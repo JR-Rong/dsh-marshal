@@ -14,7 +14,11 @@ export function redact(value: unknown, patterns: readonly RegExp[], depth = 0): 
   if (value === null || typeof value !== 'object') return value
   if (Array.isArray(value)) return value.map(item => redact(item, patterns, depth + 1))
   const out: Record<string, unknown> = {}
-  for (const [key, item] of Object.entries(value)) out[key] = redact(item, patterns, depth + 1)
+  for (const [key, item] of Object.entries(value)) {
+    // 键名同样可能夹带密钥，先脱敏再落盘；碰撞时后写覆盖即可。
+    const safeKey = patterns.reduce((text, pattern) => text.replace(pattern, '***'), key)
+    out[safeKey] = redact(item, patterns, depth + 1)
+  }
   return out
 }
 
@@ -22,8 +26,9 @@ export function redact(value: unknown, patterns: readonly RegExp[], depth = 0): 
 export function stripContent(event: EventFrame): EventFrame {
   const payload = (event.payload ?? {}) as Record<string, unknown>
   const chars = (value: unknown): number => {
+    if (value === undefined || value === null) return 0
     if (typeof value === 'string') return value.length
-    return JSON.stringify(value ?? '')?.length ?? 0
+    return JSON.stringify(value)?.length ?? 0
   }
 
   switch (event.kind) {
