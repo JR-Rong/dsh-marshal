@@ -85,12 +85,13 @@ export class NodeLink {
   /** close 的别名，便于直接当作 dispose 回调。 */
   dispose(): void { this.close() }
 
-  sendEvent(frame: EventFrame): void {
-    const text = encodeFrame(frame)
+  sendRaw(text: string): void {
     // 握手完成且没有更早的积压帧时才直发，否则排队，避免越过队首。
     if (this.acked && this.queue.length === 0 && this.socket !== undefined && this.trySend(this.socket, text)) return
     this.enqueue(text)
   }
+
+  sendEvent(frame: EventFrame): void { this.sendRaw(encodeFrame(frame)) }
 
   private enqueue(text: string): void {
     this.queue.push(text)
