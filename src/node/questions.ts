@@ -90,6 +90,8 @@ export function createQuestionRelay(options: QuestionRelayOptions): QuestionRela
       }
 
       timer = setTimeout(() => entry.finish(undefined, 'timeout'), options.timeoutMs)
+      // 没人回答时这个定时器不该拖住事件循环（同样适用于忘了 settle 的 pending）。
+      timer.unref?.()
       pending.set(requestId, entry)
       if (signal !== undefined) {
         onAbort = () => entry.finish(undefined, 'local')
