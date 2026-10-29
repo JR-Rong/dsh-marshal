@@ -25,6 +25,14 @@ export class DeviceRegistry {
 
   detach(id: string): void { this.devices.delete(id) }
 
+  /** 只在该 id 当前登记的就是这个 sender 时才摘除；用于丢弃迟到的 close。 */
+  detachIf(id: string, sender: Sender): boolean {
+    const slot = this.devices.get(id)
+    if (slot === undefined || slot.sender !== sender) return false
+    this.devices.delete(id)
+    return true
+  }
+
   touch(id: string, now: number): void {
     const slot = this.devices.get(id)
     if (slot !== undefined) slot.record = { ...slot.record, lastSeen: now }
