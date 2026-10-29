@@ -178,8 +178,12 @@ stream.onmessage = (message) => {
     // parseAnswers 要求每个问题 id 恰好一次：只认字符串 id，重复 id 合成一题。
     const ids = [...new Set(questions.map(q => q.id).filter(id => typeof id === 'string'))];
     const total = ids.length;
-    // 只能自由输入、没有选项的问题在页面上答不了：整张卡片只读，等请求超时交回本地 UI。
-    const customOnly = questions.some(q => !Array.isArray(q.options) || q.options.length === 0);
+    // 渲染时只认带字符串 label 的选项；判定与渲染用同一份过滤结果。
+    const optionsOf = question => Array.isArray(question.options)
+      ? question.options.filter(option => typeof option?.label === 'string')
+      : [];
+    // 只能自由输入、没有可用选项的问题在页面上答不了：整张卡片只读，等请求超时交回本地 UI。
+    const customOnly = questions.some(question => optionsOf(question).length === 0);
     // 有任一多选问题时用显式“提交”；全为单选时选满即自动提交（保持原有体验）。
     const hasMulti = questions.some(q => q.multiSelect === true);
     const selections = new Map(); // id -> Set<label>
@@ -224,9 +228,7 @@ stream.onmessage = (message) => {
         const heading = document.createElement('div');
         heading.textContent = question.question;
         node.append(heading);
-        const options = Array.isArray(question.options)
-          ? question.options.filter(option => typeof option?.label === 'string')
-          : [];
+        const options = optionsOf(question);
         if (options.length === 0) {
           const note = document.createElement('div');
           note.className = 'reason';

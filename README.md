@@ -136,7 +136,7 @@ location /marshal {
         answerTimeoutMs: 300000   # 正整数，默认 300000
 ```
 
-打开后 node 认领 `user-questions/request`：问题与选项发到 hub，本地弹窗**延迟**到远端作答或 `answerTimeoutMs` 到期才出现；超时、连接中断或请求被 abort 时立即交回本地 UI。发送失败则当场交回本地。
+打开后 node 认领 `user-questions/request`：问题与选项发到 hub，本地弹窗**延迟**到远端作答或 `answerTimeoutMs` 到期才出现；超时或请求被 abort 时交回本地 UI。链路断开期间远端无法作答，提问也要等超时后才回到本地。发送失败则当场交回本地。
 
 页面上的提问卡片：
 
