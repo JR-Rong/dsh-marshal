@@ -1,8 +1,9 @@
 import { createServer, request, type Server } from 'node:http'
+import { connect as netConnect } from 'node:net'
 import { afterEach, describe, expect, it } from 'vitest'
 import { WebSocket } from 'ws'
 import { DeviceRegistry, type Sender } from '../src/hub/registry.ts'
-import { mountHubSocket, nodeServerPort, type HubSocketHandle } from '../src/hub/server.ts'
+import { mountHubSocket, nodeServerPort, type HubSocketHandle, type UpgradePort } from '../src/hub/server.ts'
 import type { Frame } from '../src/wire/frames.ts'
 
 const TOKEN = 'y'.repeat(32)
@@ -29,7 +30,14 @@ async function waitFor(predicate: () => boolean, what: string): Promise<void> {
 
 interface Served { readonly port: number; readonly mounted: HubSocketHandle; readonly server: Server }
 
-async function serve(registry: DeviceRegistry, frames: Frame[] = [], devices = DEVICES): Promise<Served> {
+interface ServeOptions { readonly helloTimeoutMs?: number }
+
+async function serve(
+  registry: DeviceRegistry,
+  frames: Frame[] = [],
+  devices = DEVICES,
+  options: ServeOptions = {},
+): Promise<Served> {
   const server = createServer()
   const mounted = mountHubSocket({
     port: nodeServerPort(server),
@@ -37,6 +45,7 @@ async function serve(registry: DeviceRegistry, frames: Frame[] = [], devices = D
     devices,
     now: Date.now,
     onFrame: (_device, frame) => frames.push(frame),
+    ...options,
   })
   const port = await new Promise<number>(resolve => server.listen(0, '127.0.0.1', () => {
     const address = server.address()
@@ -98,6 +107,29 @@ function upgradeStatus(port: number, path: string, extra: Record<string, string>
   })
 }
 
+/** 原始 socket 发请求行：http.request 会在客户端就拒绝带空格的 path，够不到服务端 parser。 */
+function rawUpgrade(port: number, requestTarget: string): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const socket = netConnect(port, '127.0.0.1', () => {
+      socket.write(
+        `GET ${requestTarget} HTTP/1.1\r\n`
+        + 'Host: 127.0.0.1\r\n'
+        + 'Connection: Upgrade\r\n'
+        + 'Upgrade: websocket\r\n'
+        + 'Sec-WebSocket-Version: 13\r\n'
+        + 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n'
+        + `Authorization: Bearer ${TOKEN}\r\n\r\n`,
+      )
+    })
+    let text = ''
+    socket.setEncoding('utf8')
+    socket.on('data', chunk => { text += chunk })
+    socket.on('end', () => resolve(text))
+    socket.on('close', () => resolve(text))
+    socket.on('error', reject)
+  })
+}
+
 interface HelloOverrides { readonly device?: string; readonly token?: string; readonly agents?: readonly string[] }
 
 function helloText(overrides: HelloOverrides = {}): string {
@@ -110,8 +142,13 @@ function helloText(overrides: HelloOverrides = {}): string {
 }
 
 /** 建立连接、发 hello、等到 ack。 */
-async function hello(registry: DeviceRegistry, port: number, overrides: HelloOverrides = {}): Promise<WebSocket> {
-  const ws = await connect(port)
+async function hello(
+  registry: DeviceRegistry,
+  port: number,
+  overrides: HelloOverrides = {},
+  path = '/marshal/uplink',
+): Promise<WebSocket> {
+  const ws = await connect(port, path)
   ws.on('error', () => {})
   const acked = new Promise<Frame>(resolve => {
     ws.once('message', data => resolve(JSON.parse(String(data)) as Frame))
@@ -230,5 +267,76 @@ describe('hub socket', () => {
     await waitFor(() => ws.readyState === WebSocket.CLOSED, 'existing socket to be terminated')
     await waitFor(() => registry.get('mac') === undefined, 'slot to be removed on terminate')
     await expectRejected(port)
+  })
+
+  it('带查询串的合法路径仍能握手', async () => {
+    const registry = new DeviceRegistry()
+    const { port } = await serve(registry)
+    const ws = await hello(registry, port, {}, '/marshal/uplink?x=1')
+    expect(registry.get('mac')?.record.agents).toEqual(['dsh'])
+    ws.close()
+  })
+
+  it('绝对 URL 目标只按 pathname 判定', async () => {
+    const registry = new DeviceRegistry()
+    const { port } = await serve(registry)
+    const auth = { authorization: `Bearer ${TOKEN}` }
+    // 同 host、不同 pathname：仍然 404。
+    expect(await upgradeStatus(port, 'http://example.com/other', auth)).toBe(404)
+    // 绝对 URL 但 pathname 恰好是 uplink：放行。
+    expect(await upgradeStatus(port, 'http://example.com/marshal/uplink', auth)).toBe(101)
+    await waitFor(() => registry.get('mac') === undefined, 'unauthenticated upgrade to stay out of registry')
+  })
+
+  it('畸形 req.url 不产生未捕获异常，也不升级', async () => {
+    const registry = new DeviceRegistry()
+    const { port } = await serve(registry)
+    const uncaught: unknown[] = []
+    const onUncaught = (err: unknown): void => { uncaught.push(err) }
+    process.on('uncaughtException', onUncaught)
+    try {
+      // 空格 path 在客户端就被 Node 拒绝，服务端收不到；原始请求行才能覆盖 parser 与 pathname 解析。
+      const spaced = (): void => {
+        request({ host: '127.0.0.1', port, path: 'not a url' }).on('error', () => {}).end()
+      }
+      expect(spaced).toThrow()
+      // 请求行本身非法：parser 直接 400，不会进 upgrade。
+      expect(await rawUpgrade(port, 'not a url')).not.toContain('101')
+      // 请求行合法但不是合法 URL：pathnameOf 走 catch，回 404。
+      expect(await rawUpgrade(port, 'http://')).toContain('404')
+    } finally {
+      process.off('uncaughtException', onUncaught)
+    }
+    expect(uncaught).toEqual([])
+    expect(registry.get('mac')).toBeUndefined()
+  })
+
+  it('hello 超时后连接在 1s 内被终止', async () => {
+    const registry = new DeviceRegistry()
+    const { port } = await serve(registry, [], DEVICES, { helloTimeoutMs: 50 })
+    const started = Date.now()
+    const ws = await connect(port)
+    ws.on('error', () => {})
+    await waitFor(() => ws.readyState === WebSocket.CLOSED, 'socket to be closed after hello timeout')
+    expect(Date.now() - started).toBeLessThan(1_000)
+    expect(registry.get('mac')).toBeUndefined()
+  })
+
+  it('重复 token 在 mount 时抛错且不回显 token', () => {
+    const devices = [
+      { id: 'mac', name: 'Mac', token: TOKEN },
+      { id: 'pc', name: 'PC', token: TOKEN },
+    ]
+    const port: UpgradePort = { open: () => () => {} }
+    let caught: Error | undefined
+    try {
+      mountHubSocket({ port, registry: new DeviceRegistry(), devices, now: Date.now })
+    } catch (err) {
+      caught = err as Error
+    }
+    expect(caught).toBeInstanceOf(Error)
+    expect(caught?.message).toContain('mac')
+    expect(caught?.message).toContain('pc')
+    expect(caught?.message).not.toContain(TOKEN)
   })
 })

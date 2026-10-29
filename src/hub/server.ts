@@ -9,7 +9,7 @@ import type { DeviceRegistry, Sender } from './registry.ts'
 
 export const UPLINK_PATH = '/marshal/uplink'
 
-/** 握手成功后多久之内必须收到合法 hello，否则断开。 */
+/** 握手成功后多久之内必须收到合法 hello，否则断开（可被 options.helloTimeoutMs 覆盖）。 */
 const HELLO_TIMEOUT_MS = 10_000
 
 /** 谁持有 HTTP upgrade 事件。hub 只依赖这个端口，不关心底下是 DSH 还是裸 node。 */
@@ -35,6 +35,8 @@ export interface HubSocketOptions {
   readonly devices: readonly DeviceEntry[]
   readonly now: () => number
   readonly heartbeatMs?: number
+  /** 握手后等待合法 hello 的上限，默认 10_000ms。 */
+  readonly helloTimeoutMs?: number
   readonly onFrame?: (deviceId: string, frame: Frame) => void
 }
 
@@ -119,7 +121,7 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
       ws.on('error', () => ws.terminate())
       ws.on('pong', () => alive.set(ws, true))
 
-      const helloTimer = setTimeout(() => { ws.terminate() }, HELLO_TIMEOUT_MS)
+      const helloTimer = setTimeout(() => { ws.terminate() }, options.helloTimeoutMs ?? HELLO_TIMEOUT_MS)
       helloTimers.add(helloTimer)
       const clearHelloTimer = (): void => {
         clearTimeout(helloTimer)
