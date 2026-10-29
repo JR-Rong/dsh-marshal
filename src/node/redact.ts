@@ -17,7 +17,13 @@ export function redact(value: unknown, patterns: readonly RegExp[], depth = 0): 
   for (const [key, item] of Object.entries(value)) {
     // 键名同样可能夹带密钥，先脱敏再落盘；碰撞时后写覆盖即可。
     const safeKey = patterns.reduce((text, pattern) => text.replace(pattern, '***'), key)
-    out[safeKey] = redact(item, patterns, depth + 1)
+    // 不用赋值语法：`__proto__` 会改写原型而不是写入自有属性。
+    Object.defineProperty(out, safeKey, {
+      value: redact(item, patterns, depth + 1),
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    })
   }
   return out
 }
@@ -43,7 +49,8 @@ export function stripContent(event: EventFrame): EventFrame {
     }
     case 'tool.output':
     case 'tool.completed':
-      return { ...event, payload: { callId: payload.callId, chars: chars(payload.content), redacted: true } }
+      // isError 是状态而不是正文；丢掉它会让失败的工具在页面上显示成成功。
+      return { ...event, payload: { callId: payload.callId, chars: chars(payload.content), redacted: true, isError: payload.isError === true } }
     default:
       return event
   }

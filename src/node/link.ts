@@ -4,6 +4,9 @@ import { encodeFrame, type EventFrame } from '../wire/frames.ts'
 /** 断线期间最多缓存多少帧，超出后丢最旧的。 */
 const DEFAULT_BUFFER_LIMIT = 1000
 
+/** 断线缓存的字节上限：1000 个 1 MiB 帧会吃掉 1 GiB，必须再按体积封顶。 */
+const DEFAULT_BUFFER_BYTES = 8 * 1024 * 1024
+
 /** 重连等待的上限：指数退避在此基础上叠加抖动。 */
 const MAX_BACKOFF_MS = 30_000
 const BASE_BACKOFF_MS = 500
@@ -26,6 +29,8 @@ export interface NodeLinkOptions {
   readonly device: string
   readonly agents: readonly string[]
   readonly bufferLimit?: number
+  /** 断线缓存的总字节上限，默认 8 MiB。 */
+  readonly maxBufferedBytes?: number
   readonly heartbeatMs?: number
   /** 重连退避上限，默认 30s；主要给测试缩短等待。 */
   readonly maxBackoffMs?: number
@@ -40,8 +45,10 @@ export interface NodeLinkOptions {
 export class NodeLink {
   private socket: WebSocket | undefined
   private readonly queue: string[] = []
+  private queueBytes = 0
   /** hello.ack 之前就到的下行帧：握手确认后再按序交给 onFrame。 */
   private readonly pendingInbound: string[] = []
+  private pendingBytes = 0
   private attempts = 0
   private timer: NodeJS.Timeout | undefined
   private heartbeat: NodeJS.Timeout | undefined
@@ -76,6 +83,9 @@ export class NodeLink {
     this.clearStableTimer()
     this.stopHeartbeat()
     this.pendingInbound.length = 0
+    this.pendingBytes = 0
+    this.queue.length = 0
+    this.queueBytes = 0
     this.acked = false
     const socket = this.socket
     this.socket = undefined
@@ -97,9 +107,13 @@ export class NodeLink {
 
   private enqueue(text: string): void {
     this.queue.push(text)
+    this.queueBytes += Buffer.byteLength(text, 'utf8')
     const limit = this.limit()
-    while (this.queue.length > limit) {
-      this.queue.shift()
+    const bytes = this.limitBytes()
+    while (this.queue.length > limit || this.queueBytes > bytes) {
+      const dropped = this.queue.shift()
+      if (dropped === undefined) break
+      this.queueBytes = Math.max(0, this.queueBytes - Buffer.byteLength(dropped, 'utf8'))
       this.droppedCount += 1
     }
   }
@@ -107,6 +121,10 @@ export class NodeLink {
   private limit(): number {
     // bufferLimit 可能来自直接构造（不经过配置校验），负值会让下面的 while 无法收敛。
     return Math.max(0, this.options.bufferLimit ?? DEFAULT_BUFFER_LIMIT)
+  }
+
+  private limitBytes(): number {
+    return Math.max(0, this.options.maxBufferedBytes ?? DEFAULT_BUFFER_BYTES)
   }
 
   private dial(): void {
@@ -135,6 +153,7 @@ export class NodeLink {
       this.socket = undefined
       this.acked = false
       this.pendingInbound.length = 0
+      this.pendingBytes = 0
       this.stopHeartbeat()
       this.clearStableTimer()
       if (this.closed) return
@@ -151,6 +170,26 @@ export class NodeLink {
       // close 随后到达并触发重试；这里只把原因交给可选回调，不让它变成 uncaught。
       if (this.socket === ws) this.reportError(error)
     })
+    // hub 在升级前用 401 表示设备 token 不对；这不是暂时故障，重拨只会一直失败。
+    ws.on('unexpected-response', (_request, response) => {
+      response.resume()
+      if (this.socket !== ws) return
+      this.socket = undefined
+      this.acked = false
+      this.pendingInbound.length = 0
+      this.pendingBytes = 0
+      this.stopHeartbeat()
+      this.clearStableTimer()
+      if (this.closed) return
+      if (response.statusCode === 401) {
+        this.active = false
+        this.attempts = 0
+        this.clearTimer()
+        this.reportError(new Error('marshal: hub rejected device token (401)'))
+        return
+      }
+      this.retry()
+    })
   }
 
   private receive(ws: WebSocket, text: string): void {
@@ -158,19 +197,22 @@ export class NodeLink {
     if (this.acked) { this.deliver(text); return }
     if (this.isHelloAck(text)) {
       this.acked = true
-      // 握手确认前收到的试探性断线不该让正式连接背负数次退避。
-      this.attempts = 0
       this.startStableTimer(ws)
       const pending = this.pendingInbound.splice(0)
+      this.pendingBytes = 0
       for (const buffered of pending) this.deliver(buffered)
       this.flush(ws)
       return
     }
     // ack 之前 hub 不该下发业务帧；先攒着，确认握手后按原序放行。
     this.pendingInbound.push(text)
+    this.pendingBytes += Buffer.byteLength(text, 'utf8')
     const limit = this.limit()
-    while (this.pendingInbound.length > limit) {
-      this.pendingInbound.shift()
+    const bytes = this.limitBytes()
+    while (this.pendingInbound.length > limit || this.pendingBytes > bytes) {
+      const dropped = this.pendingInbound.shift()
+      if (dropped === undefined) break
+      this.pendingBytes = Math.max(0, this.pendingBytes - Buffer.byteLength(dropped, 'utf8'))
       this.droppedCount += 1
     }
   }
@@ -195,6 +237,7 @@ export class NodeLink {
       if (text === undefined) return
       if (!this.trySend(ws, text)) return
       this.queue.shift()
+      this.queueBytes = Math.max(0, this.queueBytes - Buffer.byteLength(text, 'utf8'))
     }
   }
 

@@ -49,7 +49,7 @@ npx --package dsh-marshal marshal-device laptop-b
 
 `marshal-device` 由 `dsh-marshal` 包提供：`npx --package dsh-marshal` 只在本地已安装该包时解析到它的 bin；包尚未发布到 npm 时，可在安装目录直接运行 `node lib/src/bin/device.js <device-id>`。不要直接 `npx marshal-device`（那是另一个包名）。
 
-设备表是一个 JSON 文件，CLI 每次写入后都会把权限收紧到 `0600`。CLI 支持 `MARSHAL_DEVICES_FILE` 环境变量覆盖路径，但 **hub 不读这个环境变量**：一旦用了覆盖，必须同时把 hub 配置里的 `devicesFile` 指到同一个绝对路径。设备表只在 hub 启动时读取，签发新设备后要重启 hub。文件存在但无法解析时 CLI 直接报错退出，不会当成空表覆盖。
+设备表是一个 JSON 文件，CLI 每次写入后都会把权限收紧到 `0600`。CLI 支持 `MARSHAL_DEVICES_FILE` 环境变量覆盖路径，但 **hub 不读这个环境变量**：一旦用了覆盖，必须同时把 hub 配置里的 `devicesFile` 指到同一个绝对路径。设备表只在 hub 启动时读取，签发新设备后要重启 hub；启动时加载不到任何设备会打 `marshal: no devices loaded from …` 警告。文件存在但无法解析时 CLI 直接报错退出，不会当成空表覆盖。
 
 hub 启动后日志会打印 `marshal: hub ready at <origin>/marshal`。
 
@@ -75,7 +75,7 @@ dsh plugin add dsh-marshal
 - `token` 至少 16 字符，与 hub 设备表里那台设备的 token 完全一致。
 - `deviceName` 可选，默认取宿主环境的 `HOSTNAME`，取不到时是 `unknown`；它必须等于 `marshal-device` 签发的设备 id，否则 hello 阶段的 `device` 对不上，hub 会以 `4401 auth-failed` 关闭连接。它同时是 hello 里的设备 id，也是事件里的 `device` 字段。
 
-node 断线后按指数退避（上限 30s）重连，断线期间最多缓存 1000 帧；收到 hello 阶段的 `4401 auth-failed` 后停止重连，需要改对 token 再重启。升级前因设备 token 不对被断开时 hub 不会返回 `4401`，node 会继续按退避重试，日志里表现为反复握手失败。
+node 断线后按指数退避（上限 30s）重连，断线期间最多缓存 1000 帧、总字节不超过 8 MiB；升级握手返回 `401` 或 hello 阶段收到 `4401` 都视为设备 token 错误，停止重连，改对 token 后再重启。每次连上都会重发会话快照。
 
 ## 打开控制台
 
@@ -92,6 +92,7 @@ token 也可以放在 `x-marshal-token` 请求头里（两者同时出现时以�
 - 左栏每 5 秒轮询 `/marshal/api/devices`，列出**当前已连接**的设备与 agent。
 - 点会话名发 `resume`，node 开始跟随并把事件推回；底部输入框发 `prompt`。
 - 事件经 `/marshal/api/stream`（SSE）实时追加。
+- hub 在设备每次连上时清空该设备的旧会话索引，再按 node 重发的快照重建，所以删掉的会话不会残留。
 
 页面在可用时用 `crypto.randomUUID()` 生成幂等键，不可用时退化成时间戳加随机串，所以普通 http 也能加载。但 token 在 URL 里，**请优先用 HTTPS**：页面响应带 `referrer-policy: no-referrer` 与 `cache-control: no-store`，也不要把带 token 的 URL 粘到第三方页面或聊天工具里。
 
@@ -160,10 +161,12 @@ WebSocket 上的 JSON 帧统一带 `v: 1`，四种 `type`：
 
 - `hello`：`device`、`token`、`agents`；必须是首帧，hub 校验后回 `ack`（`id: "hello"`）。
 - `event`：`device`、`agent`、`sessionId`、`seq`、`ts`、`kind`、`payload`；`kind` 共 14 种，完整列表见 `src/wire/frames.ts` 的 `MARSHAL_KINDS`。
-- `command`：`id`、`idempotencyKey`、`deadline`、`op`、`target{device,agent,sessionId}`、可选 `args`；`op` 为 `prompt` / `resume` / `create` / `interrupt` / `answer` / `cancel` / `configure`，v0 实际支持 `prompt` / `resume` / `interrupt` / `answer`，`create` 与 `cancel` 回 `unsupported`，`configure` 只做字段识别与拒绝放宽。
+- `command`：`id`、`idempotencyKey`、`deadline`、`op`、`target{device,agent,sessionId}`、可选 `args`；`op` 为 `prompt` / `resume` / `create` / `interrupt` / `answer` / `cancel` / `configure`，v0 实际支持 `prompt` / `resume` / `interrupt` / `answer`，`create` 与 `cancel` 回 `unsupported`，`configure` 只做字段识别与拒绝放宽。`deadline` 已过的指令由 node 直接回 `deadline-expired`，不会执行。
 - `ack`：`id`、`ok`；成功时可能带 `result`（hello 的 ack 只有 `ok`），失败带 `code`，`message` 可选。
 
-单帧上限 1 MiB（双向）；指令的结果超过上限时只回固定的小体积 `result-too-large`。hub 对能解析但违反协议的帧用 `4400` 关闭；超过 1 MiB 的入站帧由 `ws` 以 `1009` 关闭；hello 里 token 不匹配用 `4401 auth-failed` 关闭；握手后 10 秒内没收到合法 hello 会被直接断开（客户端看到 `1006`）。
+单帧上限 1 MiB（双向）；指令的结果超过上限时只回固定的小体积 `result-too-large`。hub 对能解析但违反协议的帧用 `4400` 关闭；超过 1 MiB 的入站帧由 `ws` 以 `1009` 关闭；hello 里 token 不匹配用 `4401 auth-failed` 关闭；握手后 10 秒内没收到合法 hello 会被直接断开（客户端看到 `1006`）。升级请求里的设备 token 不对时 hub 回 `401` 并断开。hub 只接受与握手登记一致的 `device`/`agent` 的事件帧，其它按 `4400` 关闭；node 也会拒收目标设备或 agent 不匹配的指令。
+
+`/marshal/api/command` 的状态码：参数错误 `400`、会话不存在 `404`、设备离线或回答已过期 `409`、执行失败 `502`、超时 `504`。
 
 ## 安全说明
 
@@ -178,7 +181,7 @@ WebSocket 上的 JSON 帧统一带 `v: 1`，四种 `type`：
 
 1. 先看日志里的 `marshal:` 前缀：`marshal: hub ready at …`、`marshal: link error: …`、`marshal: hub/node config is missing …`、`marshal: follow … dropped event` 分别指向装配、链路、配置与单条事件超限。
 2. 打开 `https://<hub-host>/marshal/api/devices?token=<dashboard-token>`：返回里应有该设备。返回 401 是 dashboard token 不对；列表为空说明 node 还没完成握手（这里只列已连接设备，不会列出设备表里的离线项）。
-3. 看 node 到 `wss://<hub-host>/marshal/uplink` 的握手：hub 对错误或缺失的设备 token 会在升级前直接断开，客户端表现为连接重置，经代理时常是 502/连接被重置——这不是 dashboard 的 401，而是设备 token 问题。hello 里的 token 不匹配会收到 `4401 auth-failed`，node 随即停止重连。
+3. 看 node 到 `wss://<hub-host>/marshal/uplink` 的握手：hub 对错误或缺失的设备 token 回 `401`，node 会停止重连；hello 阶段 token 不匹配则收到 `4401 auth-failed`。经反代时 401 可能被替换成 502 或连接重置，同样按设备 token 问题处理。
 4. 检查反代有没有吞掉 `Upgrade`/`Connection`：握手挂起、400/426，或 SSE 一直不推数据，通常就是升级头被剥掉或响应被缓冲。
 
 ## 状态

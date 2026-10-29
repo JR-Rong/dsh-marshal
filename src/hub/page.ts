@@ -108,9 +108,12 @@ async function loadSessions(device, agent) {
     row.onclick = async () => {
       // 已选中的会话再点一次不重发 resume。
       if (current !== null && current.device === device && current.agent === agent && current.sessionId === session.sessionId) return;
-      const ok = await command('resume', {}, { device, agent, sessionId: session.sessionId });
-      if (!ok) return;
-      current = { device, agent, sessionId: session.sessionId };
+      const target = { device, agent, sessionId: session.sessionId };
+      const previous = current;
+      // 先切目标再发 resume：跟随事件可能先于 HTTP 响应到达 SSE，晚切会永久丢掉开头几条。
+      current = target;
+      const ok = await command('resume', {}, target);
+      if (!ok) { current = previous; return; }
       status.textContent = '';
       for (const other of log.querySelectorAll('.row')) other.classList.remove('active');
       row.classList.add('active');

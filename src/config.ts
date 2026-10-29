@@ -1,3 +1,5 @@
+import { homedir } from 'node:os'
+
 export type Role = 'hub' | 'node'
 export type Privacy = 'metadata' | 'content'
 export type Relay = 'off' | 'remote'
@@ -80,7 +82,8 @@ function parseDeviceName(raw: unknown, hostname: string): string {
 }
 
 function parseDevicesFile(raw: unknown): string {
-  if (raw === undefined) return `${process.env.HOME ?? '.'}/.dsh-marshal/devices.json`
+  // 与 marshal-device CLI 使用同一个解析方式，避免 HOME 缺失时两边落到不同路径。
+  if (raw === undefined) return `${homedir()}/.dsh-marshal/devices.json`
   if (typeof raw !== 'string' || raw.trim() === '') throw new Error('marshal: config.devicesFile must be a non-empty string')
   return raw
 }

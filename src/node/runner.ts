@@ -44,7 +44,7 @@ export function createFollower(options: {
 /** 只允许 spec 定义的 wire 错误码过线；其余（`marshal: …`、`Error: …`）一律归为 adapter-crashed。 */
 const WIRE_CODES: ReadonlySet<string> = new Set([
   'session-unknown', 'invalid-args', 'unsupported', 'device-mismatch', 'adapter-crashed', 'result-too-large',
-  'unknown', 'invalid', 'session-mismatch', 'tighten-only',
+  'unknown', 'invalid', 'session-mismatch', 'tighten-only', 'deadline-expired',
 ])
 
 /** 错误前缀即 wire 错误码：`session-unknown: ...` → `session-unknown`。 */
@@ -74,6 +74,11 @@ export function runCommand(
   if (frame.target.device !== device) { reply({ ok: false, code: 'device-mismatch' }); return }
   if (frame.target.agent !== adapter.agent) {
     reply({ ok: false, code: 'session-unknown', message: 'agent ' + frame.target.agent + ' unavailable' })
+    return
+  }
+  // hub 已经超时并可能让用户重试过：迟到的指令再执行会跑两遍。
+  if (Number.isFinite(frame.deadline) && frame.deadline < Date.now()) {
+    reply({ ok: false, code: 'deadline-expired' })
     return
   }
   if (frame.op === 'resume') {

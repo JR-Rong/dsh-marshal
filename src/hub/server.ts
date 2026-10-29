@@ -38,6 +38,10 @@ export interface HubSocketOptions {
   /** 握手后等待合法 hello 的上限，默认 10_000ms。 */
   readonly helloTimeoutMs?: number
   readonly onFrame?: (deviceId: string, frame: Frame) => void
+  /** hello 通过、设备进入注册表之后调用；会话索引据此按设备重建。 */
+  readonly onAttach?: (deviceId: string) => void
+  /** 设备连接真正被摘除后调用；用于立刻结束发给它的等待中指令。 */
+  readonly onDetach?: (deviceId: string) => void
 }
 
 export interface HubSocketHandle {
@@ -98,6 +102,7 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
   const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_FRAME_BYTES })
   const alive = new WeakMap<WebSocket, boolean>()
   const deviceOf = new WeakMap<WebSocket, string>()
+  const agentsOf = new WeakMap<WebSocket, ReadonlySet<string>>()
   const helloTimers = new Set<ReturnType<typeof setTimeout>>()
   let disposed = false
 
@@ -112,8 +117,15 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
     if (pathnameOf(req) !== UPLINK_PATH) { rejectUpgrade(socket); return }
     const digest = sha256(bearerToken(req))
     const device = findDevice(tokens, digest)
-    // 握手失败只说原因码，不回显 token，也不进注册表。
-    if (device === undefined) { socket.destroy(); return }
+    // 握手失败只说原因码，不回显 token，也不进注册表。401 让客户端能区分「token 错」与网络故障。
+    if (device === undefined) {
+      if (socket.writable) {
+        socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
+      } else {
+        socket.destroy()
+      }
+      return
+    }
 
     wss.handleUpgrade(req, socket, head, ws => {
       alive.set(ws, true)
@@ -136,7 +148,7 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
         clearHelloTimer()
         const id = deviceOf.get(ws)
         // 同一设备重连后，旧连接迟到的 close 不能摘掉新连接的槽位。
-        if (id !== undefined) registry.detachIf(id, sender)
+        if (id !== undefined && registry.detachIf(id, sender)) options.onDetach?.(id)
       })
 
       ws.on('message', data => {
@@ -152,11 +164,22 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
           }
           clearHelloTimer()
           deviceOf.set(ws, device.id)
+          agentsOf.set(ws, new Set(frame.agents))
           registry.attach({ id: device.id, name: device.name, agents: frame.agents }, sender, now())
+          // 节点重连后会重发快照：先清掉该设备的旧索引，已删除的会话不会残留。
+          options.onAttach?.(device.id)
           sendFrame(ws, { v: 1, type: 'ack', id: 'hello', ok: true })
           return
         }
-        if (frame.type === 'event') registry.touch(id, now())
+        if (frame.type === 'event') {
+          const agents = agentsOf.get(ws)
+          // 只信握手绑定的身份：帧里自报的 device/agent 不能冒充别的设备或未声明的 agent。
+          if (frame.device !== id || (agents !== undefined && !agents.has(frame.agent))) {
+            ws.close(4400, 'device-mismatch')
+            return
+          }
+          registry.touch(id, now())
+        }
         options.onFrame?.(id, frame)
       })
     })

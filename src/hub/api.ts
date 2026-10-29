@@ -141,7 +141,16 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
         op: op as CommandFrame['op'], target, args: body.args, idempotencyKey,
       })
       if (!outcome.ok) {
-        json(res, outcome.code === 'device-offline' ? 409 : 504, outcome)
+        // 明确区分「设备不在线」「参数/会话错误」「执行失败」，别把一切都报成 504。
+        const status = outcome.code === 'device-offline' ? 409
+          : outcome.code === 'disposed' ? 503
+          : outcome.code === 'timeout' ? 504
+          : outcome.code === 'invalid-args' || outcome.code === 'unsupported'
+            || outcome.code === 'tighten-only' || outcome.code === 'device-mismatch' ? 400
+          : outcome.code === 'session-unknown' ? 404
+          : outcome.code === 'session-mismatch' || outcome.code === 'invalid' || outcome.code === 'unknown' ? 409
+          : 502
+        json(res, status, outcome)
         return
       }
       json(res, 200, outcome)

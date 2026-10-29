@@ -27,11 +27,16 @@ function applyHub(ctx: MarshalContext, config: MarshalConfig): void {
   if (webServer === undefined) throw new Error('marshal: hub role requires the webServer service')
   const registry = new DeviceRegistry()
   const relay = new HubRelay({ registry, now: Date.now })
+  const devices = loadDevices(config.devicesFile)
+  if (devices.length === 0) ctx.logger.warn(`marshal: no devices loaded from ${config.devicesFile}`)
   const socket = mountHubSocket({
     port: webServerPort(webServer),
     registry,
-    devices: loadDevices(config.devicesFile),
+    devices,
     now: Date.now,
+    // 设备重连时节点会重发快照：先清索引，再让快照重建。
+    onAttach: deviceId => relay.clearDevice(deviceId),
+    onDetach: deviceId => relay.deviceOffline(deviceId),
     onFrame: (_device, frame) => {
       // 事件进索引并扇出；ack 必须回填，否则 relay 的每条指令都会超时。
       if (frame.type === 'event') relay.publish(frame)
@@ -55,6 +60,20 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
     return { ...masked, payload: redact(masked.payload, patterns) }
   }
 
+  let snapshot: AbortController | undefined
+  const sendSnapshot = (): void => {
+    // 每次连上都重发快照：hub 在 hello 时清掉了本设备的旧索引，必须以最新列表重建。
+    snapshot?.abort()
+    const abort = new AbortController()
+    snapshot = abort
+    void (async () => {
+      for (const event of await adapter.snapshot(abort.signal)) link.sendEvent(pipeline(event))
+    })().catch((error: unknown) => {
+      // 主动取消导致的失败不是故障，不写日志。
+      if (!abort.signal.aborted) ctx.logger.warn('marshal: snapshot failed: ' + String(error))
+    })
+  }
+
   const link = new NodeLink({
     url: config.hubUrl!, token: config.token!, device: config.deviceName,
     agents: ['dsh'],
@@ -63,6 +82,7 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
       try { frame = decodeFrame(text) } catch { return }
       runCommand(link, adapter, follower, frame, config.deviceName)
     },
+    onOnline: sendSnapshot,
     onError: error => ctx.logger.warn(`marshal: link error: ${String(error)}`),
   })
   let relay: QuestionRelay | undefined
@@ -85,15 +105,6 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
     logger: ctx.logger,
   })
 
-  // 快照在 effect 之外也持有同一个 signal：卸载时必须先取消，避免它在 close 之后继续产事件。
-  const snapshotAbort = new AbortController()
-  ctx.effect(() => { snapshotAbort.abort(); follower.stopAll(); relay?.dispose(); link.close() }, 'marshal: node link')
+  ctx.effect(() => { snapshot?.abort(); follower.stopAll(); relay?.dispose(); link.close() }, 'marshal: node link')
   link.start()
-
-  void (async () => {
-    for (const event of await adapter.snapshot(snapshotAbort.signal)) link.sendEvent(pipeline(event))
-  })().catch((error: unknown) => {
-    // 主动取消导致的失败不是故障，不写日志。
-    if (!snapshotAbort.signal.aborted) ctx.logger.warn('marshal: snapshot failed: ' + String(error))
-  })
 }

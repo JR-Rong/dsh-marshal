@@ -33,7 +33,11 @@ function disposedOutcome(): CommandOutcome {
   return { ok: false, code: 'disposed', message: DISPOSED_MESSAGE }
 }
 
-interface Pending { resolve: (outcome: CommandOutcome) => void; timer: NodeJS.Timeout }
+interface Pending {
+  resolve: (outcome: CommandOutcome) => void
+  timer: NodeJS.Timeout
+  readonly device: string
+}
 
 export class HubRelay {
   private readonly pending = new Map<string, Pending>()
@@ -92,7 +96,7 @@ export class HubRelay {
         this.pending.delete(id)
         resolve({ ok: false, code: 'timeout' })
       }, timeoutMs)
-      this.pending.set(id, { resolve, timer })
+      this.pending.set(id, { resolve, timer, device: input.target.device })
       let text: string
       try {
         text = encodeFrame(frame)
@@ -124,6 +128,28 @@ export class HubRelay {
     entry.resolve(ack.ok
       ? { ok: true, result: ack.result }
       : { ok: false, code: ack.code ?? 'error', ...(ack.message === undefined ? {} : { message: ack.message }) })
+  }
+
+  /** 设备掉线时立刻结束发给它的指令，不让调用方干等到超时。 */
+  deviceOffline(deviceId: string): void {
+    for (const [id, entry] of [...this.pending]) {
+      if (entry.device !== deviceId) continue
+      clearTimeout(entry.timer)
+      this.pending.delete(id)
+      entry.resolve({ ok: false, code: 'device-offline' })
+    }
+  }
+
+  /** 节点重连后以快照为准：先清掉该设备的旧索引，并把移除通知给订阅者。 */
+  clearDevice(deviceId: string): void {
+    for (const [key, row] of [...this.index]) {
+      if (row.device !== deviceId) continue
+      this.index.delete(key)
+      this.publish({
+        v: 1, type: 'event', device: row.device, agent: row.agent, sessionId: row.sessionId,
+        seq: 0, ts: new Date(this.options.now()).toISOString(), kind: 'session.removed', payload: {},
+      })
+    }
   }
 
   /** 停止接收新指令：清定时器、以固定错误结束所有等待中的指令。幂等。 */
