@@ -115,6 +115,8 @@ describe('e2e', () => {
         }),
       })
       expect(resumeResponse.status).toBe(200)
+      // follow 由跟随循环异步取用，ack 先到；轮询等它落到记录里。
+      await waitForCount(async () => follows, 1, 'follow')
       expect(follows).toEqual([{ address: { kind: 'session', sessionId: 's1' } }])
     } finally {
       // 装配顺序是 hub → node，卸载按相反顺序。
@@ -122,7 +124,8 @@ describe('e2e', () => {
       web.server.closeAllConnections?.()
       await new Promise<void>(resolve => web.server.close(() => resolve()))
       await rm(dir, { recursive: true, force: true })
-      expect(warns).toEqual([])
     }
+    // 卸载本身不应产生任何告警。
+    expect(warns).toEqual([])
   })
 })
