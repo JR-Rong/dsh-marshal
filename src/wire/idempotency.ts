@@ -12,6 +12,8 @@ export class CommandLog {
 
   remember(key: string, result: unknown): void {
     this.prune()
+    // 先删除再写入，令重复 key 移到 Map 末尾，使淘汰顺序按最近使用（LRU）而非插入顺序。
+    this.entries.delete(key)
     this.entries.set(key, { at: this.now(), result })
     while (this.entries.size > this.limit) {
       const oldest = this.entries.keys().next()
