@@ -19,14 +19,70 @@ export interface MarshalConfig {
 
 function requireString(raw: Record<string, unknown>, key: string, missing: string[]): string | undefined {
   const value = raw[key]
-  if (typeof value !== 'string' || value.trim() === '') { missing.push(key); return undefined }
+  if (value === undefined) { missing.push(key); return undefined }
+  if (typeof value !== 'string') throw new Error(`marshal: config.${key} must be a non-empty string`)
+  if (value.trim() === '') { missing.push(key); return undefined }
   return value.trim()
 }
 
-function parseRelay(raw: unknown, key: string): Relay {
-  const value = raw ?? 'off'
-  if (value !== 'off' && value !== 'remote') throw new Error(`marshal: config.${key} must be "off" or "remote"`)
+function parseHubUrl(value: string): string {
+  let url: URL
+  try {
+    url = new URL(value)
+  } catch {
+    throw new Error('marshal: config.hubUrl is not a valid ws(s) URL')
+  }
+  if ((url.protocol !== 'ws:' && url.protocol !== 'wss:') || url.hostname === '') {
+    throw new Error('marshal: config.hubUrl is not a valid ws(s) URL')
+  }
   return value
+}
+
+function parsePrivacy(raw: unknown): Privacy {
+  if (raw === undefined) return 'metadata'
+  if (raw !== 'metadata' && raw !== 'content') throw new Error('marshal: config.privacy must be "metadata" or "content"')
+  return raw
+}
+
+function parseRelay(raw: unknown, key: string): Relay {
+  if (raw === undefined) return 'off'
+  if (raw !== 'off' && raw !== 'remote') throw new Error(`marshal: config.${key} must be "off" or "remote"`)
+  return raw
+}
+
+function parsePositiveInteger(raw: unknown, key: string, fallback: number): number {
+  if (raw === undefined) return fallback
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || !Number.isInteger(raw) || raw <= 0) {
+    throw new Error(`marshal: config.${key} must be a positive integer`)
+  }
+  return raw
+}
+
+function parseRedaction(raw: unknown): readonly string[] {
+  if (raw === undefined) return []
+  if (!Array.isArray(raw)) throw new Error('marshal: config.redaction must be an array of strings')
+  return raw.map((source, index): string => {
+    if (typeof source !== 'string') throw new Error(`marshal: config.redaction[${index}] must be a string`)
+    try {
+      new RegExp(source, 'gi')
+    } catch {
+      throw new Error(`marshal: config.redaction[${index}] is not a valid RegExp`)
+    }
+    return source
+  })
+}
+
+function parseDeviceName(raw: unknown, hostname: string): string {
+  if (raw === undefined) return hostname
+  if (typeof raw !== 'string') throw new Error('marshal: config.deviceName must be a non-empty string')
+  const value = raw.trim()
+  return value === '' ? hostname : value
+}
+
+function parseDevicesFile(raw: unknown): string {
+  if (raw === undefined) return `${process.env.HOME ?? '.'}/.dsh-marshal/devices.json`
+  if (typeof raw !== 'string' || raw.trim() === '') throw new Error('marshal: config.devicesFile must be a non-empty string')
+  return raw
 }
 
 export function parseConfig(raw: unknown, hostname: string): MarshalConfig {
@@ -43,7 +99,7 @@ export function parseConfig(raw: unknown, hostname: string): MarshalConfig {
     hubUrl = requireString(input, 'hubUrl', missing)
     token = requireString(input, 'token', missing)
     if (missing.length > 0) throw new Error(`marshal: node config is missing ${missing.join(', ')}`)
-    if (!hubUrl!.startsWith('wss://')) throw new Error('marshal: config.hubUrl must be a wss:// URL')
+    hubUrl = parseHubUrl(hubUrl!)
     if (token!.length < 16) throw new Error('marshal: config.token must be at least 16 characters')
   } else {
     dashboardToken = requireString(input, 'dashboardToken', missing)
@@ -51,17 +107,14 @@ export function parseConfig(raw: unknown, hostname: string): MarshalConfig {
     if (dashboardToken!.length < 16) throw new Error('marshal: config.dashboardToken must be at least 16 characters')
   }
 
-  const privacy = input.privacy ?? 'metadata'
-  if (privacy !== 'metadata' && privacy !== 'content') throw new Error('marshal: config.privacy must be "metadata" or "content"')
-
-  const answerTimeoutMs = input.answerTimeoutMs ?? 300_000
-  if (typeof answerTimeoutMs !== 'number' || !Number.isFinite(answerTimeoutMs) || answerTimeoutMs <= 0) {
-    throw new Error('marshal: config.answerTimeoutMs must be a positive number')
-  }
-
-  const deviceName = typeof input.deviceName === 'string' && input.deviceName.trim() !== ''
-    ? input.deviceName.trim()
-    : hostname
+  const privacy = parsePrivacy(input.privacy)
+  const answerTimeoutMs = parsePositiveInteger(input.answerTimeoutMs, 'answerTimeoutMs', 300_000)
+  const deviceName = parseDeviceName(input.deviceName, hostname)
+  const questionRelay = parseRelay(input.questionRelay, 'questionRelay')
+  const approvalRelay = parseRelay(input.approvalRelay, 'approvalRelay')
+  const ringBufferMinutes = parsePositiveInteger(input.ringBufferMinutes, 'ringBufferMinutes', 15)
+  const redaction = parseRedaction(input.redaction)
+  const devicesFile = parseDevicesFile(input.devicesFile)
 
   return {
     role,
@@ -70,11 +123,11 @@ export function parseConfig(raw: unknown, hostname: string): MarshalConfig {
     ...(dashboardToken === undefined ? {} : { dashboardToken }),
     deviceName,
     privacy,
-    questionRelay: parseRelay(input.questionRelay, 'questionRelay'),
+    questionRelay,
     answerTimeoutMs,
-    approvalRelay: parseRelay(input.approvalRelay, 'approvalRelay'),
-    ringBufferMinutes: typeof input.ringBufferMinutes === 'number' ? input.ringBufferMinutes : 15,
-    redaction: Array.isArray(input.redaction) ? input.redaction.filter((x): x is string => typeof x === 'string') : [],
-    devicesFile: typeof input.devicesFile === 'string' ? input.devicesFile : `${process.env.HOME ?? '.'}/.dsh-marshal/devices.json`,
+    approvalRelay,
+    ringBufferMinutes,
+    redaction,
+    devicesFile,
   }
 }
