@@ -71,6 +71,24 @@ export function createDshAdapter(surface: DshSurface, options: DshAdapterOptions
         }
         case 'interrupt':
           return surface.cancel(command.target.sessionId)
+        case 'answer': {
+          const payload = (command.args ?? {}) as { requestId?: string; answers?: unknown }
+          if (payload.requestId === undefined || payload.answers === undefined) {
+            throw new Error('invalid-args: requestId and answers are required')
+          }
+          const result = options.answers?.settle(command.target.sessionId, payload.requestId, payload.answers) ?? 'unknown'
+          if (result !== 'ok') throw new Error(`${result}: ${payload.requestId}`)
+          return { accepted: true }
+        }
+        case 'configure': {
+          const payload = (command.args ?? {}) as { field?: string; value?: unknown }
+          const tunable = CAPABILITY.tunables.find(item => item.id === payload.field)
+          if (tunable === undefined) throw new Error(`unsupported: ${String(payload.field)}`)
+          if (tunable.direction === 'tighten-only' && payload.value === 'wide') {
+            throw new Error('tighten-only: remote callers may not widen permissions')
+          }
+          throw new Error(`unsupported: configure ${payload.field} in v0`)
+        }
         default:
           throw new Error(`unsupported: ${command.op}`)
       }

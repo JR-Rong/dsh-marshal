@@ -11,6 +11,7 @@ import { createDshSurface } from './adapters/dsh/surface.ts'
 import { createDshAdapter } from './adapters/dsh/adapter.ts'
 import { NodeLink } from './node/link.ts'
 import { createFollower, runCommand } from './node/runner.ts'
+import { createQuestionRelay, type QuestionRelay } from './node/questions.ts'
 import { redact, stripContent } from './node/redact.ts'
 
 export const name = 'marshal'
@@ -64,7 +65,20 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
     },
     onError: error => ctx.logger.warn(`marshal: link error: ${String(error)}`),
   })
-  const adapter = createDshAdapter(createDshSurface(controller), { device: config.deviceName })
+  let relay: QuestionRelay | undefined
+  const adapter = createDshAdapter(createDshSurface(controller), {
+    device: config.deviceName,
+    answers: {
+      settle: (sessionId, requestId, answers) => relay?.settle(sessionId, requestId, answers) ?? 'unknown',
+    },
+  })
+  relay = config.questionRelay === 'remote'
+    ? createQuestionRelay({
+        ctx, timeoutMs: config.answerTimeoutMs,
+        send: event => link.sendEvent(pipeline(event)),
+        frame: adapter.frame,
+      })
+    : undefined
   const follower = createFollower({
     adapter,
     send: event => link.sendEvent(pipeline(event)),
@@ -73,7 +87,7 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
 
   // 快照在 effect 之外也持有同一个 signal：卸载时必须先取消，避免它在 close 之后继续产事件。
   const snapshotAbort = new AbortController()
-  ctx.effect(() => { snapshotAbort.abort(); follower.stopAll(); link.close() }, 'marshal: node link')
+  ctx.effect(() => { snapshotAbort.abort(); follower.stopAll(); relay?.dispose(); link.close() }, 'marshal: node link')
   link.start()
 
   void (async () => {

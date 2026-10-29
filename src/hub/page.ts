@@ -188,7 +188,7 @@ stream.onmessage = (message) => {
     }
   } else if (event.kind === 'input.resolved') {
     const card = [...log.children].find(el => el.dataset.requestId === payload.requestId);
-    if (card) card.textContent = payload.outcome === 'timeout' ? '已交回源机器' : '已由另一处回答';
+    if (card) card.textContent = payload.outcome === 'remote' ? '已由另一处回答' : '已交回源机器';
     return;
   } else {
     return;

@@ -44,6 +44,7 @@ export function createFollower(options: {
 /** 只允许 spec 定义的 wire 错误码过线；其余（`marshal: …`、`Error: …`）一律归为 adapter-crashed。 */
 const WIRE_CODES: ReadonlySet<string> = new Set([
   'session-unknown', 'invalid-args', 'unsupported', 'device-mismatch', 'adapter-crashed', 'result-too-large',
+  'unknown', 'invalid', 'session-mismatch', 'tighten-only',
 ])
 
 /** 错误前缀即 wire 错误码：`session-unknown: ...` → `session-unknown`。 */

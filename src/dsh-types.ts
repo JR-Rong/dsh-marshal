@@ -34,9 +34,35 @@ export interface LoggerLike {
   error(message: unknown): void
 }
 
+export interface UserQuestionOptionLike { readonly label: string; readonly description?: string }
+
+export interface UserQuestionLike {
+  readonly id: string
+  readonly question: string
+  readonly detail?: string
+  readonly header?: string
+  readonly options?: readonly UserQuestionOptionLike[]
+  readonly multiSelect?: boolean
+}
+
+export interface AskUserQuestionRequestLike {
+  readonly questions: readonly UserQuestionLike[]
+  /** 提问的根 Agent；只有它带有 session 时才可能属于本次转发。 */
+  readonly agent?: { readonly session: { readonly id: string } }
+  readonly signal?: AbortSignal
+}
+
+export interface AskUserQuestionAnswerLike {
+  readonly answers: readonly { readonly id: string; readonly selected: readonly string[]; readonly custom?: string }[]
+}
+
 export interface MarshalContext {
   readonly webServer?: WebServerLike
   readonly sessionController?: SessionControllerLike
   readonly logger: LoggerLike
   effect(cleanup: () => void | Promise<void>, label?: string): void
+  on(
+    event: 'user-questions/request',
+    handler: (request: AskUserQuestionRequestLike, next: () => Promise<AskUserQuestionAnswerLike>) => Promise<AskUserQuestionAnswerLike>,
+  ): () => void
 }

@@ -38,6 +38,37 @@ describe('dsh adapter', () => {
     expect(s.cancel).toHaveBeenCalledWith('s1')
   })
 
+  it('answer 采纳 sink 返回 ok 的答案', async () => {
+    const settle = vi.fn(() => 'ok' as const)
+    const adapter = createDshAdapter(surface(), { device: 'mac', answers: { settle } })
+    await expect(adapter.execute({
+      op: 'answer', target: { sessionId: 's1' },
+      args: { requestId: 'q1', answers: { answers: [{ id: 'q1', selected: ['A'] }] } },
+    })).resolves.toEqual({ accepted: true })
+    expect(settle).toHaveBeenCalledWith('s1', 'q1', { answers: [{ id: 'q1', selected: ['A'] }] })
+  })
+
+  it('answer 未命中已知请求时抛 unknown', async () => {
+    const adapter = createDshAdapter(surface(), { device: 'mac', answers: { settle: () => 'unknown' } })
+    await expect(adapter.execute({
+      op: 'answer', target: { sessionId: 's1' }, args: { requestId: 'q1', answers: { answers: [] } },
+    })).rejects.toThrow(/unknown:/)
+  })
+
+  it('configure 拒绝远端放宽 permission', async () => {
+    const adapter = createDshAdapter(surface(), options)
+    await expect(adapter.execute({
+      op: 'configure', target: { sessionId: 's1' }, args: { field: 'permission', value: 'wide' },
+    })).rejects.toThrow(/tighten-only/)
+  })
+
+  it('configure 只认出字段，v0 不支持修改 model', async () => {
+    const adapter = createDshAdapter(surface(), options)
+    await expect(adapter.execute({
+      op: 'configure', target: { sessionId: 's1' }, args: { field: 'model', value: 'opus' },
+    })).rejects.toThrow(/unsupported/)
+  })
+
   it('capabilities 声明 stream 与 tighten-only 思考强度', () => {
     const adapter = createDshAdapter(surface(), options)
     const capability = adapter.capabilities('s1')
