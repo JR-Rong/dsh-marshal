@@ -42,12 +42,14 @@ dsh plugin add dsh-marshal
 签发一台设备（token 只打印这一次，请立刻交给 node 机器）：
 
 ```bash
-npx marshal-device laptop-b
+npx --package dsh-marshal marshal-device laptop-b
 # device laptop-b added to <devices-file>
 # token (shown once): <device-token>
 ```
 
-设备表是一个 JSON 文件，CLI 首次创建时以 `0600` 写入。CLI 支持 `MARSHAL_DEVICES_FILE` 环境变量覆盖路径，但 **hub 不读这个环境变量**：一旦用了覆盖，必须同时把 hub 配置里的 `devicesFile` 指到同一个绝对路径。设备表只在 hub 启动时读取，签发新设备后要重启 hub。
+`marshal-device` 由 `dsh-marshal` 包提供：`npx --package dsh-marshal` 在本地已安装时直接用它，否则按同名包从 npm 取（不要直接 `npx marshal-device`，那是另一个包名）。
+
+设备表是一个 JSON 文件，CLI 每次写入后都会把权限收紧到 `0600`。CLI 支持 `MARSHAL_DEVICES_FILE` 环境变量覆盖路径，但 **hub 不读这个环境变量**：一旦用了覆盖，必须同时把 hub 配置里的 `devicesFile` 指到同一个绝对路径。设备表只在 hub 启动时读取，签发新设备后要重启 hub。文件存在但无法解析时 CLI 直接报错退出，不会当成空表覆盖。
 
 hub 启动后日志会打印 `marshal: hub ready at <origin>/marshal`。
 
@@ -167,7 +169,7 @@ WebSocket 上的 JSON 帧统一带 `v: 1`，四种 `type`：
 
 - `dashboardToken` 与设备 `token` 都要求至少 16 字符；`marshal-device` 生成的是 24 字节随机数的 base64url（32 字符）。
 - token 比较走 SHA-256 摘要 + `timingSafeEqual`，长度差异不落在时序上；401 不回显任何 token 片段。
-- 设备表由 CLI 首次创建时以 `0600` 写入（文件已存在时权限不变）；同一 token 指向两台设备时 hub 拒绝启动。
+- 设备表由 CLI 写入后收紧到 `0600`；同一 token 指向两台设备时 hub 拒绝启动；hub 加载时剔除缺 `id`/`name`/`token` 的条目不参与握手。
 - 控制台的每个已登记路由都要 token；页面响应带 `referrer-policy: no-referrer`、`x-content-type-options: nosniff`、`cache-control: no-store`。
 - 单帧上限 1 MiB（双向）：超过上限的入站帧由 `ws` 以 `1009` 关闭；`/marshal/api/command` 的请求体超过 1 MiB 直接 413。
 - 非 localhost 一律 `https://` + `wss://`；明文链路会把 token 交出去。

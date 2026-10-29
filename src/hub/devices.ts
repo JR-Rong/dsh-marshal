@@ -5,8 +5,17 @@ export interface DeviceEntry { readonly id: string; readonly name: string; reado
 
 export function loadDevices(path: string): DeviceEntry[] {
   try {
-    const parsed = JSON.parse(readFileSync(path, 'utf8')) as { devices?: DeviceEntry[] }
-    return parsed.devices ?? []
+    const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'))
+    const list = typeof parsed === 'object' && parsed !== null
+      ? (parsed as { devices?: unknown }).devices
+      : undefined
+    if (!Array.isArray(list)) return []
+    // 缺字段的条目会让握手阶段的 sha256(undefined) 直接抛错，加载时先剔掉。
+    return list.filter((item): item is DeviceEntry =>
+      typeof item === 'object' && item !== null
+      && typeof (item as { id?: unknown }).id === 'string'
+      && typeof (item as { name?: unknown }).name === 'string'
+      && typeof (item as { token?: unknown }).token === 'string')
   } catch { return [] }
 }
 
