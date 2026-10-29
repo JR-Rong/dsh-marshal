@@ -13,7 +13,12 @@ if (id === undefined) {
 
 let devices: DeviceEntry[] = []
 try {
-  devices = (JSON.parse(readFileSync(file, 'utf8')) as { devices?: DeviceEntry[] }).devices ?? []
+  const parsed = JSON.parse(readFileSync(file, 'utf8')) as { devices?: unknown }
+  // 文件被手工改坏（devices 不是数组）时按空表处理，避免 .some 直接抛错。
+  devices = Array.isArray(parsed.devices)
+    ? parsed.devices.filter((item): item is DeviceEntry =>
+        typeof item === 'object' && item !== null && typeof (item as { id?: unknown }).id === 'string')
+    : []
 } catch { devices = [] }
 if (devices.some(device => device.id === id)) {
   console.error(`device ${id} already exists in ${file}`)

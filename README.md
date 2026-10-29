@@ -73,7 +73,7 @@ dsh plugin add dsh-marshal
 - `token` 至少 16 字符，与 hub 设备表里那台设备的 token 完全一致。
 - `deviceName` 可选，默认取宿主环境的 `HOSTNAME`，取不到时是 `unknown`；它必须等于 `marshal-device` 签发的设备 id，否则 hello 阶段的 `device` 对不上，hub 会以 `4401 auth-failed` 关闭连接。它同时是 hello 里的设备 id，也是事件里的 `device` 字段。
 
-node 断线后按指数退避（上限 30s）重连，断线期间最多缓存 1000 帧；收到 hub 的 `4401 auth-failed` 后停止重连，需要改对 token 再重启。
+node 断线后按指数退避（上限 30s）重连，断线期间最多缓存 1000 帧；收到 hello 阶段的 `4401 auth-failed` 后停止重连，需要改对 token 再重启。升级前因设备 token 不对被断开时 hub 不会返回 `4401`，node 会继续按退避重试，日志里表现为反复握手失败。
 
 ## 打开控制台
 
@@ -83,7 +83,7 @@ node 断线后按指数退避（上限 30s）重连，断线期间最多缓存 1
 https://<hub-host>/marshal?token=<dashboard-token>
 ```
 
-token 也可以放在 `x-marshal-token` 请求头里（两者同时出现时以查询参数为准）。`/marshal` 与 `/marshal/api/*` 的每个请求都必须带 token，否则 401。
+token 也可以放在 `x-marshal-token` 请求头里（两者同时出现时以查询参数为准）。已落地的 `/marshal` 与 `/marshal/api/devices|sessions|command|stream` 每条路由都要 token，否则 401；其他路径不归本插件处理。
 
 页面做的事：
 
@@ -127,7 +127,7 @@ location /marshal {
 
 `redaction` 是正则源字符串数组（默认空），在离开 node 前对每个字符串和键名做替换，命中部分变成 `***`；非法正则启动即失败。
 
-实时思考流与工具卡片需要 `privacy: content`；`metadata` 下页面只显示「（思考 N 字，metadata 档）」「（回复 N 字，metadata 档）」和工具名/大小。
+实时思考流需要 `privacy: content`；`metadata` 下页面只显示「（思考 N 字，metadata 档）」「（回复 N 字，metadata 档）」。工具卡片两档都会出现，`metadata` 下只有工具名、参数键名与字数。
 
 提问转发默认关闭，必须显式打开：
 
@@ -136,11 +136,11 @@ location /marshal {
         answerTimeoutMs: 300000   # 正整数，默认 300000
 ```
 
-打开后 node 认领 `user-questions/request`：问题与选项发到 hub，本地弹窗**延迟**到远端作答或 `answerTimeoutMs` 到期才出现；超时或请求被 abort 时交回本地 UI。链路断开期间远端无法作答，提问也要等超时后才回到本地。发送失败则当场交回本地。
+打开后 node 认领 `user-questions/request`：问题与选项发到 hub。远端作答后请求直接结算，本地不再弹窗；无人作答时本地弹窗在 `answerTimeoutMs` 到期后出现，请求被 abort 时立即交回本地 UI。链路断开期间远端无法作答，提问同样要等到超时。只有构造或发送帧本身抛错（例如帧超限）才会当场交回本地。
 
 页面上的提问卡片：
 
-- 只能自由输入、没有选项的问题无法在页面上作答；只要有一题没有选项，整张卡片只读，显示「需要本机作答」，等超时回到源机器。
+- 只能自由输入、没有带字符串 `label` 的选项的问题无法在页面上作答；只要有一题如此，整张卡片只读，显示「需要本机作答」，等超时回到源机器。
 - 多选题必须点「提交」；全是单选时选满即自动提交。
 - 本机已经答过的卡片以本机回执为准；远端答完会显示「已由另一处回答」，超时回到本地显示「已交回源机器」。
 
@@ -148,8 +148,8 @@ location /marshal {
 
 ## 只收紧，不放宽
 
-- 远端只能把权限、思考强度等往紧的方向调；放宽必须回到源机器上做。
-- v0 的 `configure` 认得 `model`、`reasoning`、`permission`、`plan`、`goal`、`skill`、`plugin` 这些字段名，但全部返回 `unsupported`（v0 不落盘、不回读）；对 `tighten-only` 字段传放宽值会被拒绝，错误码 `tighten-only`。
+- 设计上远端只能把权限、思考强度等往紧的方向调；放宽必须回到源机器上做。
+- v0 的 `configure` 认得 `model`、`reasoning`、`permission`、`plan`、`goal`、`skill`、`plugin` 这些字段名，但只做识别与拒绝：`tighten-only` 字段传 `"wide"` 返回 `tighten-only`，其余值一律 `unsupported`；v0 不落盘、不回读任何设置。
 - v0 没有审批转发：`approvalRelay` 只被解析、没有接线，因此不存在把 `always allow` 下发到远端的路径。审批面板与设置回读属于 v1。
 
 ## 协议速览
@@ -159,24 +159,24 @@ WebSocket 上的 JSON 帧统一带 `v: 1`，四种 `type`：
 - `hello`：`device`、`token`、`agents`；必须是首帧，hub 校验后回 `ack`（`id: "hello"`）。
 - `event`：`device`、`agent`、`sessionId`、`seq`、`ts`、`kind`、`payload`；`kind` 共 14 种，完整列表见 `src/wire/frames.ts` 的 `MARSHAL_KINDS`。
 - `command`：`id`、`idempotencyKey`、`deadline`、`op`、`target{device,agent,sessionId}`、可选 `args`；`op` 为 `prompt` / `resume` / `create` / `interrupt` / `answer` / `cancel` / `configure`，v0 实际支持 `prompt` / `resume` / `interrupt` / `answer`，`create` 与 `cancel` 回 `unsupported`，`configure` 只做字段识别与拒绝放宽。
-- `ack`：`id`、`ok`，成功带 `result`，失败带 `code` 与 `message`。
+- `ack`：`id`、`ok`；成功时可能带 `result`（hello 的 ack 只有 `ok`），失败带 `code` 与 `message`。
 
-单帧上限 1 MiB（双向）；指令的结果超过上限时只回固定的小体积 `result-too-large`。hub 对非法帧与缺 hello 的连接用 `4400` 关闭，对 hello 里 token 不匹配用 `4401 auth-failed` 关闭。
+单帧上限 1 MiB（双向）；指令的结果超过上限时只回固定的小体积 `result-too-large`。hub 对能解析但违反协议的帧用 `4400` 关闭；超过 1 MiB 的入站帧由 `ws` 以 `1009` 关闭；hello 里 token 不匹配用 `4401 auth-failed` 关闭；握手后 10 秒内没收到合法 hello 会被直接断开（客户端看到 `1006`）。
 
 ## 安全说明
 
 - `dashboardToken` 与设备 `token` 都要求至少 16 字符；`marshal-device` 生成的是 24 字节随机数的 base64url（32 字符）。
 - token 比较走 SHA-256 摘要 + `timingSafeEqual`，长度差异不落在时序上；401 不回显任何 token 片段。
-- 设备表由 CLI 以 `0600` 写入；同一 token 指向两台设备时 hub 拒绝启动。
-- 控制台的每个路由都要 token；页面响应带 `referrer-policy: no-referrer`、`x-content-type-options: nosniff`、`cache-control: no-store`。
-- 单帧上限 1 MiB（双向），超限的帧被拒并以 `4400` 关闭连接；`/marshal/api/command` 的请求体超过 1 MiB 直接 413。
+- 设备表由 CLI 首次创建时以 `0600` 写入（文件已存在时权限不变）；同一 token 指向两台设备时 hub 拒绝启动。
+- 控制台的每个已登记路由都要 token；页面响应带 `referrer-policy: no-referrer`、`x-content-type-options: nosniff`、`cache-control: no-store`。
+- 单帧上限 1 MiB（双向）：超过上限的入站帧由 `ws` 以 `1009` 关闭；`/marshal/api/command` 的请求体超过 1 MiB 直接 413。
 - 非 localhost 一律 `https://` + `wss://`；明文链路会把 token 交出去。
 
 ## 排查顺序
 
 1. 先看日志里的 `marshal:` 前缀：`marshal: hub ready at …`、`marshal: link error: …`、`marshal: hub/node config is missing …`、`marshal: follow … dropped event` 分别指向装配、链路、配置与单条事件超限。
 2. 打开 `https://<hub-host>/marshal/api/devices?token=<dashboard-token>`：返回里应有该设备。返回 401 是 dashboard token 不对；列表为空说明 node 还没完成握手（这里只列已连接设备，不会列出设备表里的离线项）。
-3. 看 node 到 `wss://<hub-host>/marshal/uplink` 的握手：hub 对错误或缺失的设备 token 会在升级前直接断开（浏览器看不到 101，客户端报连接被重置），经代理时则常表现为 401——都是 token 问题。hello 里的 token 不匹配会收到 `4401 auth-failed`，node 随即停止重连。
+3. 看 node 到 `wss://<hub-host>/marshal/uplink` 的握手：hub 对错误或缺失的设备 token 会在升级前直接断开，客户端表现为连接重置，经代理时常是 502/连接被重置——这不是 dashboard 的 401，而是设备 token 问题。hello 里的 token 不匹配会收到 `4401 auth-failed`，node 随即停止重连。
 4. 检查反代有没有吞掉 `Upgrade`/`Connection`：握手挂起、400/426，或 SSE 一直不推数据，通常就是升级头被剥掉或响应被缓冲。
 
 ## 状态
