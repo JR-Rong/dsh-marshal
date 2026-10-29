@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { createDshAdapter } from '../src/adapters/dsh/adapter.ts'
-import type { AskUserQuestionAnswerLike, AskUserQuestionRequestLike, MarshalContext } from '../src/dsh-types.ts'
+import type { AskUserQuestionAnswerLike, AskUserQuestionRequestLike, MarshalContext, UserQuestionLike } from '../src/dsh-types.ts'
 import { createQuestionRelay, parseAnswers, type QuestionRelay } from '../src/node/questions.ts'
 import { createFollower, runCommand } from '../src/node/runner.ts'
 import type { NodeLink } from '../src/node/link.ts'
@@ -10,33 +10,43 @@ const questions = [{ id: 'q1', question: '选哪个？', options: [{ label: 'A' 
 
 type Handler = (request: AskUserQuestionRequestLike, next: () => Promise<AskUserQuestionAnswerLike>) => Promise<AskUserQuestionAnswerLike>
 
-function harness(timeoutMs = 50) {
+interface HarnessOptions {
+  readonly questions?: readonly UserQuestionLike[]
+  readonly send?: (event: EventFrame) => void
+  readonly next?: () => Promise<AskUserQuestionAnswerLike>
+}
+
+function harness(timeoutMs = 50, options: HarnessOptions = {}) {
   const sent: EventFrame[] = []
   let handler: Handler | undefined
   const ctx: Pick<MarshalContext, 'on'> = {
     on(_event, fn) {
       handler = fn
-      return () => { handler = undefined }
+      // 故意不在这里清空 handler：dispose 之后仍要能调用捕获的 handler。
+      return () => {}
     },
   }
   let seq = 0
   const relay = createQuestionRelay({
     ctx,
     timeoutMs,
-    send: event => sent.push(event),
+    send: options.send ?? (event => sent.push(event)),
     frame: (sessionId, kind, payload): EventFrame => ({
       v: 1, type: 'event', device: 'mac', agent: 'dsh', sessionId, seq: ++seq, ts: 't', kind, payload,
     }),
   })
+  const request = (signal?: AbortSignal): AskUserQuestionRequestLike => ({
+    questions: options.questions ?? questions,
+    agent: { session: { id: 's1' } },
+    ...(signal === undefined ? {} : { signal }),
+  })
+  const next = options.next ?? (() => Promise.reject(new Error('fell through to local')))
   const ask = (signal?: AbortSignal): Promise<AskUserQuestionAnswerLike> => {
     const fn = handler
     if (fn === undefined) throw new Error('relay did not subscribe')
-    return fn(
-      { questions, agent: { session: { id: 's1' } }, ...(signal === undefined ? {} : { signal }) },
-      () => Promise.reject(new Error('fell through to local')),
-    )
+    return fn(request(signal), next)
   }
-  return { relay, sent, ask }
+  return { relay, sent, ask, request, captured: () => handler }
 }
 
 /** input.requested 由 handler 同步发出，ask() 返回时第一帧已经在 sent 里。 */
@@ -115,6 +125,86 @@ describe('question relay', () => {
     expect(h.relay.settle('s1', requestId, { answers: [{ id: 'q1', selected: ['A'] }] })).toBe('unknown')
   })
 
+  it('选中不在 options 里的标签返回 invalid 且仍可继续作答', async () => {
+    const h = harness()
+    const pending = h.ask()
+    const requestId = requestIdOf(h.sent[0])
+    expect(h.relay.settle('s1', requestId, { answers: [{ id: 'q1', selected: ['Z'] }] })).toBe('invalid')
+    expect(h.relay.settle('s1', requestId, { answers: [{ id: 'q1', selected: ['A'] }] })).toBe('ok')
+    await expect(pending).resolves.toEqual({ answers: [{ id: 'q1', selected: ['A'] }] })
+  })
+
+  it('多题请求缺一题返回 invalid，补齐后才结算', async () => {
+    const twoQuestions = [
+      { id: 'q1', question: '第一个', options: [{ label: 'A' }, { label: 'B' }] },
+      { id: 'q2', question: '第二个', options: [{ label: 'C' }, { label: 'D' }] },
+    ]
+    const h = harness(50, { questions: twoQuestions })
+    const pending = h.ask()
+    const requestId = requestIdOf(h.sent[0])
+    expect(h.relay.settle('s1', requestId, { answers: [{ id: 'q1', selected: ['A'] }] })).toBe('invalid')
+    const full = { answers: [{ id: 'q1', selected: ['A'] }, { id: 'q2', selected: ['C'] }] }
+    expect(h.relay.settle('s1', requestId, full)).toBe('ok')
+    await expect(pending).resolves.toEqual(full)
+  })
+
+  it('multiSelect 题接受多个标签', async () => {
+    const h = harness(50, {
+      questions: [{ id: 'q1', question: '选多个', options: [{ label: 'A' }, { label: 'B' }], multiSelect: true }],
+    })
+    const pending = h.ask()
+    const requestId = requestIdOf(h.sent[0])
+    const answers = { answers: [{ id: 'q1', selected: ['A', 'B'] }] }
+    expect(h.relay.settle('s1', requestId, answers)).toBe('ok')
+    await expect(pending).resolves.toEqual(answers)
+  })
+
+  it('非 multiSelect 题拒绝多个标签', async () => {
+    const h = harness()
+    const pending = h.ask()
+    const requestId = requestIdOf(h.sent[0])
+    expect(h.relay.settle('s1', requestId, { answers: [{ id: 'q1', selected: ['A', 'B'] }] })).toBe('invalid')
+    expect(h.relay.settle('s1', requestId, { answers: [{ id: 'q1', selected: ['A'] }] })).toBe('ok')
+    await pending
+  })
+
+  it('重复问题 id 直接交回本地且不发 input.requested', async () => {
+    const h = harness(10_000, {
+      questions: [
+        { id: 'q1', question: '第一次', options: [{ label: 'A' }] },
+        { id: 'q1', question: '第二次', options: [{ label: 'B' }] },
+      ],
+      next: async () => ({ answers: [] }),
+    })
+    await expect(h.ask()).resolves.toEqual({ answers: [] })
+    expect(h.sent).toEqual([])
+  })
+
+  it('发送抛错时经 next 交回本地并清空 pending', async () => {
+    const h = harness(10_000, {
+      send: event => {
+        // 先记下事件再抛错，测试才能拿到 requestId 验证 pending 已删除。
+        h.sent.push(event)
+        throw new Error('send failed')
+      },
+      next: async () => ({ answers: [] }),
+    })
+    await expect(h.ask()).resolves.toEqual({ answers: [] })
+    expect(h.sent.map(event => event.kind)).toEqual(['input.requested'])
+    const requestId = requestIdOf(h.sent[0])
+    expect(h.relay.settle('s1', requestId, { answers: [{ id: 'q1', selected: ['A'] }] })).toBe('unknown')
+  })
+
+  it('dispose 之后调用捕获的 handler 不再创建 pending', async () => {
+    const h = harness(10_000, { next: async () => ({ answers: [] }) })
+    const fn = h.captured()
+    if (fn === undefined) throw new Error('relay did not subscribe')
+    h.relay.dispose()
+    await expect(fn(h.request(), async () => ({ answers: [] }))).resolves.toEqual({ answers: [] })
+    expect(h.sent).toEqual([])
+    expect(h.relay.settle('s1', 'q-any', { answers: [{ id: 'q1', selected: ['A'] }] })).toBe('unknown')
+  })
+
   it('parseAnswers 要求每个问题恰好一次', () => {
     expect(parseAnswers({ answers: [{ id: 'q1', selected: ['A'] }] }, ['q1'])).toEqual({
       answers: [{ id: 'q1', selected: ['A'] }],
@@ -177,12 +267,13 @@ describe('question relay end to end', () => {
     const follower = createFollower({ adapter, send: () => {}, logger: { warn() {} } })
     const flush = (): Promise<void> => new Promise(resolve => setTimeout(resolve, 1))
 
-    runCommand(link, adapter, follower, command('c1', { answers: [{ id: 'q1', selected: ['A'] }] }), 'mac')
+    // 线上 args.answers 是数组（设计 §7.2），适配器负责包成 DSH 的 `{ answers }`。
+    runCommand(link, adapter, follower, command('c1', [{ id: 'q1', selected: ['A'] }]), 'mac')
     await expect(pending).resolves.toEqual({ answers: [{ id: 'q1', selected: ['A'] }] })
     await flush()
     expect(received[0]).toMatchObject({ type: 'ack', id: 'c1', ok: true, result: { accepted: true } })
 
-    runCommand(link, adapter, follower, command('c2', { answers: [{ id: 'q1', selected: ['B'] }] }), 'mac')
+    runCommand(link, adapter, follower, command('c2', [{ id: 'q1', selected: ['B'] }]), 'mac')
     await flush()
     expect(received[1]).toMatchObject({ type: 'ack', id: 'c2', ok: false, code: 'unknown' })
     relay.dispose()

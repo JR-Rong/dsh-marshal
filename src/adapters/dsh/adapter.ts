@@ -76,7 +76,12 @@ export function createDshAdapter(surface: DshSurface, options: DshAdapterOptions
           if (payload.requestId === undefined || payload.answers === undefined) {
             throw new Error('invalid-args: requestId and answers are required')
           }
-          const result = options.answers?.settle(command.target.sessionId, payload.requestId, payload.answers) ?? 'unknown'
+          // 线上 `answers` 是数组（设计 §7.2）；DSH 侧要的是 `{ answers }`，在这里包一层。
+          const result = options.answers?.settle(
+            command.target.sessionId,
+            payload.requestId,
+            { answers: payload.answers },
+          ) ?? 'unknown'
           if (result !== 'ok') throw new Error(`${result}: ${payload.requestId}`)
           return { accepted: true }
         }

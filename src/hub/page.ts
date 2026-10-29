@@ -166,6 +166,9 @@ stream.onmessage = (message) => {
     node.className = 'tool';
     node.textContent = (payload.isError ? '✗ ' : '✓ ') + (payload.redacted ? payload.chars + ' 字' : String(payload.content).slice(0, 400));
   } else if (event.kind === 'input.requested') {
+    if (typeof payload.requestId !== 'string') return;
+    // 卡片创建时锁定目标：之后切换会话也不能把答案发到别的 session。
+    const target = { device: event.device, agent: event.agent, sessionId: event.sessionId };
     node.className = 'ask';
     node.dataset.requestId = payload.requestId;
     const questions = Array.isArray(payload.questions) ? payload.questions.filter(q => q !== null && typeof q === 'object') : [];
@@ -177,63 +180,104 @@ stream.onmessage = (message) => {
     const total = ids.length;
     // 只能自由输入、没有选项的问题在页面上答不了：整张卡片只读，等请求超时交回本地 UI。
     const customOnly = questions.some(q => !Array.isArray(q.options) || q.options.length === 0);
-    // 一张卡片先收集所有问题的选择，全部选好才发一次 answer（每个 id 恰好一条）。
-    const selections = new Map();
+    // 有任一多选问题时用显式“提交”；全为单选时选满即自动提交（保持原有体验）。
+    const hasMulti = questions.some(q => q.multiSelect === true);
+    const selections = new Map(); // id -> Set<label>
     const allButtons = [];
+    let submit = null;
+    let busy = false;
+
+    const complete = () => ids.every(id => {
+      const picked = selections.get(id);
+      return picked !== undefined && picked.size > 0;
+    });
+    const syncSubmit = () => {
+      if (submit !== null) submit.disabled = busy || customOnly || !complete();
+    };
+    const sendAnswers = async () => {
+      // 一次只允许一条 answer 在途；请求期间卡片上的按钮全部禁用。
+      if (busy || customOnly || !complete()) return;
+      busy = true;
+      // 快照选择：请求体与回执都用这份快照，不读可能被并发改动的 Map。
+      const answers = ids.map(id => ({ id, selected: [...(selections.get(id) || [])] }));
+      for (const button of allButtons) button.disabled = true;
+      if (submit !== null) submit.disabled = true;
+      const ok = await command('answer', { requestId: payload.requestId, answers }, target);
+      if (!ok) {
+        // 失败时清空选择、恢复按钮，卡片留着让用户重试；错误已由 command 写进 #status。
+        busy = false;
+        selections.clear();
+        for (const button of allButtons) {
+          button.classList.remove('picked');
+          button.setAttribute('aria-pressed', 'false');
+          button.disabled = customOnly;
+        }
+        syncSubmit();
+        return;
+      }
+      node.textContent = '已由本机回答：' + answers.map(answer => answer.selected.join('+')).join(' / ');
+      node.dataset.resolved = 'local';
+    };
+
     if (total > 0) {
       for (const question of questions) {
         const heading = document.createElement('div');
         heading.textContent = question.question;
         node.append(heading);
-        if (!Array.isArray(question.options) || question.options.length === 0) {
+        const options = Array.isArray(question.options)
+          ? question.options.filter(option => typeof option?.label === 'string')
+          : [];
+        if (options.length === 0) {
           const note = document.createElement('div');
           note.className = 'reason';
           note.textContent = '需要本机作答';
           node.append(note);
           continue;
         }
-        // 同一问题下的选项互斥，只保留最后一次点击。
+        const multi = question.multiSelect === true;
         const group = [];
-        for (const option of question.options) {
+        for (const option of options) {
+          const label = option.label;
           const button = document.createElement('button');
           button.type = 'button';
-          button.textContent = option.label;
+          button.textContent = label;
+          button.dataset.label = label;
           button.setAttribute('aria-pressed', 'false');
           if (customOnly) button.disabled = true;
           group.push(button);
           allButtons.push(button);
-          button.onclick = async () => {
-            if (typeof question.id !== 'string') return;
-            selections.set(question.id, option.label);
+          button.onclick = () => {
+            if (typeof question.id !== 'string' || busy) return;
+            // 多选切换单个标签，单选用新集合替换旧选择。
+            const picked = new Set(multi ? (selections.get(question.id) || []) : []);
+            if (multi && picked.has(label)) picked.delete(label);
+            else picked.add(label);
+            if (picked.size > 0) selections.set(question.id, picked);
+            else selections.delete(question.id);
             for (const other of group) {
-              const picked = other === button;
-              other.classList.toggle('picked', picked);
-              other.setAttribute('aria-pressed', picked ? 'true' : 'false');
+              const active = picked.has(other.dataset.label);
+              other.classList.toggle('picked', active);
+              other.setAttribute('aria-pressed', active ? 'true' : 'false');
             }
-            if (selections.size !== total) return;
-            const ok = await command('answer', {
-              requestId: payload.requestId,
-              answers: ids.map(id => ({ id, selected: [selections.get(id)] })),
-            });
-            // 失败时清空选择、取消标记，卡片留着让用户重试；错误已由 command 写进 #status。
-            if (!ok) {
-              selections.clear();
-              for (const item of allButtons) {
-                item.classList.remove('picked');
-                item.setAttribute('aria-pressed', 'false');
-              }
-              return;
-            }
-            for (const item of allButtons) item.disabled = true;
-            node.textContent = '已由本机回答：' + ids.map(id => selections.get(id)).join(' / ');
-            node.dataset.resolved = 'local';
+            syncSubmit();
+            if (!hasMulti && complete()) void sendAnswers();
           };
           node.append(button);
         }
       }
+      if (hasMulti) {
+        submit = document.createElement('button');
+        submit.type = 'button';
+        submit.textContent = '提交';
+        if (customOnly) submit.disabled = true;
+        submit.onclick = () => { void sendAnswers(); };
+        node.append(submit);
+        syncSubmit();
+      }
     }
   } else if (event.kind === 'input.resolved') {
-    const card = [...log.children].find(el => el.dataset.requestId === payload.requestId);
+    if (typeof payload.requestId !== 'string') return;
+    const card = [...log.querySelectorAll('.ask')].find(el => el.dataset.requestId === payload.requestId);
     // 本机已经答过就以本机回执为准，不被从 hub 绕回来的 "另一处" 覆盖。
     if (card && card.dataset.resolved !== 'local') {
       card.textContent = payload.outcome === 'remote' ? '已由另一处回答' : '已交回源机器';

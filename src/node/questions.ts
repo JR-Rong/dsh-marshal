@@ -1,11 +1,13 @@
 import { randomUUID } from 'node:crypto'
 import type { SettleResult } from '../adapters/types.ts'
-import type { AskUserQuestionAnswerLike, MarshalContext } from '../dsh-types.ts'
+import type { AskUserQuestionAnswerLike, MarshalContext, UserQuestionLike } from '../dsh-types.ts'
 import type { EventFrame } from '../wire/frames.ts'
 
 interface Pending {
   readonly sessionId: string
   readonly questionIds: readonly string[]
+  /** 原问题带着 options / multiSelect：结算时按它们校验标签与数量。 */
+  readonly questions: readonly UserQuestionLike[]
   /** 每个 pending 只允许结算一次；答案、超时、abort、dispose 共用它。 */
   settled: boolean
   /** outcome 为 undefined 时只结束等待，不再发 `input.resolved`（发送失败或 dispose）。 */
@@ -44,6 +46,35 @@ export function parseAnswers(value: unknown, questionIds: readonly string[]): As
 }
 
 /**
+ * 在形状正确之后再对齐题目：标签必须来自 options，数量必须符合单选/多选规则。
+ * 自定义输入（`custom`）不受数量限制，但已选标签仍要在 options 里。
+ */
+function validateAnswers(
+  answers: AskUserQuestionAnswerLike['answers'],
+  questions: readonly UserQuestionLike[],
+): boolean {
+  for (const answer of answers) {
+    const question = questions.find(item => item.id === answer.id)
+    if (question === undefined) return false
+    if (Array.isArray(question.options) && question.options.length > 0) {
+      const labels = new Set(
+        question.options
+          .map(option => option?.label)
+          .filter((label): label is string => typeof label === 'string'),
+      )
+      if (!answer.selected.every(label => labels.has(label))) return false
+    }
+    if (answer.custom !== undefined) continue
+    if (question.multiSelect === true) {
+      if (answer.selected.length < 1) return false
+    } else if (answer.selected.length !== 1) {
+      return false
+    }
+  }
+  return true
+}
+
+/**
  * 认领 `user-questions/request`：发给远端等答案，超时或无人回答就 `next()` 交回本地 UI。
  * 与 `packages/sdk/server/src/user-questions.ts` 同一写法。
  */
@@ -52,9 +83,9 @@ export function createQuestionRelay(options: QuestionRelayOptions): QuestionRela
   let disposed = false
 
   /** 帧超过 1 MiB 时 send 会抛错；提问链路上的发送绝不能把异常带出 waterfall。 */
-  const emit = (event: EventFrame): boolean => {
+  const emit = (sessionId: string, kind: EventFrame['kind'], payload: unknown): boolean => {
     try {
-      options.send(event)
+      options.send(options.frame(sessionId, kind, payload))
       return true
     } catch {
       return false
@@ -62,12 +93,17 @@ export function createQuestionRelay(options: QuestionRelayOptions): QuestionRela
   }
 
   const unsubscribe = options.ctx.on('user-questions/request', async (request, next) => {
+    // 已卸载的 relay 不能再认领请求，否则会留下永远不会结算的 pending。
+    if (disposed) return next()
     const sessionId = request.agent?.session.id
     if (sessionId === undefined) return next()
     if (request.signal?.aborted === true) return next()
 
+    const questions = request.questions
+    const questionIds = questions.map(question => question.id)
+    // 空请求或重复 id 无法满足“每个 id 恰好一次”，直接交回本地。
+    if (questionIds.length === 0 || new Set(questionIds).size !== questionIds.length) return next()
     const requestId = `q-${randomUUID()}`
-    const questionIds = request.questions.map(question => question.id)
     const signal = request.signal
 
     const answered = await new Promise<AskUserQuestionAnswerLike | undefined>(resolve => {
@@ -77,6 +113,7 @@ export function createQuestionRelay(options: QuestionRelayOptions): QuestionRela
       const entry: Pending = {
         sessionId,
         questionIds,
+        questions,
         settled: false,
         finish(answer, outcome) {
           if (entry.settled) return
@@ -84,7 +121,7 @@ export function createQuestionRelay(options: QuestionRelayOptions): QuestionRela
           if (timer !== undefined) clearTimeout(timer)
           if (signal !== undefined && onAbort !== undefined) signal.removeEventListener('abort', onAbort)
           pending.delete(requestId)
-          if (outcome !== undefined) emit(options.frame(sessionId, 'input.resolved', { requestId, outcome }))
+          if (outcome !== undefined) emit(sessionId, 'input.resolved', { requestId, outcome })
           resolve(answer)
         },
       }
@@ -99,7 +136,7 @@ export function createQuestionRelay(options: QuestionRelayOptions): QuestionRela
       }
 
       // 发不出去就按超时收拾：清掉 pending 与监听，且不再尝试发 input.resolved。
-      if (!emit(options.frame(sessionId, 'input.requested', { requestId, questions: request.questions }))) {
+      if (!emit(sessionId, 'input.requested', { requestId, questions })) {
         entry.finish(undefined)
       }
     })
@@ -114,6 +151,7 @@ export function createQuestionRelay(options: QuestionRelayOptions): QuestionRela
       if (entry.sessionId !== sessionId) return 'session-mismatch'
       const parsed = parseAnswers(answers, entry.questionIds)
       if (parsed === undefined) return 'invalid'
+      if (!validateAnswers(parsed.answers, entry.questions)) return 'invalid'
       // 链路正在关闭时 resolved 发不出去也无妨：本地已经拿到答案。
       entry.finish(parsed, 'remote')
       return 'ok'

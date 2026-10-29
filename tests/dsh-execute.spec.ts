@@ -38,12 +38,12 @@ describe('dsh adapter', () => {
     expect(s.cancel).toHaveBeenCalledWith('s1')
   })
 
-  it('answer 采纳 sink 返回 ok 的答案', async () => {
+  it('answer 采纳 sink 返回 ok 的答案，并把线上数组包成 { answers }', async () => {
     const settle = vi.fn(() => 'ok' as const)
     const adapter = createDshAdapter(surface(), { device: 'mac', answers: { settle } })
     await expect(adapter.execute({
       op: 'answer', target: { sessionId: 's1' },
-      args: { requestId: 'q1', answers: { answers: [{ id: 'q1', selected: ['A'] }] } },
+      args: { requestId: 'q1', answers: [{ id: 'q1', selected: ['A'] }] },
     })).resolves.toEqual({ accepted: true })
     expect(settle).toHaveBeenCalledWith('s1', 'q1', { answers: [{ id: 'q1', selected: ['A'] }] })
   })
@@ -51,7 +51,7 @@ describe('dsh adapter', () => {
   it('answer 未命中已知请求时抛 unknown', async () => {
     const adapter = createDshAdapter(surface(), { device: 'mac', answers: { settle: () => 'unknown' } })
     await expect(adapter.execute({
-      op: 'answer', target: { sessionId: 's1' }, args: { requestId: 'q1', answers: { answers: [] } },
+      op: 'answer', target: { sessionId: 's1' }, args: { requestId: 'q1', answers: [] },
     })).rejects.toThrow(/unknown:/)
   })
 
