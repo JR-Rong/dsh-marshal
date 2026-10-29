@@ -1,4 +1,6 @@
-# 必填：role 为 hub 或 node。node 另需 hubUrl 与 token；hub 另需 dashboardToken。
-# 缺项时插件启动即失败并列出缺失的键名，不提供任何默认端点。
-- name: dsh-marshal
-  config: {}
+# role 为 hub 或 node；node 另需 hubUrl 与 token；hub 另需 dashboardToken。
+# 缺项时插件启动即失败并列出缺失的键名，不提供任何默认端点（校验在 Task 2 落地）。
+- insert:
+    - id: dsh-marshal
+      name: dsh-marshal
+      config: {}
