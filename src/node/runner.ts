@@ -17,10 +17,20 @@ export function createFollower(options: {
       active.set(sessionId, abort)
       void (async () => {
         try {
-          for await (const event of options.adapter.follow(sessionId, abort.signal)) options.send(event)
+          for await (const event of options.adapter.follow(sessionId, abort.signal)) {
+            // 单条事件超限只丢这一条；否则一次过大的 send 会终止整个跟随循环。
+            try {
+              options.send(event)
+            } catch (error) {
+              options.logger.warn('marshal: follow ' + sessionId + ' dropped event: ' + String(error))
+            }
+          }
         } catch (error) {
           if (!abort.signal.aborted) options.logger.warn('marshal: follow ' + sessionId + ' ended: ' + String(error))
-        } finally { active.delete(sessionId) }
+        } finally {
+          // 只清掉本循环自己登记的条目，避免把重启后的新循环踢出 map。
+          if (active.get(sessionId) === abort) active.delete(sessionId)
+        }
       })()
       return true
     },
@@ -31,10 +41,16 @@ export function createFollower(options: {
   }
 }
 
+/** 只允许 spec 定义的 wire 错误码过线；其余（`marshal: …`、`Error: …`）一律归为 adapter-crashed。 */
+const WIRE_CODES: ReadonlySet<string> = new Set([
+  'session-unknown', 'invalid-args', 'unsupported', 'device-mismatch', 'adapter-crashed', 'result-too-large',
+])
+
 /** 错误前缀即 wire 错误码：`session-unknown: ...` → `session-unknown`。 */
 function codeOf(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error)
-  return /^([a-z][a-z-]*):/.exec(message)?.[1] ?? 'adapter-crashed'
+  const code = /^([a-z][a-z-]*):/.exec(message)?.[1]
+  return code !== undefined && WIRE_CODES.has(code) ? code : 'adapter-crashed'
 }
 
 export function runCommand(
@@ -45,8 +61,14 @@ export function runCommand(
   device: string,
 ): void {
   if (frame.type !== 'command') return
+  // ack 绝不能再抛：未处理的拒绝会直接打挂 DSH 宿主进程。
   const reply = (body: { ok: boolean; result?: unknown; code?: string; message?: string }): void => {
-    link.sendRaw(encodeFrame({ v: 1, type: 'ack', id: frame.id, ...body }))
+    try {
+      link.sendRaw(encodeFrame({ v: 1, type: 'ack', id: frame.id, ...body }))
+    } catch {
+      // 结果或消息超过帧上限时，只回固定的小体积错误帧。
+      link.sendRaw(encodeFrame({ v: 1, type: 'ack', id: frame.id, ok: false, code: 'result-too-large', message: 'marshal: result too large' }))
+    }
   }
   if (frame.target.device !== device) { reply({ ok: false, code: 'device-mismatch' }); return }
   if (frame.target.agent !== adapter.agent) {

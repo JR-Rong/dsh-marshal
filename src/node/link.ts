@@ -86,6 +86,8 @@ export class NodeLink {
   dispose(): void { this.close() }
 
   sendRaw(text: string): void {
+    // 关掉之后没有消费者了；再排队只会把快照/尾巴事件永久攒在内存里。
+    if (this.closed) return
     // 握手完成且没有更早的积压帧时才直发，否则排队，避免越过队首。
     if (this.acked && this.queue.length === 0 && this.socket !== undefined && this.trySend(this.socket, text)) return
     this.enqueue(text)

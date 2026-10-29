@@ -7,7 +7,7 @@ export interface TestWeb {
   listen(): Promise<number>
 }
 
-/** 把 route 注册接到真 http.Server；升级路由不在本替身范围内。 */
+/** 把 route 注册接到真 http.Server；普通路由与升级路由都直接落到同一个 server 上。 */
 export function createTestWeb(): TestWeb {
   const routes = new Map<string, (req: IncomingMessage, res: ServerResponse) => void | Promise<void>>()
   const server = createServer((req, res) => {
@@ -20,8 +20,9 @@ export function createTestWeb(): TestWeb {
       routes.set(route.path, route.handler)
       return () => { routes.delete(route.path) }
     },
-    registerUpgrade() {
-      throw new Error('createTestWeb does not serve upgrades')
+    registerUpgrade(route) {
+      server.on('upgrade', route.handler)
+      return () => { server.off('upgrade', route.handler) }
     },
     getOrigin() { return 'http://127.0.0.1' },
   }

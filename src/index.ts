@@ -71,11 +71,15 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
     logger: ctx.logger,
   })
 
-  ctx.effect(() => { follower.stopAll(); link.close() }, 'marshal: node link')
+  // 快照在 effect 之外也持有同一个 signal：卸载时必须先取消，避免它在 close 之后继续产事件。
+  const snapshotAbort = new AbortController()
+  ctx.effect(() => { snapshotAbort.abort(); follower.stopAll(); link.close() }, 'marshal: node link')
   link.start()
 
   void (async () => {
-    const abort = new AbortController()
-    for (const event of await adapter.snapshot(abort.signal)) link.sendEvent(pipeline(event))
-  })().catch((error: unknown) => ctx.logger.warn('marshal: snapshot failed: ' + String(error)))
+    for (const event of await adapter.snapshot(snapshotAbort.signal)) link.sendEvent(pipeline(event))
+  })().catch((error: unknown) => {
+    // 主动取消导致的失败不是故障，不写日志。
+    if (!snapshotAbort.signal.aborted) ctx.logger.warn('marshal: snapshot failed: ' + String(error))
+  })
 }
