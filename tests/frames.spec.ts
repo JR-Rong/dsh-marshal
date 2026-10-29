@@ -30,4 +30,22 @@ describe('frames', () => {
   it('拒绝非 JSON', () => {
     expect(() => decodeFrame('not json')).toThrow(FrameError)
   })
+
+  it('拒绝错误的协议版本', () => {
+    const bad = JSON.stringify({ ...event, v: 2 })
+    expect(() => decodeFrame(bad)).toThrow(FrameError)
+    expect(() => decodeFrame(bad)).toThrow(/v/)
+  })
+
+  it('拒绝未知 type', () => {
+    const bad = JSON.stringify({ ...event, type: 'bogus' })
+    expect(() => decodeFrame(bad)).toThrow(FrameError)
+    expect(() => decodeFrame(bad)).toThrow(/bogus/)
+  })
+
+  it('拒绝超过上限的出站帧', () => {
+    const huge = { ...event, payload: { blob: 'x'.repeat(MAX_FRAME_BYTES) } }
+    expect(() => encodeFrame(huge)).toThrow(FrameError)
+    expect(() => encodeFrame(huge)).toThrow(new RegExp(String(MAX_FRAME_BYTES)))
+  })
 })

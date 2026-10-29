@@ -2,7 +2,16 @@ import { z } from 'zod'
 
 export const MAX_FRAME_BYTES = 1_048_576
 
-export class FrameError extends Error {}
+export class FrameError extends Error {
+  override readonly name = 'FrameError'
+  /** 尽力提取的原始帧 type，解码失败时可能缺失。 */
+  readonly frameType: string | undefined
+
+  constructor(message: string, frameType?: string) {
+    super(message)
+    this.frameType = frameType
+  }
+}
 
 export const MARSHAL_KINDS = [
   'session.updated', 'session.removed', 'turn.started', 'turn.completed',
@@ -54,15 +63,41 @@ export type CommandFrame = z.infer<typeof Command>
 export type HelloFrame = z.infer<typeof Hello>
 export type AckFrame = z.infer<typeof Ack>
 
+function formatPath(path: readonly PropertyKey[]): string {
+  if (path.length === 0) return '(root)'
+  return path.map((segment) => String(segment)).join('.')
+}
+
+function extractFrameType(json: unknown): string | undefined {
+  if (typeof json !== 'object' || json === null) return undefined
+  const type: unknown = (json as { type?: unknown }).type
+  return typeof type === 'string' ? type : undefined
+}
+
+function tooLarge(bytes: number): FrameError {
+  return new FrameError(`marshal: frame too large: ${bytes} bytes exceeds limit of ${MAX_FRAME_BYTES} bytes`)
+}
+
 export function encodeFrame(frame: Frame): string {
-  return JSON.stringify(frame)
+  const text = JSON.stringify(frame)
+  const bytes = Buffer.byteLength(text, 'utf8')
+  if (bytes > MAX_FRAME_BYTES) throw tooLarge(bytes)
+  return text
 }
 
 export function decodeFrame(text: string): Frame {
-  if (Buffer.byteLength(text, 'utf8') > MAX_FRAME_BYTES) throw new FrameError('marshal: frame too large')
+  const bytes = Buffer.byteLength(text, 'utf8')
+  if (bytes > MAX_FRAME_BYTES) throw tooLarge(bytes)
   let json: unknown
   try { json = JSON.parse(text) } catch { throw new FrameError('marshal: frame is not JSON') }
   const parsed = FrameSchema.safeParse(json)
-  if (!parsed.success) throw new FrameError(`marshal: invalid frame: ${parsed.error.issues[0]?.path.join('.') ?? '?'} ${parsed.error.issues[0]?.message ?? ''}`.trim())
+  if (!parsed.success) {
+    const frameType = extractFrameType(json)
+    const issue = parsed.error.issues[0]
+    const where = issue ? formatPath(issue.path) : '(root)'
+    const detail = issue?.message ?? 'invalid frame'
+    const label = frameType === undefined ? '' : ` type=${frameType}`
+    throw new FrameError(`marshal: invalid frame${label} at ${where}: ${detail}`, frameType)
+  }
   return parsed.data
 }
