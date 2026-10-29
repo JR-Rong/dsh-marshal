@@ -85,6 +85,11 @@ async function refresh() {
 }
 
 async function loadSessions(device, agent) {
+  // 换设备/agent 后旧选中不再属于当前列表，先作废，避免指令发到上一个会话。
+  if (current !== null && (current.device !== device || current.agent !== agent)) {
+    current = null;
+    status.textContent = '';
+  }
   let data = null;
   try {
     const response = await fetch(api('/marshal/api/sessions?device=' + encodeURIComponent(device)));
@@ -92,7 +97,10 @@ async function loadSessions(device, agent) {
   } catch { /* 网络错误按加载失败处理 */ }
   if (data === null || !Array.isArray(data.sessions)) { log.textContent = '加载失败'; return; }
   log.textContent = '';
-  for (const session of data.sessions.filter(s => s && s.agent === agent)) {
+  for (const session of data.sessions) {
+    // 没 sessionId 的行直接丢掉，否则后面的 slice 会抛错并毁掉整张列表。
+    if (!session || typeof session.sessionId !== 'string') continue;
+    if (session.agent !== agent) continue;
     const row = document.createElement('div');
     row.className = 'row';
     row.append(dot(session.running), document.createTextNode(session.sessionId.slice(0, 8)));

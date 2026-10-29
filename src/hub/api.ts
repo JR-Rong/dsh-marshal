@@ -119,9 +119,11 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
         chunks.push(buffer)
       }
       if (tooLarge) {
-        // 只写一次；随后断开连接，不再继续读剩余字节。
-        if (!res.headersSent) res.writeHead(413, { 'content-type': 'text/plain; charset=utf-8' }).end('payload too large')
-        req.destroy()
+        // 已发头就无法再改状态码；直接断开，不再继续读剩余字节。
+        if (res.headersSent) { req.destroy(); return }
+        res.writeHead(413, { 'content-type': 'text/plain; charset=utf-8' }).end('payload too large')
+        // 立即 destroy 会让 413 可能到不了客户端：先让响应刷完再断开。
+        res.once('finish', () => req.destroy())
         return
       }
       let parsed: unknown
@@ -176,14 +178,21 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
       res.on('drain', () => { blocked = false })
 
       const heartbeat = setInterval(() => {
-        if (res.writableEnded || res.destroyed) return
+        // 背压时跳过：缓冲还没排空，继续写只会无限堆内存；轮询会重新对齐状态。
+        if (blocked || res.writableEnded || res.destroyed) return
         res.write(': ping\n\n')
       }, 15_000)
 
+      let cleaned = false
       const cleanup = (): void => {
+        // close/error/dispose 可能同时触发；重复调用必须是安全的空操作。
+        if (cleaned) return
+        cleaned = true
         if (unsubscribe !== null) { unsubscribe(); unsubscribe = null }
         clearInterval(heartbeat)
         streams.delete(cleanup)
+        // dispose 时也要结束仍挂着的响应，否则客户端会一直等下去。
+        if (!res.writableEnded) res.end()
       }
       streams.add(cleanup)
       req.on('close', cleanup)
