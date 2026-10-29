@@ -13,7 +13,7 @@ describe('toMarshalEvents', () => {
     const events = frames.flatMap(frame => toMarshalEvents(frame, meta, () => ++seq))
     expect(events.map(event => event.kind)).toEqual([
       'turn.started', 'reasoning.delta', 'tool.started', 'tool.completed',
-      'message.delta', 'turn.completed', 'message.completed',
+      'message.delta', 'message.completed', 'turn.completed',
     ])
     expect(events.every(event => event.type === 'event')).toBe(true)
     expect(events.every(event => event.device === 'mac' && event.sessionId === 's1')).toBe(true)
