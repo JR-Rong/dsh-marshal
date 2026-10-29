@@ -23,16 +23,26 @@ export const PAGE_HTML = `<!doctype html>
   .ask button { margin:4px 6px 0 0; padding:4px 10px; }
   form { display:flex; gap:8px; padding:12px; border-top:1px solid #8883; }
   input { flex:1; padding:8px; }
+  #status { padding:0 12px 8px; color:#c33; min-height:1.2em; }
 </style></head>
 <body>
 <aside><div id="devices">loading…</div></aside>
 <main><div id="log"></div>
-<form id="send"><input id="text" placeholder="给选中会话发一条消息"><button>发送</button></form></main>
+<form id="send"><input id="text" placeholder="给选中会话发一条消息"><button>发送</button></form>
+<div id="status"></div></main>
 <script>
 const token = new URLSearchParams(location.search).get('token') || '';
 const api = (path) => path + (token ? (path.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token) : '');
 let current = null;
+let selected = null;
 const log = document.getElementById('log');
+const devicesRoot = document.getElementById('devices');
+const status = document.getElementById('status');
+
+// 非安全上下文（局域网 http）没有 crypto.randomUUID，退化成时间戳+随机串。
+const newKey = () => (globalThis.crypto && typeof crypto.randomUUID === 'function')
+  ? crypto.randomUUID()
+  : Date.now().toString(36) + Math.random().toString(36).slice(2);
 
 function append(node) { log.append(node); log.scrollTop = log.scrollHeight; }
 
@@ -43,49 +53,96 @@ function dot(running) {
 }
 
 async function refresh() {
-  const data = await (await fetch(api('/marshal/api/devices'))).json();
-  const root = document.getElementById('devices');
-  root.textContent = '';
+  let data = null;
+  try {
+    const response = await fetch(api('/marshal/api/devices'));
+    if (response.ok) data = await response.json();
+  } catch { /* 网络错误按断开处理 */ }
+  if (data === null || !Array.isArray(data.devices)) { devicesRoot.textContent = 'hub 断开，重试中…'; return; }
+  devicesRoot.textContent = '';
   for (const device of data.devices) {
+    if (!device || typeof device.id !== 'string') continue;
     const group = document.createElement('div');
     group.className = 'group';
     group.textContent = device.name + ' (' + device.id + ')';
-    root.append(group);
+    devicesRoot.append(group);
+    if (!Array.isArray(device.agents)) continue;
     for (const agent of device.agents) {
       const row = document.createElement('div');
       row.className = 'row';
+      // 每次轮询重建列表，按记录下来的选择恢复高亮。
+      if (selected !== null && selected.device === device.id && selected.agent === agent) row.classList.add('active');
       row.append(dot(false), document.createTextNode(agent));
-      row.onclick = () => { row.classList.add('active'); loadSessions(device.id, agent); };
-      root.append(row);
+      row.onclick = () => {
+        selected = { device: device.id, agent };
+        for (const other of devicesRoot.querySelectorAll('.row')) other.classList.remove('active');
+        row.classList.add('active');
+        loadSessions(device.id, agent);
+      };
+      devicesRoot.append(row);
     }
   }
 }
 
 async function loadSessions(device, agent) {
-  const data = await (await fetch(api('/marshal/api/sessions?device=' + encodeURIComponent(device)))).json();
+  let data = null;
+  try {
+    const response = await fetch(api('/marshal/api/sessions?device=' + encodeURIComponent(device)));
+    if (response.ok) data = await response.json();
+  } catch { /* 网络错误按加载失败处理 */ }
+  if (data === null || !Array.isArray(data.sessions)) { log.textContent = '加载失败'; return; }
   log.textContent = '';
-  for (const session of data.sessions.filter(s => s.agent === agent)) {
+  for (const session of data.sessions.filter(s => s && s.agent === agent)) {
     const row = document.createElement('div');
     row.className = 'row';
     row.append(dot(session.running), document.createTextNode(session.sessionId.slice(0, 8)));
-    row.onclick = () => { current = { device, agent, sessionId: session.sessionId }; command('resume', {}); };
+    row.onclick = async () => {
+      // 已选中的会话再点一次不重发 resume。
+      if (current !== null && current.device === device && current.agent === agent && current.sessionId === session.sessionId) return;
+      const ok = await command('resume', {}, { device, agent, sessionId: session.sessionId });
+      if (!ok) return;
+      current = { device, agent, sessionId: session.sessionId };
+      status.textContent = '';
+      for (const other of log.querySelectorAll('.row')) other.classList.remove('active');
+      row.classList.add('active');
+    };
     log.append(row);
   }
 }
 
-async function command(op, args, idempotencyKey) {
-  if (current === null) return;
-  return fetch(api('/marshal/api/command'), {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ op, target: current, args, idempotencyKey: idempotencyKey || crypto.randomUUID() }),
-  });
+// 失败统一写进 #status 并返回 false，调用方据此决定是否更新本地状态。
+async function command(op, args, target, idempotencyKey) {
+  const to = target || current;
+  if (to === null) { status.textContent = '失败：请先选择会话'; return false; }
+  let response;
+  try {
+    response = await fetch(api('/marshal/api/command'), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ op, target: to, args, idempotencyKey: idempotencyKey || newKey() }),
+    });
+  } catch {
+    status.textContent = '失败：网络错误';
+    return false;
+  }
+  if (!response.ok) {
+    let message = 'HTTP ' + response.status;
+    try {
+      const body = await response.json();
+      if (body && typeof body.message === 'string' && body.message) message = body.message;
+    } catch { /* 非 JSON 错误体就用状态码 */ }
+    status.textContent = '失败：' + message;
+    return false;
+  }
+  return true;
 }
 
 const stream = new EventSource(api('/marshal/api/stream'));
 stream.onmessage = (message) => {
-  const event = JSON.parse(message.data);
-  if (current === null || event.device !== current.device || event.sessionId !== current.sessionId) return;
+  let event;
+  try { event = JSON.parse(message.data) } catch { return; }
+  // 同一 sessionId 在不同 agent 下不是同一条会话，必须连 agent 一起比对。
+  if (current === null || event.device !== current.device || event.agent !== current.agent || event.sessionId !== current.sessionId) return;
   const node = document.createElement('div');
   const payload = event.payload || {};
   if (event.kind === 'reasoning.delta') {
@@ -110,10 +167,12 @@ stream.onmessage = (message) => {
         const button = document.createElement('button');
         button.textContent = option.label;
         button.onclick = async () => {
-          await command('answer', {
+          const ok = await command('answer', {
             requestId: payload.requestId,
             answers: [{ id: question.id, selected: [option.label] }],
           });
+          // 失败时保留卡片，错误已由 command 写进 #status。
+          if (!ok) return;
           node.textContent = '已由本机回答：' + option.label;
         };
         node.append(button);
@@ -134,7 +193,7 @@ document.getElementById('send').onsubmit = async (submit) => {
   const text = document.getElementById('text').value.trim();
   if (!text) return;
   document.getElementById('text').value = '';
-  await command('prompt', { text, requestId: crypto.randomUUID() });
+  await command('prompt', { text, requestId: newKey() });
 };
 
 refresh();

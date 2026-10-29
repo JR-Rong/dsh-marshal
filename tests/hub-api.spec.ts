@@ -5,7 +5,12 @@ import { registerMarshalRoutes } from '../src/hub/api.ts'
 import { createTestWeb, type TestWeb } from './support/web.ts'
 
 let web: TestWeb | undefined
-afterEach(() => { web?.server.close(); web = undefined })
+afterEach(async () => {
+  const test = web
+  if (test === undefined) return
+  web = undefined
+  await new Promise<void>(resolve => test.server.close(() => resolve()))
+})
 
 async function start() {
   const registry = new DeviceRegistry()
@@ -35,6 +40,12 @@ describe('hub api', () => {
     expect(await response.text()).toContain('marshal')
   })
 
+  it('x-marshal-token 头也能认证', async () => {
+    const { port } = await start()
+    const response = await fetch(`http://127.0.0.1:${port}/marshal`, { headers: { 'x-marshal-token': 'secret' } })
+    expect(response.status).toBe(200)
+  })
+
   it('设备列表', async () => {
     const { port } = await start()
     const body = await (await fetch(`http://127.0.0.1:${port}/marshal/api/devices?token=secret`)).json() as { devices: { id: string }[] }
@@ -49,6 +60,19 @@ describe('hub api', () => {
     ])
   })
 
+  it('空 device 参数等同全部会话', async () => {
+    const { port } = await start()
+    const body = await (await fetch(`http://127.0.0.1:${port}/marshal/api/sessions?device=&token=secret`)).json() as { sessions: unknown[] }
+    expect(body.sessions).toHaveLength(1)
+  })
+
+  it('GET 指令端点返回 405 并声明 allow', async () => {
+    const { port } = await start()
+    const response = await fetch(`http://127.0.0.1:${port}/marshal/api/command?token=secret`)
+    expect(response.status).toBe(405)
+    expect(response.headers.get('allow')).toBe('POST')
+  })
+
   it('发给离线设备的指令返回 409', async () => {
     const { port } = await start()
     const response = await fetch(`http://127.0.0.1:${port}/marshal/api/command?token=secret`, {
@@ -57,6 +81,16 @@ describe('hub api', () => {
       body: JSON.stringify({ op: 'prompt', target: { device: 'ghost', agent: 'dsh', sessionId: 's' }, args: {}, idempotencyKey: 'k' }),
     })
     expect(response.status).toBe(409)
+  })
+
+  it('未知 op 返回 400', async () => {
+    const { port } = await start()
+    const response = await fetch(`http://127.0.0.1:${port}/marshal/api/command?token=secret`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ op: 'explode', target: { device: 'mac', agent: 'dsh', sessionId: 's1' }, args: {}, idempotencyKey: 'k-unknown-op' }),
+    })
+    expect(response.status).toBe(400)
   })
 
   it('不接管其它路径', async () => {
