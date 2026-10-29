@@ -198,6 +198,34 @@ describe('hub socket', () => {
     ws.close()
   })
 
+  it('事件里的 device 与握手身份不一致时以 4400 关闭', async () => {
+    const registry = new DeviceRegistry()
+    const frames: Frame[] = []
+    const { port } = await serve(registry, frames)
+    const ws = await hello(registry, port)
+    const code = closeCode(ws)
+    ws.send(JSON.stringify({
+      v: 1, type: 'event', device: 'other', agent: 'dsh', sessionId: 's1', seq: 1, ts: 't',
+      kind: 'turn.started', payload: {},
+    }))
+    expect(await code).toBe(4400)
+    expect(frames).toEqual([])
+  })
+
+  it('事件里的 agent 未在 hello 中声明时以 4400 关闭', async () => {
+    const registry = new DeviceRegistry()
+    const frames: Frame[] = []
+    const { port } = await serve(registry, frames)
+    const ws = await hello(registry, port)
+    const code = closeCode(ws)
+    ws.send(JSON.stringify({
+      v: 1, type: 'event', device: 'mac', agent: 'codex', sessionId: 's1', seq: 1, ts: 't',
+      kind: 'turn.started', payload: {},
+    }))
+    expect(await code).toBe(4400)
+    expect(frames).toEqual([])
+  })
+
   it('断线后设备被移除', async () => {
     const registry = new DeviceRegistry()
     const { port } = await serve(registry)

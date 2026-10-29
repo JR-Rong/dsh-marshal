@@ -72,6 +72,7 @@ dsh plugin add dsh-marshal
 
 - `hubUrl` **没有默认值**，必填，必须是 `ws://` 或 `wss://` 且带主机名。
 - 除 `localhost` 外一律用 `wss://`：代码也接受 `ws://`，但明文连接会把设备 token 暴露在链路上。
+- 指令的 `deadline` 是 hub 的绝对时间（默认 30s）：两台机器要保持时钟同步（NTP），偏差过大时指令会被判为过期。
 - `token` 至少 16 字符，与 hub 设备表里那台设备的 token 完全一致。
 - `deviceName` 可选，默认取宿主环境的 `HOSTNAME`，取不到时是 `unknown`；它必须等于 `marshal-device` 签发的设备 id，否则 hello 阶段的 `device` 对不上，hub 会以 `4401 auth-failed` 关闭连接。它同时是 hello 里的设备 id，也是事件里的 `device` 字段。
 
@@ -166,7 +167,7 @@ WebSocket 上的 JSON 帧统一带 `v: 1`，四种 `type`：
 
 单帧上限 1 MiB（双向）；指令的结果超过上限时只回固定的小体积 `result-too-large`。hub 对能解析但违反协议的帧用 `4400` 关闭；超过 1 MiB 的入站帧由 `ws` 以 `1009` 关闭；hello 里 token 不匹配用 `4401 auth-failed` 关闭；握手后 10 秒内没收到合法 hello 会被直接断开（客户端看到 `1006`）。升级请求里的设备 token 不对时 hub 回 `401` 并断开。hub 只接受与握手登记一致的 `device`/`agent` 的事件帧，其它按 `4400` 关闭；node 也会拒收目标设备或 agent 不匹配的指令。
 
-`/marshal/api/command` 的状态码：参数错误 `400`、会话不存在 `404`、设备离线或回答已过期 `409`、执行失败 `502`、超时 `504`。
+`/marshal/api/command` 的状态码：参数错误 `400`、会话不存在 `404`、设备离线或回答已过期 `409`、执行失败 `502`、hub 正在关闭 `503`、超时 `504`。
 
 ## 安全说明
 

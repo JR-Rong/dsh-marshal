@@ -240,7 +240,7 @@ describe('NodeLink', () => {
     await waitFor(() => received.filter(text => typeOf(text) === 'hello').length >= 2, 'second hello')
   })
 
-  it('close 幂等，关闭后不再重连且继续缓冲', async () => {
+  it('close 幂等，关闭后不再重连也不再缓冲', async () => {
     let connections = 0
     const { port } = await listen({ onConnection: () => { connections += 1 } })
 
@@ -255,7 +255,7 @@ describe('NodeLink', () => {
     expect(connections).toBe(1)
 
     link.sendEvent(event(1))
-    expect(link.buffered).toBe(1)
+    expect(link.buffered).toBe(0)
   })
 
   it('dispose 后不再拨号', async () => {

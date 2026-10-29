@@ -113,7 +113,8 @@ async function loadSessions(device, agent) {
       // 先切目标再发 resume：跟随事件可能先于 HTTP 响应到达 SSE，晚切会永久丢掉开头几条。
       current = target;
       const ok = await command('resume', {}, target);
-      if (!ok) { current = previous; return; }
+      // 只回滚仍然指向这次目标的状态：期间用户已选别的会话时不能把旧目标恢复回来。
+      if (!ok) { if (current === target) current = previous; return; }
       status.textContent = '';
       for (const other of log.querySelectorAll('.row')) other.classList.remove('active');
       row.classList.add('active');
