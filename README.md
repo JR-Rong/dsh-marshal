@@ -47,7 +47,7 @@ npx --package dsh-marshal marshal-device laptop-b
 # token (shown once): <device-token>
 ```
 
-`marshal-device` 由 `dsh-marshal` 包提供：`npx --package dsh-marshal` 在本地已安装时直接用它，否则按同名包从 npm 取（不要直接 `npx marshal-device`，那是另一个包名）。
+`marshal-device` 由 `dsh-marshal` 包提供：`npx --package dsh-marshal` 只在本地已安装该包时解析到它的 bin；包尚未发布到 npm 时，可在安装目录直接运行 `node lib/src/bin/device.js <device-id>`。不要直接 `npx marshal-device`（那是另一个包名）。
 
 设备表是一个 JSON 文件，CLI 每次写入后都会把权限收紧到 `0600`。CLI 支持 `MARSHAL_DEVICES_FILE` 环境变量覆盖路径，但 **hub 不读这个环境变量**：一旦用了覆盖，必须同时把 hub 配置里的 `devicesFile` 指到同一个绝对路径。设备表只在 hub 启动时读取，签发新设备后要重启 hub。文件存在但无法解析时 CLI 直接报错退出，不会当成空表覆盖。
 
