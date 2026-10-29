@@ -144,7 +144,7 @@ location /marshal {
 - 多选题必须点「提交」；全是单选时选满即自动提交。
 - 本机已经答过的卡片以本机回执为准；远端答完会显示「已由另一处回答」，超时回到本地显示「已交回源机器」。
 
-注意：`metadata` 只裁事件文本，**不裁提问**——问题、选项与答案本来就要跨机传，它们会被 `redaction` 处理，但不会被裁成计数。
+注意：`metadata` 只裁事件文本，**不裁提问**——问题与选项从 node 发出，会走 `redaction`；答案从浏览器作为指令直接下发，不经过 node 的脱敏管线；三类内容都不会被裁成计数。
 
 ## 只收紧，不放宽
 
@@ -159,7 +159,7 @@ WebSocket 上的 JSON 帧统一带 `v: 1`，四种 `type`：
 - `hello`：`device`、`token`、`agents`；必须是首帧，hub 校验后回 `ack`（`id: "hello"`）。
 - `event`：`device`、`agent`、`sessionId`、`seq`、`ts`、`kind`、`payload`；`kind` 共 14 种，完整列表见 `src/wire/frames.ts` 的 `MARSHAL_KINDS`。
 - `command`：`id`、`idempotencyKey`、`deadline`、`op`、`target{device,agent,sessionId}`、可选 `args`；`op` 为 `prompt` / `resume` / `create` / `interrupt` / `answer` / `cancel` / `configure`，v0 实际支持 `prompt` / `resume` / `interrupt` / `answer`，`create` 与 `cancel` 回 `unsupported`，`configure` 只做字段识别与拒绝放宽。
-- `ack`：`id`、`ok`；成功时可能带 `result`（hello 的 ack 只有 `ok`），失败带 `code` 与 `message`。
+- `ack`：`id`、`ok`；成功时可能带 `result`（hello 的 ack 只有 `ok`），失败带 `code`，`message` 可选。
 
 单帧上限 1 MiB（双向）；指令的结果超过上限时只回固定的小体积 `result-too-large`。hub 对能解析但违反协议的帧用 `4400` 关闭；超过 1 MiB 的入站帧由 `ws` 以 `1009` 关闭；hello 里 token 不匹配用 `4401 auth-failed` 关闭；握手后 10 秒内没收到合法 hello 会被直接断开（客户端看到 `1006`）。
 
