@@ -13,6 +13,13 @@ describe('redact', () => {
     const deep = { x: { y: { z: { w: 'sk-testtesttesttest' } } } }
     expect(() => redact(deep, [/sk-[a-z]{16}/i])).not.toThrow()
   })
+
+  it('超深子树整体替换，不泄漏深层密钥', () => {
+    const deep = { l1: { l2: { l3: { l4: { l5: { l6: { l7: 'sk-testtesttesttest' } } } } } } }
+    const result = redact(deep, [/sk-[a-z]{16}/i])
+    expect(JSON.stringify(result)).not.toContain('sk-testtesttesttest')
+    expect(result).toEqual({ l1: { l2: { l3: { l4: { l5: { l6: '***' } } } } } })
+  })
 })
 
 describe('stripContent', () => {

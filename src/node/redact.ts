@@ -2,12 +2,16 @@ import type { EventFrame } from '../wire/frames.ts'
 
 const MAX_DEPTH = 6
 
-/** 在离开源机器前替换敏感片段；超深对象原样保留，避免遍历失控。 */
+/** 在离开源机器前替换敏感片段；超深子树整体替换为 ***，避免泄漏与遍历失控。 */
 export function redact(value: unknown, patterns: readonly RegExp[], depth = 0): unknown {
   if (typeof value === 'string') {
     return patterns.reduce((text, pattern) => text.replace(pattern, '***'), value)
   }
-  if (depth >= MAX_DEPTH || value === null || typeof value !== 'object') return value
+  if (depth >= MAX_DEPTH) {
+    // 其余原始类型原样返回；对象/数组一律抹成 *** ，不再透传深层内容。
+    return value !== null && typeof value === 'object' ? '***' : value
+  }
+  if (value === null || typeof value !== 'object') return value
   if (Array.isArray(value)) return value.map(item => redact(item, patterns, depth + 1))
   const out: Record<string, unknown> = {}
   for (const [key, item] of Object.entries(value)) out[key] = redact(item, patterns, depth + 1)
