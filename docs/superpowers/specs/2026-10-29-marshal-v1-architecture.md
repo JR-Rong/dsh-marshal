@@ -16,7 +16,7 @@
 | src/agents/host.ts | 路由只读/控制、逐 agent 健康与快照；一个失败不让全部 snapshot 失败 |
 | src/agents/supervisor.ts | 子进程代次、stdio 传输、退出清理、退避与停止 |
 | src/agents/ownership.ts | foreign-unknown/acquiring/ours 状态机、证据与租约、每会话互斥 |
-| src/agents/codex/peer.ts、protocol.ts | 目标版本协议生成子集、NDJSON 请求/响应/通知、原生请求 id |
+| src/agents/codex/binary.ts、peer.ts、protocol.ts | 入口解析、目标版本协议生成子集、NDJSON 请求/响应/通知、原生请求 id |
 | src/agents/codex/discover.ts、map.ts | 只读分页、原生事件映射，不在 observe 中 resume |
 | src/agents/codex/session.ts、adapter.ts | 已取得写权后的原生 resume/turn 操作，activeTurnId |
 | src/agents/codex/approvals.ts | 单次决定映射；公共输入策略为必需依赖 |
@@ -74,7 +74,7 @@ turn、item、delta、tool result 和 settings 通知按真实 fixture 映射；
 
 原生服务端请求用 JSON-RPC request id 回应，itemId 仅作关联。command/file-change 审批取原生可用集合与单次白名单交集；permissions 请求空授权；elicitation 保守拒绝；requestUserInput 按 question 策略处理。未知请求及时返回支持的错误/拒绝，不能静默挂起。
 
-serverRequest/resolved、进程退出、所有权失效均作废对应待答。卡片生成和 settle 都经过公共策略；off 时没有审批正文出站，不能仅在 Claude 上实现开关。
+serverRequest/resolved、进程退出、所有权失效均作废对应待答。卡片生成和 settle 都经过公共策略；off 时没有审批正文出站，不能仅在 Claude 上实现开关。远端卡片需源端 relay=remote 且 hub 设备记录 `allowInteractions=true`，并取 min(approvalTimeoutMs, 原生 expiresAt) 作为等待上限；外部 unknown 会话不建立可答卡。
 
 ## 5. Claude SDK 适配
 

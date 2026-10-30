@@ -69,15 +69,15 @@
 | ID | 层 | 操作/故障注入 | 通过条件 |
 |---|---|---|---|
 | C02-01 | U/I | 100 个相同键和载荷并发，首次 ACK 延迟 | hub 只下发一次，node 只调用一次，所有等待者取得一致结果 |
-| C02-02 | U/I | 同键不同 op/args；不同 target 或 operator 使用相同键；同 owner 重新登录/轮换 token | 同域不同载荷返回 idempotency-conflict；不同域不相互误命中；同 owner 的 operatorId 稳定，已执行键不因重新登录变成新请求 |
+| C02-02 | U/I | 同键不同 op/args；不同 target 或 operator 使用相同键；同 owner 重新登录/轮换 token；提交后刷新或重开标签页 | 同域不同载荷返回 idempotency-conflict；不同域不相互误命中；同 owner 的 operatorId 稳定，已执行键不因重新登录变成新请求；未决/未知键在重载后仍复用，不隐式换键重发 |
 | C02-03 | U/I | 命令到达已过期；等待会话互斥期间过期；原 epoch 命令重连后到达 | agent 调用次数为零；分别返回 expired/stale；没有“迟到执行” |
-| C02-04 | I | 分别在落 admitted 前、落后调用前、调用后落结果前杀 node | admitted 前无调用，旧 epoch 请求拒绝且 UI 不重放；admitted 后未决记录为 outcome-unknown，同键不得重新调用；未决状态不推断副作用已发生或未发生 |
+| C02-04 | I | 分别在落 admitted 前、落 admitted 后调用前、调用后落结果前杀 node | admitted 前无调用，旧 epoch 请求拒绝且 UI 不重放；admitted 后未决记录为 outcome-unknown，同键不得重新调用；未决状态不推断副作用已发生或未发生 |
 | C02-05 | U/I | 超过去重容量；未决项长时间保留；终态超过 24h | 未决项不被驱逐，容量满拒绝新写；终态仅按保留策略回收；UI 不承诺无限期 exactly-once |
 | C02-06 | U/I | 时钟跳变、偏差/不确定度超过 5s | 期限不被延长；无法可靠校验时 clock-skew，零调用；修复时间后可重新同步 |
 
 ### C03：中继策略
 
-矩阵覆盖 DSH、Codex、Claude 各自已支持的 question/approval；DSH 审批在 v0/v1 应始终报告 unsupported。同一套测试分别驱动直接构造和真实 node 装配，防止构造参数遗漏。
+矩阵覆盖 DSH、Codex、Claude 各自已支持的 question/approval；DSH 审批在 v0/v1 应始终报告 unsupported。同一套测试分别驱动直接构造和真实 node 装配，防止构造参数遗漏。远端卡片需 node relay=remote 与 hub `allowInteractions=true` 同时成立；四种组合都要验证，任一缺失不得发正文或注册可答卡。
 
 | ID | 层 | 操作/故障注入 | 通过条件 |
 |---|---|---|---|
@@ -86,6 +86,8 @@
 | C03-03 | U/I/R | remote，合法决定与无人作答分别执行 | 单次允许回到原请求；审批超时仅拒绝；DSH 普通问题按真实 waterfall 回本地 |
 | C03-04 | I/R | 待答中在源端改 off；同请求随后 answer/decide | 原请求按保守路径结束；卡作废；恢复查询不再返回；迟到决定无效 |
 | C03-05 | U/I | approval=off、question=remote，触发 plan-review/ExitPlanMode | 不得以普通提问获得执行授权；decision 通道按审批策略拒绝 |
+| C03-06 | U/I | node relay=remote 但 hub allowInteractions=false；反向组合；原生 expiresAt 早于 answerTimeoutMs/approvalTimeoutMs | 两种单侧授权均按 off 处理，零正文出站；等待在原生 expiresAt 或本地超时的较早者结束，超时审批拒绝、问题按已验证无答案路径结算 |
+| C03-07 | U/I | 远端问题卡显式 cancel；审批卡显式 cancel；随后本地 TUI 再回答 | cancel 走已验证的拒绝/无答案路径，不提交空答案；卡作废且不复活；本地不出现重复 answer；审计只记操作与分类 |
 
 ### C04：单次授权边界
 
@@ -103,7 +105,7 @@
 | C05-01 | I | A 的 token 发送 deviceId=B 的 session/input 事件 | B 索引、卡片、能力均不变；连接按策略拒绝，日志不含帧正文 |
 | C05-02 | I | A 伪造发给 B 的 commandId ACK；旧连接发送正确 commandId ACK | 两者均无法完成 B/新连接 pending；只接受匹配认证身份与代次 |
 | C05-03 | I | 同设备新连接替换旧连接后，旧连接触发 close | 新连接仍在线；只有当前连接可更新状态/收命令 |
-| C05-04 | I | 撤销 token、未 hello 连接、错误协议修订 | 撤销立即关闭；握手有界；不无限重连；不泄露 token；无写入 |
+| C05-04 | I | 撤销 token、未 hello 连接、错误 wire/契约修订、方向错误的帧 | 撤销在 5s 内关闭连接且不无限重连；握手有界；不泄露 token；无写入；分别返回 4401/4406/4400 等约定 close code，不以字符串推断 |
 
 ### C06：写权与观察
 
@@ -119,7 +121,7 @@
 
 | ID | 层 | 操作/故障注入 | 通过条件 |
 |---|---|---|---|
-| C07-01 | U/I | Codex、Claude 分别 high→medium/low、low→high | 有真实等级定义时前者允许、后者拒绝；不会进入 permission 转移表 |
+| C07-01 | U/I | Codex、Claude 分别 high→medium/low、medium→low、low→medium/high、medium→high | 有真实等级定义时下调允许、任何上调拒绝；不会进入 permission 转移表 |
 | C07-02 | U | 打乱目录显示顺序；未知 effort、缺目录、相同值 | 顺序不影响语义；未知值 fail closed；已确认同值 no-op 且零原生 setter 调用 |
 | C07-03 | U/I/R | permission 收紧；关 plan；切模型使默认 effort/权限改变 | 比较完整最终状态；任何间接放宽拒绝；已有规则/网络/目录不被无意扩大 |
 | C07-04 | I | 运行中 configure、revision 不匹配、两个配置同时到达 | busy/conflict，零隐式排队；不会关闭正在执行的 Claude Query |
@@ -142,16 +144,17 @@
 | C09-03 | U/I | input.requested/resolved、secret、答案经过 publish；随后查历史 | 历史条数与字节均不包含这些事件；不落正文磁盘；待答仅从有效源端表获取 |
 | C09-04 | U/I | 放入事件，停止一切写入，时间超过保留窗 | read/size/定时清理均不再暴露过期内容；不需要 append 才回收 |
 | C09-05 | U/I | 中文/多字节卡片超过 4096 字节，危险后缀被截断；脱敏使动作不完整 | 按字节限制；保留可解释拒绝状态；禁止批准不完整动作 |
-| C09-06 | I | 大量会话、大帧、慢 SSE 客户端、离线队列满 | 各条数/字节预算不超限；背压有界；丢失明确提示；ACK 不被事件淘汰 |
+| C09-06 | I | 大量会话、大帧、慢 SSE 客户端、离线队列满、同步暂存超预算 | 各条数/字节预算不超限；背压有界；丢失明确提示；ACK 不被事件淘汰；暂存超限放弃并标 stale，不半覆盖 |
+| C09-07 | U/I | 中文/emoji 大文本跨越分片边界、分片丢失或乱序、重组后再渲染 | 只在完整 UTF-8 边界分片；重组后字节与原文一致；缺片不显示伪完整文本；seq 按会话键去重 |
 
 ### C10：重连与状态恢复
 
 | ID | 层 | 操作/故障注入 | 通过条件 |
 |---|---|---|---|
-| C10-01 | I/R | 仅重启 hub，node 保持运行且所有会话空闲 | 网络恢复后 30s 内完整重建清单/能力；没有任何 prompt 重放 |
+| C10-01 | I/R | 仅重启 hub，node 保持运行且所有会话空闲；人为拉长拨号间隔 | 网络恢复后 30s 内完整重建清单/能力；拨号退避封顶 10s 且带 jitter，不因 30s 封顶挤占同步预算；没有任何 prompt 重放 |
 | C10-02 | I/R | node 断网 30s，期间新增/删除会话、结束回合、改变能力；队列故意淘汰 | 重连后 30s 内以全量快照对齐，旧项删除；内容缺口明确；同步完成前禁止写 |
-| C10-03 | U/I | 快照缺片、乱序、重复、扫描中产生事件、agent 清单为空 | 仅完整一致快照原子替换；无丢失窗口；失败保留 stale 状态，不出现半快照 |
-| C10-04 | I | node 重启 seq 从低值重新开始；旧 epoch 事件迟到 | 新 epoch 正确重建；旧事件不能覆盖新值；不拿跨 epoch seq 比大小 |
+| C10-03 | U/I | 快照缺片、乱序、重复、扫描中产生事件、agent 清单为空、暂存超过单设备/hub 预算 | 仅完整一致快照原子替换；无丢失窗口；失败保留 stale 状态，不出现半快照；超预算放弃暂存并释放内存 |
+| C10-04 | I | node 重启 seq 从低值重新开始；旧 epoch 事件迟到；两个会话在同一 nodeEpoch 下出现相同 seq | 新 epoch 正确重建；旧事件不能覆盖新值；不拿跨 epoch seq 比大小；去重键包含 device/agent/session，跨会话同 seq 不互相吞掉 |
 | C10-05 | I/R | 审批产生时页面关闭；到期前打开、刷新或换浏览器 | 从源端恢复仍有效的卡并可答；已解决/过期卡不复活；离线明确不可答 |
 | C10-06 | I | SSE 在回放/订阅边界断开；Last-Event-ID 过旧或 hubEpoch 变化 | 游标去重无窗口；必要时 reset-required 并重取状态/待答；不伪装完整内容历史 |
 
@@ -159,9 +162,9 @@
 
 | ID | 层 | 场景 | 通过条件 |
 |---|---|---|---|
-| B01 | U/I | 配置、角色与认证 | 缺必填项失败且只打印键名；deviceId 与 deviceName 分离；URL token 拒绝；浏览器登录、CSRF、SSE 授权生效 |
+| B01 | U/I | 配置、设备表与认证 | 缺必填项、未知键、错误枚举、负数/非有限上限、非法正则均启动失败且只打印键名；deviceId 与 deviceName 分离；设备表损坏/重复 ID/重复 token 摘要启动失败而非静默丢弃；设备表变更后 5s 内完成撤销或授权生效；URL token 拒绝；低熵 dashboardToken 拒绝；登录失败限速生效；浏览器登录、CSRF、SSE 授权生效 |
 | B02 | I/R | DSH 普通问题 | remote 独占期间本地不出现；超时真实 next() 后本地可答；off 不改变本地行为；认领顺序有证据 |
-| B03 | I/R | 交互卡保真 | 单选、多选、自由文本按 ID 提交；重复点击不重复计数；secret 无答案外泄；错误显示与实际终态一致 |
+| B03 | I/R | 交互卡保真与渲染安全 | 单选、多选、自由文本按 ID 提交；重复点击不重复计数；secret 无答案外泄；错误显示与实际终态一致；含 `<script>`/HTML 的问题、选项、消息按纯文本显示，不执行脚本也不注入属性 |
 | B04 | I/R | 原生事件与历史 | 输出和工具顺序来自真实流，无假增量；历史读取分页；外部活跃会话不宣称有未实现的实时流 |
 | B05 | I/R | 子进程隔离 | 杀 Codex 不影响 Claude/DSH；重新握手探测后再上线；旧请求全部结束或 unknown，timer/listener 不增长 |
 | B06 | I/R | 可选 create/fork/steer | 显式触发、实际新会话 ID、cwd 白名单与 activeTurnId 均验证；未验证能力没有按钮且服务端拒绝 |
@@ -175,7 +178,7 @@
 
 | ID | 层 | 场景 | 通过条件 |
 |---|---|---|---|
-| M01 | U/I | 现有 deviceName 与设备表转换到稳定 deviceId/摘要表，修改显示名 | 身份和授权映射保持；原表保留；新表权限受限；token 不进入日志；相同转换不制造重复设备 |
+| M01 | U/I | 现有 deviceName 与设备表转换到稳定 deviceId/摘要表，修改显示名；轮换短 dashboardToken | 身份和授权映射保持；原表保留；新表权限受限；token 不进入日志；相同转换不制造重复设备；轮换窗口内旧登录可用并告警，完成后新值生效 |
 | M02 | I | v1 node→v2 hub、v2 node→v1 hub、未知修订 | 明确不兼容、零 agent 调用、无静默协议降级；不会无限重拨掩盖错误 |
 | M03 | I/R | 有 in-flight 时升级，分别在发送前/执行后丢 ACK；随后回滚 | 停止新写，已知结果保留，不明项为 unknown；新旧两端均不自动重放；新 journal 保留；回滚后未知旧键只能人工核对 |
 | M04 | I/R | 同版本升级后验证登录、观察、问题与命令；恢复旧版配套配置 | v2 的 observe 保持只读；cookie/CSRF 与新 wire 闭环成立；旧版用法可按保留文件恢复；README 明确版本边界 |

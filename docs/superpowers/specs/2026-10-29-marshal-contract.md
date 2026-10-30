@@ -24,7 +24,7 @@
 | 配置/隐私 | relay 仅 off/remote（默认 off），metadata 裁剪部分事件；redaction 默认为空 | 统一 off/notify/remote；字段白名单、内置脱敏及双重 content 授权 |
 | 命令/恢复 | hub 内存去重、node deadline；重连 clearDevice 后重发快照 | node 持久去重、unknown 查询、原子快照与 SSE reset |
 
-迁移纳入 V0-T01/T02/T08/T10：先在隔离的合成设备表与配置副本验证转换，再安排 hub/node 同版本升级。设备 ID 必须沿用原 deviceName 的身份值，显示名变化不能产生新身份；设备表迁移写入新文件且受限权限，不原地破坏旧表。旧 token 可在本地转换为摘要，不能打印、写报告或通过网络重新传输原值。
+迁移纳入 V0-T01/T02/T08/T10：先在隔离的合成设备表与配置副本验证转换，再安排 hub/node 同版本升级。设备 ID 必须沿用原 deviceName 的身份值，显示名变化不能产生新身份；设备表迁移写入新文件且受限权限，不原地破坏旧表。旧 token 可在本地转换为摘要，不能打印、写报告或通过网络重新传输原值。短于 32 字符的 dashboardToken 必须在升级窗口内轮换为随机值；轮换前保持旧登录可用但记录告警，不能让升级直接锁死所有浏览器。
 
 v1/v2 混接必须显式失败，UI 给出协议不匹配；不得用旧节点承载 v2 写请求。升级前停止接收新写入并排空 pending；无法确定结果的命令记录为 unknown，升级后不自动重放。协调升级完成前保持写入关闭。回滚恢复配套旧二进制、旧配置和设备表，仍保留新 journal 与未决记录，不因回滚自动重试旧命令。未完成迁移验收前，README 保留当前可执行配置，新增字段不能描述成当前默认值。
 
@@ -54,20 +54,21 @@ v1/v2 混接必须显式失败，UI 给出协议不匹配；不得用旧节点�
 | `token` | node | 必填，设备专用；只在 Authorization 头传输 |
 | `deviceId` | node | 必填，由 hub 注册时签发；独立于主机名，重启和改名保持不变 |
 | `deviceName` | node | 默认 hostname，仅显示用途，不参与鉴权或会话键 |
-| `dashboardToken` | hub | 必填，与 device token 隔离；不允许 URL 查询参数传递 |
-| `devicesFile` | hub | 默认 `$HOME/.dsh-marshal/devices.json`；显式覆盖使用绝对路径，不展开字面 `~`；设备 ID、显示名、token 摘要、撤销状态、内容授权 |
+| `dashboardToken` | hub | 必填，与 device token 隔离；至少 128 bit 熵（32 字符 base64url），只由随机源生成；长度不足、单字符重复或命中内置弱口令表时启动失败；不允许 URL 查询参数传递 |
+| `devicesFile` | hub | 默认 `$HOME/.dsh-marshal/devices.json`；显式覆盖使用绝对路径，不展开字面 `~`；设备 ID、显示名、token 摘要、撤销状态、内容与交互授权。文件缺失视为空表并告警；文件存在但无法解析、含重复 ID 或重复 token 摘要时 hub 启动失败，不静默丢弃条目 |
 | `privacy` | node | 默认 `metadata`；可选 `content`，还需 hub 对该 deviceId 允许内容 |
 | 设备记录 `allowContent` | hub | 默认 false；由部署者在 hub 本地设置 |
+| 设备记录 `allowInteractions` | hub | 默认 false；远端的提问/审批卡片需同时满足 node 侧 relay=remote 与本项为 true，缺一即按 off 处理 |
 | `questionRelay` | node | 默认 `off`；`off / notify / remote` |
 | `approvalRelay` | node | 默认 `off`；`off / notify / remote`；v0 DSH 审批不可用 |
-| `answerTimeoutMs` | node | 默认 300000；15000–300000 |
-| `approvalTimeoutMs` | node | 默认 60000；15000–300000 |
+| `answerTimeoutMs` | node | 默认 300000；15000–300000；实际等待取本值与原生 expiresAt 的较早者 |
+| `approvalTimeoutMs` | node | 默认 60000；15000–300000；实际等待取本值与原生 expiresAt 的较早者 |
 | `agents` | node | 默认 `[dsh]`；v0 只支持 dsh，v1 按能力探测启用 codex/claude |
 | `codexExecutable / claudeExecutable` | node | 可选显式路径；缺省按已验证的包入口/PATH 探测，不猜内网地址 |
 | `redaction` | node | 默认附加规则为空，但内置敏感模式始终生效；附加规则不能移除内置规则 |
 | `ringBufferMinutes` | hub | 默认 15；1–15；v0 不提供内容补看，v1 才生效 |
 
-固定资源预算：出站单帧不超过 1 MiB；单张交互卡不超过 4096 UTF-8 字节；node 离线事件队列最多 1000 条且总计 8 MiB；v1 历史缓冲每会话最多 2000 条/8 MiB、hub 总计 64 MiB。任何一项达到上限都触发淘汰或拒绝；这些是硬限额，不是“目标平均值”。
+固定资源预算：出站单帧不超过 1 MiB；单张交互卡不超过 4096 UTF-8 字节；node 离线事件队列最多 1000 条且总计 8 MiB；单设备同步暂存不超过 16 MiB、hub 全部暂存不超过 64 MiB；SSE 每客户端待写不超过 4 MiB；journal 必须有显式本地容量上限并在启动时校验，未决项永不驱逐。v1 历史缓冲每会话最多 2000 条/8 MiB、hub 总计 64 MiB。任何一项达到上限都触发淘汰或拒绝；这些是硬限额，不是“目标平均值”。
 
 hub 复用 DSH webServer 的端口与 TLS/反代，不另监听。node 不暴露外部监听端口；DSH 自身需要的回环服务不属于跨机入口。hub 管理本机 agent 必须显式注册一个本地 node 身份，走相同管道；不是 hub 的隐式副作用。
 
@@ -79,25 +80,25 @@ hub 复用 DSH webServer 的端口与 TLS/反代，不另监听。node 不暴露
 4. 同一 deviceId 只保留一个当前连接。替换时递增连接代次；旧连接关闭不得 detach 新连接，旧帧不得修改索引或完成新命令。
 5. 每帧入口校验认证设备、连接代次、允许方向、schema 和大小。事件中的 deviceId 不符即拒绝并记录分类；不能原样 publish。
 6. hub pending 命令绑定 `(commandId, deviceId, connectionId, nodeEpoch)`。ACK 必须来自绑定连接。重连后的结果通过只读状态查询恢复，不接受旧连接 ACK 冒充新确认。
-7. token 撤销立即关闭对应连接并禁止新命令；未知/已撤销 token 是终止性鉴权失败，不无限重试。未完成 hello 的连接有握手超时和数量上限。
+7. token 撤销生效后立即关闭对应连接并禁止新命令；未知/已撤销 token 是终止性鉴权失败，不无限重试。未完成 hello 的连接有握手超时和数量上限。设备表变更（新增、撤销、内容/交互授权）由 hub 热加载或显式 reload 生效，撤销从文件变更到关闭连接的延迟不超过 5 秒；仅启动时读取的实现不满足本节。
 
-浏览器通过登录表单 POST token 换取短期 `Secure; HttpOnly; SameSite=Strict` 会话 cookie；初始登录页可公开但不含数据。页面/API/SSE 均校验会话；写请求校验 Origin 和 CSRF token。非浏览器调用可用专用头。token、cookie、命令正文不写日志。owner 的审计身份由 hub 从认证会话赋予，不接受浏览器自报 `answeredBy`。`operatorId` 是该 hub 安装中持久的 owner 身份，跨浏览器登录、hub 重启和 token 轮换保持稳定；临时浏览器会话 ID 只作审计关联，不参与幂等域。
+浏览器通过登录表单 POST token 换取短期 `Secure; HttpOnly; SameSite=Strict` 会话 cookie；初始登录页可公开但不含数据。页面/API/SSE 均校验会话；写请求校验 Origin 和 CSRF token。非浏览器调用可用专用头。token、cookie、命令正文不写日志。登录失败按来源和全局两个维度限速（同一来源 15 分钟内最多 5 次失败，之后指数退避；全 hub 失败速率超限时短暂拒绝），延迟不泄露长度或前缀差异。owner 的审计身份由 hub 从认证会话赋予，不接受浏览器自报 `answeredBy`。`operatorId` 是该 hub 安装中持久的 owner 身份，首次启动生成后保存在 hub 本地受限文件中，跨浏览器登录、hub 重启和 token 轮换保持稳定；临时浏览器会话 ID 只作审计关联，不参与幂等域。
 
 ## 5. 公共帧、操作与时间
 
-所有时间字段统一为 UTC Unix 毫秒整数。`nodeEpoch` 是 node 进程启动标识；每个 `(deviceId, agent, sessionId, nodeEpoch)` 的 `seq` 单调递增。适配器子进程另有 `runtimeEpoch`，重启时原写权和交互失效。
+所有时间字段统一为 UTC Unix 毫秒整数。`nodeEpoch` 是 node 进程启动标识；每个 `(deviceId, agent, sessionId, nodeEpoch)` 的 `seq` 单调递增，因此任何去重或比较都必须带上会话键，不能只用 `(nodeEpoch, seq)`。`runtimeEpoch` 标识适配器实例：子进程类 agent 为进程启动，DSH 这类进程内适配器为插件实例/宿主启动；插件重载、宿主重启或子进程退出都使旧 `runtimeEpoch` 的写权和交互立即失效。`hubEpoch` 是 hub 进程启动时生成的随机标识，重启即变；SSE 游标只在同一 `hubEpoch` 内有效。
 
-| 帧 | 必需信息与用途 |
-|---|---|
-| `hello / hello.ack` | wire 版本、契约修订、功能集合、认证设备、nodeEpoch、connectionId、隐私策略 |
-| `command` | commandId、idempotencyKey、operatorId、target、op、args、issuedAt、deadline、connectionId、nodeEpoch |
-| `ack` | commandId、connectionId、nodeEpoch、status、code、受限 result；只表示命令受理/确认状态 |
-| `event` | deviceId、agent、sessionId、nodeEpoch、seq、ts、kind、按 kind 验证的 payload |
-| `sync.begin / sync.chunk / sync.end` | syncId、完整范围、快照版本、会话游标、分片计数；快照不含正文 |
-| `command.status / command.status.result` | 只读查询原幂等键状态；不触发执行、不携带原始正文 |
-| `inputs.snapshot / inputs.snapshot.result` | owner 按会话查询当前有效待答卡；node 重新执行隐私与策略校验 |
+| 帧 | 方向 | 必需信息与用途 |
+|---|---|---|
+| `hello / hello.ack` | node→hub / hub→node | wire 版本、契约修订、功能集合、认证设备、nodeEpoch、connectionId、隐私与交互策略 |
+| `command` | hub→node | commandId、idempotencyKey、operatorId、target、op、args、issuedAt、deadline、connectionId、nodeEpoch |
+| `ack` | node→hub | commandId、connectionId、nodeEpoch、status、code、受限 result；只表示命令受理/确认状态 |
+| `event` | node→hub | deviceId、agent、sessionId、nodeEpoch、seq、ts、kind、按 kind 验证的 payload |
+| `sync.begin / sync.chunk / sync.end` | node→hub | syncId、完整范围、快照版本、会话游标、分片计数；快照不含正文 |
+| `command.status / command.status.result` | hub→node / node→hub | 只读查询原幂等键状态；不触发执行、不携带原始正文 |
+| `inputs.snapshot / inputs.snapshot.result` | hub→node / node→hub | owner 按会话查询当前有效待答卡；node 重新执行隐私与策略校验 |
 
-target 为 `(deviceId, agent, sessionId)`。agent 标识是字符串，但必须在握手支持集合中。未知操作必须拒绝；未知事件可忽略并计数，不能因此绕过身份或大小检查。
+方向不符的帧按 `frame-invalid` 拒绝。target 为 `(deviceId, agent, sessionId)`。agent 标识是字符串，但必须在握手支持集合中。未知操作必须拒绝；未知事件可忽略并计数，不能因此绕过身份或大小检查。每个操作的 args 由 `wire/commands` 的判别 schema 定义并在两端验证，未知字段拒绝；`observe` 的 args 区分 `history`（带不透明 cursor 和 limit，单页有界）与 `follow`（订阅/取消订阅），两者都不带写权副作用。
 
 事件 kind 与最小语义统一如下，额外字段必须在版本 schema 和隐私白名单中声明：
 
@@ -131,7 +132,7 @@ wire v2 将当前 marshal `resume` 重命名为 `observe`；当前 DSH 的 resum
 
 ## 6. 命令生命周期与幂等（P1-01、P1-02）
 
-浏览器对一次用户意图生成并保存 idempotencyKey；网络超时不能换键自动重试。幂等域为 `(operatorId, target, idempotencyKey)`，规范化 op/args 的摘要用于检出同键不同载荷；传输 commandId、时间和连接代次不参与载荷摘要。
+浏览器对一次用户意图生成并保存 idempotencyKey；网络超时不能换键自动重试。未决或结果未知的键必须保存在浏览器本地（sessionStorage 或等价存储），刷新、重开标签页和重新登录后仍复用，直到已知终态；页面不得在重载后为新意图隐式换键。幂等域为 `(operatorId, target, idempotencyKey)`，规范化 op/args 的摘要用于检出同键不同载荷；传输 commandId、时间和连接代次不参与载荷摘要。
 
 hub 在任何 await/发送之前原子登记 in-flight。同键同载荷共享一个结果，不能再次发送；同键不同载荷返回 `idempotency-conflict`。ACK 路由必须显式分派到 pending 完成逻辑，event 路由不能吞掉 ACK；error/关闭/超时也必须完成等待者。
 
@@ -147,7 +148,7 @@ node 是去重的最终权威。按幂等域原子登记并在调用 agent 前�
 
 node 在 `admitted` 与调用 agent 之间、调用与落结果之间崩溃时，重启将未决项标记 outcome-unknown；除非上游支持且已验证同一操作的幂等恢复，否则不得自动调用。不能靠“磁盘记录存在”推断执行成功。原 nodeEpoch 的延迟 command 一律拒绝。
 
-hub 发送后丢 ACK、hub 重启或连接断开，均返回/恢复为 outcome-unknown。只读状态查询可恢复已存状态；查询 unknown 不触发重发。查询结果必须经过同样身份验证和内容清理。HTTP 区分 200（受理/确认）、202（等待确认/结果未知）、409（冲突）、410（过期）、503（离线）；所有响应带机器可读状态。UI 不把 202 当作成功完成。
+hub 发送后丢 ACK、hub 重启或连接断开，均返回/恢复为 outcome-unknown。只读状态查询可恢复已存状态；查询 unknown 不触发重发。查询结果必须经过同样身份验证和内容清理。HTTP 区分 200（受理/确认）、202（等待确认/结果未知）、400（frame-invalid/version-unsupported）、409（conflict/idempotency-conflict/revision-conflict）、410（过期）、413（size-limit）、503（离线）；所有响应带机器可读 code。UI 不把 202 当作成功完成。
 
 ## 7. 会话所有权与并发（P1-06）
 
@@ -172,9 +173,9 @@ acquire、prompt、configure 和回合状态转换均使用每会话串行状态
 |---|---|---|
 | `off` | 不发交互正文，不创建远端可答卡；可保留普通会话 waiting 状态 | DSH 不认领、交本地；独占 headless 若无本地通道，立即拒绝审批/返回无答案 |
 | `notify` | 只发脱敏的等待类别，不发命令、问题正文或选项，不可远答 | 与 off 相同；不能声称无人存在的本地 UI 会接回 |
-| `remote` | 向已认证 owner 发受限卡片，源端等待决定 | 审批超时拒绝；DSH 普通提问超时 next()；Codex/Claude 问题按已验证无答案路径结束 |
+| `remote` | 向已认证 owner 发受限卡片，源端等待决定；还要求 hub 设备记录的 `allowInteractions=true` | 审批超时拒绝；DSH 普通提问超时 next()；Codex/Claude 问题按已验证无答案路径结束；实际等待不超过原生 expiresAt |
 
-所有适配器构造参数必须包含两项策略，禁止适配器自行默认 remote。策略检查覆盖创建卡片、恢复待答卡和接受 decide/answer 三处。运行中本地收紧为 off 时立即作废卡片并按保守方向结算。
+所有适配器构造参数必须包含两项策略，禁止适配器自行默认 remote。策略检查覆盖创建卡片、恢复待答卡和接受 decide/answer 三处。远端卡片是显式内容，必须同时具备源端 `relay=remote` 与 hub `allowInteractions=true`；任一缺失按 off 处理，不发送正文也不注册可答卡。运行中本地收紧为 off 时立即作废卡片并按保守方向结算。只有 node 当前进程能够合法结算的原生请求才可认领；外部 unknown 会话即使观察到等待状态，也不建立可答卡。
 
 只允许原生可用决策与本项目白名单的交集：`accept-once / decline / cancel`。`cancel` 仅由显式点击触发，超时不升级为中止。禁止 `acceptForSession`、always-allow、execpolicy amendment、持久权限更新和权限范围扩大。Claude 允许一次只返回原输入与 allow，不返回 updatedPermissions；Codex 权限扩大请求返回空授权。MCP elicitation v1 仅拒绝/通知，不能隐式接受 URL 或授权范围。
 
@@ -182,7 +183,7 @@ acquire、prompt、configure 和回合状态转换均使用每会话串行状态
 
 marshal 决定 `accept-once` 分别映射为 Codex 的单次 accept 和 Claude 的 allow；`decline` 映射为原生拒绝；`cancel` 映射为经过验证的拒绝并中止。映射表必须由目标版本样本验证，不能直接将 marshal 字符串原样回写原生接口。
 
-统一 `input.requested` 是判别联合：共同字段为 requestId、runtimeEpoch、kind、expiresAt、notifyOnly；`kind=question` 带 questions，`kind=approval` 带 approval。approval 的 action/title/detail/decisions 一律放嵌套对象；没有另一套扁平载荷。`input.resolved` 只有标识、终态、原因和经认证的操作人，无答案和正文。
+统一 `input.requested` 是判别联合：共同字段为 requestId、runtimeEpoch、kind、expiresAt；`kind=question` 带 questions，`kind=approval` 带 approval。approval 的 action/title/detail/decisions 一律放嵌套对象；没有另一套扁平载荷。`input.resolved` 只有标识、终态、原因和经认证的操作人，无答案和正文；终态枚举固定为 `answered / declined / expired / cancelled / invalidated / failed`，不得新增未在 schema 中声明的值。
 
 questions 每项包含 id、prompt、required、multi、custom、secret，以及可选 options（id、label、description）。answers 按 questionId 携带 selectedOptionIds 和可选 text；禁止按可重复的显示 label 识别选项。approval.decisions 每项含 id、label；它们与服务端保存的允许集合一致。notify 使用 session.updated 的受限 waitKind，不注册可答的 input.requested。
 
@@ -197,7 +198,7 @@ requestId 使用随机 UUID，并以 `(deviceId, agent, sessionId, runtimeEpoch,
 权限与思考强度必须按 field 分支，禁止共用一个 agent 转移表：
 
 - permission 比较完整有效权限，包括批准策略、sandbox 文件/网络范围、额外目录和规则；模型切换和 plan 操作也检查最终权限。只允许已验证的能力子集转移；不可比较则拒绝。Claude mode 名称不构成普遍可靠的线性偏序。
-- reasoning 使用针对模型和协议版本验证的明确等级语义；已知 low < medium < high 时，只允许 high→medium/low，禁止 low→high。同值是已确认的 no-op；未知值/目录无语义依据时返回 unsupported，不从目录位置推断强弱。
+- reasoning 使用针对模型和协议版本验证的明确等级语义；已知 low < medium < high 时，只允许沿该阶梯下调（high→medium/low、medium→low），禁止任何上调（low→medium/high、medium→high）。同值是已确认的 no-op；未知值/目录无语义依据时返回 unsupported，不从目录位置推断强弱。
 - plan 是原生设置的视图。Claude plan→default 涉及权限放宽时远端拒绝；不能通过关 plan 绕过 permission 检查。Codex 同样核验组合设置。
 - model 可选择已验证目录中的模型；若其默认 effort 或权限会隐式放宽，必须保持已确认限制或拒绝。模型可选不代表费用一定更低。
 - goal 仅在完整 set/get/clear 回读及行为已验证时开放；从上游响应或 get 获取实际对象，不能用请求 objective 合成结果。skill/plugin 仅只读目录。
@@ -218,7 +219,7 @@ goal.objective、自定义说明等内容型设置同样受保护，不能从 ca
 
 content 必须同时满足源端 privacy=content 与 hub 注册记录 allowContent=true；重连协商前使用 metadata。任一授权收紧，清除离线内容、历史内容和已缓存响应，并通知浏览器清空可见缓存；已经被人看到的内容无法撤回。清理不能删除无内容的 journal 幂等状态，否则会重新允许重复执行。源机器正文依旧是权威副本。
 
-remote 交互是单独的显式内容授权，只发送决定所需字段，卡片最大 4096 UTF-8 字节。截断/脱敏导致无法完整判断动作时，卡片保留身份、到期和原因，但 accept-once 必须不可用；不能截去危险后缀仍允许批准。content 档也遵守卡片限制。
+remote 交互是单独的显式内容授权，需 node `relay=remote` 与 hub `allowInteractions=true` 同时成立；只发送决定所需字段，卡片最大 4096 UTF-8 字节。截断/脱敏导致无法完整判断动作时，卡片保留身份、到期和原因，但 accept-once 必须不可用；不能截去危险后缀仍允许批准。content 档也遵守卡片限制。所有来自 wire 的文本（消息、思考、工具输出、问题、选项、标题、错误 detail）在浏览器中按纯文本渲染，不得插入 HTML、属性或脚本；页面不得用 `innerHTML` 拼接这些字段。
 
 历史 EventBuffer 使用允许缓存的 kind 白名单；input.requested、input.resolved、secret 和答案全部排除。append、read、size 及定时清理都会处理过期项；按接收单调时间计算保留窗，不能被源端 ts 延长。时间/条数/字节任一限制达到即清理最旧项，并报告回放缺口。无新事件时到期内容也不可读取。
 
@@ -228,12 +229,12 @@ remote 交互是单独的显式内容授权，只发送决定所需字段，卡�
 
 ## 11. 同步、游标与失效恢复（P1-10）
 
-连接状态：offline → dialing → handshaking → syncing → online。syncing 时禁用写请求；在当前已有每次重连 snapshot 的基础上，增加完整性屏障与原子提交。当前 onOnline 在 socket open 后触发，帧在 hello ACK 前缓冲，尚不代表原子同步完成。
+连接状态：offline → dialing → handshaking → syncing → online。syncing 时禁用写请求；在当前已有每次重连 snapshot 的基础上，增加完整性屏障与原子提交。当前 onOnline 在 socket open 后触发，帧在 hello ACK 前缓冲，尚不代表原子同步完成。node 拨号退避从 1s 起、封顶 10s，并带 ±20% jitter；鉴权/协议错误停止拨号。该上限用于满足“网络恢复后 30s 内完成同步”，不能沿用 30s 封顶后再叠加同步时间。
 
 1. node 为已配置 agents 采集完整分页清单、能力、所有权、状态与各会话高水位 seq，发送 sync.begin/chunk/end；快照采集与增量之间有一致性屏障。
 2. hub 在暂存区验证全部分片和范围，仅在 sync.end 完整时原子替换该设备范围的索引。缺失会话删除；缺失/崩溃 agent 标记 unavailable，不将旧能力保留为可写。
 3. 缺分片/重复冲突/断线时放弃暂存区，保留旧数据并标 stale；不能部分覆盖。完整范围必须枚举空 agent 清单，防止旧会话残留。
-4. 对屏障之后的事件按 `(nodeEpoch, seq)` 去重应用；发现缺口、队列淘汰或 epoch 改变时要求重同步，不把不完整流当作已对齐。新 nodeEpoch 不与旧 seq 比大小。
+4. 对屏障之后的事件按 `(deviceId, agent, sessionId, nodeEpoch, seq)` 去重应用；发现缺口、队列淘汰或 epoch 改变时要求重同步，不把不完整流当作已对齐。不同会话的 seq 相互独立，不能只按 `(nodeEpoch, seq)` 去重或排序；新 nodeEpoch 不与旧 seq 比大小。
 5. hub 重启后清空临时连接/索引；node 重连重新同步，静默空闲会话也必须出现。不重发任何写命令；仅按第 6 节查询未决状态。
 6. 源端通过清单事件或有界周期扫描发现新建/删除会话，不依赖用户点击才更新清单。
 
@@ -245,6 +246,8 @@ WebSocket 和 SSE 均有字节背压。慢浏览器超过预算则断开并要�
 
 所有能力均要求精确版本、真实脱敏协议样本和目标机验证记录；未知方法/字段关闭对应能力，不把 model/list 成功等同全协议支持。没有安装 agent 时标明 unavailable，不制造历史数据。
 
-错误至少区分 auth-failed、device-mismatch、stale-connection、frame-invalid、device-offline、sync-required、session-unknown、writer-busy、ownership-unverified、expired、clock-skew、idempotency-conflict、outcome-unknown、approval-disabled、approval-expired、decision-invalid、widen-rejected、unsupported、readback-timeout、readback-mismatch、agent-crashed。外传 detail 仅含枚举/安全字段；禁止原样错误消息和堆栈。
+错误至少区分 auth-failed、device-mismatch、stale-connection、frame-invalid、device-offline、sync-required、session-unknown、writer-busy、ownership-unverified、expired、clock-skew、conflict、idempotency-conflict、revision-conflict、outcome-unknown、approval-disabled、approval-expired、decision-invalid、widen-rejected、unsupported、version-unsupported、size-limit、readback-timeout、readback-mismatch、agent-crashed。外传 detail 仅含枚举/安全字段；禁止原样错误消息和堆栈。
+
+错误通过四个互不混用的通道报告：命令生命周期用 `ack.code`（HTTP 映射见 §6）；异步/会话级故障用 `event.kind=error`；浏览器 API 用 HTTP 状态；连接级致命错误用 WebSocket close code。close code 固定为 4400 frame-invalid、4401 auth-failed、4403 device-mismatch、4406 version-unsupported、4408 handshake-timeout、4409 stale-connection；1009 仅表示帧超限。任何通道都不得用字符串包含关系推断错误类别，也不得省略机器可读 code。
 
 本契约的关闭标准由 [P1 验收矩阵](2026-10-29-marshal-acceptance.md)管理。文档修订完成不等于任何运行验收通过。

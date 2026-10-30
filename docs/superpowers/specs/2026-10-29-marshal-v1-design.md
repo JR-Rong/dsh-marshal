@@ -57,7 +57,7 @@ acquiring 期间第二个控制请求失败。ours-running 不接受普通 promp
 
 原生请求 id、item id、会话 id 分开保存；每张卡有随机 requestId、runtimeEpoch、原始 expiresAt 和本卡允许集合。服务端校验隐藏/伪造决定，合法首答才结算；无效决定不消耗请求。只有源端确认成功才显示已处理。
 
-交互正文统一为公共契约的嵌套判别载荷。卡片超出 4096 UTF-8 字节或脱敏导致动作不完整，允许按钮禁用，可拒绝或在源端处理。不能用不完整命令授权完整动作。
+交互正文统一为公共契约的嵌套判别载荷。卡片超出 4096 UTF-8 字节或脱敏导致动作不完整，允许按钮禁用，可拒绝或在源端处理。不能用不完整命令授权完整动作。远端卡片需 node relay=remote 且 hub 设备记录 `allowInteractions=true`；单侧授权按 off 处理，等待不超过原生 expiresAt。
 
 问题支持单选、多选、自由文本和稳定 ID；secret 默认不转发答案，明确无答案/需本机处理。DSH 超时 next()，Codex/Claude 按已验证的无答案/拒绝路径结束；MCP elicitation v1 不接受授权。
 
@@ -66,7 +66,7 @@ acquiring 期间第二个控制请求失败。ours-running 不接受普通 promp
 | 字段 | 修改规则 | 验证要求 |
 |---|---|---|
 | model | 只选支持目录；保持已确认 effort/权限限制 | 实际当前模型回读；模型变化引起的其他状态一并核验 |
-| reasoning | 模型/版本明确等级定义内只降低 | permission 逻辑不得参与；不是按目录索引方向判断 |
+| reasoning | 模型/版本明确等级定义内只沿阶梯下调（high→medium/low、medium→low） | permission 逻辑不得参与；不是按目录索引方向判断；任何上调拒绝 |
 | permission | 真实权限集合只收紧；不可比较拒绝 | sandbox、批准策略、规则/目录/网络范围都参与 |
 | plan | 映射到原生设置后执行完整权限检查 | Claude 从 plan 退出可能放宽，不能简单双向开放 |
 | goal | 可选，支持 set/get/clear 且双重 content 授权才开放编辑 | 读取 agent 返回的完整实际对象，不能回显请求字符串；metadata 不透出 objective |

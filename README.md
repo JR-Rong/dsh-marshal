@@ -53,7 +53,11 @@ npx --package dsh-marshal marshal-device laptop-b
 
 设备表是一个 JSON 文件，CLI 每次写入后都会把权限收紧到 `0600`。CLI 支持 `MARSHAL_DEVICES_FILE` 环境变量覆盖路径，但 **hub 不读这个环境变量**：一旦用了覆盖，必须同时把 hub 配置里的 `devicesFile` 指到同一个绝对路径。设备表只在 hub 启动时读取，签发新设备后要重启 hub；启动时加载不到任何设备会打 `marshal: no devices loaded from …` 警告。文件存在但无法解析时 CLI 直接报错退出，不会当成空表覆盖。
 
+> 目标契约（wire v2）要求 hub 热加载设备表、撤销 5s 内生效、文件损坏时启动失败，并要求 `dashboardToken` 来自随机源；当前实现尚未满足，见 [公共契约](docs/superpowers/specs/2026-10-29-marshal-contract.md#3-配置与默认值)。
+
 hub 启动后日志会打印 `marshal: hub ready at <origin>/marshal`。
+
+当前 v0 一个插件实例只装配一个角色，hub 机器本身不自动出现在设备列表。目标契约要求 hub 管理本机时显式增加一个本地 node 配置（独立 deviceId、相同身份/策略/去重/同步管道），而不是给 hub 开特权捷径；该装配尚未实现。
 
 ## 安装 node
 
@@ -78,7 +82,7 @@ dsh plugin add dsh-marshal
 - `token` 至少 16 字符，与 hub 设备表里那台设备的 token 完全一致。
 - `deviceName` 可选，默认取宿主环境的 `HOSTNAME`，取不到时是 `unknown`；它必须等于 `marshal-device` 签发的设备 id，否则 hello 阶段的 `device` 对不上，hub 会以 `4401 auth-failed` 关闭连接。它同时是 hello 里的设备 id，也是事件里的 `device` 字段。
 
-node 断线后按指数退避（上限 30s）重连，断线期间最多缓存 1000 帧、总字节不超过 8 MiB；升级握手返回 `401` 或 hello 阶段收到 `4401` 都视为设备 token 错误，停止重连，改对 token 后再重启。每次连上都会重发会话快照。
+node 断线后按指数退避（当前实现上限 30s；目标契约要求封顶 10s 并带 jitter，以满足网络恢复后 30s 内完成同步）重连，断线期间最多缓存 1000 帧、总字节不超过 8 MiB；升级握手返回 `401` 或 hello 阶段收到 `4401` 都视为设备 token 错误，停止重连，改对 token 后再重启。每次连上都会重发会话快照。
 
 ## 打开控制台
 
@@ -87,6 +91,8 @@ node 断线后按指数退避（上限 30s）重连，断线期间最多缓存 1
 ```text
 https://<hub-host>/marshal?token=<dashboard-token>
 ```
+
+这是当前 v0 的过渡方式。目标契约改为登录表单换 cookie，页面与 API 不再接受 URL token；迁移完成前不要把带 token 的 URL 当长期用法。
 
 token 也可以放在 `x-marshal-token` 请求头里（两者同时出现时以查询参数为准）。已落地的 `/marshal` 与 `/marshal/api/devices|sessions|command|stream` 每条路由都要 token，否则 401；其他路径不归本插件处理。
 
@@ -104,7 +110,7 @@ token 也可以放在 `x-marshal-token` 请求头里（两者同时出现时以�
 `/marshal` 与 `/marshal/uplink` 必须同源：页面用相对路径调用 `/marshal/api/*`，node 也向同一主机的 `/marshal/uplink` 拨号。
 
 - 转发 `Upgrade` 与 `Connection: upgrade`，保持请求完整，不要自己终结 WebSocket。
-- 不要吃掉 query string（`?token=`）。
+- 不要吃掉 query string（当前 v0 的 `?token=`）；目标版本改为登录 cookie 后不再依赖它。
 - node 用 `Authorization: Bearer <device-token>` 握手，不要剥掉这个头；若反代自己也用 `Authorization` 做认证，需要保留原值。
 - SSE 与 WebSocket 都是长连接：关掉响应缓冲并放大读超时。
 
@@ -152,6 +158,8 @@ location /marshal {
 
 注意：`metadata` 只裁事件文本，**不裁提问**——问题与选项从 node 发出，会走 `redaction`；答案从浏览器作为指令直接下发，不经过 node 的脱敏管线；三类内容都不会被裁成计数。
 
+目标契约把远端交互当成独立内容授权：除 node 侧 `questionRelay/approvalRelay=remote` 外，还要求 hub 设备记录的 `allowInteractions=true`（默认 false）；单侧授权按 off 处理。当前 v0 尚无这个第二把钥匙。
+
 ## 只收紧，不放宽
 
 - 设计上远端只能把权限、思考强度等往紧的方向调；放宽必须回到源机器上做。
@@ -173,9 +181,9 @@ WebSocket 上的 JSON 帧统一带 `v: 1`，四种 `type`：
 
 ## 安全说明
 
-- `dashboardToken` 与设备 `token` 都要求至少 16 字符；`marshal-device` 生成的是 24 字节随机数的 base64url（32 字符）。
+- 当前实现要求 `dashboardToken` 与设备 `token` 至少 16 字符；`marshal-device` 生成的是 24 字节随机数的 base64url（32 字符）。目标契约把 `dashboardToken` 也提高到 ≥128 bit（32 字符 base64url），并拒绝明显低熵值。
 - token 比较走 SHA-256 摘要 + `timingSafeEqual`，长度差异不落在时序上；401 不回显任何 token 片段。
-- 设备表由 CLI 写入后收紧到 `0600`；同一 token 指向两台设备时 hub 拒绝启动；hub 加载时剔除缺 `id`/`name`/`token` 的条目不参与握手。
+- 设备表由 CLI 写入后收紧到 `0600`；同一 token 指向两台设备时 hub 拒绝启动；hub 加载时剔除缺 `id`/`name`/`token` 的条目不参与握手。目标契约更进一步：文件存在但无法解析、含重复 ID 或重复 token 摘要时直接启动失败，不静默剔除。
 - 控制台的每个已登记路由都要 token；页面响应带 `referrer-policy: no-referrer`、`x-content-type-options: nosniff`、`cache-control: no-store`。
 - 单帧上限 1 MiB（双向）：超过上限的入站帧由 `ws` 以 `1009` 关闭；`/marshal/api/command` 的请求体超过 1 MiB 直接 413。
 - 非 localhost 一律 `https://` + `wss://`；明文链路会把 token 交出去。
