@@ -68,7 +68,7 @@ command.status 的原命令幂等结果与附带的原生工作单元状态分�
 
 本地新增默认关闭的 `allowDiscussion` 授权（node 本地配置与 hub 设备记录均须 true，hub 的该值随 hello.ack/`policyRevision` 下发），不由浏览器开启。所有参与讨论的成员设备以及提供历史片段的**材料来源设备**（`sourceDeviceId`）均须同时满足双侧 `allowDiscussion=true` 与现有 `content` 双授权（源端 `privacy=content` 且 hub `allowContent=true`）。hub 的该授权变化加入同一持久 `policyRevision`。每个 run 的 owner 确认绑定参与成员列表、材料来源设备、provider/model、材料摘要和策略修订；普通 `allowContent`/`allowInteractions` 均不自动授权把内容再次发给别的 agent。汇总者与其它成员同等授权。
 
-预览确认绑定当前 operatorId、各成员/来源设备的 policyRevision、准入能力、材料及预算，形成 `previewDigest`。hub 在 create 以及每次 submit/汇总分发前重验该绑定；args 携带 previewDigest 与目标设备的预期 policyRevision，均参与幂等摘要。node 在 create 时登记 run/member 与确认绑定，后续 submit 必须匹配它及当前协商授权，并在接纳与正文出站时检查本地 privacy/allowDiscussion；不能只依赖 hub 过滤。node 本地授权变化须先使关联 run 绑定失效、停止正文与新推理，再关闭该授权连接并收尾；重连或 true→false→true 不复活旧确认。hub 发现任一成员/来源设备离线、未完成同步或当前授权无法确认时暂停分发；已在途的披露不能靠后续检查撤回。
+预览确认绑定当前 operatorId、各成员/来源设备的 policyRevision、实际 provider/model、准入能力、材料及预算，形成 `previewDigest`。hub 在 create 以及每次 submit/汇总分发前重验该绑定；args 携带 previewDigest 与目标设备的预期 policyRevision，均参与幂等摘要。node 在 create 时登记 run/member 与确认绑定，后续 submit 必须匹配它及当前协商授权，并在接纳与正文出站时检查本地 privacy/allowDiscussion；不能只依赖 hub 过滤。node 本地授权变化须先使关联 run 绑定失效、停止该 run 的正文与新推理，再按 §5.1/§6 收尾；不得为此关闭整条 WSS 或影响普通监控与其它会话；重连或 true→false→true 不复活旧确认。hub 发现任一成员/来源设备离线、未完成同步或当前授权无法确认时暂停分发；已在途的披露不能靠后续检查撤回。
 
 只共享 owner 预览确认的粘贴文本（明确标为 `owner-paste`，不冒充任何设备/会话出处）或显式选择的、经源端验证的历史片段，以及本 run 的讨论输出。引用历史片段时，hub 按 `(sourceDeviceId, agent, sessionId, itemIds)` 向源端 node 只读拉取并核验（源端必须在本地确认该会话非 `purpose=discussion`、`privacy=content` 且 `allowDiscussion=true`，并执行公共契约 §10 白名单、脱敏与按 request/call/item 剔除 tool/history 中的结构化交互副本后返回片段与当前 `policyRevision`），不得从 hub `EventBuffer` 取材料或直接采信浏览器自报的“历史原文”；原生提问、审批、secret 和结构化答案不得作为材料。讨论输入、发言与汇总仅存于 RoomCoordinator 的有界 hub RAM，并通过讨论房间专用快照/流向已认证浏览器展示，**永不进入 v1 `EventBuffer`、普通会话历史或 node 离线事件队列**。首版不抓取附件/URL、不自动读取 cwd/仓库/完整历史。所有成员知道这些内容会交给列明的模型服务；不承诺原生 runtime/provider 无日志或零保留。
 
@@ -151,12 +151,12 @@ run 结束、到期、撤权或卸载时 hub 请求 discussion.dispose，node �
 |---|---|---|---|
 | G01 | R | 固定 DSH/Codex/Claude 候选版本，验证专用会话和禁用工具 | 至少两个原生平台通过；不能禁用工具/hook 的平台 unavailable；同 DSH 多 provider 不算跨平台；记录准确版本及隔离证据 |
 | G02 | U/I/R | 新建讨论、现有工作会话运行中、恶意发言要求执行/扩权 | 专用新会话；工作会话无 resume/fork/写入；终端/文件/网络工具、MCP、子 agent 调用均为零；原生交互卡为零（提问/审批按无通道拒绝并记缺席）；原有全局配置不变 |
-| G03 | U/I/R | 成员/来源设备各项讨论与 content 授权缺一；预览过期；status 后、submit 前外部更换 provider/model/能力；状态迟报或回读不可用 | 任一缺失零正文分发/零推理；create 绑定 previewDigest/policyRevision，新会话实际配置匹配后才绑定其修订；每次 submit/汇总原子比较预期配置，变化即使恢复原值也失效，零错误配置调用；不能以请求值代替回读；缺可靠原子边界则 unavailable；正常忙闲变化不误停 run；更换须新 run 确认 |
+| G03 | U/I/R | 成员/来源设备各项讨论与 content 授权缺一；预览绑定失效（成员/材料/provider-model/策略或配置已变）；status 后、submit 前外部更换 provider/model/能力；状态迟报或回读不可用 | 任一缺失零正文分发/零推理；create 绑定 previewDigest/policyRevision，新会话实际配置匹配后才绑定其修订；每次 submit/汇总原子比较预期配置，变化即使恢复原值也失效，零错误配置调用；不能以请求值代替回读；缺可靠原子边界则 unavailable；正常忙闲变化不误停 run；更换须新 run 确认 |
 | G04 | U/I | 并发开始、重复 HTTP、丢 ACK；同键只改传输字段或改语义 args；preparing 部分创建失败/未知；hub 在登记/发送/落结果边界崩溃 | 浏览器与 hub/node 稳定键协作，一个 run/命令最多一次原生调用；合法传输字段更新不改变摘要/不重执行，但仍须通过当前连接/期限检查；同键改 runExpiresAt/turnExpiresAt/previewDigest/预期策略或配置返回 idempotency-conflict；preparing 失败清理已建会话，确认后 failed，未知 paused 并保留占额、不退回 draft；重启只查询 |
 | G05 | U/I | 消息伪造作者、旧 run/成员 epoch 迟到、重复输出与乱序增量 | 作者来自认证绑定；旧代次不进入当前讨论；一个完成发言一次入封存记录，下一轮所有成员读取同一记录 |
 | G06 | U/I/R | 第三轮结束、调用额用尽、长回合、多轮累积输入逼近 64 KiB、超长输出、多个房间满额 | 名额/时间/单次组装输入 64 KiB/单次输出 16 KiB/全 hub 预算均不超界；停止新调度；无无限互相唤醒；不静默截断，不把字符数或请求取消当硬费用/执行停止证明 |
 | G07 | I/R | 成员掉线、busy、超时，首轮 0/1 人有效回复，取消确认与未确认分别注入 | busy 不排队，故障不自动重试；已终止成员可标缺席，首轮 0 有效回复直接 failed、仅 1 人有效回复跳过后续交叉轮次；未知则暂停、不发下一轮；其它 agent 的非讨论会话不受影响 |
-| G08 | I/R | 用户停止、成员/来源设备撤权或离线、策略/runtime 变化、插件卸载；completed/stopped 后撤权；本地 allowDiscussion 关闭再开启而 hub revision 未变 | 原子禁新分发，取消未确认仍未知，确认后释放；本地立即使旧 run 授权失效并断开授权连接；活跃及已结束 run 的相关正文/派生汇总/分页/SSE 待发队列清除，迟帧不填回，重新授权不复活；原认证身份下无正文查询/安全收尾仍可用，撤销凭据则远端拒绝且依赖 node 本地收尾 |
+| G08 | I/R | 用户停止、成员/来源设备撤权或离线、策略/runtime 变化、插件卸载；completed/stopped 后撤权；本地 allowDiscussion 关闭再开启而 hub revision 未变 | 原子禁新分发，取消未确认仍未知，确认后释放；本地立即使旧 run 授权失效并停止该连接的讨论正文/房间帧（不断开普通监控连接、不影响其它会话）；活跃及已结束 run 的相关正文/派生汇总/分页/SSE 待发队列清除，迟帧不填回，重新授权不复活；原认证身份下无正文查询/安全收尾仍可用，撤销凭据则远端拒绝且依赖 node 本地收尾 |
 | G09 | U/I | 秘密/原生审批答案藏在 history/tool 材料、status/command.status 原始配置或 provider URL；模型指令注入/脚本文本；未协商 discussion 时双向注入输出和状态帧 | 已知交互正文不入材料/磁盘/日志；status 只含白名单标识、修订和状态证据，未知字段不外发，不能透传配置/地址/凭据/正文；未协商均 frame-invalid 且零转发；讨论正文不入 EventBuffer/离线队列，纯文本且不能改权限/成员/调度；撤回能力不夸大 |
 | G10 | I | 浏览器重载/游标丢失、hub 重启、RAM 过期、元数据状态损坏 | 页面恢复不触发调用；重启无正文不伪造原记录，旧 run 暂停/未知且零自动汇总；损坏拒绝新运行、人工恢复 |
 | G11 | U/I/R | 意见冲突、成员缺席、汇总者自身失败/未知、汇总错误引用/额度耗尽 | 共识/分歧/未知分列；引用仅限存在且可见的封存消息；缺席不算赞成，错误引用标无效；汇总者失效不自动换人冒充，标汇总未完成并保留原发言；无虚假完整汇总、无执行任务产生 |
