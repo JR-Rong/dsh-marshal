@@ -111,7 +111,7 @@ owner 的审计身份由 hub 从认证会话赋予，不接受浏览器自报 `a
 
 | 帧 | 方向 | 必需信息与用途 |
 |---|---|---|
-| `hello / hello.ack` | node→hub / hub→node | wire 版本、契约修订、功能集合、认证设备、nodeEpoch、connectionId、operatorId/policyRevision、隐私/交互/讨论策略 |
+| `hello / hello.ack` | node→hub / hub→node | wire 版本、契约修订、功能集合、认证设备、nodeEpoch、connectionId、operatorId/policyRevision、隐私/交互/讨论策略；D1 hello 另含 node 本地 localDiscussionRevision 与 privacy/allowDiscussion 快照 |
 | `command` | hub→node | commandId、idempotencyKey、operatorId、target、op、args、issuedAt、deadline、connectionId、nodeEpoch |
 | `ack` | node→hub | commandId、connectionId、nodeEpoch、status、code、受限 result；只表示命令受理/确认状态 |
 | `event` | node→hub | deviceId、agent、sessionId、nodeEpoch、seq、ts、kind、按 kind 验证的 payload |
@@ -119,7 +119,7 @@ owner 的审计身份由 hub 从认证会话赋予，不接受浏览器自报 `a
 | `sync.ack` | hub→node | 当前 connectionId/nodeEpoch/syncId、accepted/rejected、提交版本或错误；只在原子提交后确认 |
 | `command.status / command.status.result` | hub→node / node→hub | 只读查询原幂等键状态（D1 的 `discussion.*` 另回带成员原生工作单元 `running / terminated / disposed / unknown` 状态供占额对账）；不触发执行、不携带原始正文 |
 | `inputs.snapshot / inputs.snapshot.result` | hub→node / node→hub | owner 按会话查询当前有效待答卡；node 重新执行隐私与策略校验，返回 runtimeEpoch 与同一公开序列的快照高水位 |
-| `heartbeat / heartbeat.ack` | 双向请求/应答 | 当前 connectionId/nodeEpoch、请求 nonce、发送/响应时刻；用于存活与时钟偏差估算，不携带正文 |
+| `heartbeat / heartbeat.ack` | 双向请求/应答 | 当前 connectionId/nodeEpoch、请求 nonce、发送/响应时刻；用于存活与时钟偏差估算，不携带正文；协商 D1 后，node 发出的两类帧附带当前 localDiscussionRevision 与本地 privacy/allowDiscussion 快照，hub 不回显它冒充 node 回读 |
 | `discussion.output / discussion.status` | node→hub，仅 D1 | 独立帧类型，按当前连接鉴权；deviceId/agent/sessionId/runId/memberId/turnId/nodeEpoch/runtimeEpoch/memberSeq，不携带 roomSeq；来源序号按成员/实例隔离，hub 去重后独占分配房间流 roomSeq，详见 D1 §3 |
 
 方向不符的帧按 `frame-invalid` 拒绝。target 为 `(deviceId, agent, sessionId)`；仅 `create` 与 D1 的 `discussion.create` 使用 `sessionId: null`，在 agent 级执行并以该完整 target 去重，其余操作必须有实际 sessionId。`fork` 指向父会话。create/fork/discussion.create 的新会话 ID 作为无正文结果落 journal 后返回，状态查询恢复原 ID，不通过再建会话恢复结果。agent 标识是字符串，但必须在握手支持集合中。未知操作必须拒绝；未知事件可忽略并计数，不能因此绕过身份或大小检查。每个操作的 args 由 `wire/commands` 的判别 schema 定义并在两端验证，未知字段拒绝；`observe` 的 args 区分 `history`（带不透明 cursor 和 limit，单页有界）与 `follow`（订阅/取消订阅），两者都不带写权副作用。follow 使用服务端签发、绑定认证观察者及当前连接的 subscriptionId；取消只影响自己的订阅。共享原生 follower 只在最后一个观察者退出后释放，断流/登出/卸载清理引用；两个浏览器不能互相取消或重复创建无界 follower。history、follow、状态/待答查询不占用写命令 journal。
@@ -137,6 +137,8 @@ owner 的审计身份由 hub 从认证会话赋予，不接受浏览器自报 `a
 | `error` | 受限 code、严重性、关联 ID；无原始异常内容 |
 
 D1 的 discussion.output/status 使用本节帧表的独立帧 schema，不借普通 event 信封要求的会话 seq 或 kind 表达房间序列；同样执行源端白名单/大小验证，不进入 EventBuffer、普通会话索引或 node 离线队列。`discussion.output` 可含经白名单投影的正文；`discussion.status` 仅允许上述身份/序列字段、经验证的 provider/model 标识、D1 `capabilityRevision`、`settingsRevision`、回读有效性/原生状态版本、工作单元状态、计数与错误分类，禁止正文、原始配置、服务地址/凭据和 SDK 错误。配置修订与状态证据定义见 [D1 §3](2026-10-30-marshal-discussion.md#3-架构与复用)。任一端未在 hello 握手中协商 discussion 能力时不得发送或接受这些帧；收到按 frame-invalid 拒绝，不隐式降级为普通事件。command.status 的 D1 扩展结果复用同一无正文投影，不另开原始状态出口。
+
+D1 的 localDiscussionRevision 是 node 本地讨论授权代次，与 hub 持久 policyRevision 分开；按 `(deviceId, nodeEpoch)` 单调递增，普通重连不重置，本地 privacy/allowDiscussion 每次有效变化均推进（含关闭后再开启）。仅协商 discussion 后启用此元数据扩展，不授予正文或推理权限。node 立即经既有 heartbeat 通道报告变更，hub 依当前连接/nonce 核验后使相关预览/run 失效并清正文；仅作为历史材料来源的设备也必须参与，不能依赖成员 status 才通知。沿用 5s 心跳，策略新鲜度仅由对 hub 新 nonce 的有效应答刷新；node 主动通知可使旧绑定失效但不能自行续期。15s 内无有效策略回读则仅将该设备的 D1 授权标为不可确认并清理相关讨论，普通心跳/事件不能替代策略回读或复活旧 run。身份/nonce/代次失配、同代次不同策略均不续期；节点重建后旧绑定失效。此 D1 授权失效不主动关闭健康的普通监控连接，安全收尾与无正文状态仍可用；本地 privacy 收紧对普通内容的限制仍遵守 §10，设备凭据撤销/全连接故障仍遵守 §4/§11。
 
 完整 sync 会话行是替换快照；普通 session.updated 是按 schema 合并的局部更新，两者不得混用。Capability 至少包含 observe 的独立字段（history: boolean；follow: stream/poll/none）、明确 operations 集合、工具/思考可见级别、ownership、tunables 和逐功能 unavailable reason。dispatch 不再用一个互斥字符串代表多个不同写入能力。
 

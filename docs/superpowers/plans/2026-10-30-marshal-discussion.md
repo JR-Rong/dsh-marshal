@@ -30,7 +30,8 @@
 
 - [ ] 定义 room/run/member/round/message 身份、状态机和 `discussion.create / submit / interrupt / dispose` 判别操作；独立 discussion.output/status 帧按 device/run/member/nodeEpoch/runtimeEpoch/memberSeq 去重，绑定真实 agent/session/turn，不借普通 event 的 seq；status/command.status 共用公共契约 §5 无正文白名单，回带实际 provider/model 安全标识、D1 capabilityRevision、settingsRevision、回读有效性/原生版本及工作单元状态，禁止原始配置/URL/凭据。只有 hub 接纳后分配 roomSeq，node 自报拒绝；不入 EventBuffer/离线队列。未协商 discussion 的双方都拒绝讨论帧，不让旧 node 接收房间写入。
 - [ ] 定义不可延长的 runExpiresAt、submit 的 turnExpiresAt，以及 previewDigest、预期策略/配置，均参与 args 幂等摘要；传输层时间与连接代次不参与摘要但仍独立校验。node 用保守时钟转换建立执行期限，独立于普通命令 30s 受理 TTL。
-- [ ] 实现双侧 allowDiscussion 默认 off（含本地 CLI 经进程间写锁更新设备表 `allowDiscussion` 与 `policyRevision`）、既有 content 双授权及单次 run 共享预览；成员设备与历史材料来源设备（`sourceDeviceId`，由源端 node 验证非 `purpose=discussion`、`privacy=content` 且 `allowDiscussion=true` 后按 §10 投影拉取片段，不从 `EventBuffer` 或客户端自报文本取历史）均纳入授权检查与持久 `policyRevision` 追踪。create 登记确认绑定，后续每次 submit/汇总核验；node 本地授权变化立即作废绑定并停止该 run 的讨论正文/房间帧（不断开普通监控连接、不影响其它会话），不依赖 hub revision 变化。授权依赖保留至正文清除，覆盖已结束 run（含设备表非法 reload 导致授权不可确认时的正文清理）；无正文查询/安全收尾保留身份与用途门槛，不再要求正文授权。
+- [ ] 实现双侧 allowDiscussion 默认 off（含本地 CLI 经进程间写锁更新设备表 `allowDiscussion` 与 `policyRevision`）、既有 content 双授权及服务端生成的单次 run 预览绑定；成员及历史来源设备均纳入 hub policyRevision 与 nodeEpoch/localDiscussionRevision 检查。历史仅从源端核验非讨论会话、本地授权并按 §10 投影拉取，回带当前修订，hub 拒收迟到旧策略片段；不从 EventBuffer/客户端文本冒充历史，粘贴标 owner-paste。create 绑定确认，后续每次 submit/汇总核验；授权依赖保留至正文清除，覆盖已结束 run 及非法 reload，不清未决元数据。
+- [ ] 复用 hello/heartbeat/heartbeat.ack 承载 node 本地讨论策略及 localDiscussionRevision，不开新状态通道；源端每次本地授权变化递增并立即报告，来源设备即使没有成员会话也参加。hub 在有效新 nonce 应答后刷新策略有效期，5s 心跳/15s 无有效回读即仅使相关 D1 授权不可确认；普通心跳无策略不能续期，旧代次/冲突不复活旧预览。停止相关讨论正文/新推理并清活跃及已结束 run 缓存，保留健康普通连接及无正文状态/查询/安全收尾；privacy 收紧仍影响普通内容。预览、材料拉取及正文读取/转发均核验当前授权。
 - [ ] 无正文元数据记录、进程间排他锁、浏览器 `(publicOrigin, operatorId)` 持久幂等键、hub→node 稳定写键和预留推理调用名额（仅 `submit` 占推理配额，`create/interrupt/dispose` 不占推理配额）；执行仍由 node journal 去重，查状态不重发。
 - [ ] 在 hub 安装身份状态持久保存独立 D1 初始化标记，复用 initializing 意图/配套提交/ready 流程；既有 v1 首次启用与 D1 丢文件分别处理。ready 后 journal/密钥缺失、异常残留或不匹配均 recovery-required，零新草稿/run，不自动换密钥或建空表。
 - [ ] 为恢复元数据设置容量及保留类别：未决不驱逐，已确认结束至少留 24h；node 用途墓碑保留至原生历史删除证据成立。正文 TTL 不清这些记录；恢复时先重建占额，满时拒绝新 run，保留查询/安全取消。
@@ -74,7 +75,7 @@
 **依赖**：D1-T01 至 D1-T03。
 
 - [ ] 预览成员设备/平台/provider/model、共享文本、预算及原生保留；启动回带预览版本/摘要并校验，变化须重新确认；开始/停止为独立明确操作。
-- [ ] 复用 cookie/CSRF、SSE 快照屏障/背压；页面重载、重复请求不新开 run。
+- [ ] 复用 cookie/CSRF/Origin、SSE 快照屏障/背压；讨论端点拒绝 x-marshal-token 与混合凭据，合法 cookie 也必须提供有效的服务端预览绑定，不能把 cookie 当人工确认的证明；页面重载、重复请求不新开 run。
 - [ ] 显示作者、原生完成/未知、分歧与引用；内容纯文本，没有执行建议的自动调用入口。
 - [ ] 撤权/到期清正文，覆盖已结束 run 的派生汇总、分页缓存和 SSE 待发队列，阻止延迟帧填回；恢复授权不恢复旧预览/正文，终态元数据仍可看。当前 RAM 不可用时提示材料缺失；不往浏览器持久存储写讨论正文。
 - [ ] 经实际 HTTP/WSS/runner/适配器装配执行 G01–G17 的适用 I 层与公共 P1 回归；直调普通 history/command 验证讨论隔离，不只测试房间 UI；展示正文已清除与调用结果未知的不同状态。

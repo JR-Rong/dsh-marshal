@@ -60,7 +60,7 @@
 | ID | 层 | 操作/故障注入 | 通过条件 |
 |---|---|---|---|
 | C01-01 | I/R | 浏览器提交 prompt，经实际 hub 路由、WSS 和 runner 返回成功 ACK | runtime 调用恰好一次；HTTP 在 TTL 内返回 accepted；回合尚未结束时不显示 completed |
-| C01-02 | I | runtime 拒绝；另测 runtime 异常与非法 ACK | 仅有原生未受理且无副作用证据才 rejected，调用后异常无此证据则 unknown；正确分类返回发起请求；非法 ACK 不完成 pending；pending/timer 无泄漏 |
+| C01-02 | I | runtime 拒绝；另测 runtime 异常与非法 ACK | v0/v1 仅有原生未受理且无副作用证据才 rejected，调用后异常无此证据则 unknown；D1 create 的零推理且已确认销毁例外按公共契约 §6 及 G04 单独验证，不泛化至其它操作；正确分类返回发起请求；非法 ACK 不完成 pending；pending/timer 无泄漏 |
 | C01-03 | I | agent 已受理后丢 ACK，再断开连接 | 页面显示 outcome-unknown；零自动重发；只读查询可恢复已记录状态 |
 | C01-04 | I | 回合最终失败或被打断，先前 ACK 已成功 | 最终状态依据 turn 事件；不得把 accepted 永久当作任务成功 |
 | C01-05 | U/I | 原生调用已产生受理/副作用后抛错或超时；设置超时后进程崩溃；mismatch 后查询 | 无结果证据为 outcome-unknown，不能报 rejected；pending-confirmation 落盘且恢复未知；实际 mismatch 为 confirmed + readback-mismatch，UI 不显示设置成功；同键零再执行 |
