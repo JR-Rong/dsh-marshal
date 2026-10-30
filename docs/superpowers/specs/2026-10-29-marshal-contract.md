@@ -71,7 +71,7 @@ wire v1/v2 混接必须显式失败，UI 给出协议不匹配；不得用旧节
 | `codexExecutable / claudeExecutable` | node | 可选显式路径；缺省按已验证的包入口/PATH 探测，不猜内网地址 |
 | `redaction` | node | 默认附加规则为空，但内置敏感模式始终生效；附加规则不能移除内置规则 |
 | `ringBufferMinutes` | hub | 默认 15；1–15；v0 不提供内容补看，v1 才生效 |
-| `allowDiscussion` / 设备记录 `allowDiscussion` | node / hub | 均默认 `false`；仅后续 [D1 讨论组阶段](2026-10-30-marshal-discussion.md)启用，还要求双侧 `content` 授权与单次 run 预览确认；v0/v1 不开放 |
+| `allowDiscussion` | node | 默认 `false`；仅后续 [D1 讨论组阶段](2026-10-30-marshal-discussion.md)启用，还要求 hub 设备记录同名授权、双侧 `content` 授权与单次 run 预览确认；v0/v1 不开放 |
 
 固定资源预算：出站单帧不超过 1 MiB；单张交互卡不超过 4096 UTF-8 字节；node 离线事件队列最多 1000 条且总计 8 MiB；单设备同步暂存不超过 16 MiB、hub 全部暂存不超过 64 MiB；SSE 每客户端待写不超过 4 MiB；journal 必须有显式本地容量上限并在启动时校验，未决项永不驱逐。v1 历史缓冲每会话最多 2000 条/8 MiB、hub 总计 64 MiB。D1 讨论房间的调用、轮次与正文预算见 D1 文档，并共享 hub 内容 64 MiB 总预算。任何一项达到上限都触发淘汰或拒绝；这些是硬限额，不是“目标平均值”。
 
@@ -136,7 +136,7 @@ owner 的审计身份由 hub 从认证会话赋予，不接受浏览器自报 `a
 | `capability.changed` | 当前会话的完整能力快照、revision、回读时间；不是不明确的局部 patch |
 | `error` | 受限 code、严重性、关联 ID；无原始异常内容 |
 
-D1 的 discussion.output/status 使用本节帧表的独立帧 schema，不借普通 event 信封要求的会话 seq 或 kind 表达房间序列；同样执行源端白名单/大小验证，不进入 EventBuffer、普通会话索引或 node 离线队列。`discussion.output` 可含经白名单投影的正文，`discussion.status` 只含状态、计数和错误分类，不携带正文。任一端未在 hello 握手中协商 discussion 能力时不得发送或接受这些帧；收到按 frame-invalid 拒绝，不隐式降级为普通事件。
+D1 的 discussion.output/status 使用本节帧表的独立帧 schema，不借普通 event 信封要求的会话 seq 或 kind 表达房间序列；同样执行源端白名单/大小验证，不进入 EventBuffer、普通会话索引或 node 离线队列。`discussion.output` 可含经白名单投影的正文；`discussion.status` 仅允许上述身份/序列字段、经验证的 provider/model 标识、D1 `capabilityRevision`、`settingsRevision`、回读有效性/原生状态版本、工作单元状态、计数与错误分类，禁止正文、原始配置、服务地址/凭据和 SDK 错误。配置修订与状态证据定义见 [D1 §3](2026-10-30-marshal-discussion.md#3-架构与复用)。任一端未在 hello 握手中协商 discussion 能力时不得发送或接受这些帧；收到按 frame-invalid 拒绝，不隐式降级为普通事件。command.status 的 D1 扩展结果复用同一无正文投影，不另开原始状态出口。
 
 完整 sync 会话行是替换快照；普通 session.updated 是按 schema 合并的局部更新，两者不得混用。Capability 至少包含 observe 的独立字段（history: boolean；follow: stream/poll/none）、明确 operations 集合、工具/思考可见级别、ownership、tunables 和逐功能 unavailable reason。dispatch 不再用一个互斥字符串代表多个不同写入能力。
 
@@ -178,6 +178,8 @@ node 是去重的最终权威。按幂等域原子登记并在调用 agent 前�
 本节持久登记只适用于具有副作用的操作；observe/history、command.status、inputs.snapshot 使用有界只读请求，不创建 admitted，也不因写 journal 已满而失去查询恢复能力。同一路径的 node journal/HMAC 状态由一个运行实例持有进程间排他锁；第二实例启动失败，不能各自去重后分别调用。
 
 D1 的 hub 房间 journal 也遵守未决记录不驱逐与初始化完整性规则；首次启用由独立持久标记区分，已初始化丢文件不能建空表。正文 15min 保留期不清除命令关联、占额证据或 node 会话用途墓碑；确认终止并完成对账后才能释放未知 run 的并发槽位，见 [D1 §6](2026-10-30-marshal-discussion.md#6-恢复汇总与生命周期)。
+
+D1 安全收尾是“容量满拒绝新写”的窄例外：create 在原生创建前预留会话/run 恢复槽位及稳定 dispose 键，submit 在原生受理前登记该回合的取消关联及稳定 interrupt 键；到期取消及 discussion.interrupt/dispose 复用这些槽位，任意其它新键拒绝，不无限增加记录。按已登记的原生会话/回合身份与原子状态结算收尾，同键同载荷共享结果、同键不同载荷仍 idempotency-conflict，不放宽 create/submit 或允许其它副作用。槽位不能可靠建立时禁止启动；已有调用的收尾落盘失败仍尽力安全取消，但进入 recovery-required/unknown，不回报持久成功或释放未知占额。该例外保留原身份与用途校验，不能用任意 sessionId 请求取消；细则见 [D1 §5.1](2026-10-30-marshal-discussion.md#51-node-独立执行期限)。
 
 原生调用已经开始后发生异常/超时，若没有可靠受理、实际结果或原生明确未受理且无副作用的证据，必须记 outcome-unknown，不能包装成 rejected。已知受理后回合失败用 turn 终态表示；设置 mismatch 持久为 confirmed 并附 readback-mismatch。pending-confirmation 必须落盘，崩溃后按未决项恢复。状态查询未找到键（包括已过保留期）返回 outcome-unknown / record-unavailable，不能推断从未执行或建议安全重发。
 
@@ -258,11 +260,11 @@ configure 携带 `expectedRevision=(runtimeEpoch, settingsRevision)`，它比较
 
 出站顺序：按事件类型验证 → 字段白名单投影 → 脱敏 → UTF-8 大小检查 → 编码。适用于事件、ACK/result、错误、同步快照、只读查询、审计，以及 D1 的 discussion.output/status；不得只清理 event.payload。未知对象字段默认丢弃；深度超限截除并标记，不原样保留。
 
-metadata 只发会话标识、状态、时间、计数、工具名及经允许的字段名。cwd、prompt preview、原生标题可能含源码/凭据，默认不发；显示标题用设备名/agent/短 ID，源端显式标记为可公开的别名才允许发送。内置敏感模式覆盖已知 token/私钥/连接串，但不声称正则可识别所有秘密；隐私主要由字段白名单保证。
+metadata 只发会话标识、状态、时间、计数、工具名及经允许的字段名；D1 状态查询另允许 §5 明列的配置标识/修订与状态证据，不允许整份能力或设置对象。provider/model 使用经验证的目录标识，不能把用户自由文本、服务 URL 或密钥作为标识原样发出；无法安全提供且核验实际配置的平台不开放 D1。cwd、prompt preview、原生标题可能含源码/凭据，默认不发；显示标题用设备名/agent/短 ID，源端显式标记为可公开的别名才允许发送。内置敏感模式覆盖已知 token/私钥/连接串，但不声称正则可识别所有秘密；隐私主要由字段白名单保证。
 
 goal.objective、自定义说明等内容型设置同样受保护，不能从 capability/current/pending 绕过 metadata。没有双重 content 授权时，goal 编辑关闭（privacy-readback-unavailable），只显示安全状态/计数；真实完整对象仍可在源端内部参与校验。大文本事件在源端按完整 UTF-8 边界分片，控制帧超限返回分类错误；不能任意截断 JSON 信封或 required 字段后继续执行。
 
-content 必须同时满足源端 privacy=content 与 hub 注册记录 allowContent=true；重连协商前使用 metadata。D1 讨论正文另需双侧 allowDiscussion=true、仍有效的 run 预览确认和未变化的策略修订；任一不成立时只发无正文状态。任一授权收紧，清除离线内容、历史内容和已缓存响应，并通知浏览器清空可见缓存；已经被人看到的内容无法撤回。hub 内容/交互授权收紧时先停止向浏览器转发受影响载荷，再关闭设备连接；node 在连接失效时停用协商授权，禁止正文外发与远端作答。暂时断线期间已认领原生等待按 §8 保留到原期限，与明确 off/撤权的终态结算分开。重连核验持久的 operatorId/policyRevision；已变更策略下的旧内容/卡/ACK 正文不得恢复，未变更且仍有效的待答可重新投影。允许方收紧不能只改 hub 文件而继续沿用 node 缓存的授权。清理不能删除无内容的 journal 幂等状态，否则会重新允许重复执行。源机器正文依旧是权威副本。
+content 必须同时满足源端 privacy=content 与 hub 注册记录 allowContent=true；重连协商前使用 metadata。D1 讨论正文另需双侧 allowDiscussion=true、仍有效的 run 预览确认和未变化的策略修订；任一不成立时禁止正文，只有当前认证/能力协商允许的无正文恢复状态可发，不能借此绕过 §5 的未协商拒收。D1 授权覆盖成员、历史材料来源设备和派生汇总，直至所有正文缓存清除，包括已完成/停止 run 的快照、分页及 SSE；恢复授权不恢复失效的旧预览或旧正文。任一授权收紧，清除离线内容、历史内容和已缓存响应，并通知浏览器清空可见缓存；已经被人看到的内容无法撤回。hub 内容/交互/讨论授权收紧时先停止向浏览器及其它讨论成员转发受影响载荷，再关闭设备连接；node 在连接失效时停用协商授权，禁止正文外发与远端作答。暂时断线期间已认领原生等待按 §8 保留到原期限，与明确 off/撤权的终态结算分开。重连核验持久的 operatorId/policyRevision；已变更策略下的旧内容/卡/ACK 正文不得恢复，未变更且仍有效的待答可重新投影。允许方收紧不能只改 hub 文件而继续沿用 node 缓存的授权。清理不能删除无内容的 journal 幂等状态，否则会重新允许重复执行。源机器正文依旧是权威副本。
 
 remote 交互是单独的显式内容授权，需 node `relay=remote` 与 hub `allowInteractions=true` 同时成立；只发送决定所需字段，卡片最大 4096 UTF-8 字节。截断/脱敏导致无法完整判断动作时，卡片保留身份、到期和原因，但 accept-once 必须不可用；不能截去危险后缀仍允许批准。content 档也遵守卡片限制。所有来自 wire 的文本（消息、思考、工具输出、问题、选项、标题、错误 detail）在浏览器中按纯文本渲染，不得插入 HTML、属性或脚本；页面不得用 `innerHTML` 拼接这些字段。
 
