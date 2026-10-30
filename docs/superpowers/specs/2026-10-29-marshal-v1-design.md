@@ -45,7 +45,7 @@ v1 在 v0 基础上增加 Codex/Claude；前提是完成 [v0 P1 增量计划](..
 
 发现到但没有可靠控制证据的会话为 foreign-unknown。浏览器点击仅 observe，不 resume、不创建 Query、不启动推理。显式 acquire 使用上游排他能力或经过验证的单一宿主控制边界；仅 resume 成功不够。
 
-acquiring 期间第二个控制请求失败。ours-running 不接受普通 prompt/configure，不排队；steer 只在明确验证原生语义后开放。原生锁丢失、runtimeEpoch 改变或崩溃时立刻撤销写权，旧审批/打断失效。
+acquiring 期间第二个新控制请求失败。会话锁不跨整段推理/输入等待；当前回合的合法 answer/decide/interrupt 按独立身份验证，不因 busy 阻塞到回合结束。ours-running 不接受普通 prompt/configure，不排队；steer 只在明确验证原生语义后开放。原生锁丢失、runtimeEpoch 改变或崩溃时立刻撤销写权，旧审批/打断失效。
 
 没有可用排他机制时，保留外部历史只读。可提供独立受管环境内的新会话或显式 fork，但必须报告它是新身份，不是接管原会话；该环境本身仍需证明单写者边界。
 
@@ -74,9 +74,9 @@ acquiring 期间第二个控制请求失败。ours-running 不接受普通 promp
 
 v1 只在 idle 时请求设置变化，目标是下一回合。立即生效的原生 setter 也不在活跃回合调用；不能为改 effort 直接结束进行中的 Query。
 
-能力快照包含 current/confirmedAt/revision 和独立 pending。无回读渠道的字段 editable=false，并解释原因。setter 返回 void、supportedModels 目录、旧 init 或请求值都不能当作回读。
+能力快照包含 current/confirmedAt/revision 和独立 pending；expectedRevision 绑定 runtimeEpoch 与整体 settingsRevision，关联字段变化共同推进版本。无回读渠道的字段 editable=false，并解释原因。setter 返回 void、supportedModels 目录、旧 init 或请求值都不能当作回读。
 
-10 秒未确认显示 pending-confirmation/readback-timeout；保留旧 current，不自动回滚。实际值不同则先广播实际值再报 mismatch。确认事件必须有关联/版本依据；迟到旧值不得覆盖更高 revision。
+10 秒未确认显示 pending-confirmation/readback-timeout；保留旧 current，不自动回滚。实际值不同则先广播实际值再以 confirmed + readback-mismatch 报告；若意外放宽或不可比较则 settings-unsafe 禁新推理/设置，不能据此扩大许可基线，源端人工恢复并验证后解锁。确认事件必须有关联/版本依据；迟到旧值不得覆盖更高 revision。
 
 需要在下一回合才能得到证据的设置，只有能建立“确认先于执行副作用”的已验证屏障时才可编辑；否则首版只读，不为凑齐“五项可改”牺牲真实回读。具体规则只定义在公共契约 §9。
 
@@ -91,9 +91,9 @@ v1 只在 idle 时请求设置变化，目标是下一回合。立即生效的�
 | 幂等与审计元数据 | node 受限持久文件 | 受控状态查询/本地审计 | 公共契约保留策略 |
 | 原始会话历史 | agent 原位置 | 原生只读分页 | agent 自己管理 |
 
-审批、提问、答案不进历史缓冲，也不因为断线进入离线正文队列。迟到或刷新页面重取源端当前有效卡；源端不可达时禁用决定。短暂断线仅保留原生等待至原期限，身份/策略/runtime 未变且同步完成后才恢复；明确撤权、策略修订变化或实例失效按公共契约 §8 一次结算原生等待，不能只清卡或在恢复授权后复活。历史到期清理同时发生在读取、计数、追加和定时器，无新事件也必须到期。
+审批、提问、答案不进历史缓冲，也不因为断线进入离线正文队列。每次 SSE 建连均重取索引/能力和源端当前有效卡，有效内容游标也不能替代待答刷新；源端不可达时禁用决定。短暂断线仅保留原生等待至原期限，身份/策略/runtime 未变且同步完成后才恢复；明确撤权、策略修订变化或实例失效按公共契约 §8 一次结算原生等待，不能只清卡或在恢复授权后复活。历史到期清理同时发生在读取、计数、追加和定时器，无新事件也必须到期。
 
-内容上限、双重授权、敏感字段投影及策略收紧清理见公共契约。浏览器已经看到的信息无法撤回，不能宣称清除缓存等于抹除披露。
+tool/history 的结构化交互副本同样剔除正文，无法分离时仅元数据，不以 input kind 过滤代替。内容上限、双重授权、敏感字段投影及策略收紧清理见公共契约。浏览器已经看到的信息无法撤回，不能宣称清除缓存等于抹除披露。
 
 ## 7. 失效与用户可见状态
 

@@ -200,6 +200,7 @@ WebSocket 上的 JSON 帧统一带 `v: 1`，四种 `type`：
 
 - v0 已在分支 `feat/v0` 实现并提交：hub + node，DSH↔DSH 全链路，含双向提问。
 - v1（Codex / Claude Code 适配器、设置切换与回读）尚未开始。
+- D1 跨平台讨论组仅有设计与计划：显式选择成员、只讨论与汇总、用户决定后续行动；尚未实现，也未安装或验证参考插件。
 - 两台真机上的联调与验收尚未记录；本文档中的部署步骤按代码实现编写，未附现场验收结果。
 - 当前已有 ACK 路由、hub 并发同键合并、node deadline 检查、事件设备/agent 校验及重连快照。ACK 来源绑定、node 持久去重、全通道隐私与原子同步等仍见 P1 增量计划；超时不能据此认定未执行，也不保证重启后不重复执行。
 
@@ -217,6 +218,9 @@ WebSocket 上的 JSON 帧统一带 `v: 1`，四种 `type`：
 | [设计（v1）](docs/superpowers/specs/2026-10-29-marshal-v1-design.md) | Codex / Claude 的审批、设置与所有权 |
 | [架构（v1）](docs/superpowers/specs/2026-10-29-marshal-v1-architecture.md) | 适配器、状态机与兼容策略 |
 | [计划（v1）](docs/superpowers/plans/2026-10-29-marshal-v1.md) | v1 实施计划 |
+| [讨论组设计（D1）](docs/superpowers/specs/2026-10-30-marshal-discussion.md) | 跨平台讨论边界、调度/授权/恢复及 G01–G12 验收 |
+| [讨论组计划（D1）](docs/superpowers/plans/2026-10-30-marshal-discussion.md) | v1 基础完成后的独立实施阶段，全部待执行 |
+| [DSH 编排插件参考](docs/superpowers/spikes/2026-10-30-orchestration-references.md) | dsh-agent-teams、官方 Agent Team/workflow 的可复用机制与限制 |
 
 ## 开发与验证
 

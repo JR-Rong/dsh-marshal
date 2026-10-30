@@ -22,16 +22,16 @@ hub、node、浏览器为三个角色；一个 npm 插件包按 role 装配。hu
 | src/config.ts | 严格配置验证；稳定 deviceId；默认 off；hub publicOrigin；源端与 hub 内容授权 |
 | src/wire/frames.ts | 按帧类型/方向验证、版本和连接代次；统一 ms 时间与 schema |
 | src/wire/commands.ts | op 判别、规范化载荷、目标与状态版本，不使用任意字符串透传 |
-| src/hub/devices.ts、src/bin/device.ts | 一机一密签发/撤销、只存 token 摘要、限制文件权限；文件损坏启动失败；变更热加载；授权修订高水位与撤销墓碑随授权变更原子持久化，写入失败不发布新授权；已初始化状态缺失/回退 recovery-required |
-| src/hub/identity.ts | 持久 operatorId 生成与受限存储；登录会话→审计身份的映射 |
+| src/hub/devices.ts、src/bin/device.ts | 一机一密签发/撤销、只存 token 摘要、限制文件权限；文件损坏启动失败；变更热加载；授权修订高水位与撤销墓碑随授权变更原子持久化，写入失败不发布新授权；已初始化整表缺失/损坏启动失败，修订缺失/回退 recovery-required；CLI/hub 共用进程间写锁 |
+| src/hub/identity.ts | 与设备 CLI 共用初始化器，意图/空表/身份配套提交，崩溃恢复同一身份；显式旧表迁移；登录会话→审计身份的映射 |
 | src/hub/registry.ts | 当前连接与 connectionId；替换/关闭使用比较后删除 |
 | src/hub/server.ts | WSS Upgrade、Authorization、hello ACK、每帧身份检查、握手超时 |
 | src/hub/relay.ts | event/ack/error 显式路由、in-flight 合并、状态查询、控制帧背压 |
 | src/hub/sync.ts | 分片快照暂存、原子替换范围、游标与 stale 状态 |
 | src/hub/api.ts、src/hub/page.ts | 登录/登出/CSRF/会话期限/失败限速、API、SSE、只读历史分页、交互状态、受限请求大小、纯文本渲染 |
-| src/node/link.ts | 握手后上线、重连同步、分离控制帧与离线事件、字节预算；拨号 1s 起、封顶 10s、带 jitter |
+| src/node/link.ts | 握手后上线、重连同步、分离控制帧与离线事件、字节预算；拨号 1s 起、封顶 10s、带 jitter；5s 心跳/15s 无应答检测半开连接 |
 | src/node/runner.ts | 身份、期限、幂等、写权与 op 验证；结果/错误投影 |
-| src/node/journal.ts | node 去重持久记录；原子 admitted/结果；无正文；崩溃 unknown |
+| src/node/journal.ts | 副作用命令去重，实例排他锁；原子 admitted/含 pending 的结果；无正文；调用后故障/崩溃 unknown；只读查询不占容量 |
 | src/node/sync.ts | 分页清单、快照/原生状态屏障、epoch/公开 seq、周期发现/删除；扫描不得覆盖更新的状态 |
 | src/node/privacy.ts | 字段白名单、内置/附加脱敏、字节限制；覆盖全部出站通道 |
 | src/node/inputs.ts、src/node/questions.ts | 当前待答、策略、首答竞争、waterfall 交回、非历史快照 |
@@ -73,7 +73,7 @@ hub、node、浏览器为三个角色；一个 npm 插件包按 role 装配。hu
 
 ACK、错误帧与连接关闭必须有独立分支；不得只接 event。没有收到受理证据时显示 outcome-unknown，绝不靠超时推断执行未发生。查询只读；hub 不重放命令。
 
-每会话互斥检查覆盖等待期间期限变化。重复请求直接取 journal 状态，不重新创建 DSH requestId。进程在任意崩溃窗口退出，未决操作按公共契约恢复为 unknown，不构造“最终一定只执行成功一次”的承诺。
+每会话互斥检查覆盖等待期间期限变化；锁只包受理/状态转换，不跨整段推理、输入等待或设置回读。长回合中合法 answer/cancel/interrupt 可以及时进入原生入口，新 prompt 仍 busy 拒绝。重复请求直接取 journal 状态，不重新创建 DSH requestId。进程在任意崩溃窗口退出，未决操作按公共契约恢复为 unknown，不构造“最终一定只执行成功一次”的承诺。
 
 ## 5. 连接与状态同步
 
@@ -89,7 +89,7 @@ ACK、错误帧与连接关闭必须有独立分支；不得只接 event。没�
 
 nodeEpoch/hubEpoch 的生命周期属于 marshal 角色实例；同一 OS 进程中的插件重载也须换代并屏蔽旧回调。普通重连保持 epoch；journal、operatorId 和持久策略修订不随内存状态重置。
 
-v0 不存内容补看历史；页面断线可重建索引和当前待答，时间线显示缺口。v1 再加入有限内容回放，不能把 v0 的状态同步延后到 v1。
+v0 不存内容补看历史，每次 SSE 重连 reset；每次建流先订阅再读取索引/能力/待答高水位快照，屏障后增量归并，时间线显示缺口。v1 有效游标也不能跳过当前待答刷新，具体屏障与失败行为见公共契约 §11。v1 再加入有限内容回放，不能把 v0 的状态同步延后到 v1。
 
 ## 6. 普通问题与交互生命周期
 
@@ -101,11 +101,11 @@ DSH 认领模式只用于已验证的普通问题 waterfall；持有该请求的
 
 ## 7. 隐私与安全
 
-事件、ACK、错误、快照、待答、状态查询全部在源端投影。metadata 不透出原始标题/cwd；content 必须由设备和 hub 同时允许。内置敏感规则不可关闭，递归超限丢弃而非放行。
+事件、ACK、错误、快照、待答、状态查询全部在源端投影。metadata 不透出原始标题/cwd；content 必须由设备和 hub 同时允许。内置敏感规则不可关闭，递归超限丢弃而非放行；按 request/call/item 关联剔除 tool/history 中的结构化交互副本，不只过滤 input kind。
 
 日志保留安全枚举与标识；原生异常、命令正文和已认证 token 均不记录。审计与 journal 分开：前者供追踪，后者供执行去重；二者都不持久化内容。
 
-浏览器 API/SSE 使用登录 cookie，写请求按固定 publicOrigin 和服务端会话绑定 CSRF 校验；session 查询供重载取回身份/CSRF且不续期。非浏览器 x-marshal-token 独立验证，混合凭据拒绝，不能通过无效头回退 cookie 绕开 CSRF；设备通道使用 Authorization。具体 cookie/认证分支以公共契约 §4 为准。浏览器会话有 8h 绝对与 30min 空闲期限，logout/轮换/到期后新请求拒绝且既有 SSE 在 5s 内关闭；心跳不续空闲期。登录失败按来源与全局限速；dashboardToken 必须来自随机源。WSS 握手后每帧再次绑定 deviceId/connectionId；旧 close 不能注销新连接。HTTP 请求体、JSON 深度、SSE 写缓存、同步暂存、设备待握手数量都有硬限额。设备表损坏时启动失败，热加载变更后 5s 内撤销生效；页面把 wire 文本按纯文本渲染。
+浏览器 API/SSE 使用登录 cookie，写请求按固定 publicOrigin 和服务端会话绑定 CSRF 校验；session 查询供重载取回身份/CSRF且不续期。非浏览器 x-marshal-token 独立验证，混合凭据拒绝，不能通过无效头回退 cookie 绕开 CSRF；设备通道使用 Authorization。具体 cookie/认证分支以公共契约 §4 为准。浏览器会话有 8h 绝对与 30min 空闲期限，logout/轮换/到期后新请求拒绝且既有 SSE 在 5s 内关闭；心跳不续空闲期。登录失败按来源与全局限速；dashboardToken 必须来自随机源。WSS 握手后每帧再次绑定 deviceId/connectionId；旧 close 不能注销新连接。HTTP 请求体、JSON 深度、SSE 写缓存、同步暂存、设备待握手数量都有硬限额。设备表损坏时启动失败，修订异常进入恢复；节点自报更高 revision 只隔离本设备，不凭该声明冻结全局。热加载变更后 5s 内撤销生效；页面把 wire 文本按纯文本渲染。
 
 ## 8. 可观测性与运行目标
 

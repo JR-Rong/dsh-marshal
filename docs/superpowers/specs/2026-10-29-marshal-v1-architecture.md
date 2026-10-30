@@ -88,29 +88,29 @@ setModel/setPermissionMode 等 void setter 不提供真实值；不能先改 ses
 
 ## 6. 所有权与命令上下文
 
-acquire、prompt 和 configure 复用每会话状态机；抢占、队列和自动 fork 都禁止。可靠证据包含机制类型、持有者、runtimeEpoch、取得/失效条件；仅记录一个 boolean owned 不够。
+acquire、prompt 和 configure 复用每会话状态机；锁只包受理/转换，不跨推理、输入等待或回读，answer/decide/interrupt 在活跃回合中仍按身份验证并结算；抢占、队列和自动 fork 都禁止。可靠证据包含机制类型、持有者、runtimeEpoch、取得/失效条件；仅记录一个 boolean owned 不够。
 
-节点 journal 记录公共命令生命周期；原生适配器不得因 transport timeout 自行重发 turn/start 或 query 输入。可选原生幂等能力只有在真实版本测试后才能用于恢复。重启恢复清单不等于恢复控制权，更不等于恢复原命令执行。
+节点 journal 仅记录副作用命令生命周期，含持久 pending；调用后异常无证据即 unknown，只读查询不占写 journal。原生适配器不得因 transport timeout 自行重发 turn/start 或 query 输入。可选原生幂等能力只有在真实版本测试后才能用于恢复。重启恢复清单不等于恢复控制权，更不等于恢复原命令执行。
 
-create/fork 若开放，必须显式操作、授权 cwd、捕获实际新 ID、建立其控制边界；默认不实现，未验证时 capability 关闭。
+create/fork 若开放，必须显式操作、授权 cwd、捕获实际新 ID 并落 journal、建立其控制边界；create 的 sessionId=null，fork 指向父会话，丢 ACK 查询原 ID 而非重新创建；默认不实现，未验证时 capability 关闭。
 
 ## 7. 设置端口
 
-设置组件保存 confirmed snapshot、revision、pending request，不保存一个兼作请求和回读的 settings 对象。
+设置组件保存 confirmed snapshot、跨关联字段的 settingsRevision/runtimeEpoch、pending request，不保存一个兼作请求和回读的 settings 对象。
 
-流程：校验 expectedRevision/idle/写权 → field 策略与组合权限检查 → 注册回读观察 → 调用原生 setter → 关联实际响应/通知/get → 发布实际能力 → ACK confirmed/mismatch/pending。
+流程：校验 expectedRevision/idle/写权 → field 策略与组合权限检查 → 注册回读观察 → 调用原生 setter → 关联实际响应/通知/get → 发布实际能力 → ACK confirmed（或附 readback-mismatch）/pending-confirmation。
 
 一次 session 同时只允许一个设置请求。读不到 current 时不比较“收紧”；目录数组顺序仅用于显示，权限组合和 effort 等级各自显式定义。相同已确认值 no-op；unknown 值拒绝；plan/model 引起的间接权限变化同样检查。
 
-10 秒超时移除请求等待资源但保留 pending 状态和长期状态观察。迟到通知能更新实际值，不得错误完成另一个设置请求。原生实际结果不同也必须发布，不做回滚。goal 读取实际 set/get/clear 返回，不从请求文本构造。
+10 秒超时移除请求等待资源但保留 pending 状态和长期状态观察。迟到通知能更新实际值，不得错误完成另一个设置请求。原生实际结果不同也必须发布，不做回滚；意外放宽/不可比较则 settings-unsafe 禁新推理/设置，源端人工恢复并验证后解锁，不以错误实际值重建更宽许可基线。goal 读取实际 set/get/clear 返回，不从请求文本构造。
 
 ## 8. 历史、待答和浏览器
 
-EventBuffer 只接受缓存白名单，并同时维护全局/会话条数与字节计数。过期队列按接收时间维护，append/read/size/周期清理都先 evict；避免每条事件全局 indexOf/splice 的平方级淘汰成本。淘汰后所有辅助索引也释放引用。
+EventBuffer 只接受已剔除 tool/history 结构化交互正文的缓存白名单，并同时维护全局/会话条数与字节计数。过期队列按接收时间维护，append/read/size/周期清理都先 evict；避免每条事件全局 indexOf/splice 的平方级淘汰成本。淘汰后所有辅助索引也释放引用。
 
 PendingInputs 保留在 node；hub 的输入路由只转发 owner 的按会话只读快照查询，不入历史。待答查询与 SSE 订阅有屏障，返回公共契约 §8 按已验证原生时钟域计算的 expiresAt 与 runtimeEpoch；回答时再次校验，不能仅凭快照可答。临时断线不延长原生等待，恢复须身份/策略/runtime 未变；撤权/策略修订变化或卸载一次性结算原生请求后清理，不能仅删除卡片。
 
-SSE 回放使用 hubEpoch + cursor；复用 v0 reset/sync。浏览器处理 snapshot、reset 和增量时按复合键去重；不因历史回放生成可批准旧卡。慢客户端有字节预算，断开后明确重取快照。
+SSE 回放使用 hubEpoch + cursor；复用 v0 reset/sync。即使游标有效也刷新索引/能力/有效待答；先订阅暂存再取带高水位的快照，只应用较新增量，失败保持未知不可答。浏览器处理 snapshot、reset 和增量时按复合键去重；不因历史回放生成可批准旧卡。慢客户端有字节预算，断开后明确重取快照。
 
 ## 9. 安全与错误映射
 

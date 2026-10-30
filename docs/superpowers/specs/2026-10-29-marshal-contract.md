@@ -8,7 +8,7 @@
 
 - [总体设计](2026-10-29-marshal-design.md)定义产品边界；架构文档定义模块责任；计划定义实现顺序。
 - [验收矩阵](2026-10-29-marshal-acceptance.md)定义通过条件。修改本文时必须同步关联任务和验收用例。
-- 当前 `feat/v0` 已有 wire `v: 1` 实现。本文引入不兼容的身份、帧和操作语义，目标升级为 `v: 2`、`contractRevision: p1-review-1`；产品 v0/v1 与 wire 版本分开编号。
+- 当前 `feat/v0` 已有 wire `v: 1` 实现。本文引入不兼容的身份、帧和操作语义，目标升级为 `v: 2`、`contractRevision: p1-review-2`；产品 v0/v1 与 wire 版本分开编号。
 - 目标握手交换 wire 版本、契约修订和功能集合；不兼容版本拒绝控制连接，不静默降级。不将当前成功握手等同目标契约通过。
 - 当前已有模块与待新增模块见架构和增量计划；本文的 journal、原子 sync、cookie 登录等尚未实现。逐项状态见 [基线复核](2026-10-29-marshal-acceptance.md#0-评审基线与已有证据)。
 
@@ -58,7 +58,7 @@ wire v1/v2 混接必须显式失败，UI 给出协议不匹配；不得用旧节
 | `deviceName` | node | 默认 hostname，仅显示用途，不参与鉴权或会话键 |
 | `dashboardToken` | hub | 必填，与 device token 隔离；由至少 24 随机字节生成 32 字符 base64url（≥192 bit 熵）。长度/弱口令校验不证明随机性；长度不足 32 字符、单字符重复或命中内置弱口令表时启动失败；不允许 URL 查询参数传递 |
 | `publicOrigin` | hub | 必填，浏览器访问的唯一 HTTPS origin（scheme/host/port，无路径、无尾斜杠）；作为 Origin 校验基准，不从请求 Host 或转发头推导。缺失、非 HTTPS 或含路径时启动失败 |
-| `devicesFile` | hub | 默认 `$HOME/.dsh-marshal/devices.json`；显式覆盖使用绝对路径，不展开字面 `~`；设备 ID、显示名、token 摘要、撤销状态、内容与交互授权，以及 §5 的授权修订高水位与撤销墓碑。首次初始化时缺失按空表告警；已初始化安装（以 §4 的 operatorId 持久文件存在为准）中缺失、无法解析、含重复 ID/重复 token 摘要时 hub 启动失败，不静默丢弃条目。设备记录完好但修订字段缺失/回退时按 §5 进入 recovery-required（hub 可启动，但拒绝新写且不把修订重置为零）|
+| `devicesFile` | hub | 默认 `$HOME/.dsh-marshal/devices.json`；显式覆盖使用绝对路径，不展开字面 `~`；设备 ID、显示名、token 摘要、撤销状态、内容与交互授权，以及 §5 的授权修订高水位与撤销墓碑。仅 §4 的全新初始化可按空表告警并持久化空表；已初始化安装（以 §4 的 operatorId 持久文件存在为准）中缺失、无法解析、含重复 ID/重复 token 摘要时 hub 启动失败，不静默丢弃条目。设备记录完好但修订字段缺失/回退时按 §5 进入 recovery-required（hub 可启动，但拒绝新写且不把修订重置为零）|
 | `privacy` | node | 默认 `metadata`；可选 `content`，还需 hub 对该 deviceId 允许内容 |
 | 设备记录 `allowContent` | hub | 默认 false；由部署者在 hub 本地设置 |
 | 设备记录 `allowInteractions` | hub | 默认 false；远端的提问/审批卡片需同时满足 node 侧 relay=remote 与本项为 true，缺一即按 off 处理 |
@@ -91,7 +91,9 @@ hub 复用 DSH webServer 的端口与 TLS/反代，不另监听。node 不暴露
 
 非浏览器 API 使用独立认证分支：只在未带 marshal 会话 cookie 且 `x-marshal-token` 校验成功时免 cookie/CSRF；混合两种凭据拒绝，无效头不得回退 cookie。有 Origin 的请求仍须匹配 publicOrigin。设备 WSS 的 Authorization 不与 dashboard 头混用。两种分支都受相同大小/限速与授权限制。会话、CSRF、dashboard/device token 及命令正文不写日志或 URL。登录失败按来源和全局两个维度限速（同一来源 15 分钟内最多 5 次失败，之后指数退避；全 hub 失败速率超限时短暂拒绝），延迟不泄露长度或前缀差异。
 
-owner 的审计身份由 hub 从认证会话赋予，不接受浏览器自报 `answeredBy`。`operatorId` 是该 hub 安装中持久的随机 owner 身份，首次启动生成后保存在 hub 本地受限文件中，跨浏览器登录、hub 重启和 token 轮换保持稳定；该文件同时是“安装已初始化”的判定依据：它存在而 §3 的设备状态缺失时按 §3 启动失败，它缺失而设备状态存在时不自动生成新身份（按 §6 recovery-required 人工对账）。临时浏览器会话 ID 只作审计关联，不参与幂等域。浏览器未决记录按 `(publicOrigin, operatorId)` 隔离；同一 URL 换成另一安装后不得把旧记录当新安装命令重新提交。
+owner 的审计身份由 hub 从认证会话赋予，不接受浏览器自报 `answeredBy`。`operatorId` 是该 hub 安装中持久的随机 owner 身份，经下述初始化流程生成后保存在 hub 本地受限文件中，跨浏览器登录、hub 重启和 token 轮换保持稳定；该文件同时是“安装已初始化”的判定依据：它存在而 §3 的设备状态缺失时按 §3 启动失败，它缺失而设备状态存在时不自动生成新身份（按 §6 recovery-required 人工对账）。临时浏览器会话 ID 只作审计关联，不参与幂等域。浏览器未决记录按 `(publicOrigin, operatorId)` 隔离；同一 URL 换成另一安装后不得把旧记录当新安装命令重新提交。
+
+初始化与迁移必须先于监听端口/签发设备。hub 启动与本地设备 CLI 共用一个初始化器：只有身份、设备状态及初始化记录均不存在时才创建新安装；先受限持久化初始化意图（固定 operatorId 与待写文件校验值），再原子写空的版本化设备表，最后提交身份文件并清理意图。中途崩溃仅凭匹配的意图完成同一身份的提交；不能另造身份，也不能把任意残留表当作新安装。意图不匹配转人工恢复；没有意图的文件缺失组合仍遵守上面的启动失败/恢复规则。CLI 先签发设备再启动 hub 也走同一流程。旧版设备表只经显式本地迁移进入新格式，保留原文件，不由普通启动猜测迁移。所有本地设备表写者共用进程间锁，在锁内重读、核对版本并原子提交，防止并发 CLI 丢失撤销或复用 revision；仅原子 rename 不足以保证多写者正确。
 
 认证设计依据：[OWASP 会话绑定 CSRF](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html)、[MDN cookie 前缀约束](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Set-Cookie)。这里使用已有服务端会话状态保存 CSRF，无需再引入另一套无状态签名方案。
 
@@ -103,7 +105,7 @@ owner 的审计身份由 hub 从认证会话赋予，不接受浏览器自报 `a
 
 `runtimeEpoch` 标识适配器实例：子进程类 agent 为进程启动，DSH 为适配器/插件实例；实例重建、宿主重启或子进程退出都使旧 runtimeEpoch 的写权和交互立即失效。公开 seq 是归一化后的投递顺序，不是原生状态的因果版本；迟到事件的处理见 §11。
 
-`policyRevision` 是 hub 侧每设备授权策略（撤销、allowContent、allowInteractions）的持久单调修订号。与 operatorId/deviceId 绑定，在授权生效前与授权变更一次性原子写入 §3 的受限设备状态文件，重启、删除再注册不得复用旧号（删除设备保留撤销墓碑）。写入失败等同非法 reload：不提交新 revision、不发布新授权、受影响设备保持不可确认并关闭连接。整表缺失/无法解析按 §3 启动失败；设备记录完好而修订缺失、不可读或已检测到旧备份回退时按 §6 进入 recovery-required，不从零继续。hello 回带 node 上一次绑定的 operatorId/policyRevision，hello.ack 下发当前值；node 侧该值只是实例内存，重建后为空，空值按首次绑定处理且不能跳过 hub 的当前策略下发。operatorId 不同即不同身份域，不比较修订号，丢弃旧策略状态后重新绑定；同一身份域内 node 回带更高修订而 hub 当前值更低，判定 hub 状态回退并进入 recovery-required，不能下发更低修订。任一值变化都丢弃旧策略的内容/ACK 正文，并按 §8 结算旧待答，不能只删除卡片留下原生阻塞。随后重新协商、完整同步；hubEpoch 变化但持久策略未变不等于撤权。
+`policyRevision` 是 hub 侧每设备授权策略（撤销、allowContent、allowInteractions）的持久单调修订号。与 operatorId/deviceId 绑定，在授权生效前与授权变更一次性原子写入 §3 的受限设备状态文件，重启、删除再注册不得复用旧号（删除设备保留撤销墓碑）。写入失败等同非法 reload：不提交新 revision、不发布新授权、受影响设备保持不可确认并关闭连接。整表缺失/无法解析按 §3 启动失败；设备记录完好而修订缺失、不可读或已检测到旧备份回退时按 §6 进入 recovery-required，不从零继续。hello 回带 node 上一次绑定的 operatorId/policyRevision，hello.ack 下发当前值；node 侧该值只是实例内存，重建后为空，空值按首次绑定处理且不能跳过 hub 的当前策略下发。operatorId 不同即不同身份域，不比较修订号，丢弃旧策略状态后重新绑定；同一身份域内 node 回带更高修订而 hub 当前值更低，先隔离该设备并标 recovery-required，不能下发更低修订，也不能按自报值抬高全表或冻结其它设备；只有 hub 本地完整性证据证明全局回退时才进入全局恢复。节点自报修订不是可信的全局恢复依据。任一值变化都丢弃旧策略的内容/ACK 正文，并按 §8 结算旧待答，不能只删除卡片留下原生阻塞。随后重新协商、完整同步；hubEpoch 变化但持久策略未变不等于撤权。
 
 | 帧 | 方向 | 必需信息与用途 |
 |---|---|---|
@@ -114,9 +116,10 @@ owner 的审计身份由 hub 从认证会话赋予，不接受浏览器自报 `a
 | `sync.begin / sync.chunk / sync.end` | node→hub | syncId、完整范围、快照版本、会话游标、分片计数；快照不含正文 |
 | `sync.ack` | hub→node | 当前 connectionId/nodeEpoch/syncId、accepted/rejected、提交版本或错误；只在原子提交后确认 |
 | `command.status / command.status.result` | hub→node / node→hub | 只读查询原幂等键状态；不触发执行、不携带原始正文 |
-| `inputs.snapshot / inputs.snapshot.result` | hub→node / node→hub | owner 按会话查询当前有效待答卡；node 重新执行隐私与策略校验 |
+| `inputs.snapshot / inputs.snapshot.result` | hub→node / node→hub | owner 按会话查询当前有效待答卡；node 重新执行隐私与策略校验，返回 runtimeEpoch 与同一公开序列的快照高水位 |
+| `heartbeat / heartbeat.ack` | 双向请求/应答 | 当前 connectionId/nodeEpoch、请求 nonce、发送/响应时刻；用于存活与时钟偏差估算，不携带正文 |
 
-方向不符的帧按 `frame-invalid` 拒绝。target 为 `(deviceId, agent, sessionId)`。agent 标识是字符串，但必须在握手支持集合中。未知操作必须拒绝；未知事件可忽略并计数，不能因此绕过身份或大小检查。每个操作的 args 由 `wire/commands` 的判别 schema 定义并在两端验证，未知字段拒绝；`observe` 的 args 区分 `history`（带不透明 cursor 和 limit，单页有界）与 `follow`（订阅/取消订阅），两者都不带写权副作用。
+方向不符的帧按 `frame-invalid` 拒绝。target 为 `(deviceId, agent, sessionId)`；仅 `create` 使用 `sessionId: null`，在 agent 级执行并以该完整 target 去重，其余操作必须有实际 sessionId。`fork` 指向父会话。create/fork 的新会话 ID 作为无正文结果落 journal 后返回，状态查询恢复原 ID，不通过再建会话恢复结果。agent 标识是字符串，但必须在握手支持集合中。未知操作必须拒绝；未知事件可忽略并计数，不能因此绕过身份或大小检查。每个操作的 args 由 `wire/commands` 的判别 schema 定义并在两端验证，未知字段拒绝；`observe` 的 args 区分 `history`（带不透明 cursor 和 limit，单页有界）与 `follow`（订阅/取消订阅），两者都不带写权副作用。follow 使用服务端签发、绑定认证观察者及当前连接的 subscriptionId；取消只影响自己的订阅。共享原生 follower 只在最后一个观察者退出后释放，断流/登出/卸载清理引用；两个浏览器不能互相取消或重复创建无界 follower。history、follow、状态/待答查询不占用写命令 journal。
 
 事件 kind 与最小语义统一如下，额外字段必须在版本 schema 和隐私白名单中声明：
 
@@ -130,7 +133,7 @@ owner 的审计身份由 hub 从认证会话赋予，不接受浏览器自报 `a
 | `capability.changed` | 当前会话的完整能力快照、revision、回读时间；不是不明确的局部 patch |
 | `error` | 受限 code、严重性、关联 ID；无原始异常内容 |
 
-完整 sync 会话行是替换快照；普通 session.updated 是按 schema 合并的局部更新，两者不得混用。Capability 至少包含 observe（stream/poll/history/none）、明确 operations 集合、工具/思考可见级别、ownership、tunables 和逐功能 unavailable reason。dispatch 不再用一个互斥字符串代表多个不同写入能力。
+完整 sync 会话行是替换快照；普通 session.updated 是按 schema 合并的局部更新，两者不得混用。Capability 至少包含 observe 的独立字段（history: boolean；follow: stream/poll/none）、明确 operations 集合、工具/思考可见级别、ownership、tunables 和逐功能 unavailable reason。dispatch 不再用一个互斥字符串代表多个不同写入能力。
 
 | 操作 | 语义与版本 |
 |---|---|
@@ -154,15 +157,19 @@ wire v2 将当前 marshal `resume` 重命名为 `observe`；当前 DSH 的 resum
 
 hub 在任何 await/发送之前原子登记 in-flight。同键同载荷共享一个结果，不能再次发送；同键不同载荷返回 `idempotency-conflict`。ACK 路由必须显式分派到 pending 完成逻辑，event 路由不能吞掉 ACK；error/关闭/超时也必须完成等待者。
 
-node 是去重的最终权威。按幂等域原子登记并在调用 agent 前持久化 `admitted`，之后记录 `accepted / confirmed / rejected / outcome-unknown`。日志仅含身份、目标、操作、时间、状态和带本地密钥的载荷摘要，不含提示词、答案、命令或路径。已记录的键至少保留 24 小时；未决记录不可被 LRU 驱逐，容量满则拒绝新写入。终态过保留窗口可删除，因此不承诺无限期 exactly-once。journal/HMAC 密钥、hub operatorId 及 §5 的授权修订状态必须跨重启稳定，版本迁移保留原域；已初始化安装中发现文件丢失、损坏、回滚到过旧快照或密钥不匹配时禁止新写，返回 recovery-required，不自动新建空表/新身份。首次初始化与恢复有独立标记及人工对账步骤；不能保证检测外部同时抹去全部状态的情况，重建安装须按恢复操作处理。
+node 是去重的最终权威。按幂等域原子登记并在调用 agent 前持久化 `admitted`，之后记录 `accepted / confirmed / rejected / pending-confirmation / outcome-unknown`。日志仅含身份、目标、操作、时间、状态和带本地密钥的载荷摘要，不含提示词、答案、命令或路径。已记录的键至少保留 24 小时；admitted、pending-confirmation、outcome-unknown 均属未决记录，不可被 LRU 驱逐；accepted 只表示已知受理、不追踪整个回合成败。容量满则拒绝新写入。终态过保留窗口可删除，因此不承诺无限期 exactly-once。journal/HMAC 密钥、hub operatorId 及 §5 的授权修订状态必须跨重启稳定，版本迁移保留原域；已初始化安装中发现文件丢失、损坏、回滚到过旧快照或密钥不匹配时禁止新写，返回 recovery-required，不自动新建空表/新身份。其中设备整表缺失/损坏优先按 §3 启动失败，不能泛化成允许启动的 recovery-required。首次初始化与恢复有独立标记及人工对账步骤；不能保证检测外部同时抹去全部状态的情况，重建安装须按恢复操作处理。
 
 | 状态 | 对用户的含义 | 重试规则 |
 |---|---|---|
-| `rejected` | 明确在调用 agent 前拒绝，附原因 | 更正原因后可显式发起新意图 |
+| `rejected` | 调用前拒绝，或已验证原生明确未受理且无副作用的拒绝；附原因，单纯异常不算证据 | 更正原因后可显式发起新意图 |
 | `accepted` | agent 已受理，后续回合完成由事件表示 | 不重发 |
-| `confirmed` | 设置等操作已获得实际回读 | 不重发 |
+| `confirmed` | 设置等操作已获得实际回读；code=readback-mismatch 时表示已确认实际结果与请求不符，并非设置成功 | 不重发 |
 | `pending-confirmation` | 已请求，尚无实际回读 | 只查询或等待 |
 | `outcome-unknown` | 可能已执行，连接/进程故障导致结果不明 | 只查询，禁止自动再次执行 |
+
+本节持久登记只适用于具有副作用的操作；observe/history、command.status、inputs.snapshot 使用有界只读请求，不创建 admitted，也不因写 journal 已满而失去查询恢复能力。同一路径的 node journal/HMAC 状态由一个运行实例持有进程间排他锁；第二实例启动失败，不能各自去重后分别调用。
+
+原生调用已经开始后发生异常/超时，若没有可靠受理、实际结果或原生明确未受理且无副作用的证据，必须记 outcome-unknown，不能包装成 rejected。已知受理后回合失败用 turn 终态表示；设置 mismatch 持久为 confirmed 并附 readback-mismatch。pending-confirmation 必须落盘，崩溃后按未决项恢复。状态查询未找到键（包括已过保留期）返回 outcome-unknown / record-unavailable，不能推断从未执行或建议安全重发。
 
 node 在 `admitted` 与调用 agent 之间、调用与落结果之间崩溃时，重启将未决项标记 outcome-unknown；除非上游支持且已验证同一操作的幂等恢复，否则不得自动调用。不能靠“磁盘记录存在”推断执行成功。原 nodeEpoch 的延迟 command 一律拒绝。
 
@@ -181,7 +188,7 @@ hub 发送后丢 ACK、hub 重启或连接断开，均返回/恢复为 outcome-u
 
 外部历史会话可写必须证明：上游锁/单一宿主路由等机制在执行期间持续排除其他写者，并能发现失效。验证不成立则 acquire 返回 `ownership-unverified`，保留只读。v1 可以交付“外部历史只读 + 有可靠控制边界的自有会话”，不能宣称已接管任意 TUI。显式 fork 使用独立会话和已验证隔离边界；它不是原会话接管成功。
 
-acquire、prompt、configure 和回合状态转换均使用每会话串行状态机；busy 请求立即拒绝，不建立延迟执行队列。进程崩溃、写权丢失、租约过期即撤销控制、清理待答；旧 epoch 的决定不能影响新回合。DSH 原生 writer-held 若通过 spike 验证，可作为其进程内边界；不能外推给 Codex/Claude。
+acquire、prompt、configure 的受理及回合状态转换使用每会话串行状态机；busy 的新 prompt/configure/acquire 立即拒绝，不建立延迟执行队列。锁只覆盖有界验证/登记/状态转换，不跨越整段推理、等待用户输入或设置回读；answer/decide/cancel/interrupt 必须能在长回合中按各自请求/回合身份验证并结算，否则会形成“回合等待回答、回答等待回合”的死锁。原生调用完成通过同一状态机归并；状态 busy 不等于禁止当前回合的控制操作。进程崩溃、写权丢失、租约过期即撤销控制、清理待答；旧 epoch 的决定不能影响新回合。DSH 原生 writer-held 若通过 spike 验证，可作为其进程内边界；不能外推给 Codex/Claude。
 
 DSH 没有产品 v0 的 acquire 操作。prompt 必须由原生控制器在同一受理步骤完成“当前 idle + 本次写者取得/互斥”，不能沿用当前固定 mode=steer 或先 list 再 prompt 来证明零忙时注入。若原生接口不提供该保证，则该目标版本 prompt 不开放。interrupt 必须原子比较 activeTurnId/runtimeEpoch 再取消；当前 sessionId-only cancel 不足以排除旧请求打断新回合，无法验证原子能力时关闭 interrupt，不能先读回合再调用无条件 cancel。
 
@@ -229,11 +236,11 @@ requestId 使用随机 UUID，并以 `(deviceId, agent, sessionId, runtimeEpoch,
 - model 可选择已验证目录中的模型；若其默认 effort 或权限会隐式放宽，必须保持已确认限制或拒绝。模型可选不代表费用一定更低。
 - goal 仅在完整 set/get/clear 回读及行为已验证时开放；从上游响应或 get 获取实际对象，不能用请求 objective 合成结果。skill/plugin 仅只读目录。
 
-configure 携带 `expectedRevision`；源端先检查版本和写权，再串行化设置操作，且 pending 未解决时拒绝依赖该设置的写请求。v1 只允许 idle 时配置，变化作用于下一回合，禁止为了应用 effort 在活跃回合中关闭 Query。
+configure 携带 `expectedRevision=(runtimeEpoch, settingsRevision)`，它比较整个会话的有效设置快照而非单字段；model/plan/permission/reasoning 的任一关联实际变化均推进同一修订，防止跨字段并发使用旧权限基线。源端先检查版本和写权，再串行化设置操作，且 pending 未解决时拒绝依赖该设置的写请求。v1 只允许 idle 时配置，变化作用于下一回合，禁止为了应用 effort 在活跃回合中关闭 Query。
 
 调用前注册观察者，避免先通知后 RPC 响应导致丢失确认；只有能关联到这次设置/状态版本的回读才确认。10 秒没有可靠回读返回 pending-confirmation / readback-timeout，旧 current 不变，不回滚、不重发；迟到的实际值仍更新能力，但不能覆盖已确认的更高 revision。
 
-回读与请求不一致：先发布真实 current，再返回 readback-mismatch，不能保留旧值或请求值掩盖实际状态。void setter、模型目录、初始缓存都不是实际设置回读。若某版本没有可验证的读取渠道，则该字段 editable=false；不靠等待一个未承诺再次发送的 system/init 来假装确认。下一回合才能验证的字段必须有经过实测的“确认先于执行副作用”屏障；没有该屏障则只读，不能形成“等待下一回合确认但又禁止下一回合”的死锁。
+回读与请求不一致：先发布真实 current，再返回 readback-mismatch，不能保留旧值或请求值掩盖实际状态。实际权限/effort 比操作前已确认限制更宽或不可比较时，即使回读完成，也保持会话新推理/设置写入关闭（settings-unsafe）；不能把意外放宽当作下一请求的新许可基线。只读查询和安全中止仍可用，由源端人工恢复限制并重新验证后解锁，不自动回滚。仍处于原限制内的 mismatch 可按真实值继续。void setter、模型目录、初始缓存都不是实际设置回读。若某版本没有可验证的读取渠道，则该字段 editable=false；不靠等待一个未承诺再次发送的 system/init 来假装确认。下一回合才能验证的字段必须有经过实测的“确认先于执行副作用”屏障；没有该屏障则只读，不能形成“等待下一回合确认但又禁止下一回合”的死锁。
 
 ## 10. 隐私、缓冲与待答恢复（P1-09）
 
@@ -247,7 +254,7 @@ content 必须同时满足源端 privacy=content 与 hub 注册记录 allowConte
 
 remote 交互是单独的显式内容授权，需 node `relay=remote` 与 hub `allowInteractions=true` 同时成立；只发送决定所需字段，卡片最大 4096 UTF-8 字节。截断/脱敏导致无法完整判断动作时，卡片保留身份、到期和原因，但 accept-once 必须不可用；不能截去危险后缀仍允许批准。content 档也遵守卡片限制。所有来自 wire 的文本（消息、思考、工具输出、问题、选项、标题、错误 detail）在浏览器中按纯文本渲染，不得插入 HTML、属性或脚本；页面不得用 `innerHTML` 拼接这些字段。
 
-历史 EventBuffer 使用允许缓存的 kind 白名单；input.requested、input.resolved、secret 和答案全部排除。append、read、size 及定时清理都会处理过期项；按接收单调时间计算保留窗，不能被源端 ts 延长。时间/条数/字节任一限制达到即清理最旧项，并报告回放缺口。无新事件时到期内容也不可读取。
+历史 EventBuffer 使用允许缓存的 kind 白名单；input.requested、input.resolved、secret 和答案全部排除。该限制同样覆盖结构化派生副本：原生 tool 参数/结果及 history 条目若承载问题、审批或回答，按 request/call/item 关联在源端剔除交互正文，再进入离线队列、历史 API 或 EventBuffer。无法安全分离时只发元数据，不能仅过滤 input kind。原生内部记录不由 marshal 删除；模型在普通文本中自行复述内容不能保证被语义识别，仍受普通 content 授权与脱敏约束，不宣称绝对防泄漏。append、read、size 及定时清理都会处理过期项；按接收单调时间计算保留窗，不能被源端 ts 延长。时间/条数/字节任一限制达到即清理最旧项，并报告回放缺口。无新事件时到期内容也不可读取。
 
 待答表只在 node 内存中存活至 §8 计算的 `expiresAt`；hub 不把交互正文留在历史或磁盘。刷新/迟到页面通过 inputs.snapshot 取当前有效卡，带版本和游标，再应用订阅流；过期、已解决或旧 runtimeEpoch 卡不返回。离线队列不缓冲交互正文，重连时重新从当前待答表按策略投影。源端不可达时显示“状态未知”，禁用决定；不展示旧卡为可答。
 
@@ -270,7 +277,11 @@ node 发送 sync.end 不等于完成同步；只有收到匹配当前连接/代�
 
 对公开流完成过滤/投影后才分配 seq；策略过滤掉的事件不占序号，已编号后因队列/背压丢弃才构成缺口。未知 kind 通过身份/schema 校验后可以不渲染，但仍推进接收游标。快照高水位必须使用同一公开序列，避免正常隐私过滤触发无限重同步。
 
-浏览器 SSE 使用 hub 签发的单调全局游标与 hubEpoch（不是裸时间戳），支持 Last-Event-ID。回放和实时订阅使用同一屏障，不能先读再订阅留下窗口。超出保留窗或 hubEpoch 改变，发送 reset-required，页面重取索引/能力/当前待答；内容历史缺口明确显示，不伪造完整回放。游标推进与重复消除不能重新打开已结算卡。
+浏览器 SSE 使用 hub 签发的单调全局游标与 hubEpoch（不是裸时间戳）。v0 无 EventBuffer，每次重连走 reset-required，重取索引/能力/当前待答并标内容缺口，不承诺 Last-Event-ID 正文回放；v1 才可在允许内容仍存活时补看，过期/缺口/新 hubEpoch 同样 reset。
+
+**每次 SSE 建连都重新取得当前索引、能力和有效待答，即使 v1 的 Last-Event-ID 仍有效。** input 事件不在历史中，游标有效不能证明离线期间没有作答/失效。先订阅并有界暂存实时事件，再读各会话 inputs.snapshot 的 runtimeEpoch/公开 seq 高水位，替换待答集合，只应用高水位之后的增量；终态不能被旧快照复活。索引/能力使用同一同步屏障机制。快照失败、缺口、换代或暂存超限则保留未知不可答，重新同步，不放行半快照。v1 内容回放与此状态恢复分开，历史事件不能重建可答卡。
+
+在线 WSS 双方每 5s 发送 heartbeat，仅匹配当前连接 nonce 的应答刷新该请求方的存活时间；连续 15s 无有效应答关闭连接并标 stale/禁写，半开连接不能无限显示在线。期限用单调时钟，心跳计时器在 dispose 时释放；SSE 的浏览器登录空闲期仍按 §4 独立计算。30s 恢复指标在 B07 规定负载、网络已恢复且原生清单可按时返回的条件下测量，包含半开检测/退避/同步；超预算保持 stale 并报告失败，不提前放行。
 
 WebSocket 和 SSE 均有字节背压。慢浏览器超过预算则断开并要求重同步，不能无限 res.write；控制帧与事件队列分离，ACK 不因内容队列淘汰而静默丢失。agent 崩溃只影响该 agent，撤销其写权和 pending，其他 agent 持续可用。
 
@@ -278,7 +289,7 @@ WebSocket 和 SSE 均有字节背压。慢浏览器超过预算则断开并要�
 
 所有能力均要求精确版本、真实脱敏协议样本和目标机验证记录；未知方法/字段关闭对应能力，不把 model/list 成功等同全协议支持。清单完整性必须有原生证据：分页遍历到终止，或固定版本接口明确保证全量并经超过默认页大小的样本验证，或原生返回权威全量标记/总数且完成对账。返回数组长度不等于权威总数；没有证据时只报告“完整性不可确认”，不把首个结果集当完整清单。没有安装 agent 时标明 unavailable，不制造历史数据。
 
-错误至少区分 auth-failed、device-mismatch、stale-connection、frame-invalid、device-offline、sync-required、session-unknown、writer-busy、ownership-unverified、expired、clock-skew、conflict、idempotency-conflict、revision-conflict、outcome-unknown、approval-disabled、approval-expired、decision-invalid、widen-rejected、unsupported、version-unsupported、size-limit、readback-timeout、readback-mismatch、agent-crashed、recovery-required。外传 detail 仅含枚举/安全字段；禁止原样错误消息和堆栈。
+错误至少区分 auth-failed、device-mismatch、stale-connection、frame-invalid、device-offline、sync-required、session-unknown、writer-busy、ownership-unverified、expired、clock-skew、conflict、idempotency-conflict、revision-conflict、outcome-unknown、approval-disabled、approval-expired、decision-invalid、widen-rejected、unsupported、version-unsupported、size-limit、readback-timeout、readback-mismatch、agent-crashed、recovery-required、record-unavailable、settings-unsafe。外传 detail 仅含枚举/安全字段；禁止原样错误消息和堆栈。
 
 错误通过四个互不混用的通道报告：命令生命周期用 `ack.code`（HTTP 映射见 §6）；异步/会话级故障用 `event.kind=error`；浏览器 API 用 HTTP 状态；连接级致命错误用 WebSocket close code。close code 固定为 4400 frame-invalid、4401 auth-failed、4403 device-mismatch、4406 version-unsupported、4408 handshake-timeout、4409 stale-connection；1009 仅表示帧超限。任何通道都不得用字符串包含关系推断错误类别，也不得省略机器可读 code。
 
