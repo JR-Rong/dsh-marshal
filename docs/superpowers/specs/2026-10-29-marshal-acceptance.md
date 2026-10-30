@@ -114,7 +114,7 @@
 | C05-05 | I | 保持 SSE 打开时 logout、轮换 dashboardToken、绝对/空闲会话到期；logout 后复用旧 CSRF；关闭标签再打开已登录页面；同 URL 换安装 | 新 API 请求拒绝；旧 SSE ≤5s 关闭，不再收内容；心跳不续空闲期；session 查询返回原 operatorId/CSRF/绝对期限且 no-store、不续期；cookie 属性符合契约，登出后旧值不可复用；同安装重新登录 operatorId 稳定，不同安装不误认旧未决记录 |
 | C05-06 | I | content/remote 正在传输时 hub 收紧授权，断连前后注入旧帧；设备表 reload 无法解析或无法确定影响范围 | hub 先停止转发，node 断连停用协商授权、禁止正文外发/远答；重连发现新 policyRevision 后按 C03-10 结算旧待答；旧帧/ACK 正文/卡不补发；非法 reload 不部分应用或继续写，范围不明则全部设备断开 |
 | C05-07 | I | 无/错误 token 登录；有效 cookie 携无效 header token；双凭据；伪造同值 CSRF header/cookie；复用另一会话 CSRF；cookie 写请求缺失/null/跨源 Origin，伪造 Host/转发头；header-only 的无 Origin/跨源 Origin 对照 | 绕过均拒绝且零命令下发；Origin 只匹配 publicOrigin；不能仅凭 header 存在免 CSRF，也不能仅凭 header/cookie 相等通过；合法 cookie+会话绑定 CSRF 可用，合法 header-only 无 Origin 可用但带跨源 Origin 拒绝，不授予跨源凭据 CORS |
-| C05-08 | U/I | 授权收紧后重启/重载 hub；删除再注册设备；策略持久化失败/损坏/已检测到旧备份恢复；普通 hub 重启但策略未变 | operatorId/policyRevision 不回退或复用；持久化失败禁止写且不发布新授权；损坏/检测到回退为 recovery-required；只有同一持久身份域才比较 revision；策略未变的 hubEpoch 更新不误判撤权 |
+| C05-08 | U/I | 授权收紧后重启/重载 hub；删除再注册设备；策略持久化失败/损坏/已检测到旧备份恢复；operatorId 与设备状态文件的缺失组合；普通 hub 重启但策略未变 | operatorId/policyRevision 不回退或复用；持久化失败禁止写且不发布新授权；已初始化判定以 operatorId 文件为准，该文件在而设备状态缺失即 recovery-required，反之不生成新身份；损坏/检测到回退为 recovery-required；只有同一持久身份域才比较 revision，node 回带更高修订时 hub 不降级下发；策略未变的 hubEpoch 更新不误判撤权 |
 
 ### C06：写权与观察
 
@@ -172,13 +172,13 @@
 | C10-07 | I | sync.end 已发但 hub 未提交；提交后 sync.ack 丢失/迟到/属于旧连接；期间提交写请求 | node 只认当前 sync.ack；双侧在屏障完成前拒绝写；超时重同步不重放命令，旧确认不能放开写入 |
 | C10-08 | I/R | 多页清单、非第一页会话执行/提问；原生 list 无分页或只返回首屏；不断线时新增/删除/运行态变化；A.completed 在 B.started 后到达并取得更大公开 seq；旧 started/扫描 idle/删除结果晚到 | 所有页可见且可定位；无分页须有已验证全量契约或权威全量/总数证据，否则完整性不可确认；无增量时 10s 扫描，≤30s 反映变化；超时 stale/禁写；省略字段不重置；原生因果版本/回合屏障阻止旧状态覆盖 B，即使公开 seq 更大；无法判序则 stale 并权威重读 |
 | C10-09 | U/I | 隐私过滤丢弃整条事件、未知 kind、队列在编号后丢事件、策略收紧后重同步 | 投影后分配 seq，正常过滤无假缺口；未知 kind 不呈现但推进游标；真实丢失触发同步，快照高水位与公开序列一致，无恢复循环 |
-| C10-10 | I/R | OS 进程不退出，单独卸载/重载 marshal node 或 hub 插件；旧回调、旧 SSE 游标及旧 pending 再到达；对比普通网络重连 | 重置内存状态时对应 nodeEpoch/hubEpoch 更新，适配器重建更新 runtimeEpoch；旧回调不污染新状态，旧游标 reset；node/adapter 重建结算旧输入，仅 hub 重载按 C03-10 重验有效待答；journal/operatorId/策略修订保留；仅重连不换实例 epoch；timer/listener 不增长 |
+| C10-10 | I/R | OS 进程不退出，单独卸载/重载 marshal node 或 hub 插件；旧回调、旧 SSE 游标及旧 pending 再到达；对比普通网络重连 | 重置内存状态时对应 nodeEpoch/hubEpoch 更新，适配器重建更新 runtimeEpoch；旧回调不污染新状态，旧游标 reset；node/adapter 重建结算旧输入，仅 hub 重载按 C03-10 重验有效待答；journal 与 hub 侧 operatorId/策略修订保留（node 绑定的副本重建后为空并按首次绑定处理）；仅重连不换实例 epoch；timer/listener 不增长 |
 
 ## 4. 基础功能与非功能验收
 
 | ID | 层 | 场景 | 通过条件 |
 |---|---|---|---|
-| B01 | U/I | 配置、设备表与认证 | 缺必填项、未知键、错误枚举、负数/非有限上限、非法正则均启动失败且只打印键名；deviceId 与 deviceName 分离；设备表损坏/重复 ID/重复 token 摘要启动失败而非静默丢弃；设备表变更后 5s 内完成撤销或授权生效；URL token 拒绝；低熵 dashboardToken 拒绝；登录失败限速生效；浏览器登录、CSRF、SSE 授权生效 |
+| B01 | U/I | 配置、设备表与认证 | 缺必填项、未知键、错误枚举、负数/非有限上限、非法正则均启动失败且只打印键名；deviceId 与 deviceName 分离；设备表损坏/重复 ID/重复 token 摘要启动失败而非静默丢弃；设备表变更后 5s 内完成撤销或授权生效；publicOrigin 缺失/非 HTTPS/含路径启动失败；URL token 拒绝；低熵 dashboardToken 拒绝；登录失败限速生效；浏览器登录、CSRF、SSE 授权生效 |
 | B02 | I/R | DSH 普通问题 | remote 独占期间本地不出现；超时真实 next() 后本地可答；off 不改变本地行为；认领顺序有证据 |
 | B03 | I/R | 交互卡保真与渲染安全 | 单选、多选、自由文本按 ID 提交；重复点击不重复计数；secret 无答案外泄；错误显示与实际终态一致；含 `<script>`/HTML 的问题、选项、消息按纯文本显示，不执行脚本也不注入属性 |
 | B04 | I/R | 原生事件与历史 | 输出和工具顺序来自真实流，无假增量；历史读取分页；外部活跃会话不宣称有未实现的实时流 |
@@ -194,7 +194,7 @@
 
 | ID | 层 | 场景 | 通过条件 |
 |---|---|---|---|
-| M01 | U/I | 现有 deviceName 与设备表转换到稳定 deviceId/摘要表，修改显示名；轮换短 dashboardToken | 身份和授权映射保持；原表保留；新表权限受限；token 不进入日志；相同转换不制造重复设备；旧二进制维护窗口可用旧登录；新二进制启动前完成轮换，不能临时放宽新校验；旧 cookie/SSE 失效 |
+| M01 | U/I | 现有 deviceName 与设备表转换到稳定 deviceId/摘要表，修改显示名；轮换短 dashboardToken；显式配置 publicOrigin | 身份和授权映射保持；原表保留；新表权限受限；token 不进入日志；相同转换不制造重复设备；旧二进制维护窗口可用旧登录；新二进制启动前完成轮换与 publicOrigin 配置，不能临时放宽新校验；publicOrigin 仅为 HTTPS origin；旧 cookie/SSE 与 URL token 失效 |
 | M02 | I | v1 node→v2 hub、v2 node→v1 hub、未知修订 | 明确不兼容、零 agent 调用、无静默协议降级；v2 节点遇协议错误停止；旧 v1 节点不识别新 close code 时由迁移步骤停止，不宣称旧代码有新退避行为 |
 | M03 | I/R | 有 in-flight 时升级，分别在发送前/执行后丢 ACK；随后回滚 | 停止新写，已知结果保留，不明项为 unknown；新 journal 保留；旧版不能读取 journal，回滚前关闭写入口并对账当前撤销/轮换记录；未知旧命令或授权约束未消除前不重开写入，旧 token 不复活 |
 | M04 | I/R | 同版本升级后验证登录、观察、问题与命令；恢复旧版配套配置 | v2 的 observe 保持只读；cookie/CSRF 与新 wire 闭环成立；旧版用法可按保留文件恢复；README 明确版本边界 |

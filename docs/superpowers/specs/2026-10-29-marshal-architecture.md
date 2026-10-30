@@ -22,7 +22,7 @@ hub、node、浏览器为三个角色；一个 npm 插件包按 role 装配。hu
 | src/config.ts | 严格配置验证；稳定 deviceId；默认 off；hub publicOrigin；源端与 hub 内容授权 |
 | src/wire/frames.ts | 按帧类型/方向验证、版本和连接代次；统一 ms 时间与 schema |
 | src/wire/commands.ts | op 判别、规范化载荷、目标与状态版本，不使用任意字符串透传 |
-| src/hub/devices.ts、src/bin/device.ts | 一机一密签发/撤销、只存 token 摘要、限制文件权限；文件损坏启动失败；变更热加载；授权修订原子持久化，不复用旧号 |
+| src/hub/devices.ts、src/bin/device.ts | 一机一密签发/撤销、只存 token 摘要、限制文件权限；文件损坏启动失败；变更热加载；授权修订高水位与撤销墓碑随授权变更原子持久化，写入失败不发布新授权；已初始化状态缺失/回退 recovery-required |
 | src/hub/identity.ts | 持久 operatorId 生成与受限存储；登录会话→审计身份的映射 |
 | src/hub/registry.ts | 当前连接与 connectionId；替换/关闭使用比较后删除 |
 | src/hub/server.ts | WSS Upgrade、Authorization、hello ACK、每帧身份检查、握手超时 |

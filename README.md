@@ -182,7 +182,7 @@ WebSocket 上的 JSON 帧统一带 `v: 1`，四种 `type`：
 
 ## 安全说明
 
-- 当前实现要求 `dashboardToken` 与设备 `token` 至少 16 字符；`marshal-device` 生成的是 24 字节随机数的 base64url（32 字符）。目标契约把 `dashboardToken` 也提高到 ≥128 bit（32 字符 base64url），并拒绝明显低熵值。
+- 当前实现要求 `dashboardToken` 与设备 `token` 至少 16 字符；`marshal-device` 生成的是 24 字节随机数的 base64url（32 字符）。目标契约把 `dashboardToken` 也提高到 24 随机字节生成的 32 字符 base64url（≥192 bit 熵），并拒绝明显低熵值。
 - token 比较走 SHA-256 摘要 + `timingSafeEqual`，长度差异不落在时序上；401 不回显任何 token 片段。
 - 设备表由 CLI 写入后收紧到 `0600`；同一 token 指向两台设备时 hub 拒绝启动；hub 加载时剔除缺 `id`/`name`/`token` 的条目不参与握手。目标契约更进一步：文件存在但无法解析、含重复 ID 或重复 token 摘要时直接启动失败，不静默剔除。
 - 控制台的每个已登记路由都要 token；页面响应带 `referrer-policy: no-referrer`、`x-content-type-options: nosniff`、`cache-control: no-store`。

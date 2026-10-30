@@ -16,9 +16,9 @@
 
 | 方面 | 当前 `feat/v0@702ef24` | 本文目标 |
 |---|---|---|
-| wire 与时间 | `v:1`，event.ts 为 ISO 字符串，command.deadline 为毫秒 | `v:2`，时间统一毫秒，新增连接/进程代次与 sync/status 帧 |
+| wire 与时间 | `v:1`，event.ts 为 ISO 字符串，command.deadline 为毫秒 | `v:2`，时间统一毫秒，新增连接/实例代次与 sync/status 帧 |
 | 设备身份 | `deviceName` 同时作为设备 ID，target 使用 `device` | `deviceId` 稳定，deviceName 仅显示，target 使用 deviceId |
-| 设备凭据 | 文件存 token 原值，握手头及 hello 都携带 token；文件启动加载 | 文件存摘要，token 仅请求头；撤销即时生效 |
+| 设备凭据 | 文件存 token 原值，握手头及 hello 都携带 token；文件启动加载 | 文件存摘要，token 仅请求头；撤销在 5 秒内生效 |
 | 浏览器认证 | URL query 或 `x-marshal-token`，所有现有路由鉴权 | POST 登录换 cookie，写请求增加 Origin/CSRF 检查 |
 | 观察 | marshal `resume` 只启动 DSH follow；map 丢弃原生 snapshot，没有历史 API | `observe` 区分原生历史读取与实时订阅；v1 的 `acquire` 独立且显式 |
 | DSH 写入 | prompt 固定传原生 `mode: steer`，adapter 仅检查会话存在；cancel 仅带 sessionId | 普通 prompt 忙时拒绝；interrupt 原子绑定回合；未证实能力关闭 |
@@ -56,9 +56,9 @@ wire v1/v2 混接必须显式失败，UI 给出协议不匹配；不得用旧节
 | `token` | node | 必填，设备专用；只在 Authorization 头传输 |
 | `deviceId` | node | 必填，由 hub 注册时签发；独立于主机名，重启和改名保持不变 |
 | `deviceName` | node | 默认 hostname，仅显示用途，不参与鉴权或会话键 |
-| `dashboardToken` | hub | 必填，与 device token 隔离；至少 128 bit 熵（32 字符 base64url），由至少 24 随机字节生成 32 字符 base64url；长度/弱口令校验不证明随机性；长度不足、单字符重复或命中内置弱口令表时启动失败；不允许 URL 查询参数传递 |
-| `publicOrigin` | hub | 必填，浏览器访问的唯一 HTTPS origin（scheme/host/port，无路径）；作为 Origin 校验基准，不从请求 Host 或转发头推导 |
-| `devicesFile` | hub | 默认 `$HOME/.dsh-marshal/devices.json`；显式覆盖使用绝对路径，不展开字面 `~`；设备 ID、显示名、token 摘要、撤销状态、内容与交互授权。文件缺失视为空表并告警；文件存在但无法解析、含重复 ID 或重复 token 摘要时 hub 启动失败，不静默丢弃条目 |
+| `dashboardToken` | hub | 必填，与 device token 隔离；由至少 24 随机字节生成 32 字符 base64url（≥192 bit 熵）。长度/弱口令校验不证明随机性；长度不足 32 字符、单字符重复或命中内置弱口令表时启动失败；不允许 URL 查询参数传递 |
+| `publicOrigin` | hub | 必填，浏览器访问的唯一 HTTPS origin（scheme/host/port，无路径、无尾斜杠）；作为 Origin 校验基准，不从请求 Host 或转发头推导。缺失、非 HTTPS 或含路径时启动失败 |
+| `devicesFile` | hub | 默认 `$HOME/.dsh-marshal/devices.json`；显式覆盖使用绝对路径，不展开字面 `~`；设备 ID、显示名、token 摘要、撤销状态、内容与交互授权，以及 §5 的授权修订高水位与撤销墓碑。首次初始化时缺失按空表告警；已初始化安装（以 §4 的 operatorId 持久文件存在为准）中缺失、无法解析、含重复 ID/重复 token 摘要或修订不可读时 hub 启动失败，不静默丢弃条目或把修订重置为零 |
 | `privacy` | node | 默认 `metadata`；可选 `content`，还需 hub 对该 deviceId 允许内容 |
 | 设备记录 `allowContent` | hub | 默认 false；由部署者在 hub 本地设置 |
 | 设备记录 `allowInteractions` | hub | 默认 false；远端的提问/审批卡片需同时满足 node 侧 relay=remote 与本项为 true，缺一即按 off 处理 |
@@ -78,8 +78,8 @@ hub 复用 DSH webServer 的端口与 TLS/反代，不另监听。node 不暴露
 ## 4. 身份、握手与连接代次
 
 1. TLS 建连，设备 token 只在 Authorization 头发送；`hello` 不重复携带 token。
-2. hub 从 token 摘要取得注册记录，核验 `hello.deviceId`。`hello` 带版本、`nodeEpoch`、适配器探测摘要，不带会话正文。
-3. hub 签发随机 `connectionId`，返回有效隐私策略、时钟信息；node 收到握手 ACK 后才进入 syncing，不能在 WebSocket open 时立即冲刷队列。
+2. hub 从 token 摘要取得注册记录，核验 `hello.deviceId`。`hello` 带版本、契约修订、`nodeEpoch`、适配器探测摘要，以及上一次绑定的 `operatorId`/`policyRevision`（实例首次为空），不带会话正文。
+3. hub 签发随机 `connectionId`，返回当前 `operatorId`/`policyRevision`、有效隐私策略与时钟信息；node 收到握手 ACK 后才进入 syncing，不能在 WebSocket open 时立即冲刷队列。
 4. 同一 deviceId 只保留一个当前连接。替换时递增连接代次；旧连接关闭不得 detach 新连接，旧帧不得修改索引或完成新命令。
 5. 每帧入口校验认证设备、连接代次、允许方向、schema 和大小。事件中的 deviceId 不符即拒绝并记录分类；不能原样 publish。
 6. hub pending 命令绑定 `(commandId, deviceId, connectionId, nodeEpoch)`。ACK 必须来自绑定连接。重连后的结果通过只读状态查询恢复，不接受旧连接 ACK 冒充新确认。
@@ -91,19 +91,19 @@ hub 复用 DSH webServer 的端口与 TLS/反代，不另监听。node 不暴露
 
 非浏览器 API 使用独立认证分支：只在未带 marshal 会话 cookie 且 `x-marshal-token` 校验成功时免 cookie/CSRF；混合两种凭据拒绝，无效头不得回退 cookie。有 Origin 的请求仍须匹配 publicOrigin。设备 WSS 的 Authorization 不与 dashboard 头混用。两种分支都受相同大小/限速与授权限制。会话、CSRF、dashboard/device token 及命令正文不写日志或 URL。登录失败按来源和全局两个维度限速（同一来源 15 分钟内最多 5 次失败，之后指数退避；全 hub 失败速率超限时短暂拒绝），延迟不泄露长度或前缀差异。
 
-owner 的审计身份由 hub 从认证会话赋予，不接受浏览器自报 `answeredBy`。`operatorId` 是该 hub 安装中持久的随机 owner 身份，首次启动生成后保存在 hub 本地受限文件中，跨浏览器登录、hub 重启和 token 轮换保持稳定；临时浏览器会话 ID 只作审计关联，不参与幂等域。浏览器未决记录按 `(publicOrigin, operatorId)` 隔离；同一 URL 换成另一安装后不得把旧记录当新安装命令重新提交。
+owner 的审计身份由 hub 从认证会话赋予，不接受浏览器自报 `answeredBy`。`operatorId` 是该 hub 安装中持久的随机 owner 身份，首次启动生成后保存在 hub 本地受限文件中，跨浏览器登录、hub 重启和 token 轮换保持稳定；该文件同时是“安装已初始化”的判定依据：它存在而 §3 的设备状态缺失按 §6 recovery-required，它缺失而设备状态存在时不自动生成新身份。临时浏览器会话 ID 只作审计关联，不参与幂等域。浏览器未决记录按 `(publicOrigin, operatorId)` 隔离；同一 URL 换成另一安装后不得把旧记录当新安装命令重新提交。
 
 认证设计依据：[OWASP 会话绑定 CSRF](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html)、[MDN cookie 前缀约束](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Set-Cookie)。这里使用已有服务端会话状态保存 CSRF，无需再引入另一套无状态签名方案。
 
-浏览器会话使用服务端状态，绝对有效期 8 小时、空闲上限 30 分钟；SSE 心跳不延长空闲期。logout、token 轮换及会话到期后，新 API 请求立即拒绝，已有 SSE 最迟 5 秒内关闭并清除页面敏感视图，不能只在建流时鉴权。operatorId 的持久文件与 node journal/HMAC 密钥按 §6 的完整性要求管理。
+浏览器会话使用服务端状态，绝对有效期 8 小时、空闲上限 30 分钟；SSE 心跳不延长空闲期。logout、token 轮换及会话到期后，新 API 请求立即拒绝，已有 SSE 最迟 5 秒内关闭并清除页面敏感视图，不能只在建流时鉴权。operatorId 的持久文件、§5 的授权修订状态与 node journal/HMAC 密钥按 §6 的完整性要求管理。
 
 ## 5. 公共帧、操作与时间
 
-所有跨端时间字段统一为 UTC Unix 毫秒整数。`nodeEpoch` 是 marshal node **运行实例**的随机标识；每个 `(deviceId, agent, sessionId, nodeEpoch)` 的 `seq` 单调递增，因此任何去重或比较都必须带上会话键，不能只用 `(nodeEpoch, seq)`。`hubEpoch` 标识 marshal hub 运行实例；SSE 游标只在同一 hubEpoch 内有效。两者在插件重载、角色重建或进程重启导致内存序列/索引重置时都必须更换，不能仅依据 OS 进程是否重启；普通网络重连不更换。旧实例回调/帧不得进入新实例，持久 journal 和 operatorId 不随 epoch 清空。
+所有跨端时间字段统一为 UTC Unix 毫秒整数。`nodeEpoch` 是 marshal node **运行实例**的随机标识；每个 `(deviceId, agent, sessionId, nodeEpoch)` 的 `seq` 单调递增，因此任何去重或比较都必须带上会话键，不能只用 `(nodeEpoch, seq)`。`hubEpoch` 标识 marshal hub 运行实例；SSE 游标只在同一 hubEpoch 内有效。两者在插件重载、角色重建或进程重启导致内存序列/索引重置时都必须更换，不能仅依据 OS 进程是否重启；普通网络重连不更换。旧实例回调/帧不得进入新实例，持久 journal、operatorId 与授权修订不随 epoch 清空。
 
 `runtimeEpoch` 标识适配器实例：子进程类 agent 为进程启动，DSH 为适配器/插件实例；实例重建、宿主重启或子进程退出都使旧 runtimeEpoch 的写权和交互立即失效。公开 seq 是归一化后的投递顺序，不是原生状态的因果版本；迟到事件的处理见 §11。
 
-`policyRevision` 是 hub 侧每设备授权策略（撤销、allowContent、allowInteractions）的持久单调修订号。与 operatorId/deviceId 绑定，在授权生效前原子持久化，重启、删除再注册不得复用旧号；非法 reload 不提交新 revision，授权保持不可确认。状态丢失/损坏或已检测到旧备份回退按 §6 进入 recovery-required，不从零继续。hello 回带 node 上一次绑定的 operatorId/policyRevision（首次为空），hello.ack 下发当前值；只有同一身份域内比较修订号。任一值变化都丢弃旧策略的内容/ACK 正文，并按 §8 结算旧待答，不能只删除卡片留下原生阻塞。随后重新协商、完整同步；hubEpoch 变化但持久策略未变不等于撤权。
+`policyRevision` 是 hub 侧每设备授权策略（撤销、allowContent、allowInteractions）的持久单调修订号。与 operatorId/deviceId 绑定，在授权生效前与授权变更一次性原子写入 §3 的受限设备状态文件，重启、删除再注册不得复用旧号（删除设备保留撤销墓碑）。写入失败等同非法 reload：不提交新 revision、不发布新授权、受影响设备保持不可确认并关闭连接。状态缺失、损坏、不可读或已检测到旧备份回退按 §6 进入 recovery-required，不从零继续。hello 回带 node 上一次绑定的 operatorId/policyRevision，hello.ack 下发当前值；node 侧该值只是实例内存，重建后为空，空值按首次绑定处理且不能跳过 hub 的当前策略下发。operatorId 不同即不同身份域，不比较修订号，丢弃旧策略状态后重新绑定；同一身份域内 node 回带更高修订而 hub 当前值更低，判定 hub 状态回退并进入 recovery-required，不能下发更低修订。任一值变化都丢弃旧策略的内容/ACK 正文，并按 §8 结算旧待答，不能只删除卡片留下原生阻塞。随后重新协商、完整同步；hubEpoch 变化但持久策略未变不等于撤权。
 
 | 帧 | 方向 | 必需信息与用途 |
 |---|---|---|
@@ -150,11 +150,11 @@ wire v2 将当前 marshal `resume` 重命名为 `observe`；当前 DSH 的 resum
 
 ## 6. 命令生命周期与幂等（P1-01、P1-02）
 
-浏览器对一次用户意图生成并保存 idempotencyKey；网络超时不能换键自动重试。未决或结果未知的键必须在发请求前保存到跨标签页/浏览器重启仍可用的持久存储（如 IndexedDB），以 hub 身份和 operatorId 隔离；sessionStorage 不能满足关闭标签页后的恢复。仅存 target、op、key、状态、时间等无正文元数据，不存 prompt、答案、token 或响应正文。重开、重新登录后先查状态，不重发命令；人工提交新意图须明确与未知旧意图区分。存储不可用或写入失败时拒绝新的远端写请求；本地记录丢失时提示恢复信息不足，先人工核对，不将再次点击视作可安全重试。幂等域为 `(operatorId, target, idempotencyKey)`，规范化 op/args 的摘要用于检出同键不同载荷；传输 commandId、时间和连接代次不参与载荷摘要。
+浏览器对一次用户意图生成并保存 idempotencyKey；网络超时不能换键自动重试。未决或结果未知的键必须在发请求前保存到跨标签页/浏览器重启仍可用的持久存储（如 IndexedDB），以 `(publicOrigin, operatorId)` 隔离；sessionStorage 不能满足关闭标签页后的恢复。仅存 target、op、key、状态、时间等无正文元数据，不存 prompt、答案、token 或响应正文。重开、重新登录后先查状态，不重发命令；人工提交新意图须明确与未知旧意图区分。存储不可用或写入失败时拒绝新的远端写请求；本地记录丢失时提示恢复信息不足，先人工核对，不将再次点击视作可安全重试。幂等域为 `(operatorId, target, idempotencyKey)`，规范化 op/args 的摘要用于检出同键不同载荷；传输 commandId、时间和连接代次不参与载荷摘要。
 
 hub 在任何 await/发送之前原子登记 in-flight。同键同载荷共享一个结果，不能再次发送；同键不同载荷返回 `idempotency-conflict`。ACK 路由必须显式分派到 pending 完成逻辑，event 路由不能吞掉 ACK；error/关闭/超时也必须完成等待者。
 
-node 是去重的最终权威。按幂等域原子登记并在调用 agent 前持久化 `admitted`，之后记录 `accepted / confirmed / rejected / outcome-unknown`。日志仅含身份、目标、操作、时间、状态和带本地密钥的载荷摘要，不含提示词、答案、命令或路径。已记录的键至少保留 24 小时；未决记录不可被 LRU 驱逐，容量满则拒绝新写入。终态过保留窗口可删除，因此不承诺无限期 exactly-once。journal/HMAC 密钥及 hub operatorId 必须跨重启稳定，版本迁移保留原域；已初始化安装中发现文件丢失、损坏、回滚到过旧快照或密钥不匹配时禁止新写，返回 recovery-required，不自动新建空表/新身份。首次初始化与恢复有独立标记及人工对账步骤；不能保证检测外部同时抹去全部状态的情况，重建安装须按恢复操作处理。
+node 是去重的最终权威。按幂等域原子登记并在调用 agent 前持久化 `admitted`，之后记录 `accepted / confirmed / rejected / outcome-unknown`。日志仅含身份、目标、操作、时间、状态和带本地密钥的载荷摘要，不含提示词、答案、命令或路径。已记录的键至少保留 24 小时；未决记录不可被 LRU 驱逐，容量满则拒绝新写入。终态过保留窗口可删除，因此不承诺无限期 exactly-once。journal/HMAC 密钥、hub operatorId 及 §5 的授权修订状态必须跨重启稳定，版本迁移保留原域；已初始化安装中发现文件丢失、损坏、回滚到过旧快照或密钥不匹配时禁止新写，返回 recovery-required，不自动新建空表/新身份。首次初始化与恢复有独立标记及人工对账步骤；不能保证检测外部同时抹去全部状态的情况，重建安装须按恢复操作处理。
 
 | 状态 | 对用户的含义 | 重试规则 |
 |---|---|---|
