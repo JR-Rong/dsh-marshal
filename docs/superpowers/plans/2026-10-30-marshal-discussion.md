@@ -28,10 +28,10 @@
 **文件**：未来扩展 wire/commands、config、hub/devices、node/runner/privacy；新增 hub/discussions 的类型/状态存储最小模块。
 **依赖**：D1-T00。
 
-- [ ] 定义 room/run/member/round/message 身份、状态机和 `discussion.create / submit / interrupt / dispose` 判别操作；扩展契约修订与能力协商，不让旧 node 接收房间写入。
+- [ ] 定义 room/run/member/round/message 身份、状态机和 `discussion.create / submit / interrupt / dispose` 判别操作，以及 `discussion.output / discussion.status` 事件帧（绑定 run/member/turn 与每 run `roomSeq`，不入 EventBuffer/离线队列）；扩展契约修订与能力协商，不让旧 node 接收房间写入。
 - [ ] 实现双侧 allowDiscussion 默认 off、既有 content 双授权及单次 run 共享预览；成员设备与历史材料来源设备（`sourceDeviceId`）均纳入授权检查与持久 `policyRevision` 追踪。
 - [ ] 无正文元数据记录、进程间排他锁、浏览器 `(publicOrigin, operatorId)` 持久幂等键、hub→node 稳定写键和预留推理调用名额（仅 `submit` 占推理配额，`create/interrupt/dispose` 不占推理配额）；执行仍由 node journal 去重，查状态不重发。
-- [ ] 将模型输入/输出纳入统一隐私/字节预算；预览阶段预校验单次组装输入 ≤ 64 KiB，运行时分发前再次校验；结构化交互正文不得从历史选择绕过过滤，讨论正文不进入 v1 `EventBuffer` 或 node 离线事件队列。
+- [ ] 将模型输入/输出纳入统一隐私/字节预算；预览按成员/轮次与材料估算最坏累积并提示触顶组合，运行时分发前按实际封存发言再次校验单次组装输入 ≤ 64 KiB；结构化交互正文不得从历史选择绕过过滤，讨论正文不进入 v1 `EventBuffer` 或 node 离线事件队列。
 
 **验证/完成**：G03/G04/G05/G09 的 U/可运行 I 层；身份、迁移与恢复路径明确，组件失败零模型调用。
 
@@ -41,7 +41,7 @@
 **依赖**：D1-T00、D1-T01。
 
 - [ ] 创建隔离、无工具新会话（`discussion.create` 使用 `target.sessionId: null` 并在 node journal 记录新专用 `sessionId`），保存真实 session/runtime/turn ID，原生能力不成立则 unavailable。
-- [ ] create/submit/observe/interrupt/dispose 经现有 runner/journal/supervisor；不新增直连 provider 旁路。
+- [ ] create/submit/observe/interrupt/dispose 经现有 runner/journal/supervisor；不新增直连 provider 旁路；`submit` 复用公共契约 §7 的写权与原子 idle 受理，原生交互一律拒绝且不生成远端卡，无法满足即标 unavailable。
 - [ ] 返回接纳、最终输出、原生取消确认与未知状态；busy 零排队，超时不自行重试。
 - [ ] 验证工作会话保持原状态；run 终态（`completed / stopped / failed`）、节点重载、撤权、15 分钟保留到期及进程退出均清理专用会话句柄，原生历史保留如实报告。
 
@@ -66,7 +66,7 @@
 **文件**：未来最小扩展 hub/api.ts、page.ts、index.ts，新增讨论装配/浏览器测试。
 **依赖**：D1-T01 至 D1-T03。
 
-- [ ] 预览成员设备/平台/provider/model、共享文本、预算及原生保留；开始/停止为独立明确操作。
+- [ ] 预览成员设备/平台/provider/model、共享文本、预算及原生保留；启动回带预览版本/摘要并校验，变化须重新确认；开始/停止为独立明确操作。
 - [ ] 复用 cookie/CSRF、SSE 快照屏障/背压；页面重载、重复请求不新开 run。
 - [ ] 显示作者、原生完成/未知、分歧与引用；内容纯文本，没有执行建议的自动调用入口。
 - [ ] 撤权/到期清正文，当前 RAM 不可用时提示材料缺失；不往浏览器持久存储写讨论正文。

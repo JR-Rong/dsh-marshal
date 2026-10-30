@@ -19,8 +19,8 @@ D1 在 v1 认证、node journal、真实控制边界、隐私及恢复门槛完�
 ## 2. 用户流程
 
 1. 新建草稿：填写议题，选择 2–4 个成员（设备、原生平台、精确模型/版本、角色），指定一名成员在讨论结束后汇总。
-2. 预览：展示会发送给哪些设备及其配置的模型服务、正文片段、轮次、时间/调用上限和原生会话可能保留记录的事实。该确认仅授权这次讨论所需的模型调用与成员间共享。
-3. 开始：使用浏览器按 `(publicOrigin, operatorId)` 持久化的幂等键发起启动，校验每个成员及历史材料来源设备的能力与本地授权，创建专用无工具会话。任一成员创建失败则停止后续创建、立即销毁本 run 已创建的专用会话并转入 `failed`；若任一创建结果处于 `outcome-unknown`，则转入 `paused`（待人工/状态查询核对），绝不退回 `draft` 复用同一 `runId` 或偷偷换 provider、模型与成员。
+2. 预览：展示会发送给哪些设备及其配置的模型服务、正文片段、轮次、时间/调用上限和原生会话可能保留记录的事实。该确认仅授权这次讨论所需的模型调用与成员间共享。预览结果带版本与摘要；启动请求必须回带同一摘要，成员、材料、provider/model 或 `policyRevision` 任一变化都须重新预览确认，不匹配返回 `revision-conflict`，不能沿用旧确认静默更新共享范围。
+3. 开始：使用浏览器按 `(publicOrigin, operatorId)` 持久化的幂等键发起启动，校验每个成员及历史材料来源设备的能力与本地授权，以及每个成员会话的写权门槛（§5），创建专用无工具会话。任一成员创建失败则停止后续创建、立即销毁本 run 已创建的专用会话并转入 `failed`；若任一创建结果处于 `outcome-unknown`，则转入 `paused`（待人工/状态查询核对），绝不退回 `draft` 复用同一 `runId` 或偷偷换 provider、模型与成员。
 4. 第一轮独立给出意见；至少 2 名成员完成有效封存发言才进入下一轮交叉评论，后续轮次只读取上一轮已封存的共同记录。若第一轮有效发言为 0 则直接 `failed`（不调用汇总）；若仅 1 名成员完成有效发言或后续轮次无新有效发言，则不再启动后续交叉轮次。UI 显示发言来源、原生完成证据、未回复或失效成员。
 5. 汇总：分别列出共识、分歧、证据与未知项，引用 messageId；未完成者明确缺席，不把沉默当赞成。用户据此决定后续行动。
 
@@ -46,11 +46,17 @@ hub 是唯一调度者，成员不能直接互相发控制命令。每个 node �
 | 内容与页面 | 复用源端白名单、设备策略、纯文本/SSE/背压；讨论正文与原生 PendingInputs、普通会话历史及 v1 `EventBuffer` 隔离，讨论帧不入 `EventBuffer` 或 node 离线事件队列 |
 | DSH 原生协作机制 | 参考 Agent Team 的身份/投递与 dsh-agent-teams 的代次/调度；是否调用窄公共接口由 D1-T00 决定，不默认挂载整个 profile |
 
+node→hub 的讨论输出走独立 `discussion.output / discussion.status` 事件帧，绑定 `(deviceId, runId, memberId, turnId, nodeEpoch)` 与每 run 的 `roomSeq`，不占用普通会话 `seq` 索引。hub 只把已通过源端白名单与字节校验的完整输出交给 RoomCoordinator；增量只用于展示，不进入封存记录，也不能绕过 `discussion.submit` 的幂等结果。未在握手中协商 `discussion` 能力的 node 不接收房间命令，旧 hub/node 组合显式失败而不是降级解释。
+
+浏览器房间端点（D1 新增）：读取需有效 cookie 会话；写操作还需 cookie+CSRF，以及 `(publicOrigin, operatorId)` 持久幂等键。`POST /marshal/api/discussions` 新建草稿，`POST /marshal/api/discussions/:roomId/runs` 在预览确认后启动，`POST /marshal/api/discussions/:roomId/stop` 停止或暂停，`GET /marshal/api/discussions/:roomId` 读取状态与封存记录分页，`GET /marshal/api/discussions/stream` 提供绑定 `hubEpoch` 游标与 reset 的房间专用 SSE。端点不提供正文导出、不写文件，也不接受 URL 查询参数中的凭据。
+
 未来路径建议为 `src/hub/discussions/`、`src/agents/discussion.ts` 与现有 wire、runner、privacy、api/page 的最小扩展。以上均未创建；不另建重复的认证、journal 或适配器进程监督器。
 
 ## 4. 讨论权限与内容授权
 
 “仅讨论”必须由原生能力和宿主隔离强制执行，不能只靠 system prompt。新会话需要已验证的工具禁用：无文件/终端/网络工具、MCP、技能执行、子 agent、用户自定义启动 hook 或自动恢复工作任务；模型服务的正常推理请求除外。若宿主不能保证这些条件或创建会话就会执行不可隔离的 hook，标 `discussion-unavailable`，不以“工具申请时再拒绝”替代禁用证据。
+
+讨论专用会话必须关闭原生交互：任何原生提问、审批或 plan-review 请求一律按本机无通道处理（拒绝/无答案），把该成员标为失败或缺席；不注册 `input.requested`、不创建远端可答卡，也不因等待而延长 run。若平台无法在不产生可答交互的前提下运行，同样标 `discussion-unavailable`，不能把 §8 的远答通道复用到讨论会话。
 
 本地新增默认关闭的 `allowDiscussion` 授权（node 本地配置与 hub 设备记录均须 true），不由浏览器开启。所有参与讨论的成员设备以及提供历史片段的**材料来源设备**（`sourceDeviceId`）均须同时满足双侧 `allowDiscussion=true` 与现有 `content` 双授权（源端 `privacy=content` 且 hub `allowContent=true`）。hub 的该授权变化加入同一持久 `policyRevision`。每个 run 的 owner 确认绑定参与成员列表、材料来源设备、provider/model、材料摘要和策略修订；普通 `allowContent`/`allowInteractions` 均不自动授权把内容再次发给别的 agent。汇总者与其它成员同等授权。
 
@@ -64,6 +70,8 @@ hub 是唯一调度者，成员不能直接互相发控制命令。每个 node �
 
 `roomId` 是持久元数据身份；每次显式运行生成 `runId`，绑定当前 `hubEpoch`、材料来源设备及各成员的 `(deviceId, agent, sessionId, runtimeEpoch)`。每条调度命令绑定 `runId/roundId/memberId/turnId/idempotencyKey`；`discussion.create` 尚无 `sessionId` 时沿用公共契约 `create` 的 `sessionId: null` target 语义，由 node journal 持久化新生成的专用 `sessionId`。服务端签发 `messageId` 和单调 `roomSeq`，保存 `replyTo/sourceMessageIds`；来源不可由模型伪造。
 
+`discussion.submit` 与普通 `prompt` 使用同一写权门槛：只有该专用会话处于 `ours-idle`、由当前 `runtimeEpoch` 持有排他控制，且原生控制器在同一次受理步骤完成“当前 idle + 本次写者取得/互斥”时才可接收；不能沿用先 list 再 submit、忙时排队或 hub 固定调度时序来证明。无法验证原子受理的平台不开放讨论成员（`discussion-unavailable`）。`interrupt` 仍需匹配 `activeTurnId/runtimeEpoch`，`dispose` 只释放本 run 的专用会话，不得作用于其它会话。
+
 房间状态为 `draft → preparing → running → summarizing → completed`；任何活跃状态可转 `pausing → paused`、`stopping → stopped` 或 `failed`。`preparing` 阶段只要任一成员会话创建明确失败，即销毁本 run 已创建的专用会话并进入 `failed`；若创建结果 `outcome-unknown` 则进入 `paused` 等待查询对账，绝不退回 `draft` 复用同一 `runId`。停止/暂停先原子关闭新分发，再取消已接纳调用；直到源端确认不再运行才进入相应终态，否则显示结果未知。`completed` 只表示讨论及汇总完成，不表示建议已经执行。
 
 首版固定轮次：一轮内各成员最多发言一次，可并行；下一轮只消费上一轮封存的同一份记录，不能边输出边无限触发其它成员。一个原生会话最多一条在途调用；busy 不进入延迟队列。成员超时/错误留出缺席项，不自动重试或由另一模型冒名补位。只有已确认终止的失败成员可跳过后继续；取消/结果未知则 run 暂停，不能边猜测边启动下一轮。第一轮若有效封存发言数为 0，直接进入 `failed` 且不发起汇总；若第一轮仅 1 名成员完成有效发言（无交叉评论对象）或后续某轮无新有效发言，则跳过剩余讨论轮次（已确认无未知在途调用时可按规则进入 `summarizing` 或结束）。
@@ -74,7 +82,7 @@ hub 是唯一调度者，成员不能直接互相发控制命令。每个 node �
 | 推理调用 | 仅 `discussion.submit`（轮次发言与汇总）计入推理配额，最多成员数 × 轮数 + 1 次汇总（最多 13 次）；失败和超时也消耗名额，不补发。`discussion.create`（已证明零推理）与 `interrupt/dispose` 不占推理名额，但同样受命令幂等与速率约束 |
 | 并发 | 每 run 最多成员数个在途调用；hub 最多 4 个活跃 run，每成员专用会话仅属于一个 run |
 | 时间 | 单次调用 120s，整个 run 15min，单调时钟；超限停止分发并请求取消 |
-| 正文 | 单次模型调用组装后的完整输入（含议题、共享材料、前序轮次封存发言与固定提示词框架）≤ 64 KiB、单次输出 ≤ 16 KiB UTF-8；预览阶段须预校验初始材料与最大轮次组合不会突破 64 KiB 单次输入上限（或限制初始材料字节数以留出前序发言空间），运行时分发前再次校验；单房间总计 ≤ 4 MiB，所有房间合计 ≤ 16 MiB，并共享公共契约的 hub 内容 64 MiB 总预算；超限停止，标不完整，不静默截断后宣称完整结论 |
+| 正文 | 单次模型调用组装后的完整输入（含议题、共享材料、前序轮次封存发言与固定提示词框架）≤ 64 KiB、单次输出 ≤ 16 KiB UTF-8；预览按所选成员/轮次与材料大小估算最坏累积并提示可能触达上限的组合，运行时分发前按实际封存发言再次校验；单房间总计 ≤ 4 MiB，所有房间合计 ≤ 16 MiB，并共享公共契约的 hub 内容 64 MiB 总预算；超限停止、标不完整，不静默截断后宣称完整结论 |
 | 保留 | 仅 hub RAM；结束/暂停后最多 15min，活跃期亦受整体期限和字节上限；到期、关闭或撤权清理，不落磁盘/IndexedDB/正文日志 |
 
 首次分发前原子预留调用名额；`discussion.create`、轮次 `submit` 与汇总 `submit` 使用稳定的写命令键并通过 node journal。ACK accepted、完整原生 turn 结束、消息被选入下一轮是三个不同状态。只有完整且已校验的最终输出进入封存记录；未完成增量仅供预览，不当作已完成意见。
@@ -83,7 +91,7 @@ hub 是唯一调度者，成员不能直接互相发控制命令。每个 node �
 
 ## 6. 恢复、汇总与生命周期
 
-房间元数据 journal 只保存 owner、成员与材料来源设备绑定、run/round/命令 ID、预算预留、状态和材料的带密钥摘要，不存议题/材料/发言/汇总正文。启动/分发前先持久化相关元数据，再调用现有 node journal；单 hub 实例对该状态持有排他锁，多实例不竞跑同一房间。
+房间元数据 journal 只保存 owner、成员与材料来源设备绑定、run/round/命令 ID、预算预留、状态和材料的带密钥摘要，不存议题/材料/发言/汇总正文。启动/分发前先持久化相关元数据，再调用现有 node journal；单 hub 实例对该状态持有排他锁，多实例不竞跑同一房间。该 journal 是 hub 本地受限文件，默认 `$HOME/.dsh-marshal/discussions.json`，显式覆盖使用绝对路径、不展开字面 `~`，目录/文件权限与完整性规则等同于公共契约 §3 的设备状态文件；启动时校验可解析、版本和与 operatorId 的绑定。文件缺失按首次初始化处理；损坏、回滚或身份不匹配时拒绝新 run，只读展示仍可保留元数据摘要，不自动重建或清空。摘要密钥按公共契约 §6 的 HMAC 完整性要求持久化，不能因 hub 重启而改变或丢失。
 
 hub 重启不恢复自动调度；旧 run 标 `paused/outcome-unknown`，查询原命令状态但不重发。没有正文就不能重建原讨论或自动重新汇总。用户必须核对未知调用，再显式以材料重新预览启动新 run；清除旧未知不作为启动的捷径。node/runtime 重启、设备离线或协议版本改变同样撤销原成员绑定，不偷偷创建替代会话。普通页面重连在 hub RAM 仍有效时用快照+游标恢复展示，不能再次发起讨论。
 
@@ -98,8 +106,8 @@ hub 重启不恢复自动调度；旧 run 标 `paused/outcome-unknown`，查询�
 | ID | 层 | 场景 | 通过条件 |
 |---|---|---|---|
 | G01 | R | 固定 DSH/Codex/Claude 候选版本，验证专用会话和禁用工具 | 至少两个原生平台通过；不能禁用工具/hook 的平台 unavailable；同 DSH 多 provider 不算跨平台；记录准确版本及隔离证据 |
-| G02 | U/I/R | 新建讨论、现有工作会话运行中、恶意发言要求执行/扩权 | 专用新会话；工作会话无 resume/fork/写入；终端/文件/网络工具、MCP、子 agent 调用均为零；原有全局配置不变 |
-| G03 | U/I | 成员或材料来源设备的 allowDiscussion/content 各自缺一、参与方未确认、临时更换模型/provider | 任一缺失零正文分发/零推理；共享预览与实际成员/来源设备/模型一致；更换须新 run 确认，不能自动降级或换人 |
+| G02 | U/I/R | 新建讨论、现有工作会话运行中、恶意发言要求执行/扩权 | 专用新会话；工作会话无 resume/fork/写入；终端/文件/网络工具、MCP、子 agent 调用均为零；原生交互卡为零（提问/审批按无通道拒绝并记缺席）；原有全局配置不变 |
+| G03 | U/I | 成员或材料来源设备的 allowDiscussion/content 各自缺一、参与方未确认、临时更换模型/provider | 任一缺失零正文分发/零推理；共享预览与实际成员/来源设备/模型一致；启动摘要不匹配零调用；更换须新 run 确认，不能自动降级或换人 |
 | G04 | U/I | 并发开始、重复 HTTP、丢 ACK、preparing 部分创建失败/未知、hub 在登记/发送/落结果边界崩溃 | 浏览器与 hub/node 稳定键协作，一个 run/命令最多一次原生调用；preparing 失败销毁已建会话并进入 failed、未知进入 paused 且不退回 draft；重启只查询不自动重发/重建会话 |
 | G05 | U/I | 消息伪造作者、旧 run/成员 epoch 迟到、重复输出与乱序增量 | 作者来自认证绑定；旧代次不进入当前讨论；一个完成发言一次入封存记录，下一轮所有成员读取同一记录 |
 | G06 | U/I/R | 第三轮结束、调用额用尽、长回合、多轮累积输入逼近 64 KiB、超长输出、多个房间满额 | 名额/时间/单次组装输入 64 KiB/单次输出 16 KiB/全 hub 预算均不超界；停止新调度；无无限互相唤醒；不静默截断，不把字符数或请求取消当硬费用/执行停止证明 |

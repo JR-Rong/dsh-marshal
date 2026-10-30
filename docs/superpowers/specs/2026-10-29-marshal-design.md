@@ -122,6 +122,8 @@ Codex/Claude headless 没有可凭空接回的本地界面。它们的无答案/
 | GET /marshal/api/command-status | 只读查原操作状态，不触发执行 |
 | GET /marshal/api/inputs | 从 node 获取当前会话有效待答快照 |
 | GET /marshal/api/stream | 带游标、reset 和背压的 SSE |
+| POST /marshal/api/discussions、/discussions/:roomId/runs、/discussions/:roomId/stop | D1 后续阶段：新建草稿、预览确认后启动 run、停止/暂停；写操作校验 cookie/CSRF 与 `(publicOrigin, operatorId)` 幂等键 |
+| GET /marshal/api/discussions/:roomId、/discussions/stream | D1 后续阶段：房间状态与封存记录分页、房间专用 SSE；正文仅 hub RAM，不进入 EventBuffer 或磁盘 |
 | /marshal/uplink | 仅设备 WSS 升级与握手 |
 
 卡片按 device/agent/session/runtimeEpoch/requestId 定位；页面不把一个会话的能力更新到另一个当前选中会话。待答状态独立于时间线，切换会话、刷新和重复事件不造成重复提交。所有来自 wire 的文本按纯文本渲染，不使用 `innerHTML` 或字符串拼接 HTML，避免问题/消息/工具输出注入脚本。

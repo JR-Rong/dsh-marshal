@@ -58,7 +58,7 @@ wire v1/v2 混接必须显式失败，UI 给出协议不匹配；不得用旧节
 | `deviceName` | node | 默认 hostname，仅显示用途，不参与鉴权或会话键 |
 | `dashboardToken` | hub | 必填，与 device token 隔离；由至少 24 随机字节生成 32 字符 base64url（≥192 bit 熵）。长度/弱口令校验不证明随机性；长度不足 32 字符、单字符重复或命中内置弱口令表时启动失败；不允许 URL 查询参数传递 |
 | `publicOrigin` | hub | 必填，浏览器访问的唯一 HTTPS origin（scheme/host/port，无路径、无尾斜杠）；作为 Origin 校验基准，不从请求 Host 或转发头推导。缺失、非 HTTPS 或含路径时启动失败 |
-| `devicesFile` | hub | 默认 `$HOME/.dsh-marshal/devices.json`；显式覆盖使用绝对路径，不展开字面 `~`；设备 ID、显示名、token 摘要、撤销状态、内容与交互授权，以及 §5 的授权修订高水位与撤销墓碑。仅 §4 的全新初始化可按空表告警并持久化空表；已初始化安装（以 §4 的 operatorId 持久文件存在为准）中缺失、无法解析、含重复 ID/重复 token 摘要时 hub 启动失败，不静默丢弃条目。设备记录完好但修订字段缺失/回退时按 §5 进入 recovery-required（hub 可启动，但拒绝新写且不把修订重置为零）|
+| `devicesFile` | hub | 默认 `$HOME/.dsh-marshal/devices.json`；显式覆盖使用绝对路径，不展开字面 `~`；设备 ID、显示名、token 摘要、撤销状态、内容、交互与讨论授权，以及 §5 的授权修订高水位与撤销墓碑。仅 §4 的全新初始化可按空表告警并持久化空表；已初始化安装（以 §4 的 operatorId 持久文件存在为准）中缺失、无法解析、含重复 ID/重复 token 摘要时 hub 启动失败，不静默丢弃条目。设备记录完好但修订字段缺失/回退时按 §5 进入 recovery-required（hub 可启动，但拒绝新写且不把修订重置为零）|
 | `privacy` | node | 默认 `metadata`；可选 `content`，还需 hub 对该 deviceId 允许内容 |
 | 设备记录 `allowContent` | hub | 默认 false；由部署者在 hub 本地设置 |
 | 设备记录 `allowInteractions` | hub | 默认 false；远端的提问/审批卡片需同时满足 node 侧 relay=remote 与本项为 true，缺一即按 off 处理 |
@@ -72,7 +72,7 @@ wire v1/v2 混接必须显式失败，UI 给出协议不匹配；不得用旧节
 | `ringBufferMinutes` | hub | 默认 15；1–15；v0 不提供内容补看，v1 才生效 |
 | `allowDiscussion` / 设备记录 `allowDiscussion` | node / hub | 均默认 `false`；仅后续 [D1 讨论组阶段](2026-10-30-marshal-discussion.md)启用，还要求双侧 `content` 授权与单次 run 预览确认；v0/v1 不开放 |
 
-固定资源预算：出站单帧不超过 1 MiB；单张交互卡不超过 4096 UTF-8 字节；node 离线事件队列最多 1000 条且总计 8 MiB；单设备同步暂存不超过 16 MiB、hub 全部暂存不超过 64 MiB；SSE 每客户端待写不超过 4 MiB；journal 必须有显式本地容量上限并在启动时校验，未决项永不驱逐。v1 历史缓冲每会话最多 2000 条/8 MiB、hub 总计 64 MiB。任何一项达到上限都触发淘汰或拒绝；这些是硬限额，不是“目标平均值”。
+固定资源预算：出站单帧不超过 1 MiB；单张交互卡不超过 4096 UTF-8 字节；node 离线事件队列最多 1000 条且总计 8 MiB；单设备同步暂存不超过 16 MiB、hub 全部暂存不超过 64 MiB；SSE 每客户端待写不超过 4 MiB；journal 必须有显式本地容量上限并在启动时校验，未决项永不驱逐。v1 历史缓冲每会话最多 2000 条/8 MiB、hub 总计 64 MiB。D1 讨论房间的调用、轮次与正文预算见 D1 文档，并共享 hub 内容 64 MiB 总预算。任何一项达到上限都触发淘汰或拒绝；这些是硬限额，不是“目标平均值”。
 
 hub 复用 DSH webServer 的端口与 TLS/反代，不另监听。node 不暴露外部监听端口；DSH 自身需要的回环服务不属于跨机入口。hub 管理本机 agent 必须显式注册一个本地 node 身份，走相同管道；不是 hub 的隐式副作用。
 
@@ -120,7 +120,7 @@ owner 的审计身份由 hub 从认证会话赋予，不接受浏览器自报 `a
 | `inputs.snapshot / inputs.snapshot.result` | hub→node / node→hub | owner 按会话查询当前有效待答卡；node 重新执行隐私与策略校验，返回 runtimeEpoch 与同一公开序列的快照高水位 |
 | `heartbeat / heartbeat.ack` | 双向请求/应答 | 当前 connectionId/nodeEpoch、请求 nonce、发送/响应时刻；用于存活与时钟偏差估算，不携带正文 |
 
-方向不符的帧按 `frame-invalid` 拒绝。target 为 `(deviceId, agent, sessionId)`；仅 `create` 使用 `sessionId: null`，在 agent 级执行并以该完整 target 去重，其余操作必须有实际 sessionId。`fork` 指向父会话。create/fork 的新会话 ID 作为无正文结果落 journal 后返回，状态查询恢复原 ID，不通过再建会话恢复结果。agent 标识是字符串，但必须在握手支持集合中。未知操作必须拒绝；未知事件可忽略并计数，不能因此绕过身份或大小检查。每个操作的 args 由 `wire/commands` 的判别 schema 定义并在两端验证，未知字段拒绝；`observe` 的 args 区分 `history`（带不透明 cursor 和 limit，单页有界）与 `follow`（订阅/取消订阅），两者都不带写权副作用。follow 使用服务端签发、绑定认证观察者及当前连接的 subscriptionId；取消只影响自己的订阅。共享原生 follower 只在最后一个观察者退出后释放，断流/登出/卸载清理引用；两个浏览器不能互相取消或重复创建无界 follower。history、follow、状态/待答查询不占用写命令 journal。
+方向不符的帧按 `frame-invalid` 拒绝。target 为 `(deviceId, agent, sessionId)`；仅 `create` 与 D1 的 `discussion.create` 使用 `sessionId: null`，在 agent 级执行并以该完整 target 去重，其余操作必须有实际 sessionId。`fork` 指向父会话。create/fork/discussion.create 的新会话 ID 作为无正文结果落 journal 后返回，状态查询恢复原 ID，不通过再建会话恢复结果。agent 标识是字符串，但必须在握手支持集合中。未知操作必须拒绝；未知事件可忽略并计数，不能因此绕过身份或大小检查。每个操作的 args 由 `wire/commands` 的判别 schema 定义并在两端验证，未知字段拒绝；`observe` 的 args 区分 `history`（带不透明 cursor 和 limit，单页有界）与 `follow`（订阅/取消订阅），两者都不带写权副作用。follow 使用服务端签发、绑定认证观察者及当前连接的 subscriptionId；取消只影响自己的订阅。共享原生 follower 只在最后一个观察者退出后释放，断流/登出/卸载清理引用；两个浏览器不能互相取消或重复创建无界 follower。history、follow、状态/待答查询不占用写命令 journal。
 
 事件 kind 与最小语义统一如下，额外字段必须在版本 schema 和隐私白名单中声明：
 
@@ -132,6 +132,7 @@ owner 的审计身份由 hub 从认证会话赋予，不接受浏览器自报 `a
 | `tool.started / tool.output / tool.completed` | callId、工具名、参数/输出或计数、最终状态；不同工具不得共用卡片身份 |
 | `input.requested / input.resolved` | 第 8 节嵌套判别载荷，永不进入历史缓冲 |
 | `capability.changed` | 当前会话的完整能力快照、revision、回读时间；不是不明确的局部 patch |
+| `discussion.output / discussion.status` | D1 预留：绑定 `runId/memberId/turnId`、`nodeEpoch` 与每 run 的 `roomSeq`，只携带经源端白名单和大小校验的成员输出或状态；不进入 `EventBuffer`、普通会话索引或 node 离线队列，未协商 `discussion` 能力时忽略并计数 |
 | `error` | 受限 code、严重性、关联 ID；无原始异常内容 |
 
 完整 sync 会话行是替换快照；普通 session.updated 是按 schema 合并的局部更新，两者不得混用。Capability 至少包含 observe 的独立字段（history: boolean；follow: stream/poll/none）、明确 operations 集合、工具/思考可见级别、ownership、tunables 和逐功能 unavailable reason。dispatch 不再用一个互斥字符串代表多个不同写入能力。
@@ -147,6 +148,7 @@ owner 的审计身份由 hub 从认证会话赋予，不接受浏览器自报 `a
 | `decide` | v1：审批单次决定；受第 8 节约束 |
 | `configure` | v1：会话设置；受第 9 节约束，DSH 留 v1.1 |
 | `create / fork` | v1 可选：显式新建/分叉；能力、cwd 范围和新会话身份均须验证 |
+| `discussion.create / submit / interrupt / dispose` | D1 后续阶段：房间专用无工具会话与有限轮次；v0/v1 返回 `unsupported`，未协商 `discussion` 能力的 node 不得收到这些命令。`discussion.create` 复用 `sessionId: null` 的 create target 语义；`submit` 与其他会话写操作受第 7 节写权及原子 idle 受理约束，不能因 hub 调度而绕过 |
 
 wire v2 将当前 marshal `resume` 重命名为 `observe`；当前 DSH 的 resume 仅建立 follow，并无原生会话接管副作用。v1 新增独立 `acquire`；底层 Codex/Claude 的 resume API 只允许在取得写权后的适配器内部使用。
 
