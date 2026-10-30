@@ -91,7 +91,7 @@ hub 复用 DSH webServer 的端口与 TLS/反代，不另监听。node 不暴露
 
 登录成功响应返回非秘密的 `operatorId`、会话绑定的 CSRF token 与绝对到期时间；已登录页面重载通过 `GET /marshal/api/session` 取得同样信息，不续期、不创建新会话。登录与 session 响应均为 `Cache-Control: no-store`。写请求（包括 logout）必须校验有效会话、Origin、CSRF header/cookie，并将 CSRF 值与**服务端该会话保存的随机值**比较；仅 header 与 cookie 相等不够。新登录生成新 CSRF，不能绑定稳定 operatorId 代替登录会话。Origin 以配置 publicOrigin 为准，拒绝缺失、null 或不匹配；不信任客户端 Host/X-Forwarded-Host，也不开放跨源凭据 CORS。`POST /marshal/logout` 撤销会话、清除两个 cookie 及关联 SSE。
 
-非浏览器 API 使用独立认证分支：只在未带 marshal 会话 cookie 且 `x-marshal-token` 校验成功时免 cookie/CSRF；混合两种凭据拒绝，无效头不得回退 cookie。有 Origin 的请求仍须匹配 publicOrigin。设备 WSS 的 Authorization 不与 dashboard 头混用。两种分支都受相同大小/限速与授权限制。会话、CSRF、dashboard/device token 及命令正文不写日志或 URL。登录失败按来源和全局两个维度限速（同一来源 15 分钟内最多 5 次失败，之后指数退避；全 hub 失败速率超限时短暂拒绝），延迟不泄露长度或前缀差异。
+非浏览器 API 使用独立认证分支：只在未带 marshal 会话 cookie 且 `x-marshal-token` 校验成功时免 cookie/CSRF；混合两种凭据拒绝，无效头不得回退 cookie。D1 的 `/marshal/api/discussions*` 仅限浏览器会话（cookie + 写操作 CSRF/Origin）访问，不接受 `x-marshal-token`。有 Origin 的请求仍须匹配 publicOrigin。设备 WSS 的 Authorization 不与 dashboard 头混用。两种分支都受相同大小/限速与授权限制。会话、CSRF、dashboard/device token 及命令正文不写日志或 URL。登录失败按来源和全局两个维度限速（同一来源 15 分钟内最多 5 次失败，之后指数退避；全 hub 失败速率超限时短暂拒绝），延迟不泄露长度或前缀差异。
 
 owner 的审计身份由 hub 从认证会话赋予，不接受浏览器自报 `answeredBy`。`operatorId` 是该 hub 安装中持久的随机 owner 身份，经下述初始化流程生成后保存在 hub 本地受限文件中，跨浏览器登录、hub 重启和 token 轮换保持稳定；该文件同时是“安装已初始化”的判定依据：它存在而 §3 的设备状态缺失时按 §3 启动失败，它缺失而设备状态存在时不自动生成新身份（按 §6 recovery-required 人工对账）。临时浏览器会话 ID 只作审计关联，不参与幂等域。浏览器未决记录按 `(publicOrigin, operatorId)` 隔离；同一 URL 换成另一安装后不得把旧记录当新安装命令重新提交。
 

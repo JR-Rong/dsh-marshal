@@ -56,7 +56,7 @@ D1 的 `capabilityRevision` 标识经过验证的讨论准入能力与隔离配�
 
 command.status 的原命令幂等结果与附带的原生工作单元状态分开返回：accepted 不因查询变成回合完成，查询也不启动推理。状态证据必须绑定原 run/member/session/runtime/turn，并有可靠的原生版本或一致性读取屏障；旧回合终态、较大 memberSeq、收到查询响应本身都不能证明当前工作单元已终止。读取失败或实例更换后无法核对旧工作单元时为 unknown。已释放会话的当前配置可标不可读取，仍保留可验证的原生终止证据；不得凭旧配置快照重新启用讨论。未在握手中协商 `discussion` 能力的任一端都不发送或接收 discussion.output/status（frame-invalid），不接受房间写入；旧 hub/node 组合显式失败而不是降级解释。
 
-浏览器房间端点（D1 新增）：读取需有效 cookie 会话；写操作还需 cookie+CSRF，以及 `(publicOrigin, operatorId)` 持久幂等键。`GET /marshal/api/discussions` 列出房间及当前占额/未决 run 的无正文元数据摘要（供页面重载或 hub 重启后定位占额项并对账），`POST /marshal/api/discussions` 新建草稿，`POST /marshal/api/discussions/:roomId/runs` 在预览确认后启动，`POST /marshal/api/discussions/:roomId/stop` 停止或暂停，`GET /marshal/api/discussions/:roomId` 读取状态与封存记录分页，`GET /marshal/api/discussions/stream` 提供绑定 `(hubEpoch, runId, roomSeq)` 高水位屏障与 reset 的房间专用 SSE（先订阅有界暂存再取房间快照，且在登出/轮换/会话到期后 ≤5s 内关闭）。端点不提供正文导出、不写文件，也不接受 URL 查询参数中的凭据。
+浏览器房间端点（D1 新增）：**仅限浏览器登录会话访问**（读取需有效 `__Host-marshal-session` cookie；写操作还需匹配的 `Origin`、会话绑定 `__Host-marshal-csrf` 以及 `(publicOrigin, operatorId)` 持久幂等键；非浏览器 `x-marshal-token` 在 `/marshal/api/discussions*` 一律拒绝，防止脚本绕过交互式预览确认与浏览器持久键恢复）。`GET /marshal/api/discussions` 列出房间及当前占额/未决 run 的无正文元数据摘要（供页面重载或 hub 重启后定位占额项并对账），`POST /marshal/api/discussions` 新建草稿，`POST /marshal/api/discussions/:roomId/runs` 在预览确认后启动，`POST /marshal/api/discussions/:roomId/stop` 停止或暂停，`GET /marshal/api/discussions/:roomId` 读取状态与封存记录分页，`GET /marshal/api/discussions/stream` 提供绑定 `(hubEpoch, runId, roomSeq)` 高水位屏障与 reset 的房间专用 SSE（先订阅有界暂存再取房间快照，且在登出/轮换/会话到期后 ≤5s 内关闭）。端点不提供正文导出、不写文件，也不接受 URL 查询参数中的凭据。
 
 未来路径建议为 `src/hub/discussions/`、`src/agents/discussion.ts` 与现有 wire、runner、privacy、api/page 的最小扩展。以上均未创建；不另建重复的认证、journal 或适配器进程监督器。
 
@@ -70,13 +70,13 @@ command.status 的原命令幂等结果与附带的原生工作单元状态分�
 
 预览确认绑定当前 operatorId、各成员/来源设备的 policyRevision、准入能力、材料及预算，形成 `previewDigest`。hub 在 create 以及每次 submit/汇总分发前重验该绑定；args 携带 previewDigest 与目标设备的预期 policyRevision，均参与幂等摘要。node 在 create 时登记 run/member 与确认绑定，后续 submit 必须匹配它及当前协商授权，并在接纳与正文出站时检查本地 privacy/allowDiscussion；不能只依赖 hub 过滤。node 本地授权变化须先使关联 run 绑定失效、停止正文与新推理，再关闭该授权连接并收尾；重连或 true→false→true 不复活旧确认。hub 发现任一成员/来源设备离线、未完成同步或当前授权无法确认时暂停分发；已在途的披露不能靠后续检查撤回。
 
-只共享 owner 预览确认的粘贴文本或显式选择的、经允许的历史片段，以及本 run 的讨论输出。历史选择仍经过公共契约 §10 过滤（含按 request/call/item 剔除 tool/history 中的结构化交互副本）；原生提问、审批、secret 和结构化答案不得作为材料。讨论输入、发言与汇总仅存于 RoomCoordinator 的有界 hub RAM，并通过讨论房间专用快照/流向已认证浏览器展示，**永不进入 v1 `EventBuffer`、普通会话历史或 node 离线事件队列**。首版不抓取附件/URL、不自动读取 cwd/仓库/完整历史。所有成员知道这些内容会交给列明的模型服务；不承诺原生 runtime/provider 无日志或零保留。
+只共享 owner 预览确认的粘贴文本（明确标为 `owner-paste`，不冒充任何设备/会话出处）或显式选择的、经源端验证的历史片段，以及本 run 的讨论输出。引用历史片段时，hub 按 `(sourceDeviceId, agent, sessionId, itemIds)` 向源端 node 只读拉取并核验（源端必须在本地确认该会话非 `purpose=discussion`、`privacy=content` 且 `allowDiscussion=true`，并执行公共契约 §10 白名单、脱敏与按 request/call/item 剔除 tool/history 中的结构化交互副本后返回片段与当前 `policyRevision`），不得从 hub `EventBuffer` 取材料或直接采信浏览器自报的“历史原文”；原生提问、审批、secret 和结构化答案不得作为材料。讨论输入、发言与汇总仅存于 RoomCoordinator 的有界 hub RAM，并通过讨论房间专用快照/流向已认证浏览器展示，**永不进入 v1 `EventBuffer`、普通会话历史或 node 离线事件队列**。首版不抓取附件/URL、不自动读取 cwd/仓库/完整历史。所有成员知道这些内容会交给列明的模型服务；不承诺原生 runtime/provider 无日志或零保留。
 
 跨成员转发必须同时满足发送方（含历史材料来源设备）当前出站授权、所有接收方当前讨论授权和该 run 的共享清单。每条成员输出标为不可信引用数据；其中“忽略规则”“执行命令”“添加成员”等文字不能修改房间配置、预算或工具权限。消息实际作者取认证 device/session 绑定，不能相信正文或帧自报名称。
 
-运行中任一参与成员或材料来源设备的授权、模型配置或 runtime 变化即暂停整个 run，停止新分发，清空本 run 的正文（含派生汇总）并通知所有浏览器清空；源端尽力取消已接纳调用并释放专用会话。新策略经用户重新确认才能使用全新专用会话开始新 run，不复用已收过撤权内容的旧讨论上下文。无法撤回已经送达其它模型/已被人看到的内容，不宣称清缓存等于撤回披露。
+运行中任一参与成员或材料来源设备的授权、模型配置或 runtime 变化，以及设备表非法 reload 导致授权不可确认，即暂停受影响 run（范围不明时暂停全部 run），停止新分发，清空本 run 的正文（含派生汇总）并通知所有浏览器清空；源端尽力取消已接纳调用并释放专用会话。新策略经用户重新确认才能使用全新专用会话开始新 run，不复用已收过撤权内容的旧讨论上下文。无法撤回已经送达其它模型/已被人看到的内容，不宣称清缓存等于撤回披露。
 
-授权追踪持续到正文完全清除，不能在 completed/stopped/failed 时解除成员/来源依赖：撤权同样清除这些 run 的正文、派生汇总、分页缓存和 SSE 待发队列，阻止旧快照/延迟帧再次填回；终态元数据仍可保留，不伪造新的执行状态。重新授权也不能恢复旧预览/正文。恢复查询与仅减少既有活动的 interrupt/dispose 不要求重新取得 content/allowDiscussion 或有效预览，但仍需当前认证、discussion 能力协商、原 operatorId/run/member/原生身份及用途校验；不能在撤权后借安全收尾创建会话或提交正文。设备凭据撤销后远端请求仍拒绝，只由 node 本地收尾/到期机制处理。
+授权追踪持续到正文完全清除，不能在 completed/stopped/failed 时解除成员/来源依赖：撤权或设备表 reload 失败导致授权不可确认，同样清除这些已结束或活跃 run 的正文、派生汇总、分页缓存和 SSE 待发队列，阻止旧快照/延迟帧再次填回；终态元数据仍可保留，不伪造新的执行状态。重新授权也不能恢复旧预览/正文。恢复查询与仅减少既有活动的 interrupt/dispose 不要求重新取得 content/allowDiscussion 或有效预览，但仍需当前认证、discussion 能力协商、原 operatorId/run/member/原生身份及用途校验；不能在撤权后借安全收尾创建会话或提交正文。设备凭据撤销后远端请求仍拒绝，只由 node 本地收尾/到期机制处理。
 
 ### 4.1 专用会话与普通入口隔离
 
@@ -94,7 +94,7 @@ node 按 `(deviceId, agent, nativeSessionId)` 持久识别用途，保存 `purpo
 
 `discussion.submit` 与普通 `prompt` 使用同一写权门槛：只有该专用会话处于 `ours-idle`、由当前 `runtimeEpoch` 持有排他控制，且原生控制器在同一次受理步骤完成“当前 idle + 本次写者取得/互斥”时才可接收；不能沿用先 list 再 submit、忙时排队或 hub 固定调度时序来证明。无法验证原子受理的平台不开放讨论成员（`discussion-unavailable`）。`interrupt` 仍需匹配 `activeTurnId/runtimeEpoch`，`dispose` 只释放本 run 的专用会话，不得作用于其它会话。
 
-同一原生受理屏障还须核验冻结的 provider/model、D1 capabilityRevision、会话 settingsRevision、禁用工具/交互约束及 §4 的当前授权。submit 的 args 携带这些预期配置值，参与幂等摘要；配置比较与调用之间必须有已验证的互斥或原生条件提交，不能靠 hub 最近一次 status 或 marshal 单进程锁排除外部配置变更。create 先验证准入配置，创建后实际配置不符则清理、零 submit；每次 submit（含汇总）不符返回 revision-conflict/未知分类并暂停、零新推理。没有可靠回读或原子边界的平台标 discussion-unavailable，不用增加轮询伪装保证。正常回合忙闲变化不推进配置修订。
+同一原生受理屏障还须核验冻结的 provider/model、D1 capabilityRevision、会话 settingsRevision、禁用工具/交互约束及 §4 的当前授权。submit 的 args 携带这些预期配置值，参与幂等摘要；配置比较与调用之间必须有已验证的互斥或原生条件提交，不能靠 hub 最近一次 status 或 marshal 单进程锁排除外部配置变更。create 先验证准入配置，原生会话创建返回 `nativeSessionId` 后必须先持久化 `purpose=discussion` 归属记录，再读取其实际配置校验：若配置不符或不可回读，仅在确认该新建原生会话已安全销毁后才可按 `rejected`（保留必要的用途墓碑，零 submit）返回；若销毁未确认或失败，则必须记录并返回 `outcome-unknown`（保留恢复槽位与 `nativeSessionId` 绑定供后续对账），不得在原生会话仍可能存活时返回 `rejected`。每次 submit（含汇总）不符返回 revision-conflict/未知分类并暂停、零新推理。没有可靠回读或原子边界的平台标 discussion-unavailable，不用增加轮询伪装保证。正常回合忙闲变化不推进配置修订。
 
 房间状态为 `draft → preparing → running → summarizing → completed`；任何活跃状态可转 `pausing → paused`、`stopping → stopped` 或 `failed`。`preparing` 阶段只要任一成员会话创建明确失败，即请求销毁本 run 已创建的专用会话；确认清理后进入 `failed`，清理/创建结果 `outcome-unknown` 则进入 `paused` 等待查询对账，绝不退回 `draft` 复用同一 `runId`。停止/暂停先原子关闭新分发，再取消已接纳调用；直到源端确认不再运行才进入相应终态，否则显示结果未知。`paused/outcome-unknown` 只表示调度暂停，不能作为资源已终止或配额可回收的证据。`completed` 只表示讨论及汇总完成，不表示建议已经执行。
 

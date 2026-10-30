@@ -25,12 +25,12 @@
 
 ## D1-T01：房间契约、授权与元数据
 
-**文件**：未来扩展 wire/commands、config、hub/devices/identity、node/runner/privacy/journal；新增 hub/discussions 的类型/状态存储最小模块。
+**文件**：未来扩展 wire/commands、config、src/bin/device.ts、hub/devices/identity、node/runner/privacy/journal；新增 hub/discussions 的类型/状态存储最小模块。
 **依赖**：D1-T00。
 
 - [ ] 定义 room/run/member/round/message 身份、状态机和 `discussion.create / submit / interrupt / dispose` 判别操作；独立 discussion.output/status 帧按 device/run/member/nodeEpoch/runtimeEpoch/memberSeq 去重，绑定真实 agent/session/turn，不借普通 event 的 seq；status/command.status 共用公共契约 §5 无正文白名单，回带实际 provider/model 安全标识、D1 capabilityRevision、settingsRevision、回读有效性/原生版本及工作单元状态，禁止原始配置/URL/凭据。只有 hub 接纳后分配 roomSeq，node 自报拒绝；不入 EventBuffer/离线队列。未协商 discussion 的双方都拒绝讨论帧，不让旧 node 接收房间写入。
 - [ ] 定义不可延长的 runExpiresAt、submit 的 turnExpiresAt，以及 previewDigest、预期策略/配置，均参与 args 幂等摘要；传输层时间与连接代次不参与摘要但仍独立校验。node 用保守时钟转换建立执行期限，独立于普通命令 30s 受理 TTL。
-- [ ] 实现双侧 allowDiscussion 默认 off、既有 content 双授权及单次 run 共享预览；成员设备与历史材料来源设备（`sourceDeviceId`）均纳入授权检查与持久 `policyRevision` 追踪。create 登记确认绑定，后续每次 submit/汇总核验；node 本地授权变化立即作废绑定并关闭授权连接，不依赖 hub revision 变化。授权依赖保留至正文清除，覆盖已结束 run；无正文查询/安全收尾保留身份与用途门槛，不再要求正文授权。
+- [ ] 实现双侧 allowDiscussion 默认 off（含本地 CLI 经进程间写锁更新设备表 `allowDiscussion` 与 `policyRevision`）、既有 content 双授权及单次 run 共享预览；成员设备与历史材料来源设备（`sourceDeviceId`，由源端 node 验证非 `purpose=discussion`、`privacy=content` 且 `allowDiscussion=true` 后按 §10 投影拉取片段，不从 `EventBuffer` 或客户端自报文本取历史）均纳入授权检查与持久 `policyRevision` 追踪。create 登记确认绑定，后续每次 submit/汇总核验；node 本地授权变化立即作废绑定并关闭授权连接，不依赖 hub revision 变化。授权依赖保留至正文清除，覆盖已结束 run（含设备表非法 reload 导致授权不可确认时的正文清理）；无正文查询/安全收尾保留身份与用途门槛，不再要求正文授权。
 - [ ] 无正文元数据记录、进程间排他锁、浏览器 `(publicOrigin, operatorId)` 持久幂等键、hub→node 稳定写键和预留推理调用名额（仅 `submit` 占推理配额，`create/interrupt/dispose` 不占推理配额）；执行仍由 node journal 去重，查状态不重发。
 - [ ] 在 hub 安装身份状态持久保存独立 D1 初始化标记，复用 initializing 意图/配套提交/ready 流程；既有 v1 首次启用与 D1 丢文件分别处理。ready 后 journal/密钥缺失、异常残留或不匹配均 recovery-required，零新草稿/run，不自动换密钥或建空表。
 - [ ] 为恢复元数据设置容量及保留类别：未决不驱逐，已确认结束至少留 24h；node 用途墓碑保留至原生历史删除证据成立。正文 TTL 不清这些记录；恢复时先重建占额，满时拒绝新 run，保留查询/安全取消。
@@ -45,7 +45,7 @@
 
 - [ ] 创建隔离、无工具新会话（`discussion.create` 使用 `target.sessionId: null`），创建前记录认领意图，在途创建期间阻塞/暂扣该 agent 周期 `list/sync` 对新出现的未分类原生会话的广播，并阻断直接传入该 ID 的普通读取/控制及原生事件出口；真实 nativeSessionId 返回后先持久化用途/run/member 归属并写回 journal，再允许状态发布，不能以显示别名作键；崩溃后无法归类则隔离并恢复，原生边界不成立则 unavailable。
 - [ ] 公共路由统一用途校验：普通 list/sync 隐藏讨论会话，history/follow/inputs 及普通控制即使直传 sessionId 也拒绝；原生事件仅走讨论通道。重启、重新扫描、停用 D1、身份变化和命令键回收均不清用途墓碑。
-- [ ] `discussion.create / submit / interrupt / dispose` 经现有 runner/journal/supervisor（节点内部观察原生流以生成 `discussion.output / status`，不开放远端 `observe`）；不新增直连 provider 旁路；`submit` 复用公共契约 §7 的写权与原子 idle 受理，同一原生屏障核验 provider/model、能力/设置修订、工具隔离和当前授权。创建后回读匹配预览才绑定新会话修订；请求值/旧 status 不算回读，配置变化又恢复仍作废绑定，正常忙闲变化不算配置变更。原生交互一律拒绝且不生成远端卡，无法满足即标 unavailable。
+- [ ] `discussion.create / submit / interrupt / dispose` 经现有 runner/journal/supervisor（节点内部观察原生流以生成 `discussion.output / status`，不开放远端 `observe`）；不新增直连 provider 旁路；`submit` 复用公共契约 §7 的写权与原子 idle 受理，同一原生屏障核验 provider/model、能力/设置修订、工具隔离和当前授权。创建拿到 `nativeSessionId` 先落用途再回读配置：匹配预览才绑定新会话修订；若配置不符/不可读，确认销毁后才可报 `rejected`（保留必要墓碑），销毁未确认则报 `outcome-unknown` 并保留占额。请求值/旧 status 不算回读，配置变化又恢复仍作废绑定，正常忙闲变化不算配置变更。原生交互一律拒绝且不生成远端卡，无法满足即标 unavailable。
 - [ ] 返回接纳、最终输出、原生取消确认与未知状态；busy 零排队，超时不自行重试。
 - [ ] 原生调用前预留恢复槽位/收尾键、登记回合取消关联和 node 单调到期任务；预留失败不启动。hub 失联/重启仍独立取消，重连/换新键不续期，过期 submit 零调用，迟到创建先登记用途再清理；本地到期取消及 `discussion.interrupt / dispose` 复用已登记槽位和稳定收尾状态，journal 满/写失败/正文撤权不能挡住合法安全取消，禁止任意新键无限扩容；写失败进入恢复，不报持久成功或释放未知占额，不杀共享 runtime。
 - [ ] 按设计 §6 分开正文、原生资源及无正文恢复记录。command.status 的原命令结果与实际工作单元状态分开；只在取得绑定原 run/member/session/runtime/turn 的可靠原生终止及清理证据时释放占额，旧回合终态、accepted 或未知回读均不足；配置不可读也不抹除已验证终止证据。未知保留必要对账关联，15min 不清未决或墓碑；原生历史保留如实报告，不触及工作会话。
