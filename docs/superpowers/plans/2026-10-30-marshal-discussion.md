@@ -43,12 +43,12 @@
 **文件**：未来新增 src/agents/discussion.ts，最小扩展现有 DSH/Codex/Claude adapter 和 AgentHost。
 **依赖**：D1-T00、D1-T01。
 
-- [ ] 创建隔离、无工具新会话（`discussion.create` 使用 `target.sessionId: null`），创建前记录认领意图，真实 ID 返回后先持久化用途/run/member 归属，再允许发现或事件发布；崩溃后无法归类则隔离并恢复，原生边界不成立则 unavailable。
+- [ ] 创建隔离、无工具新会话（`discussion.create` 使用 `target.sessionId: null`），创建前记录认领意图，在途创建期间阻塞/暂扣该 agent 周期 `list/sync` 对新出现的未分类原生会话的广播，真实 ID 返回后先持久化用途/run/member 归属并写回 journal，再允许状态发布；崩溃后无法归类则隔离并恢复，原生边界不成立则 unavailable。
 - [ ] 公共路由统一用途校验：普通 list/sync 隐藏讨论会话，history/follow/inputs 及普通控制即使直传 sessionId 也拒绝；原生事件仅走讨论通道。重启、重新扫描、停用 D1、身份变化和命令键回收均不清用途墓碑。
-- [ ] create/submit/observe/interrupt/dispose 经现有 runner/journal/supervisor；不新增直连 provider 旁路；`submit` 复用公共契约 §7 的写权与原子 idle 受理，原生交互一律拒绝且不生成远端卡，无法满足即标 unavailable。
+- [ ] `discussion.create / submit / interrupt / dispose` 经现有 runner/journal/supervisor（节点内部观察原生流以生成 `discussion.output / status`，不开放远端 `observe`）；不新增直连 provider 旁路；`submit` 复用公共契约 §7 的写权与原子 idle 受理，原生交互一律拒绝且不生成远端卡，无法满足即标 unavailable。
 - [ ] 返回接纳、最终输出、原生取消确认与未知状态；busy 零排队，超时不自行重试。
-- [ ] 原生调用前注册 node 单调到期任务；hub 失联/重启仍独立取消，重连不续期，过期 submit 零调用，迟到创建先登记用途再清理；journal 满/写失败不能挡住安全取消，未确认则保留 unknown，不杀共享 runtime。
-- [ ] 按设计 §6 分开正文、原生资源及无正文恢复记录。只在有原生终止证据时释放运行资源/占额；未知保留必要对账关联，15min 不清未决或墓碑；原生历史保留如实报告，不触及工作会话。
+- [ ] 原生调用前注册 node 单调到期任务；hub 失联/重启仍独立取消，重连不续期，过期 submit 零调用，迟到创建先登记用途再清理；本地到期取消及 `discussion.interrupt / dispose` 复用已登记的恢复槽位，journal 满/写失败不能挡住安全取消，未确认则保留 unknown，不杀共享 runtime。
+- [ ] 按设计 §6 分开正文、原生资源及无正文恢复记录。只在经 `discussion.status`、`command.status`（回带成员原生工作单元状态）或 `discussion.dispose` 取得原生终止证据时释放运行资源/占额；未知保留必要对账关联，15min 不清未决或墓碑；原生历史保留如实报告，不触及工作会话。
 
 **验证/完成**：G01/G02/G07/G08/G12/G14/G15/G16；首版支持报告逐版本填写，任何依赖 prompt 自律的路径不得开放。
 

@@ -116,7 +116,7 @@ owner 的审计身份由 hub 从认证会话赋予，不接受浏览器自报 `a
 | `event` | node→hub | deviceId、agent、sessionId、nodeEpoch、seq、ts、kind、按 kind 验证的 payload |
 | `sync.begin / sync.chunk / sync.end` | node→hub | syncId、完整范围、快照版本、会话游标、分片计数；快照不含正文 |
 | `sync.ack` | hub→node | 当前 connectionId/nodeEpoch/syncId、accepted/rejected、提交版本或错误；只在原子提交后确认 |
-| `command.status / command.status.result` | hub→node / node→hub | 只读查询原幂等键状态；不触发执行、不携带原始正文 |
+| `command.status / command.status.result` | hub→node / node→hub | 只读查询原幂等键状态（D1 的 `discussion.*` 另回带成员原生工作单元 `running / terminated / disposed / unknown` 状态供占额对账）；不触发执行、不携带原始正文 |
 | `inputs.snapshot / inputs.snapshot.result` | hub→node / node→hub | owner 按会话查询当前有效待答卡；node 重新执行隐私与策略校验，返回 runtimeEpoch 与同一公开序列的快照高水位 |
 | `heartbeat / heartbeat.ack` | 双向请求/应答 | 当前 connectionId/nodeEpoch、请求 nonce、发送/响应时刻；用于存活与时钟偏差估算，不携带正文 |
 | `discussion.output / discussion.status` | node→hub，仅 D1 | 独立帧类型，按当前连接鉴权；deviceId/agent/sessionId/runId/memberId/turnId/nodeEpoch/runtimeEpoch/memberSeq，不携带 roomSeq；来源序号按成员/实例隔离，hub 去重后独占分配房间流 roomSeq，详见 D1 §3 |
