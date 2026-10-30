@@ -28,10 +28,10 @@
 **文件**：未来扩展 wire/commands、config、hub/devices、node/runner/privacy；新增 hub/discussions 的类型/状态存储最小模块。
 **依赖**：D1-T00。
 
-- [ ] 定义 room/run/member/round/message 身份、状态机和判别操作；扩展契约修订与能力协商，不让旧 node 接收房间写入。
-- [ ] 实现双侧 allowDiscussion 默认 off、既有 content 双授权及单次 run 共享预览；授权变化沿用持久 policyRevision。
-- [ ] 无正文元数据记录、进程间排他锁、稳定写键和预留调用名额；执行仍由 node journal 去重，查状态不重发。
-- [ ] 将模型输入/输出纳入统一隐私/字节预算；结构化交互正文不得从历史选择绕过过滤。
+- [ ] 定义 room/run/member/round/message 身份、状态机和 `discussion.create / submit / interrupt / dispose` 判别操作；扩展契约修订与能力协商，不让旧 node 接收房间写入。
+- [ ] 实现双侧 allowDiscussion 默认 off、既有 content 双授权及单次 run 共享预览；成员设备与历史材料来源设备（`sourceDeviceId`）均纳入授权检查与持久 `policyRevision` 追踪。
+- [ ] 无正文元数据记录、进程间排他锁、浏览器 `(publicOrigin, operatorId)` 持久幂等键、hub→node 稳定写键和预留推理调用名额（仅 `submit` 占推理配额，`create/interrupt/dispose` 不占推理配额）；执行仍由 node journal 去重，查状态不重发。
+- [ ] 将模型输入/输出纳入统一隐私/字节预算；预览阶段预校验单次组装输入 ≤ 64 KiB，运行时分发前再次校验；结构化交互正文不得从历史选择绕过过滤，讨论正文不进入 v1 `EventBuffer` 或 node 离线事件队列。
 
 **验证/完成**：G03/G04/G05/G09 的 U/可运行 I 层；身份、迁移与恢复路径明确，组件失败零模型调用。
 
@@ -40,10 +40,10 @@
 **文件**：未来新增 src/agents/discussion.ts，最小扩展现有 DSH/Codex/Claude adapter 和 AgentHost。
 **依赖**：D1-T00、D1-T01。
 
-- [ ] 创建隔离、无工具新会话，保存真实 session/runtime/turn ID，原生能力不成立则 unavailable。
+- [ ] 创建隔离、无工具新会话（`discussion.create` 使用 `target.sessionId: null` 并在 node journal 记录新专用 `sessionId`），保存真实 session/runtime/turn ID，原生能力不成立则 unavailable。
 - [ ] create/submit/observe/interrupt/dispose 经现有 runner/journal/supervisor；不新增直连 provider 旁路。
 - [ ] 返回接纳、最终输出、原生取消确认与未知状态；busy 零排队，超时不自行重试。
-- [ ] 验证工作会话保持原状态；节点重载、撤权及进程退出清理专用句柄，原生历史保留如实报告。
+- [ ] 验证工作会话保持原状态；run 终态（`completed / stopped / failed`）、节点重载、撤权、15 分钟保留到期及进程退出均清理专用会话句柄，原生历史保留如实报告。
 
 **验证/完成**：G01/G02/G07/G08/G12；首版支持报告逐版本填写，任何依赖 prompt 自律的路径不得开放。
 
@@ -52,10 +52,11 @@
 **文件**：未来新增 hub/discussions/coordinator.ts 及必要的状态机/调度测试。
 **依赖**：D1-T01、D1-T02。
 
-- [ ] 第一轮独立分析，后续读取上一轮封存记录；一次完整发言只接纳一次，旧代次排除。
-- [ ] 实施成员/轮次/调用/并发/时间/正文预算；预留后再分发，失败亦消耗名额，禁止自动重试/扩容。
+- [ ] `preparing` 阶段任一成员创建失败即销毁本 run 已建专用会话并转 `failed`，创建结果 `outcome-unknown` 转 `paused` 待查询核对，不退回 `draft` 复用同一 `runId`。
+- [ ] 第一轮独立分析，至少 2 名成员完成有效封存发言才进入后续交叉轮次；首轮 0 有效发言直接 `failed`（不调用汇总），仅 1 名有效发言或后续轮次无新有效发言则跳过剩余交叉轮次；一次完整发言只接纳一次，旧代次排除。
+- [ ] 实施成员/轮次/推理调用/并发/时间/正文预算（含每轮组装后完整输入 ≤ 64 KiB 校验）；预留后再分发，失败亦消耗名额，禁止自动重试/扩容。
 - [ ] 停止/暂停先关调度入口，再取消在途调用；未知不前进，已确认失败可作为缺席处理。
-- [ ] 汇总者固定一次额外调用；出处校验、分歧/未知/缺席分列，失败保留原记录、不产生执行任务。
+- [ ] 汇总者固定一次额外调用；若预先选定的汇总成员已失败/离线/未知，不自动换人或换模型冒充，直接标记“汇总未完成（summary-unavailable）”并保留带缺席标记的原发言记录；出处校验、分歧/未知/缺席分列，不产生执行任务。
 - [ ] hub 重启只恢复元数据并查询旧键，不恢复推理；无正文时不自动重新汇总。
 
 **验证/完成**：G04 至 G08、G10/G11 的 U/I；故障注入检查调用次数、预算及资源，不只断言 UI 文案。

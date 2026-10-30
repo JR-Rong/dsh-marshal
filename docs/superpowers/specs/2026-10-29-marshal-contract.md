@@ -70,6 +70,7 @@ wire v1/v2 混接必须显式失败，UI 给出协议不匹配；不得用旧节
 | `codexExecutable / claudeExecutable` | node | 可选显式路径；缺省按已验证的包入口/PATH 探测，不猜内网地址 |
 | `redaction` | node | 默认附加规则为空，但内置敏感模式始终生效；附加规则不能移除内置规则 |
 | `ringBufferMinutes` | hub | 默认 15；1–15；v0 不提供内容补看，v1 才生效 |
+| `allowDiscussion` / 设备记录 `allowDiscussion` | node / hub | 均默认 `false`；仅后续 [D1 讨论组阶段](2026-10-30-marshal-discussion.md)启用，还要求双侧 `content` 授权与单次 run 预览确认；v0/v1 不开放 |
 
 固定资源预算：出站单帧不超过 1 MiB；单张交互卡不超过 4096 UTF-8 字节；node 离线事件队列最多 1000 条且总计 8 MiB；单设备同步暂存不超过 16 MiB、hub 全部暂存不超过 64 MiB；SSE 每客户端待写不超过 4 MiB；journal 必须有显式本地容量上限并在启动时校验，未决项永不驱逐。v1 历史缓冲每会话最多 2000 条/8 MiB、hub 总计 64 MiB。任何一项达到上限都触发淘汰或拒绝；这些是硬限额，不是“目标平均值”。
 
@@ -105,7 +106,7 @@ owner 的审计身份由 hub 从认证会话赋予，不接受浏览器自报 `a
 
 `runtimeEpoch` 标识适配器实例：子进程类 agent 为进程启动，DSH 为适配器/插件实例；实例重建、宿主重启或子进程退出都使旧 runtimeEpoch 的写权和交互立即失效。公开 seq 是归一化后的投递顺序，不是原生状态的因果版本；迟到事件的处理见 §11。
 
-`policyRevision` 是 hub 侧每设备授权策略（撤销、allowContent、allowInteractions）的持久单调修订号。与 operatorId/deviceId 绑定，在授权生效前与授权变更一次性原子写入 §3 的受限设备状态文件，重启、删除再注册不得复用旧号（删除设备保留撤销墓碑）。写入失败等同非法 reload：不提交新 revision、不发布新授权、受影响设备保持不可确认并关闭连接。整表缺失/无法解析按 §3 启动失败；设备记录完好而修订缺失、不可读或已检测到旧备份回退时按 §6 进入 recovery-required，不从零继续。hello 回带 node 上一次绑定的 operatorId/policyRevision，hello.ack 下发当前值；node 侧该值只是实例内存，重建后为空，空值按首次绑定处理且不能跳过 hub 的当前策略下发。operatorId 不同即不同身份域，不比较修订号，丢弃旧策略状态后重新绑定；同一身份域内 node 回带更高修订而 hub 当前值更低，先隔离该设备并标 recovery-required，不能下发更低修订，也不能按自报值抬高全表或冻结其它设备；只有 hub 本地完整性证据证明全局回退时才进入全局恢复。节点自报修订不是可信的全局恢复依据。任一值变化都丢弃旧策略的内容/ACK 正文，并按 §8 结算旧待答，不能只删除卡片留下原生阻塞。随后重新协商、完整同步；hubEpoch 变化但持久策略未变不等于撤权。
+`policyRevision` 是 hub 侧每设备授权策略（撤销、allowContent、allowInteractions，以及 D1 阶段启用后的 allowDiscussion）的持久单调修订号。与 operatorId/deviceId 绑定，在授权生效前与授权变更一次性原子写入 §3 的受限设备状态文件，重启、删除再注册不得复用旧号（删除设备保留撤销墓碑）。写入失败等同非法 reload：不提交新 revision、不发布新授权、受影响设备保持不可确认并关闭连接。整表缺失/无法解析按 §3 启动失败；设备记录完好而修订缺失、不可读或已检测到旧备份回退时按 §6 进入 recovery-required，不从零继续。hello 回带 node 上一次绑定的 operatorId/policyRevision，hello.ack 下发当前值；node 侧该值只是实例内存，重建后为空，空值按首次绑定处理且不能跳过 hub 的当前策略下发。operatorId 不同即不同身份域，不比较修订号，丢弃旧策略状态后重新绑定；同一身份域内 node 回带更高修订而 hub 当前值更低，先隔离该设备并标 recovery-required，不能下发更低修订，也不能按自报值抬高全表或冻结其它设备；只有 hub 本地完整性证据证明全局回退时才进入全局恢复。节点自报修订不是可信的全局恢复依据。任一值变化都丢弃旧策略的内容/ACK 正文，并按 §8 结算旧待答，不能只删除卡片留下原生阻塞。随后重新协商、完整同步；hubEpoch 变化但持久策略未变不等于撤权。
 
 | 帧 | 方向 | 必需信息与用途 |
 |---|---|---|
