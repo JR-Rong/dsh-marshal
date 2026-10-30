@@ -55,11 +55,11 @@ acquiring 期间第二个控制请求失败。ours-running 不接受普通 promp
 
 允许远端的决策只有原生支持的单次 allow、decline、cancel。去除“本会话允许”、持久权限更新及策略 amendment。Claude suggestions 不返回为 updatedPermissions，不管其 destination 是 session 还是全局；范围扩展请求不授权。
 
-原生请求 id、item id、会话 id 分开保存；每张卡有随机 requestId、runtimeEpoch、原始 expiresAt 和本卡允许集合。服务端校验隐藏/伪造决定，合法首答才结算；无效决定不消耗请求。只有源端确认成功才显示已处理。
+原生请求 id、item id、会话 id 分开保存；每张卡有随机 requestId、runtimeEpoch、原生 `nativeExpiresAt`（若提供）和本卡允许集合。服务端校验隐藏/伪造决定，合法首答才结算；无效决定不消耗请求。只有源端确认成功才显示已处理。
 
-交互正文统一为公共契约的嵌套判别载荷。卡片超出 4096 UTF-8 字节或脱敏导致动作不完整，允许按钮禁用，可拒绝或在源端处理。不能用不完整命令授权完整动作。远端卡片需 node relay=remote 且 hub 设备记录 `allowInteractions=true`；单侧授权按 off 处理，等待不超过原生 expiresAt。
+交互正文统一为公共契约的嵌套判别载荷。卡片超出 4096 UTF-8 字节或脱敏导致动作不完整，允许按钮禁用，可拒绝或在源端处理。不能用不完整命令授权完整动作。远端卡片需 node relay=remote 且 hub 设备记录 `allowInteractions=true`；单侧授权按 off 处理，等待取 min(createdAt + 对应 timeoutMs, nativeExpiresAt)。
 
-问题支持单选、多选、自由文本和稳定 ID；secret 默认不转发答案，明确无答案/需本机处理。DSH 超时 next()，Codex/Claude 按已验证的无答案/拒绝路径结束；MCP elicitation v1 不接受授权。
+问题支持单选、多选、自由文本和稳定 ID；secret 默认不转发答案，明确无答案/需本机处理。DSH 超时仅原生请求仍有效时 next()，Codex/Claude 按已验证的无答案/拒绝路径结束；MCP elicitation v1 不接受授权。
 
 ## 5. 设置：范围、策略与回读
 

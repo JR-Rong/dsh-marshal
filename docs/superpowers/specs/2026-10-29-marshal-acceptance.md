@@ -7,7 +7,7 @@
 
 ## 0. 评审基线与已有证据
 
-基线：`feat/v0@702ef24308db10b3381ffcaff0f2746582842433`。该分支已有 v0 源码、构建配置、测试及接缝报告；v1 适配器尚未实现。本轮在 PR head `7390293` 上继续复核并保留该提交的修订。下面的“已有”来自本轮源码/测试文件核对，不等于本轮执行 PASS。旧设计草稿的问题不能直接套为当前代码缺陷。
+基线：`feat/v0@702ef24308db10b3381ffcaff0f2746582842433`。该分支已有 v0 源码、构建配置、测试及接缝报告；v1 适配器尚未实现。本轮在 PR head `8c0062a` 上继续复核，`7390293` 为上一轮提交且其修订保留。下面的“已有”来自本轮源码/测试文件核对，不等于本轮执行 PASS。旧设计草稿的问题不能直接套为当前代码缺陷。
 
 | P1 | 当前状态与证据 | 后续处理 |
 |---|---|---|
@@ -88,10 +88,10 @@
 | C03-03 | U/I/R | remote，合法决定与无人作答分别执行 | 单次允许回到原请求；审批超时仅拒绝；DSH 普通问题按真实 waterfall 回本地 |
 | C03-04 | I/R | 待答中在源端改 off；同请求随后 answer/decide | 原请求按保守路径结束；卡作废；恢复查询不再返回；迟到决定无效 |
 | C03-05 | U/I | approval=off、question=remote，触发 plan-review/ExitPlanMode | 不得以普通提问获得执行授权；decision 通道按审批策略拒绝 |
-| C03-06 | U/I | node relay=remote 但 hub allowInteractions=false；反向组合；原生 expiresAt 早于 answerTimeoutMs/approvalTimeoutMs | 两种单侧授权均按 off 处理，零正文出站；等待在原生 expiresAt 或本地超时的较早者结束，超时审批拒绝、问题按已验证无答案路径结算 |
+| C03-06 | U/I | node relay=remote 但 hub allowInteractions=false；反向组合；原生 expiresAt 早于按本地 timeout 计算的截止时刻，或缺失原生期限 | 两种单侧授权均按 off 处理，零正文出站；等待在 min(createdAt+timeoutMs, nativeExpiresAt) 结束，超时审批拒绝、问题按已验证无答案路径结算 |
 | C03-07 | U/I | 远端问题卡显式 cancel；审批卡显式 cancel；随后本地 TUI 再回答 | cancel 走已验证的拒绝/无答案路径，不提交空答案；卡作废且不复活；本地不出现重复 answer；审计只记操作与分类 |
 | C03-08 | I/R | 本地 TUI 发起 DSH 普通问题，marshal 未取得会话写权但持有合法 waterfall；对比仅观察外部等待状态 | 双授权下前者可 answer/cancel 且只结算该请求；不取得 prompt/interrupt 权限。后者无请求作答权不可建卡；原生 abort 后不可答 |
-| C03-09 | U/I | 假时钟从真实量级 UTC 毫秒开始，原生截止早于/晚于配置时长或缺失；阻塞 timer 后提交；abort 与回答竞争 | expiresAt=min(createdAt+timeoutMs,nativeExpiresAt)，缺原生期限用本地期限；到期/abort 后回答入口零回写，终态仅一次；next() 不误报本地已答 |
+| C03-09 | U/I | 假时钟从真实量级 UTC 毫秒开始，原生截止早于/晚于配置时长或缺失；源端与 node 时钟偏差接近/超过 5s；阻塞 timer 后提交；abort 与回答竞争 | expiresAt=min(createdAt+timeoutMs,nativeExpiresAt)，缺原生期限用本地期限；偏差不可信时取较早截止并提前回本地；到期/abort 后回答入口零回写，终态仅一次；next() 不误报本地已答 |
 
 ### C04：单次授权边界
 
@@ -110,7 +110,7 @@
 | C05-02 | I | A 伪造发给 B 的 commandId ACK；旧连接发送正确 commandId ACK | 两者均无法完成 B/新连接 pending；只接受匹配认证身份与代次 |
 | C05-03 | I | 同设备新连接替换旧连接后，旧连接触发 close | 新连接仍在线；只有当前连接可更新状态/收命令 |
 | C05-04 | I | 撤销 token、未 hello 连接、错误 wire/契约修订、方向错误的帧 | 撤销在 5s 内关闭连接且不无限重连；握手有界；不泄露 token；无写入；分别返回 4401/4406/4400 等约定 close code，不以字符串推断 |
-| C05-05 | I | 保持 SSE 打开时 logout、轮换 dashboardToken、绝对/空闲会话到期 | 新 API 请求拒绝；旧 SSE ≤5s 关闭，不再收内容；心跳不续空闲期；重新登录仍是同 operatorId |
+| C05-05 | I | 保持 SSE 打开时 logout、轮换 dashboardToken、绝对/空闲会话到期；logout 后复用旧 CSRF；页面重载 | 新 API 请求拒绝；旧 SSE ≤5s 关闭，不再收内容；心跳不续空闲期；登录响应提供 operatorId/CSRF，重载后可重读 CSRF，logout 后旧 CSRF 与 cookie 均不可复用；重新登录仍是同 operatorId |
 | C05-06 | I | content/remote 正在传输时 hub 收紧授权，断连前后注入旧帧；非法设备表 reload | hub 先停止转发，node 断连撤销协商授权；重连新 policyRevision 前 metadata/off；旧帧/ACK 正文/卡不补发；非法 reload 不部分应用或继续允许写入 |
 
 ### C06：写权与观察
@@ -167,7 +167,7 @@
 | C10-05 | I/R | 普通问题（v0/v1）或审批（v1）产生时页面关闭；到期前打开、刷新或换浏览器 | 从源端恢复仍有效的卡并可答；已解决/过期卡不复活；离线明确不可答 |
 | C10-06 | I | SSE 在回放/订阅边界断开；Last-Event-ID 过旧或 hubEpoch 变化 | 游标去重无窗口；必要时 reset-required 并重取状态/待答；不伪装完整内容历史 |
 | C10-07 | I | sync.end 已发但 hub 未提交；提交后 sync.ack 丢失/迟到/属于旧连接；期间提交写请求 | node 只认当前 sync.ack；双侧在屏障完成前拒绝写；超时重同步不重放命令，旧确认不能放开写入 |
-| C10-08 | I/R | 多页清单、非第一页会话执行/提问；不断线时新增/删除/开始/结束回合；状态 patch 省略 running，旧 turn.end 迟到 | 所有页可见且可正确定位；无增量时 10s 扫描，≤30s 反映变化；扫描超时 stale/禁写；省略字段不重置，旧终态不将新回合置闲 |
+| C10-08 | I/R | 多页清单、非第一页会话执行/提问；原生 list 无分页参数或只返回首屏；不断线时新增/删除/开始/结束回合；状态 patch 省略 running，旧 turn.end 迟到 | 所有页可见且可正确定位；原生无分页时须有显式全量/计数证据，否则报告完整性不可确认，不把首屏当全量；无增量时 10s 扫描，≤30s 反映变化；扫描超时 stale/禁写；省略字段不重置，旧终态不将新回合置闲 |
 | C10-09 | U/I | 隐私过滤丢弃整条事件、未知 kind、队列在编号后丢事件、策略收紧后重同步 | 投影后分配 seq，正常过滤无假缺口；未知 kind 不呈现但推进游标；真实丢失触发同步，快照高水位与公开序列一致，无恢复循环 |
 
 ## 4. 基础功能与非功能验收

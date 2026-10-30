@@ -84,13 +84,13 @@ hub 复用 DSH webServer 的端口与 TLS/反代，不另监听。node 不暴露
 6. hub pending 命令绑定 `(commandId, deviceId, connectionId, nodeEpoch)`。ACK 必须来自绑定连接。重连后的结果通过只读状态查询恢复，不接受旧连接 ACK 冒充新确认。
 7. token 撤销生效后立即关闭对应连接并禁止新命令；未知/已撤销 token 是终止性鉴权失败，不无限重试。未完成 hello 的连接有握手超时和数量上限。设备表变更（新增、撤销、内容/交互授权）由 hub 热加载或显式 reload 生效，撤销从有效文件变更到关闭连接的延迟不超过 5 秒；仅启动时读取不满足本节。非法 reload 不部分应用，也不静默继续接受写入：将受影响设备置为授权不可确认、关闭其连接并报告配置错误，修复后重新鉴权。
 
-浏览器通过登录表单 POST token 换取短期 `Secure; HttpOnly; SameSite=Strict` 会话 cookie；初始登录页可公开但不含数据。页面/API/SSE 均校验会话；写请求校验 Origin 和 CSRF token。非浏览器调用可用专用头。token、cookie、命令正文不写日志。登录失败按来源和全局两个维度限速（同一来源 15 分钟内最多 5 次失败，之后指数退避；全 hub 失败速率超限时短暂拒绝），延迟不泄露长度或前缀差异。owner 的审计身份由 hub 从认证会话赋予，不接受浏览器自报 `answeredBy`。`operatorId` 是该 hub 安装中持久的 owner 身份，首次启动生成后保存在 hub 本地受限文件中，跨浏览器登录、hub 重启和 token 轮换保持稳定；临时浏览器会话 ID 只作审计关联，不参与幂等域。
+浏览器通过登录表单 POST token 换取短期 `Secure; HttpOnly; SameSite=Strict` 会话 cookie；初始登录页可公开但不含数据。页面/API/SSE 均校验会话；登录请求只校验 Origin，登录成功响应返回非秘密的 `operatorId`、绑定该会话的 CSRF token（同时以非 HttpOnly cookie 下发，重载后可重读）与到期时间，此后写请求同时校验 Origin 与 `x-marshal-csrf` 头（双重提交），`POST /marshal/logout` 撤销会话及关联 SSE。非浏览器调用可用专用头，改用该头时不依赖 cookie 与 CSRF，但仍受大小与速率限制。token、cookie、命令正文不写日志。登录失败按来源和全局两个维度限速（同一来源 15 分钟内最多 5 次失败，之后指数退避；全 hub 失败速率超限时短暂拒绝），延迟不泄露长度或前缀差异。owner 的审计身份由 hub 从认证会话赋予，不接受浏览器自报 `answeredBy`。`operatorId` 是该 hub 安装中持久的 owner 身份，首次启动生成后保存在 hub 本地受限文件中，跨浏览器登录、hub 重启和 token 轮换保持稳定；临时浏览器会话 ID 只作审计关联，不参与幂等域。
 
 浏览器会话使用服务端状态，绝对有效期 8 小时、空闲上限 30 分钟；SSE 心跳不延长空闲期。logout、token 轮换及会话到期后，新 API 请求立即拒绝，已有 SSE 最迟 5 秒内关闭并清除页面敏感视图，不能只在建流时鉴权。operatorId 的持久文件与 node journal/HMAC 密钥按 §6 的完整性要求管理。
 
 ## 5. 公共帧、操作与时间
 
-所有时间字段统一为 UTC Unix 毫秒整数。`nodeEpoch` 是 node 进程启动标识；每个 `(deviceId, agent, sessionId, nodeEpoch)` 的 `seq` 单调递增，因此任何去重或比较都必须带上会话键，不能只用 `(nodeEpoch, seq)`。`runtimeEpoch` 标识适配器实例：子进程类 agent 为进程启动，DSH 这类进程内适配器为插件实例/宿主启动；插件重载、宿主重启或子进程退出都使旧 `runtimeEpoch` 的写权和交互立即失效。`hubEpoch` 是 hub 进程启动时生成的随机标识，重启即变；SSE 游标只在同一 `hubEpoch` 内有效。
+所有时间字段统一为 UTC Unix 毫秒整数。`nodeEpoch` 是 node 进程启动标识；每个 `(deviceId, agent, sessionId, nodeEpoch)` 的 `seq` 单调递增，因此任何去重或比较都必须带上会话键，不能只用 `(nodeEpoch, seq)`。`runtimeEpoch` 标识适配器实例：子进程类 agent 为进程启动，DSH 这类进程内适配器为插件实例/宿主启动；插件重载、宿主重启或子进程退出都使旧 `runtimeEpoch` 的写权和交互立即失效。`hubEpoch` 是 hub 进程启动时生成的随机标识，重启即变；SSE 游标只在同一 `hubEpoch` 内有效。`policyRevision` 是 hub 侧该设备授权策略（撤销、`allowContent`、`allowInteractions`）的单调修订号，随该设备授权变更递增；hub 在 `hello.ack` 下发当前值，node 在 `hello` 回带上一次绑定的值（首次为空），不一致时以 hub 值为准并丢弃旧策略下的内容、卡片与 ACK 正文，重新协商。
 
 | 帧 | 方向 | 必需信息与用途 |
 |---|---|---|
@@ -184,7 +184,7 @@ DSH 没有产品 v0 的 acquire 操作。prompt 必须由原生控制器在同�
 
 所有适配器构造参数必须包含两项策略，禁止适配器自行默认 remote。策略检查覆盖创建卡片、恢复待答卡和接受 decide/answer 三处。远端卡片是显式内容，必须同时具备源端 `relay=remote` 与 hub `allowInteractions=true`；任一缺失按 off 处理，不发送正文也不注册可答卡。运行中本地收紧为 off 时立即作废卡片并按保守方向结算。只有 node 当前进程能够合法结算的原生请求才可认领。Codex/Claude 受管请求仍要求当前 runtime 写权；仅观察到外部等待状态不能创建可答卡。DSH 的请求作答权来自本插件仍持有的 user-questions/request waterfall 回调及未取消的 request，而非 marshal 发起了该会话：本地 TUI 发起的普通问题可被合法认领，answer/cancel 只结算这一请求，不取得 prompt/interrupt/configure 权限。
 
-在认领时记录 createdAt（UTC 毫秒）及本地单调截止时刻：expiresAt = min(createdAt + 对应 timeoutMs, nativeExpiresAt)，原生不提供截止时刻时第二项按无穷大处理；不是把时长与绝对时间直接取 min。到期、abort、本地收紧及卸载共用一次终态转换，回答入口也同步检查到期和 signal，不能只等 timer 回调。DSH 超时/cancel 仅在原生请求仍有效时 next() 回本地；abort 表示请求取消，不表示本地已回答或一定弹窗。
+在认领时记录 createdAt（UTC 毫秒）及本地单调截止时刻：expiresAt = min(createdAt + 对应 timeoutMs, nativeExpiresAt)，原生不提供截止时刻时第二项按无穷大处理；不是把时长与绝对时间直接取 min。nativeExpiresAt 来自源端时钟，比较前按 §5 的偏差估计换算；偏差不可信时取较早值，宁可提前回本地。到期、abort、本地收紧及卸载共用一次终态转换，回答入口也同步检查到期和 signal，不能只等 timer 回调。DSH 超时/cancel 仅在原生请求仍有效时 next() 回本地；abort 表示请求取消，不表示本地已回答或一定弹窗。
 
 只允许原生可用决策与本项目白名单的交集：`accept-once / decline / cancel`。`cancel` 仅由显式点击触发，超时不升级为中止。禁止 `acceptForSession`、always-allow、execpolicy amendment、持久权限更新和权限范围扩大。Claude 允许一次只返回原输入与 allow，不返回 updatedPermissions；Codex 权限扩大请求返回空授权。MCP elicitation v1 仅拒绝/通知，不能隐式接受 URL 或授权范围。
 
@@ -232,7 +232,7 @@ remote 交互是单独的显式内容授权，需 node `relay=remote` 与 hub `a
 
 历史 EventBuffer 使用允许缓存的 kind 白名单；input.requested、input.resolved、secret 和答案全部排除。append、read、size 及定时清理都会处理过期项；按接收单调时间计算保留窗，不能被源端 ts 延长。时间/条数/字节任一限制达到即清理最旧项，并报告回放缺口。无新事件时到期内容也不可读取。
 
-待答表只在 node 内存中存活至原始 expiresAt；hub 不把交互正文留在历史或磁盘。刷新/迟到页面通过 inputs.snapshot 取当前有效卡，带版本和游标，再应用订阅流；过期、已解决或旧 runtimeEpoch 卡不返回。离线队列不缓冲交互正文，重连时重新从当前待答表按策略投影。源端不可达时显示“状态未知”，禁用决定；不展示旧卡为可答。
+待答表只在 node 内存中存活至 §8 计算的 `expiresAt`；hub 不把交互正文留在历史或磁盘。刷新/迟到页面通过 inputs.snapshot 取当前有效卡，带版本和游标，再应用订阅流；过期、已解决或旧 runtimeEpoch 卡不返回。离线队列不缓冲交互正文，重连时重新从当前待答表按策略投影。源端不可达时显示“状态未知”，禁用决定；不展示旧卡为可答。
 
 审计仅保存时间、认证操作人、设备、agent、会话、操作、请求标识、决策、状态/错误分类；不得保存提示词、命令、路径、答案、raw SDK 错误。去重日志是执行元数据，不是内容历史。
 
@@ -245,7 +245,7 @@ remote 交互是单独的显式内容授权，需 node `relay=remote` 与 hub `a
 3. 缺分片/重复冲突/断线时放弃暂存区，保留旧数据并标 stale；不能部分覆盖。完整范围必须枚举空 agent 清单，防止旧会话残留。
 4. 对屏障之后的事件按 `(deviceId, agent, sessionId, nodeEpoch, seq)` 去重应用；发现缺口、队列淘汰或 epoch 改变时要求重同步，不把不完整流当作已对齐。不同会话的 seq 相互独立，不能只按 `(nodeEpoch, seq)` 去重或排序；新 nodeEpoch 不与旧 seq 比大小。
 5. hub 重启后清空临时连接/索引；node 重连重新同步，静默空闲会话也必须出现。不重发任何写命令；仅按第 6 节查询未决状态。
-6. 源端通过清单事件或有界周期扫描发现新建/删除会话，不依赖用户点击才更新清单。没有可靠增量时每 10 秒启动一次完整分页扫描且不重叠；单次 10 秒内未完成即标 stale 并拒绝写，不能把第一页或缺失状态当完整数据。在线无重连时，静默新增/删除/运行态变化在 30 秒内可见。turn.started/completed 与 session.updated 用同一状态版本归并，省略字段保留旧值；旧完成事件不能将新回合置闲。
+6. 源端通过清单事件或有界周期扫描发现新建/删除会话，不依赖用户点击才更新清单。没有可靠增量时每 10 秒启动一次完整分页扫描且不重叠；单次 10 秒内未完成即标 stale 并拒绝写，不能把第一页或缺失状态当完整数据。在线无重连时，静默新增/删除/运行态变化在 30 秒内可见。turn.started/completed 与 session.updated 的“状态版本”即该会话的公开 seq：按 seq 归并，低 seq 的迟到事件不得覆盖更高 seq 的状态；省略字段保留旧值，旧完成事件不能将新回合置闲。
 
 node 发送 sync.end 不等于完成同步；只有收到匹配当前连接/代次/syncId 的成功 sync.ack 后才 online。hub 与 node 双侧在屏障完成前拒绝写入；同步被拒、ACK 丢失/超时不得放开写入，以新 syncId 重新同步且不重放命令。
 
@@ -257,7 +257,7 @@ WebSocket 和 SSE 均有字节背压。慢浏览器超过预算则断开并要�
 
 ## 12. 证据、能力与错误
 
-所有能力均要求精确版本、真实脱敏协议样本和目标机验证记录；未知方法/字段关闭对应能力，不把 model/list 成功等同全协议支持。没有安装 agent 时标明 unavailable，不制造历史数据。
+所有能力均要求精确版本、真实脱敏协议样本和目标机验证记录；未知方法/字段关闭对应能力，不把 model/list 成功等同全协议支持。清单完整性必须有原生证据：分页遍历到终止，或原生返回显式全量标记；两者都不成立时只报告“完整性不可确认”，不把首个结果集当完整清单。没有安装 agent 时标明 unavailable，不制造历史数据。
 
 错误至少区分 auth-failed、device-mismatch、stale-connection、frame-invalid、device-offline、sync-required、session-unknown、writer-busy、ownership-unverified、expired、clock-skew、conflict、idempotency-conflict、revision-conflict、outcome-unknown、approval-disabled、approval-expired、decision-invalid、widen-rejected、unsupported、version-unsupported、size-limit、readback-timeout、readback-mismatch、agent-crashed、recovery-required。外传 detail 仅含枚举/安全字段；禁止原样错误消息和堆栈。
 

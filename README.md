@@ -92,7 +92,7 @@ node 断线后按指数退避（当前实现上限 30s；目标契约要求封�
 https://<hub-host>/marshal?token=<dashboard-token>
 ```
 
-这是当前 v0 的过渡方式。目标契约改为登录表单换 cookie，页面与 API 不再接受 URL token；迁移完成前不要把带 token 的 URL 当长期用法。
+这是当前 v0 的过渡方式。目标契约改为登录表单换 cookie，页面与 API 不再接受 URL token；登录响应返回 operatorId 与 CSRF token，并新增 logout 撤销会话。迁移完成前不要把带 token 的 URL 当长期用法。
 
 token 也可以放在 `x-marshal-token` 请求头里（两者同时出现时以查询参数为准）。已落地的 `/marshal` 与 `/marshal/api/devices|sessions|command|stream` 每条路由都要 token，否则 401；其他路径不归本插件处理。
 

@@ -28,7 +28,7 @@ hub、node、浏览器为三个角色；一个 npm 插件包按 role 装配。hu
 | src/hub/server.ts | WSS Upgrade、Authorization、hello ACK、每帧身份检查、握手超时 |
 | src/hub/relay.ts | event/ack/error 显式路由、in-flight 合并、状态查询、控制帧背压 |
 | src/hub/sync.ts | 分片快照暂存、原子替换范围、游标与 stale 状态 |
-| src/hub/api.ts、src/hub/page.ts | 登录/CSRF/失败限速、API、SSE、只读历史分页、交互状态、受限请求大小、纯文本渲染 |
+| src/hub/api.ts、src/hub/page.ts | 登录/登出/CSRF/会话期限/失败限速、API、SSE、只读历史分页、交互状态、受限请求大小、纯文本渲染 |
 | src/node/link.ts | 握手后上线、重连同步、分离控制帧与离线事件、字节预算；拨号 1s 起、封顶 10s、带 jitter |
 | src/node/runner.ts | 身份、期限、幂等、写权与 op 验证；结果/错误投影 |
 | src/node/journal.ts | node 去重持久记录；原子 admitted/结果；无正文；崩溃 unknown |
@@ -37,7 +37,7 @@ hub、node、浏览器为三个角色；一个 npm 插件包按 role 装配。hu
 | src/node/inputs.ts、src/node/questions.ts | 当前待答、策略、首答竞争、waterfall 交回、非历史快照 |
 | src/node/audit.ts | 结构化无内容审计、操作人取认证上下文 |
 | src/adapters/dsh/surface.ts | DSH 特有 API、进程内身份和 writer-held 接缝 |
-| src/adapters/dsh/adapter.ts、map.ts | 原生帧归一化，观察与写入分开，统一 seq 分配 |
+| src/adapters/dsh/adapter.ts、map.ts | 原生帧归一化，观察与写入分开；不自行分配公开 seq |
 
 避免重复：ACK 和事件共享验证/隐私工具，但使用不同队列；适配器不各写一套幂等/期限逻辑。v1 只扩展 adapter 生命周期，不绕过 runner。
 
@@ -51,9 +51,9 @@ hub、node、浏览器为三个角色；一个 npm 插件包按 role 装配。hu
 | NodeLink | handshake/sync/online 分开；接收经认证的结构化 Frame；onOnline 只在收到当前 sync.ack 后调用 |
 | CommandJournal | reserve/lookup/transition；相同域原子互斥，持久失败不执行；显式容量上限 |
 | HubRelay | command/status/publish/settle；settle 必须同时接收认证连接上下文 |
-| OperatorIdentity | get/create；hub 本地受限存储；跨重启稳定，不接受浏览器自报 |
+| OperatorIdentity | 首次初始化生成；已初始化文件缺失/损坏不重建，返回 recovery-required；跨重启稳定，不接受浏览器自报 |
 | SnapshotCoordinator | begin/chunk/end；完整范围、屏障游标、原子提交；单设备/hub 暂存字节预算 |
-| PendingInputs | listValid/settle/expire；完整复合键与原始 expiresAt，不能延长审批期限 |
+| PendingInputs | listValid/settle/expire；完整复合键与公共契约 §8 计算的 expiresAt（含原生上限），不能延长审批期限 |
 
 这里只规定责任与结果，不用本地自造的宽松类型宣称兼容 DSH。现有签名已封装在 surface；V0-T00 只补齐缺失证据和必要适配。
 
@@ -103,7 +103,7 @@ DSH 认领模式只用于已验证的普通问题 waterfall；持有该请求的
 
 日志保留安全枚举与标识；原生异常、命令正文和已认证 token 均不记录。审计与 journal 分开：前者供追踪，后者供执行去重；二者都不持久化内容。
 
-API/SSE 使用登录 cookie 与 Origin/CSRF 检查，设备通道使用 Authorization。登录失败按来源与全局限速；dashboardToken 必须来自随机源。WSS 握手后每帧再次绑定 deviceId/connectionId；旧 close 不能注销新连接。HTTP 请求体、JSON 深度、SSE 写缓存、同步暂存、设备待握手数量都有硬限额。设备表损坏时启动失败，热加载变更后 5s 内撤销生效；页面把 wire 文本按纯文本渲染。
+API/SSE 使用登录 cookie 与 Origin/CSRF 检查，设备通道使用 Authorization。浏览器会话有 8h 绝对与 30min 空闲期限，logout/轮换/到期后新请求拒绝且既有 SSE 在 5s 内关闭；心跳不续空闲期。登录失败按来源与全局限速；dashboardToken 必须来自随机源。WSS 握手后每帧再次绑定 deviceId/connectionId；旧 close 不能注销新连接。HTTP 请求体、JSON 深度、SSE 写缓存、同步暂存、设备待握手数量都有硬限额。设备表损坏时启动失败，热加载变更后 5s 内撤销生效；页面把 wire 文本按纯文本渲染。
 
 ## 8. 可观测性与运行目标
 

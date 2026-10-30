@@ -72,7 +72,7 @@ prompt 接受后显示“已受理”；turn.completed 才决定回合结果。A
 
 ### 4.3 普通问题
 
-DSH 普通问题的作答权来自当前持有的原生 waterfall 请求，不要求该会话由 marshal 发起，也不赋予其它会话写权。questionRelay=remote 时，waterfall 由 marshal 认领，原本本地卡片会延迟到 answerTimeoutMs 到期后才出现；此行为必须在部署文档中说明。off 不注册认领者。notify 仅在不改变本地语义的观察接缝已验证后可用，否则报告 unsupported。
+DSH 普通问题的作答权来自当前持有的原生 waterfall 请求，不要求该会话由 marshal 发起，也不赋予其它会话写权。questionRelay=remote 时，waterfall 由 marshal 认领，原本本地卡片会延迟到本地超时或原生 expiresAt 较早者到期后才出现；此行为必须在部署文档中说明。off 不注册认领者。notify 仅在不改变本地语义的观察接缝已验证后可用，否则报告 unsupported。
 
 普通问题与批准执行分开处理。plan-review 不因采用选择题 UI 就变成低权限问题。v0 不支持审批，因此不能借普通问答放行 plan-review。远端问题/审批卡片同时受 node `relay=remote` 与 hub 设备记录的 `allowInteractions=true` 约束，任一未开都按 off 处理。
 
@@ -109,12 +109,12 @@ Codex/Claude headless 没有可凭空接回的本地界面。它们的无答案/
 
 | 端点 | 职责 |
 |---|---|
-| POST /marshal/login | 交换 dashboardToken，建立浏览器会话；失败限速 |
+| POST /marshal/login | 交换 dashboardToken，建立浏览器会话；返回 operatorId、CSRF token 与到期时间；失败限速 |
 | POST /marshal/logout | 校验 Origin/CSRF，撤销当前浏览器会话及关联 SSE |
 | GET /marshal | 登录/控制面入口，无 token URL |
 | GET /marshal/api/devices、/sessions | 带在线、stale、同步代次的清单 |
 | GET /marshal/api/history | 只读分页历史；不透明 cursor、limit 有界、无写权副作用 |
-| POST /marshal/api/command | 操作、目标、幂等键和预期状态版本验证 |
+| POST /marshal/api/command | 操作、目标、幂等键；configure 另带 expectedRevision 并先校验 |
 | GET /marshal/api/command-status | 只读查原操作状态，不触发执行 |
 | GET /marshal/api/inputs | 从 node 获取当前会话有效待答快照 |
 | GET /marshal/api/stream | 带游标、reset 和背压的 SSE |
