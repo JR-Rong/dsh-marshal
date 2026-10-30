@@ -218,7 +218,7 @@ WebSocket 上的 JSON 帧统一带 `v: 1`，四种 `type`：
 | [设计（v1）](docs/superpowers/specs/2026-10-29-marshal-v1-design.md) | Codex / Claude 的审批、设置与所有权 |
 | [架构（v1）](docs/superpowers/specs/2026-10-29-marshal-v1-architecture.md) | 适配器、状态机与兼容策略 |
 | [计划（v1）](docs/superpowers/plans/2026-10-29-marshal-v1.md) | v1 实施计划 |
-| [讨论组设计（D1）](docs/superpowers/specs/2026-10-30-marshal-discussion.md) | 跨平台讨论边界、调度/授权/恢复及 G01–G12 验收 |
+| [讨论组设计（D1）](docs/superpowers/specs/2026-10-30-marshal-discussion.md) | 跨平台讨论边界、调度/授权/恢复及 G01–G17 验收 |
 | [讨论组计划（D1）](docs/superpowers/plans/2026-10-30-marshal-discussion.md) | v1 基础完成后的独立实施阶段，全部待执行 |
 | [DSH 编排插件参考](docs/superpowers/spikes/2026-10-30-orchestration-references.md) | dsh-agent-teams、官方 Agent Team/workflow 的可复用机制与限制 |
 

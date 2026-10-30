@@ -119,6 +119,7 @@ owner 的审计身份由 hub 从认证会话赋予，不接受浏览器自报 `a
 | `command.status / command.status.result` | hub→node / node→hub | 只读查询原幂等键状态；不触发执行、不携带原始正文 |
 | `inputs.snapshot / inputs.snapshot.result` | hub→node / node→hub | owner 按会话查询当前有效待答卡；node 重新执行隐私与策略校验，返回 runtimeEpoch 与同一公开序列的快照高水位 |
 | `heartbeat / heartbeat.ack` | 双向请求/应答 | 当前 connectionId/nodeEpoch、请求 nonce、发送/响应时刻；用于存活与时钟偏差估算，不携带正文 |
+| `discussion.output / discussion.status` | node→hub，仅 D1 | 独立帧类型，按当前连接鉴权；deviceId/agent/sessionId/runId/memberId/turnId/nodeEpoch/runtimeEpoch/memberSeq，不携带 roomSeq；来源序号按成员/实例隔离，hub 去重后独占分配房间流 roomSeq，详见 D1 §3 |
 
 方向不符的帧按 `frame-invalid` 拒绝。target 为 `(deviceId, agent, sessionId)`；仅 `create` 与 D1 的 `discussion.create` 使用 `sessionId: null`，在 agent 级执行并以该完整 target 去重，其余操作必须有实际 sessionId。`fork` 指向父会话。create/fork/discussion.create 的新会话 ID 作为无正文结果落 journal 后返回，状态查询恢复原 ID，不通过再建会话恢复结果。agent 标识是字符串，但必须在握手支持集合中。未知操作必须拒绝；未知事件可忽略并计数，不能因此绕过身份或大小检查。每个操作的 args 由 `wire/commands` 的判别 schema 定义并在两端验证，未知字段拒绝；`observe` 的 args 区分 `history`（带不透明 cursor 和 limit，单页有界）与 `follow`（订阅/取消订阅），两者都不带写权副作用。follow 使用服务端签发、绑定认证观察者及当前连接的 subscriptionId；取消只影响自己的订阅。共享原生 follower 只在最后一个观察者退出后释放，断流/登出/卸载清理引用；两个浏览器不能互相取消或重复创建无界 follower。history、follow、状态/待答查询不占用写命令 journal。
 
@@ -132,8 +133,9 @@ owner 的审计身份由 hub 从认证会话赋予，不接受浏览器自报 `a
 | `tool.started / tool.output / tool.completed` | callId、工具名、参数/输出或计数、最终状态；不同工具不得共用卡片身份 |
 | `input.requested / input.resolved` | 第 8 节嵌套判别载荷，永不进入历史缓冲 |
 | `capability.changed` | 当前会话的完整能力快照、revision、回读时间；不是不明确的局部 patch |
-| `discussion.output / discussion.status` | D1 预留：绑定 `runId/memberId/turnId`、`nodeEpoch` 与每 run 的 `roomSeq`，只携带经源端白名单和大小校验的成员输出或状态；不进入 `EventBuffer`、普通会话索引或 node 离线队列，未协商 `discussion` 能力时忽略并计数 |
 | `error` | 受限 code、严重性、关联 ID；无原始异常内容 |
+
+D1 的 discussion.output/status 使用上表的独立帧 schema，不借普通 event 信封要求的会话 seq 或 kind 表达房间序列；同样执行源端白名单/大小验证，不进入 EventBuffer、普通会话索引或 node 离线队列。未协商 discussion 能力的连接不得接收这些帧，按 frame-invalid 拒绝，不隐式降级为普通事件。
 
 完整 sync 会话行是替换快照；普通 session.updated 是按 schema 合并的局部更新，两者不得混用。Capability 至少包含 observe 的独立字段（history: boolean；follow: stream/poll/none）、明确 operations 集合、工具/思考可见级别、ownership、tunables 和逐功能 unavailable reason。dispatch 不再用一个互斥字符串代表多个不同写入能力。
 
@@ -154,6 +156,8 @@ wire v2 将当前 marshal `resume` 重命名为 `observe`；当前 DSH 的 resum
 
 命令 TTL 固定 30000 ms，从 hub 接收合法请求开始计时。node 在入队、获得执行互斥后、调用 agent 前检查 deadline；过期命令零调用。握手和心跳重新估算时钟偏差；无法将偏差/不确定度限制在 5000 ms 内则写请求返回 `clock-skew`，并保守使用最早可能过期时间。执行开始前用单调时钟约束本地等待，不能靠调整墙钟延长 TTL。TTL 不是已开始操作的自动取消机制。
 
+D1 另有执行期限：discussion.create 携带 runExpiresAt，submit 同时携带 runExpiresAt/turnExpiresAt，均为参与幂等摘要的 UTC 毫秒字段。node 保守换算为不可续期的本地单调期限，到期独立请求取消，不依赖 hub 在线；这是 D1 的执行约束，不改变上述普通命令 TTL 语义。取消未确认仍 unknown，详见 [D1 §5.1](2026-10-30-marshal-discussion.md#51-node-独立执行期限)。
+
 ## 6. 命令生命周期与幂等（P1-01、P1-02）
 
 浏览器对一次用户意图生成并保存 idempotencyKey；网络超时不能换键自动重试。未决或结果未知的键必须在发请求前保存到跨标签页/浏览器重启仍可用的持久存储（如 IndexedDB），以 `(publicOrigin, operatorId)` 隔离；sessionStorage 不能满足关闭标签页后的恢复。仅存 target、op、key、状态、时间等无正文元数据，不存 prompt、答案、token 或响应正文。重开、重新登录后先查状态，不重发命令；人工提交新意图须明确与未知旧意图区分。存储不可用或写入失败时拒绝新的远端写请求；本地记录丢失时提示恢复信息不足，先人工核对，不将再次点击视作可安全重试。幂等域为 `(operatorId, target, idempotencyKey)`，规范化 op/args 的摘要用于检出同键不同载荷；传输 commandId、时间和连接代次不参与载荷摘要。
@@ -171,6 +175,8 @@ node 是去重的最终权威。按幂等域原子登记并在调用 agent 前�
 | `outcome-unknown` | 可能已执行，连接/进程故障导致结果不明 | 只查询，禁止自动再次执行 |
 
 本节持久登记只适用于具有副作用的操作；observe/history、command.status、inputs.snapshot 使用有界只读请求，不创建 admitted，也不因写 journal 已满而失去查询恢复能力。同一路径的 node journal/HMAC 状态由一个运行实例持有进程间排他锁；第二实例启动失败，不能各自去重后分别调用。
+
+D1 的 hub 房间 journal 也遵守未决记录不驱逐与初始化完整性规则；首次启用由独立持久标记区分，已初始化丢文件不能建空表。正文 15min 保留期不清除命令关联、占额证据或 node 会话用途墓碑；确认终止并完成对账后才能释放未知 run 的并发槽位，见 [D1 §6](2026-10-30-marshal-discussion.md#6-恢复汇总与生命周期)。
 
 原生调用已经开始后发生异常/超时，若没有可靠受理、实际结果或原生明确未受理且无副作用的证据，必须记 outcome-unknown，不能包装成 rejected。已知受理后回合失败用 turn 终态表示；设置 mismatch 持久为 confirmed 并附 readback-mismatch。pending-confirmation 必须落盘，崩溃后按未决项恢复。状态查询未找到键（包括已过保留期）返回 outcome-unknown / record-unavailable，不能推断从未执行或建议安全重发。
 
@@ -194,6 +200,8 @@ hub 发送后丢 ACK、hub 重启或连接断开，均返回/恢复为 outcome-u
 acquire、prompt、configure 的受理及回合状态转换使用每会话串行状态机；busy 的新 prompt/configure/acquire 立即拒绝，不建立延迟执行队列。锁只覆盖有界验证/登记/状态转换，不跨越整段推理、等待用户输入或设置回读；answer/decide/cancel/interrupt 必须能在长回合中按各自请求/回合身份验证并结算，否则会形成“回合等待回答、回答等待回合”的死锁。原生调用完成通过同一状态机归并；状态 busy 不等于禁止当前回合的控制操作。进程崩溃、写权丢失、租约过期即撤销控制、清理待答；旧 epoch 的决定不能影响新回合。DSH 原生 writer-held 若通过 spike 验证，可作为其进程内边界；不能外推给 Codex/Claude。
 
 DSH 没有产品 v0 的 acquire 操作。prompt 必须由原生控制器在同一受理步骤完成“当前 idle + 本次写者取得/互斥”，不能沿用当前固定 mode=steer 或先 list 再 prompt 来证明零忙时注入。若原生接口不提供该保证，则该目标版本 prompt 不开放。interrupt 必须原子比较 activeTurnId/runtimeEpoch 再取消；当前 sessionId-only cancel 不足以排除旧请求打断新回合，无法验证原子能力时关闭 interrupt，不能先读回合再调用无条件 cancel。
+
+D1 专用会话除写权外还须通过用途校验：node 持久识别 purpose=discussion，公共路由阻断普通 history/follow/inputs 和全部普通会话控制，普通 list/sync 与事件映射也不得重新暴露它。仅匹配 run/member 的 discussion 操作与无正文恢复查询可用，错误为 session-purpose-conflict（HTTP 409）。重启、停用 D1 或退役后仍保留隔离；用途不明时隔离受影响范围，不能降为普通会话。完整规则与墓碑回收条件见 [D1 §4.1](2026-10-30-marshal-discussion.md#41-专用会话与普通入口隔离)。
 
 ## 8. 审批、提问与策略（P1-03、P1-04）
 
@@ -292,7 +300,7 @@ WebSocket 和 SSE 均有字节背压。慢浏览器超过预算则断开并要�
 
 所有能力均要求精确版本、真实脱敏协议样本和目标机验证记录；未知方法/字段关闭对应能力，不把 model/list 成功等同全协议支持。清单完整性必须有原生证据：分页遍历到终止，或固定版本接口明确保证全量并经超过默认页大小的样本验证，或原生返回权威全量标记/总数且完成对账。返回数组长度不等于权威总数；没有证据时只报告“完整性不可确认”，不把首个结果集当完整清单。没有安装 agent 时标明 unavailable，不制造历史数据。
 
-错误至少区分 auth-failed、device-mismatch、stale-connection、frame-invalid、device-offline、sync-required、session-unknown、writer-busy、ownership-unverified、expired、clock-skew、conflict、idempotency-conflict、revision-conflict、outcome-unknown、approval-disabled、approval-expired、decision-invalid、widen-rejected、unsupported、version-unsupported、size-limit、readback-timeout、readback-mismatch、agent-crashed、recovery-required、record-unavailable、settings-unsafe。外传 detail 仅含枚举/安全字段；禁止原样错误消息和堆栈。
+错误至少区分 auth-failed、device-mismatch、stale-connection、frame-invalid、device-offline、sync-required、session-unknown、writer-busy、ownership-unverified、expired、clock-skew、conflict、idempotency-conflict、revision-conflict、outcome-unknown、approval-disabled、approval-expired、decision-invalid、widen-rejected、unsupported、version-unsupported、size-limit、readback-timeout、readback-mismatch、agent-crashed、recovery-required、record-unavailable、settings-unsafe，以及 D1 的 session-purpose-conflict。外传 detail 仅含枚举/安全字段；禁止原样错误消息和堆栈。
 
 错误通过四个互不混用的通道报告：命令生命周期用 `ack.code`（HTTP 映射见 §6）；异步/会话级故障用 `event.kind=error`；浏览器 API 用 HTTP 状态；连接级致命错误用 WebSocket close code。close code 固定为 4400 frame-invalid、4401 auth-failed、4403 device-mismatch、4406 version-unsupported、4408 handshake-timeout、4409 stale-connection；1009 仅表示帧超限。任何通道都不得用字符串包含关系推断错误类别，也不得省略机器可读 code。
 

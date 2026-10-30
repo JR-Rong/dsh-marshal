@@ -44,6 +44,8 @@ PendingInputs、CommandJournal、privacy 和 sync 复用 v0；不要为每种 ag
 
 能力是实际观测结果，不是方法名存在就设置 editable=true。方法缺失只关闭该能力；根本无法安全观察时 agent unavailable。隔离扫描用逐 adapter 结果汇总，不能 Promise.all 的一个异常使全部设备看板空白。
 
+后续 D1 增量不得绕过本节公共端口：node 的公共路由与发现/事件投影统一查询持久会话用途，阻断讨论会话的普通历史、跟随及控制入口；用途记录复用 journal 的完整性/锁机制，但保留期独立于命令键。专用会话端口在 node 内持有不依赖 hub 的到期任务，supervisor 处理取消与未知状态，不能为取消一个成员杀共享 runtime。hub 只在源端 memberSeq 去重后分配 roomSeq；恢复状态与正文缓存分开管理。细则及 G13–G17 见 [D1 设计](2026-10-30-marshal-discussion.md)，不据此宣称 v1 已支持讨论。
+
 ## 3. 子进程监督与重启
 
 Codex 每 node 一个受管 app-server；Claude 每个受管活跃会话一个 Query。只读发现可以按需启动协议服务进程，但不能加载会话为可写、启动推理 Query 或取得控制；这些动作必须来自显式控制请求。
