@@ -109,7 +109,8 @@ Codex/Claude headless 没有可凭空接回的本地界面。它们的无答案/
 
 | 端点 | 职责 |
 |---|---|
-| POST /marshal/login | 交换 dashboardToken，建立浏览器会话；返回 operatorId、CSRF token 与到期时间；失败限速 |
+| POST /marshal/login | 校验 dashboardToken 与 publicOrigin，建立浏览器会话；返回 operatorId、CSRF token 与到期时间；失败限速 |
+| GET /marshal/api/session | 已登录页面重载取身份/会话绑定 CSRF/绝对期限；no-store，不续期；用于恢复持久未决记录 |
 | POST /marshal/logout | 校验 Origin/CSRF，撤销当前浏览器会话及关联 SSE |
 | GET /marshal | 登录/控制面入口，无 token URL |
 | GET /marshal/api/devices、/sessions | 带在线、stale、同步代次的清单 |

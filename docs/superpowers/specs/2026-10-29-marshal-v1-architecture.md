@@ -40,7 +40,7 @@ PendingInputs、CommandJournal、privacy 和 sync 复用 v0；不要为每种 ag
 | prompt/steer/interrupt | 当前写者、idle/activeTurnId、操作幂等上下文；无隐式队列 |
 | configure/readSettings | 真实回读与版本关联；请求值独立存储 |
 | handleNativeInput | 两项中继策略、完整输入 schema、允许决定集合与原生 `nativeExpiresAt`（缺失为空） |
-| frame | node 提供统一 epoch/seq；所有源端输出经过同一投影管道 |
+| frame | adapter 先验证原生因果版本/回合，node 再投影并提供公开 epoch/seq；迟到原生状态不能仅按更大公开 seq 覆盖当前回合 |
 
 能力是实际观测结果，不是方法名存在就设置 editable=true。方法缺失只关闭该能力；根本无法安全观察时 agent unavailable。隔离扫描用逐 adapter 结果汇总，不能 Promise.all 的一个异常使全部设备看板空白。
 
@@ -74,7 +74,7 @@ turn、item、delta、tool result 和 settings 通知按真实 fixture 映射；
 
 原生服务端请求用 JSON-RPC request id 回应，itemId 仅作关联。command/file-change 审批取原生可用集合与单次白名单交集；permissions 请求空授权；elicitation 保守拒绝；requestUserInput 按 question 策略处理。未知请求及时返回支持的错误/拒绝，不能静默挂起。
 
-serverRequest/resolved、进程退出、所有权失效均作废对应待答。卡片生成和 settle 都经过公共策略；off 时没有审批正文出站，不能仅在 Claude 上实现开关。远端卡片需源端 relay=remote 且 hub 设备记录 `allowInteractions=true`，并取 min(createdAt + approvalTimeoutMs, nativeExpiresAt) 作为等待上限；外部 unknown 会话不建立可答卡。
+serverRequest/resolved、进程退出、所有权失效均作废对应待答。卡片生成和 settle 都经过公共策略；off 时没有审批正文出站，不能仅在 Claude 上实现开关。远端卡片需源端 relay=remote 且 hub 设备记录 `allowInteractions=true`，等待上限按公共契约 §8 归一化原生期限的单位/时钟域后计算；外部 unknown 会话不建立可答卡。
 
 ## 5. Claude SDK 适配
 
@@ -108,7 +108,7 @@ create/fork 若开放，必须显式操作、授权 cwd、捕获实际新 ID、�
 
 EventBuffer 只接受缓存白名单，并同时维护全局/会话条数与字节计数。过期队列按接收时间维护，append/read/size/周期清理都先 evict；避免每条事件全局 indexOf/splice 的平方级淘汰成本。淘汰后所有辅助索引也释放引用。
 
-PendingInputs 保留在 node；hub 的输入路由只转发 owner 的按会话只读快照查询，不入历史。待答查询与 SSE 订阅有屏障，返回公共契约 §8 计算的 expiresAt（含原生上限）与 runtimeEpoch；回答时再次校验，不能仅凭快照可答。
+PendingInputs 保留在 node；hub 的输入路由只转发 owner 的按会话只读快照查询，不入历史。待答查询与 SSE 订阅有屏障，返回公共契约 §8 按已验证原生时钟域计算的 expiresAt 与 runtimeEpoch；回答时再次校验，不能仅凭快照可答。临时断线不延长原生等待，恢复须身份/策略/runtime 未变；撤权/策略修订变化或卸载一次性结算原生请求后清理，不能仅删除卡片。
 
 SSE 回放使用 hubEpoch + cursor；复用 v0 reset/sync。浏览器处理 snapshot、reset 和增量时按复合键去重；不因历史回放生成可批准旧卡。慢客户端有字节预算，断开后明确重取快照。
 
