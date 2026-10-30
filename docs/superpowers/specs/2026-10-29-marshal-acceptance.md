@@ -114,7 +114,7 @@
 | C05-05 | I | 保持 SSE 打开时 logout、轮换 dashboardToken、绝对/空闲会话到期；logout 后复用旧 CSRF；关闭标签再打开已登录页面；同 URL 换安装 | 新 API 请求拒绝；旧 SSE ≤5s 关闭，不再收内容；心跳不续空闲期；session 查询返回原 operatorId/CSRF/绝对期限且 no-store、不续期；cookie 属性符合契约，登出后旧值不可复用；同安装重新登录 operatorId 稳定，不同安装不误认旧未决记录 |
 | C05-06 | I | content/remote 正在传输时 hub 收紧授权，断连前后注入旧帧；设备表 reload 无法解析或无法确定影响范围 | hub 先停止转发，node 断连停用协商授权、禁止正文外发/远答；重连发现新 policyRevision 后按 C03-10 结算旧待答；旧帧/ACK 正文/卡不补发；非法 reload 不部分应用或继续写，范围不明则全部设备断开 |
 | C05-07 | I | 无/错误 token 登录；有效 cookie 携无效 header token；双凭据；伪造同值 CSRF header/cookie；复用另一会话 CSRF；cookie 写请求缺失/null/跨源 Origin，伪造 Host/转发头；header-only 的无 Origin/跨源 Origin 对照 | 绕过均拒绝且零命令下发；Origin 只匹配 publicOrigin；不能仅凭 header 存在免 CSRF，也不能仅凭 header/cookie 相等通过；合法 cookie+会话绑定 CSRF 可用，合法 header-only 无 Origin 可用但带跨源 Origin 拒绝，不授予跨源凭据 CORS |
-| C05-08 | U/I | 授权收紧后重启/重载 hub；删除再注册设备；策略持久化失败/损坏/已检测到旧备份恢复；operatorId 与设备状态文件的缺失组合；普通 hub 重启但策略未变 | operatorId/policyRevision 不回退或复用；持久化失败禁止写且不发布新授权；已初始化判定以 operatorId 文件为准，该文件在而设备状态缺失即 recovery-required，反之不生成新身份；损坏/检测到回退为 recovery-required；只有同一持久身份域才比较 revision，node 回带更高修订时 hub 不降级下发；策略未变的 hubEpoch 更新不误判撤权 |
+| C05-08 | U/I | 授权收紧后重启/重载 hub；删除再注册设备；策略持久化失败/损坏/已检测到旧备份恢复；operatorId 与设备状态文件的缺失组合；普通 hub 重启但策略未变 | operatorId/policyRevision 不回退或复用；持久化失败禁止写且不发布新授权；已初始化判定以 operatorId 文件为准：该文件在而设备表缺失/损坏时启动失败，仅修订字段不可读或检测到回退时为 recovery-required，反之不生成新身份；只有同一持久身份域才比较 revision，node 回带更高修订时 hub 不降级下发；策略未变的 hubEpoch 更新不误判撤权 |
 
 ### C06：写权与观察
 

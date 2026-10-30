@@ -58,7 +58,7 @@ wire v1/v2 混接必须显式失败，UI 给出协议不匹配；不得用旧节
 | `deviceName` | node | 默认 hostname，仅显示用途，不参与鉴权或会话键 |
 | `dashboardToken` | hub | 必填，与 device token 隔离；由至少 24 随机字节生成 32 字符 base64url（≥192 bit 熵）。长度/弱口令校验不证明随机性；长度不足 32 字符、单字符重复或命中内置弱口令表时启动失败；不允许 URL 查询参数传递 |
 | `publicOrigin` | hub | 必填，浏览器访问的唯一 HTTPS origin（scheme/host/port，无路径、无尾斜杠）；作为 Origin 校验基准，不从请求 Host 或转发头推导。缺失、非 HTTPS 或含路径时启动失败 |
-| `devicesFile` | hub | 默认 `$HOME/.dsh-marshal/devices.json`；显式覆盖使用绝对路径，不展开字面 `~`；设备 ID、显示名、token 摘要、撤销状态、内容与交互授权，以及 §5 的授权修订高水位与撤销墓碑。首次初始化时缺失按空表告警；已初始化安装（以 §4 的 operatorId 持久文件存在为准）中缺失、无法解析、含重复 ID/重复 token 摘要或修订不可读时 hub 启动失败，不静默丢弃条目或把修订重置为零 |
+| `devicesFile` | hub | 默认 `$HOME/.dsh-marshal/devices.json`；显式覆盖使用绝对路径，不展开字面 `~`；设备 ID、显示名、token 摘要、撤销状态、内容与交互授权，以及 §5 的授权修订高水位与撤销墓碑。首次初始化时缺失按空表告警；已初始化安装（以 §4 的 operatorId 持久文件存在为准）中缺失、无法解析、含重复 ID/重复 token 摘要时 hub 启动失败，不静默丢弃条目。设备记录完好但修订字段缺失/回退时按 §5 进入 recovery-required（hub 可启动，但拒绝新写且不把修订重置为零）|
 | `privacy` | node | 默认 `metadata`；可选 `content`，还需 hub 对该 deviceId 允许内容 |
 | 设备记录 `allowContent` | hub | 默认 false；由部署者在 hub 本地设置 |
 | 设备记录 `allowInteractions` | hub | 默认 false；远端的提问/审批卡片需同时满足 node 侧 relay=remote 与本项为 true，缺一即按 off 处理 |
@@ -91,7 +91,7 @@ hub 复用 DSH webServer 的端口与 TLS/反代，不另监听。node 不暴露
 
 非浏览器 API 使用独立认证分支：只在未带 marshal 会话 cookie 且 `x-marshal-token` 校验成功时免 cookie/CSRF；混合两种凭据拒绝，无效头不得回退 cookie。有 Origin 的请求仍须匹配 publicOrigin。设备 WSS 的 Authorization 不与 dashboard 头混用。两种分支都受相同大小/限速与授权限制。会话、CSRF、dashboard/device token 及命令正文不写日志或 URL。登录失败按来源和全局两个维度限速（同一来源 15 分钟内最多 5 次失败，之后指数退避；全 hub 失败速率超限时短暂拒绝），延迟不泄露长度或前缀差异。
 
-owner 的审计身份由 hub 从认证会话赋予，不接受浏览器自报 `answeredBy`。`operatorId` 是该 hub 安装中持久的随机 owner 身份，首次启动生成后保存在 hub 本地受限文件中，跨浏览器登录、hub 重启和 token 轮换保持稳定；该文件同时是“安装已初始化”的判定依据：它存在而 §3 的设备状态缺失按 §6 recovery-required，它缺失而设备状态存在时不自动生成新身份。临时浏览器会话 ID 只作审计关联，不参与幂等域。浏览器未决记录按 `(publicOrigin, operatorId)` 隔离；同一 URL 换成另一安装后不得把旧记录当新安装命令重新提交。
+owner 的审计身份由 hub 从认证会话赋予，不接受浏览器自报 `answeredBy`。`operatorId` 是该 hub 安装中持久的随机 owner 身份，首次启动生成后保存在 hub 本地受限文件中，跨浏览器登录、hub 重启和 token 轮换保持稳定；该文件同时是“安装已初始化”的判定依据：它存在而 §3 的设备状态缺失时按 §3 启动失败，它缺失而设备状态存在时不自动生成新身份（按 §6 recovery-required 人工对账）。临时浏览器会话 ID 只作审计关联，不参与幂等域。浏览器未决记录按 `(publicOrigin, operatorId)` 隔离；同一 URL 换成另一安装后不得把旧记录当新安装命令重新提交。
 
 认证设计依据：[OWASP 会话绑定 CSRF](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html)、[MDN cookie 前缀约束](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Set-Cookie)。这里使用已有服务端会话状态保存 CSRF，无需再引入另一套无状态签名方案。
 
@@ -103,7 +103,7 @@ owner 的审计身份由 hub 从认证会话赋予，不接受浏览器自报 `a
 
 `runtimeEpoch` 标识适配器实例：子进程类 agent 为进程启动，DSH 为适配器/插件实例；实例重建、宿主重启或子进程退出都使旧 runtimeEpoch 的写权和交互立即失效。公开 seq 是归一化后的投递顺序，不是原生状态的因果版本；迟到事件的处理见 §11。
 
-`policyRevision` 是 hub 侧每设备授权策略（撤销、allowContent、allowInteractions）的持久单调修订号。与 operatorId/deviceId 绑定，在授权生效前与授权变更一次性原子写入 §3 的受限设备状态文件，重启、删除再注册不得复用旧号（删除设备保留撤销墓碑）。写入失败等同非法 reload：不提交新 revision、不发布新授权、受影响设备保持不可确认并关闭连接。状态缺失、损坏、不可读或已检测到旧备份回退按 §6 进入 recovery-required，不从零继续。hello 回带 node 上一次绑定的 operatorId/policyRevision，hello.ack 下发当前值；node 侧该值只是实例内存，重建后为空，空值按首次绑定处理且不能跳过 hub 的当前策略下发。operatorId 不同即不同身份域，不比较修订号，丢弃旧策略状态后重新绑定；同一身份域内 node 回带更高修订而 hub 当前值更低，判定 hub 状态回退并进入 recovery-required，不能下发更低修订。任一值变化都丢弃旧策略的内容/ACK 正文，并按 §8 结算旧待答，不能只删除卡片留下原生阻塞。随后重新协商、完整同步；hubEpoch 变化但持久策略未变不等于撤权。
+`policyRevision` 是 hub 侧每设备授权策略（撤销、allowContent、allowInteractions）的持久单调修订号。与 operatorId/deviceId 绑定，在授权生效前与授权变更一次性原子写入 §3 的受限设备状态文件，重启、删除再注册不得复用旧号（删除设备保留撤销墓碑）。写入失败等同非法 reload：不提交新 revision、不发布新授权、受影响设备保持不可确认并关闭连接。整表缺失/无法解析按 §3 启动失败；设备记录完好而修订缺失、不可读或已检测到旧备份回退时按 §6 进入 recovery-required，不从零继续。hello 回带 node 上一次绑定的 operatorId/policyRevision，hello.ack 下发当前值；node 侧该值只是实例内存，重建后为空，空值按首次绑定处理且不能跳过 hub 的当前策略下发。operatorId 不同即不同身份域，不比较修订号，丢弃旧策略状态后重新绑定；同一身份域内 node 回带更高修订而 hub 当前值更低，判定 hub 状态回退并进入 recovery-required，不能下发更低修订。任一值变化都丢弃旧策略的内容/ACK 正文，并按 §8 结算旧待答，不能只删除卡片留下原生阻塞。随后重新协商、完整同步；hubEpoch 变化但持久策略未变不等于撤权。
 
 | 帧 | 方向 | 必需信息与用途 |
 |---|---|---|
