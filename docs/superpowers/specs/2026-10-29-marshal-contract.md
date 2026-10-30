@@ -1,16 +1,32 @@
 # dsh-marshal 公共契约
 
 日期：2026-10-29
-状态：P1 评审修订；规范草案，尚无实现与运行验收
-适用：v0、v1；本文是配置、协议、安全及恢复语义的唯一权威定义。
+状态：基于 `feat/v0@702ef24` 的 P1 目标契约；本次仅修改文档
+适用：v0 后续加固及 v1；本文定义目标行为，现有 wire v1 的使用说明见 [README](../../../README.md)。
 
 ## 1. 文档关系与版本
 
 - [总体设计](2026-10-29-marshal-design.md)定义产品边界；架构文档定义模块责任；计划定义实现顺序。
 - [验收矩阵](2026-10-29-marshal-acceptance.md)定义通过条件。修改本文时必须同步关联任务和验收用例。
-- 目前没有已发布的 wire 实现，草案采用 `v: 1`、`contractRevision: p1-review-1`。产品版本 v0/v1 与 wire 版本不是同一概念。
-- 握手交换 wire 版本、契约修订和功能集合；不兼容修订拒绝建立控制通道，不能仅看到 `v: 1` 就假定兼容。发布后的破坏性变更须升级协议版本。
-- 以下出现的模块名、接口和帧均是待实现契约，不表示源文件已经存在。
+- 当前 `feat/v0` 已有 wire `v: 1` 实现。本文引入不兼容的身份、帧和操作语义，目标升级为 `v: 2`、`contractRevision: p1-review-1`；产品 v0/v1 与 wire 版本分开编号。
+- 目标握手交换 wire 版本、契约修订和功能集合；不兼容版本拒绝控制连接，不静默降级。不将当前成功握手等同目标契约通过。
+- 当前已有模块与待新增模块见架构和增量计划；本文的 journal、原子 sync、cookie 登录等尚未实现。逐项状态见 [基线复核](2026-10-29-marshal-acceptance.md#0-评审基线与已有证据)。
+
+### 1.1 从当前实现迁移
+
+| 方面 | 当前 `feat/v0@702ef24` | 本文目标 |
+|---|---|---|
+| wire 与时间 | `v:1`，event.ts 为 ISO 字符串，command.deadline 为毫秒 | `v:2`，时间统一毫秒，新增连接/进程代次与 sync/status 帧 |
+| 设备身份 | `deviceName` 同时作为设备 ID，target 使用 `device` | `deviceId` 稳定，deviceName 仅显示，target 使用 deviceId |
+| 设备凭据 | 文件存 token 原值，握手头及 hello 都携带 token；文件启动加载 | 文件存摘要，token 仅请求头；撤销即时生效 |
+| 浏览器认证 | URL query 或 Authorization token，所有现有路由鉴权 | POST 登录换 cookie，写请求增加 Origin/CSRF 检查 |
+| 观察 | marshal `resume` 只启动 DSH follow，不调用原生 resume | 重命名 `observe`；v1 的 `acquire` 独立且显式 |
+| 配置/隐私 | relay 仅 off/remote（默认 off），metadata 裁剪部分事件；redaction 默认为空 | 统一 off/notify/remote；字段白名单、内置脱敏及双重 content 授权 |
+| 命令/恢复 | hub 内存去重、node deadline；重连 clearDevice 后重发快照 | node 持久去重、unknown 查询、原子快照与 SSE reset |
+
+迁移纳入 V0-T01/T02/T08/T10：先在隔离的合成设备表与配置副本验证转换，再安排 hub/node 同版本升级。设备 ID 必须沿用原 deviceName 的身份值，显示名变化不能产生新身份；设备表迁移写入新文件且受限权限，不原地破坏旧表。旧 token 可在本地转换为摘要，不能打印、写报告或通过网络重新传输原值。
+
+v1/v2 混接必须显式失败，UI 给出协议不匹配；不得用旧节点承载 v2 写请求。升级前停止接收新写入并排空 pending；无法确定结果的命令记录为 unknown，升级后不自动重放。协调升级完成前保持写入关闭。回滚恢复配套旧二进制、旧配置和设备表，仍保留新 journal 与未决记录，不因回滚自动重试旧命令。未完成迁移验收前，README 保留当前可执行配置，新增字段不能描述成当前默认值。
 
 ## 2. 不变量
 
@@ -39,7 +55,7 @@
 | `deviceId` | node | 必填，由 hub 注册时签发；独立于主机名，重启和改名保持不变 |
 | `deviceName` | node | 默认 hostname，仅显示用途，不参与鉴权或会话键 |
 | `dashboardToken` | hub | 必填，与 device token 隔离；不允许 URL 查询参数传递 |
-| `devicesFile` | hub | 默认 `~/.dsh-marshal/devices.json`；设备 ID、显示名、token 摘要、撤销状态、内容授权 |
+| `devicesFile` | hub | 默认 `$HOME/.dsh-marshal/devices.json`；显式覆盖使用绝对路径，不展开字面 `~`；设备 ID、显示名、token 摘要、撤销状态、内容授权 |
 | `privacy` | node | 默认 `metadata`；可选 `content`，还需 hub 对该 deviceId 允许内容 |
 | 设备记录 `allowContent` | hub | 默认 false；由部署者在 hub 本地设置 |
 | `questionRelay` | node | 默认 `off`；`off / notify / remote` |
@@ -109,7 +125,7 @@ target 为 `(deviceId, agent, sessionId)`。agent 标识是字符串，但必须
 | `configure` | v1：会话设置；受第 9 节约束，DSH 留 v1.1 |
 | `create / fork` | v1 可选：显式新建/分叉；能力、cwd 范围和新会话身份均须验证 |
 
-旧稿 marshal `resume` 操作删除：浏览改为 `observe`，取得控制改为 `acquire`；底层 agent 的 resume API 只允许在取得写权后的适配器内部使用。
+wire v2 将当前 marshal `resume` 重命名为 `observe`；当前 DSH 的 resume 仅建立 follow，并无原生会话接管副作用。v1 新增独立 `acquire`；底层 Codex/Claude 的 resume API 只允许在取得写权后的适配器内部使用。
 
 命令 TTL 固定 30000 ms，从 hub 接收合法请求开始计时。node 在入队、获得执行互斥后、调用 agent 前检查 deadline；过期命令零调用。握手和心跳重新估算时钟偏差；无法将偏差/不确定度限制在 5000 ms 内则写请求返回 `clock-skew`，并保守使用最早可能过期时间。执行开始前用单调时钟约束本地等待，不能靠调整墙钟延长 TTL。TTL 不是已开始操作的自动取消机制。
 
@@ -212,7 +228,7 @@ remote 交互是单独的显式内容授权，只发送决定所需字段，卡�
 
 ## 11. 同步、游标与失效恢复（P1-10）
 
-连接状态：offline → dialing → handshaking → syncing → online。syncing 时禁用写请求；所有启动和重连都执行完整同步，不能只在 applyNode() 首次调用 snapshot。
+连接状态：offline → dialing → handshaking → syncing → online。syncing 时禁用写请求；在当前已有每次重连 snapshot 的基础上，增加完整性屏障与原子提交。当前 onOnline 在 socket open 后触发，帧在 hello ACK 前缓冲，尚不代表原子同步完成。
 
 1. node 为已配置 agents 采集完整分页清单、能力、所有权、状态与各会话高水位 seq，发送 sync.begin/chunk/end；快照采集与增量之间有一致性屏障。
 2. hub 在暂存区验证全部分片和范围，仅在 sync.end 完整时原子替换该设备范围的索引。缺失会话删除；缺失/崩溃 agent 标记 unavailable，不将旧能力保留为可写。

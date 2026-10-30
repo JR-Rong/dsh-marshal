@@ -8,7 +8,7 @@
 
 ## 1. 运行时与模块
 
-保留 v0 hub/node、runner、journal、隐私、同步和认证边界。新增 AgentHost 管理各 agent，不能由适配器直接绕过 node runner 接受远端写入。
+复用现有 v0 hub/node、runner；journal、统一隐私、原子同步和完整认证边界依赖 [v0 P1 增量计划](../plans/2026-10-29-marshal-v0-p1.md) 先交付，目前不能作为现成功能调用。新增 AgentHost 管理各 agent，不能由适配器直接绕过 node runner 接受远端写入。
 
 | 模块 | 职责 |
 |---|---|

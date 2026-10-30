@@ -1,9 +1,11 @@
 # dsh-marshal（调度官）总体设计
 
 日期：2026-10-29
-状态：P1 评审修订；尚未实现
+状态：基于 `feat/v0@702ef24` 的 P1 目标修订；v0 已有实现，本次不改实现
 规范：[公共契约](2026-10-29-marshal-contract.md) · [验收矩阵](2026-10-29-marshal-acceptance.md)
-配套：[v0 架构](2026-10-29-marshal-architecture.md) · [v0 计划](../plans/2026-10-29-marshal-v0.md)
+配套：[v0 架构](2026-10-29-marshal-architecture.md) · [v0 增量计划](../plans/2026-10-29-marshal-v0-p1.md)
+
+本文描述后续加固目标。当前安装、wire v1 和已支持行为以 [README](../../../README.md) 为准；已有修复及剩余缺口见 [基线复核](2026-10-29-marshal-acceptance.md#0-评审基线与已有证据)。
 
 ## 1. 问题与目标
 
@@ -52,7 +54,7 @@ hub 使用 DSH webServer 托管 /marshal 与 API，复用原有端口/TLS。node
 
 node 可支持 DSH web 或其他具备必需服务的宿主形态；Electron 是否具备相同服务必须实测，不能仅因“不需要外部 HTTP”就宣称已兼容。桌面浏览器为 v0 验收范围，手机浏览器布局在 v1 UI 任务中验证；PWA/推送不阻塞首版。
 
-配置字段及默认值仅在公共契约 §3 定义，README 提供示例。稳定 deviceId 与显示 deviceName 分离；地址和认证信息无默认端点。
+目标配置字段及默认值在公共契约 §3 定义，迁移见 §1.1；README 保留现有 v0 的可运行示例。稳定 deviceId 与显示 deviceName 分离；地址和认证信息无默认端点。
 
 ## 4. 使用流程
 
@@ -64,7 +66,7 @@ node 可支持 DSH web 或其他具备必需服务的宿主形态；Electron 是
 
 ### 4.2 控制
 
-DSH 通过已经验证的原生 writer-held 边界提交写入。Codex/Claude 先显式 acquire，确认当前 runtimeEpoch 的控制证据后才开放 prompt/configure/interrupt。foreign-unknown 只读；无法证明排他控制时不能靠重试 resume 解决。
+DSH 当前委托原生 prompt/cancel；后续须补齐 writer-held 原子边界的并发验证，才能按目标契约声明写权保证。Codex/Claude 先显式 acquire，确认当前 runtimeEpoch 的控制证据后才开放 prompt/configure/interrupt。foreign-unknown 只读；无法证明排他控制时不能靠重试 resume 解决。
 
 prompt 接受后显示“已受理”；turn.completed 才决定回合结果。ACK 丢失显示“执行结果未知”，提供只读状态查询，禁止自动换幂等键重新发送。
 
@@ -122,4 +124,4 @@ Codex/Claude headless 没有可凭空接回的本地界面。它们的无答案/
 
 v0 完成以验收矩阵发布门槛为准。至少覆盖两台目标机器的 DSH 提示词闭环、真实工具流、远端问题与本地回退、断网恢复、单独重启 hub，以及同键并发只执行一次。
 
-当前未解决的外部条件：DSH 精确接缝、Codex/Claude 控制权机制、原生设置回读能力。必须通过 spike 得到 OK/FAIL/UNKNOWN；UNKNOWN 不授予可写能力。本稿的修订是设计决策，不是部署或生产验收证明。
+已有 [DSH 接缝记录](../spikes/2026-10-29-dsh-seams.md) 覆盖 Upgrade/跟随/路由核对。仍待补证的是 DSH 写者并发、真实宿主完整生命周期与两机链路，以及 Codex/Claude 控制权机制和原生设置回读能力。必须通过 spike 得到 OK/FAIL/UNKNOWN；UNKNOWN 不授予可写能力。本稿的修订是设计决策，不是部署或生产验收证明。

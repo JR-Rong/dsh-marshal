@@ -1,9 +1,9 @@
 # dsh-marshal v0 架构设计
 
 日期：2026-10-29
-状态：P1 评审修订；待实现与接缝验证
+状态：基于已有 v0 实现的 P1 目标架构；新增能力待实施
 上游：[总体设计](2026-10-29-marshal-design.md) · [公共契约](2026-10-29-marshal-contract.md)
-验证：[验收矩阵](2026-10-29-marshal-acceptance.md) · [v0 计划](../plans/2026-10-29-marshal-v0.md)
+验证：[验收矩阵](2026-10-29-marshal-acceptance.md) · [v0 增量计划](../plans/2026-10-29-marshal-v0-p1.md)
 
 ## 1. 运行时与依赖方向
 
@@ -13,7 +13,9 @@ hub、node、浏览器为三个角色；一个 npm 插件包按 role 装配。hu
 
 ## 2. 模块责任
 
-以下是计划路径，当前仓库没有实现。
+以下列出目标责任。当前 `feat/v0@702ef24` 已有 config、wire/frames、hub 的 devices/registry/server/relay/api/page、node 的 link/runner/questions/redact、DSH adapter/surface/map 及对应测试。
+
+待新增的是 wire/commands、hub/sync、node/journal/sync/privacy/inputs/audit；privacy 应复用现有 redact，inputs 应吸收 questions 中现有待答逻辑，不创建互不一致的两套状态。表中的新职责尚未全量实现，不能当作当前模块能力。
 
 | 模块 | 责任与边界 |
 |---|---|
@@ -51,7 +53,7 @@ hub、node、浏览器为三个角色；一个 npm 插件包按 role 装配。hu
 | SnapshotCoordinator | begin/chunk/end；完整范围、屏障游标、原子提交 |
 | PendingInputs | listValid/settle/expire；完整复合键与原始 expiresAt，不能延长审批期限 |
 
-这里只规定责任与结果，不用本地自造的宽松类型宣称兼容 DSH。实际签名由 V0-T00 验证后在 surface 内适配。
+这里只规定责任与结果，不用本地自造的宽松类型宣称兼容 DSH。现有签名已封装在 surface；V0-T00 只补齐缺失证据和必要适配。
 
 ## 4. 命令时序与故障语义
 
@@ -117,12 +119,12 @@ API/SSE 使用登录 cookie 与 Origin/CSRF 检查，设备通道使用 Authoriz
 | waterfall 顺序和 next() | 远端认领、超时、本地回答、卸载四条链路 | questionRelay 关闭，保留本地行为 |
 | disposal | 插件停用后连接、timer、follow 全释放 | 阻塞交付，不能靠进程退出清理 |
 
-V0-T00 必须为各项记录 OK/FAIL/UNKNOWN。后续任务只对有证据的接缝编码。
+已有 [接缝报告](../spikes/2026-10-29-dsh-seams.md) 中三项 OK 保留，不能把源码/最小握手实验扩大为两机或完整宿主验收。V0-T00 增补 writer-held、完整生命周期及目标环境差异，分别记录 OK/FAIL/UNKNOWN。
 
 ## 10. 架构决策
 
 - 保留反向 WSS 和自包含页面，满足 node 零入站与单包部署。
 - 新增 node 无内容的持久去重 journal，避免 hub 重启/ACK 丢失导致重复执行；不引入云端正文数据库。
 - 将连接同步作为通用基础能力，不能留到适配器完成后补救。
-- 观察与控制独立，UI 点击不再调用具有接管语义的 resume。
+- 观察与控制独立：现有 DSH resume 只是 follow，wire v2 改名 observe；v1 新增的原生 resume 受 acquire 写权门槛约束。
 - P1 与验收映射统一放入验收矩阵；本文件不复制不同默认值和“预计全部通过”的结果。

@@ -1,9 +1,30 @@
 # dsh-marshal P1 与发布验收矩阵
 
 日期：2026-10-29
-状态：验收设计完成；以下运行用例全部待执行，无通过声明。
+状态：基于 feat/v0 的源码复核与目标验收设计；本轮未重跑运行测试。
 规范：[公共契约](2026-10-29-marshal-contract.md)
-计划：[v0](../plans/2026-10-29-marshal-v0.md)、[v1](../plans/2026-10-29-marshal-v1.md)
+计划：[v0 增量](../plans/2026-10-29-marshal-v0-p1.md)、[v1](../plans/2026-10-29-marshal-v1.md)
+
+## 0. 评审基线与已有证据
+
+基线：`feat/v0@702ef24308db10b3381ffcaff0f2746582842433`。该分支已有 v0 源码、构建配置、测试及接缝报告；v1 适配器尚未实现。下面的“已有”来自本轮源码/测试文件核对，不等于本轮执行 PASS。旧设计草稿的问题不能直接套为当前代码缺陷。
+
+| P1 | 当前状态与证据 | 后续处理 |
+|---|---|---|
+| P1-01 ACK | **原装配缺口已修复**。[index](../../../src/index.ts) 的 onFrame 将 ack 送入 relay.settle；[e2e](../../../tests/e2e.spec.ts) 已覆盖正式 apply→HTTP→WS→node→ACK 和一次 prompt 调用（DSH 为替身） | 保留回归；扩展非法/丢失 ACK、受理与回合完成区分，不能再按“只有 event 分支”派工 |
+| P1-02 幂等/期限 | **部分已有，仍有缺口**。[relay](../../../src/hub/relay.ts) 有 in-flight，[测试](../../../tests/relay.spec.ts) 有同键并发；[runner](../../../src/node/runner.ts) 已检查 deadline。现有去重域为 device/op/key，缺 session/payload 冲突校验；无 node 持久 journal | 扩展完整幂等域、node 持久状态和 outcome-unknown 查询；保留当前检查 |
+| P1-03 策略 | **v1 设计风险**，当前没有 Codex/Claude adapter。[index](../../../src/index.ts) 仅在 DSH questionRelay=remote 时安装提问中继；approvalRelay 当前未接通审批 | v1 构造与执行必须统一强制策略；v0 补普通问题策略/待答恢复验收，不称已存在 Codex 默认审批漏洞 |
+| P1-04 持续授权 | **v1 设计风险**，当前没有对应 SDK 权限更新实现 | 目标仅允许单次决定，排除持久权限更新；用 C04 验证 |
+| P1-05 身份 | **事件绑定已修复，ACK/代次待补**。[server](../../../src/hub/server.ts) 校验 event.device/agent，detachIf 保护新连接；[测试](../../../tests/hub-server.spec.ts) 覆盖冒充与旧 close。relay.settle 仍仅按 ack.id 完成 pending | 所有帧检查当前连接，ACK 绑定认证设备与命令连接；事件/旧 close 作为回归保留 |
+| P1-06 所有权 | **v1 设计风险及 DSH 待补证**。当前 marshal resume 仅在 [runner](../../../src/node/runner.ts) 启动 follow，没有调用 Codex/Claude 原生 resume | wire v2 重命名 observe；v1 的 acquire 单独验证排他证据，补 DSH writer-held 并发证据 |
+| P1-07 收紧方向 | **v1 设计风险**。[DSH adapter](../../../src/adapters/dsh/adapter.ts) 七项设置均 editable=false，当前没有可执行的 reasoning setter | 按 field/模型版本定义策略，未知保持只读 |
+| P1-08 真实回读 | **v1 设计风险**，当前 v0 设置不可编辑 | current/pending 分开，真实回读关联后才确认；无法回读保持只读 |
+| P1-09 隐私/缓存 | **v0 隐私仍有缺口；历史缓存为 v1 设计风险**。[redact](../../../src/node/redact.ts) 已覆盖键名与超深对象，但默认规则为空，metadata 仅裁剪部分事件；[runner](../../../src/node/runner.ts) ACK 可含 raw Error.message。当前无 v1 EventBuffer | 补全通道投影；交互不入历史/离线正文队列与主动 TTL 清理由增量及 v1 任务验收 |
+| P1-10 恢复 | **每次重连 snapshot 已接入，原子性待补**。[index](../../../src/index.ts) 的 onOnline→sendSnapshot 与 onAttach→clearDevice 已存在；[link 测试](../../../tests/node-link.spec.ts) 覆盖 hello ACK 前缓冲。当前是先清索引再逐条更新，无完整快照提交/epoch/待答重取 | 在已有重连路径上增加原子同步、stale、游标及有效待答快照；不再宣称仅启动时 snapshot |
+
+[DSH 接缝报告](../spikes/2026-10-29-dsh-seams.md) 已记录 DSH `f3803c9697` / 0.2.2-alpha.2、Node 24.22.2、ws 8.21.3：Upgrade Duplex 最小握手、follow 无 Remote 上下文、路由无冲突三项 OK。保留其源码与最小实验范围，不能扩大为真实宿主生命周期、writer-held 并发或两台真机验收。
+
+下列 C/B/M 用例是 P1 **目标契约**的验收，包括已有行为的回归及新增要求。新增用例在本轮均 NOT RUN；历史测试结果如需引用须附原报告，不因文件存在就填写 PASS。当前安装配置见 README；目标 wire v2 不回写成当前 v1 能力。
 
 ## 1. 执行与证据规则
 
@@ -148,16 +169,27 @@
 | B08 | U/I | 审计与持久化 | 去重记录原子落盘、失败拒绝写；审计仅枚举/标识，不含内容；目录权限受限；崩溃恢复不重复调用 |
 | B09 | I/R | hub 本机管理 | 未显式配置不管理本机；启用后仍经过相同身份、策略、去重、投影和同步路径 |
 
-## 5. 发布门槛
+## 5. 兼容迁移验收
 
-v0：C01、C02、C05、C09 的通用部分、C10、DSH 的 C03/C06、B01–B04/B07–B09 通过；v1 专属能力标 N/A 并说明范围，不伪造通过。v0 不提供历史 EventBuffer，C09 的历史缓存实现检查留 v1，但不缓存交互的约束从 v0 就成立。
+关联公共契约 §1.1 与 V0-T01/T02/T08/T10。只在合成配置、设备表副本和测试会话上先验证，所有输出使用合成 token。
+
+| ID | 层 | 场景 | 通过条件 |
+|---|---|---|---|
+| M01 | U/I | 现有 deviceName 与设备表转换到稳定 deviceId/摘要表，修改显示名 | 身份和授权映射保持；原表保留；新表权限受限；token 不进入日志；相同转换不制造重复设备 |
+| M02 | I | v1 node→v2 hub、v2 node→v1 hub、未知修订 | 明确不兼容、零 agent 调用、无静默协议降级；不会无限重拨掩盖错误 |
+| M03 | I/R | 有 in-flight 时升级，分别在发送前/执行后丢 ACK；随后回滚 | 停止新写，已知结果保留，不明项为 unknown；新旧两端均不自动重放；新 journal 保留；回滚后未知旧键只能人工核对 |
+| M04 | I/R | 同版本升级后验证登录、观察、问题与命令；恢复旧版配套配置 | v2 的 observe 保持只读；cookie/CSRF 与新 wire 闭环成立；旧版用法可按保留文件恢复；README 明确版本边界 |
+
+## 6. 发布门槛
+
+v0 后续加固目标（不是对现有分支的已通过声明）：M01–M04 及 C01、C02、C05、C09 的通用部分、C10、DSH 的 C03/C06、B01–B04/B07–B09 通过；v1 专属能力标 N/A 并说明范围，不伪造通过。v0 不提供历史 EventBuffer，C09 的历史缓存实现检查留 v1，但不缓存交互的约束从 v0 就成立。
 
 v1：全部 P1 用例通过或按能力明确降级；Codex/Claude 各至少有一条已验证控制边界内的 prompt→流→审批/问题→结算链路；其余能力按精确版本逐项开关。所有 v0 回归继续通过。计划不得用预写的“Expected: N passed”当作已执行证据。
 
 P1 设计闭环的完成条件：规范有明确规则、架构有责任模块、计划有对应任务、矩阵有可执行判据。P1 实现关闭的完成条件另外要求实现与 U/I/R 证据；本次文档修订只达到前者。
 
-## 6. 报告模板
+## 7. 报告模板
 
 每次验收报告包含：环境版本表、配置摘要、用例结果表、失败复现、能力降级清单、资源/延迟测量、遗留风险和最终 PASS/PARTIAL/BLOCKED。建议保存到 `docs/superpowers/spikes/`，目录及报告在执行相应任务时才创建。
 
-当前状态：所有用例 NOT RUN；跨进程排他、DSH 接缝和各 agent 的实际回读渠道仍待验证。
+本轮状态：仅做源码/文档静态复核，未运行 U/I/R 测试；新增目标用例 NOT RUN。已有 DSH 接缝证据见 §0；尚待补齐写者并发、目标机链路、跨进程排他及新 agent 的回读证据。
