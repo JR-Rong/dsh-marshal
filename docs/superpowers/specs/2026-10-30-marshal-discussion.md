@@ -50,7 +50,7 @@ node→hub 的讨论输出走独立 `discussion.output / discussion.status` 帧�
 
 `roomSeq` 仅由 hub 在接纳源消息后按 `(hubEpoch, runId)` 单调分配，供房间快照/浏览器流排序，与成员来源序号分开；普通重连不重置 memberSeq，新 node/runtime 代次使旧 run 的成员失效，不能沿用旧序号继续讨论。预览增量若在传输中丢弃仅标示预览缺口；最终封存输出必须携带完整终态标记与字节校验，终态状态或完整最终输出缺失/不完整使 run 暂停并通过无正文 `command.status`（对 `discussion.*` 额外回带成员原生工作单元 `running / terminated / disposed / unknown` 状态）与 `discussion.dispose` 对账，正文缺口明确标示；不为补齐消息重发 submit，不把到达顺序或较大 roomSeq 当作原生回合完成证据。hubEpoch 变化后浏览器 reset，旧 run 按 §6 恢复。
 
-hub 只把已通过源端白名单与字节校验的完整输出交给 RoomCoordinator；增量只用于展示，不进入封存记录，也不能绕过 `discussion.submit` 的幂等结果。未在握手中协商 `discussion` 能力的 node 不接收房间命令，旧 hub/node 组合显式失败而不是降级解释。
+hub 只把已通过源端白名单与字节校验的完整输出交给 RoomCoordinator；增量只用于展示，不进入封存记录，也不能绕过 `discussion.submit` 的幂等结果。`discussion.status` 至少回带成员当前 provider/model、capability revision 与原生工作单元状态；与预览冻结值或该 run 的成员绑定不一致时 hub 暂停 run，不按旧配置继续分发。未在握手中协商 `discussion` 能力的 node 不接收房间命令，旧 hub/node 组合显式失败而不是降级解释。
 
 浏览器房间端点（D1 新增）：读取需有效 cookie 会话；写操作还需 cookie+CSRF，以及 `(publicOrigin, operatorId)` 持久幂等键。`GET /marshal/api/discussions` 列出房间及当前占额/未决 run 的无正文元数据摘要（供页面重载或 hub 重启后定位占额项并对账），`POST /marshal/api/discussions` 新建草稿，`POST /marshal/api/discussions/:roomId/runs` 在预览确认后启动，`POST /marshal/api/discussions/:roomId/stop` 停止或暂停，`GET /marshal/api/discussions/:roomId` 读取状态与封存记录分页，`GET /marshal/api/discussions/stream` 提供绑定 `(hubEpoch, runId, roomSeq)` 高水位屏障与 reset 的房间专用 SSE（先订阅有界暂存再取房间快照，且在登出/轮换/会话到期后 ≤5s 内关闭）。端点不提供正文导出、不写文件，也不接受 URL 查询参数中的凭据。
 
@@ -62,7 +62,7 @@ hub 只把已通过源端白名单与字节校验的完整输出交给 RoomCoord
 
 讨论专用会话必须关闭原生交互：任何原生提问、审批或 plan-review 请求一律按本机无通道处理（拒绝/无答案），把该成员标为失败或缺席；不注册 `input.requested`、不创建远端可答卡，也不因等待而延长 run。若平台无法在不产生可答交互的前提下运行，同样标 `discussion-unavailable`，不能把 §8 的远答通道复用到讨论会话。
 
-本地新增默认关闭的 `allowDiscussion` 授权（node 本地配置与 hub 设备记录均须 true），不由浏览器开启。所有参与讨论的成员设备以及提供历史片段的**材料来源设备**（`sourceDeviceId`）均须同时满足双侧 `allowDiscussion=true` 与现有 `content` 双授权（源端 `privacy=content` 且 hub `allowContent=true`）。hub 的该授权变化加入同一持久 `policyRevision`。每个 run 的 owner 确认绑定参与成员列表、材料来源设备、provider/model、材料摘要和策略修订；普通 `allowContent`/`allowInteractions` 均不自动授权把内容再次发给别的 agent。汇总者与其它成员同等授权。
+本地新增默认关闭的 `allowDiscussion` 授权（node 本地配置与 hub 设备记录均须 true，hub 的该值随 hello.ack/`policyRevision` 下发），不由浏览器开启。所有参与讨论的成员设备以及提供历史片段的**材料来源设备**（`sourceDeviceId`）均须同时满足双侧 `allowDiscussion=true` 与现有 `content` 双授权（源端 `privacy=content` 且 hub `allowContent=true`）。hub 的该授权变化加入同一持久 `policyRevision`。每个 run 的 owner 确认绑定参与成员列表、材料来源设备、provider/model、材料摘要和策略修订；普通 `allowContent`/`allowInteractions` 均不自动授权把内容再次发给别的 agent。汇总者与其它成员同等授权。
 
 只共享 owner 预览确认的粘贴文本或显式选择的、经允许的历史片段，以及本 run 的讨论输出。历史选择仍经过公共契约 §10 过滤（含按 request/call/item 剔除 tool/history 中的结构化交互副本）；原生提问、审批、secret 和结构化答案不得作为材料。讨论输入、发言与汇总仅存于 RoomCoordinator 的有界 hub RAM，并通过讨论房间专用快照/流向已认证浏览器展示，**永不进入 v1 `EventBuffer`、普通会话历史或 node 离线事件队列**。首版不抓取附件/URL、不自动读取 cwd/仓库/完整历史。所有成员知道这些内容会交给列明的模型服务；不承诺原生 runtime/provider 无日志或零保留。
 
@@ -72,7 +72,7 @@ hub 只把已通过源端白名单与字节校验的完整输出交给 RoomCoord
 
 ### 4.1 专用会话与普通入口隔离
 
-node 按 `(deviceId, agent, nativeSessionId)` 持久识别用途，保存 `purpose=discussion / operatorId / roomId / runId / memberId` 无正文归属记录；operatorId 是原归属证据，切换 owner/hub 不把旧会话变成普通会话；runtimeEpoch 是另行校验的运行代次，重启不清除会话用途。创建前先落认领意图，新 sessionId 返回后先提交用途记录并写回 `discussion.create` 的 journal 结果，再允许任何发现/流/写入口发布或使用该会话。当该 agent 存在在途或未决的 `discussion.create` 认领意图时，周期 `list/sync` 扫描必须与创建屏障串行化或暂扣期间新出现的未分类原生会话，禁止在用途落盘前将其作为普通 `foreign-unknown` 会话广播出去。原生创建成功但 ID 尚未落盘时崩溃，须凭已验证的原生标记或隔离存储范围完成识别；无法识别时隔离受影响的发现/控制范围并进入恢复，不把可疑会话当普通历史。平台无法提供该恢复边界时 D1 不开放。
+node 按 `(deviceId, agent, nativeSessionId)` 持久识别用途，保存 `purpose=discussion / operatorId / roomId / runId / memberId` 无正文归属记录；wire target 的 `sessionId` 就是该 `nativeSessionId`，不能用显示名或另一套别名作为用途键；operatorId 是原归属证据，切换 owner/hub 不把旧会话变成普通会话；runtimeEpoch 是另行校验的运行代次，重启不清除会话用途。创建前先落认领意图，新 sessionId 返回后先提交用途记录并写回 `discussion.create` 的 journal 结果，再允许任何发现/流/写入口发布或使用该会话。当该 agent 存在在途或未决的 `discussion.create` 认领意图时，周期 `list/sync` 扫描必须与创建屏障串行化或暂扣期间新出现的未分类原生会话，禁止在用途落盘前将其作为普通 `foreign-unknown` 会话广播出去。原生创建成功但 ID 尚未落盘时崩溃，须凭已验证的原生标记或隔离存储范围完成识别；无法识别时隔离受影响的发现/控制范围并进入恢复，不把可疑会话当普通历史。平台无法提供该恢复边界时 D1 不开放。
 
 用途检查在公共 node 路由统一执行，hub 同时过滤：普通 list/sync 不枚举讨论会话；普通 history/follow/inputs 以及 acquire/prompt/steer/interrupt/configure/fork/answer/cancel/decide 均对该会话拒绝（`session-purpose-conflict`）。原生增量也按用途进入讨论通道，不能先生成普通事件再只在 UI 隐藏。只有匹配 run/member 的 discussion 操作可控制专用会话；无正文 command.status 仍可用于恢复。猜中 sessionId、绕过 UI 或在 runtime 重启后重新扫描，都不能打开普通入口。
 
@@ -93,7 +93,7 @@ node 按 `(deviceId, agent, nativeSessionId)` 持久识别用途，保存 `purpo
 | 成员/轮次 | 2–4 名成员；1–3 轮，由 owner 开始前选择；首版不得扩大 |
 | 推理调用 | 仅 `discussion.submit`（轮次发言与汇总）计入推理配额，最多成员数 × 轮数 + 1 次汇总（最多 13 次）；失败和超时也消耗名额，不补发。`discussion.create`（已证明零推理）与 `interrupt/dispose` 不占推理名额，但同样受命令幂等与速率约束 |
 | 并发 | 每 run 最多成员数个在途调用；hub 最多 4 个占额 run（含 preparing、取消中及 paused/unknown 尚未确认终止者）；每成员专用会话仅属于一个 run，恢复时从持久记录重建占额 |
-| 时间 | 单次调用最多 120s，整个 run 自进入 preparing 起最多 15min；hub 与 node 独立用单调时钟执行 §5.1，源端超限不依赖 hub 在线即可请求取消 |
+| 时间 | 单次调用最多 120s，整个 run 不超过预先持久化的 `runExpiresAt`，且自进入 preparing 起最多 15min；hub 与 node 独立用单调时钟执行 §5.1，源端超限不依赖 hub 在线即可请求取消 |
 | 正文 | 单次模型调用组装后的完整输入（含议题、共享材料、前序轮次封存发言与固定提示词框架）≤ 64 KiB、单次输出 ≤ 16 KiB UTF-8；初始议题+共享材料+框架本身超过 64 KiB 在预览/启动时直接以 `size-limit` 拒绝（零创建/零推理），预览同时按所选成员/轮次估算最坏累积并提示可能触达上限的组合，运行时每轮/汇总分发前按实际封存发言再次校验；单房间总计 ≤ 4 MiB，所有房间合计 ≤ 16 MiB，并共享公共契约的 hub 内容 64 MiB 总预算；超限停止、标不完整，不静默截断后宣称完整结论 |
 | 正文保留 | 仅 hub RAM；结束/暂停后最多 15min，活跃期亦受整体期限和字节上限；到期、关闭或撤权清理，不落磁盘/IndexedDB/正文日志；该期限不适用于无正文恢复记录、占额证据或用途墓碑 |
 
@@ -111,7 +111,7 @@ hub 和 node 均可提前请求取消；到期时 node 自行禁止该 run 新 s
 
 ## 6. 恢复、汇总与生命周期
 
-房间元数据 journal 只保存 owner、成员与材料来源设备绑定、run/round/命令 ID、期限、预算预留、状态和材料的带密钥摘要，不存议题/材料/发言/汇总正文。启动/分发前先持久化相关元数据，再调用现有 node journal；单 hub 实例对该状态持有排他锁，多实例不竞跑同一房间。该 journal 是 hub 本地受限文件，默认 `$HOME/.dsh-marshal/discussions.json`，显式覆盖使用绝对路径、不展开字面 `~`，目录/文件权限与完整性规则等同公共契约；启动时校验可解析、版本和 operatorId 绑定。HMAC 密钥持久稳定，不因 hub 重启或文件缺失重新生成。
+房间元数据 journal 只保存 owner、成员与材料来源设备绑定、run/round/命令 ID、期限、预算预留、状态和材料的带密钥摘要，不存议题/材料/发言/汇总正文。启动/分发前先持久化相关元数据，再调用现有 node journal；单 hub 实例对该状态持有排他锁，多实例不竞跑同一房间。该 journal 是 hub 本地受限文件，默认 `$HOME/.dsh-marshal/discussions.json`，显式覆盖使用绝对路径、不展开字面 `~`，目录/文件权限与完整性规则等同公共契约 §3 的设备状态文件；启动时校验可解析、版本和 operatorId 绑定。HMAC 密钥保存在独立受限文件（默认 `$HOME/.dsh-marshal/discussions.key`，权限同上，不与 journal 合并），持久稳定，不因 hub 重启或文件缺失重新生成。
 
 D1 初始化标记存于 hub 安装身份状态中，与 discussions.json 及其 HMAC 密钥分离，绑定 operatorId、状态文件/密钥位置及初始化版本。首次启用由本地初始化步骤显式执行：标记、journal 和密钥均不存在时才可建立新 D1 状态；复用公共契约 §4 的“持久 initializing 意图 → 配套提交 → ready”流程，不改变既有 operatorId。只凭匹配的未完成意图继续同一次初始化。ready 后任一必需文件缺失，或发现无合法意图的残留文件、损坏、已检测到回滚、身份/密钥不匹配，均进入 recovery-required、拒绝新草稿/run，不自动建空表或新密钥。既有 v1 安装首次启用 D1 与已初始化 D1 丢文件必须可区分；仅可展示已验证的元数据/只读查询结果，不能把损坏文件当可信摘要。
 

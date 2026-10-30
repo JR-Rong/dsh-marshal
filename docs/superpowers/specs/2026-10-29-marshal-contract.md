@@ -62,6 +62,7 @@ wire v1/v2 混接必须显式失败，UI 给出协议不匹配；不得用旧节
 | `privacy` | node | 默认 `metadata`；可选 `content`，还需 hub 对该 deviceId 允许内容 |
 | 设备记录 `allowContent` | hub | 默认 false；由部署者在 hub 本地设置 |
 | 设备记录 `allowInteractions` | hub | 默认 false；远端的提问/审批卡片需同时满足 node 侧 relay=remote 与本项为 true，缺一即按 off 处理 |
+| 设备记录 `allowDiscussion` | hub | 默认 false；D1 阶段启用，需与 node 本地同名配置同时为 true，缺一即不参与讨论、不发正文；变化计入 `policyRevision` |
 | `questionRelay` | node | 默认 `off`；`off / notify / remote` |
 | `approvalRelay` | node | 默认 `off`；`off / notify / remote`；v0 DSH 审批不可用 |
 | `answerTimeoutMs` | node | 默认 300000；15000–300000；expiresAt 按 §8 的绝对截止时刻公式计算 |
@@ -80,11 +81,11 @@ hub 复用 DSH webServer 的端口与 TLS/反代，不另监听。node 不暴露
 
 1. TLS 建连，设备 token 只在 Authorization 头发送；`hello` 不重复携带 token。
 2. hub 从 token 摘要取得注册记录，核验 `hello.deviceId`。`hello` 带版本、契约修订、`nodeEpoch`、适配器探测摘要，以及上一次绑定的 `operatorId`/`policyRevision`（实例首次为空），不带会话正文。
-3. hub 签发随机 `connectionId`，返回当前 `operatorId`/`policyRevision`、有效隐私策略与时钟信息；node 收到握手 ACK 后才进入 syncing，不能在 WebSocket open 时立即冲刷队列。
+3. hub 签发随机 `connectionId`，返回当前 `operatorId`/`policyRevision`、有效隐私/交互/讨论策略与时钟信息；node 收到握手 ACK 后才进入 syncing，不能在 WebSocket open 时立即冲刷队列。
 4. 同一 deviceId 只保留一个当前连接。替换时递增连接代次；旧连接关闭不得 detach 新连接，旧帧不得修改索引或完成新命令。
 5. 每帧入口校验认证设备、连接代次、允许方向、schema 和大小。事件中的 deviceId 不符即拒绝并记录分类；不能原样 publish。
 6. hub pending 命令绑定 `(commandId, deviceId, connectionId, nodeEpoch)`。ACK 必须来自绑定连接。重连后的结果通过只读状态查询恢复，不接受旧连接 ACK 冒充新确认。
-7. token 撤销生效后立即关闭对应连接并禁止新命令；未知/已撤销 token 是终止性鉴权失败，不无限重试。未完成 hello 的连接有握手超时和数量上限。设备表变更（新增、撤销、内容/交互授权）由 hub 热加载或显式 reload 生效，撤销从有效文件变更到关闭连接的延迟不超过 5 秒；仅启动时读取不满足本节。非法 reload 不部分应用，也不静默继续接受写入：将受影响设备置为授权不可确认、关闭其连接并报告配置错误；无法确定影响范围时关闭全部设备连接，修复后重新鉴权。
+7. token 撤销生效后立即关闭对应连接并禁止新命令；未知/已撤销 token 是终止性鉴权失败，不无限重试。未完成 hello 的连接有握手超时和数量上限。设备表变更（新增、撤销、内容/交互/讨论授权）由 hub 热加载或显式 reload 生效，撤销从有效文件变更到关闭连接的延迟不超过 5 秒；仅启动时读取不满足本节。非法 reload 不部分应用，也不静默继续接受写入：将受影响设备置为授权不可确认、关闭其连接并报告配置错误；无法确定影响范围时关闭全部设备连接，修复后重新鉴权。
 
 浏览器通过 `POST /marshal/login` 校验 dashboardToken 和精确匹配的 Origin 后换取新随机会话；登录不要求预先存在 CSRF token，不能把“登录前无需 CSRF”实现为免验凭据。会话 cookie 使用 `__Host-marshal-session; Secure; HttpOnly; SameSite=Strict; Path=/`，无 Domain；CSRF cookie 使用 `__Host-marshal-csrf`，相同属性但非 HttpOnly。初始登录页可公开且不含数据，其余页面/API/SSE 均鉴权。
 
@@ -110,7 +111,7 @@ owner 的审计身份由 hub 从认证会话赋予，不接受浏览器自报 `a
 
 | 帧 | 方向 | 必需信息与用途 |
 |---|---|---|
-| `hello / hello.ack` | node→hub / hub→node | wire 版本、契约修订、功能集合、认证设备、nodeEpoch、connectionId、operatorId/policyRevision、隐私与交互策略 |
+| `hello / hello.ack` | node→hub / hub→node | wire 版本、契约修订、功能集合、认证设备、nodeEpoch、connectionId、operatorId/policyRevision、隐私/交互/讨论策略 |
 | `command` | hub→node | commandId、idempotencyKey、operatorId、target、op、args、issuedAt、deadline、connectionId、nodeEpoch |
 | `ack` | node→hub | commandId、connectionId、nodeEpoch、status、code、受限 result；只表示命令受理/确认状态 |
 | `event` | node→hub | deviceId、agent、sessionId、nodeEpoch、seq、ts、kind、按 kind 验证的 payload |
@@ -135,7 +136,7 @@ owner 的审计身份由 hub 从认证会话赋予，不接受浏览器自报 `a
 | `capability.changed` | 当前会话的完整能力快照、revision、回读时间；不是不明确的局部 patch |
 | `error` | 受限 code、严重性、关联 ID；无原始异常内容 |
 
-D1 的 discussion.output/status 使用上表的独立帧 schema，不借普通 event 信封要求的会话 seq 或 kind 表达房间序列；同样执行源端白名单/大小验证，不进入 EventBuffer、普通会话索引或 node 离线队列。未协商 discussion 能力的连接不得接收这些帧，按 frame-invalid 拒绝，不隐式降级为普通事件。
+D1 的 discussion.output/status 使用本节帧表的独立帧 schema，不借普通 event 信封要求的会话 seq 或 kind 表达房间序列；同样执行源端白名单/大小验证，不进入 EventBuffer、普通会话索引或 node 离线队列。`discussion.output` 可含经白名单投影的正文，`discussion.status` 只含状态、计数和错误分类，不携带正文。任一端未在 hello 握手中协商 discussion 能力时不得发送或接受这些帧；收到按 frame-invalid 拒绝，不隐式降级为普通事件。
 
 完整 sync 会话行是替换快照；普通 session.updated 是按 schema 合并的局部更新，两者不得混用。Capability 至少包含 observe 的独立字段（history: boolean；follow: stream/poll/none）、明确 operations 集合、工具/思考可见级别、ownership、tunables 和逐功能 unavailable reason。dispatch 不再用一个互斥字符串代表多个不同写入能力。
 
@@ -156,11 +157,11 @@ wire v2 将当前 marshal `resume` 重命名为 `observe`；当前 DSH 的 resum
 
 命令 TTL 固定 30000 ms，从 hub 接收合法请求开始计时。node 在入队、获得执行互斥后、调用 agent 前检查 deadline；过期命令零调用。握手和心跳重新估算时钟偏差；无法将偏差/不确定度限制在 5000 ms 内则写请求返回 `clock-skew`，并保守使用最早可能过期时间。执行开始前用单调时钟约束本地等待，不能靠调整墙钟延长 TTL。TTL 不是已开始操作的自动取消机制。
 
-D1 另有执行期限：discussion.create 携带 runExpiresAt，submit 同时携带 runExpiresAt/turnExpiresAt，均为参与幂等摘要的 UTC 毫秒字段。node 保守换算为不可续期的本地单调期限，到期独立请求取消，不依赖 hub 在线；这是 D1 的执行约束，不改变上述普通命令 TTL 语义。取消未确认仍 unknown，详见 [D1 §5.1](2026-10-30-marshal-discussion.md#51-node-独立执行期限)。
+D1 另有执行期限：discussion.create 携带 runExpiresAt，discussion.submit 同时携带 runExpiresAt/turnExpiresAt；这些语义时间字段属于 op args，按规范化载荷参与幂等摘要（不同于传输层 issuedAt/deadline）。node 保守换算为不可续期的本地单调期限，到期独立请求取消，不依赖 hub 在线；这是 D1 的执行约束，不改变上述普通命令 TTL 语义。取消未确认仍 unknown，详见 [D1 §5.1](2026-10-30-marshal-discussion.md#51-node-独立执行期限)。
 
 ## 6. 命令生命周期与幂等（P1-01、P1-02）
 
-浏览器对一次用户意图生成并保存 idempotencyKey；网络超时不能换键自动重试。未决或结果未知的键必须在发请求前保存到跨标签页/浏览器重启仍可用的持久存储（如 IndexedDB），以 `(publicOrigin, operatorId)` 隔离；sessionStorage 不能满足关闭标签页后的恢复。仅存 target、op、key、状态、时间等无正文元数据，不存 prompt、答案、token 或响应正文。重开、重新登录后先查状态，不重发命令；人工提交新意图须明确与未知旧意图区分。存储不可用或写入失败时拒绝新的远端写请求；本地记录丢失时提示恢复信息不足，先人工核对，不将再次点击视作可安全重试。幂等域为 `(operatorId, target, idempotencyKey)`，规范化 op/args 的摘要用于检出同键不同载荷；传输 commandId、时间和连接代次不参与载荷摘要。
+浏览器对一次用户意图生成并保存 idempotencyKey；网络超时不能换键自动重试。未决或结果未知的键必须在发请求前保存到跨标签页/浏览器重启仍可用的持久存储（如 IndexedDB），以 `(publicOrigin, operatorId)` 隔离；sessionStorage 不能满足关闭标签页后的恢复。仅存 target、op、key、状态、时间等无正文元数据，不存 prompt、答案、token 或响应正文。重开、重新登录后先查状态，不重发命令；人工提交新意图须明确与未知旧意图区分。存储不可用或写入失败时拒绝新的远端写请求；本地记录丢失时提示恢复信息不足，先人工核对，不将再次点击视作可安全重试。幂等域为 `(operatorId, target, idempotencyKey)`，规范化 op/args 的摘要用于检出同键不同载荷；传输层 commandId、issuedAt/deadline 与连接代次不参与载荷摘要，op schema 中声明的语义时间字段（如 D1 的 runExpiresAt/turnExpiresAt）属于 args，按规范化载荷参与。
 
 hub 在任何 await/发送之前原子登记 in-flight。同键同载荷共享一个结果，不能再次发送；同键不同载荷返回 `idempotency-conflict`。ACK 路由必须显式分派到 pending 完成逻辑，event 路由不能吞掉 ACK；error/关闭/超时也必须完成等待者。
 
@@ -255,13 +256,13 @@ configure 携带 `expectedRevision=(runtimeEpoch, settingsRevision)`，它比较
 
 ## 10. 隐私、缓冲与待答恢复（P1-09）
 
-出站顺序：按事件类型验证 → 字段白名单投影 → 脱敏 → UTF-8 大小检查 → 编码。适用于事件、ACK/result、错误、同步快照、只读查询和审计，不得只清理 event.payload。未知对象字段默认丢弃；深度超限截除并标记，不原样保留。
+出站顺序：按事件类型验证 → 字段白名单投影 → 脱敏 → UTF-8 大小检查 → 编码。适用于事件、ACK/result、错误、同步快照、只读查询、审计，以及 D1 的 discussion.output/status；不得只清理 event.payload。未知对象字段默认丢弃；深度超限截除并标记，不原样保留。
 
 metadata 只发会话标识、状态、时间、计数、工具名及经允许的字段名。cwd、prompt preview、原生标题可能含源码/凭据，默认不发；显示标题用设备名/agent/短 ID，源端显式标记为可公开的别名才允许发送。内置敏感模式覆盖已知 token/私钥/连接串，但不声称正则可识别所有秘密；隐私主要由字段白名单保证。
 
 goal.objective、自定义说明等内容型设置同样受保护，不能从 capability/current/pending 绕过 metadata。没有双重 content 授权时，goal 编辑关闭（privacy-readback-unavailable），只显示安全状态/计数；真实完整对象仍可在源端内部参与校验。大文本事件在源端按完整 UTF-8 边界分片，控制帧超限返回分类错误；不能任意截断 JSON 信封或 required 字段后继续执行。
 
-content 必须同时满足源端 privacy=content 与 hub 注册记录 allowContent=true；重连协商前使用 metadata。任一授权收紧，清除离线内容、历史内容和已缓存响应，并通知浏览器清空可见缓存；已经被人看到的内容无法撤回。hub 内容/交互授权收紧时先停止向浏览器转发受影响载荷，再关闭设备连接；node 在连接失效时停用协商授权，禁止正文外发与远端作答。暂时断线期间已认领原生等待按 §8 保留到原期限，与明确 off/撤权的终态结算分开。重连核验持久的 operatorId/policyRevision；已变更策略下的旧内容/卡/ACK 正文不得恢复，未变更且仍有效的待答可重新投影。允许方收紧不能只改 hub 文件而继续沿用 node 缓存的授权。清理不能删除无内容的 journal 幂等状态，否则会重新允许重复执行。源机器正文依旧是权威副本。
+content 必须同时满足源端 privacy=content 与 hub 注册记录 allowContent=true；重连协商前使用 metadata。D1 讨论正文另需双侧 allowDiscussion=true、仍有效的 run 预览确认和未变化的策略修订；任一不成立时只发无正文状态。任一授权收紧，清除离线内容、历史内容和已缓存响应，并通知浏览器清空可见缓存；已经被人看到的内容无法撤回。hub 内容/交互授权收紧时先停止向浏览器转发受影响载荷，再关闭设备连接；node 在连接失效时停用协商授权，禁止正文外发与远端作答。暂时断线期间已认领原生等待按 §8 保留到原期限，与明确 off/撤权的终态结算分开。重连核验持久的 operatorId/policyRevision；已变更策略下的旧内容/卡/ACK 正文不得恢复，未变更且仍有效的待答可重新投影。允许方收紧不能只改 hub 文件而继续沿用 node 缓存的授权。清理不能删除无内容的 journal 幂等状态，否则会重新允许重复执行。源机器正文依旧是权威副本。
 
 remote 交互是单独的显式内容授权，需 node `relay=remote` 与 hub `allowInteractions=true` 同时成立；只发送决定所需字段，卡片最大 4096 UTF-8 字节。截断/脱敏导致无法完整判断动作时，卡片保留身份、到期和原因，但 accept-once 必须不可用；不能截去危险后缀仍允许批准。content 档也遵守卡片限制。所有来自 wire 的文本（消息、思考、工具输出、问题、选项、标题、错误 detail）在浏览器中按纯文本渲染，不得插入 HTML、属性或脚本；页面不得用 `innerHTML` 拼接这些字段。
 

@@ -28,7 +28,7 @@
 **文件**：未来扩展 wire/commands、config、hub/devices/identity、node/runner/privacy/journal；新增 hub/discussions 的类型/状态存储最小模块。
 **依赖**：D1-T00。
 
-- [ ] 定义 room/run/member/round/message 身份、状态机和 `discussion.create / submit / interrupt / dispose` 判别操作；独立 discussion.output/status 帧按 device/run/member/nodeEpoch/runtimeEpoch/memberSeq 去重，绑定真实 agent/session/turn，不借普通 event 的 seq。只有 hub 接纳后分配 roomSeq，node 自报拒绝；不入 EventBuffer/离线队列。扩展契约修订与能力协商，不让旧 node 接收房间写入。
+- [ ] 定义 room/run/member/round/message 身份、状态机和 `discussion.create / submit / interrupt / dispose` 判别操作；独立 discussion.output/status 帧按 device/run/member/nodeEpoch/runtimeEpoch/memberSeq 去重，绑定真实 agent/session/turn，不借普通 event 的 seq；status 回带 provider/model、capability revision 与原生工作单元状态。只有 hub 接纳后分配 roomSeq，node 自报拒绝；不入 EventBuffer/离线队列。扩展契约修订与能力协商，不让旧 node 接收房间写入。
 - [ ] 定义不可延长的 runExpiresAt、submit 的 turnExpiresAt，参与 args 幂等摘要；node 用保守时钟转换建立执行期限，独立于普通命令 30s 受理 TTL。
 - [ ] 实现双侧 allowDiscussion 默认 off、既有 content 双授权及单次 run 共享预览；成员设备与历史材料来源设备（`sourceDeviceId`）均纳入授权检查与持久 `policyRevision` 追踪。
 - [ ] 无正文元数据记录、进程间排他锁、浏览器 `(publicOrigin, operatorId)` 持久幂等键、hub→node 稳定写键和预留推理调用名额（仅 `submit` 占推理配额，`create/interrupt/dispose` 不占推理配额）；执行仍由 node journal 去重，查状态不重发。
