@@ -74,7 +74,7 @@ turn、item、delta、tool result 和 settings 通知按真实 fixture 映射；
 
 原生服务端请求用 JSON-RPC request id 回应，itemId 仅作关联。command/file-change 审批取原生可用集合与单次白名单交集；permissions 请求空授权；elicitation 保守拒绝；requestUserInput 按 question 策略处理。未知请求及时返回支持的错误/拒绝，不能静默挂起。
 
-serverRequest/resolved、进程退出、所有权失效均作废对应待答。卡片生成和 settle 都经过公共策略；off 时没有审批正文出站，不能仅在 Claude 上实现开关。远端卡片需源端 relay=remote 且 hub 设备记录 `allowInteractions=true`，并取 min(approvalTimeoutMs, 原生 expiresAt) 作为等待上限；外部 unknown 会话不建立可答卡。
+serverRequest/resolved、进程退出、所有权失效均作废对应待答。卡片生成和 settle 都经过公共策略；off 时没有审批正文出站，不能仅在 Claude 上实现开关。远端卡片需源端 relay=remote 且 hub 设备记录 `allowInteractions=true`，并取 min(createdAt + approvalTimeoutMs, nativeExpiresAt) 作为等待上限；外部 unknown 会话不建立可答卡。
 
 ## 5. Claude SDK 适配
 

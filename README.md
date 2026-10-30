@@ -99,9 +99,9 @@ token 也可以放在 `x-marshal-token` 请求头里（两者同时出现时以�
 页面做的事：
 
 - 左栏每 5 秒轮询 `/marshal/api/devices`，列出**当前已连接**的设备与 agent。
-- 点会话名发 `resume`，node 开始跟随并把事件推回；底部输入框发 `prompt`。
+- 点会话名发 `resume`，node 开始跟随并把事件推回；当前映射忽略原生 snapshot，没有历史读取端点。底部输入框发 `prompt`，底层固定用 DSH `mode: steer`，marshal 尚未实现忙时拒绝；实际运行中输入行为由目标 DSH 决定。
 - 事件经 `/marshal/api/stream`（SSE）实时追加。
-- hub 在设备每次连上时清空该设备的旧会话索引，再按 node 重发的快照重建，所以删掉的会话不会残留。
+- hub 每次连上时先清旧索引，再逐条加入 node 快照。当前只读取一次 list({})、无分页遍历与周期发现；turn 事件也不更新索引运行态，因此不能保证完整/持续新鲜的清单或原子恢复。
 
 页面在可用时用 `crypto.randomUUID()` 生成幂等键，不可用时退化成时间戳加随机串，所以普通 http 也能加载。但 token 在 URL 里，**请优先用 HTTPS**：页面响应带 `referrer-policy: no-referrer` 与 `cache-control: no-store`，也不要把带 token 的 URL 粘到第三方页面或聊天工具里。
 
@@ -137,7 +137,7 @@ location /marshal {
 | `metadata`（默认） | 只发字数，`redacted: true` | 工具名 + 参数键名 | 只发字数 |
 | `content` | 发正文 | 工具名 + 参数 | 发正文 |
 
-`redaction` 是正则源字符串数组（默认空），在离开 node 前对每个字符串和键名做替换，命中部分变成 `***`；非法正则启动即失败。
+`redaction` 是正则源字符串数组（默认空），当前只对出站 event.payload 中的字符串和键名做替换，命中部分变成 `***`；非法正则启动即失败。
 
 实时思考流需要 `privacy: content`；`metadata` 下页面只显示「（思考 N 字，metadata 档）」「（回复 N 字，metadata 档）」。工具卡片两档都会出现，`metadata` 下只有工具名、参数键名与字数。
 
@@ -148,7 +148,7 @@ location /marshal {
         answerTimeoutMs: 300000   # 正整数，默认 300000
 ```
 
-打开后 node 认领 `user-questions/request`：问题与选项发到 hub。远端作答后请求直接结算，本地不再弹窗；无人作答时本地弹窗在 `answerTimeoutMs` 到期后出现，请求被 abort 时立即交回本地 UI。链路断开期间远端无法作答，提问同样要等到超时。只有构造或发送帧本身抛错（例如帧超限）才会当场交回本地。
+打开后 node 认领 `user-questions/request`：问题与选项发到 hub。远端作答后请求直接结算，本地不再弹窗；无人作答时本地弹窗在 `answerTimeoutMs` 到期后出现，请求被 abort 时清理远端等待并调用 next()；原生取消后的本地行为尚未实测，不能据此保证弹窗或认定已本地作答。链路断开期间远端无法作答，提问同样要等到超时。只有构造或发送帧本身抛错（例如帧超限）才会当场交回本地。
 
 页面上的提问卡片：
 
@@ -164,6 +164,7 @@ location /marshal {
 
 - 设计上远端只能把权限、思考强度等往紧的方向调；放宽必须回到源机器上做。
 - v0 的 `configure` 认得 `model`、`reasoning`、`permission`、`plan`、`goal`、`skill`、`plugin` 这些字段名，但只做识别与拒绝：`tighten-only` 字段传 `"wide"` 返回 `tighten-only`，其余值一律 `unsupported`；v0 不落盘、不回读任何设置。
+- 当前 `interrupt` 仅按 sessionId 调用 DSH cancel，尚无 activeTurnId/runtimeEpoch 校验；不能宣称迟到打断不会影响新回合。
 - v0 没有审批转发：`approvalRelay` 只被解析、没有接线，因此不存在把 `always allow` 下发到远端的路径。审批面板与设置回读属于 v1。
 
 ## 协议速览

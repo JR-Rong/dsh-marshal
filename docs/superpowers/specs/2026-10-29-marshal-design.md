@@ -66,13 +66,13 @@ node 可支持 DSH web 或其他具备必需服务的宿主形态；Electron 是
 
 ### 4.2 控制
 
-DSH 当前委托原生 prompt/cancel；后续须补齐 writer-held 原子边界的并发验证，才能按目标契约声明写权保证。Codex/Claude 先显式 acquire，确认当前 runtimeEpoch 的控制证据后才开放 prompt/configure/interrupt。foreign-unknown 只读；无法证明排他控制时不能靠重试 resume 解决。
+DSH 当前 prompt 固定传 mode=steer，cancel 只带 sessionId；目标的忙时拒绝与绑定回合打断尚未具备。后续必须验证原生原子受理/取消边界，不成立则相应写操作关闭，不能用先 list 再调用补出排他保证。Codex/Claude 先显式 acquire，确认当前 runtimeEpoch 的控制证据后才开放 prompt/configure/interrupt。foreign-unknown 只读；无法证明排他控制时不能靠重试 resume 解决。
 
 prompt 接受后显示“已受理”；turn.completed 才决定回合结果。ACK 丢失显示“执行结果未知”，提供只读状态查询，禁止自动换幂等键重新发送。
 
 ### 4.3 普通问题
 
-DSH questionRelay=remote 时，waterfall 由 marshal 认领，原本本地卡片会延迟到 answerTimeoutMs 到期后才出现；此行为必须在部署文档中说明。off 不注册认领者。notify 仅在不改变本地语义的观察接缝已验证后可用，否则报告 unsupported。
+DSH 普通问题的作答权来自当前持有的原生 waterfall 请求，不要求该会话由 marshal 发起，也不赋予其它会话写权。questionRelay=remote 时，waterfall 由 marshal 认领，原本本地卡片会延迟到 answerTimeoutMs 到期后才出现；此行为必须在部署文档中说明。off 不注册认领者。notify 仅在不改变本地语义的观察接缝已验证后可用，否则报告 unsupported。
 
 普通问题与批准执行分开处理。plan-review 不因采用选择题 UI 就变成低权限问题。v0 不支持审批，因此不能借普通问答放行 plan-review。远端问题/审批卡片同时受 node `relay=remote` 与 hub 设备记录的 `allowInteractions=true` 约束，任一未开都按 off 处理。
 
@@ -110,6 +110,7 @@ Codex/Claude headless 没有可凭空接回的本地界面。它们的无答案/
 | 端点 | 职责 |
 |---|---|
 | POST /marshal/login | 交换 dashboardToken，建立浏览器会话；失败限速 |
+| POST /marshal/logout | 校验 Origin/CSRF，撤销当前浏览器会话及关联 SSE |
 | GET /marshal | 登录/控制面入口，无 token URL |
 | GET /marshal/api/devices、/sessions | 带在线、stale、同步代次的清单 |
 | GET /marshal/api/history | 只读分页历史；不透明 cursor、limit 有界、无写权副作用 |

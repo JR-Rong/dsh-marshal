@@ -47,8 +47,8 @@ hub、node、浏览器为三个角色；一个 npm 插件包按 role 装配。hu
 |---|---|
 | DshSurface.list/history/observe | AbortSignal、分页游标；不得 prompt/resume 取得写权 |
 | DshSurface.write | 当前原生写者证据、操作标识；原生原子拒绝占用，不靠 list 后检查代替 |
-| Adapter.frame | 同一会话快照、流、问题共用 seq；nodeEpoch 由 node 管理 |
-| NodeLink | handshake/sync/online 分开；接收经认证的结构化 Frame；onOnline 只在同步完成后调用 |
+| Adapter.frame | 提供原生标识/载荷；node 投影后统一分配公开 seq，快照高水位使用同一序列 |
+| NodeLink | handshake/sync/online 分开；接收经认证的结构化 Frame；onOnline 只在收到当前 sync.ack 后调用 |
 | CommandJournal | reserve/lookup/transition；相同域原子互斥，持久失败不执行；显式容量上限 |
 | HubRelay | command/status/publish/settle；settle 必须同时接收认证连接上下文 |
 | OperatorIdentity | get/create；hub 本地受限存储；跨重启稳定，不接受浏览器自报 |
@@ -81,19 +81,19 @@ ACK、错误帧与连接关闭必须有独立分支；不得只接 event。没�
 
 1. 完成带版本/代次/内容策略的 hello ACK。
 2. 原生分页清单与能力生成完整快照，设置增量屏障。
-3. hub 暂存分片，验证 sync.end 后原子替换该设备范围。
-4. 之后按 epoch/seq 应用增量，进入 online，开放写操作。
+3. hub 暂存分片，验证 sync.end 后原子替换该设备范围并回 sync.ack。
+4. node 取得匹配的 sync.ack 后才进入 online；双侧均验证同步状态，按 epoch/公开 seq 应用增量，之后开放写操作。
 5. 发现缺口或离线队列淘汰时重新同步，不能仅打印 dropped 后宣称一致。
 
-清单中删除的会话要从索引移除；agent 不可用不能当作“仍可写但空闲”。没有新事件的会话通过同步恢复，不依赖 follow 被再次点击。node 周期发现新建/删除会话。快照与周期扫描须有界分页、AbortSignal 和单实例执行，不能重叠扫描。
+清单中删除的会话要从索引移除；agent 不可用不能当作“仍可写但空闲”。没有新事件的会话通过同步恢复，不依赖 follow 被再次点击。当前 surface 只调用一次 list({})、map 忽略原生 snapshot，relay 也不由 turn 事件更新 running；完整分页、原生历史读取和持续状态归并均是增量任务。node 周期发现新建/删除会话。快照与周期扫描须有界分页、AbortSignal 和单实例执行，不能重叠扫描。
 
 v0 不存内容补看历史；页面断线可重建索引和当前待答，时间线显示缺口。v1 再加入有限内容回放，不能把 v0 的状态同步延后到 v1。
 
 ## 6. 普通问题与交互生命周期
 
-DSH 认领模式只用于已验证的普通问题 waterfall。远端策略、请求类别、完整可表达性必须在认领前验证。remote 认领后在 node 持有待答 Promise，交互正文通过即时发送或 inputs.snapshot 获取，不进离线事件缓存。
+DSH 认领模式只用于已验证的普通问题 waterfall；持有该请求的作答权与会话写权独立，本地 TUI 的普通问题可在双授权下被认领。远端策略、请求类别、完整可表达性必须在认领前验证。remote 认领后在 node 持有待答 Promise，交互正文通过即时发送或 inputs.snapshot 获取，不进离线事件缓存。
 
-合法首答由 node 原子结算；非法答案不抢占；多端以源端 input.resolved 收拢。超时或远端放弃时按已验证的 next() 语义回本地；取消/卸载要清理 timer/handler，不能同时给本地和远端执行两次答案。continued 补偿首版不实现。
+合法首答由 node 原子结算；非法答案不抢占；多端以源端 input.resolved 收拢。超时或远端放弃时，仅原生请求仍有效才按已验证的 next() 语义回本地；原生 abort 记 cancelled，不能宣称本地已答；取消/卸载要清理 timer/handler，不能同时给本地和远端执行两次答案。continued 补偿首版不实现。
 
 页面刷新从源端恢复有效待答；只记录 requestId 不能恢复题目，不能把完整卡片塞进历史缓冲解决。源端断线显示未知不可答。
 
