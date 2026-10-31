@@ -61,6 +61,11 @@ const CAPABILITY_REASON_CODES: ReadonlySet<string> = new Set([
   'v0-field-only',
   'v0-tighten-only',
   'host-config',
+  'ownership-unverified',
+  'session-not-owned',
+  'native-steer-unverified',
+  'settings-readback-unavailable',
+  'interaction-relay-unavailable',
 ])
 
 const TURN_STATES = new Set(['running', 'completed', 'failed', 'interrupted'])
