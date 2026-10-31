@@ -75,6 +75,8 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
     nodeEpoch,
     answers: {
       settle: (sessionId, requestId, answers) => relay?.settle(sessionId, requestId, answers) ?? 'unknown',
+      // 普通提问的 cancel 只结算本进程待答表，不是原生会话取消。
+      cancel: (sessionId, requestId) => relay?.cancel(sessionId, requestId) ?? 'unknown',
     },
   })
   const audit = createAuditLog({ warn: message => ctx.logger.warn(message) })
@@ -117,6 +119,10 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
       for (const event of await adapter.snapshot(abort.signal)) {
         for (const projected of projector.event(event)) link.sendEvent(projected)
       }
+      // 分页没有终止证据时只报告“不完整”，T06 的同步必须据此标记而不是当全量。
+      if (adapter.snapshotCompleteness === 'unconfirmed') {
+        ctx.logger.warn('marshal: snapshot incomplete: pagination unconfirmed')
+      }
     })().catch((error: unknown) => {
       // 主动取消导致的失败不是故障，不写日志；日志只留错误类型。
       if (!abort.signal.aborted) ctx.logger.warn('marshal: snapshot failed: ' + errorName(error))
@@ -148,6 +154,8 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
       if (tightened) link.clearOutbound()
     },
     onOnline: sendSnapshot,
+    // 订阅绑定当前连接：断线即清空引用，重连后由 hub 重新订阅。
+    onOffline: () => follower.stopAll(),
     onError: error => ctx.logger.warn(`marshal: link error: ${errorName(error)}`),
   })
   relay = config.questionRelay === 'off'

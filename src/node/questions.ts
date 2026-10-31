@@ -37,6 +37,8 @@ const MAX_BLOCKED_CARDS = 64
 
 export interface QuestionRelay {
   settle(sessionId: string, requestId: string, answers: unknown): SettleResult
+  /** 放弃待答：结束本进程的等待并交回本地，不触发任何会话级取消。 */
+  cancel(sessionId: string, requestId: string): SettleResult
   /** 每次合法 hello.ack 后调用：授权变化时一次性结算旧卡。 */
   revalidate(): void
   /** 明确收紧/撤权：立即作废所有待答卡。 */
@@ -288,6 +290,25 @@ export function createQuestionRelay(options: QuestionRelayOptions): QuestionRela
       if (!validateAnswers(parsed.answers, entry.questions)) return 'invalid'
       // 链路正在关闭时 resolved 发不出去也无妨：本地已经拿到答案。
       entry.finish(parsed, 'remote')
+      return 'ok'
+    },
+    cancel(sessionId, requestId) {
+      const denied = blocked.get(requestId)
+      if (denied !== undefined) {
+        if (denied.sessionId !== sessionId) return 'session-mismatch'
+        // 卡片本来就不能远答：取消只是让这个 requestId 不再被提及。
+        blocked.delete(requestId)
+        return 'ok'
+      }
+      const entry = pending.get(requestId)
+      if (entry === undefined) return 'unknown'
+      if (entry.sessionId !== sessionId) return 'session-mismatch'
+      if (!stillAuthorized(entry.authorization)) {
+        entry.finish(undefined, 'invalidated')
+        return 'decision-invalid'
+      }
+      // 放弃即交回本地 waterfall；`input.resolved` 记 cancelled。
+      entry.finish(undefined, 'local')
       return 'ok'
     },
     revalidate() {

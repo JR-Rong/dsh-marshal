@@ -58,6 +58,72 @@ function turnState(reason: unknown): 'running' | 'completed' | 'failed' | 'inter
 }
 
 /**
+ * 跟随流可能重复交付同一完成态（原生重放/重订阅）。按 `(callId,status)`、
+ * `(turnId,state)`、`message.completed(itemId)` 去重，每个会话有界 1000 条。
+ * 去重发生在分配公开 seq 之前，被丢弃的重复帧不占序号。
+ */
+const MAX_DEDUPE_PER_SESSION = 1_000
+const MAX_DEDUPE_SESSIONS = 256
+
+function dedupeKey(event: EventFrame): string | undefined {
+  const payload = asRecord(event.payload)
+  if (payload === undefined) return undefined
+  const text = (value: unknown): string | undefined =>
+    typeof value === 'string' && value !== '' ? value : undefined
+  switch (event.kind) {
+    case 'tool.started':
+    case 'tool.completed': {
+      const callId = text(payload.callId)
+      return callId === undefined ? undefined : `tool:${callId}:${String(payload.status ?? '')}`
+    }
+    case 'turn.started':
+    case 'turn.completed': {
+      const turnId = text(payload.turnId)
+      return turnId === undefined ? undefined : `turn:${turnId}:${String(payload.state ?? '')}`
+    }
+    case 'message.completed': {
+      const itemId = text(payload.itemId)
+      return itemId === undefined ? undefined : `message:${itemId}`
+    }
+    default:
+      return undefined
+  }
+}
+
+export interface EventDeduper {
+  /** true 表示该事件可以投递；重复的完成态返回 false。 */
+  accept(sessionId: string, event: EventFrame): boolean
+}
+
+export function createEventDeduper(): EventDeduper {
+  const seen = new Map<string, Set<string>>()
+  const accept = (sessionId: string, event: EventFrame): boolean => {
+    const key = dedupeKey(event)
+    if (key === undefined) return true
+    let keys = seen.get(sessionId)
+    if (keys === undefined) {
+      if (seen.size >= MAX_DEDUPE_SESSIONS) {
+        const oldest = seen.keys().next().value
+        if (oldest !== undefined) seen.delete(oldest)
+      }
+      keys = new Set()
+    } else {
+      // 刷新 LRU 顺序：活跃会话不会先被淘汰。
+      seen.delete(sessionId)
+    }
+    seen.set(sessionId, keys)
+    if (keys.has(key)) return false
+    keys.add(key)
+    if (keys.size > MAX_DEDUPE_PER_SESSION) {
+      const oldest = keys.values().next().value
+      if (oldest !== undefined) keys.delete(oldest)
+    }
+    return true
+  }
+  return { accept }
+}
+
+/**
  * 把 DSH 的 `SessionFollowFrame` 翻成 marshal 事件。
  * 分支以 `tests/fixtures/dsh-follow.jsonl` 为事实来源：
  * `snapshot` 不重放历史，`tool-call-delta` 不产卡片（持久 `tool/call` 才产）。

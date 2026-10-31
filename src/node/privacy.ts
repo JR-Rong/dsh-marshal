@@ -33,7 +33,14 @@ const BUILTIN_PATTERNS: readonly string[] = [
 
 const RESULT_KEYS = new Set([
   'accepted', 'cancelled', 'following', 'subscriptionId', 'created',
-  'sessionId', 'status', 'state', 'count', 'bytes', 'chars',
+  'sessionId', 'status', 'state', 'count', 'bytes', 'chars', 'reason',
+])
+
+const CAPABILITY_OPERATIONS: ReadonlySet<string> = new Set([
+  'prompt', 'interrupt', 'answer', 'cancel', 'configure', 'create', 'fork',
+])
+const CAPABILITY_OWNERSHIP: ReadonlySet<string> = new Set([
+  'ours', 'foreign-unknown', 'foreign-running', 'unverified',
 ])
 
 const TURN_STATES = new Set(['running', 'completed', 'failed', 'interrupted'])
@@ -300,6 +307,7 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
       case 'session.updated': {
         const out: Record<string, unknown> = {}
         if (typeof payload.running === 'boolean') out.running = payload.running
+        if (typeof payload.blank === 'boolean') out.blank = payload.blank
         const updatedAt = safeInt(payload.updatedAt)
         if (updatedAt !== undefined) out.updatedAt = updatedAt
         const ownership = safeString(payload.ownership, 32)
@@ -450,22 +458,35 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
 
   function capabilityPayload(payload: Record<string, unknown>): Record<string, unknown> {
     const out: Record<string, unknown> = {}
-    for (const key of ['observe', 'dispatch', 'toolDetail', 'promptFidelity'] as const) {
+    // observe 是独立字段对象；history 与 follow 必须分开投影，不能压回一个字符串。
+    const observe = asRecord(payload.observe)
+    if (observe !== undefined) {
+      const projected: Record<string, unknown> = {}
+      const history = safeBool(observe.history)
+      if (history !== undefined) projected.history = history
+      const follow = safeString(observe.follow, 16)
+      if (follow === 'stream' || follow === 'poll' || follow === 'none') projected.follow = follow
+      // 未知 follow 值连字段都不发，避免页面把陌生枚举当能力。
+      if (Object.keys(projected).length > 0) out.observe = projected
+    }
+    if (Array.isArray(payload.operations)) {
+      out.operations = [...new Set(payload.operations
+        .filter((item): item is string => typeof item === 'string' && CAPABILITY_OPERATIONS.has(item)))]
+        .slice(0, 32).map(item => scrub(item).text)
+    }
+    const ownership = safeString(payload.ownership, 32)
+    if (ownership !== undefined && CAPABILITY_OWNERSHIP.has(ownership)) {
+      out.ownership = scrub(ownership).text
+    }
+    for (const key of ['toolDetail', 'promptFidelity'] as const) {
       const value = safeString(payload[key], 32)
       if (value !== undefined) out[key] = scrub(value).text
     }
-    for (const key of ['reasoning'] as const) {
-      const value = safeBool(payload[key])
-      if (value !== undefined) out[key] = value
-    }
+    const reasoning = safeBool(payload.reasoning)
+    if (reasoning !== undefined) out.reasoning = reasoning
     for (const key of ['revision', 'readAt'] as const) {
       const value = safeInt(payload[key])
       if (value !== undefined) out[key] = value
-    }
-    if (Array.isArray(payload.operations)) {
-      out.operations = payload.operations
-        .filter((item): item is string => typeof item === 'string')
-        .slice(0, 32).map(item => scrub(item.slice(0, 32)).text)
     }
     if (Array.isArray(payload.tunables)) {
       // 只留标识与可编辑性；current/values/pending 等设置对象一律丢弃。
@@ -485,6 +506,22 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
         if (reason !== undefined) entry.reason = reason
         return [entry]
       })
+    }
+    const unavailable = asRecord(payload.unavailable)
+    if (unavailable !== undefined) {
+      // 原因码是稳定枚举式短串；键名截断，值只留安全字符，未知字段不放大。
+      const projected: Record<string, string> = {}
+      let seen = 0
+      for (const [key, value] of Object.entries(unavailable)) {
+        if (seen >= 16) break
+        const reason = safeString(value, 64)
+        if (reason === undefined) continue
+        Object.defineProperty(projected, scrub(key.slice(0, 64)).text, {
+          value: scrub(reason).text, enumerable: true, configurable: true, writable: true,
+        })
+        seen += 1
+      }
+      if (seen > 0) out.unavailable = projected
     }
     return out
   }

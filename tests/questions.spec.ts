@@ -364,10 +364,12 @@ describe('question relay end to end', () => {
       },
     }
     const surface = {
-      list: async () => [{ sessionId: 's1', running: false, blank: false, updatedAt: 1 }],
+      list: async () => ({
+        items: [{ sessionId: 's1', running: false, blank: false, updatedAt: 1 }],
+        completeness: 'complete' as const,
+      }),
       follow: async function* () {},
       prompt: async () => ({ accepted: true }),
-      cancel: async () => ({ cancelled: true }),
     }
     let relay: QuestionRelay | undefined
     const adapter = createDshAdapter(surface, {

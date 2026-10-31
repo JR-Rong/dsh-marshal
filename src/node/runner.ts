@@ -23,50 +23,84 @@ function errorClass(error: unknown): string {
 }
 
 /**
- * 每会话一条跟随循环；`observe` 指令只启动一次。
- * subscriptionId 由 runner 生成并随订阅绑定到当前连接（link 本身按连接隔离）。
+ * 每会话一条原生跟随循环，按观察者引用计数。
+ * subscriptionId 由服务端签发、绑定认证观察者（operatorId + 当前 connectionId）：
+ * 同一调用者重复订阅返回同一个 id；取消只移除自己的引用，最后一个观察者退出才释放原生 follower。
  */
 export function createFollower(options: {
   adapter: Adapter
   send: (event: EventFrame) => void
   logger: Pick<LoggerLike, 'warn'>
 }) {
-  const active = new Map<string, { subscriptionId: string; abort: AbortController }>()
-  return {
-    start(sessionId: string, subscriptionId: string): boolean {
-      if (active.has(sessionId)) return false
-      const abort = new AbortController()
-      active.set(sessionId, { subscriptionId, abort })
-      void (async () => {
-        try {
-          for await (const event of options.adapter.follow(sessionId, abort.signal)) {
-            // 单条事件超限只丢这一条；否则一次过大的 send 会终止整个跟随循环。
-            try {
-              options.send(event)
-            } catch (error) {
-              options.logger.warn('marshal: follow ' + sessionId + ' dropped event: ' + errorClass(error))
-            }
+  interface SessionFollow {
+    readonly abort: AbortController
+    /** observer key -> subscriptionId；不同观察者各自持有一个 id。 */
+    readonly refs: Map<string, string>
+  }
+  const sessions = new Map<string, SessionFollow>()
+
+  const run = (sessionId: string, entry: SessionFollow): void => {
+    void (async () => {
+      try {
+        for await (const event of options.adapter.follow(sessionId, entry.abort.signal)) {
+          // 单条事件超限只丢这一条；否则一次过大的 send 会终止整个跟随循环。
+          try {
+            options.send(event)
+          } catch (error) {
+            options.logger.warn('marshal: follow ' + sessionId + ' dropped event: ' + errorClass(error))
           }
-        } catch (error) {
-          if (!abort.signal.aborted) options.logger.warn('marshal: follow ' + sessionId + ' ended: ' + errorClass(error))
-        } finally {
-          // 只清掉本循环自己登记的条目，避免把重启后的新循环踢出 map。
-          if (active.get(sessionId)?.abort === abort) active.delete(sessionId)
         }
-      })()
+      } catch (error) {
+        if (!entry.abort.signal.aborted) options.logger.warn('marshal: follow ' + sessionId + ' ended: ' + errorClass(error))
+      } finally {
+        // 只清掉本循环自己登记的条目，避免把重启后的新循环踢出 map。
+        if (sessions.get(sessionId) === entry) sessions.delete(sessionId)
+      }
+    })()
+  }
+
+  const release = (sessionId: string, entry: SessionFollow): void => {
+    if (entry.refs.size > 0) return
+    entry.abort.abort()
+    if (sessions.get(sessionId) === entry) sessions.delete(sessionId)
+  }
+
+  return {
+    /** 同一观察者重复订阅不会新增引用，直接返回已签发的 id。 */
+    subscribe(sessionId: string, observer: string): string {
+      const existing = sessions.get(sessionId)
+      const known = existing?.refs.get(observer)
+      if (existing !== undefined && known !== undefined) return known
+      const entry: SessionFollow = existing ?? { abort: new AbortController(), refs: new Map() }
+      if (existing === undefined) {
+        sessions.set(sessionId, entry)
+        run(sessionId, entry)
+      }
+      const subscriptionId = randomUUID()
+      entry.refs.set(observer, subscriptionId)
+      return subscriptionId
+    },
+    subscriptionOf(sessionId: string, observer: string): string | undefined {
+      return sessions.get(sessionId)?.refs.get(observer)
+    },
+    unsubscribe(sessionId: string, observer: string, subscriptionId: string): boolean {
+      const entry = sessions.get(sessionId)
+      if (entry === undefined || entry.refs.get(observer) !== subscriptionId) return false
+      entry.refs.delete(observer)
+      release(sessionId, entry)
       return true
     },
-    stop(sessionId: string, subscriptionId: string): boolean {
-      const entry = active.get(sessionId)
-      if (entry === undefined || entry.subscriptionId !== subscriptionId) return false
-      entry.abort.abort()
-      active.delete(sessionId)
-      return true
+    /** 断线时清掉该连接的全部引用；只有归零的会话才停止原生跟随。 */
+    unsubscribeObserver(observer: string): void {
+      for (const [sessionId, entry] of [...sessions]) {
+        entry.refs.delete(observer)
+        release(sessionId, entry)
+      }
     },
-    has(sessionId: string): boolean { return active.has(sessionId) },
+    has(sessionId: string): boolean { return sessions.has(sessionId) },
     stopAll(): void {
-      for (const entry of active.values()) entry.abort.abort()
-      active.clear()
+      for (const entry of sessions.values()) entry.abort.abort()
+      sessions.clear()
     },
   }
 }
@@ -75,19 +109,11 @@ export function createFollower(options: {
 const WIRE_CODES: ReadonlySet<string> = new Set([
   'session-unknown', 'invalid-args', 'unsupported', 'device-mismatch', 'agent-crashed', 'result-too-large',
   'unknown', 'invalid', 'session-mismatch', 'tighten-only', 'deadline-expired',
-  'stale-connection', 'clock-skew',
+  'stale-connection', 'clock-skew', 'writer-busy', 'conflict',
 ])
 
 /** 超过这个偏差就不接受带副作用的命令：期限判断已经不可信。 */
 const MAX_CLOCK_SKEW_MS = 60_000
-
-/** 错误前缀即 wire 错误码：`session-unknown: ...` 或 `marshal: session-unknown: ...` → `session-unknown`。 */
-function codeOf(error: unknown): WireErrorCode {
-  const message = error instanceof Error ? error.message : String(error)
-  const code = /^marshal: ([a-z][a-z-]*):/.exec(message)?.[1]
-    ?? /^([a-z][a-z-]*):/.exec(message)?.[1]
-  return code !== undefined && WIRE_CODES.has(code) ? code as WireErrorCode : 'agent-crashed'
-}
 
 /** 只允许已声明的 wire 错误码过线；journal 里的 code 可能来自旧版本。 */
 function asWireCode(code: string | undefined, fallback: WireErrorCode): WireErrorCode {
@@ -99,13 +125,9 @@ function entryStatus(entry: JournalEntry): AckFrame['status'] {
   return entry.status === 'admitted' ? 'outcome-unknown' : entry.status
 }
 
-/** subscriptionId 由 runner 生成，按会话存放；link 每连接一个，因此状态天然绑定连接。 */
-const subscriptions = new WeakMap<ReturnType<typeof createFollower>, Map<string, string>>()
-
-function subscriptionsOf(follower: ReturnType<typeof createFollower>): Map<string, string> {
-  let map = subscriptions.get(follower)
-  if (map === undefined) { map = new Map(); subscriptions.set(follower, map) }
-  return map
+/** 观察者身份：认证 operatorId + 当前连接；重连后旧连接引用全部失效。 */
+function observerKey(frame: { operatorId: string; connectionId: string }): string {
+  return `${frame.operatorId}\u0000${frame.connectionId}`
 }
 
 /** 只读状态查询：不占 journal、不触发执行。 */
@@ -288,39 +310,29 @@ export function runCommand(
   if (frame.op === 'observe') {
     const observe = args as ObserveArgs
     if (observe.kind === 'history') {
-      // 历史读取由适配器实现（T05）；当前适配器会明确返回 unsupported，不能静默改成跟随。
-      void adapter.execute({ op: 'observe', target: { sessionId }, args: observe })
-        .then(result => reply({ status: 'accepted', result }))
-        .catch((error: unknown) => reply({ status: 'rejected', code: codeOf(error) }))
+      // 已验证的 DSH surface 没有只读历史入口；明确拒绝，不能让调用方自己猜。
+      reply({ status: 'rejected', code: 'unsupported', result: { reason: 'history-unavailable' } })
       return
     }
-    const map = subscriptionsOf(follower)
+    const observer = observerKey(frame)
     if (observe.action === 'subscribe') {
-      const existing = map.get(sessionId)
-      if (existing !== undefined && follower.has(sessionId)) {
-        // 同一连接对同一会话重复订阅是幂等的：返回已有订阅，不启动第二条跟随循环。
+      const existing = follower.subscriptionOf(sessionId, observer)
+      if (existing !== undefined) {
+        // 同一观察者重复订阅是幂等的：返回已有订阅，不启动第二条跟随循环。
         reply({ status: 'accepted', result: { following: true, subscriptionId: existing } })
         return
       }
-      // 跟随循环已自然结束（例如会话终止）：旧 id 作废，重新签发。
-      if (existing !== undefined) map.delete(sessionId)
-      const subscriptionId = randomUUID()
-      if (!follower.start(sessionId, subscriptionId)) {
-        reply({ status: 'rejected', code: 'conflict' })
-        return
-      }
-      map.set(sessionId, subscriptionId)
+      // 原生跟随已因会话终止而结束时，旧 id 自然失效；subscribe 会签发新 id。
+      const subscriptionId = follower.subscribe(sessionId, observer)
       reply({ status: 'accepted', result: { following: true, subscriptionId } })
       return
     }
     const subscriptionId = observe.subscriptionId
     if (subscriptionId === undefined
-      || map.get(sessionId) !== subscriptionId
-      || !follower.stop(sessionId, subscriptionId)) {
+      || !follower.unsubscribe(sessionId, observer, subscriptionId)) {
       reply({ status: 'rejected', code: 'conflict' })
       return
     }
-    map.delete(sessionId)
     reply({ status: 'accepted', result: { following: false, subscriptionId } })
     return
   }

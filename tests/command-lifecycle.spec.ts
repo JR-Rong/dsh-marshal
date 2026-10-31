@@ -258,6 +258,19 @@ describe('node command lifecycle', () => {
     expect(h.acks()[0]).toMatchObject({ status: 'accepted' })
   })
 
+  it('observe 历史在 v0 明确拒绝，不静默改成跟随', async () => {
+    const { journal } = setup()
+    const h = harness()
+    runCommand(h.link, h.adapter, h.follower, command({
+      key: 'history', op: 'observe', args: { kind: 'history' },
+    }), 'mac', journal)
+    await flush()
+    expect(journal.size).toBe(0)
+    expect(h.acks()[0]).toMatchObject({
+      status: 'rejected', code: 'unsupported', result: { reason: 'history-unavailable' },
+    })
+  })
+
   it('结果超过帧上限时保留真实状态并只回 result-too-large', async () => {
     const { journal } = setup()
     const h = harness()

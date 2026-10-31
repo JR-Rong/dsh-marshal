@@ -71,6 +71,8 @@ export interface NodeLinkOptions {
   readonly stableMs?: number
   readonly onFrame?: (text: string) => void
   readonly onOnline?: () => void
+  /** 连接断开（含握手前失败）：订阅引用按连接清理，原生 follower 不能跨连接存活。 */
+  readonly onOffline?: () => void
   /** 每次合法 hello.ack 后触发；index 用它重建投影器并在收紧时清空旧队列。 */
   readonly onHandshake?: (binding: NodePolicyBinding, previous: NodePolicyBinding | undefined) => void
   /** onFrame 或底层 socket 抛错时的可选出口；不传就静默，绝不外抛。 */
@@ -264,6 +266,7 @@ export class NodeLink {
       this.stopHeartbeat()
       this.clearStableTimer()
       if (this.closed) return
+      this.reportOffline()
       if (TERMINAL_CLOSE_CODES.has(code)) {
         // 鉴权/撤销/协议不兼容重拨没有意义：停下进 stopped，等显式 start()。
         this.active = false
@@ -291,6 +294,7 @@ export class NodeLink {
       this.stopHeartbeat()
       this.clearStableTimer()
       if (this.closed) return
+      this.reportOffline()
       if (response.statusCode === 401) {
         this.active = false
         this.attempts = 0
@@ -468,6 +472,10 @@ export class NodeLink {
 
   private reportError(error: unknown): void {
     try { this.options.onError?.(error) } catch { /* onError 自己抛错也不再外抛 */ }
+  }
+
+  private reportOffline(): void {
+    try { this.options.onOffline?.() } catch (error) { this.reportError(error) }
   }
 
   private resetSkew(): void {

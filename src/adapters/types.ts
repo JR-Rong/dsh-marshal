@@ -28,13 +28,34 @@ export interface Tunable {
   readonly reason?: string
 }
 
+/** 只读观察能力：history 与 follow 是两条独立通道，不能用一个枚举互相代替。 */
+export interface ObserveCapability {
+  readonly history: boolean
+  readonly follow: 'stream' | 'poll' | 'none'
+}
+
+/** v0 只可能暴露这些写操作；create/fork/acquire 属于 v1。 */
+export type Operation = 'prompt' | 'interrupt' | 'answer' | 'cancel' | 'configure' | 'create' | 'fork'
+
+/**
+ * v0 的 DSH 没有已验证的写权证据，能力里必须如实写 `unverified`；
+ * 后三个值留给 v1 的 acquire/写权实现，不能在本版本冒充。
+ */
+export type Ownership = 'ours' | 'foreign-unknown' | 'foreign-running' | 'unverified'
+
+/** 清单遍历是否被原生证据证明完整；`items.length` 不是证据。 */
+export type SnapshotCompleteness = 'complete' | 'unconfirmed'
+
 export interface Capability {
-  readonly observe: 'stream' | 'poll' | 'none'
-  readonly dispatch: 'resume' | 'prompt' | 'new' | 'none'
+  readonly observe: ObserveCapability
+  readonly operations: ReadonlySet<Operation>
+  readonly ownership: Ownership
   readonly reasoning: boolean
   readonly toolDetail: 'args+output' | 'args' | 'none'
   readonly promptFidelity: 'native' | 'relay' | 'dom' | 'none'
   readonly tunables: readonly Tunable[]
+  /** operation/field -> 稳定原因码；缺字段表示该能力没有被关闭。 */
+  readonly unavailable?: Readonly<Record<string, string>>
 }
 
 /** `decision-invalid`：卡片因脱敏/超限被标为不可远答，答案必须拒绝。 */
@@ -43,12 +64,22 @@ export type SettleResult = 'ok' | 'unknown' | 'invalid' | 'session-mismatch' | '
 /** 远端答案回到本机时走它；只有 `ok` 表示这次答案被采纳。 */
 export interface AnswerSink {
   settle(sessionId: string, requestId: string, answers: unknown): SettleResult
+  /**
+   * 放弃一个待答请求（`cancel` op）。它是问题表操作，不是会话级 cancel；
+   * 没有待答表时适配器必须拒绝，不能退化成原生会话取消。
+   */
+  cancel?(sessionId: string, requestId: string): SettleResult
 }
 
 export interface Adapter {
   readonly agent: string
   capabilities(sessionId: string): Capability
-  /** 当前会话清单，已转成 `session.updated` 事件。 */
+  /**
+   * 最近一次清单遍历的完整性。`unconfirmed` 时同步方（T06）只能发布
+   * “不完整”标记，不能把首个结果集当全量。
+   */
+  readonly snapshotCompleteness: SnapshotCompleteness
+  /** 当前会话清单，已转成 `session.updated`/`capability.changed` 事件。 */
   snapshot(signal: AbortSignal): Promise<readonly EventFrame[]>
   /** 跟随一个会话；seq 由适配器按 sessionId 单调分配。 */
   follow(sessionId: string, signal: AbortSignal): AsyncIterable<EventFrame>
