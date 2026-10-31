@@ -72,10 +72,10 @@ async function refresh() {
       const row = document.createElement('div');
       row.className = 'row';
       // 每次轮询重建列表，按记录下来的选择恢复高亮。
-      if (selected !== null && selected.device === device.id && selected.agent === agent) row.classList.add('active');
+      if (selected !== null && selected.deviceId === device.id && selected.agent === agent) row.classList.add('active');
       row.append(dot(false), document.createTextNode(agent));
       row.onclick = () => {
-        selected = { device: device.id, agent };
+        selected = { deviceId: device.id, agent };
         for (const other of devicesRoot.querySelectorAll('.row')) other.classList.remove('active');
         row.classList.add('active');
         loadSessions(device.id, agent);
@@ -87,7 +87,7 @@ async function refresh() {
 
 async function loadSessions(device, agent) {
   // 换设备/agent 后旧选中不再属于当前列表，先作废，避免指令发到上一个会话。
-  if (current !== null && (current.device !== device || current.agent !== agent)) {
+  if (current !== null && (current.deviceId !== device || current.agent !== agent)) {
     current = null;
     status.textContent = '';
   }
@@ -107,12 +107,12 @@ async function loadSessions(device, agent) {
     row.append(dot(session.running), document.createTextNode(session.sessionId.slice(0, 8)));
     row.onclick = async () => {
       // 已选中的会话再点一次不重发 resume。
-      if (current !== null && current.device === device && current.agent === agent && current.sessionId === session.sessionId) return;
-      const target = { device, agent, sessionId: session.sessionId };
+      if (current !== null && current.deviceId === device && current.agent === agent && current.sessionId === session.sessionId) return;
+      const target = { deviceId: device, agent, sessionId: session.sessionId };
       const previous = current;
       // 先切目标再发 resume：跟随事件可能先于 HTTP 响应到达 SSE，晚切会永久丢掉开头几条。
       current = target;
-      const ok = await command('resume', {}, target);
+      const ok = await command('observe', { kind: 'follow', action: 'subscribe' }, target);
       // 只回滚仍然指向这次目标的状态：期间用户已选别的会话时不能把旧目标恢复回来。
       if (!ok) { if (current === target) current = previous; return; }
       status.textContent = '';
@@ -155,7 +155,7 @@ stream.onmessage = (message) => {
   let event;
   try { event = JSON.parse(message.data) } catch { return; }
   // 同一 sessionId 在不同 agent 下不是同一条会话，必须连 agent 一起比对。
-  if (current === null || event.device !== current.device || event.agent !== current.agent || event.sessionId !== current.sessionId) return;
+  if (current === null || event.deviceId !== current.deviceId || event.agent !== current.agent || event.sessionId !== current.sessionId) return;
   const node = document.createElement('div');
   const payload = event.payload || {};
   if (event.kind === 'reasoning.delta') {
@@ -172,7 +172,7 @@ stream.onmessage = (message) => {
   } else if (event.kind === 'input.requested') {
     if (typeof payload.requestId !== 'string') return;
     // 卡片创建时锁定目标：之后切换会话也不能把答案发到别的 session。
-    const target = { device: event.device, agent: event.agent, sessionId: event.sessionId };
+    const target = { deviceId: event.deviceId, agent: event.agent, sessionId: event.sessionId };
     node.className = 'ask';
     node.dataset.requestId = payload.requestId;
     const questions = Array.isArray(payload.questions) ? payload.questions.filter(q => q !== null && typeof q === 'object') : [];

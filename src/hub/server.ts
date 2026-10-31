@@ -1,9 +1,13 @@
-import { createHash, timingSafeEqual } from 'node:crypto'
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto'
 import type { IncomingMessage, Server } from 'node:http'
 import type { Duplex } from 'node:stream'
 import { WebSocket, WebSocketServer } from 'ws'
 import type { WebServerLike } from '../dsh-types.ts'
-import { MAX_FRAME_BYTES, decodeFrame, encodeFrame, type Frame } from '../wire/frames.ts'
+import {
+  CLOSE_CODES, CONTRACT_REVISION, FrameError, decodeFrame, directionOf, encodeFrame,
+  type Frame, type HelloAckFrame,
+} from '../wire/frames.ts'
+import { MAX_FRAME_BYTES } from '../wire/limits.ts'
 import type { DeviceEntry } from './devices.ts'
 import type { DeviceRegistry, Sender } from './registry.ts'
 
@@ -11,6 +15,10 @@ export const UPLINK_PATH = '/marshal/uplink'
 
 /** 握手成功后多久之内必须收到合法 hello，否则断开（可被 options.helloTimeoutMs 覆盖）。 */
 const HELLO_TIMEOUT_MS = 10_000
+
+/** T02 会换成持久化的 operator 身份与授权修订；当前只作为显式占位值下发。 */
+const PLACEHOLDER_OPERATOR_ID = 'operator-unbound'
+const PLACEHOLDER_POLICY_REVISION = 0
 
 /** 谁持有 HTTP upgrade 事件。hub 只依赖这个端口，不关心底下是 DSH 还是裸 node。 */
 export interface UpgradePort {
@@ -37,6 +45,9 @@ export interface HubSocketOptions {
   readonly heartbeatMs?: number
   /** 握手后等待合法 hello 的上限，默认 10_000ms。 */
   readonly helloTimeoutMs?: number
+  /** T02 之前的显式占位值：当前安装的 owner 身份与授权修订。 */
+  readonly operatorId?: string
+  readonly policyRevision?: number
   readonly onFrame?: (deviceId: string, frame: Frame) => void
   /** hello 通过、设备进入注册表之后调用；会话索引据此按设备重建。 */
   readonly onAttach?: (deviceId: string) => void
@@ -86,6 +97,9 @@ function rejectUpgrade(socket: Duplex): void {
 
 export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
   const { registry, devices, now } = options
+  const hubEpoch = randomUUID()
+  const operatorId = options.operatorId ?? PLACEHOLDER_OPERATOR_ID
+  const policyRevision = options.policyRevision ?? PLACEHOLDER_POLICY_REVISION
 
   const tokens: DeviceToken[] = devices.map(device => ({ device, digest: sha256(device.token) }))
   // 重复 token 会让 token→设备 的映射有歧义；只报 device id，不碰 token 本身。
@@ -133,7 +147,8 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
       ws.on('error', () => ws.terminate())
       ws.on('pong', () => alive.set(ws, true))
 
-      const helloTimer = setTimeout(() => { ws.terminate() }, options.helloTimeoutMs ?? HELLO_TIMEOUT_MS)
+      const connectionId = randomUUID()
+      const helloTimer = setTimeout(() => { ws.close(CLOSE_CODES.HELLO_TIMEOUT, 'hello-timeout') }, options.helloTimeoutMs ?? HELLO_TIMEOUT_MS)
       helloTimers.add(helloTimer)
       const clearHelloTimer = (): void => {
         clearTimeout(helloTimer)
@@ -153,29 +168,67 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
 
       ws.on('message', data => {
         let frame: Frame
-        try { frame = decodeFrame(String(data)) } catch { ws.close(4400, 'frame-invalid'); return }
+        try {
+          frame = decodeFrame(String(data))
+        } catch (error) {
+          const code = error instanceof FrameError && error.code === 'version-unsupported'
+            ? CLOSE_CODES.VERSION_UNSUPPORTED
+            : CLOSE_CODES.FRAME_INVALID
+          ws.close(code, error instanceof FrameError ? error.code : 'frame-invalid')
+          return
+        }
         const id = deviceOf.get(ws)
         if (id === undefined) {
           // 未发 hello 的 socket 不进注册表；首帧必须既是 hello，又与握手时那个设备一致。
-          if (frame.type !== 'hello') { ws.close(4400, 'hello-required'); return }
-          if (frame.device !== device.id || !digestEquals(sha256(frame.token), digest)) {
-            ws.close(4401, 'auth-failed')
+          if (frame.type !== 'hello') { ws.close(CLOSE_CODES.FRAME_INVALID, 'hello-required'); return }
+          if (frame.deviceId !== device.id) {
+            ws.close(CLOSE_CODES.AUTH_FAILED, 'auth-failed')
             return
           }
+          if (frame.contractRevision !== CONTRACT_REVISION) {
+            ws.close(CLOSE_CODES.VERSION_UNSUPPORTED, 'version-unsupported')
+            return
+          }
+          const nodeEpoch = frame.nodeEpoch
           clearHelloTimer()
           deviceOf.set(ws, device.id)
           agentsOf.set(ws, new Set(frame.agents))
-          registry.attach({ id: device.id, name: device.name, agents: frame.agents }, sender, now())
+          registry.attach(
+            { id: device.id, name: device.name, agents: frame.agents },
+            sender,
+            now(),
+            { connectionId, nodeEpoch },
+          )
           // 节点重连后会重发快照：先清掉该设备的旧索引，已删除的会话不会残留。
           options.onAttach?.(device.id)
-          sendFrame(ws, { v: 1, type: 'ack', id: 'hello', ok: true })
+          const ack: HelloAckFrame = {
+            v: 2, type: 'hello.ack', connectionId, hubEpoch, operatorId, policyRevision,
+            deviceId: device.id,
+            policies: {
+              privacy: 'metadata',
+              questionRelay: 'off',
+              approvalRelay: 'off',
+              allowContent: false,
+              allowInteractions: false,
+              allowDiscussion: false,
+            },
+            serverTime: now(),
+          }
+          sendFrame(ws, ack)
           return
         }
+        // 每条已认证连接只接受 node→hub 或双向帧；hub→node 帧从设备发来即协议错误。
+        const direction = directionOf(frame)
+        if (direction !== 'node-to-hub' && direction !== 'both') {
+          ws.close(CLOSE_CODES.FRAME_INVALID, 'frame-invalid')
+          return
+        }
+        if (frame.type === 'hello') { ws.close(CLOSE_CODES.FRAME_INVALID, 'frame-invalid'); return }
         if (frame.type === 'event') {
           const agents = agentsOf.get(ws)
-          // 只信握手绑定的身份：帧里自报的 device/agent 不能冒充别的设备或未声明的 agent。
-          if (frame.device !== id || (agents !== undefined && !agents.has(frame.agent))) {
-            ws.close(4400, 'device-mismatch')
+          // 只信握手绑定的身份：帧里自报的 deviceId/agent 不能冒充别的设备或未声明的 agent。
+          if (frame.deviceId !== id || (agents !== undefined && !agents.has(frame.agent))) {
+            ws.close(CLOSE_CODES.FRAME_INVALID, 'device-mismatch')
             return
           }
           registry.touch(id, now())

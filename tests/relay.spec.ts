@@ -1,9 +1,18 @@
 import { describe, expect, it, vi } from 'vitest'
 import { HubRelay } from '../src/hub/relay.ts'
 import { DeviceRegistry } from '../src/hub/registry.ts'
+import type { AckFrame } from '../src/wire/frames.ts'
 
-function target(device = 'mac') {
-  return { device, agent: 'dsh', sessionId: 's1' }
+function target(deviceId = 'mac') {
+  return { deviceId, agent: 'dsh', sessionId: 's1' }
+}
+
+function ack(commandId: string, overrides: Partial<AckFrame> = {}): AckFrame {
+  return {
+    v: 2, type: 'ack', commandId,
+    connectionId: 'conn-1', nodeEpoch: 'epoch-1', status: 'accepted',
+    ...overrides,
+  }
 }
 
 function setup(ids: readonly string[] = ['mac']) {
@@ -27,7 +36,7 @@ describe('HubRelay', () => {
     expect(frame.type).toBe('command')
     expect(frame.op).toBe('prompt')
 
-    relay.settle({ v: 1, type: 'ack', id: frame.id, ok: true, result: { accepted: true } })
+    relay.settle(ack(frame.commandId, { result: { accepted: true } }))
     await expect(promise).resolves.toEqual({ ok: true, result: { accepted: true } })
   })
 
@@ -54,7 +63,7 @@ describe('HubRelay', () => {
     registry.attach({ id: 'mac', name: 'Mac', agents: [] }, { send: t => sent.push(t) }, 0)
     const relay = new HubRelay({ registry, now: () => 0, timeoutMs: 50 })
     const first = relay.command({ op: 'interrupt', target: target(), args: {}, idempotencyKey: 'same' })
-    relay.settle({ v: 1, type: 'ack', id: JSON.parse(sent[0]!).id, ok: true })
+    relay.settle(ack(JSON.parse(sent[0]!).commandId))
     await first
     await expect(relay.command({ op: 'interrupt', target: target(), args: {}, idempotencyKey: 'same' }))
       .resolves.toMatchObject({ ok: true })
@@ -67,10 +76,10 @@ describe('HubRelay', () => {
     registry.attach({ id: 'mac', name: 'Mac', agents: ['dsh'] }, { send: () => {} }, 0)
     const relay = new HubRelay({ registry, now: () => 0 })
     relay.subscribe(event => received.push(event))
-    const base = { v: 1, type: 'event', device: 'mac', agent: 'dsh', sessionId: 's1', ts: 't' } as const
+    const base = { v: 2, type: 'event', deviceId: 'mac', agent: 'dsh', sessionId: 's1', nodeEpoch: 'epoch-1', ts: 1 } as const
     relay.publish({ ...base, seq: 1, kind: 'session.updated', payload: { running: true, updatedAt: 9, cwd: '/w' } })
     expect(relay.sessions('mac')).toEqual([
-      { device: 'mac', agent: 'dsh', sessionId: 's1', running: true, updatedAt: 9, cwd: '/w' },
+      { deviceId: 'mac', agent: 'dsh', sessionId: 's1', running: true, updatedAt: 9, cwd: '/w' },
     ])
     relay.publish({ ...base, seq: 2, kind: 'session.removed', payload: {} })
     expect(relay.sessions('mac')).toEqual([])
@@ -93,7 +102,7 @@ describe('HubRelay', () => {
     // 幂等：再次 dispose 不抛错。
     expect(() => relay.dispose()).not.toThrow()
     // 迟到的 ack 与后续指令都不再改变状态。
-    relay.settle({ v: 1, type: 'ack', id: JSON.parse(sent[0]!).id, ok: true, result: 1 })
+    relay.settle(ack(JSON.parse(sent[0]!).commandId, { result: 1 }))
     await expect(relay.command({ op: 'prompt', target: target(), args: {}, idempotencyKey: 'c' }))
       .resolves.toEqual({ ok: false, code: 'disposed', message: 'relay: disposed' })
     expect(sent).toHaveLength(2)
@@ -107,7 +116,7 @@ describe('HubRelay', () => {
     const second = relay.command({ op: 'prompt', target: target(), args: {}, idempotencyKey: 'dup' })
     expect(sent).toHaveLength(1)
 
-    relay.settle({ v: 1, type: 'ack', id: JSON.parse(sent[0]!).id, ok: true, result: 7 })
+    relay.settle(ack(JSON.parse(sent[0]!).commandId, { result: 7 }))
     await expect(Promise.all([first, second])).resolves.toEqual([{ ok: true, result: 7 }, { ok: true, result: 7 }])
     expect(sent).toHaveLength(1)
   })
@@ -118,9 +127,9 @@ describe('HubRelay', () => {
     const onMac = relay.command({ op: 'prompt', target: target('mac'), args: {}, idempotencyKey: 'shared' })
     const onPc = relay.command({ op: 'prompt', target: target('pc'), args: {}, idempotencyKey: 'shared' })
     expect(sent).toHaveLength(2)
-    expect(sent.map(text => JSON.parse(text).target.device)).toEqual(['mac', 'pc'])
+    expect(sent.map(text => JSON.parse(text).target.deviceId)).toEqual(['mac', 'pc'])
 
-    for (const text of sent) relay.settle({ v: 1, type: 'ack', id: JSON.parse(text).id, ok: true })
+    for (const text of sent) relay.settle(ack(JSON.parse(text).commandId))
     await expect(Promise.all([onMac, onPc])).resolves.toMatchObject([{ ok: true }, { ok: true }])
   })
 
@@ -137,7 +146,7 @@ describe('HubRelay', () => {
     // 同键重试必须重新下发，而不是复用已失败的 in-flight Promise。
     const retry = relay.command({ op: 'prompt', target: target(), args: {}, idempotencyKey: 'bad' })
     expect(sent).toHaveLength(1)
-    relay.settle({ v: 1, type: 'ack', id: JSON.parse(sent[0]!).id, ok: true })
+    relay.settle(ack(JSON.parse(sent[0]!).commandId))
     await expect(retry).resolves.toMatchObject({ ok: true })
   })
 
@@ -146,7 +155,7 @@ describe('HubRelay', () => {
     const received: unknown[] = []
     relay.subscribe(() => { throw new Error('boom') })
     relay.subscribe(event => received.push(event))
-    const base = { v: 1, type: 'event', device: 'mac', agent: 'dsh', sessionId: 's1', ts: 't' } as const
+    const base = { v: 2, type: 'event', deviceId: 'mac', agent: 'dsh', sessionId: 's1', nodeEpoch: 'epoch-1', ts: 1 } as const
 
     expect(() => relay.publish({ ...base, seq: 1, kind: 'turn.started', payload: {} })).not.toThrow()
     expect(received).toHaveLength(1)
@@ -167,7 +176,7 @@ describe('HubRelay', () => {
     const registry = new DeviceRegistry()
     registry.attach({ id: 'mac', name: 'Mac', agents: ['dsh'] }, { send: () => {} }, 0)
     const relay = new HubRelay({ registry, now: () => 0 })
-    const base = { v: 1, type: 'event', device: 'mac', agent: 'dsh', sessionId: 's1', ts: 't' } as const
+    const base = { v: 2, type: 'event', deviceId: 'mac', agent: 'dsh', sessionId: 's1', nodeEpoch: 'epoch-1', ts: 1 } as const
     relay.publish({ ...base, seq: 1, kind: 'session.updated', payload: { running: true } })
     expect(relay.sessions()).toHaveLength(1)
     expect(relay.sessions('mac')).toHaveLength(1)

@@ -1,9 +1,9 @@
-import { encodeFrame, type EventFrame, type Frame } from '../wire/frames.ts'
+import { encodeFrame, type AckFrame, type EventFrame, type Frame, type WireErrorCode } from '../wire/frames.ts'
 import type { Adapter } from '../adapters/types.ts'
 import type { LoggerLike } from '../dsh-types.ts'
 import type { NodeLink } from './link.ts'
 
-/** 每会话一条跟随循环；`resume` 指令只启动一次。 */
+/** 每会话一条跟随循环；`observe` 指令只启动一次。 */
 export function createFollower(options: {
   adapter: Adapter
   send: (event: EventFrame) => void
@@ -48,10 +48,10 @@ const WIRE_CODES: ReadonlySet<string> = new Set([
 ])
 
 /** 错误前缀即 wire 错误码：`session-unknown: ...` → `session-unknown`。 */
-function codeOf(error: unknown): string {
+function codeOf(error: unknown): WireErrorCode {
   const message = error instanceof Error ? error.message : String(error)
   const code = /^([a-z][a-z-]*):/.exec(message)?.[1]
-  return code !== undefined && WIRE_CODES.has(code) ? code : 'adapter-crashed'
+  return code !== undefined && WIRE_CODES.has(code) ? code as WireErrorCode : 'adapter-crashed'
 }
 
 export function runCommand(
@@ -59,37 +59,55 @@ export function runCommand(
   adapter: Adapter,
   follower: ReturnType<typeof createFollower>,
   frame: Frame,
-  device: string,
+  deviceId: string,
 ): void {
   if (frame.type !== 'command') return
   // ack 绝不能再抛：未处理的拒绝会直接打挂 DSH 宿主进程。
-  const reply = (body: { ok: boolean; result?: unknown; code?: string; message?: string }): void => {
+  const reply = (body: {
+    status: AckFrame['status']
+    code?: WireErrorCode
+    result?: unknown
+  }): void => {
+    const ack: AckFrame = {
+      v: 2, type: 'ack', commandId: frame.commandId,
+      connectionId: frame.connectionId, nodeEpoch: frame.nodeEpoch,
+      status: body.status,
+      ...(body.code === undefined ? {} : { code: body.code }),
+      ...(body.result === undefined ? {} : { result: body.result }),
+    }
     try {
-      link.sendRaw(encodeFrame({ v: 1, type: 'ack', id: frame.id, ...body }))
+      link.sendRaw(encodeFrame(ack))
     } catch {
-      // 结果或消息超过帧上限时，只回固定的小体积错误帧。
-      link.sendRaw(encodeFrame({ v: 1, type: 'ack', id: frame.id, ok: false, code: 'result-too-large', message: 'marshal: result too large' }))
+      // 结果超过帧上限时，只回固定的小体积错误帧。
+      link.sendRaw(encodeFrame({
+        v: 2, type: 'ack', commandId: frame.commandId,
+        connectionId: frame.connectionId, nodeEpoch: frame.nodeEpoch,
+        status: 'rejected', code: 'result-too-large',
+      }))
     }
   }
-  if (frame.target.device !== device) { reply({ ok: false, code: 'device-mismatch' }); return }
+  if (frame.target.deviceId !== deviceId) { reply({ status: 'rejected', code: 'device-mismatch' }); return }
   if (frame.target.agent !== adapter.agent) {
-    reply({ ok: false, code: 'session-unknown', message: 'agent ' + frame.target.agent + ' unavailable' })
+    reply({ status: 'rejected', code: 'session-unknown' })
     return
   }
   // hub 已经超时并可能让用户重试过：迟到的指令再执行会跑两遍。
-  if (Number.isFinite(frame.deadline) && frame.deadline < Date.now()) {
-    reply({ ok: false, code: 'deadline-expired' })
+  if (frame.deadline < Date.now()) {
+    reply({ status: 'rejected', code: 'deadline-expired' })
     return
   }
-  if (frame.op === 'resume') {
-    follower.start(frame.target.sessionId)
-    reply({ ok: true, result: { following: true } })
+  const sessionId = frame.target.sessionId
+  if (sessionId === null) {
+    // v0 的 op 都要求实际会话；create/fork 在 v1 才允许 sessionId: null。
+    reply({ status: 'rejected', code: 'session-unknown' })
     return
   }
-  void adapter.execute({ op: frame.op, target: { sessionId: frame.target.sessionId }, args: frame.args })
-    .then(result => reply({ ok: true, result }))
-    .catch((error: unknown) => reply({
-      ok: false, code: codeOf(error),
-      message: error instanceof Error ? error.message : String(error),
-    }))
+  if (frame.op === 'observe') {
+    follower.start(sessionId)
+    reply({ status: 'accepted', result: { following: true } })
+    return
+  }
+  void adapter.execute({ op: frame.op, target: { sessionId }, args: frame.args })
+    .then(result => reply({ status: 'accepted', result }))
+    .catch((error: unknown) => reply({ status: 'rejected', code: codeOf(error) }))
 }

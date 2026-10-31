@@ -1,6 +1,6 @@
 import type { EventFrame } from '../../wire/frames.ts'
 
-interface Meta { device: string; agent: string; sessionId: string }
+interface Meta { deviceId: string; agent: string; sessionId: string; nodeEpoch: string }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -18,8 +18,8 @@ export function toMarshalEvents(frame: unknown, meta: Meta, nextSeq: () => numbe
   if (record === undefined) return []
 
   const emit = (kind: EventFrame['kind'], payload: unknown): EventFrame[] => [{
-    v: 1, type: 'event', device: meta.device, agent: meta.agent, sessionId: meta.sessionId,
-    seq: nextSeq(), ts: new Date().toISOString(), kind, payload,
+    v: 2, type: 'event', deviceId: meta.deviceId, agent: meta.agent, sessionId: meta.sessionId,
+    nodeEpoch: meta.nodeEpoch, seq: nextSeq(), ts: Date.now(), kind, payload,
   }]
 
   if (record.type === 'assistant-stream') {

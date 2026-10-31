@@ -15,7 +15,7 @@ function surface() {
   }
 }
 
-const options = { device: 'mac' }
+const options = { deviceId: 'mac', nodeEpoch: 'epoch-1' }
 
 describe('dsh adapter', () => {
   it('未知会话被拒绝并附已知列表', async () => {
@@ -40,7 +40,7 @@ describe('dsh adapter', () => {
 
   it('answer 采纳 sink 返回 ok 的答案，并把线上数组包成 { answers }', async () => {
     const settle = vi.fn(() => 'ok' as const)
-    const adapter = createDshAdapter(surface(), { device: 'mac', answers: { settle } })
+    const adapter = createDshAdapter(surface(), { ...options, answers: { settle } })
     await expect(adapter.execute({
       op: 'answer', target: { sessionId: 's1' },
       args: { requestId: 'q1', answers: [{ id: 'q1', selected: ['A'] }] },
@@ -49,7 +49,7 @@ describe('dsh adapter', () => {
   })
 
   it('answer 未命中已知请求时抛 unknown', async () => {
-    const adapter = createDshAdapter(surface(), { device: 'mac', answers: { settle: () => 'unknown' } })
+    const adapter = createDshAdapter(surface(), { ...options, answers: { settle: () => 'unknown' } })
     await expect(adapter.execute({
       op: 'answer', target: { sessionId: 's1' }, args: { requestId: 'q1', answers: [] },
     })).rejects.toThrow(/unknown:/)
@@ -80,7 +80,7 @@ describe('dsh adapter', () => {
     const adapter = createDshAdapter(surface(), options)
     const events = await adapter.snapshot(new AbortController().signal)
     expect(events[0]).toMatchObject({
-      v: 1, type: 'event', device: 'mac', agent: 'dsh', sessionId: 's1', seq: 1,
+      v: 2, type: 'event', deviceId: 'mac', agent: 'dsh', sessionId: 's1', nodeEpoch: 'epoch-1', seq: 1,
       kind: 'session.updated', payload: { running: false, updatedAt: 1, cwd: '/w' },
     })
   })
@@ -88,8 +88,8 @@ describe('dsh adapter', () => {
   it('frame 与跟随共用一个 seq 计数器', async () => {
     const adapter = createDshAdapter(surface(), options)
     expect(adapter.frame('s1', 'input.requested', { requestId: 'q1' })).toMatchObject({
-      device: 'mac', agent: 'dsh', sessionId: 's1', seq: 1, kind: 'input.requested',
-      payload: { requestId: 'q1' },
+      deviceId: 'mac', agent: 'dsh', sessionId: 's1', nodeEpoch: 'epoch-1', seq: 1,
+      kind: 'input.requested', payload: { requestId: 'q1' },
     })
     const first: EventFrame[] = []
     for await (const event of adapter.follow('s1', new AbortController().signal)) {

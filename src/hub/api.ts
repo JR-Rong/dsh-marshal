@@ -1,7 +1,8 @@
 import { createHash, timingSafeEqual } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { WebServerLike } from '../dsh-types.ts'
-import { COMMAND_OPS, MAX_FRAME_BYTES, type CommandFrame, type EventFrame } from '../wire/frames.ts'
+import { COMMAND_OPS, type CommandFrame, type EventFrame } from '../wire/frames.ts'
+import { MAX_FRAME_BYTES } from '../wire/limits.ts'
 import type { DeviceRegistry } from './registry.ts'
 import type { HubRelay } from './relay.ts'
 import { PAGE_HTML } from './page.ts'
@@ -24,13 +25,12 @@ interface CommandBody {
 
 const digest = (value: string): Buffer => createHash('sha256').update(value, 'utf8').digest()
 
-/** 只接受结构完整的 target；任一字段缺失或非字符串都按缺参处理。 */
 function isTarget(value: unknown): value is CommandFrame['target'] {
   if (typeof value !== 'object' || value === null) return false
   const target = value as Record<string, unknown>
-  return typeof target.device === 'string' && target.device.length > 0
+  return typeof target.deviceId === 'string' && target.deviceId.length > 0
     && typeof target.agent === 'string' && target.agent.length > 0
-    && typeof target.sessionId === 'string' && target.sessionId.length > 0
+    && (target.sessionId === null || (typeof target.sessionId === 'string' && target.sessionId.length > 0))
 }
 
 /**

@@ -35,7 +35,7 @@ describe('redact', () => {
 })
 
 describe('stripContent', () => {
-  const event = { v: 1, type: 'event', device: 'mac', agent: 'dsh', sessionId: 's1', seq: 1, ts: 't', kind: 'message.delta', payload: { text: 'hello there' } } as const
+  const event = { v: 2, type: 'event', deviceId: 'mac', agent: 'dsh', sessionId: 's1', nodeEpoch: 'epoch-1', seq: 1, ts: 1, kind: 'message.delta', payload: { text: 'hello there' } } as const
 
   it('metadata 档把正文换成字符数', () => {
     const stripped = stripContent(event)

@@ -7,7 +7,7 @@ import type { MarshalContext, SessionControllerLike } from '../src/dsh-types.ts'
 import { createTestWeb } from './support/web.ts'
 
 const TOKEN = 't'.repeat(32)
-const DASHBOARD_TOKEN = 'd'.repeat(32)
+const DASHBOARD_TOKEN = 'e2e-dashboard-token-0123456789abcdef'
 const POLL_INTERVAL_MS = 20
 const POLL_TIMEOUT_MS = 2_000
 
@@ -66,7 +66,8 @@ describe('e2e', () => {
         effect(cleanup: () => void | Promise<void>) { cleanups.push(cleanup) },
       }
       apply(hubContext as unknown as MarshalContext, {
-        role: 'hub', dashboardToken: DASHBOARD_TOKEN, devicesFile,
+        role: 'hub', dashboardToken: DASHBOARD_TOKEN,
+        publicOrigin: 'https://marshal.example', devicesFile,
       })
 
       const port = await web.listen()
@@ -78,7 +79,8 @@ describe('e2e', () => {
         sessionController,
       }
       apply(nodeContext as unknown as MarshalContext, {
-        role: 'node', hubUrl: `ws://127.0.0.1:${port}/marshal/uplink`, token: TOKEN, deviceName: 'mac',
+        role: 'node', hubUrl: `ws://127.0.0.1:${port}/marshal/uplink`, token: TOKEN,
+        deviceId: 'mac', deviceName: 'mac',
       })
 
       await waitForCount(async () => {
@@ -94,7 +96,7 @@ describe('e2e', () => {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
-          op: 'prompt', target: { device: 'mac', agent: 'dsh', sessionId: 's1' },
+          op: 'prompt', target: { deviceId: 'mac', agent: 'dsh', sessionId: 's1' },
           args: { text: 'hi' }, idempotencyKey: 'e2e-1',
         }),
       })
@@ -106,15 +108,15 @@ describe('e2e', () => {
       const recorded = prompts[0] as { content?: { text?: string }[] }
       expect(recorded.content?.[0]?.text).toBe('hi')
 
-      const resumeResponse = await fetch(`${base}/marshal/api/command?token=${DASHBOARD_TOKEN}`, {
+      const observeResponse = await fetch(`${base}/marshal/api/command?token=${DASHBOARD_TOKEN}`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
-          op: 'resume', target: { device: 'mac', agent: 'dsh', sessionId: 's1' },
-          args: {}, idempotencyKey: 'e2e-resume',
+          op: 'observe', target: { deviceId: 'mac', agent: 'dsh', sessionId: 's1' },
+          args: { kind: 'follow', action: 'subscribe' }, idempotencyKey: 'e2e-observe',
         }),
       })
-      expect(resumeResponse.status).toBe(200)
+      expect(observeResponse.status).toBe(200)
       // follow 由跟随循环异步取用，ack 先到；轮询等它落到记录里。
       await waitForCount(async () => follows, 1, 'follow')
       expect(follows).toEqual([{ address: { kind: 'session', sessionId: 's1' } }])

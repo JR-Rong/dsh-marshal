@@ -7,7 +7,15 @@ import type { EventFrame } from '../src/wire/frames.ts'
 const TOKEN = 'z'.repeat(32)
 const POLL_INTERVAL_MS = 20
 const POLL_TIMEOUT_MS = 5_000
-const HELLO_ACK = JSON.stringify({ v: 1, type: 'ack', id: 'hello', ok: true })
+const HELLO_ACK = JSON.stringify({
+  v: 2, type: 'hello.ack', connectionId: 'conn-1', hubEpoch: 'hub-1',
+  operatorId: 'op-1', policyRevision: 0, deviceId: 'mac',
+  policies: {
+    privacy: 'metadata', questionRelay: 'off', approvalRelay: 'off',
+    allowContent: false, allowInteractions: false, allowDiscussion: false,
+  },
+  serverTime: 0,
+})
 
 interface Harness {
   readonly wss: WebSocketServer
@@ -75,8 +83,8 @@ function seqOf(text: string): number {
 
 function event(seq: number): EventFrame {
   return {
-    v: 1, type: 'event', device: 'mac', agent: 'dsh', sessionId: 's', seq, ts: 't',
-    kind: 'turn.started', payload: {},
+    v: 2, type: 'event', deviceId: 'mac', agent: 'dsh', sessionId: 's', nodeEpoch: 'epoch-1',
+    seq, ts: 1, kind: 'turn.started', payload: {},
   }
 }
 
@@ -95,12 +103,13 @@ async function settle(ms: number): Promise<void> {
 
 function createLink(
   port: number,
-  options: Partial<Omit<NodeLinkOptions, 'url' | 'token' | 'device' | 'agents'>> = {},
+  options: Partial<Omit<NodeLinkOptions, 'url' | 'token' | 'deviceId' | 'deviceName' | 'agents'>> = {},
 ): NodeLink {
   const link = new NodeLink({
     url: `ws://127.0.0.1:${port}`,
     token: TOKEN,
-    device: 'mac',
+    deviceId: 'mac',
+    deviceName: 'Mac',
     agents: ['dsh'],
     ...options,
   })

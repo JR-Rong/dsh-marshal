@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { WebSocket } from 'ws'
 import { DeviceRegistry, type Sender } from '../src/hub/registry.ts'
 import { mountHubSocket, nodeServerPort, type HubSocketHandle, type UpgradePort } from '../src/hub/server.ts'
-import type { Frame } from '../src/wire/frames.ts'
+import { CONTRACT_REVISION, type Frame } from '../src/wire/frames.ts'
 
 const TOKEN = 'y'.repeat(32)
 const DEVICES = [{ id: 'mac', name: 'Mac', token: TOKEN }]
@@ -131,14 +131,22 @@ function rawUpgrade(port: number, requestTarget: string): Promise<string> {
   })
 }
 
-interface HelloOverrides { readonly device?: string; readonly token?: string; readonly agents?: readonly string[] }
+interface HelloOverrides {
+  readonly deviceId?: string
+  readonly contractRevision?: string
+  readonly nodeEpoch?: string
+  readonly agents?: readonly string[]
+}
 
 function helloText(overrides: HelloOverrides = {}): string {
   return JSON.stringify({
-    v: 1, type: 'hello',
-    device: overrides.device ?? 'mac',
-    token: overrides.token ?? TOKEN,
+    v: 2, type: 'hello',
+    contractRevision: overrides.contractRevision ?? CONTRACT_REVISION,
+    deviceId: overrides.deviceId ?? 'mac',
+    deviceName: 'Mac',
+    nodeEpoch: overrides.nodeEpoch ?? 'epoch-1',
     agents: overrides.agents ?? ['dsh'],
+    features: [],
   })
 }
 
@@ -156,7 +164,7 @@ async function hello(
   })
   ws.send(helloText(overrides))
   const ack = await acked
-  expect(ack).toMatchObject({ type: 'ack', id: 'hello', ok: true })
+  expect(ack).toMatchObject({ type: 'hello.ack', deviceId: 'mac' })
   await waitFor(() => registry.get('mac') !== undefined, 'device to enter registry')
   return ws
 }
@@ -190,8 +198,8 @@ describe('hub socket', () => {
     const ws = await hello(registry, port)
     expect(registry.get('mac')?.record.agents).toEqual(['dsh'])
     ws.send(JSON.stringify({
-      v: 1, type: 'event', device: 'mac', agent: 'dsh', sessionId: 's1', seq: 1, ts: 't',
-      kind: 'turn.started', payload: {},
+      v: 2, type: 'event', deviceId: 'mac', agent: 'dsh', sessionId: 's1', nodeEpoch: 'epoch-1',
+      seq: 1, ts: 1, kind: 'turn.started', payload: {},
     }))
     await waitFor(() => frames.length === 1, 'event frame to reach onFrame')
     expect(frames.map(frame => frame.type)).toEqual(['event'])
@@ -206,8 +214,8 @@ describe('hub socket', () => {
     const ws = await hello(registry, port)
     const code = closeCode(ws)
     ws.send(JSON.stringify({
-      v: 1, type: 'event', device: 'other', agent: 'dsh', sessionId: 's1', seq: 1, ts: 't',
-      kind: 'turn.started', payload: {},
+      v: 2, type: 'event', deviceId: 'other', agent: 'dsh', sessionId: 's1', nodeEpoch: 'epoch-1',
+      seq: 1, ts: 1, kind: 'turn.started', payload: {},
     }))
     expect(await code).toBe(4400)
     expect(frames).toEqual([])
@@ -220,8 +228,8 @@ describe('hub socket', () => {
     const ws = await hello(registry, port)
     const code = closeCode(ws)
     ws.send(JSON.stringify({
-      v: 1, type: 'event', device: 'mac', agent: 'codex', sessionId: 's1', seq: 1, ts: 't',
-      kind: 'turn.started', payload: {},
+      v: 2, type: 'event', deviceId: 'mac', agent: 'codex', sessionId: 's1', nodeEpoch: 'epoch-1',
+      seq: 1, ts: 1, kind: 'turn.started', payload: {},
     }))
     expect(await code).toBe(4400)
     expect(frames).toEqual([])
@@ -247,18 +255,24 @@ describe('hub socket', () => {
     const registry = new DeviceRegistry()
     const { port } = await serve(registry)
 
-    const wrongToken = await connect(port)
-    const wrongTokenCode = closeCode(wrongToken)
-    wrongToken.send(helloText({ token: 'z'.repeat(32) }))
-    expect(await wrongTokenCode).toBe(4401)
-
     const wrongDevice = await connect(port)
     const wrongDeviceCode = closeCode(wrongDevice)
-    wrongDevice.send(helloText({ device: 'other' }))
+    wrongDevice.send(helloText({ deviceId: 'other' }))
     expect(await wrongDeviceCode).toBe(4401)
 
     expect(registry.get('mac')).toBeUndefined()
     expect(registry.get('other')).toBeUndefined()
+  })
+
+  it('契约修订不匹配时以 4409 关闭', async () => {
+    const registry = new DeviceRegistry()
+    const { port } = await serve(registry)
+
+    const stale = await connect(port)
+    const code = closeCode(stale)
+    stale.send(helloText({ contractRevision: 'p1-review-1' }))
+    expect(await code).toBe(4409)
+    expect(registry.get('mac')).toBeUndefined()
   })
 
   it('首帧不是 hello 时以 4400 关闭', async () => {
@@ -267,8 +281,8 @@ describe('hub socket', () => {
     const ws = await connect(port)
     const code = closeCode(ws)
     ws.send(JSON.stringify({
-      v: 1, type: 'event', device: 'mac', agent: 'dsh', sessionId: 's1', seq: 1, ts: 't',
-      kind: 'turn.started', payload: {},
+      v: 2, type: 'event', deviceId: 'mac', agent: 'dsh', sessionId: 's1', nodeEpoch: 'epoch-1',
+      seq: 1, ts: 1, kind: 'turn.started', payload: {},
     }))
     expect(await code).toBe(4400)
     expect(registry.get('mac')).toBeUndefined()

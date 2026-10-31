@@ -1,11 +1,13 @@
+import { randomUUID } from 'node:crypto'
 import { WebSocket } from 'ws'
-import { encodeFrame, type EventFrame } from '../wire/frames.ts'
+import { CONTRACT_REVISION, encodeFrame, type EventFrame } from '../wire/frames.ts'
+import { OFFLINE_QUEUE_MAX_BYTES, OFFLINE_QUEUE_MAX_ITEMS } from '../wire/limits.ts'
 
 /** 断线期间最多缓存多少帧，超出后丢最旧的。 */
-const DEFAULT_BUFFER_LIMIT = 1000
+const DEFAULT_BUFFER_LIMIT = OFFLINE_QUEUE_MAX_ITEMS
 
 /** 断线缓存的字节上限：1000 个 1 MiB 帧会吃掉 1 GiB，必须再按体积封顶。 */
-const DEFAULT_BUFFER_BYTES = 8 * 1024 * 1024
+const DEFAULT_BUFFER_BYTES = OFFLINE_QUEUE_MAX_BYTES
 
 /** 重连等待的上限：指数退避在此基础上叠加抖动。 */
 const MAX_BACKOFF_MS = 30_000
@@ -17,16 +19,20 @@ const DEFAULT_HEARTBEAT_MS = 30_000
 /** 连接稳定这么久之后把退避计数清零，避免偶发一次断线就让下次重连等满上限。 */
 const STABLE_RESET_MS = 30_000
 
-/** hub 用它表示鉴权失败；重拨只会一直失败，必须停下来等人修配置。 */
-const AUTH_FAILED_CLOSE_CODE = 4401
+/** 鉴权失败、设备撤销与协议不兼容都是终态：重拨不会成功，等显式 start()。 */
+const TERMINAL_CLOSE_CODES: ReadonlySet<number> = new Set([4401, 4403, 4409])
+
+/** 运行实例 epoch：进程内共享，普通网络重连不变。 */
+export const NODE_EPOCH = randomUUID()
 
 /** hub 收到 hello 后回的确认帧：只有它到达才算握手完成。 */
-const HELLO_ACK_ID = 'hello'
+const HELLO_ACK_TYPE = 'hello.ack'
 
 export interface NodeLinkOptions {
   readonly url: string
   readonly token: string
-  readonly device: string
+  readonly deviceId: string
+  readonly deviceName: string
   readonly agents: readonly string[]
   readonly bufferLimit?: number
   /** 断线缓存的总字节上限，默认 8 MiB。 */
@@ -139,8 +145,9 @@ export class NodeLink {
       if (this.socket !== ws) { ws.close(); return }
       // hello 必须先于任何缓冲事件，hub 只认首帧 hello；它发不出去就换一条连接。
       const hello = encodeFrame({
-        v: 1, type: 'hello', device: this.options.device,
-        token: this.options.token, agents: [...this.options.agents],
+        v: 2, type: 'hello', contractRevision: CONTRACT_REVISION,
+        deviceId: this.options.deviceId, deviceName: this.options.deviceName,
+        nodeEpoch: NODE_EPOCH, agents: [...this.options.agents], features: [],
       })
       if (!this.trySend(ws, hello)) { ws.close(); return }
       this.startHeartbeat(ws)
@@ -157,8 +164,8 @@ export class NodeLink {
       this.stopHeartbeat()
       this.clearStableTimer()
       if (this.closed) return
-      if (code === AUTH_FAILED_CLOSE_CODE) {
-        // 鉴权失败重拨没有意义：停下进 stopped，等显式 start()。
+      if (TERMINAL_CLOSE_CODES.has(code)) {
+        // 鉴权/撤销/协议不兼容重拨没有意义：停下进 stopped，等显式 start()。
         this.active = false
         this.attempts = 0
         this.clearTimer()
@@ -221,8 +228,8 @@ export class NodeLink {
     try {
       const parsed: unknown = JSON.parse(text)
       if (typeof parsed !== 'object' || parsed === null) return false
-      const frame = parsed as { type?: unknown; id?: unknown; ok?: unknown }
-      return frame.type === 'ack' && frame.id === HELLO_ACK_ID && frame.ok === true
+      const frame = parsed as { type?: unknown }
+      return frame.type === HELLO_ACK_TYPE
     } catch { return false }
   }
 

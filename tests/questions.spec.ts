@@ -32,7 +32,8 @@ function harness(timeoutMs = 50, options: HarnessOptions = {}) {
     timeoutMs,
     send: options.send ?? (event => sent.push(event)),
     frame: (sessionId, kind, payload): EventFrame => ({
-      v: 1, type: 'event', device: 'mac', agent: 'dsh', sessionId, seq: ++seq, ts: 't', kind, payload,
+      v: 2, type: 'event', deviceId: 'mac', agent: 'dsh', sessionId, nodeEpoch: 'epoch-1',
+      seq: ++seq, ts: 1, kind, payload,
     }),
   })
   const request = (signal?: AbortSignal): AskUserQuestionRequestLike => ({
@@ -236,7 +237,8 @@ describe('question relay end to end', () => {
     }
     let relay: QuestionRelay | undefined
     const adapter = createDshAdapter(surface, {
-      device: 'mac',
+      deviceId: 'mac',
+      nodeEpoch: 'epoch-1',
       answers: {
         settle: (sessionId, requestId, answers) => relay?.settle(sessionId, requestId, answers) ?? 'unknown',
       },
@@ -256,11 +258,13 @@ describe('question relay end to end', () => {
     )
     const requestId = requestIdOf(sent[0])
 
-    const command = (id: string, answers: unknown): Frame => ({
-      v: 1, type: 'command', id, idempotencyKey: id + '-key', deadline: Date.now() + 1_000,
+    const command = (commandId: string, answers: unknown): Frame => ({
+      v: 2, type: 'command', commandId, idempotencyKey: commandId + '-key', operatorId: 'op-1',
+      issuedAt: Date.now(), deadline: Date.now() + 1_000,
       op: 'answer',
-      target: { device: 'mac', agent: 'dsh', sessionId: 's1' },
+      target: { deviceId: 'mac', agent: 'dsh', sessionId: 's1' },
       args: { requestId, answers },
+      connectionId: 'conn-1', nodeEpoch: 'epoch-1',
     })
     const received: Frame[] = []
     const link = { sendRaw(text: string) { received.push(JSON.parse(text) as Frame) } } as unknown as NodeLink
@@ -271,11 +275,11 @@ describe('question relay end to end', () => {
     runCommand(link, adapter, follower, command('c1', [{ id: 'q1', selected: ['A'] }]), 'mac')
     await expect(pending).resolves.toEqual({ answers: [{ id: 'q1', selected: ['A'] }] })
     await flush()
-    expect(received[0]).toMatchObject({ type: 'ack', id: 'c1', ok: true, result: { accepted: true } })
+    expect(received[0]).toMatchObject({ type: 'ack', commandId: 'c1', status: 'accepted', result: { accepted: true } })
 
     runCommand(link, adapter, follower, command('c2', [{ id: 'q1', selected: ['B'] }]), 'mac')
     await flush()
-    expect(received[1]).toMatchObject({ type: 'ack', id: 'c2', ok: false, code: 'unknown' })
+    expect(received[1]).toMatchObject({ type: 'ack', commandId: 'c2', status: 'rejected', code: 'unknown' })
     relay.dispose()
   })
 })

@@ -1,10 +1,18 @@
 import { randomUUID } from 'node:crypto'
 import { CommandLog } from '../wire/idempotency.ts'
-import { encodeFrame, type AckFrame, type CommandFrame, type EventFrame } from '../wire/frames.ts'
+import {
+  encodeFrame, type AckFrame, type CommandFrame, type CommandOp, type EventFrame,
+} from '../wire/frames.ts'
+import { COMMAND_TTL_MS } from '../wire/limits.ts'
 import type { DeviceRegistry, Sender } from './registry.ts'
 
+/** T02 会换成持久化 owner 身份；当前显式占位，不能当作安全声明。 */
+const PLACEHOLDER_OPERATOR_ID = 'operator-unbound'
+const UNBOUND_CONNECTION_ID = 'unbound'
+const UNBOUND_NODE_EPOCH = 'unbound'
+
 export interface CommandInput {
-  readonly op: CommandFrame['op']
+  readonly op: CommandOp
   readonly target: CommandFrame['target']
   readonly args?: unknown
   readonly idempotencyKey: string
@@ -15,7 +23,7 @@ export type CommandOutcome =
   | { ok: false; code: 'device-offline' | 'timeout' | string; message?: string }
 
 export interface SessionRow {
-  readonly device: string
+  readonly deviceId: string
   readonly agent: string
   readonly sessionId: string
   readonly running: boolean
@@ -36,7 +44,7 @@ function disposedOutcome(): CommandOutcome {
 interface Pending {
   resolve: (outcome: CommandOutcome) => void
   timer: NodeJS.Timeout
-  readonly device: string
+  readonly deviceId: string
 }
 
 export class HubRelay {
@@ -46,29 +54,31 @@ export class HubRelay {
   private readonly log = new CommandLog()
   private readonly consumers = new Set<(event: EventFrame) => void>()
   private readonly index = new Map<string, SessionRow>()
+  private readonly epochs = new Map<string, string>()
   private disposed = false
 
   constructor(private readonly options: {
     registry: DeviceRegistry
     now: () => number
     timeoutMs?: number
+    operatorId?: string
   }) {}
 
   async command(input: CommandInput): Promise<CommandOutcome> {
     if (this.disposed) return disposedOutcome()
 
     // 幂等范围按设备与 op 隔离：不同设备/不同 op 用同名 key 也各自下发。
-    const cacheKey = `${input.target.device}:${input.op}:${input.idempotencyKey}`
+    const cacheKey = `${input.target.deviceId}:${input.op}:${input.idempotencyKey}`
     const cached = this.log.lookup(cacheKey)
     if (cached.hit) return { ok: true, result: cached.result }
 
     const running = this.inflight.get(cacheKey)
     if (running !== undefined) return running
 
-    const slot = this.options.registry.get(input.target.device)
+    const slot = this.options.registry.get(input.target.deviceId)
     if (slot === undefined) return { ok: false, code: 'device-offline' }
 
-    const promise = this.dispatch(input, cacheKey, slot.sender)
+    const promise = this.dispatch(input, cacheKey, slot)
     this.inflight.set(cacheKey, promise)
     try {
       return await promise
@@ -80,38 +90,44 @@ export class HubRelay {
   private async dispatch(
     input: CommandInput,
     cacheKey: string,
-    sender: Sender,
+    slot: { readonly sender: Sender; readonly connectionId?: string; readonly nodeEpoch?: string },
   ): Promise<CommandOutcome> {
-    const id = randomUUID()
-    const timeoutMs = this.options.timeoutMs ?? 30_000
+    const commandId = randomUUID()
+    const timeoutMs = this.options.timeoutMs ?? COMMAND_TTL_MS
+    const issuedAt = this.options.now()
     const frame: CommandFrame = {
-      v: 1, type: 'command', id, idempotencyKey: input.idempotencyKey,
-      deadline: this.options.now() + timeoutMs,
-      op: input.op, target: input.target,
-      ...(input.args === undefined ? {} : { args: input.args }),
+      v: 2, type: 'command', commandId, idempotencyKey: input.idempotencyKey,
+      operatorId: this.options.operatorId ?? PLACEHOLDER_OPERATOR_ID,
+      target: input.target,
+      op: input.op,
+      args: input.args ?? {},
+      issuedAt,
+      deadline: issuedAt + timeoutMs,
+      connectionId: slot.connectionId ?? UNBOUND_CONNECTION_ID,
+      nodeEpoch: slot.nodeEpoch ?? UNBOUND_NODE_EPOCH,
     }
 
     const outcome = await new Promise<CommandOutcome>((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.pending.delete(id)
+        this.pending.delete(commandId)
         resolve({ ok: false, code: 'timeout' })
       }, timeoutMs)
-      this.pending.set(id, { resolve, timer, device: input.target.device })
+      this.pending.set(commandId, { resolve, timer, deviceId: input.target.deviceId })
       let text: string
       try {
         text = encodeFrame(frame)
       } catch (error) {
         // 编码失败不能留下悬挂的 pending 与定时器。
         clearTimeout(timer)
-        this.pending.delete(id)
+        this.pending.delete(commandId)
         reject(error)
         return
       }
       try {
-        sender.send(text)
+        slot.sender.send(text)
       } catch (error) {
         clearTimeout(timer)
-        this.pending.delete(id)
+        this.pending.delete(commandId)
         reject(error)
       }
     })
@@ -121,21 +137,22 @@ export class HubRelay {
   }
 
   settle(ack: AckFrame): void {
-    const entry = this.pending.get(ack.id)
+    const entry = this.pending.get(ack.commandId)
     if (entry === undefined) return
     clearTimeout(entry.timer)
-    this.pending.delete(ack.id)
-    entry.resolve(ack.ok
+    this.pending.delete(ack.commandId)
+    const ok = ack.status === 'accepted' || ack.status === 'confirmed'
+    entry.resolve(ok
       ? { ok: true, result: ack.result }
-      : { ok: false, code: ack.code ?? 'error', ...(ack.message === undefined ? {} : { message: ack.message }) })
+      : { ok: false, code: ack.code ?? 'unknown' })
   }
 
   /** 设备掉线时立刻结束发给它的指令，不让调用方干等到超时。 */
   deviceOffline(deviceId: string): void {
-    for (const [id, entry] of [...this.pending]) {
-      if (entry.device !== deviceId) continue
+    for (const [commandId, entry] of [...this.pending]) {
+      if (entry.deviceId !== deviceId) continue
       clearTimeout(entry.timer)
-      this.pending.delete(id)
+      this.pending.delete(commandId)
       entry.resolve({ ok: false, code: 'device-offline' })
     }
   }
@@ -143,11 +160,12 @@ export class HubRelay {
   /** 节点重连后以快照为准：先清掉该设备的旧索引，并把移除通知给订阅者。 */
   clearDevice(deviceId: string): void {
     for (const [key, row] of [...this.index]) {
-      if (row.device !== deviceId) continue
+      if (row.deviceId !== deviceId) continue
       this.index.delete(key)
       this.publish({
-        v: 1, type: 'event', device: row.device, agent: row.agent, sessionId: row.sessionId,
-        seq: 0, ts: new Date(this.options.now()).toISOString(), kind: 'session.removed', payload: {},
+        v: 2, type: 'event', deviceId: row.deviceId, agent: row.agent, sessionId: row.sessionId,
+        nodeEpoch: this.epochs.get(deviceId) ?? UNBOUND_NODE_EPOCH,
+        seq: 0, ts: this.options.now(), kind: 'session.removed', payload: {},
       })
     }
   }
@@ -167,15 +185,16 @@ export class HubRelay {
 
   /** 记录会话索引并扇出；索引只存设备/agent/sessionId/运行态，不存标题或正文。 */
   publish(event: EventFrame): void {
-    const key = `${event.device}\u0000${event.agent}\u0000${event.sessionId}`
+    const key = `${event.deviceId}\u0000${event.agent}\u0000${event.sessionId}`
+    this.epochs.set(event.deviceId, event.nodeEpoch)
     if (event.kind === 'session.removed') {
       this.index.delete(key)
     } else if (event.kind === 'session.updated') {
       const payload = (event.payload ?? {}) as { running?: unknown; updatedAt?: unknown; cwd?: unknown }
       this.index.set(key, {
-        device: event.device, agent: event.agent, sessionId: event.sessionId,
+        deviceId: event.deviceId, agent: event.agent, sessionId: event.sessionId,
         running: payload.running === true,
-        updatedAt: typeof payload.updatedAt === 'number' ? payload.updatedAt : (Date.parse(event.ts) || 0),
+        updatedAt: typeof payload.updatedAt === 'number' ? payload.updatedAt : event.ts,
         ...(typeof payload.cwd === 'string' ? { cwd: payload.cwd } : {}),
       })
     }
@@ -186,9 +205,9 @@ export class HubRelay {
   }
 
   /** 只返回注册表里仍存在设备的会话，设备断线后不再残留。 */
-  sessions(device?: string): SessionRow[] {
+  sessions(deviceId?: string): SessionRow[] {
     return [...this.index.values()].filter(row =>
-      (device === undefined || row.device === device) && this.options.registry.get(row.device) !== undefined)
+      (deviceId === undefined || row.deviceId === deviceId) && this.options.registry.get(row.deviceId) !== undefined)
   }
 
   subscribe(consumer: (event: EventFrame) => void): () => void {

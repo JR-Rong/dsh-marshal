@@ -11,15 +11,27 @@ export interface DeviceView extends DeviceSeed {
   readonly lastSeen: number
 }
 
-interface Slot { record: DeviceView; readonly sender: Sender }
+/** 当前连接的身份；T02 会把它替换为完整连接代次校验。 */
+export interface Attachment {
+  readonly connectionId: string
+  readonly nodeEpoch: string
+}
+
+interface Slot {
+  record: DeviceView
+  readonly sender: Sender
+  readonly connectionId?: string
+  readonly nodeEpoch?: string
+}
 
 export class DeviceRegistry {
   private readonly devices = new Map<string, Slot>()
 
-  attach(seed: DeviceSeed, sender: Sender, now: number): void {
+  attach(seed: DeviceSeed, sender: Sender, now: number, attachment?: Attachment): void {
     this.devices.set(seed.id, {
       record: { ...seed, connectedAt: now, lastSeen: now },
       sender,
+      ...(attachment === undefined ? {} : { connectionId: attachment.connectionId, nodeEpoch: attachment.nodeEpoch }),
     })
   }
 

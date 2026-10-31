@@ -5,7 +5,7 @@ import { toMarshalEvents } from '../src/adapters/dsh/map.ts'
 const frames = readFileSync(new URL('./fixtures/dsh-follow.jsonl', import.meta.url), 'utf8')
   .trim().split('\n').map(line => JSON.parse(line))
 
-const meta = { device: 'mac', agent: 'dsh', sessionId: 's1' }
+const meta = { deviceId: 'mac', agent: 'dsh', sessionId: 's1', nodeEpoch: 'epoch-1' }
 
 describe('toMarshalEvents', () => {
   it('把跟随帧映射成 marshal 事件', () => {
@@ -16,7 +16,7 @@ describe('toMarshalEvents', () => {
       'message.delta', 'message.completed', 'turn.completed',
     ])
     expect(events.every(event => event.type === 'event')).toBe(true)
-    expect(events.every(event => event.device === 'mac' && event.sessionId === 's1')).toBe(true)
+    expect(events.every(event => event.deviceId === 'mac' && event.sessionId === 's1')).toBe(true)
   })
 
   it('序号来自 nextSeq，连续递增', () => {

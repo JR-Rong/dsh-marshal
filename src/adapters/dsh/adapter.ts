@@ -21,7 +21,8 @@ const CAPABILITY: Capability = {
 }
 
 export interface DshAdapterOptions {
-  readonly device: string
+  readonly deviceId: string
+  readonly nodeEpoch: string
   readonly answers?: AnswerSink
 }
 
@@ -33,8 +34,8 @@ export function createDshAdapter(surface: DshSurface, options: DshAdapterOptions
     return next
   }
   const frame = (sessionId: string, kind: EventFrame['kind'], payload: unknown): EventFrame => ({
-    v: 1, type: 'event', device: options.device, agent: 'dsh', sessionId,
-    seq: nextSeq(sessionId), ts: new Date().toISOString(), kind, payload,
+    v: 2, type: 'event', deviceId: options.deviceId, agent: 'dsh', sessionId,
+    nodeEpoch: options.nodeEpoch, seq: nextSeq(sessionId), ts: Date.now(), kind, payload,
   })
 
   return {
@@ -53,7 +54,9 @@ export function createDshAdapter(surface: DshSurface, options: DshAdapterOptions
 
     async *follow(sessionId: string, signal: AbortSignal): AsyncIterable<EventFrame> {
       for await (const frame of surface.follow(sessionId, signal)) {
-        yield* toMarshalEvents(frame, { device: options.device, agent: 'dsh', sessionId }, () => nextSeq(sessionId))
+        yield* toMarshalEvents(frame, {
+          deviceId: options.deviceId, agent: 'dsh', sessionId, nodeEpoch: options.nodeEpoch,
+        }, () => nextSeq(sessionId))
       }
     },
 

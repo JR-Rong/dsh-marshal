@@ -17,8 +17,8 @@ async function start() {
   registry.attach({ id: 'mac', name: 'Mac', agents: ['dsh'] }, { send: () => {} }, 0)
   const relay = new HubRelay({ registry, now: Date.now, timeoutMs: 50 })
   relay.publish({
-    v: 1, type: 'event', device: 'mac', agent: 'dsh', sessionId: 's1', seq: 1,
-    ts: new Date().toISOString(), kind: 'session.updated', payload: { running: false, updatedAt: 1 },
+    v: 2, type: 'event', deviceId: 'mac', agent: 'dsh', sessionId: 's1', nodeEpoch: 'epoch-1',
+    seq: 1, ts: 1, kind: 'session.updated', payload: { running: false, updatedAt: 1 },
   })
   const test = createTestWeb()
   const routes = registerMarshalRoutes({ webServer: test.webServer, registry, relay, requireToken: 'secret' })
@@ -56,7 +56,7 @@ describe('hub api', () => {
     const { port } = await start()
     const body = await (await fetch(`http://127.0.0.1:${port}/marshal/api/sessions?device=mac&token=secret`)).json() as { sessions: unknown[] }
     expect(body.sessions).toEqual([
-      { device: 'mac', agent: 'dsh', sessionId: 's1', running: false, updatedAt: 1 },
+      { deviceId: 'mac', agent: 'dsh', sessionId: 's1', running: false, updatedAt: 1 },
     ])
   })
 
@@ -78,7 +78,7 @@ describe('hub api', () => {
     const response = await fetch(`http://127.0.0.1:${port}/marshal/api/command?token=secret`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ op: 'prompt', target: { device: 'ghost', agent: 'dsh', sessionId: 's' }, args: {}, idempotencyKey: 'k' }),
+      body: JSON.stringify({ op: 'prompt', target: { deviceId: 'ghost', agent: 'dsh', sessionId: 's' }, args: {}, idempotencyKey: 'k' }),
     })
     expect(response.status).toBe(409)
   })
@@ -88,7 +88,7 @@ describe('hub api', () => {
     const response = await fetch(`http://127.0.0.1:${port}/marshal/api/command?token=secret`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ op: 'explode', target: { device: 'mac', agent: 'dsh', sessionId: 's1' }, args: {}, idempotencyKey: 'k-unknown-op' }),
+      body: JSON.stringify({ op: 'explode', target: { deviceId: 'mac', agent: 'dsh', sessionId: 's1' }, args: {}, idempotencyKey: 'k-unknown-op' }),
     })
     expect(response.status).toBe(400)
   })

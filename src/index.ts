@@ -9,7 +9,7 @@ import { HubRelay } from './hub/relay.ts'
 import { loadDevices } from './hub/devices.ts'
 import { createDshSurface } from './adapters/dsh/surface.ts'
 import { createDshAdapter } from './adapters/dsh/adapter.ts'
-import { NodeLink } from './node/link.ts'
+import { NodeLink, NODE_EPOCH } from './node/link.ts'
 import { createFollower, runCommand } from './node/runner.ts'
 import { createQuestionRelay, type QuestionRelay } from './node/questions.ts'
 import { redact, stripContent } from './node/redact.ts'
@@ -75,19 +75,21 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
   }
 
   const link = new NodeLink({
-    url: config.hubUrl!, token: config.token!, device: config.deviceName,
-    agents: ['dsh'],
+    url: config.hubUrl!, token: config.token!, deviceId: config.deviceId!,
+    deviceName: config.deviceName,
+    agents: config.agents,
     onFrame: text => {
       let frame: Frame
       try { frame = decodeFrame(text) } catch { return }
-      runCommand(link, adapter, follower, frame, config.deviceName)
+      runCommand(link, adapter, follower, frame, config.deviceId!)
     },
     onOnline: sendSnapshot,
     onError: error => ctx.logger.warn(`marshal: link error: ${String(error)}`),
   })
   let relay: QuestionRelay | undefined
   const adapter = createDshAdapter(createDshSurface(controller), {
-    device: config.deviceName,
+    deviceId: config.deviceId!,
+    nodeEpoch: NODE_EPOCH,
     answers: {
       settle: (sessionId, requestId, answers) => relay?.settle(sessionId, requestId, answers) ?? 'unknown',
     },
