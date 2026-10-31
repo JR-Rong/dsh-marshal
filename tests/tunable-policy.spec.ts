@@ -122,6 +122,7 @@ function request(overrides: Partial<ConfigureRequest> = {}): ConfigureRequest {
     value: 'medium',
     expectedRevision: 3,
     runtimeEpoch: 'epoch-1',
+    contentAuthorized: false,
     ...overrides,
   }
 }
@@ -465,13 +466,30 @@ describe('plan 只允许收紧', () => {
 })
 
 describe('goal 需要双重 content 授权', () => {
-  const goal = (value: unknown, overrides: Partial<ConfigureContext> = {}) => decideConfigure(
-    request({ field: 'goal', value }),
+  const goal = (
+    value: unknown,
+    overrides: Partial<ConfigureContext> = {},
+    requestOverrides: Partial<ConfigureRequest> = {},
+  ) => decideConfigure(
+    request({
+      field: 'goal',
+      value,
+      // 请求级授权默认与上下文一致；可显式覆盖以验证单侧拒绝。
+      contentAuthorized: overrides.contentAuthorized ?? true,
+      ...requestOverrides,
+    }),
     context(overrides),
   )
 
   it('缺少 content 授权时关闭', () => {
     expect(goal({ objective: 'ship v1' }, { contentAuthorized: false }))
+      .toEqual({ outcome: 'reject', code: 'unsupported', reason: 'privacy-readback-unavailable' })
+  })
+
+  it('仅请求级授权缺失时同样关闭', () => {
+    expect(goal({ objective: 'ship v1' }, {}, { contentAuthorized: false }))
+      .toEqual({ outcome: 'reject', code: 'unsupported', reason: 'privacy-readback-unavailable' })
+    expect(goal(null, {}, { contentAuthorized: false }))
       .toEqual({ outcome: 'reject', code: 'unsupported', reason: 'privacy-readback-unavailable' })
   })
 
@@ -490,10 +508,25 @@ describe('goal 需要双重 content 授权', () => {
     expect(JSON.stringify(decision)).not.toContain('ship v1')
   })
 
+  it('双授权成立时允许 clear，仍不携带正文', () => {
+    const decision = goal(null)
+    expect(decision).toEqual({ outcome: 'apply' })
+    expect(JSON.stringify(decision)).not.toContain('objective')
+  })
+
+  it('clear 同样受回读渠道门控', () => {
+    const noReadback: TunableCatalog = {
+      ...CATALOG,
+      readback: { ...CATALOG.readback, goal: false },
+    }
+    expect(goal(null, { catalog: noReadback }))
+      .toEqual({ outcome: 'reject', code: 'unsupported', reason: 'settings-readback-unavailable' })
+  })
+
   it('objective 形状或长度非法时拒绝', () => {
     for (const value of [
       {}, { objective: '' }, { objective: '   ' }, { objective: 7 },
-      { objective: ['ship'] }, 'ship', ['ship'],
+      { objective: ['ship'] }, 'ship', ['ship'], undefined,
     ]) {
       expect(goal(value)).toEqual({ outcome: 'reject', code: 'invalid-args', reason: 'goal-objective-invalid' })
     }

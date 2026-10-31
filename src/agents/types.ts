@@ -13,7 +13,8 @@ import type { EventFrame } from '../wire/frames.ts'
  * 不另造一套能力枚举。
  *
  * T01 交付类型边界；T02 在此补上所有权快照/证据与 create/fork 端口，
- * configure/readSettings 仍留给 T07。原生输入由 node 的统一中继（interactions.ts）
+ * configure/readSettings 的类型边界由 T07 提供，适配器接线随后续子任务完成。
+ * 原生输入由 node 的统一中继（interactions.ts）
  * 实现 NativeInputPort，适配器只做分类并等待决定。本文件不提供空实现。
  * AgentHost 也不绕过 node runner/journal/privacy 接受远端写命令（见 host.ts）。
  */
@@ -224,12 +225,18 @@ export interface ConfigureRequest {
   readonly value: unknown
   readonly expectedRevision: number
   readonly runtimeEpoch: RuntimeEpoch
+  /**
+   * 由 node 的本地隐私授权注入，绝不从 wire 读取；适配器不得用它替代
+   * node 已经做出的内容授权判断。
+   */
+  readonly contentAuthorized: boolean
 }
 
 export interface ConfigureResult {
   readonly status: 'confirmed' | 'pending-confirmation'
   readonly revision: number
   readonly runtimeEpoch: RuntimeEpoch
+  readonly code?: 'readback-mismatch' | 'readback-timeout' | 'settings-unsafe'
 }
 
 export interface SettingsPort {

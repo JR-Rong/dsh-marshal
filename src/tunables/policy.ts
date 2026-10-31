@@ -238,10 +238,18 @@ function decidePlan(value: unknown, context: ConfigureContext): ConfigureDecisio
   return { outcome: 'apply' }
 }
 
-function decideGoal(value: unknown, context: ConfigureContext): ConfigureDecision {
-  // objective 属于内容型设置：双重授权缺失时连校验分支都不进入。
-  if (context.contentAuthorized !== true) return reject('unsupported', 'privacy-readback-unavailable')
+function decideGoal(
+  value: unknown,
+  request: ConfigureRequest,
+  context: ConfigureContext,
+): ConfigureDecision {
+  // objective 属于内容型设置：请求级与上下文授权必须同时成立，任一缺失都关闭。
+  if (context.contentAuthorized !== true || request.contentAuthorized !== true) {
+    return reject('unsupported', 'privacy-readback-unavailable')
+  }
   if (context.catalog.readback.goal !== true) return reject('unsupported', 'settings-readback-unavailable')
+  // null 表示 clear；实际为空仍须由关联回读确认，决策只放行。
+  if (value === null) return { outcome: 'apply' }
   if (!isPlainObject(value)) return reject('invalid-args', 'goal-objective-invalid')
   const objective = value.objective
   if (typeof objective !== 'string' || objective.trim().length === 0) {
@@ -288,6 +296,6 @@ export function decideConfigure(
     case 'plan':
       return decidePlan(request.value, context)
     case 'goal':
-      return decideGoal(request.value, context)
+      return decideGoal(request.value, request, context)
   }
 }
