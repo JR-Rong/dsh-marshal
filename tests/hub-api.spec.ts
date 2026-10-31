@@ -31,7 +31,7 @@ async function start(options: {
     0,
     { connectionId: 'conn-1', nodeEpoch: 'epoch-1' },
   )
-  const relay = new HubRelay({ registry, now: options.now ?? Date.now, timeoutMs: 50 })
+  const relay = new HubRelay({ registry, now: options.now ?? Date.now, timeoutMs: 50, hubEpoch: 'hub-test' })
   relay.publish({
     v: 2, type: 'event', deviceId: 'mac', agent: 'dsh', sessionId: 's1', nodeEpoch: 'epoch-1',
     seq: 1, ts: 1, kind: 'session.updated', payload: { running: false, updatedAt: 1, cwd: '/secret-project' },
@@ -44,7 +44,6 @@ async function start(options: {
     requireToken: TOKEN,
     publicOrigin: ORIGIN,
     operatorId: 'operator-test',
-    hubEpoch: 'hub-test',
     loginFailureDelayMs: 0,
     ...(options.sessionIdleMs === undefined ? {} : { sessionIdleMs: options.sessionIdleMs }),
     ...(options.sessionAbsoluteMs === undefined ? {} : { sessionAbsoluteMs: options.sessionAbsoluteMs }),

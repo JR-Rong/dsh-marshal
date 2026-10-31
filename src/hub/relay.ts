@@ -8,6 +8,7 @@ import { COMMAND_TTL_MS } from '../wire/limits.ts'
 import { commandPayloadDigest } from '../wire/commands.ts'
 import { commandDomainKey } from '../wire/idempotency.ts'
 import { HubIdempotency, DEFAULT_COMPLETED_LIMIT } from './idempotency.ts'
+import { createEventBuffer, type BufferReadResult, type EventBuffer } from './buffer.ts'
 import type { DeviceRegistry, Sender } from './registry.ts'
 
 /** T02 会换成持久化 owner 身份；当前显式占位，不能当作安全声明。 */
@@ -290,7 +291,13 @@ export class HubRelay {
   private readonly idempotency = new HubIdempotency<CommandOutcome>()
   /** 幂等键归属：断线时按设备清掉缓存里的结果正文。 */
   private readonly cacheDevices = new Map<string, string>()
-  private readonly consumers = new Set<(event: EventFrame) => void>()
+  private readonly consumers = new Set<(event: EventFrame, cursor: string | undefined) => void>()
+  /**
+   * 有界历史缓冲是唯一可回放来源；游标 epoch 与 hello.ack 的 hubEpoch 由装配方
+   * 传入同一个值，重连后客户端只需按 `last-event-id` 对齐。
+   */
+  private readonly buffer: EventBuffer
+  private readonly historyEpochValue: string
   private readonly index = new Map<string, SessionRow>()
   /** 设备 -> agent -> 已提交能力文档；只在 sync 提交或 capability.changed 时更新。 */
   private readonly capabilityIndex = new Map<string, Map<string, Record<string, unknown>>>()
@@ -306,7 +313,11 @@ export class HubRelay {
     now: () => number
     timeoutMs?: number
     operatorId?: string
-  }) {}
+    hubEpoch?: string
+  }) {
+    this.historyEpochValue = options.hubEpoch ?? randomUUID()
+    this.buffer = createEventBuffer({ hubEpoch: this.historyEpochValue, now: options.now })
+  }
 
   /** hub 装配同步协调器后注入：未完成原子提交的设备不得收到写命令。 */
   setSyncGate(gate: ((deviceId: string, connectionId: string, nodeEpoch: string) => boolean) | undefined): void {
@@ -714,14 +725,15 @@ export class HubRelay {
     this.capabilityIndex.set(commit.deviceId, capabilities)
 
     // 删除与新/变更都在同一轮同步代码内发布；失败路径不会走到这里。
+    // 这些是 hub 派生通知，不回放进历史（重连屏障会重新取索引/能力）。
     for (const [, row] of removed) {
       this.fanout({
         v: 2, type: 'event', deviceId: commit.deviceId, agent: row.agent, sessionId: row.sessionId,
         nodeEpoch: commit.nodeEpoch, seq: 0, ts: this.options.now(), kind: 'session.removed', payload: {},
-      })
+      }, undefined)
     }
     for (const [, row] of changed) {
-      this.fanout(this.sessionEvent(row, commit.nodeEpoch))
+      this.fanout(this.sessionEvent(row, commit.nodeEpoch), undefined)
     }
     for (const [agent, document] of capabilities) {
       if (stableCapability(previousCapabilities?.get(agent)) === stableCapability(document)) continue
@@ -731,7 +743,7 @@ export class HubRelay {
           v: 2, type: 'event', deviceId: commit.deviceId, agent, sessionId: row.sessionId,
           nodeEpoch: commit.nodeEpoch, seq: 0, ts: this.options.now(), kind: 'capability.changed',
           payload: document,
-        })
+        }, undefined)
       }
     }
     return true
@@ -746,10 +758,11 @@ export class HubRelay {
     return out
   }
 
-  /** 停止接收新指令：清定时器、以固定错误结束所有等待中的指令。幂等。 */
+  /** 停止接收新指令：清定时器、以固定错误结束所有等待中的指令、清空并关闭历史。幂等。 */
   dispose(): void {
     if (this.disposed) return
     this.disposed = true
+    this.buffer.dispose()
     const waiting = [...this.pending.values()]
     this.pending.clear()
     const waitingStatus = [...this.statusPending.values()]
@@ -786,17 +799,21 @@ export class HubRelay {
   }
 
   /** 单个订阅者抛错不影响其它订阅者，也不影响调用方。 */
-  private fanout(event: EventFrame): void {
+  private fanout(event: EventFrame, cursor: string | undefined): void {
     for (const consumer of [...this.consumers]) {
-      try { consumer(event) } catch { /* 忽略单个订阅者的失败 */ }
+      try { consumer(event, cursor) } catch { /* 忽略单个订阅者的失败 */ }
     }
   }
 
   /**
    * 记录会话索引并扇出；索引只存设备/agent/sessionId/运行态/所有权/计数，
    * 不存 cwd/标题或正文。省略字段保留旧值；turn 事件只在已有行上改运行态。
+   *
+   * 先 append 再扇出：缓存是唯一可回放来源，只有缓存接纳的事件才带游标。
+   * 交互帧（input.*）与非白名单载荷会被 buffer 拒收，因此没有 id 行。
    */
   publish(event: EventFrame): void {
+    const appended = this.buffer.append(event)
     const key = `${event.deviceId}\u0000${event.agent}\u0000${event.sessionId}`
     this.epochs.set(event.deviceId, event.nodeEpoch)
     const payload: Record<string, unknown> = event.kind === 'session.removed'
@@ -855,7 +872,7 @@ export class HubRelay {
         map.set(event.agent, document)
       }
     }
-    this.fanout(event)
+    this.fanout(event, appended.cursor)
   }
 
   /** 只返回注册表里仍存在设备的会话，设备断线后不再残留。 */
@@ -864,11 +881,31 @@ export class HubRelay {
       (deviceId === undefined || row.deviceId === deviceId) && this.options.registry.get(row.deviceId) !== undefined)
   }
 
-  subscribe(consumer: (event: EventFrame) => void): () => void {
+  subscribe(consumer: (event: EventFrame, cursor: string | undefined) => void): () => void {
     if (!this.consumers.has(consumer) && this.consumers.size >= MAX_SUBSCRIBERS) {
       throw new Error('relay: too many subscribers')
     }
     this.consumers.add(consumer)
     return () => { this.consumers.delete(consumer) }
+  }
+
+  /** hub 实例 epoch；与 hello.ack 的 hubEpoch、缓存游标前缀同源。 */
+  historyEpoch(): string {
+    return this.historyEpochValue
+  }
+
+  /** 当前高水位游标；没有可回放事件时为 `${epoch}:0`。 */
+  historyCursor(): string {
+    return this.buffer.cursor()
+  }
+
+  /** cursor 省略 = 只做 live 对齐；未知/过期/跨 epoch 游标由 buffer 标 gap。 */
+  historyRead(cursor: string | undefined): BufferReadResult {
+    return this.buffer.read(cursor)
+  }
+
+  /** 内容授权收紧：删除该设备全部可回放历史，返回删除条数。 */
+  purgeHistory(deviceId: string): number {
+    return this.buffer.purgeDevice(deviceId)
   }
 }

@@ -27,7 +27,7 @@ function start(options: { writeResult?: boolean } = {}) {
     0,
     { connectionId: 'conn-1', nodeEpoch: 'epoch-1' },
   )
-  const relay = new HubRelay({ registry, now: Date.now, timeoutMs: 50 })
+  const relay = new HubRelay({ registry, now: Date.now, timeoutMs: 50, hubEpoch: 'hub-test' })
   const test = createMemoryWeb({ ...(options.writeResult === undefined ? {} : { writeResult: options.writeResult }) })
   routes = registerMarshalRoutes({
     webServer: test.webServer,
@@ -36,7 +36,6 @@ function start(options: { writeResult?: boolean } = {}) {
     requireToken: TOKEN,
     publicOrigin: ORIGIN,
     operatorId: 'operator-test',
-    hubEpoch: 'hub-test',
     loginFailureDelayMs: 0,
   })
   web = test
@@ -48,6 +47,22 @@ function publishSession(relay: HubRelay, sessionId = 's1'): void {
     v: 2, type: 'event', deviceId: 'mac', agent: 'dsh', sessionId, nodeEpoch: 'epoch-1',
     seq: 1, ts: 1, kind: 'session.updated', payload: { running: false, updatedAt: 1 },
   })
+}
+
+function publishDelta(relay: HubRelay, seq: number, text: string, sessionId = 's1'): void {
+  relay.publish({
+    v: 2, type: 'event', deviceId: 'mac', agent: 'dsh', sessionId, nodeEpoch: 'epoch-1',
+    seq, ts: seq, kind: 'message.delta', payload: { text },
+  })
+}
+
+/** 重连屏障会按会话索引发起 inputs.snapshot；用给定高水位立即结算。 */
+async function settleSnapshot(sent: string[], relay: HubRelay, highWatermark: number): Promise<void> {
+  const frame = await waitForFrame(sent, 'inputs.snapshot')
+  relay.settleInputs({
+    v: 2, type: 'inputs.snapshot.result', requestId: frame.requestId as string,
+    runtimeEpoch: 'epoch-1', highWatermark, cards: [],
+  } satisfies InputsSnapshotResultFrame, { deviceId: 'mac', connectionId: 'conn-1', nodeEpoch: 'epoch-1' })
 }
 
 async function waitFor(predicate: () => boolean, label: string): Promise<void> {
@@ -140,5 +155,94 @@ describe('hub sse', () => {
     // 第一次 write 返回 false 后进入 blocked，后续增量直接丢弃。
     expect(res.chunks.length - before).toBeLessThan(5)
     await done
+  })
+
+  it('重连按 last-event-id 回放缓存事件', async () => {
+    const { web: target, relay, sent } = await start()
+    const first = target.start('/marshal/api/stream', { headers: AUTH })
+    await waitFor(() => resetPayload(first.res) !== undefined, 'first reset')
+    const cursor = resetPayload(first.res)?.cursor
+    expect(typeof cursor).toBe('string')
+    expect((cursor as string).startsWith('hub-test:')).toBe(true)
+    first.res.destroy()
+    await first.done
+
+    publishSession(relay, 's2')
+    publishDelta(relay, 2, 'replayed-missing', 's2')
+
+    const second = target.start('/marshal/api/stream', {
+      headers: { ...AUTH, 'last-event-id': cursor as string },
+    })
+    // s2 已进入索引，屏障必须取到输入快照；高水位 1 让 seq 2 的增量进入回放。
+    await settleSnapshot(sent, relay, 1)
+    await waitFor(() => resetPayload(second.res) !== undefined, 'second reset')
+    expect(resetPayload(second.res)).toMatchObject({
+      cursor: expect.stringMatching(/^hub-test:/),
+      replay: { gap: false, truncated: false },
+    })
+    await waitFor(() => second.res.body.includes('replayed-missing'), 'replayed delta')
+    expect(second.res.body).toContain('id: hub-test:')
+    await second.done
+    second.res.destroy()
+  })
+
+  it('过期或跨 epoch 游标只 reset 并报告缺口', async () => {
+    const { web: target, relay } = await start()
+    publishDelta(relay, 1, 'cached-should-not-replay')
+    const { res, done } = target.start('/marshal/api/stream', {
+      headers: { ...AUTH, 'last-event-id': 'hub-test:999999' },
+    })
+    await waitFor(() => resetPayload(res) !== undefined, 'reset')
+    expect(resetPayload(res)).toMatchObject({
+      cursor: expect.stringMatching(/^hub-test:/),
+      replay: { gap: true, truncated: false },
+    })
+    expect(res.body).not.toContain('cached-should-not-replay')
+    await done
+    res.destroy()
+  })
+
+  it('回放跳过不可缓存的交互帧（query 游标）', async () => {
+    const { web: target, relay } = await start()
+    const first = target.start('/marshal/api/stream', { headers: AUTH })
+    await waitFor(() => resetPayload(first.res) !== undefined, 'first reset')
+    const cursor = resetPayload(first.res)?.cursor as string
+    first.res.destroy()
+    await first.done
+
+    relay.publish({
+      v: 2, type: 'event', deviceId: 'mac', agent: 'dsh', sessionId: 's1', nodeEpoch: 'epoch-1',
+      seq: 1, ts: 1, kind: 'input.requested', payload: { requestId: 'req-1' },
+    })
+    publishDelta(relay, 2, 'after-input')
+
+    const { res, done } = target.start(
+      `/marshal/api/stream?cursor=${encodeURIComponent(cursor)}`,
+      { headers: AUTH },
+    )
+    await waitFor(() => resetPayload(res) !== undefined, 'reset')
+    expect(resetPayload(res)).toMatchObject({ replay: { gap: false } })
+    await waitFor(() => res.body.includes('after-input'), 'later delta')
+    expect(res.body).not.toContain('input.requested')
+    await done
+    res.destroy()
+  })
+
+  it('内容撤权清空历史后旧游标变为缺口', async () => {
+    const { web: target, relay } = await start()
+    publishDelta(relay, 1, 'before-purge')
+    const cursor = relay.historyCursor()
+    expect(cursor).toBe('hub-test:1')
+    publishDelta(relay, 2, 'purged-payload')
+    expect(relay.purgeHistory('mac')).toBe(2)
+
+    const { res, done } = target.start('/marshal/api/stream', {
+      headers: { ...AUTH, 'last-event-id': cursor },
+    })
+    await waitFor(() => resetPayload(res) !== undefined, 'reset')
+    expect(resetPayload(res)).toMatchObject({ replay: { gap: true } })
+    expect(res.body).not.toContain('purged-payload')
+    await done
+    res.destroy()
   })
 })

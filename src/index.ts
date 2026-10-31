@@ -34,12 +34,13 @@ function applyHub(ctx: MarshalContext, config: MarshalConfig): void {
   const registry = new DeviceRegistry()
   const install = ensureInstall(config.devicesFile)
   if (install.initialized) ctx.logger.warn('marshal: empty device table')
-  const relay = new HubRelay({ registry, now: Date.now, operatorId: install.operatorId })
+  // 同一个 epoch 同时作为历史游标前缀与 hello.ack 的 hubEpoch，重连才能对齐。
+  const hubEpoch = randomUUID()
+  const relay = new HubRelay({ registry, now: Date.now, operatorId: install.operatorId, hubEpoch })
   const sync = createHubSync({ relay, now: Date.now, logger: ctx.logger })
   // 只能在匹配的 sync.ack 原子提交后写入；同步期间一律 sync-required。
   relay.setSyncGate((deviceId, connectionId, nodeEpoch) =>
     sync.isSynced({ deviceId, connectionId, nodeEpoch }))
-  const hubEpoch = randomUUID()
   const socket = mountHubSocket({
     port: webServerPort(webServer),
     registry,
@@ -50,6 +51,8 @@ function applyHub(ctx: MarshalContext, config: MarshalConfig): void {
     logger: ctx.logger,
     sync,
     onDetach: deviceId => relay.deviceOffline(deviceId),
+    // 内容授权收紧后不再保留该设备的可回放正文。
+    onContentRevoked: deviceId => { relay.purgeHistory(deviceId) },
     onFrame: (identity, frame) => {
       // 事件进索引并扇出；ACK 必须同时匹配 commandId 与连接身份才结算。
       if (frame.type === 'event') relay.publish(frame)
@@ -63,7 +66,7 @@ function applyHub(ctx: MarshalContext, config: MarshalConfig): void {
   ctx.effect(() => { socket.dispose(); sync.dispose(); relay.dispose() }, 'marshal: uplink socket')
   ctx.effect(registerMarshalRoutes({
     webServer, registry, relay, sync, requireToken: config.dashboardToken!,
-    publicOrigin: config.publicOrigin!, operatorId: install.operatorId, hubEpoch,
+    publicOrigin: config.publicOrigin!, operatorId: install.operatorId,
   }).dispose, 'marshal: dashboard routes')
   ctx.logger.info(`marshal: hub ready at ${webServer.getOrigin()}/marshal`)
 }

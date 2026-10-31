@@ -88,6 +88,8 @@ export interface HubSocketOptions {
   readonly onAttach?: (deviceId: string) => void
   /** 设备连接真正被摘除后调用；用于立刻结束发给它的等待中指令。 */
   readonly onDetach?: (deviceId: string) => void
+  /** 内容授权实际收紧后调用；用于清掉该设备的可回放历史。 */
+  readonly onContentRevoked?: (deviceId: string) => void
 }
 
 export interface HubSocketHandle {
@@ -165,6 +167,12 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
   const connections = new WeakMap<WebSocket, Connection>()
   const socketOf = new Map<string, WebSocket>()
   const liveness = new WeakMap<WebSocket, LivenessState>()
+  /**
+   * 当前实际持有内容授权的设备：节点自报 privacy === 'content' 且 hub 记录
+   * allowContent === true 才算生效（hub 策略始终优先）。跨重连保留，用于识别
+   * “从有内容权限变为没有”的收紧瞬间。
+   */
+  const contentDevices = new Set<string>()
   /** 升级成功但还没完成 hello 的 socket 数量；超过上限直接 4408。 */
   let pendingHellos = 0
   /** 节点自报更高 revision 时只隔离该设备，不抬高全局修订。 */
@@ -266,6 +274,12 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
       } else if (current.policyRevision !== previous.policyRevision) {
         // 授权变化必须让节点重新握手拿到新 ack；4409 可重试且不更换 nodeEpoch。
         closeDevice(deviceId, CLOSE_CODES.STALE_CONNECTION, 'policy-changed')
+      }
+      // 只有 allowContent 真正由真变假（或设备消失/撤销）才算内容收紧；
+      // recovery-required 只是修订不可确认，不是收紧，不能误清历史。
+      if (previous.allowContent && (current === undefined || current.revoked || !current.allowContent)) {
+        contentDevices.delete(deviceId)
+        options.onContentRevoked?.(deviceId)
       }
     }
     records = next
@@ -453,6 +467,10 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
           // 节点重连后会重新同步：协调器保留旧索引并标 stale，或按新 epoch 丢弃旧能力。
           options.sync?.attach(identityOf(connection), frame.agents)
           options.onAttach?.(latest.id)
+          // 内容授权 = 节点自报 privacy + hub 持久 allowContent；收紧时清掉历史正文。
+          const effectiveContent = frame.privacy === 'content' && latest.allowContent === true
+          if (effectiveContent) contentDevices.add(latest.id)
+          else if (contentDevices.delete(latest.id)) options.onContentRevoked?.(latest.id)
           const ack: HelloAckFrame = {
             v: 2, type: 'hello.ack', connectionId, hubEpoch,
             contractRevision: CONTRACT_REVISION,
@@ -598,6 +616,7 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
       clearInterval(pingTimer)
       for (const helloTimer of helloTimers) clearTimeout(helloTimer)
       helloTimers.clear()
+      contentDevices.clear()
       closePort()
       for (const ws of wss.clients) {
         stopHubHeartbeat(ws)

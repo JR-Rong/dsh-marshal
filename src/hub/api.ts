@@ -4,6 +4,7 @@ import type { WebServerLike } from '../dsh-types.ts'
 import { COMMAND_OPS, type CommandFrame, type CommandOp, type EventFrame } from '../wire/frames.ts'
 import { parseCommandArgs } from '../wire/commands.ts'
 import { MAX_FRAME_BYTES } from '../wire/limits.ts'
+import type { BufferReadResult } from './buffer.ts'
 import type { DeviceRegistry } from './registry.ts'
 import type { CommandOutcome, CommandStatusOutcome, HubRelay } from './relay.ts'
 import type { HubSync } from './sync.ts'
@@ -19,8 +20,6 @@ export interface ApiOptions {
   readonly publicOrigin?: string
   /** 会话绑定的持久 owner 身份；不接收浏览器自报值。 */
   readonly operatorId?: string
-  /** 每次挂载一个实例标识；SSE reset 用它让客户端丢弃旧时间线。 */
-  readonly hubEpoch?: string
   readonly now?: () => number
   /** 测试可缩短；生产固定 8h 绝对 / 30min 空闲。 */
   readonly sessionAbsoluteMs?: number
@@ -411,7 +410,8 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
   const now = options.now ?? Date.now
   const publicOrigin = options.publicOrigin ?? ''
   const operatorId = options.operatorId ?? 'operator-unbound'
-  const hubEpoch = options.hubEpoch ?? randomUUID()
+  // 游标 epoch 以中继历史缓冲为准，保证 hello.ack、reset 与 id 行走同一个代次。
+  const hubEpoch = relay.historyEpoch()
   const absoluteMs = options.sessionAbsoluteMs ?? SESSION_ABSOLUTE_MS
   const idleMs = options.sessionIdleMs ?? SESSION_IDLE_MS
   const failureDelayMs = options.loginFailureDelayMs ?? 250
@@ -818,31 +818,50 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
     if (auth === undefined) return
     const sessionId = auth.kind === 'session' ? auth.session.id : undefined
 
+    // 游标解析：query 优先于 Last-Event-ID；空串视为没带。超长游标不报 400，
+    // 统一按未知游标产生 gap，避免客户端被一个坏 id 永久钉死在错误码上。
+    const query = new URL(req.url ?? '/', 'http://localhost').searchParams
+    const queryCursor = query.get('cursor')?.trim()
+    const headerCursor = headerValue(req, 'last-event-id')?.trim()
+    const requestedRaw = queryCursor !== undefined && queryCursor !== ''
+      ? queryCursor
+      : headerCursor !== undefined && headerCursor !== '' ? headerCursor : undefined
+    const replayRequested = requestedRaw !== undefined
+    const requestedCursor = requestedRaw !== undefined && requestedRaw.length <= HISTORY_CURSOR_MAX
+      ? requestedRaw
+      : undefined
+
     // 背压：tab 卡住时丢弃增量，轮询会重新对齐状态，避免无限缓冲。
     let blocked = false
     const writeRaw = (text: string): void => {
       if (res.writableEnded || res.destroyed) return
       blocked = res.write(text) === false
     }
-    const sendEvent = (event: EventFrame): void => {
+    const sendEvent = (event: EventFrame, cursor: string | undefined): void => {
       if (blocked) return
-      writeRaw(`data: ${JSON.stringify(event)}\n\n`)
+      // 只有被历史缓冲接纳的事件才有可回放 id；input.* 等交互帧不带 id。
+      const id = cursor === undefined ? '' : `id: ${cursor}\n`
+      writeRaw(`${id}data: ${JSON.stringify(event)}\n\n`)
     }
-    const sendReset = (
-      degraded: readonly string[],
-      complete: boolean,
-      capabilities?: Record<string, Record<string, Record<string, unknown>>>,
-    ): void => {
+    const sendReset = (reset: {
+      degraded: readonly string[]
+      complete: boolean
+      capabilities?: Record<string, Record<string, Record<string, unknown>>>
+      cursor: string
+      replay?: { gap: boolean; dropped: number; truncated: boolean }
+    }): void => {
       writeRaw(`event: reset\ndata: ${JSON.stringify({
-        required: true, hubEpoch, degradedDevices: [...degraded], complete,
-        ...(capabilities === undefined ? {} : { capabilities }),
+        required: true, hubEpoch, degradedDevices: [...reset.degraded], complete: reset.complete,
+        cursor: reset.cursor,
+        ...(reset.capabilities === undefined ? {} : { capabilities: reset.capabilities }),
+        ...(reset.replay === undefined ? {} : { replay: reset.replay }),
       })}\n\n`)
     }
 
     // 先订阅再有界暂存：订阅回调本身就是屏障完成前的队列，不做正文回放。
     let phase: 'buffer' | 'live' = 'buffer'
     let overflow = false
-    const staged: EventFrame[] = []
+    const staged: Array<{ event: EventFrame; cursor: string | undefined }> = []
     let stagedChars = 0
     const floors = new Map<string, number>()
     /** 设备 -> 快照时观测到的 runtimeEpoch；换代说明屏障已过期。 */
@@ -850,7 +869,7 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
     const nodeEpochs = new Map<string, string>()
     const degraded = new Set<string>()
 
-    const deliver = (event: EventFrame): void => {
+    const deliver = (event: EventFrame, cursor: string | undefined): void => {
       // 同一设备的 nodeEpoch 变化意味着旧索引/高水位已失效，必须重新 reset。
       const knownEpoch = nodeEpochs.get(event.deviceId)
       if (knownEpoch === undefined) {
@@ -862,30 +881,30 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
         for (const key of [...floors.keys()]) {
           if (key.startsWith(prefix)) floors.delete(key)
         }
-        sendReset([...degraded], false)
+        sendReset({ degraded: [...degraded], complete: false, cursor: relay.historyCursor() })
         return
       }
       const key = `${event.deviceId}\u0000${event.agent}\u0000${event.sessionId}`
       const floor = floors.get(key)
       if (floor !== undefined && event.seq <= floor) return
       floors.set(key, event.seq)
-      sendEvent(event)
+      sendEvent(event, cursor)
     }
 
     let unsubscribe: (() => void) | null = null
     try {
-      unsubscribe = relay.subscribe(event => {
+      unsubscribe = relay.subscribe((event, cursor) => {
         if (phase === 'buffer') {
           const size = JSON.stringify(event).length
           if (staged.length >= MAX_STAGED_EVENTS || stagedChars + size > MAX_STAGED_CHARS) {
             overflow = true
             return
           }
-          staged.push(event)
+          staged.push({ event, cursor })
           stagedChars += size
           return
         }
-        deliver(event)
+        deliver(event, cursor)
       })
     } catch {
       // 订阅者上限是内部容量问题，不回显异常文本。
@@ -966,13 +985,33 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
     // 能力文档与索引在同一屏障内读取；页面以 reset 后的这份快照为准。
     const barrierCapabilities: Record<string, Record<string, Record<string, unknown>>> = {}
     for (const deviceId of byDevice.keys()) barrierCapabilities[deviceId] = relay.capabilities(deviceId)
+    // 快照高水位：客户端拿它作为下一次 live 对齐点；历史缺口另行报告。
+    const snapshotCursor = relay.historyCursor()
+    let replay: BufferReadResult | undefined
+    if (replayRequested) {
+      replay = requestedCursor === undefined
+        ? { events: [], cursor: snapshotCursor, gap: true, dropped: 0, truncated: false }
+        : relay.historyRead(requestedCursor)
+    }
     // v0 每次建连都要求 reset：先让客户端清空时间线/卡片，再补高水位之后的增量。
-    sendReset([...degraded], complete, barrierCapabilities)
+    sendReset({
+      degraded: [...degraded], complete, capabilities: barrierCapabilities, cursor: snapshotCursor,
+      ...(replay === undefined
+        ? {}
+        : { replay: { gap: replay.gap, dropped: replay.dropped, truncated: replay.truncated } }),
+    })
     // 暂存超限时整段丢弃：不知道缺了哪条，就不能放行半快照。
     if (complete) {
-      for (const event of staged) {
-        if (degraded.has(event.deviceId)) continue
-        deliver(event)
+      // 先按接收顺序补历史，再放行屏障期间的增量；重复项由每会话 seq 底价去重。
+      if (replay !== undefined) {
+        for (const item of replay.events) {
+          if (degraded.has(item.event.deviceId)) continue
+          deliver(item.event, item.cursor)
+        }
+      }
+      for (const item of staged) {
+        if (degraded.has(item.event.deviceId)) continue
+        deliver(item.event, item.cursor)
       }
     }
     staged.length = 0

@@ -63,6 +63,7 @@ interface ServeOptions {
   readonly watchDevices?: boolean
   readonly pollMs?: number
   readonly sync?: HubSync
+  readonly onContentRevoked?: (deviceId: string) => void
 }
 
 function writeStore(records: readonly DeviceRecord[] = [DEVICE]): { store: DeviceStore; path: string } {
@@ -462,6 +463,31 @@ describe('hub socket', () => {
     const code = closeCode(ws)
     store.setPolicy(DEVICE_ID, { allowContent: true })
     expect(await code).toBe(4409)
+  })
+
+  it('内容授权收紧回调一次，重连 metadata 不再回调', async () => {
+    const registry = new DeviceRegistry()
+    const revoked: string[] = []
+    const record: DeviceRecord = { ...DEVICE, allowContent: true }
+    const { port, mounted, devicesPath } = await serve(registry, [], [record], {
+      onContentRevoked: deviceId => revoked.push(deviceId),
+    })
+    const ws = await hello(registry, port, { privacy: 'content' })
+    const code = closeCode(ws)
+    // 重写设备表模拟操作者收紧 allowContent；策略修订必须一起递增。
+    writeFileSync(
+      devicesPath,
+      serializeDevicesState({ version: 2, devices: [{ ...record, allowContent: false, policyRevision: 2 }] }),
+      { mode: 0o600 },
+    )
+    mounted.reload()
+    expect(await code).toBe(4409)
+    expect(revoked).toEqual([DEVICE_ID])
+
+    // 已经清空的设备重连只报 metadata：没有“由真变假”的瞬间，不能再清一次。
+    const second = await hello(registry, port)
+    expect(revoked).toEqual([DEVICE_ID])
+    second.close()
   })
 
   it('节点自报更高 policyRevision 只隔离该设备', async () => {
