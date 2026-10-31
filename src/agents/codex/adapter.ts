@@ -10,11 +10,13 @@ import {
   AgentUnavailableError,
   type AgentAdapter, type AgentHealth, type AgentListResult, type AgentState,
   type ControlResult, type CreatedSession, type CreateSessionRequest, type ForkSessionRequest,
-  type HistoryPage, type HistoryRequest, type InterruptRequest, type OwnershipPort,
-  type ProbeResult, type PromptRequest, type SteerRequest, type UnavailableCause,
+  type HistoryPage, type HistoryRequest, type InterruptRequest, type NativeInputPort,
+  type OwnershipPort, type ProbeResult, type PromptRequest, type RelayPolicy,
+  type SteerRequest, type UnavailableCause,
 } from '../types.ts'
 import { createOwnershipCoordinator, OwnershipError, type OwnershipCoordinator } from '../ownership.ts'
 import { createSupervisor, type SpawnFn, type Supervisor, type SupervisorExitReason } from '../supervisor.ts'
+import { classifyCodexServerRequest, codexResponseFor } from './approvals.ts'
 import { resolveCodexBinary, type CodexBinaryResolution } from './binary.ts'
 import { listAllThreads, listTurnsPage, threadRow, type CodexRequest } from './discover.ts'
 import {
@@ -59,6 +61,11 @@ const CODEX_TUNABLES: readonly Tunable[] = [
 export interface CodexAdapterOptions {
   readonly deviceId: string
   readonly nodeEpoch: string
+  /** 必须显式给出；适配器不默认 remote。 */
+  readonly questionRelay: RelayPolicy
+  readonly approvalRelay: RelayPolicy
+  /** node 统一中继；缺失时审批只能本地拒绝。 */
+  readonly inputRelay?: NativeInputPort
   /** 覆盖入口解析（测试/装配注入）；不提供时按显式路径或 PATH 解析。 */
   readonly binary?: CodexBinaryResolution
   readonly explicitPath?: string
@@ -82,6 +89,12 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined
+}
+
+/** 原生请求所属会话；缺失/非法时不能交给中继，只能按协议拒绝。 */
+function requestThreadId(params: unknown): string | undefined {
+  const threadId = asRecord(params)?.threadId
+  return typeof threadId === 'string' && threadId !== '' ? threadId : undefined
 }
 
 function withSignal<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
@@ -142,6 +155,13 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
   let peerEntry: PeerEntry | undefined
   let startup: Promise<CodexPeer> | undefined
   let stopping = false
+  /** 正在等待中继决定的原生审批；连接关闭/停止时一次性 abort，留下原生等待会挂死 agent。 */
+  const pendingApprovals = new Set<AbortController>()
+
+  const abortPendingApprovals = (): void => {
+    for (const controller of pendingApprovals) controller.abort()
+    pendingApprovals.clear()
+  }
 
   const nextSeq = (sessionId: string): number => {
     const next = (seqs.get(sessionId) ?? 0) + 1
@@ -155,6 +175,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
   })
 
   const closePeer = (): void => {
+    abortPendingApprovals()
     const entry = peerEntry
     if (entry === undefined) return
     peerEntry = undefined
@@ -195,12 +216,45 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
     return await peer.request(method, params, signal, parse)
   }
 
-  const handleServerRequest = (_request: {
+  const relayEnabled = (): boolean => options.inputRelay !== undefined
+    && (options.questionRelay === 'remote' || options.approvalRelay === 'remote')
+
+  /** 只有本实例受管且当前持有写权的会话才能把原生等待交给中继。 */
+  const relayable = (sessionId: string): boolean => !stopping
+    && options.inputRelay !== undefined
+    && sessions.isManaged(sessionId)
+    && coordinator.ownership(sessionId) === 'ours'
+
+  const handleServerRequest = async (request: {
     readonly method: string
     readonly params: unknown
-  }): CodexServerResponse => {
-    // T03 只完成基础链路；审批/提问中继由 T05 接入。未知请求一律 method-not-found。
-    return { error: { code: -32601, message: 'method not found' } }
+  }): Promise<CodexServerResponse> => {
+    const classification = classifyCodexServerRequest(request.method, request.params)
+    if (classification.kind === 'response') return classification.response
+
+    const threadId = requestThreadId(request.params)
+    const relay = options.inputRelay
+    if (threadId === undefined || relay === undefined || !relayable(threadId)) {
+      return codexResponseFor(request.method, request.params, { decision: 'decline' })
+    }
+
+    const controller = new AbortController()
+    pendingApprovals.add(controller)
+    try {
+      // 0.166.0 审批不带原生期限，不传 nativeExpiry。
+      const decision = await relay.claim({
+        kind: 'approval',
+        sessionId: threadId,
+        runtimeEpoch,
+        approval: classification.approval,
+      }, controller.signal)
+      return codexResponseFor(request.method, request.params, decision)
+    } catch {
+      // 中继异常只影响本次决定；原生端必须收到明确的拒绝而不是被挂起。
+      return codexResponseFor(request.method, request.params, { decision: 'decline' })
+    } finally {
+      pendingApprovals.delete(controller)
+    }
   }
 
   const bindTurnFromNotification = (sessionId: string, params: unknown): void => {
@@ -363,23 +417,32 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
     }
   }
 
-  const buildAgentCapability = (): Capability => ({
-    observe: { history: true, follow: 'stream' },
-    operations: new Set<Operation>(['create', 'fork']),
-    ownership: 'foreign-unknown',
-    reasoning: true,
-    toolDetail: 'args+output',
-    promptFidelity: 'native',
-    tunables: CODEX_TUNABLES,
-    unavailable: {
+  const buildAgentCapability = (): Capability => {
+    const operations = new Set<Operation>(['create', 'fork'])
+    const unavailable: Record<string, string> = {
       prompt: 'ownership-unverified',
       interrupt: 'ownership-unverified',
       acquire: 'ownership-unverified',
-      answer: 'interaction-relay-unavailable',
-      cancel: 'interaction-relay-unavailable',
       configure: 'settings-readback-unavailable',
-    },
-  })
+    }
+    if (relayEnabled()) {
+      operations.add('answer')
+      operations.add('cancel')
+    } else {
+      unavailable.answer = 'interaction-relay-unavailable'
+      unavailable.cancel = 'interaction-relay-unavailable'
+    }
+    return {
+      observe: { history: true, follow: 'stream' },
+      operations,
+      ownership: 'foreign-unknown',
+      reasoning: true,
+      toolDetail: 'args+output',
+      promptFidelity: 'native',
+      tunables: CODEX_TUNABLES,
+      unavailable,
+    }
+  }
 
   const buildSessionCapability = (sessionId: string): Capability => {
     const ownership = coordinator.ownership(sessionId)
@@ -387,9 +450,15 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
     const managed = sessions.isManaged(sessionId)
     const operations = new Set<Operation>(['create', 'fork'])
     const unavailable: Record<string, string> = {
-      answer: 'interaction-relay-unavailable',
-      cancel: 'interaction-relay-unavailable',
       configure: 'settings-readback-unavailable',
+    }
+    // 外部/未管理的会话永远没有可答卡，能力里也不能暴露 answer/cancel。
+    if (relayEnabled() && owns && managed) {
+      operations.add('answer')
+      operations.add('cancel')
+    } else {
+      unavailable.answer = 'interaction-relay-unavailable'
+      unavailable.cancel = 'interaction-relay-unavailable'
     }
     if (owns) {
       operations.add('prompt')
@@ -626,6 +695,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
     async stop(): Promise<void> {
       stopping = true
       closePeer()
+      abortPendingApprovals()
       sessions.clear()
       coordinator.clear()
       await supervisor.stop()
@@ -777,6 +847,8 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
 
     ownershipPort,
 
+    ...(options.inputRelay === undefined ? {} : { nativeInputPort: options.inputRelay }),
+
     async execute(command: { op: string; target: { sessionId: string }; args?: unknown }): Promise<unknown> {
       const sessionId = command.target.sessionId
       const args = asRecord(command.args) ?? {}
@@ -800,9 +872,30 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
           const snapshot = await ownershipPort.acquire(sessionId, new AbortController().signal)
           return { ownership: snapshot.wire, state: snapshot.state }
         }
-        case 'answer':
-        case 'cancel':
-          throw new PreCallRejection('unsupported', 'interaction-relay-unavailable')
+        case 'answer': {
+          const relay = options.inputRelay
+          if (relay === undefined) {
+            throw new PreCallRejection('unsupported', 'interaction-relay-unavailable')
+          }
+          const requestId = typeof args.requestId === 'string' ? args.requestId : ''
+          if (requestId === '') throw new PreCallRejection('invalid-args', 'requestId is required')
+          const answers = args.answers
+          if (!Array.isArray(answers)) throw new PreCallRejection('invalid-args', 'answers is required')
+          const result = relay.answer(sessionId, requestId, { answers })
+          if (result !== 'ok') throw new PreCallRejection(result)
+          return { accepted: true }
+        }
+        case 'cancel': {
+          const relay = options.inputRelay
+          if (relay === undefined) {
+            throw new PreCallRejection('unsupported', 'interaction-relay-unavailable')
+          }
+          const requestId = typeof args.requestId === 'string' ? args.requestId : ''
+          if (requestId === '') throw new PreCallRejection('invalid-args', 'requestId is required')
+          const result = relay.cancel(sessionId, requestId)
+          if (result !== 'ok') throw new PreCallRejection(result)
+          return { cancelled: true }
+        }
         case 'configure':
           throw new PreCallRejection('unsupported', 'settings-readback-unavailable')
         default:

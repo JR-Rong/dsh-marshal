@@ -88,6 +88,8 @@ export interface ClaudeRuntimeOptions {
   readonly forkSession?: boolean
   readonly pathToClaudeCodeExecutable?: string
   readonly permissionMode?: PermissionMode
+  /** 原生工具审批/提问回调；由适配器分类后交给统一中继。 */
+  readonly canUseTool?: Options['canUseTool']
   readonly includePartialMessages?: boolean
   readonly initTimeoutMs?: number
   readonly maxQueuedInputs?: number
@@ -174,6 +176,7 @@ export function createClaudeRuntime(options: ClaudeRuntimeOptions): ClaudeRuntim
       ? {}
       : { pathToClaudeCodeExecutable: options.pathToClaudeCodeExecutable }),
     ...(options.permissionMode === undefined ? {} : { permissionMode: options.permissionMode }),
+    ...(options.canUseTool === undefined ? {} : { canUseTool: options.canUseTool }),
   }
 
   // SDK 在这里 spawn CLI；之后所有失败都属于「原生调用已经发生」。

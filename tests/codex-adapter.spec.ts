@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest'
+import type { SettleResult } from '../src/adapters/types.ts'
 import { OwnershipError } from '../src/agents/ownership.ts'
 import type { SpawnFn, SupervisorChild } from '../src/agents/supervisor.ts'
+import type {
+  NativeInputClaim, NativeInputDecision, NativeInputPort,
+} from '../src/agents/types.ts'
 import { createCodexAdapter, type CodexAdapterOptions } from '../src/agents/codex/adapter.ts'
 import type { CodexThread, CodexTurn } from '../src/agents/codex/protocol.ts'
 
@@ -104,6 +108,8 @@ class FakeCodexServer {
   readonly child: FakeChild
   readonly requests: ServerRequest[] = []
   readonly notifications: ServerNotification[] = []
+  /** 服务端请求的应答（无 method 的入站记录）。 */
+  readonly responses: Record<string, unknown>[] = []
   threads: CodexThread[] = []
   historyTurns: readonly CodexTurn[] = []
   version = '0.166.0'
@@ -152,7 +158,10 @@ class FakeCodexServer {
   private handleLine(line: string): void {
     const record = JSON.parse(line) as Record<string, unknown>
     const method = record.method
-    if (typeof method !== 'string') return
+    if (typeof method !== 'string') {
+      this.responses.push(record)
+      return
+    }
     if (record.id === undefined) {
       this.notifications.push({ method, params: record.params })
       return
@@ -198,6 +207,46 @@ class FakeCodexServer {
   }
 }
 
+/** 最小内存中继：记录 claim/answer/cancel，并按预设决定立即结算。 */
+class StubInputPort implements NativeInputPort {
+  readonly claims: NativeInputClaim[] = []
+  readonly answerCalls: { sessionId: string; requestId: string; value: unknown }[] = []
+  readonly cancelCalls: { sessionId: string; requestId: string }[] = []
+  decision: NativeInputDecision = { decision: 'decline' }
+  answerResult: SettleResult = 'ok'
+  cancelResult: SettleResult = 'ok'
+
+  async claim(input: NativeInputClaim, _signal: AbortSignal): Promise<NativeInputDecision> {
+    this.claims.push(input)
+    return this.decision
+  }
+
+  answer(sessionId: string, requestId: string, value: unknown): SettleResult {
+    this.answerCalls.push({ sessionId, requestId, value })
+    return this.answerResult
+  }
+
+  cancel(sessionId: string, requestId: string): SettleResult {
+    this.cancelCalls.push({ sessionId, requestId })
+    return this.cancelResult
+  }
+
+  snapshot(): readonly unknown[] { return [] }
+  revalidate(): void {}
+  invalidate(): void {}
+  dispose(): void {}
+}
+
+/** 等适配器的异步应答写出到假服务端。 */
+async function waitForResponse(server: FakeCodexServer, id: unknown): Promise<Record<string, unknown>> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const found = server.responses.find(item => item.id === id)
+    if (found !== undefined) return found
+    await new Promise(resolve => setTimeout(resolve, 1))
+  }
+  throw new Error(`no server response for id ${String(id)}`)
+}
+
 interface Harness {
   readonly adapter: ReturnType<typeof createCodexAdapter>
   readonly servers: FakeCodexServer[]
@@ -215,6 +264,9 @@ function harness(overrides: Partial<CodexAdapterOptions> = {}): Harness {
     deviceId: 'device-1',
     nodeEpoch: 'node-epoch-1',
     runtimeEpoch: 'epoch-1',
+    // 默认关闭交互中继：既有用例不含原生审批/提问。
+    questionRelay: 'off',
+    approvalRelay: 'off',
     binary: {
       ok: true,
       entry: { command: '/opt/codex', args: ['app-server', '--stdio'], source: 'config' },
@@ -442,5 +494,107 @@ describe('codex adapter', () => {
     expect(forked).toEqual({ sessionId: 'fork-1', runtimeEpoch: 'epoch-1', parentSessionId: 's1' })
     expect(h.server().forks).toBe(1)
     await h.adapter.stop()
+  })
+
+  it('relays a native approval of an owned session and answers with the mapped decision', async () => {
+    const relay = new StubInputPort()
+    relay.decision = { decision: 'answer', value: 'accept' }
+    const h = harness({ questionRelay: 'remote', approvalRelay: 'remote', inputRelay: relay })
+    const create = h.adapter.createSession
+    const port = h.adapter.ownershipPort
+    if (create === undefined || port === undefined) throw new Error('v1 ports missing')
+    const created = await create({ requestId: 'req-create' }, signal())
+    await port.acquire(created.sessionId, signal())
+
+    h.server().send({
+      jsonrpc: '2.0',
+      id: 77,
+      method: 'item/commandExecution/requestApproval',
+      params: { threadId: created.sessionId, itemId: 'item-1', command: 'ls -la' },
+    })
+    const response = await waitForResponse(h.server(), 77)
+    expect(response.result).toEqual({ decision: 'accept' })
+    expect(relay.claims).toHaveLength(1)
+    expect(relay.claims[0]).toMatchObject({
+      kind: 'approval', sessionId: created.sessionId, runtimeEpoch: 'epoch-1',
+    })
+    expect(relay.claims[0]?.approval).toMatchObject({ action: '运行命令', detail: 'ls -la' })
+    expect(relay.claims[0]?.nativeExpiry).toBeUndefined()
+    await h.adapter.stop()
+  })
+
+  it('declines a native approval of an external session without claiming', async () => {
+    const relay = new StubInputPort()
+    relay.decision = { decision: 'answer', value: 'accept' }
+    const h = harness({ questionRelay: 'remote', approvalRelay: 'remote', inputRelay: relay })
+    await h.adapter.start(signal())
+    h.server().send({
+      jsonrpc: '2.0',
+      id: 78,
+      method: 'item/commandExecution/requestApproval',
+      params: { threadId: 'external-1', itemId: 'item-1', command: 'ls' },
+    })
+    const response = await waitForResponse(h.server(), 78)
+    expect(response.result).toEqual({ decision: 'decline' })
+    expect(relay.claims).toHaveLength(0)
+    await h.adapter.stop()
+  })
+
+  it('exposes answer/cancel only with a relay and a remote policy', async () => {
+    const off = harness()
+    expect(off.adapter.capabilities('new-1').operations.has('answer')).toBe(false)
+    expect(off.adapter.capabilities('new-1').unavailable?.answer).toBe('interaction-relay-unavailable')
+    await off.adapter.stop()
+
+    const relayed = harness({
+      questionRelay: 'remote', approvalRelay: 'remote', inputRelay: new StubInputPort(),
+    })
+    const capability = relayed.adapter.capabilities('new-1')
+    expect(capability.operations.has('answer')).toBe(false)
+    expect(capability.unavailable?.answer).toBe('interaction-relay-unavailable')
+    const probed = await relayed.adapter.probe(signal())
+    expect([...(probed.capability?.operations ?? [])].sort()).toEqual(['answer', 'cancel', 'create', 'fork'])
+    expect(probed.capability?.unavailable?.answer).toBeUndefined()
+    expect(probed.capability?.unavailable?.cancel).toBeUndefined()
+    await relayed.adapter.stop()
+  })
+
+  it('routes answer and cancel commands to the interaction port', async () => {
+    const relay = new StubInputPort()
+    const h = harness({ questionRelay: 'remote', approvalRelay: 'remote', inputRelay: relay })
+    const answers = [{ id: 'accept', selectedOptionIds: [] }]
+
+    await expect(h.adapter.execute({
+      op: 'answer', target: { sessionId: 'new-1' }, args: { requestId: 'a-1', answers },
+    })).resolves.toEqual({ accepted: true })
+    expect(relay.answerCalls).toEqual([{
+      sessionId: 'new-1', requestId: 'a-1', value: { answers },
+    }])
+
+    relay.answerResult = 'expired'
+    await expect(h.adapter.execute({
+      op: 'answer', target: { sessionId: 'new-1' }, args: { requestId: 'a-2', answers },
+    })).rejects.toMatchObject({ code: 'expired' })
+
+    await expect(h.adapter.execute({
+      op: 'cancel', target: { sessionId: 'new-1' }, args: { requestId: 'a-3' },
+    })).resolves.toEqual({ cancelled: true })
+    expect(relay.cancelCalls).toEqual([{ sessionId: 'new-1', requestId: 'a-3' }])
+
+    relay.cancelResult = 'unknown'
+    await expect(h.adapter.execute({
+      op: 'cancel', target: { sessionId: 'new-1' }, args: { requestId: 'a-4' },
+    })).rejects.toMatchObject({ code: 'unknown' })
+    await h.adapter.stop()
+  })
+
+  it('rejects answer/cancel when no interaction port is wired', async () => {
+    const h = harness()
+    await expect(h.adapter.execute({
+      op: 'answer', target: { sessionId: 'new-1' }, args: { requestId: 'a-1', answers: [] },
+    })).rejects.toMatchObject({ code: 'unsupported' })
+    await expect(h.adapter.execute({
+      op: 'cancel', target: { sessionId: 'new-1' }, args: { requestId: 'a-1' },
+    })).rejects.toMatchObject({ code: 'unsupported' })
   })
 })

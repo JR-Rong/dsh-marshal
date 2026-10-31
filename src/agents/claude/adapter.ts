@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto'
 import { isAbsolute } from 'node:path'
-import type { SDKMessage, SDKSystemMessage } from '@anthropic-ai/claude-agent-sdk'
+import type {
+  Options, PermissionResult, SDKMessage, SDKSystemMessage,
+} from '@anthropic-ai/claude-agent-sdk'
 import {
   PreCallRejection,
   type Capability, type Operation, type SnapshotCompleteness,
@@ -11,8 +13,9 @@ import {
   AgentUnavailableError,
   type AgentAdapter, type AgentHealth, type AgentListResult, type AgentState,
   type ControlResult, type CreatedSession, type CreateSessionRequest, type ForkSessionRequest,
-  type HistoryPage, type HistoryRequest, type InterruptRequest, type OwnershipPort,
-  type ProbeResult, type PromptRequest, type SteerRequest, type UnavailableCause,
+  type HistoryPage, type HistoryRequest, type InterruptRequest, type NativeInputPort,
+  type OwnershipPort, type ProbeResult, type PromptRequest, type RelayPolicy,
+  type SteerRequest, type UnavailableCause,
 } from '../types.ts'
 import { createOwnershipCoordinator, OwnershipError, type OwnershipCoordinator } from '../ownership.ts'
 import { claudeRow, listAllSessions, listSessionMessagesPage } from './discover.ts'
@@ -20,6 +23,7 @@ import {
   createClaudeStreamTracker, historyToEvents, toClaudeEvents,
   type ClaudeEventMeta, type ClaudeStreamTracker,
 } from './map.ts'
+import { classifyClaudeTool, claudePermissionResult } from './permissions.ts'
 import {
   ClaudeRuntimeError, createClaudeRuntime, loadClaudeSdk,
   type ClaudeRuntime, type ClaudeSdk,
@@ -61,6 +65,11 @@ export interface ClaudeAdapterOptions {
   readonly deviceId: string
   readonly nodeEpoch: string
   readonly runtimeEpoch?: string
+  /** 必须显式给出；适配器不默认 remote。 */
+  readonly questionRelay: RelayPolicy
+  readonly approvalRelay: RelayPolicy
+  /** node 统一中继；缺失时原生请求只能本地拒绝。 */
+  readonly inputRelay?: NativeInputPort
   /** 测试/装配注入；不提供时延迟 import 真实 SDK。 */
   readonly sdk?: ClaudeSdk
   /** 新建会话的默认工作目录（必须是绝对路径）。 */
@@ -232,6 +241,43 @@ export function createClaudeAdapter(options: ClaudeAdapterOptions): AgentAdapter
     readonly forkSession?: boolean
   }
 
+  type CanUseToolOptions = Parameters<NonNullable<Options['canUseTool']>>[2]
+
+  const DENIED_TOOL: PermissionResult = { behavior: 'deny', message: '已在 marshal 拒绝此操作' }
+
+  /** canUseTool 不能抛也不能挂起：任何异常/不可中继都返回显式 deny。 */
+  const handleCanUseTool = async (
+    holder: RuntimeHolder,
+    toolName: string,
+    input: Record<string, unknown>,
+    toolOptions: CanUseToolOptions,
+  ): Promise<PermissionResult> => {
+    try {
+      const entry = holder.entry
+      if (entry === undefined || stopping) return DENIED_TOOL
+      const relay = options.inputRelay
+      if (relay === undefined) return DENIED_TOOL
+      // 外部（非本实例受管）会话或失去写权时不建卡；只允许当前 runtime 结算的请求。
+      if (!sessions.isManaged(entry.sessionId)
+        || coordinator.ownership(entry.sessionId) !== 'ours') return DENIED_TOOL
+      const classification = classifyClaudeTool(toolName, input)
+      if (classification.kind === 'deny') {
+        return claudePermissionResult(classification, { decision: 'decline' })
+      }
+      const decision = await relay.claim({
+        kind: classification.kind,
+        sessionId: entry.sessionId,
+        runtimeEpoch,
+        ...(classification.kind === 'question'
+          ? { questions: classification.questions }
+          : { approval: classification.approval }),
+      }, toolOptions.signal)
+      return claudePermissionResult(classification, decision)
+    } catch {
+      return DENIED_TOOL
+    }
+  }
+
   const openRuntime = async (
     sdk: ClaudeSdk,
     params: OpenRuntimeParams,
@@ -255,6 +301,8 @@ export function createClaudeAdapter(options: ClaudeAdapterOptions): AgentAdapter
         if (entry === undefined) return
         handleMessage(entry.sessionId, message)
       },
+      canUseTool: (toolName, input, toolOptions) =>
+        handleCanUseTool(holder, toolName, input, toolOptions),
       onExit: () => {
         const entry = holder.entry
         if (entry === undefined || stopping) return
@@ -295,23 +343,35 @@ export function createClaudeAdapter(options: ClaudeAdapterOptions): AgentAdapter
     phase = 'ready'
   }
 
-  const buildAgentCapability = (): Capability => ({
-    observe: { history: true, follow: 'stream' },
-    operations: new Set<Operation>(['create', 'fork']),
-    ownership: 'foreign-unknown',
-    reasoning: true,
-    toolDetail: 'args+output',
-    promptFidelity: 'native',
-    tunables: CLAUDE_TUNABLES,
-    unavailable: {
+  const relayEnabled = (): boolean => options.inputRelay !== undefined
+    && (options.questionRelay === 'remote' || options.approvalRelay === 'remote')
+
+  const buildAgentCapability = (): Capability => {
+    const operations = new Set<Operation>(['create', 'fork'])
+    const unavailable: Record<string, string> = {
       prompt: 'ownership-unverified',
       interrupt: 'ownership-unverified',
       acquire: 'ownership-unverified',
-      answer: 'interaction-relay-unavailable',
-      cancel: 'interaction-relay-unavailable',
       configure: 'settings-readback-unavailable',
-    },
-  })
+    }
+    if (relayEnabled()) {
+      operations.add('answer')
+      operations.add('cancel')
+    } else {
+      unavailable.answer = 'interaction-relay-unavailable'
+      unavailable.cancel = 'interaction-relay-unavailable'
+    }
+    return {
+      observe: { history: true, follow: 'stream' },
+      operations,
+      ownership: 'foreign-unknown',
+      reasoning: true,
+      toolDetail: 'args+output',
+      promptFidelity: 'native',
+      tunables: CLAUDE_TUNABLES,
+      unavailable,
+    }
+  }
 
   const buildSessionCapability = (sessionId: string): Capability => {
     const ownership = coordinator.ownership(sessionId)
@@ -320,9 +380,15 @@ export function createClaudeAdapter(options: ClaudeAdapterOptions): AgentAdapter
     const dead = failed.has(sessionId)
     const operations = new Set<Operation>(['create', 'fork'])
     const unavailable: Record<string, string> = {
-      answer: 'interaction-relay-unavailable',
-      cancel: 'interaction-relay-unavailable',
       configure: 'settings-readback-unavailable',
+    }
+    // 外部/未管理的会话永远没有可答卡，能力里也不能暴露 answer/cancel。
+    if (relayEnabled() && owns && managed) {
+      operations.add('answer')
+      operations.add('cancel')
+    } else {
+      unavailable.answer = 'interaction-relay-unavailable'
+      unavailable.cancel = 'interaction-relay-unavailable'
     }
     if (dead) {
       unavailable.prompt = 'terminal-failure'
@@ -729,6 +795,8 @@ export function createClaudeAdapter(options: ClaudeAdapterOptions): AgentAdapter
 
     ownershipPort,
 
+    ...(options.inputRelay === undefined ? {} : { nativeInputPort: options.inputRelay }),
+
     async execute(command: { op: string; target: { sessionId: string }; args?: unknown }): Promise<unknown> {
       const sessionId = command.target.sessionId
       const args = asRecord(command.args) ?? {}
@@ -752,9 +820,30 @@ export function createClaudeAdapter(options: ClaudeAdapterOptions): AgentAdapter
           const snapshot = await ownershipPort.acquire(sessionId, new AbortController().signal)
           return { ownership: snapshot.wire, state: snapshot.state }
         }
-        case 'answer':
-        case 'cancel':
-          throw new PreCallRejection('unsupported', 'interaction-relay-unavailable')
+        case 'answer': {
+          const relay = options.inputRelay
+          if (relay === undefined) {
+            throw new PreCallRejection('unsupported', 'interaction-relay-unavailable')
+          }
+          const requestId = typeof args.requestId === 'string' ? args.requestId : ''
+          if (requestId === '') throw new PreCallRejection('invalid-args', 'requestId is required')
+          const answers = args.answers
+          if (!Array.isArray(answers)) throw new PreCallRejection('invalid-args', 'answers is required')
+          const result = relay.answer(sessionId, requestId, { answers })
+          if (result !== 'ok') throw new PreCallRejection(result)
+          return { accepted: true }
+        }
+        case 'cancel': {
+          const relay = options.inputRelay
+          if (relay === undefined) {
+            throw new PreCallRejection('unsupported', 'interaction-relay-unavailable')
+          }
+          const requestId = typeof args.requestId === 'string' ? args.requestId : ''
+          if (requestId === '') throw new PreCallRejection('invalid-args', 'requestId is required')
+          const result = relay.cancel(sessionId, requestId)
+          if (result !== 'ok') throw new PreCallRejection(result)
+          return { cancelled: true }
+        }
         case 'configure':
           throw new PreCallRejection('unsupported', 'settings-readback-unavailable')
         default:

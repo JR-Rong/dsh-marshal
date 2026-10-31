@@ -5,7 +5,11 @@ import type {
   SDKSessionInfo, SDKSystemMessage, SDKUserMessage, SessionMessage,
 } from '@anthropic-ai/claude-agent-sdk'
 import type { EventFrame } from '../src/wire/frames.ts'
+import type { SettleResult } from '../src/adapters/types.ts'
 import { OwnershipError } from '../src/agents/ownership.ts'
+import type {
+  NativeInputClaim, NativeInputDecision, NativeInputPort,
+} from '../src/agents/types.ts'
 import {
   createClaudeAdapter, type ClaudeAdapterOptions,
 } from '../src/agents/claude/adapter.ts'
@@ -178,12 +182,45 @@ interface Harness {
   query(): FakeQuery
 }
 
+/** 最小内存中继：记录 claim/answer/cancel，并按预设决定立即结算。 */
+class StubInputPort implements NativeInputPort {
+  readonly claims: NativeInputClaim[] = []
+  readonly answerCalls: { sessionId: string; requestId: string; value: unknown }[] = []
+  readonly cancelCalls: { sessionId: string; requestId: string }[] = []
+  decision: NativeInputDecision = { decision: 'decline' }
+  answerResult: SettleResult = 'ok'
+  cancelResult: SettleResult = 'ok'
+
+  async claim(input: NativeInputClaim, _signal: AbortSignal): Promise<NativeInputDecision> {
+    this.claims.push(input)
+    return this.decision
+  }
+
+  answer(sessionId: string, requestId: string, value: unknown): SettleResult {
+    this.answerCalls.push({ sessionId, requestId, value })
+    return this.answerResult
+  }
+
+  cancel(sessionId: string, requestId: string): SettleResult {
+    this.cancelCalls.push({ sessionId, requestId })
+    return this.cancelResult
+  }
+
+  snapshot(): readonly unknown[] { return [] }
+  revalidate(): void {}
+  invalidate(): void {}
+  dispose(): void {}
+}
+
 function harness(overrides: Partial<ClaudeAdapterOptions> = {}): Harness {
   const sdk = new FakeClaudeSdk()
   const adapter = createClaudeAdapter({
     deviceId: 'device-1',
     nodeEpoch: 'node-epoch-1',
     runtimeEpoch: 'epoch-1',
+    // 默认关闭交互中继：既有用例不含原生审批/提问。
+    questionRelay: 'off',
+    approvalRelay: 'off',
     sdk,
     now: () => 1_700_000_000_000,
     initTimeoutMs: 500,
@@ -479,5 +516,104 @@ describe('claude adapter', () => {
 
     await h.adapter.stop()
     expect(h.adapter.health().state).toBe('stopped')
+  })
+
+  it('routes native AskUserQuestion through the interaction port', async () => {
+    const relay = new StubInputPort()
+    relay.decision = {
+      decision: 'answer',
+      value: { answers: [{ id: 'q1', selected: ['Postgres'] }] },
+    }
+    const h = harness({ questionRelay: 'remote', approvalRelay: 'remote', inputRelay: relay })
+    const create = h.adapter.createSession
+    const port = h.adapter.ownershipPort
+    if (create === undefined || port === undefined) throw new Error('v1 ports missing')
+    const created = await create({ requestId: 'req-create' }, signal())
+    await port.acquire(created.sessionId, signal())
+
+    const canUseTool = h.query().params.options?.canUseTool
+    if (canUseTool === undefined) throw new Error('canUseTool missing')
+    const input = {
+      questions: [{
+        question: '选哪个数据库？',
+        multiSelect: false,
+        options: [{ label: 'Postgres' }, { label: 'SQLite' }],
+      }],
+    }
+    const result = await canUseTool('AskUserQuestion', input, {
+      signal: new AbortController().signal, toolUseID: 'tool-1', requestId: 'ctl-1',
+    })
+
+    expect(relay.claims).toHaveLength(1)
+    expect(relay.claims[0]).toMatchObject({
+      kind: 'question', sessionId: created.sessionId, runtimeEpoch: 'epoch-1',
+    })
+    expect(relay.claims[0]?.questions).toEqual([{
+      id: 'q1',
+      question: '选哪个数据库？',
+      multiSelect: false,
+      options: [{ label: 'Postgres' }, { label: 'SQLite' }],
+    }])
+    expect(result).toEqual({
+      behavior: 'allow',
+      updatedInput: { ...input, answers: { '选哪个数据库？': 'Postgres' } },
+    })
+    if (result === null || result.behavior !== 'allow') throw new Error('expected allow')
+    expect('updatedPermissions' in result).toBe(false)
+
+    const capability = h.adapter.capabilities(created.sessionId)
+    expect(capability.operations.has('answer')).toBe(true)
+    expect(capability.operations.has('cancel')).toBe(true)
+    expect(capability.unavailable?.answer).toBeUndefined()
+    expect(h.adapter.nativeInputPort).toBe(relay)
+    await h.adapter.stop()
+  })
+
+  it('denies tool calls for sessions that are not ours without claiming', async () => {
+    const relay = new StubInputPort()
+    relay.decision = { decision: 'answer', value: 'accept' }
+    const h = harness({ questionRelay: 'remote', approvalRelay: 'remote', inputRelay: relay })
+    const create = h.adapter.createSession
+    if (create === undefined) throw new Error('createSession missing')
+    await create({ requestId: 'req-create' }, signal())
+
+    const canUseTool = h.query().params.options?.canUseTool
+    if (canUseTool === undefined) throw new Error('canUseTool missing')
+    const result = await canUseTool('Bash', { command: 'ls' }, {
+      signal: new AbortController().signal, toolUseID: 'tool-1', requestId: 'ctl-1',
+    })
+    expect(result).toMatchObject({ behavior: 'deny' })
+    expect(relay.claims).toHaveLength(0)
+    expect(h.adapter.capabilities('session-created').operations.has('answer')).toBe(false)
+    await h.adapter.stop()
+  })
+
+  it('routes answer and cancel commands to the interaction port', async () => {
+    const relay = new StubInputPort()
+    const h = harness({ questionRelay: 'remote', approvalRelay: 'remote', inputRelay: relay })
+    const answers = [{ id: 'q1', selectedOptionIds: ['q1o1'] }]
+
+    await expect(h.adapter.execute({
+      op: 'answer', target: { sessionId: 'session-created' }, args: { requestId: 'q-1', answers },
+    })).resolves.toEqual({ accepted: true })
+    expect(relay.answerCalls).toEqual([{
+      sessionId: 'session-created', requestId: 'q-1', value: { answers },
+    }])
+
+    relay.answerResult = 'decision-invalid'
+    await expect(h.adapter.execute({
+      op: 'answer', target: { sessionId: 'session-created' }, args: { requestId: 'q-2', answers },
+    })).rejects.toMatchObject({ code: 'decision-invalid' })
+
+    await expect(h.adapter.execute({
+      op: 'cancel', target: { sessionId: 'session-created' }, args: { requestId: 'q-3' },
+    })).resolves.toEqual({ cancelled: true })
+    expect(relay.cancelCalls).toEqual([{ sessionId: 'session-created', requestId: 'q-3' }])
+
+    relay.cancelResult = 'session-mismatch'
+    await expect(h.adapter.execute({
+      op: 'cancel', target: { sessionId: 'session-created' }, args: { requestId: 'q-4' },
+    })).rejects.toMatchObject({ code: 'session-mismatch' })
+    await h.adapter.stop()
   })
 })
