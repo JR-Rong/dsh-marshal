@@ -46,7 +46,8 @@ describe('page v1 capability flow', () => {
     expect(PAGE_HTML).toContain('回读未确认，不自动重试')
     expect(PAGE_HTML).toContain('已受理，等待源端回读')
     // 提交值不得写回展示值；current 只来自新的服务端能力文档。
-    expect(PAGE_HTML).not.toContain('tunable.current =')
+    // 用正则排除赋值，避免把 `tunable.current === ...` 这种只读比较误判为写回。
+    expect(PAGE_HTML).not.toMatch(/tunable\.current\s*=(?!=)/)
     // 没有超时自动重发路径。
     expect(PAGE_HTML).not.toContain('setTimeout(function() { configureTunable')
   })
