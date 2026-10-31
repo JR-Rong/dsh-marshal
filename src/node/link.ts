@@ -171,7 +171,28 @@ export class NodeLink {
     this.enqueue(text)
   }
 
-  sendEvent(frame: EventFrame): void { this.sendRaw(encodeFrame(frame)) }
+  sendEvent(frame: EventFrame): void {
+    // 交互帧无论从哪个出口来都不能进入离线队列。
+    if (frame.kind === 'input.requested' || frame.kind === 'input.resolved') {
+      this.sendVolatileEvent(frame)
+      return
+    }
+    this.sendRaw(encodeFrame(frame))
+  }
+
+  /**
+   * 交互卡/通知的 volatile 出口：只在线且已握手时直发，绝不进入离线队列。
+   * 重连后由当前待答表重新投影（T07）；旧卡不能从缓存补发。
+   */
+  sendVolatileRaw(text: string): void {
+    if (this.closed || !this.acked || this.socket === undefined) {
+      this.droppedCount += 1
+      return
+    }
+    if (!this.trySend(this.socket, text)) this.droppedCount += 1
+  }
+
+  sendVolatileEvent(frame: EventFrame): void { this.sendVolatileRaw(encodeFrame(frame)) }
 
   /** 授权收紧时丢弃按旧策略编码的积压帧；快照会以新策略重建可见状态。 */
   clearOutbound(): void {

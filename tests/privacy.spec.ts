@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import type { AckFrame, EventFrame, MarshalKind } from '../src/wire/frames.ts'
+import type { AckFrame, CommandStatusResultFrame, EventFrame, MarshalKind } from '../src/wire/frames.ts'
 import { MAX_FRAME_BYTES } from '../src/wire/limits.ts'
 import {
   createPrivacyProjector, splitUtf8,
@@ -196,6 +196,19 @@ describe('privacy projector: ack/status', () => {
     expect(projected.code).toBe('unknown')
   })
 
+  it('工具/回合状态与状态查询只透出已知枚举', () => {
+    const p = projector()
+    const tool = p.event(event('tool.started', { callId: 'c1', tool: 'bash', status: 'free text / leaked' }))
+    expect((tool[0]?.payload as { status: string }).status).toBe('unknown')
+    const turn = p.event(event('turn.completed', { turnId: 't1', state: 'whatever' }))
+    expect((turn[0]?.payload as { state: string }).state).toBe('unknown')
+    const status = p.statusResult({
+      v: 2, type: 'command.status.result', requestId: 'r1',
+      status: 'not-a-status' as CommandStatusResultFrame['status'],
+    })
+    expect(status.status).toBe('outcome-unknown')
+  })
+
   it('状态查询结果走同一白名单', () => {
     const p = projector()
     const projected = p.statusResult({
@@ -281,8 +294,47 @@ describe('privacy projector: interaction cards', () => {
     }
   })
 
-  it('重复选项或脱敏歧义使整卡不可答', () => {
+  it('任何截断/丢弃都让卡片不可远答并标记 ambiguous', () => {
     const p = projector({ questionRelay: 'remote', allowInteractions: true })
+    const longPrompt = p.card({
+      ...cardInput,
+      questions: [{ id: 'q1', prompt: 'x'.repeat(2_100), options: [{ label: 'A' }] }],
+    })
+    expect(longPrompt.mode).toBe('remote')
+    if (longPrompt.mode === 'remote') {
+      expect(longPrompt.answerable).toBe(false)
+      expect(longPrompt.payload.acceptOnceEligible).toBe(false)
+      expect(longPrompt.payload.ambiguous).toBe(true)
+    }
+
+    const tooManyOptions = p.card({
+      ...cardInput,
+      questions: [{
+        id: 'q1', question: '选哪个？',
+        options: Array.from({ length: 17 }, (_, index) => ({ id: `o${index}`, label: `L${index}` })),
+      }],
+    })
+    expect(tooManyOptions.mode).toBe('remote')
+    if (tooManyOptions.mode === 'remote') {
+      expect(tooManyOptions.answerable).toBe(false)
+      expect(tooManyOptions.payload.acceptOnceEligible).toBe(false)
+      expect(tooManyOptions.payload.ambiguous).toBe(true)
+    }
+  })
+
+  it('可远答的卡片没有任何截断/歧义标记', () => {
+    const p = projector({ questionRelay: 'remote', allowInteractions: true })
+    const card = p.card(cardInput)
+    expect(card.mode).toBe('remote')
+    if (card.mode === 'remote') {
+      expect(card.answerable).toBe(true)
+      expect(card.payload.acceptOnceEligible).toBe(true)
+      expect(card.payload.ambiguous).toBeUndefined()
+      expect(JSON.stringify(card.payload)).not.toContain('truncated')
+    }
+  })
+
+  it('重复选项或脱敏歧义使整卡不可答', () => {    const p = projector({ questionRelay: 'remote', allowInteractions: true })
     const duplicate = p.card({
       ...cardInput,
       questions: [{

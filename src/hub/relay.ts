@@ -6,7 +6,7 @@ import {
 import { COMMAND_TTL_MS } from '../wire/limits.ts'
 import { commandPayloadDigest } from '../wire/commands.ts'
 import { commandDomainKey } from '../wire/idempotency.ts'
-import { HubIdempotency } from './idempotency.ts'
+import { HubIdempotency, DEFAULT_COMPLETED_LIMIT } from './idempotency.ts'
 import type { DeviceRegistry, Sender } from './registry.ts'
 
 /** T02 会换成持久化 owner 身份；当前显式占位，不能当作安全声明。 */
@@ -60,7 +60,8 @@ export interface SessionRow {
   readonly sessionId: string
   readonly running: boolean
   readonly updatedAt: number
-  readonly cwd?: string
+  readonly ownership?: string
+  readonly counts?: Readonly<Record<string, number>>
 }
 
 /** 订阅者数量上限，避免单个 hub 被无限个监听者拖垮。 */
@@ -72,8 +73,8 @@ const DISPOSED_MESSAGE = 'relay: disposed'
 /** 被拒绝 ACK 的计数上限：只用于观测，不能被对端无限推高。 */
 const MAX_REJECTED_ACKS = 1_000
 
-/** 幂等键→设备的有界映射，只用于断线时定位要清正文的缓存。 */
-const MAX_CACHE_DEVICES = 4_096
+/** 幂等键→设备的有界映射，只用于断线时定位要清正文的缓存；与结果缓存同上限。 */
+const MAX_CACHE_DEVICES = DEFAULT_COMPLETED_LIMIT
 
 /** 帧到达时的连接身份；ACK 必须与命令绑定及当前连接同时匹配。 */
 export interface FrameIdentity {
@@ -84,6 +85,21 @@ export interface FrameIdentity {
 
 function disposedOutcome(): CommandOutcome {
   return { ok: false, status: 'outcome-unknown', code: 'disposed', message: DISPOSED_MESSAGE }
+}
+
+/** 索引计数只收有界非负整数；未知字段/嵌套对象一律丢弃。 */
+function indexCounts(value: unknown): Readonly<Record<string, number>> | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
+  const out: Record<string, number> = {}
+  let seen = 0
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    if (seen >= 16) break
+    if (typeof item === 'number' && Number.isInteger(item) && item >= 0) {
+      out[key.slice(0, 32)] = item
+      seen += 1
+    }
+  }
+  return seen === 0 ? undefined : out
 }
 
 /** 断线/收紧后缓存只能保留生命周期结论，结果正文一律丢弃。 */
@@ -164,7 +180,10 @@ export class HubRelay {
     }
   }
 
-  /** 只清该设备的结果正文，保留状态与 code；幂等键仍会阻止重放。 */
+  /**
+   * 只清该设备的结果正文，保留状态与 code；幂等键仍会阻止重放。
+   * 交互正文不进入缓存；completed/unresolved 两张表里的 result 一并清除。
+   */
   private stripDeviceBodies(deviceId: string): void {
     if (this.cacheDevices.size === 0) return
     this.idempotency.stripBodies(key => this.cacheDevices.get(key) === deviceId, withoutBody)
@@ -425,19 +444,24 @@ export class HubRelay {
     }
   }
 
-  /** 记录会话索引并扇出；索引只存设备/agent/sessionId/运行态，不存标题或正文。 */
+  /** 记录会话索引并扇出；索引只存设备/agent/sessionId/运行态/所有权/计数，不存 cwd/标题或正文。 */
   publish(event: EventFrame): void {
     const key = `${event.deviceId}\u0000${event.agent}\u0000${event.sessionId}`
     this.epochs.set(event.deviceId, event.nodeEpoch)
     if (event.kind === 'session.removed') {
       this.index.delete(key)
     } else if (event.kind === 'session.updated') {
-      const payload = (event.payload ?? {}) as { running?: unknown; updatedAt?: unknown; cwd?: unknown }
+      const payload = (event.payload ?? {}) as {
+        running?: unknown; updatedAt?: unknown; ownership?: unknown; counts?: unknown
+      }
+      const ownership = typeof payload.ownership === 'string' ? payload.ownership.slice(0, 32) : undefined
+      const counts = indexCounts(payload.counts)
       this.index.set(key, {
         deviceId: event.deviceId, agent: event.agent, sessionId: event.sessionId,
         running: payload.running === true,
         updatedAt: typeof payload.updatedAt === 'number' ? payload.updatedAt : event.ts,
-        ...(typeof payload.cwd === 'string' ? { cwd: payload.cwd } : {}),
+        ...(ownership === undefined ? {} : { ownership }),
+        ...(counts === undefined ? {} : { counts }),
       })
     }
     // 单个订阅者抛错不影响其它订阅者，也不影响调用方。

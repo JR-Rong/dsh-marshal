@@ -1,6 +1,6 @@
 import { MAX_FRAME_BYTES, MAX_INTERACTION_INPUT_BYTES } from '../wire/limits.ts'
 import {
-  MARSHAL_KINDS, WIRE_ERROR_CODES,
+  COMMAND_OPS, MARSHAL_KINDS, WIRE_ERROR_CODES,
   type AckFrame, type CommandStatusResultFrame, type EventFrame, type MarshalKind, type WireErrorCode,
 } from '../wire/frames.ts'
 import type { AuditFields } from './audit.ts'
@@ -37,9 +37,30 @@ const RESULT_KEYS = new Set([
 ])
 
 const TURN_STATES = new Set(['running', 'completed', 'failed', 'interrupted'])
+const TOOL_STATES = new Set(['running', 'completed', 'failed', 'interrupted', 'error', 'ok', 'cancelled'])
 const RESOLVED_STATES = new Set(['answered', 'declined', 'expired', 'cancelled', 'invalidated', 'failed'])
+const ACK_STATES = new Set(['accepted', 'confirmed', 'rejected', 'pending-confirmation', 'outcome-unknown'])
+const AUDIT_ACTIONS = new Set([
+  ...ACK_STATES, 'admitted', 'answered', 'declined', 'expired', 'cancelled', 'invalidated', 'failed', 'timeout',
+])
+const AUDIT_OPS: ReadonlySet<string> = new Set(COMMAND_OPS)
 const WIRE_CODE_SET: ReadonlySet<string> = new Set(WIRE_ERROR_CODES)
 const KIND_SET: ReadonlySet<string> = new Set(MARSHAL_KINDS)
+const WAIT_KINDS: ReadonlySet<string> = new Set(['input', 'question', 'approval'])
+/** 审计只收标识符；自由文本（含空格/引号/URL 片段）一律不落盘。 */
+const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:@+/-]*$/
+
+/** 卡片字段上限；任何切分/丢弃都会把整卡标成 ambiguous。 */
+const MAX_QUESTIONS = 32
+const MAX_OPTIONS = 16
+const MAX_DECISIONS = 8
+const MAX_PROMPT_CHARS = 2_000
+const MAX_OPTION_LABEL_CHARS = 200
+const MAX_OPTION_DESCRIPTION_CHARS = 400
+const MAX_ACTION_CHARS = 300
+const MAX_APPROVAL_TITLE_CHARS = 200
+const MAX_APPROVAL_DETAIL_CHARS = 600
+const MAX_DECISION_LABEL_CHARS = 120
 
 export interface PrivacyOptions {
   readonly privacy: PrivacyMode
@@ -193,6 +214,20 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
     return { text: masked, changed: masked !== text }
   }
 
+  /** 切片或脱敏都算 altered：卡片据此整体降级，绝不带着残缺内容允许批准。 */
+  const boundedText = (text: string, max: number): { text: string; altered: boolean } => {
+    const sliced = text.length > max
+    const cleaned = scrub(sliced ? text.slice(0, max) : text)
+    return { text: cleaned.text, altered: sliced || cleaned.changed }
+  }
+
+  const boundedId = (value: unknown, max: number): { value?: string; altered: boolean } => {
+    if (typeof value !== 'string' || value === '') return { altered: value !== undefined }
+    const altered = value.length > max
+    const cleaned = scrub(altered ? value.slice(0, max) : value)
+    return altered || cleaned.changed ? { value: cleaned.text, altered: true } : { value: cleaned.text, altered: false }
+  }
+
   const safeText = (value: unknown, max = 4096): string | undefined => {
     const text = typeof value === 'string' ? value : undefined
     if (text === undefined) return undefined
@@ -271,6 +306,10 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
         if (ownership !== undefined) out.ownership = scrub(ownership).text
         const counts = countsOf(payload.counts)
         if (counts !== undefined) out.counts = counts
+        // notify 只带受限等待类别；问题/选项正文绝不进入 session.updated。
+        if (typeof payload.waitKind === 'string' && WAIT_KINDS.has(payload.waitKind)) {
+          out.waitKind = payload.waitKind
+        }
         return out
       }
       case 'session.removed':
@@ -284,7 +323,7 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
         if (runtimeEpoch !== undefined) out.runtimeEpoch = scrub(runtimeEpoch).text
         const state = typeof payload.state === 'string' && TURN_STATES.has(payload.state)
           ? payload.state
-          : kind === 'turn.completed' ? 'completed' : 'running'
+          : 'unknown'
         out.state = state
         return out
       }
@@ -296,7 +335,9 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
       case 'tool.started': {
         const callId = callIdOf(payload, frame)
         const tool = safeString(payload.tool ?? payload.name, 64) ?? 'tool'
-        const status = typeof payload.status === 'string' ? payload.status.slice(0, 16) : 'running'
+        const status = typeof payload.status === 'string'
+          ? TOOL_STATES.has(payload.status) ? payload.status : 'unknown'
+          : 'running'
         return { callId, tool: scrub(tool).text, status }
       }
       case 'tool.output': {
@@ -307,13 +348,14 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
       case 'tool.completed': {
         const callId = callIdOf(payload, frame)
         const status = typeof payload.status === 'string'
-          ? payload.status.slice(0, 16)
+          ? TOOL_STATES.has(payload.status) ? payload.status : 'unknown'
           : payload.isError === true ? 'error' : 'ok'
         return { callId, status }
       }
       case 'input.requested': {
         const mode = interactionMode(payload.kind === 'approval' ? 'approval' : 'question')
-        if (mode === 'off') return undefined
+        // notify 走 session.updated 的 body-less waitKind，绝不注册可答的 input.requested。
+        if (mode !== 'remote') return undefined
         // 适配器可能直接把卡片字段放在 payload 里；缺字段时由 projectCard 拒绝。
         const card = projectCard({
           kind: payload.kind === 'approval' ? 'approval' : 'question',
@@ -480,20 +522,24 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
 
   function projectCard(input: CardInput): CardProjection {
     const kind = input.kind
-    const requestId = safeString(input.requestId, 128)
-    const sessionId = safeString(input.sessionId, 128)
-    const runtimeEpoch = safeString(input.runtimeEpoch, 128)
+    // 卡片身份必须原样保留；被截断的 requestId/sessionId 无法再匹配原生请求，直接不建卡。
+    const requestId = boundedId(input.requestId, 128)
+    const sessionId = boundedId(input.sessionId, 128)
+    const runtimeEpoch = boundedId(input.runtimeEpoch, 128)
     const expiresAt = safeInt(input.expiresAt)
-    if (requestId === undefined || sessionId === undefined || runtimeEpoch === undefined || expiresAt === undefined) {
+    if (requestId.value === undefined || requestId.altered
+      || sessionId.value === undefined || sessionId.altered
+      || runtimeEpoch.value === undefined || runtimeEpoch.altered
+      || expiresAt === undefined) {
       return { mode: 'off' }
     }
     const mode = interactionMode(kind)
     if (mode === 'off') return { mode: 'off' }
 
     const head = {
-      requestId,
-      sessionId,
-      runtimeEpoch,
+      requestId: requestId.value,
+      sessionId: sessionId.value,
+      runtimeEpoch: runtimeEpoch.value,
       kind,
       expiresAt,
     }
@@ -507,13 +553,20 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
       const reason = body.reason ?? 'invalid-card'
       return {
         mode: 'remote',
-        payload: { ...head, waitKind: kind, acceptOnceEligible: false, reason },
+        payload: { ...head, waitKind: kind, acceptOnceEligible: false, ambiguous: true, reason },
         answerable: false,
         reason,
       }
     }
-    const full: Record<string, unknown> = { ...head, ...body.fields, acceptOnceEligible: body.answerable }
-    if (body.answerable) {
+    // 反向守卫：只有完全未改动的卡片才允许标记为可远答。
+    const answerable = body.answerable && body.ambiguous !== true
+    const full: Record<string, unknown> = {
+      ...head,
+      ...body.fields,
+      ...(body.ambiguous === true ? { ambiguous: true } : {}),
+      acceptOnceEligible: answerable,
+    }
+    if (answerable) {
       if (bytesOfJson(full) <= MAX_INTERACTION_INPUT_BYTES) {
         return { mode: 'remote', payload: full, answerable: true }
       }
@@ -525,7 +578,7 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
         reason: 'card-too-large',
       }
     }
-    const reason = body.reason ?? 'card-not-answerable'
+    const reason = body.reason ?? (body.ambiguous === true ? 'redaction-ambiguous' : 'card-not-answerable')
     const reduced = reducedCard(head, kind, body.fields, reason)
     return { mode: 'remote', payload: reduced, answerable: false, reason }
   }
@@ -533,6 +586,7 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
   function questionCard(raw: readonly unknown[] | undefined): {
     fields: Record<string, unknown>
     answerable: boolean
+    ambiguous?: boolean
     reason?: string
     bodyless?: boolean
   } {
@@ -543,54 +597,93 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
     const ids = new Set<string>()
     const questions: Record<string, unknown>[] = []
     let secret = false
-    raw.slice(0, 32).forEach((item, index) => {
+    // 超量不是静默丢弃：整卡标成 ambiguous，用户知道还有未展示的决定但不能批准。
+    if (raw.length > MAX_QUESTIONS) ambiguous = true
+    raw.slice(0, MAX_QUESTIONS).forEach((item, index) => {
+      const fallbackId = `q${index + 1}`
       const question = asRecord(item)
-      if (question === undefined) { ambiguous = true; return }
-      const rawId = safeString(question.id, 64)
-      const idMask = scrub(rawId ?? `q${index + 1}`)
+      if (question === undefined) {
+        ambiguous = true
+        questions.push({
+          id: fallbackId, prompt: '[unavailable]', required: true,
+          multi: false, custom: false, secret: false, ambiguous: true,
+        })
+        return
+      }
+      const idInfo = boundedId(question.id, 64)
+      const idMask = scrub(idInfo.value ?? fallbackId)
       const id = idMask.text
-      if (rawId !== undefined && idMask.changed) ambiguous = true
+      if (idInfo.altered || idMask.changed) ambiguous = true
       if (ids.has(id)) ambiguous = true
       ids.add(id)
       if (question.secret === true) secret = true
-      const promptRaw = typeof question.prompt === 'string'
-        ? question.prompt
-        : typeof question.question === 'string' ? question.question : undefined
-      if (promptRaw === undefined) { ambiguous = true; return }
-      const prompt = scrub(sliceChars(promptRaw, 2000))
-      if (prompt.changed) ambiguous = true
+
       const entry: Record<string, unknown> = {
         id,
-        prompt: prompt.text,
+        prompt: '[unavailable]',
         required: question.required !== false,
         multi: question.multi === true || question.multiSelect === true,
         custom: question.custom !== false,
         secret: false,
       }
+      let questionAltered = idInfo.altered || idMask.changed
+      const promptRaw = typeof question.prompt === 'string'
+        ? question.prompt
+        : typeof question.question === 'string' ? question.question : undefined
+      if (promptRaw === undefined) {
+        ambiguous = true
+        entry.ambiguous = true
+        questions.push(entry)
+        return
+      }
+      const prompt = boundedText(promptRaw, MAX_PROMPT_CHARS)
+      if (prompt.altered) { ambiguous = true; questionAltered = true }
+      entry.prompt = prompt.text
+
       const optionsRaw = question.options
       if (Array.isArray(optionsRaw)) {
+        if (optionsRaw.length > MAX_OPTIONS) ambiguous = true
         const labels = new Set<string>()
         const options: Record<string, unknown>[] = []
-        optionsRaw.slice(0, 16).forEach((optionValue, optionIndex) => {
+        optionsRaw.slice(0, MAX_OPTIONS).forEach((optionValue, optionIndex) => {
+          const fallbackOptionId = `${id}o${optionIndex + 1}`
           const option = asRecord(optionValue)
-          if (option === undefined || typeof option.label !== 'string') { ambiguous = true; return }
-          const label = scrub(sliceChars(option.label, 200))
-          if (label.changed) ambiguous = true
-          if (labels.has(label.text)) ambiguous = true
-          labels.add(label.text)
-          const rawOptionId = safeString(option.id, 64)
-          const optionIdMask = scrub(rawOptionId ?? `${id}o${optionIndex + 1}`)
-          if (rawOptionId !== undefined && optionIdMask.changed) ambiguous = true
-          const itemOut: Record<string, unknown> = { id: optionIdMask.text, label: label.text }
-          if (typeof option.description === 'string') {
-            const description = scrub(sliceChars(option.description, 400))
-            if (description.changed) ambiguous = true
-            itemOut.description = description.text
+          if (option === undefined || typeof option.label !== 'string') {
+            ambiguous = true
+            questionAltered = true
+            options.push({ id: fallbackOptionId, label: '[unavailable]', ambiguous: true })
+            return
           }
+          const label = boundedText(option.label, MAX_OPTION_LABEL_CHARS)
+          if (label.altered) { ambiguous = true; questionAltered = true }
+          if (labels.has(label.text)) { ambiguous = true; questionAltered = true }
+          labels.add(label.text)
+          const optionIdInfo = boundedId(option.id, 64)
+          const optionIdMask = scrub(optionIdInfo.value ?? fallbackOptionId)
+          if (optionIdInfo.altered || optionIdMask.changed) { ambiguous = true; questionAltered = true }
+          const itemOut: Record<string, unknown> = { id: optionIdMask.text, label: label.text }
+          let optionAltered = label.altered || optionIdInfo.altered || optionIdMask.changed
+          if (option.description !== undefined) {
+            if (typeof option.description !== 'string') {
+              ambiguous = true
+              questionAltered = true
+              optionAltered = true
+            } else {
+              const description = boundedText(option.description, MAX_OPTION_DESCRIPTION_CHARS)
+              if (description.altered) { ambiguous = true; questionAltered = true; optionAltered = true }
+              itemOut.description = description.text
+            }
+          }
+          if (optionAltered) itemOut.ambiguous = true
           options.push(itemOut)
         })
         entry.options = options
+      } else if (optionsRaw !== undefined) {
+        // 选项存在但不是数组：宁可整卡不可答，也不假装没有选项。
+        ambiguous = true
+        questionAltered = true
       }
+      if (questionAltered) entry.ambiguous = true
       questions.push(entry)
     })
     if (secret) {
@@ -600,13 +693,14 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
     return {
       fields: { questions },
       answerable: !ambiguous,
-      ...(ambiguous ? { reason: 'redaction-ambiguous' } : {}),
+      ...(ambiguous ? { ambiguous: true, reason: 'redaction-ambiguous' } : {}),
     }
   }
 
   function approvalCard(raw: unknown): {
     fields: Record<string, unknown>
     answerable: boolean
+    ambiguous?: boolean
     reason?: string
     bodyless?: boolean
   } {
@@ -621,44 +715,57 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
       return { fields: {}, answerable: false, reason: 'invalid-card', bodyless: true }
     }
     let ambiguous = false
-    const action = scrub(sliceChars(actionRaw, 300))
-    if (action.changed) ambiguous = true
+    const action = boundedText(actionRaw, MAX_ACTION_CHARS)
+    if (action.altered) ambiguous = true
     const decisionsRaw = Array.isArray(approval.decisions) ? approval.decisions : []
+    if (decisionsRaw.length > MAX_DECISIONS) ambiguous = true
     const decisions: Record<string, unknown>[] = []
     const decisionIds = new Set<string>()
-    decisionsRaw.slice(0, 8).forEach((item, index) => {
+    decisionsRaw.slice(0, MAX_DECISIONS).forEach((item, index) => {
+      const fallbackId = `d${index + 1}`
       const decision = asRecord(item)
-      if (decision === undefined || typeof decision.label !== 'string') { ambiguous = true; return }
-      const rawId = safeString(decision.id, 32)
-      const idMask = scrub(rawId ?? `d${index + 1}`)
+      if (decision === undefined || typeof decision.label !== 'string') {
+        ambiguous = true
+        decisions.push({ id: fallbackId, label: '[unavailable]', ambiguous: true })
+        return
+      }
+      const idInfo = boundedId(decision.id, 32)
+      const idMask = scrub(idInfo.value ?? fallbackId)
       const id = idMask.text
-      if (rawId !== undefined && idMask.changed) ambiguous = true
+      if (idInfo.altered || idMask.changed) ambiguous = true
       if (decisionIds.has(id)) ambiguous = true
       decisionIds.add(id)
-      const label = scrub(sliceChars(decision.label, 120))
-      if (label.changed) ambiguous = true
-      decisions.push({ id, label: label.text })
+      const label = boundedText(decision.label, MAX_DECISION_LABEL_CHARS)
+      if (label.altered) ambiguous = true
+      const altered = label.altered || idInfo.altered || idMask.changed
+      decisions.push({ id, label: label.text, ...(altered ? { ambiguous: true } : {}) })
     })
     if (decisions.length === 0) ambiguous = true
     const fields: Record<string, unknown> = {
       approval: { action: action.text, decisions },
     }
     const nested = fields.approval as Record<string, unknown>
-    if (typeof approval.detail === 'string') {
-      const detail = scrub(sliceChars(approval.detail, 600))
-      if (detail.changed) ambiguous = true
-      nested.detail = detail.text
+    if (approval.detail !== undefined) {
+      if (typeof approval.detail !== 'string') {
+        ambiguous = true
+      } else {
+        const detail = boundedText(approval.detail, MAX_APPROVAL_DETAIL_CHARS)
+        if (detail.altered) ambiguous = true
+        nested.detail = detail.text
+      }
     }
     if (typeof approval.title === 'string' && approval.title !== actionRaw) {
-      const title = scrub(sliceChars(approval.title, 200))
-      if (title.changed) ambiguous = true
+      const title = boundedText(approval.title, MAX_APPROVAL_TITLE_CHARS)
+      if (title.altered) ambiguous = true
       nested.title = title.text
+    } else if (approval.title !== undefined && typeof approval.title !== 'string') {
+      ambiguous = true
     }
     return {
       fields,
       // 决策列表缺失或不可辨别时不推断允许项，只保留拒绝路径的展示。
       answerable: !ambiguous,
-      ...(ambiguous ? { reason: 'redaction-ambiguous' } : {}),
+      ...(ambiguous ? { ambiguous: true, reason: 'redaction-ambiguous' } : {}),
     }
   }
 
@@ -668,12 +775,15 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
       kind,
       expiresAt: head.expiresAt,
       acceptOnceEligible: false,
+      ambiguous: true,
       truncated: true,
       reason,
     }
     if (kind === 'question') minimal.questionIds = []
     else minimal.approval = { action: '[unavailable]', decisions: [] }
-    return bytesOfJson(minimal) <= MAX_INTERACTION_INPUT_BYTES ? minimal : { requestId: head.requestId, kind, expiresAt: head.expiresAt, acceptOnceEligible: false, truncated: true, reason }
+    return bytesOfJson(minimal) <= MAX_INTERACTION_INPUT_BYTES
+      ? minimal
+      : { requestId: head.requestId, kind, expiresAt: head.expiresAt, acceptOnceEligible: false, ambiguous: true, truncated: true, reason }
   }
 
   function reducedCard(
@@ -682,7 +792,9 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
     fields: Record<string, unknown>,
     reason: string,
   ): Record<string, unknown> {
-    const reduced: Record<string, unknown> = { ...head, ...fields, acceptOnceEligible: false, reason }
+    const reduced: Record<string, unknown> = {
+      ...head, ...fields, acceptOnceEligible: false, ambiguous: true, reason,
+    }
     if (bytesOfJson(reduced) <= MAX_INTERACTION_INPUT_BYTES) return reduced
     // 去掉描述/细节后仍超限：只留身份、到期与原因，防止截断后的危险后缀被误读。
     return minimalCard(head, kind, 'card-too-large')
@@ -786,11 +898,12 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
     },
 
     statusResult(input: CommandStatusResultFrame): CommandStatusResultFrame {
+      const status = ACK_STATES.has(input.status) ? input.status : 'outcome-unknown'
       const body: CommandStatusResultFrame = {
         v: 2,
         type: 'command.status.result',
         requestId: safeString(input.requestId, 128) ?? 'unknown',
-        status: input.status,
+        status,
       }
       if (input.code !== undefined) body.code = WIRE_CODE_SET.has(input.code) ? input.code : 'unknown'
       applyResult(body, input.result, sanitizeResult(input.result))
@@ -814,9 +927,21 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
         status?: string
         errorClass?: string
       } = { ts: now() }
-      for (const key of ['operatorId', 'deviceId', 'agent', 'sessionId', 'op', 'requestId', 'decision', 'status', 'errorClass'] as const) {
+      // 标识符字段：只允许短标识，内置脱敏命中即丢弃（不写回掩码）。
+      for (const key of ['operatorId', 'deviceId', 'agent', 'sessionId', 'requestId'] as const) {
         const value = safeString(input[key], 160)
-        if (value !== undefined) out[key] = value
+        if (value === undefined || !IDENTIFIER.test(value)) continue
+        const cleaned = scrub(value)
+        if (!cleaned.changed) out[key] = cleaned.text
+      }
+      // 枚举字段：未知值一律丢弃，绝不把自由文本写进审计。
+      if (typeof input.op === 'string' && AUDIT_OPS.has(input.op)) out.op = input.op
+      for (const key of ['decision', 'status'] as const) {
+        const value = input[key]
+        if (typeof value === 'string' && AUDIT_ACTIONS.has(value)) out[key] = value
+      }
+      if (typeof input.errorClass === 'string' && WIRE_CODE_SET.has(input.errorClass)) {
+        out.errorClass = input.errorClass
       }
       return out
     },

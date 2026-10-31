@@ -42,6 +42,13 @@ interface HarnessOptions {
   readonly next?: () => Promise<AskUserQuestionAnswerLike>
   readonly questionRelay?: 'off' | 'notify' | 'remote'
   readonly allowInteractions?: boolean
+  readonly authorization?: () => {
+    relay: 'off' | 'notify' | 'remote'
+    operatorId: string
+    policyRevision: number
+    allowInteractions: boolean
+    content: boolean
+  } | undefined
 }
 
 function projectorFor(options: HarnessOptions): PrivacyProjector {
@@ -80,6 +87,10 @@ function harness(timeoutMs = 50, options: HarnessOptions = {}) {
       v: 2, type: 'event', deviceId: 'mac', agent: 'dsh', sessionId, nodeEpoch: 'epoch-1',
       seq: ++seq, ts: 1, kind, payload,
     }),
+    authorization: options.authorization ?? (() => ({
+      relay: 'remote', operatorId: 'op-1', policyRevision: 1,
+      allowInteractions: true, content: false,
+    })),
   })
   const request = (signal?: AbortSignal): AskUserQuestionRequestLike => ({
     questions: options.questions ?? questions,
@@ -120,6 +131,41 @@ describe('question relay', () => {
     const requestId = requestIdOf(h.sent[0])
     h.relay.settle('s1', requestId, { answers: [{ id: 'q1', selected: ['A'] }] })
     await pending
+    expect(h.relay.settle('s1', requestId, { answers: [{ id: 'q1', selected: ['A'] }] })).toBe('unknown')
+  })
+
+  it('policyRevision 变化后 answer 返回 decision-invalid 并发出 invalidated', async () => {
+    let revision = 1
+    const h = harness(10_000, {
+      authorization: () => ({
+        relay: 'remote', operatorId: 'op-1', policyRevision: revision,
+        allowInteractions: true, content: false,
+      }),
+    })
+    const pending = h.ask()
+    const requestId = requestIdOf(h.sent[0])
+    revision = 2
+    expect(h.relay.settle('s1', requestId, { answers: [{ id: 'q1', selected: ['A'] }] })).toBe('decision-invalid')
+    await expect(pending).rejects.toThrow(/fell through/)
+    expect(h.sent.map(event => event.kind)).toEqual(['input.requested', 'input.resolved'])
+    expect((h.sent[1]?.payload as { state: string }).state).toBe('invalidated')
+    expect(h.relay.settle('s1', requestId, { answers: [{ id: 'q1', selected: ['A'] }] })).toBe('unknown')
+  })
+
+  it('hello.ack 重新核验会一次性作废旧卡', async () => {
+    let allowed = true
+    const h = harness(10_000, {
+      authorization: () => ({
+        relay: 'remote', operatorId: 'op-1', policyRevision: 1,
+        allowInteractions: allowed, content: false,
+      }),
+    })
+    const pending = h.ask()
+    const requestId = requestIdOf(h.sent[0])
+    allowed = false
+    h.relay.revalidate()
+    await expect(pending).rejects.toThrow(/fell through/)
+    expect((h.sent[1]?.payload as { state: string }).state).toBe('invalidated')
     expect(h.relay.settle('s1', requestId, { answers: [{ id: 'q1', selected: ['A'] }] })).toBe('unknown')
   })
 
@@ -257,14 +303,14 @@ describe('question relay', () => {
     expect(h.sent).toEqual([])
   })
 
-  it('notify 只发无正文提示，立即交回本地', async () => {
+  it('notify 只发无正文 session.updated waitKind，立即交回本地', async () => {
     const h = harness(10_000, { questionRelay: 'notify', next: async () => ({ answers: [] }) })
     await expect(h.ask()).resolves.toEqual({ answers: [] })
-    expect(h.sent.map(event => event.kind)).toEqual(['input.requested'])
+    expect(h.sent.map(event => event.kind)).toEqual(['session.updated'])
     const payload = h.sent[0]?.payload as Record<string, unknown>
-    expect(payload.waitKind).toBe('question')
+    expect(payload.waitKind).toBe('input')
     expect(payload.questions).toBeUndefined()
-    expect(payload.acceptOnceEligible).toBe(false)
+    expect(payload.acceptOnceEligible).toBeUndefined()
   })
 
   it('secret 问题不跨机，伪造答案返回 decision-invalid', async () => {

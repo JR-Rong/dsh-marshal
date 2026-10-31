@@ -70,13 +70,32 @@ function commandStatusHttpStatus(outcome: CommandStatusOutcome): number {
 }
 
 /** 出口只给分类/结果白名单字段；内部 message 与原始异常绝不回显。 */
+const RESULT_KEYS = new Set([
+  'accepted', 'cancelled', 'following', 'subscriptionId', 'created',
+  'sessionId', 'status', 'state', 'count', 'bytes', 'chars',
+])
+
+/** 结果对象按显式白名单重建，绝不透传节点 payload。 */
+function publicResult(result: unknown): unknown {
+  if (typeof result !== 'object' || result === null || Array.isArray(result)) return undefined
+  const out: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(result as Record<string, unknown>)) {
+    if (!RESULT_KEYS.has(key)) continue
+    if (typeof value === 'boolean') { out[key] = value; continue }
+    if (typeof value === 'number' && Number.isFinite(value) && value >= 0) { out[key] = value; continue }
+    if (typeof value === 'string' && value !== '') out[key] = value.slice(0, 128)
+  }
+  return Object.keys(out).length === 0 ? undefined : out
+}
+
 function publicOutcome(outcome: CommandOutcome): Record<string, unknown> {
   if (outcome.ok) {
+    const result = publicResult(outcome.result)
     return {
       ok: true,
       status: outcome.status,
       ...(outcome.code === undefined ? {} : { code: outcome.code }),
-      ...(outcome.result === undefined ? {} : { result: outcome.result }),
+      ...(result === undefined ? {} : { result }),
     }
   }
   return { ok: false, status: outcome.status, code: outcome.code }
@@ -85,7 +104,8 @@ function publicOutcome(outcome: CommandOutcome): Record<string, unknown> {
 /** 会话索引只暴露契约字段；cwd/标题等本机信息不经过 HTTP。 */
 function publicSession(row: {
   deviceId: string; agent: string; sessionId: string;
-  running: boolean; updatedAt: number
+  running: boolean; updatedAt: number;
+  ownership?: string; counts?: Readonly<Record<string, number>>
 }): Record<string, unknown> {
   return {
     deviceId: row.deviceId,
@@ -93,6 +113,22 @@ function publicSession(row: {
     sessionId: row.sessionId,
     running: row.running,
     updatedAt: row.updatedAt,
+    ...(row.ownership === undefined ? {} : { ownership: row.ownership }),
+    ...(row.counts === undefined ? {} : { counts: row.counts }),
+  }
+}
+
+/** 设备列表也显式重建，避免把内部字段（token 摘要等）透传出去。 */
+function publicDevice(row: {
+  id: string; name: string; agents: readonly string[];
+  connectedAt: number; lastSeen: number
+}): Record<string, unknown> {
+  return {
+    id: row.id,
+    name: row.name,
+    agents: [...row.agents],
+    connectedAt: row.connectedAt,
+    lastSeen: row.lastSeen,
   }
 }
 
@@ -164,7 +200,7 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
 
   disposers.push(webServer.register({
     kind: 'exact', path: '/marshal/api/devices',
-    handler: guard((_req, res) => { json(res, 200, { devices: registry.list(Date.now()) }) }),
+    handler: guard((_req, res) => { json(res, 200, { devices: registry.list(Date.now()).map(publicDevice) }) }),
   }))
 
   disposers.push(webServer.register({
@@ -246,11 +282,12 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
         idempotencyKey: key,
       })
       const ok = outcome.status === 'accepted' || outcome.status === 'confirmed'
+      const result = publicResult(outcome.result)
       json(res, commandStatusHttpStatus(outcome), {
         ok,
         status: outcome.status,
         ...(outcome.code === undefined ? {} : { code: outcome.code }),
-        ...(outcome.result === undefined ? {} : { result: outcome.result }),
+        ...(result === undefined ? {} : { result }),
       })
     }),
   }))

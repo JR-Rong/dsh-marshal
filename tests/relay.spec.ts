@@ -178,7 +178,7 @@ describe('HubRelay', () => {
     const base = { v: 2, type: 'event', deviceId: 'mac', agent: 'dsh', sessionId: 's1', nodeEpoch: 'epoch-1', ts: 1 } as const
     relay.publish({ ...base, seq: 1, kind: 'session.updated', payload: { running: true, updatedAt: 9, cwd: '/w' } })
     expect(relay.sessions('mac')).toEqual([
-      { deviceId: 'mac', agent: 'dsh', sessionId: 's1', running: true, updatedAt: 9, cwd: '/w' },
+      { deviceId: 'mac', agent: 'dsh', sessionId: 's1', running: true, updatedAt: 9 },
     ])
     relay.publish({ ...base, seq: 2, kind: 'session.removed', payload: {} })
     expect(relay.sessions('mac')).toEqual([])

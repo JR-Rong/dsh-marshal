@@ -178,7 +178,8 @@ describe('hub api', () => {
       result: { accepted: true, cwd: '/home/secret' },
     } satisfies AckFrame, ORIGIN)
     const firstBody = await (await first).json() as { result?: unknown }
-    expect(firstBody.result).toEqual({ accepted: true, cwd: '/home/secret' })
+    // hub 出口只按显式白名单重建结果，未知字段（如 cwd）不透传。
+    expect(firstBody.result).toEqual({ accepted: true })
 
     relay.deviceOffline('mac')
     const second = await fetch(`http://127.0.0.1:${port}/marshal/api/command`, {

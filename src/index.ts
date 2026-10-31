@@ -138,9 +138,12 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
       })
     },
     onHandshake: (binding, previous) => {
-      projector = buildProjector(binding.policies.allowContent, binding.policies.allowInteractions)
       const tightened = (previous?.policies.allowContent === true && binding.policies.allowContent !== true)
         || (previous?.policies.allowInteractions === true && binding.policies.allowInteractions !== true)
+      // 每次合法 hello.ack 都重新核验旧卡授权（含仅 revision 变化）；
+      // 必须在重建投影器之前发出 invalidated，否则收紧后连终态都发不出去。
+      relay?.revalidate()
+      projector = buildProjector(binding.policies.allowContent, binding.policies.allowInteractions)
       // 旧队列按更宽策略编码，不能在新握手上补发。
       if (tightened) link.clearOutbound()
     },
@@ -153,9 +156,21 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
         ctx, timeoutMs: config.answerTimeoutMs,
         projector: liveProjector,
         runtimeEpoch: nodeEpoch,
-        // 卡片 payload 已由 projector.card 投影；resolved 也已在 relay 内投影。
-        send: event => link.sendEvent(event),
+        // 卡片/通知是交互帧：只走 volatile 出口，断线即丢，绝不进入离线队列。
+        send: event => link.sendVolatileEvent(event),
         frame: adapter.frame,
+        // 当前协商授权；卡片创建、answer/cancel 结算与每次 hello.ack 都按它复核。
+        authorization: () => {
+          const binding = link.binding
+          if (binding === undefined) return undefined
+          return {
+            relay: config.questionRelay,
+            operatorId: binding.operatorId,
+            policyRevision: binding.policyRevision,
+            allowInteractions: binding.policies.allowInteractions,
+            content: liveProjector.content,
+          }
+        },
       })
   const follower = createFollower({
     adapter,

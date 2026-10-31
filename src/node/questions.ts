@@ -2,29 +2,45 @@ import { randomUUID } from 'node:crypto'
 import type { SettleResult } from '../adapters/types.ts'
 import type { AskUserQuestionAnswerLike, MarshalContext, UserQuestionLike } from '../dsh-types.ts'
 import type { EventFrame } from '../wire/frames.ts'
-import type { PrivacyProjector } from './privacy.ts'
+import type { PrivacyProjector, RelayPolicy } from './privacy.ts'
+
+/** 创建卡片时的协商授权快照；结算与重连时都必须原样匹配。 */
+export interface CardAuthorization {
+  readonly relay: RelayPolicy
+  readonly operatorId: string
+  readonly policyRevision: number
+  readonly allowInteractions: boolean
+  readonly content: boolean
+}
 
 interface Pending {
   readonly sessionId: string
   readonly questionIds: readonly string[]
   /** 原问题带着 options / multiSelect：结算时按它们校验标签与数量。 */
   readonly questions: readonly UserQuestionLike[]
+  /** 卡片创建时的 operatorId/policyRevision/隐私与交互授权。 */
+  readonly authorization: CardAuthorization | undefined
   /** 每个 pending 只允许结算一次；答案、超时、abort、dispose 共用它。 */
   settled: boolean
   /** outcome 为 undefined 时只结束等待，不再发 `input.resolved`（发送失败或 dispose）。 */
-  finish(answer: AskUserQuestionAnswerLike | undefined, outcome?: 'remote' | 'timeout' | 'local'): void
+  finish(answer: AskUserQuestionAnswerLike | undefined, outcome?: 'remote' | 'timeout' | 'local' | 'invalidated'): void
 }
 
 /** 不可远答的卡：仍记住 requestId，伪造答案要明确拒绝而不是“未知”。 */
 interface BlockedCard {
   readonly sessionId: string
   readonly expiresAt: number
+  readonly authorization: CardAuthorization | undefined
 }
 
 const MAX_BLOCKED_CARDS = 64
 
 export interface QuestionRelay {
   settle(sessionId: string, requestId: string, answers: unknown): SettleResult
+  /** 每次合法 hello.ack 后调用：授权变化时一次性结算旧卡。 */
+  revalidate(): void
+  /** 明确收紧/撤权：立即作废所有待答卡。 */
+  invalidate(): void
   dispose(): void
 }
 
@@ -36,6 +52,8 @@ export interface QuestionRelayOptions {
   readonly runtimeEpoch: string
   readonly send: (event: EventFrame) => void
   readonly frame: (sessionId: string, kind: EventFrame['kind'], payload: unknown) => EventFrame
+  /** 当前协商授权；缺省视为固定授权（仅单元测试使用）。 */
+  readonly authorization?: () => CardAuthorization | undefined
 }
 
 /** 校验远端答案：每个问题 id 恰好一次，selected 必须是字符串数组。 */
@@ -95,6 +113,20 @@ export function createQuestionRelay(options: QuestionRelayOptions): QuestionRela
   const blocked = new Map<string, BlockedCard>()
   let disposed = false
 
+  const currentAuthorization = (): CardAuthorization | undefined => options.authorization?.()
+
+  /** 旧卡只有在当前协商仍为 remote、同一 operatorId/policyRevision 时才可结算。 */
+  const stillAuthorized = (snapshot: CardAuthorization | undefined): boolean => {
+    if (options.authorization === undefined) return true
+    const current = currentAuthorization()
+    if (current === undefined) return false
+    if (current.relay !== 'remote' || !current.allowInteractions) return false
+    return snapshot !== undefined
+      && snapshot.relay === 'remote'
+      && current.operatorId === snapshot.operatorId
+      && current.policyRevision === snapshot.policyRevision
+  }
+
   const pruneBlocked = (): void => {
     const at = Date.now()
     for (const [requestId, card] of blocked) {
@@ -109,7 +141,7 @@ export function createQuestionRelay(options: QuestionRelayOptions): QuestionRela
 
   /**
    * 卡片 payload 已是投影结果，直接交给 link；`input.resolved` 仍走 projector 的
-   * 白名单，避免答案或正文从这条出口漏出。
+   * 白名单，避免答案或正文从这条出口漏出。交互帧只走 volatile 路径。
    */
   const emitRequested = (sessionId: string, payload: unknown): boolean => {
     try {
@@ -120,8 +152,22 @@ export function createQuestionRelay(options: QuestionRelayOptions): QuestionRela
     }
   }
 
-  const emitResolved = (sessionId: string, requestId: string, outcome: 'remote' | 'timeout' | 'local'): boolean => {
-    const state = outcome === 'remote' ? 'answered' : outcome === 'timeout' ? 'expired' : 'cancelled'
+  /** notify 只发 body-less 的 session.updated waitKind，不注册可答卡。 */
+  const emitWaiting = (sessionId: string): void => {
+    const projected = options.projector.event(
+      options.frame(sessionId, 'session.updated', { waitKind: 'input' }),
+    )
+    for (const event of projected) {
+      try { options.send(event) } catch { /* 通知发不出去不影响本地应答 */ }
+    }
+  }
+
+  const emitResolved = (sessionId: string, requestId: string, outcome: 'remote' | 'timeout' | 'local' | 'invalidated'): boolean => {
+    const state = outcome === 'remote'
+      ? 'answered'
+      : outcome === 'timeout'
+        ? 'expired'
+        : outcome === 'invalidated' ? 'invalidated' : 'cancelled'
     const projected = options.projector.event(
       options.frame(sessionId, 'input.resolved', { requestId, state }),
     )
@@ -159,13 +205,26 @@ export function createQuestionRelay(options: QuestionRelayOptions): QuestionRela
     if (card.mode === 'off') return next()
     // notify：只发无正文等待提示，不能远答，立即交回本地。
     if (card.mode === 'notify') {
-      emitRequested(sessionId, card.payload)
+      emitWaiting(sessionId)
       return next()
     }
     // 不可远答（脱敏歧义、secret、超限）：保留身份/到期/原因，但立即走本地路径。
     if (!card.answerable) {
       pruneBlocked()
-      blocked.set(requestId, { sessionId, expiresAt: Date.now() + options.timeoutMs })
+      blocked.set(requestId, {
+        sessionId,
+        expiresAt: Date.now() + options.timeoutMs,
+        authorization: currentAuthorization(),
+      })
+      emitRequested(sessionId, card.payload)
+      return next()
+    }
+
+    const authorization = currentAuthorization()
+    // 创建可答卡时也必须持有当前 remote 授权；否则按不可远答处理。
+    if (!stillAuthorized(authorization)) {
+      pruneBlocked()
+      blocked.set(requestId, { sessionId, expiresAt: Date.now() + options.timeoutMs, authorization })
       emitRequested(sessionId, card.payload)
       return next()
     }
@@ -178,6 +237,7 @@ export function createQuestionRelay(options: QuestionRelayOptions): QuestionRela
         sessionId,
         questionIds,
         questions,
+        authorization,
         settled: false,
         finish(answer, outcome) {
           if (entry.settled) return
@@ -218,12 +278,31 @@ export function createQuestionRelay(options: QuestionRelayOptions): QuestionRela
       const entry = pending.get(requestId)
       if (entry === undefined) return 'unknown'
       if (entry.sessionId !== sessionId) return 'session-mismatch'
+      // 回答时必须重新核验当前协商授权；变化或缺失即作废并一次性结算原生等待。
+      if (!stillAuthorized(entry.authorization)) {
+        entry.finish(undefined, 'invalidated')
+        return 'decision-invalid'
+      }
       const parsed = parseAnswers(answers, entry.questionIds)
       if (parsed === undefined) return 'invalid'
       if (!validateAnswers(parsed.answers, entry.questions)) return 'invalid'
       // 链路正在关闭时 resolved 发不出去也无妨：本地已经拿到答案。
       entry.finish(parsed, 'remote')
       return 'ok'
+    },
+    revalidate() {
+      if (disposed || options.authorization === undefined) return
+      for (const entry of [...pending.values()]) {
+        if (!stillAuthorized(entry.authorization)) entry.finish(undefined, 'invalidated')
+      }
+      for (const [requestId, card] of [...blocked]) {
+        if (!stillAuthorized(card.authorization)) blocked.delete(requestId)
+      }
+    },
+    invalidate() {
+      if (disposed) return
+      for (const entry of [...pending.values()]) entry.finish(undefined, 'invalidated')
+      blocked.clear()
     },
     dispose() {
       if (disposed) return
