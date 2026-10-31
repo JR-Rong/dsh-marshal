@@ -395,17 +395,21 @@ function sandboxMapping(value: unknown):
   }
 }
 
+/**
+ * permission 只有同时具备可比较的 approvalPolicy（non-empty string）与可映射的
+ * sandbox 时才发布；任一缺失/不可表达都省略整个 permission，绝不发布一半。
+ */
 function permissionScope(approvalValue: unknown, sandboxValue: unknown): PermissionScope | undefined {
   const approvalPolicy = nonEmptyString(approvalValue)
+  if (approvalPolicy === undefined) return undefined
   const sandbox = sandboxMapping(sandboxValue)
-  if (sandbox !== undefined && !sandbox.applicable) return undefined
-  const scope = sandbox?.scope
-  const additionalDirectories = sandbox?.additionalDirectories
-  if (approvalPolicy === undefined && scope === undefined) return undefined
+  if (sandbox === undefined || !sandbox.applicable || sandbox.scope === undefined) return undefined
   return {
-    ...(approvalPolicy === undefined ? {} : { approvalPolicy }),
-    ...(scope === undefined ? {} : { sandbox: scope }),
-    ...(additionalDirectories === undefined ? {} : { additionalDirectories }),
+    approvalPolicy,
+    sandbox: sandbox.scope,
+    ...(sandbox.additionalDirectories === undefined
+      ? {}
+      : { additionalDirectories: sandbox.additionalDirectories }),
   }
 }
 

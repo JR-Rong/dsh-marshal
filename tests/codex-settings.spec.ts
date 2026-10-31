@@ -145,10 +145,11 @@ describe('Codex 设置快照解析', () => {
     expect(external).toEqual({ threadId: 's1', model: 'gpt-5', reasoning: 'high' })
 
     const granular = parseThreadSettingsSnapshot(resume({ approvalPolicy: { granular: {} } }))
-    expect(granular?.permission).toEqual({
-      sandbox: { fileSystem: 'workspace-write', network: false },
-      additionalDirectories: ['/repo/src'],
-    })
+    // granular approvalPolicy 即使 sandbox 可映射，也只能省略整个 permission。
+    expect(granular?.permission).toBeUndefined()
+
+    // 有 approvalPolicy 但 sandbox 缺失：同样省略整个 permission。
+    expect(parseThreadSettingsSnapshot(resume({ sandbox: undefined }))?.permission).toBeUndefined()
 
     expect(parseThreadSettingsSnapshot(resume({ sandbox: { type: 'dangerFullAccess' } }))?.permission)
       .toEqual({ approvalPolicy: 'on-request', sandbox: { fileSystem: 'danger-full-access' } })
@@ -356,6 +357,41 @@ describe('CodexSettingsPort configure goal', () => {
     expect(result.code).toBe('readback-timeout')
     expect(port.snapshot('s1')?.current.goal).toBeUndefined()
     expect(port.snapshot('s1')?.pending?.status).toBe('readback-timeout')
+  })
+
+  it('超时后可手动重试：同一 expectedRevision 不会被 configure-pending 拒绝', async () => {
+    const { timers, fake, port, began, ended } = setup()
+    fake.on('thread/goal/set', () => { throw new CodexPeerError('timeout') })
+
+    const first = port.configure(configureRequest(), signal())
+    timers.fire()
+    const timedOut = await first
+    expect(timedOut.status).toBe('pending-confirmation')
+    expect(timedOut.code).toBe('readback-timeout')
+    // 超时保持旧 current，revision 不推进。
+    expect(port.snapshot('s1')?.current.revision).toBe(0)
+
+    fake.on('thread/goal/set', () => ({ goal: { objective: 'do X' } }))
+    fake.on('thread/goal/get', () => ({ goal: { objective: 'do X' } }))
+    const result = await port.configure(configureRequest(), signal())
+    expect(result.status).toBe('confirmed')
+    expect(result.code).toBeUndefined()
+    expect(port.snapshot('s1')?.current.goal).toBe(true)
+    expect(began).toHaveLength(2)
+    expect(ended).toHaveLength(2)
+  })
+
+  it('已 abort 的 signal 在原生写前拒绝：零 goal 调用、无 pending、不取锁', async () => {
+    const { fake, port, began, ended } = setup()
+    const reason = new Error('cancelled before write')
+    const controller = new AbortController()
+    controller.abort(reason)
+
+    await expect(port.configure(configureRequest(), controller.signal)).rejects.toBe(reason)
+    expect(fake.calls.filter(call => call.method.startsWith('thread/goal/'))).toHaveLength(0)
+    expect(port.snapshot('s1')?.pending).toBeUndefined()
+    expect(began).toHaveLength(0)
+    expect(ended).toHaveLength(0)
   })
 })
 

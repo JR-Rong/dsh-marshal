@@ -183,6 +183,11 @@ export function createCodexSettingsPort(deps: CodexSettingsDeps): CodexSettingsP
     objective: string | undefined,
     signal: AbortSignal,
   ): Promise<void> => {
+    // 原生写尚未发出：释放 waiter 并按调用前拒绝，不进入 10s 回读等待。
+    if (signal.aborted) {
+      handle.abort()
+      throw signal.reason
+    }
     try {
       if (objective === undefined) {
         await deps.request(
@@ -248,6 +253,8 @@ export function createCodexSettingsPort(deps: CodexSettingsDeps): CodexSettingsP
 
     // 保守目录：只有 goal 声明了真实回读；不提供任何模型/等级 lattice。
     const catalog: TunableCatalog = { agent: 'codex', models: [], readback: { goal: true } }
+    // 只有仍在等待回读的请求才占用会话；超时已释放 waiter，允许手动重试（不排队）。
+    const activePending = base.pending?.status === 'pending' ? base.pending : undefined
     const decision = decideConfigure(request, {
       agent: 'codex',
       runtimeEpoch: deps.runtimeEpoch,
@@ -256,9 +263,9 @@ export function createCodexSettingsPort(deps: CodexSettingsDeps): CodexSettingsP
       current: base.current,
       catalog,
       contentAuthorized: request.contentAuthorized,
-      ...(base.pending === undefined
+      ...(activePending === undefined
         ? {}
-        : { pending: { requestId: base.pending.requestId, field: base.pending.field } }),
+        : { pending: { requestId: activePending.requestId, field: activePending.field } }),
     })
     if (decision.outcome === 'reject') {
       throw new PreCallRejection(decision.code, decision.reason)
