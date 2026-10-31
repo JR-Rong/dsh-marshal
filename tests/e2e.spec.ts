@@ -1,4 +1,5 @@
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -10,6 +11,7 @@ const TOKEN = 't'.repeat(32)
 const DASHBOARD_TOKEN = 'e2e-dashboard-token-0123456789abcdef'
 const POLL_INTERVAL_MS = 20
 const POLL_TIMEOUT_MS = 2_000
+const AUTH = { 'x-marshal-token': DASHBOARD_TOKEN }
 
 const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -51,8 +53,16 @@ describe('e2e', () => {
       },
       cancel: async () => ({}),
     }
-    const web = createTestWeb()
+    const web = createTestWeb({
+      tls: {
+        key: readFileSync(new URL('./fixtures/tls-key.pem', import.meta.url), 'utf8'),
+        cert: readFileSync(new URL('./fixtures/tls-cert.pem', import.meta.url), 'utf8'),
+      },
+    })
     const dir = await mkdtemp(join(tmpdir(), 'marshal-e2e-'))
+    // node 配置只接受 wss://；测试用自签证书，需要临时关闭校验。
+    const previousTlsSetting = process.env.NODE_TLS_REJECT_UNAUTHORIZED
+    process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'
     try {
       const devicesFile = join(dir, 'devices.json')
       await writeFile(devicesFile, JSON.stringify({
@@ -71,7 +81,7 @@ describe('e2e', () => {
       })
 
       const port = await web.listen()
-      const base = `http://127.0.0.1:${port}`
+      const base = `https://127.0.0.1:${port}`
 
       const nodeContext = {
         logger,
@@ -79,22 +89,22 @@ describe('e2e', () => {
         sessionController,
       }
       apply(nodeContext as unknown as MarshalContext, {
-        role: 'node', hubUrl: `ws://127.0.0.1:${port}/marshal/uplink`, token: TOKEN,
+        role: 'node', hubUrl: `wss://127.0.0.1:${port}/marshal/uplink`, token: TOKEN,
         deviceId: 'mac', deviceName: 'mac',
       })
 
       await waitForCount(async () => {
-        const body = await (await fetch(`${base}/marshal/api/devices?token=${DASHBOARD_TOKEN}`)).json() as DeviceBody
+        const body = await (await fetch(`${base}/marshal/api/devices`, { headers: AUTH })).json() as DeviceBody
         return body.devices
       }, 1, 'device')
       await waitForCount(async () => {
-        const body = await (await fetch(`${base}/marshal/api/sessions?token=${DASHBOARD_TOKEN}`)).json() as SessionBody
+        const body = await (await fetch(`${base}/marshal/api/sessions`, { headers: AUTH })).json() as SessionBody
         return body.sessions
       }, 1, 'session')
 
-      const promptResponse = await fetch(`${base}/marshal/api/command?token=${DASHBOARD_TOKEN}`, {
+      const promptResponse = await fetch(`${base}/marshal/api/command`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { ...AUTH, 'content-type': 'application/json' },
         body: JSON.stringify({
           op: 'prompt', target: { deviceId: 'mac', agent: 'dsh', sessionId: 's1' },
           args: { text: 'hi' }, idempotencyKey: 'e2e-1',
@@ -108,9 +118,9 @@ describe('e2e', () => {
       const recorded = prompts[0] as { content?: { text?: string }[] }
       expect(recorded.content?.[0]?.text).toBe('hi')
 
-      const observeResponse = await fetch(`${base}/marshal/api/command?token=${DASHBOARD_TOKEN}`, {
+      const observeResponse = await fetch(`${base}/marshal/api/command`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { ...AUTH, 'content-type': 'application/json' },
         body: JSON.stringify({
           op: 'observe', target: { deviceId: 'mac', agent: 'dsh', sessionId: 's1' },
           args: { kind: 'follow', action: 'subscribe' }, idempotencyKey: 'e2e-observe',
@@ -126,6 +136,8 @@ describe('e2e', () => {
       web.server.closeAllConnections?.()
       await new Promise<void>(resolve => web.server.close(() => resolve()))
       await rm(dir, { recursive: true, force: true })
+      if (previousTlsSetting === undefined) delete process.env.NODE_TLS_REJECT_UNAUTHORIZED
+      else process.env.NODE_TLS_REJECT_UNAUTHORIZED = previousTlsSetting
     }
     // 卸载本身不应产生任何告警。
     expect(warns).toEqual([])

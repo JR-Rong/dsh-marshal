@@ -68,14 +68,26 @@ const ARG_SCHEMAS = {
   configure: ConfigureArgsSchema,
 } as const
 
+export function parseCommandArgs(op: 'observe', args: unknown): ObserveArgs
+export function parseCommandArgs(op: 'prompt', args: unknown): PromptArgs
+export function parseCommandArgs(op: 'interrupt', args: unknown): InterruptArgs
+export function parseCommandArgs(op: 'answer', args: unknown): AnswerArgs
+export function parseCommandArgs(op: 'cancel', args: unknown): CancelArgs
+export function parseCommandArgs(op: 'configure', args: unknown): ConfigureArgs
+export function parseCommandArgs(op: CommandOp, args: unknown): CommandArgs
 export function parseCommandArgs(op: CommandOp, args: unknown): CommandArgs {
   const schema = ARG_SCHEMAS[op]
-  const parsed = schema.safeParse(args === undefined ? {} : args)
+  const value = args === undefined ? {} : args
+  // strict schema 拒绝未知键；这里先给出统一的非对象错误，避免把数组/标量当参数透传。
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new FrameError(`invalid args for ${op}: expected an object`, 'command', 'invalid-args')
+  }
+  const parsed = schema.safeParse(value)
   if (parsed.success) return parsed.data
   const issue = parsed.error.issues[0]
   const where = issue === undefined || issue.path.length === 0 ? '(root)' : issue.path.map(String).join('.')
   const detail = issue?.message ?? 'invalid arguments'
-  throw new FrameError(`marshal: invalid args for ${op} at ${where}: ${detail}`, 'command', 'invalid-args')
+  throw new FrameError(`invalid args for ${op} at ${where}: ${detail}`, 'command', 'invalid-args')
 }
 
 /** Deterministic JSON for digests: object keys sorted, array order preserved, undefined omitted. */

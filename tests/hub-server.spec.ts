@@ -164,7 +164,10 @@ async function hello(
   })
   ws.send(helloText(overrides))
   const ack = await acked
-  expect(ack).toMatchObject({ type: 'hello.ack', deviceId: 'mac' })
+  expect(ack).toMatchObject({
+    type: 'hello.ack', deviceId: 'mac', nodeEpoch: 'epoch-1',
+    contractRevision: CONTRACT_REVISION, features: [],
+  })
   await waitFor(() => registry.get('mac') !== undefined, 'device to enter registry')
   return ws
 }
@@ -207,7 +210,7 @@ describe('hub socket', () => {
     ws.close()
   })
 
-  it('事件里的 device 与握手身份不一致时以 4400 关闭', async () => {
+  it('事件里的 device 与握手身份不一致时以 4403 关闭', async () => {
     const registry = new DeviceRegistry()
     const frames: Frame[] = []
     const { port } = await serve(registry, frames)
@@ -217,7 +220,7 @@ describe('hub socket', () => {
       v: 2, type: 'event', deviceId: 'other', agent: 'dsh', sessionId: 's1', nodeEpoch: 'epoch-1',
       seq: 1, ts: 1, kind: 'turn.started', payload: {},
     }))
-    expect(await code).toBe(4400)
+    expect(await code).toBe(4403)
     expect(frames).toEqual([])
   })
 
@@ -251,27 +254,27 @@ describe('hub socket', () => {
     expect(registry.get('mac')).toBeUndefined()
   })
 
-  it('hello 与握手设备不一致时以 4401 关闭', async () => {
+  it('hello 与握手设备不一致时以 4403 关闭', async () => {
     const registry = new DeviceRegistry()
     const { port } = await serve(registry)
 
     const wrongDevice = await connect(port)
     const wrongDeviceCode = closeCode(wrongDevice)
     wrongDevice.send(helloText({ deviceId: 'other' }))
-    expect(await wrongDeviceCode).toBe(4401)
+    expect(await wrongDeviceCode).toBe(4403)
 
     expect(registry.get('mac')).toBeUndefined()
     expect(registry.get('other')).toBeUndefined()
   })
 
-  it('契约修订不匹配时以 4409 关闭', async () => {
+  it('契约修订不匹配时以 4406 关闭', async () => {
     const registry = new DeviceRegistry()
     const { port } = await serve(registry)
 
     const stale = await connect(port)
     const code = closeCode(stale)
     stale.send(helloText({ contractRevision: 'p1-review-1' }))
-    expect(await code).toBe(4409)
+    expect(await code).toBe(4406)
     expect(registry.get('mac')).toBeUndefined()
   })
 
@@ -299,6 +302,23 @@ describe('hub socket', () => {
     expect(registry.detaches[0]).toEqual({ id: 'mac', removed: false })
     expect(registry.get('mac')).toBeDefined()
     expect(second.readyState).toBe(WebSocket.OPEN)
+    second.close()
+  })
+
+  it('被替换连接上的帧以 4409 stale-connection 关闭', async () => {
+    const registry = new DeviceRegistry()
+    const frames: Frame[] = []
+    const { port } = await serve(registry, frames)
+    const first = await hello(registry, port)
+    const second = await hello(registry, port)
+    const code = closeCode(first)
+    first.send(JSON.stringify({
+      v: 2, type: 'event', deviceId: 'mac', agent: 'dsh', sessionId: 's1', nodeEpoch: 'epoch-1',
+      seq: 1, ts: 1, kind: 'turn.started', payload: {},
+    }))
+    expect(await code).toBe(4409)
+    expect(frames).toEqual([])
+    expect(registry.get('mac')).toBeDefined()
     second.close()
   })
 
@@ -354,14 +374,16 @@ describe('hub socket', () => {
     expect(registry.get('mac')).toBeUndefined()
   })
 
-  it('hello 超时后连接在 1s 内被终止', async () => {
+  it('hello 超时后以 4408 关闭', async () => {
     const registry = new DeviceRegistry()
     const { port } = await serve(registry, [], DEVICES, { helloTimeoutMs: 50 })
     const started = Date.now()
     const ws = await connect(port)
     ws.on('error', () => {})
-    await waitFor(() => ws.readyState === WebSocket.CLOSED, 'socket to be closed after hello timeout')
+    const code = closeCode(ws)
+    expect(await code).toBe(4408)
     expect(Date.now() - started).toBeLessThan(1_000)
+    await waitFor(() => ws.readyState === WebSocket.CLOSED, 'socket to be closed after hello timeout')
     expect(registry.get('mac')).toBeUndefined()
   })
 

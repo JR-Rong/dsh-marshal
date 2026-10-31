@@ -3,6 +3,7 @@ import {
   CLOSE_CODES, CONTRACT_REVISION, FrameError, decodeFrame, directionOf, encodeFrame,
   type CommandFrame, type EventFrame, type HeartbeatFrame,
 } from '../src/wire/frames.ts'
+import { parseCommandArgs } from '../src/wire/commands.ts'
 import { MAX_FRAME_BYTES } from '../src/wire/limits.ts'
 
 const event: EventFrame = {
@@ -27,8 +28,7 @@ describe('frames', () => {
   it('只有 v2 帧可解码', () => {
     const bad = JSON.stringify({ ...event, v: 1 })
     expect(() => decodeFrame(bad)).toThrow(FrameError)
-    expect(() => decodeFrame(bad)).toThrow(/unsupported wire version/)
-    expect(() => decodeFrame(bad)).toThrow(/version-unsupported/)
+    expect(() => decodeFrame(bad)).toThrow(/^marshal: version-unsupported: .*unsupported wire version/)
   })
 
   it('拒绝未知 kind', () => {
@@ -85,9 +85,10 @@ describe('frames', () => {
       .not.toThrow()
   })
 
-  it('hello.ack 携带连接与策略信息', () => {
+  it('hello.ack 携带连接、契约修订与策略信息', () => {
     const ack = {
       v: 2, type: 'hello.ack', connectionId: 'conn-1', hubEpoch: 'hub-1',
+      contractRevision: CONTRACT_REVISION, features: ['question-relay'], nodeEpoch: 'epoch-1',
       operatorId: 'op-1', policyRevision: 1, deviceId: 'mac',
       policies: {
         privacy: 'metadata', questionRelay: 'off', approvalRelay: 'off',
@@ -96,6 +97,8 @@ describe('frames', () => {
       serverTime: 1_790_000_000_000,
     }
     expect(decodeFrame(JSON.stringify(ack))).toEqual(ack)
+    const { contractRevision: _revision, ...withoutRevision } = ack
+    expect(() => decodeFrame(JSON.stringify(withoutRevision))).toThrow(/contractRevision/)
   })
 
   it('拒绝超过上限的出站帧', () => {
@@ -116,9 +119,36 @@ describe('frames', () => {
   it('close code 表与契约一致', () => {
     expect(CLOSE_CODES.FRAME_INVALID).toBe(4400)
     expect(CLOSE_CODES.AUTH_FAILED).toBe(4401)
-    expect(CLOSE_CODES.FORBIDDEN).toBe(4403)
-    expect(CLOSE_CODES.HELLO_TIMEOUT).toBe(4406)
-    expect(CLOSE_CODES.POLICY_UNCONFIRMED).toBe(4408)
-    expect(CLOSE_CODES.VERSION_UNSUPPORTED).toBe(4409)
+    expect(CLOSE_CODES.DEVICE_MISMATCH).toBe(4403)
+    expect(CLOSE_CODES.VERSION_UNSUPPORTED).toBe(4406)
+    expect(CLOSE_CODES.HANDSHAKE_TIMEOUT).toBe(4408)
+    expect(CLOSE_CODES.STALE_CONNECTION).toBe(4409)
+    expect(CLOSE_CODES.FRAME_SIZE).toBe(1009)
+  })
+
+  it('所有 FrameError 消息都带机器可读 code 前缀', () => {
+    const cases: Array<() => void> = [
+      () => decodeFrame('not json'),
+      () => decodeFrame(JSON.stringify({ ...event, v: 1 })),
+      () => decodeFrame(JSON.stringify({ ...event, type: 'bogus' })),
+      () => decodeFrame('x'.repeat(MAX_FRAME_BYTES + 1)),
+      () => decodeFrame(`${'['.repeat(40)}${']'.repeat(40)}`),
+      () => parseCommandArgs('prompt', { text: '' }),
+      () => parseCommandArgs('observe', { kind: 'follow', action: 'unsubscribe' }),
+    ]
+    for (const run of cases) {
+      let error: FrameError | undefined
+      try { run() } catch (caught) { error = caught as FrameError }
+      expect(error).toBeInstanceOf(FrameError)
+      expect(error?.message).toMatch(new RegExp(`^marshal: ${error?.code}: `))
+    }
+  })
+
+  it('parseCommandArgs 拒绝非对象与未知键', () => {
+    expect(() => parseCommandArgs('prompt', 'hi')).toThrow(/^marshal: invalid-args:/)
+    expect(() => parseCommandArgs('prompt', ['hi'])).toThrow(/^marshal: invalid-args:/)
+    expect(() => parseCommandArgs('prompt', { text: 'hi', extra: 1 })).toThrow(/^marshal: invalid-args:/)
+    expect(parseCommandArgs('observe', { kind: 'follow', action: 'subscribe' }))
+      .toEqual({ kind: 'follow', action: 'subscribe' })
   })
 })

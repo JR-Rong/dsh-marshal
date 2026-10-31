@@ -60,10 +60,11 @@ function parseHubUrl(value: string): string {
   try {
     url = new URL(value)
   } catch {
-    throw new Error('marshal: config.hubUrl is not a valid ws(s) URL')
+    throw new Error('marshal: config.hubUrl must be a wss:// URL')
   }
-  if ((url.protocol !== 'ws:' && url.protocol !== 'wss:') || url.hostname === '') {
-    throw new Error('marshal: config.hubUrl is not a valid ws(s) URL')
+  // 契约 §3：明文 hub 连接一律拒绝，生产也不允许跳过证书验证。
+  if (url.protocol !== 'wss:' || url.hostname === '') {
+    throw new Error('marshal: config.hubUrl must be a wss:// URL')
   }
   return value
 }

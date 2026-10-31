@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { WebSocket } from 'ws'
-import { CONTRACT_REVISION, encodeFrame, type EventFrame } from '../wire/frames.ts'
+import { CONTRACT_REVISION, CLOSE_CODES, encodeFrame, type EventFrame } from '../wire/frames.ts'
 import { OFFLINE_QUEUE_MAX_BYTES, OFFLINE_QUEUE_MAX_ITEMS } from '../wire/limits.ts'
 
 /** 断线期间最多缓存多少帧，超出后丢最旧的。 */
@@ -19,8 +19,12 @@ const DEFAULT_HEARTBEAT_MS = 30_000
 /** 连接稳定这么久之后把退避计数清零，避免偶发一次断线就让下次重连等满上限。 */
 const STABLE_RESET_MS = 30_000
 
-/** 鉴权失败、设备撤销与协议不兼容都是终态：重拨不会成功，等显式 start()。 */
-const TERMINAL_CLOSE_CODES: ReadonlySet<number> = new Set([4401, 4403, 4409])
+/**
+ * 终态：重拨不会成功，停下等显式 start()。
+ * 4400 也是终态：帧/协议不匹配是配置错误，重拨只会无限循环。
+ * 4409（连接被同设备新连接替换）可重试：下一次拨号会拿到新的槽位。
+ */
+const TERMINAL_CLOSE_CODES: ReadonlySet<number> = new Set([4400, 4401, 4403, 4406, 4408])
 
 /** 运行实例 epoch：进程内共享，普通网络重连不变。 */
 export const NODE_EPOCH = randomUUID()
@@ -151,7 +155,7 @@ export class NodeLink {
       })
       if (!this.trySend(ws, hello)) { ws.close(); return }
       this.startHeartbeat(ws)
-      if (ws.readyState === WebSocket.OPEN) this.options.onOnline?.()
+      // 不在 socket open 时报告在线：只有合法 hello.ack 才代表握手完成。
     })
     ws.on('message', data => this.receive(ws, String(data)))
     ws.on('close', (code: number) => {
@@ -169,6 +173,7 @@ export class NodeLink {
         this.active = false
         this.attempts = 0
         this.clearTimer()
+        this.reportError(new Error(`marshal: link closed with terminal code ${code}`))
         return
       }
       this.retry()
@@ -202,13 +207,24 @@ export class NodeLink {
   private receive(ws: WebSocket, text: string): void {
     if (this.socket !== ws) return
     if (this.acked) { this.deliver(text); return }
-    if (this.isHelloAck(text)) {
+    const ack = this.helloAckOf(text)
+    if (ack === 'valid') {
       this.acked = true
       this.startStableTimer(ws)
       const pending = this.pendingInbound.splice(0)
       this.pendingBytes = 0
       for (const buffered of pending) this.deliver(buffered)
       this.flush(ws)
+      // 只有合法 hello.ack 之后才算在线；同步由上层在 onOnline 里发起。
+      try { this.options.onOnline?.() } catch (error) { this.reportError(error) }
+      return
+    }
+    if (ack !== 'none') {
+      // 设备/实例或契约修订不匹配时握手永远无法完成：直接按终态关闭。
+      ws.close(
+        ack === 'version' ? CLOSE_CODES.VERSION_UNSUPPORTED : CLOSE_CODES.DEVICE_MISMATCH,
+        ack === 'version' ? 'version-unsupported' : 'device-mismatch',
+      )
       return
     }
     // ack 之前 hub 不该下发业务帧；先攒着，确认握手后按原序放行。
@@ -224,13 +240,23 @@ export class NodeLink {
     }
   }
 
-  private isHelloAck(text: string): boolean {
+  /** 只有 type/设备/实例/契约修订全部匹配的 hello.ack 才能完成握手。 */
+  private helloAckOf(text: string): 'valid' | 'version' | 'identity' | 'none' {
     try {
       const parsed: unknown = JSON.parse(text)
-      if (typeof parsed !== 'object' || parsed === null) return false
-      const frame = parsed as { type?: unknown }
-      return frame.type === HELLO_ACK_TYPE
-    } catch { return false }
+      if (typeof parsed !== 'object' || parsed === null) return 'none'
+      const frame = parsed as {
+        type?: unknown
+        v?: unknown
+        deviceId?: unknown
+        nodeEpoch?: unknown
+        contractRevision?: unknown
+      }
+      if (frame.type !== HELLO_ACK_TYPE) return 'none'
+      if (frame.v !== 2 || frame.contractRevision !== CONTRACT_REVISION) return 'version'
+      if (frame.deviceId !== this.options.deviceId || frame.nodeEpoch !== NODE_EPOCH) return 'identity'
+      return 'valid'
+    } catch { return 'none' }
   }
 
   /**

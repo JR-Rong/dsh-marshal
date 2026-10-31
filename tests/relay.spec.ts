@@ -40,6 +40,38 @@ describe('HubRelay', () => {
     await expect(promise).resolves.toEqual({ ok: true, result: { accepted: true } })
   })
 
+  it('accepted 与 confirmed 都表示成功', async () => {
+    const { registry, sent } = setup()
+    const relay = new HubRelay({ registry, now: () => 0, timeoutMs: 50 })
+    const accepted = relay.command({ op: 'prompt', target: target(), args: { text: 'a' }, idempotencyKey: 'a' })
+    relay.settle(ack(JSON.parse(sent[0]!).commandId, { status: 'accepted', result: 1 }))
+    await expect(accepted).resolves.toEqual({ ok: true, result: 1 })
+
+    const confirmed = relay.command({ op: 'prompt', target: target(), args: { text: 'b' }, idempotencyKey: 'b' })
+    relay.settle(ack(JSON.parse(sent[1]!).commandId, { status: 'confirmed', result: 2 }))
+    await expect(confirmed).resolves.toEqual({ ok: true, result: 2 })
+  })
+
+  it('rejected 缺 code 时默认 unsupported', async () => {
+    const { registry, sent } = setup()
+    const relay = new HubRelay({ registry, now: () => 0, timeoutMs: 50 })
+    const promise = relay.command({ op: 'prompt', target: target(), args: { text: 'hi' }, idempotencyKey: 'r' })
+    relay.settle(ack(JSON.parse(sent[0]!).commandId, { status: 'rejected' }))
+    await expect(promise).resolves.toEqual({ ok: false, code: 'unsupported' })
+  })
+
+  it('pending-confirmation 与 outcome-unknown 保留各自 code', async () => {
+    const { registry, sent } = setup()
+    const relay = new HubRelay({ registry, now: () => 0, timeoutMs: 50 })
+    const pending = relay.command({ op: 'prompt', target: target(), args: { text: 'p' }, idempotencyKey: 'p' })
+    relay.settle(ack(JSON.parse(sent[0]!).commandId, { status: 'pending-confirmation' }))
+    await expect(pending).resolves.toEqual({ ok: false, code: 'pending-confirmation' })
+
+    const unknown = relay.command({ op: 'prompt', target: target(), args: { text: 'u' }, idempotencyKey: 'u' })
+    relay.settle(ack(JSON.parse(sent[1]!).commandId, { status: 'outcome-unknown' }))
+    await expect(unknown).resolves.toEqual({ ok: false, code: 'outcome-unknown' })
+  })
+
   it('目标离线直接失败', async () => {
     const relay = new HubRelay({ registry: new DeviceRegistry(), now: () => 0, timeoutMs: 50 })
     await expect(relay.command({ op: 'prompt', target: target('ghost'), args: {}, idempotencyKey: 'k' }))

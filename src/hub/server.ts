@@ -148,7 +148,13 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
       ws.on('pong', () => alive.set(ws, true))
 
       const connectionId = randomUUID()
-      const helloTimer = setTimeout(() => { ws.close(CLOSE_CODES.HELLO_TIMEOUT, 'hello-timeout') }, options.helloTimeoutMs ?? HELLO_TIMEOUT_MS)
+      const helloTimer = setTimeout(() => {
+        // 先发 4408 关闭帧；对端不回应关闭握手时再强拆，避免半开连接常驻。
+        ws.close(CLOSE_CODES.HANDSHAKE_TIMEOUT, 'handshake-timeout')
+        const force = setTimeout(() => ws.terminate(), 1_000)
+        force.unref()
+        helloTimers.add(force)
+      }, options.helloTimeoutMs ?? HELLO_TIMEOUT_MS)
       helloTimers.add(helloTimer)
       const clearHelloTimer = (): void => {
         clearTimeout(helloTimer)
@@ -180,9 +186,9 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
         const id = deviceOf.get(ws)
         if (id === undefined) {
           // 未发 hello 的 socket 不进注册表；首帧必须既是 hello，又与握手时那个设备一致。
-          if (frame.type !== 'hello') { ws.close(CLOSE_CODES.FRAME_INVALID, 'hello-required'); return }
+          if (frame.type !== 'hello') { ws.close(CLOSE_CODES.FRAME_INVALID, 'frame-invalid'); return }
           if (frame.deviceId !== device.id) {
-            ws.close(CLOSE_CODES.AUTH_FAILED, 'auth-failed')
+            ws.close(CLOSE_CODES.DEVICE_MISMATCH, 'device-mismatch')
             return
           }
           if (frame.contractRevision !== CONTRACT_REVISION) {
@@ -202,7 +208,11 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
           // 节点重连后会重发快照：先清掉该设备的旧索引，已删除的会话不会残留。
           options.onAttach?.(device.id)
           const ack: HelloAckFrame = {
-            v: 2, type: 'hello.ack', connectionId, hubEpoch, operatorId, policyRevision,
+            v: 2, type: 'hello.ack', connectionId, hubEpoch,
+            contractRevision: CONTRACT_REVISION,
+            features: [...frame.features],
+            nodeEpoch,
+            operatorId, policyRevision,
             deviceId: device.id,
             policies: {
               privacy: 'metadata',
@@ -217,6 +227,12 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
           sendFrame(ws, ack)
           return
         }
+        // 同设备新连接已接管槽位：旧连接上的帧一律视为过期，不能修改索引或完成新命令。
+        const slot = registry.get(id)
+        if (slot === undefined || slot.sender !== sender) {
+          ws.close(CLOSE_CODES.STALE_CONNECTION, 'stale-connection')
+          return
+        }
         // 每条已认证连接只接受 node→hub 或双向帧；hub→node 帧从设备发来即协议错误。
         const direction = directionOf(frame)
         if (direction !== 'node-to-hub' && direction !== 'both') {
@@ -227,8 +243,12 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
         if (frame.type === 'event') {
           const agents = agentsOf.get(ws)
           // 只信握手绑定的身份：帧里自报的 deviceId/agent 不能冒充别的设备或未声明的 agent。
-          if (frame.deviceId !== id || (agents !== undefined && !agents.has(frame.agent))) {
-            ws.close(CLOSE_CODES.FRAME_INVALID, 'device-mismatch')
+          if (frame.deviceId !== id) {
+            ws.close(CLOSE_CODES.DEVICE_MISMATCH, 'device-mismatch')
+            return
+          }
+          if (agents !== undefined && !agents.has(frame.agent)) {
+            ws.close(CLOSE_CODES.FRAME_INVALID, 'frame-invalid')
             return
           }
           registry.touch(id, now())

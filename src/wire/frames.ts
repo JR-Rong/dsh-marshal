@@ -3,23 +3,31 @@ import { MAX_FRAME_BYTES, MAX_JSON_DEPTH } from './limits.ts'
 
 export const CONTRACT_REVISION = 'p1-review-2'
 
+/** 契约 §12 的错误码，加上本实现内部使用的传输级分类。 */
 export const WIRE_ERROR_CODES = [
-  'frame-invalid', 'version-unsupported', 'auth-failed', 'hello-required', 'device-mismatch',
-  'conflict', 'idempotency-conflict', 'revision-conflict', 'size-limit', 'device-offline',
-  'timeout', 'disposed', 'recovery-required', 'session-unknown', 'invalid-args', 'unsupported',
-  'adapter-crashed', 'result-too-large', 'deadline-expired', 'tighten-only', 'session-mismatch',
-  'invalid', 'unknown', 'record-unavailable',
+  'auth-failed', 'device-mismatch', 'stale-connection', 'frame-invalid', 'device-offline',
+  'sync-required', 'session-unknown', 'writer-busy', 'ownership-unverified', 'expired',
+  'clock-skew', 'conflict', 'idempotency-conflict', 'revision-conflict', 'outcome-unknown',
+  'approval-disabled', 'approval-expired', 'decision-invalid', 'widen-rejected', 'unsupported',
+  'version-unsupported', 'size-limit', 'readback-timeout', 'readback-mismatch', 'agent-crashed',
+  'recovery-required', 'record-unavailable', 'settings-unsafe', 'session-purpose-conflict',
+  'invalid-args',
+  // 传输层内部使用，不在契约 §12 的公开枚举里。
+  'hello-required', 'timeout', 'disposed', 'invalid', 'unknown', 'result-too-large',
+  'deadline-expired', 'tighten-only', 'session-mismatch',
 ] as const
 export const WireErrorCode = z.enum(WIRE_ERROR_CODES)
 export type WireErrorCode = z.infer<typeof WireErrorCode>
 
+/** 契约 §12 固定的 close code；1009 仅表示帧超限，由 ws 库在 maxPayload 溢出时发出。 */
 export const CLOSE_CODES = {
   FRAME_INVALID: 4400,
   AUTH_FAILED: 4401,
-  FORBIDDEN: 4403,
-  HELLO_TIMEOUT: 4406,
-  POLICY_UNCONFIRMED: 4408,
-  VERSION_UNSUPPORTED: 4409,
+  DEVICE_MISMATCH: 4403,
+  VERSION_UNSUPPORTED: 4406,
+  HANDSHAKE_TIMEOUT: 4408,
+  STALE_CONNECTION: 4409,
+  FRAME_SIZE: 1009,
 } as const
 
 export class FrameError extends Error {
@@ -29,7 +37,12 @@ export class FrameError extends Error {
   readonly code: WireErrorCode
 
   constructor(message: string, frameType?: string, code: WireErrorCode = 'frame-invalid') {
-    super(message)
+    // 契约 §12：任何通道都不得省略机器可读 code，消息统一以 `marshal: <code>:` 开头。
+    const withoutPrefix = message.startsWith('marshal: ') ? message.slice('marshal: '.length) : message
+    const detail = withoutPrefix.startsWith(`${code}:`)
+      ? withoutPrefix.slice(code.length + 1).trimStart()
+      : withoutPrefix
+    super(`marshal: ${code}: ${detail}`)
     this.frameType = frameType
     this.code = code
   }
@@ -91,6 +104,9 @@ const HelloAckSchema = z.object({
   v: z.literal(2), type: z.literal('hello.ack'),
   connectionId: z.string().min(1),
   hubEpoch: z.string().min(1),
+  contractRevision: z.string().min(1),
+  features: z.array(z.string().min(1)),
+  nodeEpoch: z.string().min(1),
   operatorId: z.string().min(1),
   policyRevision: z.number().int().nonnegative(),
   deviceId: z.string().min(1),
@@ -327,14 +343,14 @@ function valueExceedsDepth(value: unknown): boolean {
 
 function tooLarge(bytes: number): FrameError {
   return new FrameError(
-    `marshal: frame too large: ${bytes} bytes exceeds limit of ${MAX_FRAME_BYTES} bytes`,
+    `frame too large: ${bytes} bytes exceeds limit of ${MAX_FRAME_BYTES} bytes`,
     undefined,
     'size-limit',
   )
 }
 
 function tooDeep(): FrameError {
-  return new FrameError(`marshal: frame exceeds maximum JSON depth of ${MAX_JSON_DEPTH}`)
+  return new FrameError(`frame exceeds maximum JSON depth of ${MAX_JSON_DEPTH}`)
 }
 
 export function encodeFrame(frame: Frame): string {
@@ -350,20 +366,20 @@ export function decodeFrame(text: string): Frame {
   if (bytes > MAX_FRAME_BYTES) throw tooLarge(bytes)
   if (textExceedsDepth(text)) throw tooDeep()
   let json: unknown
-  try { json = JSON.parse(text) } catch { throw new FrameError('marshal: frame is not JSON') }
+  try { json = JSON.parse(text) } catch { throw new FrameError('frame is not JSON') }
   if (valueExceedsDepth(json)) throw tooDeep()
   const parsed = FrameSchema.safeParse(json)
   if (!parsed.success) {
     const frameType = extractFrameType(json)
     const version = extractVersion(json)
     if (version !== undefined && version !== 2) {
-      throw new FrameError('marshal: unsupported wire version', frameType, 'version-unsupported')
+      throw new FrameError('unsupported wire version', frameType, 'version-unsupported')
     }
     const issue = parsed.error.issues[0]
     const where = issue ? formatPath(issue.path) : '(root)'
     const detail = issue?.message ?? 'invalid frame'
     const label = frameType === undefined ? '' : ` type=${frameType}`
-    throw new FrameError(`marshal: invalid frame${label} at ${where}: ${detail}`, frameType)
+    throw new FrameError(`invalid frame${label} at ${where}: ${detail}`, frameType)
   }
   return parsed.data
 }

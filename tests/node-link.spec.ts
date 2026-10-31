@@ -1,15 +1,16 @@
 import { createServer, type Server } from 'node:http'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { WebSocket, WebSocketServer } from 'ws'
-import { NodeLink, type NodeLinkOptions } from '../src/node/link.ts'
-import type { EventFrame } from '../src/wire/frames.ts'
+import { NodeLink, NODE_EPOCH, type NodeLinkOptions } from '../src/node/link.ts'
+import { CONTRACT_REVISION, type EventFrame } from '../src/wire/frames.ts'
 
 const TOKEN = 'z'.repeat(32)
 const POLL_INTERVAL_MS = 20
 const POLL_TIMEOUT_MS = 5_000
 const HELLO_ACK = JSON.stringify({
   v: 2, type: 'hello.ack', connectionId: 'conn-1', hubEpoch: 'hub-1',
-  operatorId: 'op-1', policyRevision: 0, deviceId: 'mac',
+  contractRevision: CONTRACT_REVISION, features: [],
+  operatorId: 'op-1', policyRevision: 0, deviceId: 'mac', nodeEpoch: NODE_EPOCH,
   policies: {
     privacy: 'metadata', questionRelay: 'off', approvalRelay: 'off',
     allowContent: false, allowInteractions: false, allowDiscussion: false,
@@ -302,6 +303,42 @@ describe('NodeLink', () => {
     link.start()
     await waitFor(() => connections === 2, 'second connection after explicit start')
     expect(received.filter(text => typeOf(text) === 'hello')).toHaveLength(2)
+  })
+
+  it('onOnline 只在合法 hello.ack 之后触发', async () => {
+    let client: WebSocket | undefined
+    const online: number[] = []
+    const { port } = await listen({ ack: false, onHello: ws => { client = ws } })
+
+    const link = createLink(port, { onOnline: () => { online.push(Date.now()) } })
+    link.start()
+    await waitFor(() => client !== undefined, 'server side socket')
+    await settle(100)
+    expect(online).toHaveLength(0)
+
+    client?.send(HELLO_ACK)
+    await waitFor(() => online.length === 1, 'onOnline after hello.ack')
+  })
+
+  it('contractRevision 不匹配时以 4406 终止，不再重拨', async () => {
+    let connections = 0
+    const errors: unknown[] = []
+    const { port, received } = await listen({
+      ack: false,
+      onConnection: () => { connections += 1 },
+      onHello: ws => ws.send(JSON.stringify({ ...JSON.parse(HELLO_ACK), contractRevision: 'old-revision' })),
+    })
+
+    const link = createLink(port, {
+      maxBackoffMs: 40,
+      onError: error => { errors.push(error) },
+    })
+    link.start()
+    await waitFor(() => received.filter(text => typeOf(text) === 'hello').length === 1, 'hello frame')
+    await waitFor(() => errors.length > 0, 'terminal handshake error')
+    await settle(400)
+    expect(connections).toBe(1)
+    expect(received.filter(text => typeOf(text) === 'hello')).toHaveLength(1)
   })
 
   it('重复 start 只建立一个连接', async () => {

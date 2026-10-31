@@ -54,15 +54,11 @@ describe('parseConfig', () => {
     expect(Object.isFrozen(config)).toBe(true)
   })
 
-  it('拒绝非 ws(s) 的 hubUrl', () => {
-    expect(() => parseConfig({ ...base, hubUrl: 'http://hub/marshal' }, 'box')).toThrow(/not a valid ws\(s\) URL/)
-    expect(() => parseConfig({ ...base, hubUrl: 'wss://' }, 'box')).toThrow(/not a valid ws\(s\) URL/)
-  })
-
-  it('接受 ws:// 与 wss:// 的 hubUrl', () => {
+  it('hubUrl 必须是 wss://', () => {
     expect(parseConfig(base, 'box').hubUrl).toBe('wss://hub.example/marshal/uplink')
-    expect(parseConfig({ ...base, hubUrl: 'ws://127.0.0.1:8787/marshal' }, 'box').hubUrl)
-      .toBe('ws://127.0.0.1:8787/marshal')
+    expect(() => parseConfig({ ...base, hubUrl: 'http://hub/marshal' }, 'box')).toThrow(/wss:\/\/ URL/)
+    expect(() => parseConfig({ ...base, hubUrl: 'ws://127.0.0.1:8787/marshal' }, 'box')).toThrow(/wss:\/\/ URL/)
+    expect(() => parseConfig({ ...base, hubUrl: 'wss://' }, 'box')).toThrow(/wss:\/\/ URL/)
   })
 
   it('空串或纯空白的 token 按缺失处理', () => {

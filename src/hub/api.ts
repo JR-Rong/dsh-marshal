@@ -1,7 +1,8 @@
 import { createHash, timingSafeEqual } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { WebServerLike } from '../dsh-types.ts'
-import { COMMAND_OPS, type CommandFrame, type EventFrame } from '../wire/frames.ts'
+import { COMMAND_OPS, type CommandFrame, type CommandOp, type EventFrame } from '../wire/frames.ts'
+import { parseCommandArgs } from '../wire/commands.ts'
 import { MAX_FRAME_BYTES } from '../wire/limits.ts'
 import type { DeviceRegistry } from './registry.ts'
 import type { HubRelay } from './relay.ts'
@@ -51,9 +52,10 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
   }
 
   // 401 不回显任何 token 片段；比较定长摘要，长度差异不落在时序上。
-  const authorized = (req: IncomingMessage, url: URL): boolean => {
+  // 契约 §3/§4：token 只走 Authorization 语义的请求头，禁止 URL 查询参数（浏览器登录由 T08 提供）。
+  const authorized = (req: IncomingMessage): boolean => {
     const header = req.headers['x-marshal-token']
-    const provided = url.searchParams.get('token') ?? (Array.isArray(header) ? header[0] : header)
+    const provided = Array.isArray(header) ? header[0] : header
     return typeof provided === 'string' && provided.length > 0
       && timingSafeEqual(digest(provided), expected)
   }
@@ -61,9 +63,8 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
   // 异步失败统一收口：未发头回 500，已发头只结束响应，避免客户端一直挂着。
   const guard = (handler: Handler): Handler => async (req, res) => {
     // 畸形 URL 一律当未授权，避免抛错变成 500。
-    let url: URL
-    try { url = new URL(req.url ?? '/', 'http://localhost') } catch { res.writeHead(401).end('unauthorized'); return }
-    if (!authorized(req, url)) { res.writeHead(401).end('unauthorized'); return }
+    try { new URL(req.url ?? '/', 'http://localhost') } catch { res.writeHead(401).end('unauthorized'); return }
+    if (!authorized(req)) { res.writeHead(401).end('unauthorized'); return }
     try {
       await handler(req, res)
     } catch (error) {
@@ -83,7 +84,7 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
       res.writeHead(200, {
         'content-type': 'text/html; charset=utf-8',
         'cache-control': 'no-store',
-        // token 走 URL，禁止外链携带，也禁止浏览器猜内容类型。
+        // 页面本身不含数据；禁止外链携带凭据，也禁止浏览器猜内容类型。
         'referrer-policy': 'no-referrer',
         'x-content-type-options': 'nosniff',
       })
@@ -134,15 +135,25 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
       const body = parsed as CommandBody
       const { op, target, idempotencyKey } = body
       if (typeof op !== 'string' || !isTarget(target) || typeof idempotencyKey !== 'string' || idempotencyKey.length === 0) {
-        res.writeHead(400).end('missing op/target/idempotencyKey'); return
+        json(res, 400, { ok: false, code: 'invalid-args' }); return
       }
-      if (!(COMMAND_OPS as readonly string[]).includes(op)) { res.writeHead(400).end('unknown op'); return }
+      if (!(COMMAND_OPS as readonly string[]).includes(op)) {
+        json(res, 400, { ok: false, code: 'invalid-args' }); return
+      }
+      // 参数在 hub 侧先按 op 校验；非法参数不进入中继，也不消耗幂等键。
+      let args: ReturnType<typeof parseCommandArgs>
+      try {
+        args = parseCommandArgs(op as CommandOp, body.args)
+      } catch {
+        json(res, 400, { ok: false, code: 'invalid-args' }); return
+      }
       const outcome = await relay.command({
-        op: op as CommandFrame['op'], target, args: body.args, idempotencyKey,
+        op: op as CommandFrame['op'], target, args, idempotencyKey,
       })
       if (!outcome.ok) {
         // 明确区分「设备不在线」「参数/会话错误」「执行失败」，别把一切都报成 504。
-        const status = outcome.code === 'device-offline' ? 409
+        const status = outcome.code === 'pending-confirmation' || outcome.code === 'outcome-unknown' ? 202
+          : outcome.code === 'device-offline' ? 409
           : outcome.code === 'disposed' ? 503
           : outcome.code === 'timeout' ? 504
           : outcome.code === 'invalid-args' || outcome.code === 'unsupported'

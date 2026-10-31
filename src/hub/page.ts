@@ -32,8 +32,11 @@ export const PAGE_HTML = `<!doctype html>
 <form id="send"><input id="text" placeholder="给选中会话发一条消息"><button>发送</button></form>
 <div id="status"></div></main>
 <script>
-const token = new URLSearchParams(location.search).get('token') || '';
-const api = (path) => path + (token ? (path.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token) : '');
+// T08 会换成 POST /marshal/login + cookie；在此之前只从会话存储取令牌走请求头，
+// 不接受 URL 查询参数（契约 §3/§4）。
+const token = sessionStorage.getItem('marshal-token') || '';
+const api = (path) => path;
+const headers = (extra) => token ? Object.assign({}, extra, { 'x-marshal-token': token }) : (extra || {});
 let current = null;
 let selected = null;
 const log = document.getElementById('log');
@@ -56,7 +59,7 @@ function dot(running) {
 async function refresh() {
   let data = null;
   try {
-    const response = await fetch(api('/marshal/api/devices'));
+    const response = await fetch(api('/marshal/api/devices'), { headers: headers() });
     if (response.ok) data = await response.json();
   } catch { /* 网络错误按断开处理 */ }
   if (data === null || !Array.isArray(data.devices)) { devicesRoot.textContent = 'hub 断开，重试中…'; return; }
@@ -93,7 +96,7 @@ async function loadSessions(device, agent) {
   }
   let data = null;
   try {
-    const response = await fetch(api('/marshal/api/sessions?device=' + encodeURIComponent(device)));
+    const response = await fetch(api('/marshal/api/sessions?device=' + encodeURIComponent(device)), { headers: headers() });
     if (response.ok) data = await response.json();
   } catch { /* 网络错误按加载失败处理 */ }
   if (data === null || !Array.isArray(data.sessions)) { log.textContent = '加载失败'; return; }
@@ -131,7 +134,7 @@ async function command(op, args, target, idempotencyKey) {
   try {
     response = await fetch(api('/marshal/api/command'), {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: headers({ 'content-type': 'application/json' }),
       body: JSON.stringify({ op, target: to, args, idempotencyKey: idempotencyKey || newKey() }),
     });
   } catch {

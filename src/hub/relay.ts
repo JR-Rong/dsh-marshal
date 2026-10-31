@@ -141,10 +141,20 @@ export class HubRelay {
     if (entry === undefined) return
     clearTimeout(entry.timer)
     this.pending.delete(ack.commandId)
-    const ok = ack.status === 'accepted' || ack.status === 'confirmed'
-    entry.resolve(ok
-      ? { ok: true, result: ack.result }
-      : { ok: false, code: ack.code ?? 'unknown' })
+    switch (ack.status) {
+      case 'accepted':
+      case 'confirmed':
+        entry.resolve({ ok: true, result: ack.result })
+        return
+      case 'rejected':
+        entry.resolve({ ok: false, code: ack.code ?? 'unsupported' })
+        return
+      case 'pending-confirmation':
+      case 'outcome-unknown':
+        // 两种状态都不是失败重试信号：保留各自的机器可读 code，不能折叠成 unknown。
+        entry.resolve({ ok: false, code: ack.status })
+        return
+    }
   }
 
   /** 设备掉线时立刻结束发给它的指令，不让调用方干等到超时。 */
