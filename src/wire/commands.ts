@@ -31,10 +31,17 @@ const InterruptArgsSchema = z.object({
   turnId: z.string().min(1).optional(),
 }).strict()
 
+const WireAnswerSchema = z.object({
+  // 稳定选项 ID 由 node 端投影生成；显示 label 不参与识别。
+  id: z.string().min(1).max(128),
+  selectedOptionIds: z.array(z.string().min(1).max(256)).max(64),
+  text: z.string().max(4096).optional(),
+}).strict()
+
 const AnswerArgsSchema = z.object({
   requestId: z.string().min(1),
   // 卡片总大小（含 answers）由投影层按 MAX_INTERACTION_INPUT_BYTES 限制。
-  answers: z.unknown(),
+  answers: z.array(WireAnswerSchema).max(64),
 }).strict()
 
 const CancelArgsSchema = z.object({

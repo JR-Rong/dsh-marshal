@@ -58,8 +58,8 @@ export interface Capability {
   readonly unavailable?: Readonly<Record<string, string>>
 }
 
-/** `decision-invalid`：卡片因脱敏/超限被标为不可远答，答案必须拒绝。 */
-export type SettleResult = 'ok' | 'unknown' | 'invalid' | 'session-mismatch' | 'decision-invalid'
+/** `decision-invalid`：卡片因脱敏/超限被标为不可远答，答案必须拒绝；`expired`：期限已过。 */
+export type SettleResult = 'ok' | 'unknown' | 'invalid' | 'session-mismatch' | 'decision-invalid' | 'expired'
 
 /** 远端答案回到本机时走它；只有 `ok` 表示这次答案被采纳。 */
 export interface AnswerSink {

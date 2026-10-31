@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import {
   encodeFrame, type AckFrame, type CommandFrame, type CommandOp,
   type CommandStatusFrame, type CommandStatusResultFrame, type EventFrame,
+  type InputsSnapshotFrame, type InputsSnapshotResultFrame,
 } from '../wire/frames.ts'
 import { COMMAND_TTL_MS } from '../wire/limits.ts'
 import { commandPayloadDigest } from '../wire/commands.ts'
@@ -261,9 +262,31 @@ interface PendingStatus {
   readonly nodeEpoch: string
 }
 
+/** 待答快照的只读结果；失败码与命令一样区分“没发出”和“结果未知”。 */
+export type InputsSnapshotOutcome =
+  | {
+    readonly ok: true
+    readonly runtimeEpoch: string
+    readonly highWatermark: number
+    readonly cards: readonly unknown[]
+  }
+  | {
+    readonly ok: false
+    readonly code: 'device-offline' | 'outcome-unknown' | 'disposed'
+  }
+
+interface PendingInputs {
+  resolve: (outcome: InputsSnapshotOutcome) => void
+  timer: NodeJS.Timeout
+  readonly deviceId: string
+  readonly connectionId: string
+  readonly nodeEpoch: string
+}
+
 export class HubRelay {
   private readonly pending = new Map<string, Pending>()
   private readonly statusPending = new Map<string, PendingStatus>()
+  private readonly inputsPending = new Map<string, PendingInputs>()
   private readonly idempotency = new HubIdempotency<CommandOutcome>()
   /** 幂等键归属：断线时按设备清掉缓存里的结果正文。 */
   private readonly cacheDevices = new Map<string, string>()
@@ -531,6 +554,63 @@ export class HubRelay {
     })
   }
 
+  /**
+   * 当前待答快照：只读、有界（COMMAND_TTL_MS），绑定请求时刻的连接身份。
+   * 未注册设备立即返回 device-offline；发出后没有匹配结果按结果未知。
+   */
+  async requestInputs(target: CommandFrame['target'], sessionId: string): Promise<InputsSnapshotOutcome> {
+    if (this.disposed) return { ok: false, code: 'disposed' }
+    const slot = this.options.registry.get(target.deviceId)
+    if (slot === undefined) return { ok: false, code: 'device-offline' }
+
+    const requestId = randomUUID()
+    const timeoutMs = this.options.timeoutMs ?? COMMAND_TTL_MS
+    const connectionId = slot.connectionId ?? UNBOUND_CONNECTION_ID
+    const nodeEpoch = slot.nodeEpoch ?? UNBOUND_NODE_EPOCH
+    const frame: InputsSnapshotFrame = {
+      v: 2, type: 'inputs.snapshot', requestId,
+      target: { deviceId: target.deviceId, agent: target.agent, sessionId },
+      connectionId,
+      nodeEpoch,
+    }
+
+    return await new Promise<InputsSnapshotOutcome>((resolve) => {
+      const timer = setTimeout(() => {
+        this.inputsPending.delete(requestId)
+        resolve({ ok: false, code: 'outcome-unknown' })
+      }, timeoutMs)
+      this.inputsPending.set(requestId, {
+        resolve, timer, deviceId: target.deviceId, connectionId, nodeEpoch,
+      })
+      try {
+        slot.sender.send(encodeFrame(frame))
+      } catch {
+        // 没有发出去：不是“未知结果”，但也不能当作有效快照，按 unknown 处理。
+        clearTimeout(timer)
+        this.inputsPending.delete(requestId)
+        resolve({ ok: false, code: 'outcome-unknown' })
+      }
+    })
+  }
+
+  /** 结果必须来自请求时刻的同一设备/连接/代次；否则忽略（调用方超时）。 */
+  settleInputs(frame: InputsSnapshotResultFrame, origin: FrameIdentity): void {
+    const entry = this.inputsPending.get(frame.requestId)
+    if (entry === undefined) return
+    if (entry.deviceId !== origin.deviceId
+      || entry.connectionId !== origin.connectionId
+      || entry.nodeEpoch !== origin.nodeEpoch) return
+    if (!this.currentBinding(entry, origin)) return
+    clearTimeout(entry.timer)
+    this.inputsPending.delete(frame.requestId)
+    entry.resolve({
+      ok: true,
+      runtimeEpoch: frame.runtimeEpoch,
+      highWatermark: frame.highWatermark,
+      cards: frame.cards,
+    })
+  }
+
   private currentBinding(
     entry: { readonly deviceId: string; readonly connectionId: string; readonly nodeEpoch: string },
     origin: FrameIdentity,
@@ -557,6 +637,12 @@ export class HubRelay {
       this.statusPending.delete(requestId)
       entry.resolve({ status: 'outcome-unknown', code: 'device-offline' })
     }
+    for (const [requestId, entry] of [...this.inputsPending]) {
+      if (entry.deviceId !== deviceId) continue
+      clearTimeout(entry.timer)
+      this.inputsPending.delete(requestId)
+      entry.resolve({ ok: false, code: 'device-offline' })
+    }
   }
 
   /**
@@ -572,6 +658,13 @@ export class HubRelay {
     const prefix = `${deviceId}\u0000`
     for (const key of [...this.activeTurns.keys()]) {
       if (key.startsWith(prefix)) this.activeTurns.delete(key)
+    }
+    // 旧代次的待答快照不能作为新连接的当前状态返回。
+    for (const [requestId, entry] of [...this.inputsPending]) {
+      if (entry.deviceId !== deviceId) continue
+      clearTimeout(entry.timer)
+      this.inputsPending.delete(requestId)
+      entry.resolve({ ok: false, code: 'outcome-unknown' })
     }
   }
 
@@ -661,6 +754,8 @@ export class HubRelay {
     this.pending.clear()
     const waitingStatus = [...this.statusPending.values()]
     this.statusPending.clear()
+    const waitingInputs = [...this.inputsPending.values()]
+    this.inputsPending.clear()
     this.idempotency.clear()
     for (const entry of waiting) {
       clearTimeout(entry.timer)
@@ -669,6 +764,10 @@ export class HubRelay {
     for (const entry of waitingStatus) {
       clearTimeout(entry.timer)
       entry.resolve({ status: 'outcome-unknown', code: 'disposed' })
+    }
+    for (const entry of waitingInputs) {
+      clearTimeout(entry.timer)
+      entry.resolve({ ok: false, code: 'disposed' })
     }
   }
 

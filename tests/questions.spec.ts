@@ -6,7 +6,7 @@ import { createDshAdapter } from '../src/adapters/dsh/adapter.ts'
 import type { AskUserQuestionAnswerLike, AskUserQuestionRequestLike, MarshalContext, UserQuestionLike } from '../src/dsh-types.ts'
 import { openJournal, type Journal } from '../src/node/journal.ts'
 import { createPrivacyProjector, type PrivacyProjector } from '../src/node/privacy.ts'
-import { createQuestionRelay, parseAnswers, type QuestionRelay } from '../src/node/questions.ts'
+import { createQuestionRelay, type QuestionRelay } from '../src/node/questions.ts'
 import { createFollower, runCommand } from '../src/node/runner.ts'
 import type { NodeLink } from '../src/node/link.ts'
 import type { EventFrame, Frame } from '../src/wire/frames.ts'
@@ -66,6 +66,11 @@ function projectorFor(options: HarnessOptions): PrivacyProjector {
   })
 }
 
+/** 无 id 选项的投影 ID 固定为 `${questionId}o${index+1}`。 */
+function wire(id: string, optionIds: string[]): { answers: { id: string; selectedOptionIds: string[] }[] } {
+  return { answers: [{ id, selectedOptionIds: optionIds }] }
+}
+
 function harness(timeoutMs = 50, options: HarnessOptions = {}) {
   const sent: EventFrame[] = []
   let handler: Handler | undefined
@@ -113,25 +118,26 @@ function requestIdOf(event: EventFrame | undefined): string {
 }
 
 describe('question relay', () => {
-  it('发 input.requested 并等远端答案', async () => {
+  it('发 input.requested 并等远端答案，原生回写原始 label', async () => {
     const h = harness()
     const pending = h.ask()
     const requested = h.sent[0]
     expect(requested?.kind).toBe('input.requested')
     const requestId = requestIdOf(requested)
-    expect(h.relay.settle('s1', requestId, { answers: [{ id: 'q1', selected: ['A'] }] })).toBe('ok')
+    expect(h.relay.settle('s1', requestId, wire('q1', ['q1o1']))).toBe('ok')
     await expect(pending).resolves.toEqual({ answers: [{ id: 'q1', selected: ['A'] }] })
     expect(h.sent.map(event => event.kind)).toEqual(['input.requested', 'input.resolved'])
     expect((h.sent[1]?.payload as { state: string }).state).toBe('answered')
+    expect(JSON.stringify(h.sent[1]?.payload)).not.toContain('A')
   })
 
   it('同一请求第二次结算返回 unknown', async () => {
     const h = harness()
     const pending = h.ask()
     const requestId = requestIdOf(h.sent[0])
-    h.relay.settle('s1', requestId, { answers: [{ id: 'q1', selected: ['A'] }] })
+    h.relay.settle('s1', requestId, wire('q1', ['q1o1']))
     await pending
-    expect(h.relay.settle('s1', requestId, { answers: [{ id: 'q1', selected: ['A'] }] })).toBe('unknown')
+    expect(h.relay.settle('s1', requestId, wire('q1', ['q1o1']))).toBe('unknown')
   })
 
   it('policyRevision 变化后 answer 返回 decision-invalid 并发出 invalidated', async () => {
@@ -145,11 +151,11 @@ describe('question relay', () => {
     const pending = h.ask()
     const requestId = requestIdOf(h.sent[0])
     revision = 2
-    expect(h.relay.settle('s1', requestId, { answers: [{ id: 'q1', selected: ['A'] }] })).toBe('decision-invalid')
+    expect(h.relay.settle('s1', requestId, wire('q1', ['q1o1']))).toBe('decision-invalid')
     await expect(pending).rejects.toThrow(/fell through/)
     expect(h.sent.map(event => event.kind)).toEqual(['input.requested', 'input.resolved'])
     expect((h.sent[1]?.payload as { state: string }).state).toBe('invalidated')
-    expect(h.relay.settle('s1', requestId, { answers: [{ id: 'q1', selected: ['A'] }] })).toBe('unknown')
+    expect(h.relay.settle('s1', requestId, wire('q1', ['q1o1']))).toBe('unknown')
   })
 
   it('hello.ack 重新核验会一次性作废旧卡', async () => {
@@ -166,15 +172,15 @@ describe('question relay', () => {
     h.relay.revalidate()
     await expect(pending).rejects.toThrow(/fell through/)
     expect((h.sent[1]?.payload as { state: string }).state).toBe('invalidated')
-    expect(h.relay.settle('s1', requestId, { answers: [{ id: 'q1', selected: ['A'] }] })).toBe('unknown')
+    expect(h.relay.settle('s1', requestId, wire('q1', ['q1o1']))).toBe('unknown')
   })
 
   it('会话不匹配返回 session-mismatch 且仍在等待', async () => {
     const h = harness()
     const pending = h.ask()
     const requestId = requestIdOf(h.sent[0])
-    expect(h.relay.settle('other', requestId, { answers: [{ id: 'q1', selected: ['A'] }] })).toBe('session-mismatch')
-    h.relay.settle('s1', requestId, { answers: [{ id: 'q1', selected: ['A'] }] })
+    expect(h.relay.settle('other', requestId, wire('q1', ['q1o1']))).toBe('session-mismatch')
+    h.relay.settle('s1', requestId, wire('q1', ['q1o1']))
     await expect(pending).resolves.toEqual({ answers: [{ id: 'q1', selected: ['A'] }] })
   })
 
@@ -183,7 +189,7 @@ describe('question relay', () => {
     const pending = h.ask()
     const requestId = requestIdOf(h.sent[0])
     expect(h.relay.settle('s1', requestId, { answers: [] })).toBe('invalid')
-    h.relay.settle('s1', requestId, { answers: [{ id: 'q1', selected: ['B'] }] })
+    h.relay.settle('s1', requestId, wire('q1', ['q1o2']))
     await expect(pending).resolves.toEqual({ answers: [{ id: 'q1', selected: ['B'] }] })
   })
 
@@ -203,7 +209,7 @@ describe('question relay', () => {
     await expect(pending).rejects.toThrow(/fell through/)
     expect(h.sent.map(event => event.kind)).toEqual(['input.requested', 'input.resolved'])
     expect((h.sent[1]?.payload as { state: string }).state).toBe('cancelled')
-    expect(h.relay.settle('s1', requestId, { answers: [{ id: 'q1', selected: ['A'] }] })).toBe('unknown')
+    expect(h.relay.settle('s1', requestId, wire('q1', ['q1o1']))).toBe('unknown')
   })
 
   it('dispose 结束等待但不发 input.resolved，且可重复调用', async () => {
@@ -214,15 +220,15 @@ describe('question relay', () => {
     await expect(pending).rejects.toThrow(/fell through/)
     expect(h.sent.map(event => event.kind)).toEqual(['input.requested'])
     h.relay.dispose()
-    expect(h.relay.settle('s1', requestId, { answers: [{ id: 'q1', selected: ['A'] }] })).toBe('unknown')
+    expect(h.relay.settle('s1', requestId, wire('q1', ['q1o1']))).toBe('unknown')
   })
 
-  it('选中不在 options 里的标签返回 invalid 且仍可继续作答', async () => {
+  it('选中不在映射里的投影 ID 返回 invalid 且仍可继续作答', async () => {
     const h = harness()
     const pending = h.ask()
     const requestId = requestIdOf(h.sent[0])
-    expect(h.relay.settle('s1', requestId, { answers: [{ id: 'q1', selected: ['Z'] }] })).toBe('invalid')
-    expect(h.relay.settle('s1', requestId, { answers: [{ id: 'q1', selected: ['A'] }] })).toBe('ok')
+    expect(h.relay.settle('s1', requestId, wire('q1', ['Z']))).toBe('invalid')
+    expect(h.relay.settle('s1', requestId, wire('q1', ['q1o1']))).toBe('ok')
     await expect(pending).resolves.toEqual({ answers: [{ id: 'q1', selected: ['A'] }] })
   })
 
@@ -234,29 +240,31 @@ describe('question relay', () => {
     const h = harness(50, { questions: twoQuestions })
     const pending = h.ask()
     const requestId = requestIdOf(h.sent[0])
-    expect(h.relay.settle('s1', requestId, { answers: [{ id: 'q1', selected: ['A'] }] })).toBe('invalid')
-    const full = { answers: [{ id: 'q1', selected: ['A'] }, { id: 'q2', selected: ['C'] }] }
+    expect(h.relay.settle('s1', requestId, wire('q1', ['q1o1']))).toBe('invalid')
+    const full = { answers: [{ id: 'q1', selectedOptionIds: ['q1o1'] }, { id: 'q2', selectedOptionIds: ['q2o1'] }] }
     expect(h.relay.settle('s1', requestId, full)).toBe('ok')
-    await expect(pending).resolves.toEqual(full)
+    await expect(pending).resolves.toEqual({
+      answers: [{ id: 'q1', selected: ['A'] }, { id: 'q2', selected: ['C'] }],
+    })
   })
 
-  it('multiSelect 题接受多个标签', async () => {
+  it('multiSelect 题接受多个选项', async () => {
     const h = harness(50, {
       questions: [{ id: 'q1', question: '选多个', options: [{ label: 'A' }, { label: 'B' }], multiSelect: true }],
     })
     const pending = h.ask()
     const requestId = requestIdOf(h.sent[0])
-    const answers = { answers: [{ id: 'q1', selected: ['A', 'B'] }] }
+    const answers = wire('q1', ['q1o1', 'q1o2'])
     expect(h.relay.settle('s1', requestId, answers)).toBe('ok')
-    await expect(pending).resolves.toEqual(answers)
+    await expect(pending).resolves.toEqual({ answers: [{ id: 'q1', selected: ['A', 'B'] }] })
   })
 
-  it('非 multiSelect 题拒绝多个标签', async () => {
+  it('非 multiSelect 题拒绝多个选项', async () => {
     const h = harness()
     const pending = h.ask()
     const requestId = requestIdOf(h.sent[0])
-    expect(h.relay.settle('s1', requestId, { answers: [{ id: 'q1', selected: ['A', 'B'] }] })).toBe('invalid')
-    expect(h.relay.settle('s1', requestId, { answers: [{ id: 'q1', selected: ['A'] }] })).toBe('ok')
+    expect(h.relay.settle('s1', requestId, wire('q1', ['q1o1', 'q1o2']))).toBe('invalid')
+    expect(h.relay.settle('s1', requestId, wire('q1', ['q1o1']))).toBe('ok')
     await pending
   })
 
@@ -272,6 +280,18 @@ describe('question relay', () => {
     expect(h.sent).toEqual([])
   })
 
+  it('审批/plan-review 分类字段不借普通提问中继', async () => {
+    const h = harness(10_000, { next: async () => ({ answers: [] }) })
+    const fn = h.captured()
+    if (fn === undefined) throw new Error('relay did not subscribe')
+    const request = {
+      questions, agent: { session: { id: 's1' } },
+      category: 'approval', planReview: true,
+    } as unknown as AskUserQuestionRequestLike
+    await expect(fn(request, async () => ({ answers: [] }))).resolves.toEqual({ answers: [] })
+    expect(h.sent).toEqual([])
+  })
+
   it('发送抛错时经 next 交回本地并清空 pending', async () => {
     const h = harness(10_000, {
       send: event => {
@@ -284,7 +304,7 @@ describe('question relay', () => {
     await expect(h.ask()).resolves.toEqual({ answers: [] })
     expect(h.sent.map(event => event.kind)).toEqual(['input.requested'])
     const requestId = requestIdOf(h.sent[0])
-    expect(h.relay.settle('s1', requestId, { answers: [{ id: 'q1', selected: ['A'] }] })).toBe('unknown')
+    expect(h.relay.settle('s1', requestId, wire('q1', ['q1o1']))).toBe('unknown')
   })
 
   it('dispose 之后调用捕获的 handler 不再创建 pending', async () => {
@@ -294,7 +314,7 @@ describe('question relay', () => {
     h.relay.dispose()
     await expect(fn(h.request(), async () => ({ answers: [] }))).resolves.toEqual({ answers: [] })
     expect(h.sent).toEqual([])
-    expect(h.relay.settle('s1', 'q-any', { answers: [{ id: 'q1', selected: ['A'] }] })).toBe('unknown')
+    expect(h.relay.settle('s1', 'q-any', wire('q1', ['q1o1']))).toBe('unknown')
   })
 
   it('off 不发任何事件，直接交回本地', async () => {
@@ -321,7 +341,7 @@ describe('question relay', () => {
     await expect(h.ask()).resolves.toEqual({ answers: [] })
     const requestId = requestIdOf(h.sent[0])
     expect((h.sent[0]?.payload as { reason: string }).reason).toBe('secret-local-only')
-    expect(h.relay.settle('s1', requestId, { answers: [{ id: 'q1', selected: ['A'] }] })).toBe('decision-invalid')
+    expect(h.relay.settle('s1', requestId, wire('q1', ['q1o1']))).toBe('decision-invalid')
   })
 
   it('超过 4096 字节的卡片不可远答，伪造答案返回 decision-invalid', async () => {
@@ -337,19 +357,7 @@ describe('question relay', () => {
     expect(payload.truncated).toBe(true)
     expect(payload.acceptOnceEligible).toBe(false)
     expect(payload.reason).toBe('card-too-large')
-    expect(h.relay.settle('s1', requestId, { answers: [{ id: 'q1', selected: ['A'] }] })).toBe('decision-invalid')
-  })
-
-  it('parseAnswers 要求每个问题恰好一次', () => {
-    expect(parseAnswers({ answers: [{ id: 'q1', selected: ['A'] }] }, ['q1'])).toEqual({
-      answers: [{ id: 'q1', selected: ['A'] }],
-    })
-    expect(parseAnswers({ answers: [{ id: 'q1', selected: ['A'] }, { id: 'q1', selected: ['B'] }] }, ['q1'])).toBeUndefined()
-    expect(parseAnswers({ answers: [{ id: 'q1', selected: 'A' }] }, ['q1'])).toBeUndefined()
-    expect(parseAnswers({ answers: [{ id: 'q2', selected: ['A'] }] }, ['q1'])).toBeUndefined()
-    expect(parseAnswers({ answers: [{ id: 'q1', selected: ['A'], custom: 1 }] }, ['q1'])).toBeUndefined()
-    expect(parseAnswers({ answers: [] }, ['q1'])).toBeUndefined()
-    expect(parseAnswers(null, ['q1'])).toBeUndefined()
+    expect(h.relay.settle('s1', requestId, wire('q1', ['q1o1']))).toBe('decision-invalid')
   })
 })
 
@@ -415,13 +423,13 @@ describe('question relay end to end', () => {
     const follower = createFollower({ adapter, send: () => {}, logger: { warn() {} } })
     const flush = (): Promise<void> => new Promise(resolve => setTimeout(resolve, 1))
 
-    // 线上 args.answers 是数组（设计 §7.2），适配器负责包成 DSH 的 `{ answers }`。
-    runCommand(link, adapter, follower, command('c1', [{ id: 'q1', selected: ['A'] }]), 'mac', journal)
+    // 线上 args.answers 是稳定选项 ID 数组；适配器负责包成 DSH 的 `{ answers }`。
+    runCommand(link, adapter, follower, command('c1', [{ id: 'q1', selectedOptionIds: ['q1o1'] }]), 'mac', journal)
     await expect(pending).resolves.toEqual({ answers: [{ id: 'q1', selected: ['A'] }] })
     await flush()
     expect(received[0]).toMatchObject({ type: 'ack', commandId: 'c1', status: 'accepted', result: { accepted: true } })
 
-    runCommand(link, adapter, follower, command('c2', [{ id: 'q1', selected: ['B'] }]), 'mac', journal)
+    runCommand(link, adapter, follower, command('c2', [{ id: 'q1', selectedOptionIds: ['q1o2'] }]), 'mac', journal)
     await flush()
     expect(received[1]).toMatchObject({ type: 'ack', commandId: 'c2', status: 'rejected', code: 'unknown' })
     relay.dispose()

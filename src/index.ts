@@ -56,6 +56,8 @@ function applyHub(ctx: MarshalContext, config: MarshalConfig): void {
       else if (frame.type === 'ack') relay.settle(frame, identity)
       // 只读状态查询走独立完成逻辑，不能混进 ACK 或 event。
       else if (frame.type === 'command.status.result') relay.settleStatus(frame, identity)
+      // 待答快照结果只按请求时刻的设备/连接/代次结算。
+      else if (frame.type === 'inputs.snapshot.result') relay.settleInputs(frame, identity)
     },
   })
   ctx.effect(() => { socket.dispose(); sync.dispose(); relay.dispose() }, 'marshal: uplink socket')
@@ -143,6 +145,11 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
       runCommand(link, adapter, follower, frame, config.deviceId!, journal, Date.now, {
         projector: () => projector,
         audit,
+        // 待答快照只读：node 内存里的当前有效卡，公开高水位与事件同源。
+        inputs: {
+          snapshot: sessionId => relay?.snapshot(sessionId) ?? [],
+          highWatermark: () => publicSeq.highWatermark(),
+        },
       })
     },
     onHandshake: (binding, previous) => {
@@ -183,6 +190,12 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
         // 序号在投影之后统一分配，卡片 payload 已投影，这里只补公开 seq。
         send: event => emitVolatileProjected(event),
         frame: adapter.frame,
+        // 断线/syncing 期间暂停新认领；已认领的请求仍按原 monoDeadline 等待。
+        available: () => link.online,
+        now: Date.now,
+        monoNow: () => globalThis.performance.now(),
+        deviceId: config.deviceId!,
+        agent: adapter.agent,
         // 当前协商授权；卡片创建、answer/cancel 结算与每次 hello.ack 都按它复核。
         authorization: () => {
           const binding = link.binding

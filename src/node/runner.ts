@@ -14,6 +14,11 @@ import type { AuditSink } from './audit.ts'
 export interface CommandRuntime {
   projector(): PrivacyProjector
   audit?: AuditSink
+  /** 当前待答快照；只读，不写 journal，也不进入命令分派。 */
+  inputs?: {
+    snapshot(sessionId: string): readonly unknown[]
+    highWatermark(): number
+  }
 }
 
 /** 日志只留错误类型：原始 message 可能夹带会话正文或密钥。 */
@@ -200,6 +205,54 @@ function bindingFor(link: NodeLink, frame: { connectionId: string; nodeEpoch: st
   return binding
 }
 
+/**
+ * 待答快照是只读查询：不占 journal、不触发执行。
+ * 身份/会话不匹配就静默忽略，由调用方超时按 unknown 处理。
+ */
+function runInputsSnapshot(
+  link: NodeLink,
+  adapter: Adapter,
+  frame: Extract<Frame, { type: 'inputs.snapshot' }>,
+  deviceId: string,
+  runtime?: CommandRuntime,
+): void {
+  const binding = bindingFor(link, frame)
+  if (binding === undefined) return
+  if (frame.target.deviceId !== deviceId) return
+  if (frame.target.agent !== adapter.agent) return
+  const sessionId = frame.target.sessionId
+  // schema 已保证非空字符串；这里再防一手运行期构造。
+  if (typeof sessionId !== 'string' || sessionId === '') return
+
+  const reply = (cards: readonly unknown[], highWatermark: number): void => {
+    const body = {
+      v: 2 as const,
+      type: 'inputs.snapshot.result' as const,
+      requestId: frame.requestId,
+      runtimeEpoch: binding.nodeEpoch,
+      highWatermark,
+      cards: [...cards],
+    }
+    link.sendRaw(encodeFrame(body))
+  }
+
+  let cards: readonly unknown[] = []
+  let highWatermark = 0
+  try {
+    cards = runtime?.inputs?.snapshot(sessionId) ?? []
+    highWatermark = runtime?.inputs?.highWatermark() ?? 0
+  } catch {
+    cards = []
+    highWatermark = 0
+  }
+  try {
+    reply(cards, highWatermark)
+  } catch {
+    // 快照编码/发送失败（例如单帧过大）：退回最小结果，不能打挂宿主。
+    try { reply([], 0) } catch { /* 连接已断：调用方超时 */ }
+  }
+}
+
 export function runCommand(
   link: NodeLink,
   adapter: Adapter,
@@ -217,6 +270,11 @@ export function runCommand(
   const project = (): PrivacyProjector => runtime?.projector() ?? fallback
   if (frame.type === 'command.status') {
     runStatusQuery(link, adapter, journal, frame, deviceId, runtime)
+    return
+  }
+  // 待答快照是只读控制帧，不是命令，也不能落 journal。
+  if (frame.type === 'inputs.snapshot') {
+    runInputsSnapshot(link, adapter, frame, deviceId, runtime)
     return
   }
   if (frame.type !== 'command') return

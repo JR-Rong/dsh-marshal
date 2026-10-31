@@ -135,6 +135,21 @@ export interface CardInput {
   readonly approval?: unknown
 }
 
+/** 单个问题的投影 ID -> 原生 ID/选项映射；只留在 node 内存，绝不进 payload。 */
+export interface CardQuestionMapping {
+  readonly nativeId: string
+  readonly required: boolean
+  readonly multi: boolean
+  readonly custom: boolean
+  /** 投影 option id -> 原生 label（回写只用原生值）。 */
+  readonly options: ReadonlyMap<string, string>
+}
+
+export interface CardMapping {
+  /** key 为卡片 payload 里的 question id。 */
+  readonly questions: ReadonlyMap<string, CardQuestionMapping>
+}
+
 export type CardProjection =
   | { readonly mode: 'off' }
   | { readonly mode: 'notify'; readonly payload: Record<string, unknown> }
@@ -143,6 +158,8 @@ export type CardProjection =
       readonly payload: Record<string, unknown>
       readonly answerable: boolean
       readonly reason?: string
+      /** 仅可远答时提供；随对象返回但不会序列化进 payload。 */
+      readonly mapping?: CardMapping
     }
 
 export interface PrivacyProjector {
@@ -633,7 +650,11 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
     }
     if (answerable) {
       if (bytesOfJson(full) <= MAX_INTERACTION_INPUT_BYTES) {
-        return { mode: 'remote', payload: full, answerable: true }
+        return {
+          mode: 'remote', payload: full, answerable: true,
+          // 映射随投影对象返回，但不属于 payload，序列化时不会出现。
+          ...(body.mapping === undefined ? {} : { mapping: body.mapping }),
+        }
       }
       // 超限即不可远答：保留身份/到期/原因，去掉可误导的决定内容。
       return {
@@ -654,6 +675,7 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
     ambiguous?: boolean
     reason?: string
     bodyless?: boolean
+    mapping?: CardMapping
   } {
     if (!Array.isArray(raw) || raw.length === 0) {
       return { fields: { questions: [] }, answerable: false, reason: 'invalid-card', bodyless: true }
@@ -661,6 +683,7 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
     let ambiguous = false
     const ids = new Set<string>()
     const questions: Record<string, unknown>[] = []
+    const mapping = new Map<string, CardQuestionMapping>()
     let secret = false
     // 超量不是静默丢弃：整卡标成 ambiguous，用户知道还有未展示的决定但不能批准。
     if (raw.length > MAX_QUESTIONS) ambiguous = true
@@ -706,9 +729,11 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
       entry.prompt = prompt.text
 
       const optionsRaw = question.options
+      const optionLabels = new Map<string, string>()
       if (Array.isArray(optionsRaw)) {
         if (optionsRaw.length > MAX_OPTIONS) ambiguous = true
         const labels = new Set<string>()
+        const optionIds = new Set<string>()
         const options: Record<string, unknown>[] = []
         optionsRaw.slice(0, MAX_OPTIONS).forEach((optionValue, optionIndex) => {
           const fallbackOptionId = `${id}o${optionIndex + 1}`
@@ -726,7 +751,11 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
           const optionIdInfo = boundedId(option.id, 64)
           const optionIdMask = scrub(optionIdInfo.value ?? fallbackOptionId)
           if (optionIdInfo.altered || optionIdMask.changed) { ambiguous = true; questionAltered = true }
+          // 投影后重复的选项 ID 会让答案映射指向同一 label，整卡不可远答。
+          if (optionIds.has(optionIdMask.text)) { ambiguous = true; questionAltered = true }
+          optionIds.add(optionIdMask.text)
           const itemOut: Record<string, unknown> = { id: optionIdMask.text, label: label.text }
+          optionLabels.set(optionIdMask.text, option.label)
           let optionAltered = label.altered || optionIdInfo.altered || optionIdMask.changed
           if (option.description !== undefined) {
             if (typeof option.description !== 'string') {
@@ -748,6 +777,13 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
         ambiguous = true
         questionAltered = true
       }
+      mapping.set(id, {
+        nativeId: typeof question.id === 'string' && question.id !== '' ? question.id : fallbackId,
+        required: question.required !== false,
+        multi: question.multi === true || question.multiSelect === true,
+        custom: question.custom !== false,
+        options: optionLabels,
+      })
       if (questionAltered) entry.ambiguous = true
       questions.push(entry)
     })
@@ -759,6 +795,7 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
       fields: { questions },
       answerable: !ambiguous,
       ...(ambiguous ? { ambiguous: true, reason: 'redaction-ambiguous' } : {}),
+      ...(ambiguous ? {} : { mapping: { questions: mapping } }),
     }
   }
 
@@ -768,6 +805,7 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
     ambiguous?: boolean
     reason?: string
     bodyless?: boolean
+    mapping?: CardMapping
   } {
     const approval = asRecord(raw)
     if (approval === undefined) {

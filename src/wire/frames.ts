@@ -211,10 +211,17 @@ const CommandStatusResultSchema = z.object({
   result: z.unknown().optional(),
 }).strict()
 
+/** 待答快照必须是具体会话：sessionId 为 null 的快照没有可返回的卡。 */
+const InputsSnapshotTargetSchema = z.object({
+  deviceId: z.string().min(1),
+  agent: z.string().min(1),
+  sessionId: z.string().min(1),
+}).strict()
+
 const InputsSnapshotSchema = z.object({
   v: z.literal(2), type: z.literal('inputs.snapshot'),
   requestId: z.string().min(1),
-  target: TargetSchema,
+  target: InputsSnapshotTargetSchema,
   connectionId: z.string().min(1),
   nodeEpoch: z.string().min(1),
 }).strict()
