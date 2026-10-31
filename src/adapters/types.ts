@@ -35,7 +35,7 @@ export interface ObserveCapability {
 }
 
 /** v0 只可能暴露这些写操作；create/fork/acquire 属于 v1。 */
-export type Operation = 'prompt' | 'interrupt' | 'answer' | 'cancel' | 'configure' | 'create' | 'fork'
+export type Operation = 'prompt' | 'interrupt' | 'answer' | 'cancel' | 'configure' | 'create' | 'fork' | 'acquire'
 
 /**
  * v0 的 DSH 没有已验证的写权证据，能力里必须如实写 `unverified`；
@@ -45,6 +45,12 @@ export type Ownership = 'ours' | 'foreign-unknown' | 'foreign-running' | 'unveri
 
 /** 清单遍历是否被原生证据证明完整；`items.length` 不是证据。 */
 export type SnapshotCompleteness = 'complete' | 'unconfirmed'
+
+/** 会话级设置写请求的回读状态；不含请求值/时间/基线版本。 */
+export interface CapabilityPending {
+  readonly field: Tunable['id']
+  readonly status: 'pending' | 'readback-timeout'
+}
 
 export interface Capability {
   readonly observe: ObserveCapability
@@ -56,6 +62,12 @@ export interface Capability {
   readonly tunables: readonly Tunable[]
   /** operation/field -> 稳定原因码；缺字段表示该能力没有被关闭。 */
   readonly unavailable?: Readonly<Record<string, string>>
+  /** 已确认设置快照的修订号；缺失快照时为 0。 */
+  readonly settingsRevision?: number
+  /** 适配器实例代次；页面据此丢弃跨代次的旧回读。 */
+  readonly runtimeEpoch?: string
+  /** 正在等待回读的字段；绝不携带请求值。 */
+  readonly pending?: CapabilityPending
 }
 
 /** `decision-invalid`：卡片因脱敏/超限被标为不可远答，答案必须拒绝；`expired`：期限已过。 */

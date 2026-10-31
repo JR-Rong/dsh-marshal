@@ -262,7 +262,8 @@ function publicSession(row: {
   deviceId: string; agent: string; sessionId: string;
   running: boolean; updatedAt: number; blank?: boolean;
   ownership?: string; counts?: Readonly<Record<string, number>>
-}): Record<string, unknown> {
+}, relay: Pick<HubRelay, 'sessionCapability'>): Record<string, unknown> {
+  const capability = relay.sessionCapability(row.deviceId, row.agent, row.sessionId)
   return {
     deviceId: row.deviceId,
     agent: row.agent,
@@ -272,6 +273,7 @@ function publicSession(row: {
     ...(row.blank === undefined ? {} : { blank: row.blank }),
     ...(row.ownership === undefined ? {} : { ownership: row.ownership }),
     ...(row.counts === undefined ? {} : { counts: row.counts }),
+    ...(capability === undefined ? {} : { capability }),
   }
 }
 
@@ -673,7 +675,7 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
     const query = new URL(req.url ?? '/', 'http://localhost').searchParams
     // 空串 `?device=` 与缺参等价。
     const device = query.get('device') || undefined
-    json(res, 200, { sessions: relay.sessions(device).map(publicSession) })
+    json(res, 200, { sessions: relay.sessions(device).map(row => publicSession(row, relay)) })
   }))
 
   register('/marshal/api/command', guard(async (req, res) => {

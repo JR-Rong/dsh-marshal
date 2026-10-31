@@ -125,7 +125,7 @@ function indexCounts(value: unknown): Readonly<Record<string, number>> | undefin
 }
 
 const CAPABILITY_OPERATIONS: ReadonlySet<string> = new Set([
-  'prompt', 'interrupt', 'answer', 'cancel', 'configure', 'create', 'fork',
+  'prompt', 'interrupt', 'answer', 'cancel', 'configure', 'create', 'fork', 'acquire',
 ])
 const CAPABILITY_OWNERSHIP: ReadonlySet<string> = new Set([
   'ours', 'foreign-unknown', 'foreign-running', 'unverified',
@@ -148,6 +148,34 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 
 function safeShortString(value: unknown, max: number): string | undefined {
   return typeof value === 'string' && value !== '' ? value.slice(0, max) : undefined
+}
+
+const SETTING_VALUE_KEYS = new Set(['approvalPolicy', 'sandbox', 'fileSystem', 'network'])
+
+/**
+ * 设置 current/values 的有界结构投影（与 node 侧结构一致但不再脱敏）。
+ * 目录/规则字段是路径或自由文本，hub 第二次重建时同样丢弃。
+ */
+function projectSettingValue(value: unknown, depth = 0): unknown {
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined
+  if (typeof value === 'string') return value.slice(0, 128)
+  if (Array.isArray(value)) {
+    if (depth > 1) return undefined
+    const items = value.slice(0, 16)
+      .map(item => projectSettingValue(item, depth + 1))
+      .filter(item => item !== undefined)
+    return items.length === 0 ? undefined : items
+  }
+  const record = asRecord(value)
+  if (record === undefined || depth > 1) return undefined
+  const out: Record<string, unknown> = {}
+  for (const key of SETTING_VALUE_KEYS) {
+    if (!(key in record)) continue
+    const item = projectSettingValue(record[key], depth + 1)
+    if (item !== undefined) out[key] = item
+  }
+  return Object.keys(out).length === 0 ? undefined : out
 }
 
 /**
@@ -181,9 +209,20 @@ export function publicCapability(value: unknown): Record<string, unknown> | unde
   }
   if (typeof record.reasoning === 'boolean') out.reasoning = record.reasoning
   if (typeof record.stale === 'boolean') out.stale = record.stale
-  for (const key of ['revision', 'readAt'] as const) {
+  for (const key of ['revision', 'readAt', 'settingsRevision'] as const) {
     const item = record[key]
     if (typeof item === 'number' && Number.isInteger(item) && item >= 0) out[key] = item
+  }
+  const runtimeEpoch = safeShortString(record.runtimeEpoch, 128)
+  if (runtimeEpoch !== undefined) out.runtimeEpoch = runtimeEpoch
+  const pending = asRecord(record.pending)
+  if (pending !== undefined) {
+    const field = safeShortString(pending.field, 32)
+    const status = safeShortString(pending.status, 32)
+    if (field !== undefined && CAPABILITY_TUNABLE_IDS.has(field)
+      && (status === 'pending' || status === 'readback-timeout')) {
+      out.pending = { field, status }
+    }
   }
   if (Array.isArray(record.tunables)) {
     out.tunables = record.tunables.slice(0, 16).flatMap(item => {
@@ -201,6 +240,20 @@ export function publicCapability(value: unknown): Record<string, unknown> | unde
       if (typeof tunable.editable === 'boolean') entry.editable = tunable.editable
       const reason = safeShortString(tunable.reason, 64)
       if (reason !== undefined) entry.reason = reason
+      if (Array.isArray(tunable.values)) {
+        const values: Record<string, unknown>[] = []
+        for (const raw of tunable.values.slice(0, 32)) {
+          const value = asRecord(raw)
+          if (value === undefined) continue
+          const valueId = safeShortString(value.id, 64)
+          if (valueId === undefined) continue
+          const label = safeShortString(value.label, 128) ?? valueId
+          values.push({ id: valueId, label })
+        }
+        if (values.length > 0) entry.values = values
+      }
+      const current = projectSettingValue(tunable.current)
+      if (current !== undefined) entry.current = current
       return [entry]
     })
   }
@@ -301,6 +354,8 @@ export class HubRelay {
   private readonly index = new Map<string, SessionRow>()
   /** 设备 -> agent -> 已提交能力文档；只在 sync 提交或 capability.changed 时更新。 */
   private readonly capabilityIndex = new Map<string, Map<string, Record<string, unknown>>>()
+  /** 设备 -> `${agent}\u0000${sessionId}` -> 会话级能力文档。 */
+  private readonly sessionCapabilityIndex = new Map<string, Map<string, Record<string, unknown>>>()
   private readonly epochs = new Map<string, string>()
   /** 每个设备经历过多少次内容清理；SSE 用它在发出前拦截跨过 purge 的旧帧。 */
   private readonly purgeGenerations = new Map<string, number>()
@@ -668,6 +723,8 @@ export class HubRelay {
     this.epochs.set(deviceId, nodeEpoch)
     if (previous === undefined || previous === nodeEpoch) return
     this.capabilityIndex.delete(deviceId)
+    // 旧代次的会话级能力同样失效，等待新提交/新的 capability.changed 重建。
+    this.sessionCapabilityIndex.delete(deviceId)
     const prefix = `${deviceId}\u0000`
     for (const key of [...this.activeTurns.keys()]) {
       if (key.startsWith(prefix)) this.activeTurns.delete(key)
@@ -725,6 +782,16 @@ export class HubRelay {
     }
     for (const [key, row] of changed) this.index.set(key, row)
     this.capabilityIndex.set(commit.deviceId, capabilities)
+    // 会话级能力必须随同步一起重建：先用 agent 文档作保守回退，
+    // 具体会话差异由后续 capability.changed 覆盖，绝不保留旧代次的文档。
+    const sessionCapabilities = new Map<string, Record<string, unknown>>()
+    for (const row of next.values()) {
+      const document = capabilities.get(row.agent)
+      if (document !== undefined) {
+        sessionCapabilities.set(`${row.agent}\u0000${row.sessionId}`, document)
+      }
+    }
+    this.sessionCapabilityIndex.set(commit.deviceId, sessionCapabilities)
 
     // 删除与新/变更都在同一轮同步代码内发布；失败路径不会走到这里。
     // 这些是 hub 派生通知，不回放进历史（重连屏障会重新取索引/能力）。
@@ -758,6 +825,17 @@ export class HubRelay {
     if (map === undefined) return out
     for (const [agent, document] of map) out[agent] = document
     return out
+  }
+
+  /** 某会话最近一次投影后的能力文档；返回副本，未知会话返回 undefined。 */
+  sessionCapability(
+    deviceId: string,
+    agent: string,
+    sessionId: string,
+  ): Record<string, unknown> | undefined {
+    const document = this.sessionCapabilityIndex.get(deviceId)
+      ?.get(`${agent}\u0000${sessionId}`)
+    return document === undefined ? undefined : { ...document }
   }
 
   /** 停止接收新指令：清定时器、以固定错误结束所有等待中的指令、清空并关闭历史。幂等。 */
@@ -824,6 +902,7 @@ export class HubRelay {
     if (event.kind === 'session.removed') {
       this.index.delete(key)
       this.activeTurns.delete(key)
+      this.sessionCapabilityIndex.get(event.deviceId)?.delete(`${event.agent}\u0000${event.sessionId}`)
     } else if (event.kind === 'session.updated') {
       const previous = this.index.get(key)
       const running = typeof payload.running === 'boolean' ? payload.running : previous?.running
@@ -872,6 +951,13 @@ export class HubRelay {
           this.capabilityIndex.set(event.deviceId, map)
         }
         map.set(event.agent, document)
+        // 会话级文档与 agent 级文档同源；页面按 sessionId 渲染当前值/待阅读。
+        let sessions = this.sessionCapabilityIndex.get(event.deviceId)
+        if (sessions === undefined) {
+          sessions = new Map()
+          this.sessionCapabilityIndex.set(event.deviceId, sessions)
+        }
+        sessions.set(`${event.agent}\u0000${event.sessionId}`, document)
       }
     }
     this.fanout(event, appended.cursor)

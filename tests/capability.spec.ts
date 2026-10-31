@@ -73,27 +73,76 @@ describe('capability projection', () => {
     expect(projected[0]?.payload).toEqual({ observe: { history: true } })
   })
 
-  it('unavailable 原因码有界，tunables 的 current/values 丢弃', () => {
+  it('unavailable 原因码有界，tunables 的 values/current 只保留有界结构', () => {
     const unavailable: Record<string, string> = { 'observe.history': 'history-unavailable' }
     for (let index = 0; index < 20; index += 1) unavailable[`x${index}`] = `reason-${index}`
     const projected = projector().event(event('capability.changed', {
+      settingsRevision: 4,
+      runtimeEpoch: 'epoch-1',
+      operations: ['prompt', 'acquire', 'teleport'],
+      pending: {
+        field: 'goal',
+        status: 'pending',
+        requested: { objective: SENTINEL },
+        requestedAt: 9,
+        baseFieldRevision: 3,
+      },
       tunables: [{
         id: 'model', scope: 'next-turn', effect: 'immediate', editable: false,
         reason: 'v0-field-only', current: SENTINEL,
         values: [{ id: 'opus', label: SENTINEL }],
-      }],
+      }, {
+        id: 'permission', scope: 'next-session', effect: 'next-session', editable: false,
+        current: {
+          approvalPolicy: 'on-request',
+          sandbox: { fileSystem: 'workspace-write', network: false },
+          additionalDirectories: ['/home/secret'],
+          rules: [SENTINEL],
+        },
+        values: [{ id: 'x'.repeat(80), label: 'y'.repeat(200) }],
+      }, { id: 'shell' }],
       unavailable,
     }))
     const payload = projected[0]?.payload as {
+      operations: string[]
       tunables: Record<string, unknown>[]
       unavailable: Record<string, string>
+      settingsRevision: number
+      runtimeEpoch: string
+      pending: Record<string, unknown>
     }
-    expect(payload.tunables[0]).toEqual({
-      id: 'model', scope: 'next-turn', effect: 'immediate', editable: false, reason: 'v0-field-only',
-    })
+    expect(payload.operations).toEqual(['prompt', 'acquire'])
+    expect(payload.settingsRevision).toBe(4)
+    expect(payload.runtimeEpoch).toBe('epoch-1')
+    // pending 只保留字段与状态；requested/requestedAt/baseFieldRevision 不进入投影。
+    expect(payload.pending).toEqual({ field: 'goal', status: 'pending' })
     expect(Object.keys(payload.unavailable)).toHaveLength(16)
     expect(payload.unavailable['observe.history']).toBe('history-unavailable')
-    expect(JSON.stringify(projected)).not.toContain(SENTINEL)
+
+    // 未知 tunable id 被丢弃；values/current 按有界结构保留并脱敏。
+    expect(payload.tunables).toHaveLength(2)
+    const model = payload.tunables[0] as {
+      current: string
+      values: { id: string; label: string }[]
+    }
+    expect(model).toMatchObject({ id: 'model', editable: false, reason: 'v0-field-only' })
+    expect(typeof model.current).toBe('string')
+    expect(model.values).toHaveLength(1)
+    expect(model.values[0]?.id).toBe('opus')
+
+    const permission = payload.tunables[1] as { current: unknown; values: { id: string; label: string }[] }
+    // 目录/规则是路径或自由文本，投影后只剩 approvalPolicy/sandbox。
+    expect(permission.current).toEqual({
+      approvalPolicy: 'on-request',
+      sandbox: { fileSystem: 'workspace-write', network: false },
+    })
+    expect(permission.values[0]?.id).toHaveLength(64)
+    expect(permission.values[0]?.label).toHaveLength(128)
+
+    const serialized = JSON.stringify(projected)
+    expect(serialized).not.toContain(SENTINEL)
+    expect(serialized).not.toContain('/home/secret')
+    expect(serialized).not.toContain('additionalDirectories')
   })
 
   it('未知枚举与自由文本一律丢弃，不把陌生值当能力', () => {

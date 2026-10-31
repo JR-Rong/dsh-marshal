@@ -158,6 +158,14 @@ export function createClaudeAdapter(options: ClaudeAdapterOptions): AgentAdapter
     nodeEpoch: options.nodeEpoch, seq: nextSeq(sessionId), ts: now(), kind, payload,
   })
 
+  /** 写权/运行态变化后重新发布会话能力；buildSessionCapability 在调用时才求值。 */
+  const publishCapability = (sessionId: string): void => {
+    sessions.publish(sessionId, frame(
+      sessionId, 'capability.changed',
+      capabilityPayload(buildSessionCapability(sessionId)),
+    ))
+  }
+
   /**
    * 真实 SDK 只在需要时求值；类型来自 0.3.316 的 `sdk.d.ts`。
    * 加载失败对控制路径是「调用前就不可用」，可以安全转成 PreCallRejection。
@@ -381,6 +389,8 @@ export function createClaudeAdapter(options: ClaudeAdapterOptions): AgentAdapter
       promptFidelity: 'native',
       tunables: CLAUDE_TUNABLES,
       unavailable,
+      settingsRevision: 0,
+      runtimeEpoch,
     }
   }
 
@@ -421,6 +431,11 @@ export function createClaudeAdapter(options: ClaudeAdapterOptions): AgentAdapter
       unavailable.interrupt = 'ownership-unverified'
       unavailable.acquire = 'ownership-unverified'
     }
+    // 受管且未终止的会话才宣传 acquire；未受管/死亡保持上面的原因码。
+    if (managed && !dead) {
+      operations.add('acquire')
+      delete unavailable.acquire
+    }
     return {
       // 外部会话没有可订阅的原生通道：只有受管会话才会在我们自己的 Query 上产生事件。
       observe: { history: true, follow: managed && !dead ? 'stream' : 'none' },
@@ -431,6 +446,8 @@ export function createClaudeAdapter(options: ClaudeAdapterOptions): AgentAdapter
       promptFidelity: 'native',
       tunables: CLAUDE_TUNABLES,
       unavailable,
+      settingsRevision: 0,
+      runtimeEpoch,
     }
   }
 
@@ -443,6 +460,8 @@ export function createClaudeAdapter(options: ClaudeAdapterOptions): AgentAdapter
     promptFidelity: capability.promptFidelity,
     tunables: capability.tunables,
     ...(capability.unavailable === undefined ? {} : { unavailable: capability.unavailable }),
+    settingsRevision: capability.settingsRevision ?? 0,
+    runtimeEpoch: capability.runtimeEpoch ?? runtimeEpoch,
     revision: CAPABILITY_REVISION,
     readAt: now(),
   })
@@ -720,7 +739,12 @@ export function createClaudeAdapter(options: ClaudeAdapterOptions): AgentAdapter
     observe,
 
     follow(sessionId: string, signal: AbortSignal): AsyncIterable<EventFrame> {
-      return observe(sessionId, signal)
+      return (async function* (): AsyncIterable<EventFrame> {
+        // 只有受管会话有可订阅的原生通道；先给订阅者当前能力再转发事件。
+        if (!sessions.isManaged(sessionId)) return
+        yield frame(sessionId, 'capability.changed', capabilityPayload(buildSessionCapability(sessionId)))
+        yield* sessions.observe(sessionId, signal)
+      })()
     },
 
     frame,
@@ -830,6 +854,8 @@ export function createClaudeAdapter(options: ClaudeAdapterOptions): AgentAdapter
           throw new PreCallRejection('unsupported', 'native-steer-unverified')
         case 'acquire': {
           const snapshot = await ownershipPort.acquire(sessionId, new AbortController().signal)
+          // 成功取得写权后立即广播会话能力（ownership=ours）。
+          publishCapability(sessionId)
           return { ownership: snapshot.wire, state: snapshot.state }
         }
         case 'answer': {

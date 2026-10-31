@@ -32,7 +32,8 @@ import {
   supportsVersion, threadRunning,
 } from './protocol.ts'
 import { createCodexSessionRegistry } from './session.ts'
-import { createCodexSettingsPort } from './settings.ts'
+import { CODEX_SETTINGS_CATALOG, createCodexSettingsPort } from './settings.ts'
+import { buildTunables } from '../../tunables/catalog.ts'
 
 /**
  * Codex 基础适配器（app-server over stdio）。
@@ -78,6 +79,8 @@ export interface CodexAdapterOptions {
   readonly requestTimeoutMs?: number
   readonly handshakeTimeoutMs?: number
   readonly probeTimeoutMs?: number
+  /** node privacy=content 且 hub allowContent 同时成立时才允许展示设置内容。 */
+  readonly contentAuthorized?: () => boolean
 }
 
 interface PeerEntry {
@@ -219,6 +222,17 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
     return await peer.request(method, params, signal, parse)
   }
 
+  /**
+   * 设置回读变化后重新发布会话能力。回调只会在初始化完成后触发，
+   * 因此可以引用后面声明的 buildSessionCapability。
+   */
+  const publishCapability = (sessionId: string): void => {
+    sessions.publish(sessionId, frame(
+      sessionId, 'capability.changed',
+      capabilityPayload(buildSessionCapability(sessionId)),
+    ))
+  }
+
   const settings = createCodexSettingsPort({
     request,
     runtimeEpoch,
@@ -226,6 +240,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
     idle: id => coordinator.state(id) === 'ours-idle',
     beginConfigure: id => coordinator.beginConfigure(id),
     endConfigure: id => coordinator.endConfigure(id),
+    onChanged: publishCapability,
     ...(options.now === undefined ? {} : { now: options.now }),
   })
 
@@ -461,6 +476,8 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
       promptFidelity: 'native',
       tunables: CODEX_TUNABLES,
       unavailable,
+      settingsRevision: 0,
+      runtimeEpoch,
     }
   }
 
@@ -468,10 +485,9 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
     const ownership = coordinator.ownership(sessionId)
     const owns = ownership === 'ours'
     const managed = sessions.isManaged(sessionId)
+    const snapshot = settings.snapshot(sessionId)
     const operations = new Set<Operation>(['create', 'fork'])
-    const unavailable: Record<string, string> = {
-      configure: 'settings-readback-unavailable',
-    }
+    const unavailable: Record<string, string> = {}
     // 外部/未管理的会话永远没有可答卡，能力里也不能暴露 answer/cancel。
     if (relayEnabled() && owns && managed) {
       operations.add('answer')
@@ -495,6 +511,23 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
       unavailable.interrupt = 'ownership-unverified'
       unavailable.acquire = 'ownership-unverified'
     }
+    // Codex 的 acquire 只对受管会话有效；未受管会话保持 ownership-unverified。
+    if (managed) {
+      operations.add('acquire')
+      delete unavailable.acquire
+    }
+    // 只有受管、写权属于本实例且回读未闩锁时才宣传 configure。
+    if (managed && owns && snapshot?.unsafe !== true) {
+      operations.add('configure')
+      delete unavailable.configure
+    } else if (snapshot?.unsafe === true) {
+      unavailable.configure = 'settings-unsafe'
+    } else if (managed && !owns) {
+      unavailable.configure = 'session-not-owned'
+    } else {
+      unavailable.configure = 'ownership-unverified'
+    }
+    const pending = snapshot?.pending
     return {
       observe: { history: true, follow: 'stream' },
       operations,
@@ -502,8 +535,20 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
       reasoning: true,
       toolDetail: 'args+output',
       promptFidelity: 'native',
-      tunables: CODEX_TUNABLES,
+      tunables: buildTunables(CODEX_SETTINGS_CATALOG, snapshot?.current, {
+        contentAuthorized: options.contentAuthorized?.() === true,
+      }),
       unavailable,
+      settingsRevision: snapshot?.current.revision ?? 0,
+      runtimeEpoch,
+      ...(pending === undefined
+        ? {}
+        : {
+            pending: {
+              field: pending.field,
+              status: pending.status === 'pending' ? 'pending' as const : 'readback-timeout' as const,
+            },
+          }),
     }
   }
 
@@ -516,6 +561,11 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
     promptFidelity: capability.promptFidelity,
     tunables: capability.tunables,
     ...(capability.unavailable === undefined ? {} : { unavailable: capability.unavailable }),
+    settingsRevision: capability.settingsRevision ?? 0,
+    runtimeEpoch: capability.runtimeEpoch ?? runtimeEpoch,
+    ...(capability.pending === undefined
+      ? {}
+      : { pending: { field: capability.pending.field, status: capability.pending.status } }),
     revision: CAPABILITY_REVISION,
     readAt: now(),
   })
@@ -773,7 +823,13 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
     observe,
 
     follow(sessionId: string, signal: AbortSignal): AsyncIterable<EventFrame> {
-      return observe(sessionId, signal)
+      return (async function* (): AsyncIterable<EventFrame> {
+        await ensurePeer(signal)
+        // 先给订阅者一份当前能力（含 settingsRevision/runtimeEpoch/pending），
+        // 再流式转发后续事件；observe 本身保持只读语义不变。
+        yield frame(sessionId, 'capability.changed', capabilityPayload(buildSessionCapability(sessionId)))
+        yield* sessions.observe(sessionId, signal)
+      })()
     },
 
     frame,
@@ -893,6 +949,8 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
           throw new PreCallRejection('unsupported', 'native-steer-unverified')
         case 'acquire': {
           const snapshot = await ownershipPort.acquire(sessionId, new AbortController().signal)
+          // 写权状态已改变（ours）：立即广播新的会话能力，页面不必等下一次同步。
+          publishCapability(sessionId)
           return { ownership: snapshot.wire, state: snapshot.state }
         }
         case 'answer': {

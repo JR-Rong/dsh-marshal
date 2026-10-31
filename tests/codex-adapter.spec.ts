@@ -120,6 +120,10 @@ class FakeCodexServer {
   interrupts = 0
   resumes = 0
   forks = 0
+  goal: { objective: string } | null = null
+  /** 为 pending 测试挂起 goal/set 响应，直到 releaseGoalSet 显式放行。 */
+  holdGoalSet = false
+  private pendingGoalSet: { readonly id: number; readonly params: Record<string, unknown> } | undefined
   private buffer = ''
 
   constructor() {
@@ -201,9 +205,34 @@ class FakeCodexServer {
         this.interrupts += 1
         this.respond(id, {})
         return
+      case 'thread/goal/get':
+        this.respond(id, { goal: this.goal })
+        return
+      case 'thread/goal/set': {
+        if (this.holdGoalSet) {
+          this.pendingGoalSet = { id, params }
+          return
+        }
+        this.goal = { objective: typeof params.objective === 'string' ? params.objective : '' }
+        this.respond(id, { goal: this.goal })
+        return
+      }
+      case 'thread/goal/clear':
+        this.goal = null
+        this.respond(id, { cleared: true })
+        return
       default:
         this.fail(id, -32601)
     }
+  }
+
+  /** 放行被 holdGoalSet 挂起的写入，并按真实 set 语义回包。 */
+  releaseGoalSet(): void {
+    const held = this.pendingGoalSet
+    if (held === undefined) return
+    this.pendingGoalSet = undefined
+    this.goal = { objective: typeof held.params.objective === 'string' ? held.params.objective : '' }
+    this.respond(held.id, { goal: this.goal })
   }
 }
 
@@ -596,5 +625,133 @@ describe('codex adapter', () => {
     await expect(h.adapter.execute({
       op: 'cancel', target: { sessionId: 'new-1' }, args: { requestId: 'a-1' },
     })).rejects.toMatchObject({ code: 'unsupported' })
+  })
+
+  it('advertises configure/acquire for a managed owned session with authorized goal', async () => {
+    const h = harness({ contentAuthorized: () => true })
+    const create = h.adapter.createSession
+    const port = h.adapter.ownershipPort
+    if (create === undefined || port === undefined) throw new Error('v1 ports missing')
+    const created = await create({ requestId: 'req-create' }, signal())
+    await port.acquire(created.sessionId, signal())
+
+    const capability = h.adapter.capabilities(created.sessionId)
+    expect(capability.operations.has('configure')).toBe(true)
+    expect(capability.operations.has('acquire')).toBe(true)
+    expect(capability.unavailable?.configure).toBeUndefined()
+    expect(capability.unavailable?.acquire).toBeUndefined()
+    expect(capability.settingsRevision).toBe(0)
+    expect(capability.runtimeEpoch).toBe('epoch-1')
+    expect(capability.tunables.find(item => item.id === 'goal')?.editable).toBe(true)
+    // 目录没有模型/等级：除 goal 外的字段保持只读。
+    expect(capability.tunables.filter(item => item.id !== 'goal').every(item => !item.editable)).toBe(true)
+
+    // 没有 contentAuthorized 时同一会话的 goal 仍不可编辑。
+    const closed = harness()
+    const closedCreate = closed.adapter.createSession
+    const closedPort = closed.adapter.ownershipPort
+    if (closedCreate === undefined || closedPort === undefined) throw new Error('v1 ports missing')
+    const un = await closedCreate({ requestId: 'req-create' }, signal())
+    await closedPort.acquire(un.sessionId, signal())
+    const ungoal = closed.adapter.capabilities(un.sessionId).tunables.find(item => item.id === 'goal')
+    expect(ungoal?.editable).toBe(false)
+    expect(ungoal?.reason).toBe('privacy-readback-unavailable')
+
+    await closed.adapter.stop()
+    await h.adapter.stop()
+  })
+
+  it('keeps acquire/configure off for an unmanaged session', () => {
+    const h = harness()
+    const capability = h.adapter.capabilities('external-1')
+    expect(capability.operations.has('acquire')).toBe(false)
+    expect(capability.operations.has('configure')).toBe(false)
+    expect(capability.unavailable?.acquire).toBe('ownership-unverified')
+    expect(capability.unavailable?.configure).toBe('ownership-unverified')
+    expect(capability.settingsRevision).toBe(0)
+    expect(capability.runtimeEpoch).toBe('epoch-1')
+  })
+
+  it('follows a managed session with an initial capability frame', async () => {
+    const h = harness()
+    const controller = new AbortController()
+    const create = h.adapter.createSession
+    if (create === undefined) throw new Error('createSession missing')
+    const created = await create({ requestId: 'req-create' }, controller.signal)
+
+    const iterator = h.adapter.follow(created.sessionId, controller.signal)[Symbol.asyncIterator]()
+    const first = await iterator.next()
+    if (first.done) throw new Error('follow ended before the capability frame')
+    expect(first.value.kind).toBe('capability.changed')
+    expect(first.value.payload).toMatchObject({ settingsRevision: 0, runtimeEpoch: 'epoch-1' })
+
+    controller.abort()
+    await iterator.return?.()
+    await h.adapter.stop()
+  })
+
+  it('publishes capability.changed with pending while a configure readback waits', async () => {
+    const h = harness({ contentAuthorized: () => true })
+    const controller = new AbortController()
+    const create = h.adapter.createSession
+    const port = h.adapter.ownershipPort
+    const settingsPort = h.adapter.settingsPort
+    if (create === undefined || port === undefined || settingsPort === undefined) {
+      throw new Error('v1 ports missing')
+    }
+    const created = await create({ requestId: 'req-create' }, controller.signal)
+    await port.acquire(created.sessionId, controller.signal)
+
+    const iterator = h.adapter.follow(created.sessionId, controller.signal)[Symbol.asyncIterator]()
+    const initial = await iterator.next()
+    if (initial.done) throw new Error('follow ended before the capability frame')
+    expect(initial.value.kind).toBe('capability.changed')
+
+    // 让跟随生成器注册观察者，再启动会被挂起的 configure。
+    const pendingNext = iterator.next()
+    await new Promise(resolve => setTimeout(resolve, 0))
+    h.server().holdGoalSet = true
+    const configure = settingsPort.configure({
+      sessionId: created.sessionId,
+      field: 'goal',
+      value: { objective: 'do X' },
+      expectedRevision: 0,
+      runtimeEpoch: 'epoch-1',
+      contentAuthorized: true,
+    }, controller.signal)
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if (h.server().requests.some(item => item.method === 'thread/goal/set')) break
+      await new Promise(resolve => setTimeout(resolve, 1))
+    }
+    expect(h.server().requests.some(item => item.method === 'thread/goal/set')).toBe(true)
+
+    // 等待期内的原生通知触发能力广播；pending 只暴露字段与状态。
+    h.server().notify('thread/goal/updated', {
+      threadId: created.sessionId,
+      goal: { objective: 'do X' },
+    })
+    const pendingFrame = await pendingNext
+    if (pendingFrame.done) throw new Error('follow ended before the pending capability')
+    // 先放行写入，避免断言失败时留下未结算的等待。
+    h.server().releaseGoalSet()
+
+    expect(pendingFrame.value.kind).toBe('capability.changed')
+    const pendingPayload = pendingFrame.value.payload as Record<string, unknown>
+    expect(pendingPayload.settingsRevision).toBe(1)
+    expect(pendingPayload.pending).toEqual({ field: 'goal', status: 'pending' })
+    expect(JSON.stringify(pendingPayload)).not.toContain('do X')
+
+    const result = await configure
+    expect(result.status).toBe('confirmed')
+    const confirmedFrame = await iterator.next()
+    if (confirmedFrame.done) throw new Error('follow ended before the confirmed capability')
+    expect(confirmedFrame.value.kind).toBe('capability.changed')
+    const confirmedPayload = confirmedFrame.value.payload as Record<string, unknown>
+    expect(confirmedPayload.pending).toBeUndefined()
+    expect(confirmedPayload.settingsRevision).toBe(1)
+
+    controller.abort()
+    await iterator.return?.()
+    await h.adapter.stop()
   })
 })

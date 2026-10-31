@@ -285,6 +285,49 @@ describe('hub api endpoints', () => {
     expect(all.json<{ sessions: unknown[] }>().sessions).toHaveLength(1)
   })
 
+  it('会话索引附带最近一次能力文档且不暴露未投影字段', async () => {
+    const { web: target, relay } = await start()
+    const before = await target.request('/marshal/api/sessions?device=mac', { headers: AUTH })
+    expect(before.json<{ sessions: Record<string, unknown>[] }>().sessions[0]?.capability).toBeUndefined()
+
+    relay.publish({
+      v: 2, type: 'event', deviceId: 'mac', agent: 'dsh', sessionId: 's1', nodeEpoch: 'epoch-1',
+      seq: 2, ts: 2, kind: 'capability.changed',
+      payload: {
+        operations: ['prompt', 'acquire', 'teleport'],
+        ownership: 'ours',
+        settingsRevision: 2,
+        runtimeEpoch: 'epoch-1',
+        pending: { field: 'goal', status: 'pending', requested: { objective: 'secret objective' } },
+        tunables: [{
+          id: 'permission', editable: true,
+          current: { approvalPolicy: 'never', additionalDirectories: ['/home/secret'] },
+        }],
+        cwd: '/secret-project',
+        title: 'secret title',
+      },
+    })
+
+    const after = await target.request('/marshal/api/sessions?device=mac', { headers: AUTH })
+    const session = after.json<{ sessions: Record<string, unknown>[] }>().sessions[0]
+    expect(session).toMatchObject({
+      deviceId: 'mac',
+      agent: 'dsh',
+      sessionId: 's1',
+      capability: {
+        operations: ['prompt', 'acquire'],
+        settingsRevision: 2,
+        runtimeEpoch: 'epoch-1',
+        pending: { field: 'goal', status: 'pending' },
+      },
+    })
+    const serialized = JSON.stringify(session)
+    expect(serialized).not.toContain('secret objective')
+    expect(serialized).not.toContain('/home/secret')
+    expect(serialized).not.toContain('/secret-project')
+    expect(serialized).not.toContain('secret title')
+  })
+
   it('未知 op / 非法 args / 超大 body 被拒绝', async () => {
     const { web: target, sent } = await start()
     const call = (body: unknown) => target.request('/marshal/api/command', {

@@ -388,6 +388,53 @@ describe('claude adapter', () => {
     await h.adapter.stop()
   })
 
+  it('advertises acquire only for managed sessions and carries epoch metadata', async () => {
+    const h = harness()
+    const create = h.adapter.createSession
+    if (create === undefined) throw new Error('createSession missing')
+    const created = await create({ requestId: 'req-create' }, signal())
+
+    const managed = h.adapter.capabilities(created.sessionId)
+    expect(managed.operations.has('acquire')).toBe(true)
+    expect(managed.unavailable?.acquire).toBeUndefined()
+    expect(managed.settingsRevision).toBe(0)
+    expect(managed.runtimeEpoch).toBe('epoch-1')
+
+    const foreign = h.adapter.capabilities('external-1')
+    expect(foreign.operations.has('acquire')).toBe(false)
+    expect(foreign.unavailable?.acquire).toBe('ownership-unverified')
+    expect(foreign.settingsRevision).toBe(0)
+    expect(foreign.runtimeEpoch).toBe('epoch-1')
+    await h.adapter.stop()
+  })
+
+  it('yields the current capability before following a managed session', async () => {
+    const h = harness()
+    const create = h.adapter.createSession
+    if (create === undefined) throw new Error('createSession missing')
+    const created = await create({ requestId: 'req-create' }, signal())
+
+    const controller = new AbortController()
+    const iterator = h.adapter.follow(created.sessionId, controller.signal)[Symbol.asyncIterator]()
+    const first = await iterator.next()
+    if (first.done) throw new Error('follow ended before the initial capability')
+    expect(first.value.kind).toBe('capability.changed')
+    expect(first.value.sessionId).toBe(created.sessionId)
+    const payload = first.value.payload as Record<string, unknown>
+    expect(payload).toMatchObject({
+      settingsRevision: 0,
+      runtimeEpoch: 'epoch-1',
+    })
+    expect(payload.operations).toContain('acquire')
+    controller.abort()
+    await iterator.return?.()
+
+    // 外部会话没有可订阅通道：既不宣传能力，也不产生任何初始帧。
+    const foreign = await collect(h.adapter.follow('external-1', signal()))
+    expect(foreign).toEqual([])
+    await h.adapter.stop()
+  })
+
   it('rejects prompt and steer on unowned sessions before any native call', async () => {
     const h = harness()
     await h.adapter.start(signal())

@@ -37,7 +37,7 @@ const RESULT_KEYS = new Set([
 ])
 
 const CAPABILITY_OPERATIONS: ReadonlySet<string> = new Set([
-  'prompt', 'interrupt', 'answer', 'cancel', 'configure', 'create', 'fork',
+  'prompt', 'interrupt', 'answer', 'cancel', 'configure', 'create', 'fork', 'acquire',
 ])
 const CAPABILITY_OWNERSHIP: ReadonlySet<string> = new Set([
   'ours', 'foreign-unknown', 'foreign-running', 'unverified',
@@ -69,7 +69,11 @@ const CAPABILITY_REASON_CODES: ReadonlySet<string> = new Set([
   'settings-readback-unavailable',
   'privacy-readback-unavailable',
   'interaction-relay-unavailable',
+  'settings-unsafe',
 ])
+
+/** 会话设置的待回读状态；未知值连字段都不发。 */
+const CAPABILITY_PENDING_STATUS: ReadonlySet<string> = new Set(['pending', 'readback-timeout'])
 
 const TURN_STATES = new Set(['running', 'completed', 'failed', 'interrupted'])
 const TOOL_STATES = new Set(['running', 'completed', 'failed', 'interrupted', 'error', 'ok', 'cancelled'])
@@ -501,6 +505,33 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
     }
   }
 
+  const SETTING_VALUE_KEYS = new Set(['approvalPolicy', 'sandbox', 'fileSystem', 'network'])
+  /**
+   * 设置 current/values 的有界结构投影：只保留已知字段与标量。
+   * 目录/规则（additionalDirectories、rules）是路径或自由文本，一律丢弃。
+   */
+  const projectSettingValue = (value: unknown, depth = 0): unknown => {
+    if (typeof value === 'boolean') return value
+    if (typeof value === 'number') return Number.isFinite(value) ? value : undefined
+    if (typeof value === 'string') return scrub(value).text.slice(0, 128)
+    if (Array.isArray(value)) {
+      if (depth > 1) return undefined
+      const items = value.slice(0, 16)
+        .map(item => projectSettingValue(item, depth + 1))
+        .filter(item => item !== undefined)
+      return items.length === 0 ? undefined : items
+    }
+    const record = asRecord(value)
+    if (record === undefined || depth > 1) return undefined
+    const out: Record<string, unknown> = {}
+    for (const key of SETTING_VALUE_KEYS) {
+      if (!(key in record)) continue
+      const item = projectSettingValue(record[key], depth + 1)
+      if (item !== undefined) out[key] = item
+    }
+    return Object.keys(out).length === 0 ? undefined : out
+  }
+
   function capabilityPayload(payload: Record<string, unknown>): Record<string, unknown> {
     const out: Record<string, unknown> = {}
     // observe 是独立字段对象；history 与 follow 必须分开投影，不能压回一个字符串。
@@ -533,12 +564,24 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
     if (reasoning !== undefined) out.reasoning = reasoning
     const stale = safeBool(payload.stale)
     if (stale !== undefined) out.stale = stale
-    for (const key of ['revision', 'readAt'] as const) {
+    for (const key of ['revision', 'readAt', 'settingsRevision'] as const) {
       const value = safeInt(payload[key])
       if (value !== undefined) out[key] = value
     }
+    const runtimeEpoch = safeString(payload.runtimeEpoch, 128)
+    if (runtimeEpoch !== undefined) out.runtimeEpoch = scrub(runtimeEpoch).text
+    // pending 只保留字段名与枚举状态；requested/requestedAt/baseFieldRevision 一律丢弃。
+    const pending = asRecord(payload.pending)
+    if (pending !== undefined) {
+      const field = safeString(pending.field, 32)
+      const status = safeString(pending.status, 32)
+      if (field !== undefined && CAPABILITY_TUNABLE_IDS.has(field)
+        && status !== undefined && CAPABILITY_PENDING_STATUS.has(status)) {
+        out.pending = { field, status }
+      }
+    }
     if (Array.isArray(payload.tunables)) {
-      // 只留固定枚举内的标识与可编辑性；current/values/pending 等设置对象一律丢弃。
+      // 只留固定枚举内的标识与有界设置值；未知字段/自由文本不放大。
       out.tunables = payload.tunables.slice(0, 16).flatMap(item => {
         const tunable = asRecord(item)
         if (tunable === undefined) return []
@@ -557,6 +600,22 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
         if (editable !== undefined) entry.editable = editable
         const reason = safeString(tunable.reason, 64)
         if (reason !== undefined && CAPABILITY_REASON_CODES.has(reason)) entry.reason = reason
+        if (Array.isArray(tunable.values)) {
+          const values: Record<string, unknown>[] = []
+          for (const raw of tunable.values.slice(0, 32)) {
+            const value = asRecord(raw)
+            if (value === undefined) continue
+            const valueId = safeString(value.id, 64)
+            if (valueId === undefined) continue
+            const scrubbedId = scrub(valueId).text
+            const rawLabel = safeString(value.label, 128)
+            const label = rawLabel === undefined ? scrubbedId : scrub(rawLabel).text
+            values.push({ id: scrubbedId, label })
+          }
+          if (values.length > 0) entry.values = values
+        }
+        const current = projectSettingValue(tunable.current)
+        if (current !== undefined) entry.current = current
         return [entry]
       })
     }

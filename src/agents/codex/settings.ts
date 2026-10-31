@@ -44,6 +44,16 @@ export interface CodexSettingsDeps {
   readonly readbackTimeoutMs?: number
   /** 测试注入假调度器；不能覆盖 initial。 */
   readonly readbackOptions?: Omit<ReadbackOptions, 'initial'>
+  /** 已确认状态发生变化后通知装配方重新发布能力；抛错路径不调用。 */
+  readonly onChanged?: (sessionId: string) => void
+}
+
+/**
+ * 保守目录：只有 goal 声明了真实回读；不提供任何模型/等级 lattice。
+ * 能力文档据此生成 tunables，绝不把目录之外的设置当作已知值。
+ */
+export const CODEX_SETTINGS_CATALOG: TunableCatalog = {
+  agent: 'codex', models: [], readback: { goal: true },
 }
 
 export interface CodexSettingsPort extends SettingsPort {
@@ -168,6 +178,8 @@ export function createCodexSettingsPort(deps: CodexSettingsDeps): CodexSettingsP
     if (current.plan !== undefined) values.push({ field: 'plan', current: current.plan, revision, confirmed: true })
     if (current.goal !== undefined) values.push({ field: 'goal', current: current.goal, revision, confirmed: true })
 
+    // 已确认状态更新完毕：让装配方发布带 current/revision 的新能力文档。
+    deps.onChanged?.(request.sessionId)
     return { values, runtimeEpoch: deps.runtimeEpoch, revision }
   }
 
@@ -251,8 +263,6 @@ export function createCodexSettingsPort(deps: CodexSettingsDeps): CodexSettingsP
       throw new PreCallRejection('revision-conflict', 'settings-revision-mismatch')
     }
 
-    // 保守目录：只有 goal 声明了真实回读；不提供任何模型/等级 lattice。
-    const catalog: TunableCatalog = { agent: 'codex', models: [], readback: { goal: true } }
     // 只有仍在等待回读的请求才占用会话；超时已释放 waiter，允许手动重试（不排队）。
     const activePending = base.pending?.status === 'pending' ? base.pending : undefined
     const decision = decideConfigure(request, {
@@ -261,7 +271,7 @@ export function createCodexSettingsPort(deps: CodexSettingsDeps): CodexSettingsP
       state: deps.idle(request.sessionId) ? 'idle' : 'running',
       settingsRevision: base.current.revision,
       current: base.current,
-      catalog,
+      catalog: CODEX_SETTINGS_CATALOG,
       contentAuthorized: request.contentAuthorized,
       ...(activePending === undefined
         ? {}
@@ -276,6 +286,8 @@ export function createCodexSettingsPort(deps: CodexSettingsDeps): CodexSettingsP
     }
 
     if (decision.outcome === 'no-op') {
+      // 无状态变化也要让页面看到最新 revision/待确认状态。
+      deps.onChanged?.(request.sessionId)
       return {
         status: 'confirmed',
         revision: base.current.revision,
@@ -303,6 +315,8 @@ export function createCodexSettingsPort(deps: CodexSettingsDeps): CodexSettingsP
       await writeGoal(readback, handle, requestId, request.sessionId, objective, signal)
       const outcome = await handle.outcome
       const snapshot = readback.snapshot()
+      // confirmed 与 pending-confirmation 都发布了新的 current/pending，必须重新广播。
+      deps.onChanged?.(request.sessionId)
       return {
         status: outcome.status,
         revision: snapshot.current.revision,
@@ -324,19 +338,26 @@ export function createCodexSettingsPort(deps: CodexSettingsDeps): CodexSettingsP
       const readback = readbacks.get(update.threadId)
       if (readback === undefined) return
       observeSnapshot(readback, update.snapshot)
+      deps.onChanged?.(update.threadId)
       return
     }
     if (method === 'thread/goal/updated') {
       const update = parseGoalUpdatedNotification(params)
       if (update === undefined) return
       // 只为已有回读的会话更新；未知会话不创建状态。
-      readbacks.get(update.threadId)?.observe({ field: 'goal', value: true })
+      const readback = readbacks.get(update.threadId)
+      if (readback === undefined) return
+      readback.observe({ field: 'goal', value: true })
+      deps.onChanged?.(update.threadId)
       return
     }
     if (method === 'thread/goal/cleared') {
       const update = parseGoalClearedNotification(params)
       if (update === undefined) return
-      readbacks.get(update.threadId)?.observe({ field: 'goal', value: false })
+      const readback = readbacks.get(update.threadId)
+      if (readback === undefined) return
+      readback.observe({ field: 'goal', value: false })
+      deps.onChanged?.(update.threadId)
     }
   }
 

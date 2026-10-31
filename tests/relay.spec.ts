@@ -185,6 +185,107 @@ describe('HubRelay', () => {
     expect(received).toHaveLength(2)
   })
 
+  it('会话能力按 sessionId 投影且只保留有界设置结构', () => {
+    const registry = new DeviceRegistry()
+    registry.attach({ id: 'mac', name: 'Mac', agents: ['dsh'] }, { send: () => {} }, 0)
+    const relay = new HubRelay({ registry, now: () => 0 })
+    const base = { v: 2, type: 'event', deviceId: 'mac', agent: 'dsh', sessionId: 's1', nodeEpoch: 'epoch-1', ts: 1 } as const
+    relay.publish({
+      ...base, seq: 1, kind: 'capability.changed',
+      payload: {
+        operations: ['prompt', 'acquire', 'teleport'],
+        ownership: 'ours',
+        settingsRevision: 4,
+        runtimeEpoch: 'epoch-1',
+        pending: {
+          field: 'goal', status: 'pending',
+          requested: { objective: 'secret objective' }, requestedAt: 9, baseFieldRevision: 3,
+        },
+        tunables: [{
+          id: 'permission',
+          editable: true,
+          values: [{ id: 'a'.repeat(80), label: 'b'.repeat(200) }],
+          current: {
+            approvalPolicy: 'on-request',
+            sandbox: { fileSystem: 'workspace-write', network: false },
+            additionalDirectories: ['/home/secret'],
+            rules: 'secret rule text',
+          },
+        }],
+      },
+    })
+
+    const document = relay.sessionCapability('mac', 'dsh', 's1')
+    expect(document).toBeDefined()
+    expect(document?.operations).toEqual(['prompt', 'acquire'])
+    expect(document?.settingsRevision).toBe(4)
+    expect(document?.runtimeEpoch).toBe('epoch-1')
+    expect(document?.pending).toEqual({ field: 'goal', status: 'pending' })
+    const tunables = document?.tunables as Record<string, unknown>[]
+    expect(tunables).toHaveLength(1)
+    expect(tunables[0]?.current).toEqual({
+      approvalPolicy: 'on-request',
+      sandbox: { fileSystem: 'workspace-write', network: false },
+    })
+    const values = tunables[0]?.values as { id: string; label: string }[]
+    expect(values[0]?.id).toHaveLength(64)
+    expect(values[0]?.label).toHaveLength(128)
+    const serialized = JSON.stringify(document)
+    expect(serialized).not.toContain('secret objective')
+    expect(serialized).not.toContain('/home/secret')
+    expect(serialized).not.toContain('secret rule')
+    expect(relay.sessionCapability('mac', 'dsh', 'missing')).toBeUndefined()
+  })
+
+  it('session.removed 与 epoch 切换清掉会话级能力', () => {
+    const registry = new DeviceRegistry()
+    registry.attach({ id: 'mac', name: 'Mac', agents: ['dsh'] }, { send: () => {} }, 0)
+    const relay = new HubRelay({ registry, now: () => 0 })
+    const base = { v: 2, type: 'event', deviceId: 'mac', agent: 'dsh', sessionId: 's1', nodeEpoch: 'epoch-1', ts: 1 } as const
+    const capability = { operations: ['prompt', 'acquire'], ownership: 'ours', settingsRevision: 1 }
+    relay.publish({ ...base, seq: 1, kind: 'capability.changed', payload: capability })
+    expect(relay.sessionCapability('mac', 'dsh', 's1')).toBeDefined()
+
+    relay.publish({ ...base, seq: 2, kind: 'session.removed', payload: {} })
+    expect(relay.sessionCapability('mac', 'dsh', 's1')).toBeUndefined()
+
+    relay.publish({ ...base, seq: 3, kind: 'capability.changed', payload: capability })
+    expect(relay.sessionCapability('mac', 'dsh', 's1')).toBeDefined()
+    relay.beginEpoch('mac', 'epoch-2')
+    expect(relay.sessionCapability('mac', 'dsh', 's1')).toBeUndefined()
+  })
+
+  it('commitDevice 用 agent 文档回退并覆盖旧会话能力', () => {
+    const registry = new DeviceRegistry()
+    registry.attach({ id: 'mac', name: 'Mac', agents: ['dsh'] }, { send: () => {} }, 0)
+    const relay = new HubRelay({ registry, now: () => 0 })
+    const commit = {
+      deviceId: 'mac',
+      nodeEpoch: 'epoch-1',
+      version: 1,
+      rows: [{ agent: 'dsh', sessionId: 's1', running: false, updatedAt: 9 }],
+      capabilities: { dsh: { operations: ['prompt'], ownership: 'foreign-unknown', settingsRevision: 0 } },
+    }
+    expect(relay.commitDevice(commit)).toBe(true)
+    expect(relay.sessionCapability('mac', 'dsh', 's1')).toEqual({
+      operations: ['prompt'],
+      ownership: 'foreign-unknown',
+      settingsRevision: 0,
+    })
+
+    const base = { v: 2, type: 'event', deviceId: 'mac', agent: 'dsh', sessionId: 's1', nodeEpoch: 'epoch-1', ts: 1 } as const
+    relay.publish({
+      ...base, seq: 1, kind: 'capability.changed',
+      payload: { operations: ['prompt', 'acquire'], ownership: 'ours', settingsRevision: 7 },
+    })
+    expect(relay.sessionCapability('mac', 'dsh', 's1')?.settingsRevision).toBe(7)
+
+    // 下一次提交重建为 agent 级回退，旧会话级文档不残留。
+    expect(relay.commitDevice({ ...commit, version: 2 })).toBe(true)
+    expect(relay.sessionCapability('mac', 'dsh', 's1')?.settingsRevision).toBe(0)
+    expect(relay.sessionCapability('mac', 'dsh', 's1')?.operations).toEqual(['prompt'])
+  })
+
   it('dispose 拒绝未完成的指令并清理定时器', async () => {
     vi.useFakeTimers()
     const { registry, sent } = setup()
