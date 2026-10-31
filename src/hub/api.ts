@@ -848,7 +848,7 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
       complete: boolean
       capabilities?: Record<string, Record<string, Record<string, unknown>>>
       cursor: string
-      replay?: { gap: boolean; dropped: number; truncated: boolean }
+      replay?: { gap: boolean; dropped: number; truncated: boolean; cursor: string }
     }): void => {
       writeRaw(`event: reset\ndata: ${JSON.stringify({
         required: true, hubEpoch, degradedDevices: [...reset.degraded], complete: reset.complete,
@@ -861,14 +861,18 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
     // 先订阅再有界暂存：订阅回调本身就是屏障完成前的队列，不做正文回放。
     let phase: 'buffer' | 'live' = 'buffer'
     let overflow = false
-    const staged: Array<{ event: EventFrame; cursor: string | undefined }> = []
+    const staged: Array<{ event: EventFrame; cursor: string | undefined; purge: number }> = []
     let stagedChars = 0
     const floors = new Map<string, number>()
+    /** 设备 -> 订阅时观测到的清理代次；之后发生 purge 的旧帧即使已暂存也不能发出。 */
+    const purgeBase = new Map<string, number>()
     /** 设备 -> 快照时观测到的 runtimeEpoch；换代说明屏障已过期。 */
     const epochs = new Map<string, string | undefined>()
     const degraded = new Set<string>()
 
     const deliver = (event: EventFrame, cursor: string | undefined): void => {
+      // 观测后发生过内容清理：暂存/回放中的旧帧一律不再发出。
+      if (purgeBase.get(event.deviceId) !== relay.purgeGeneration(event.deviceId)) return
       // 权威代次来自中继：快照后已换代的事件（含回放）一律丢弃，不能污染新时间线。
       const authoritative = relay.nodeEpoch(event.deviceId)
       if (authoritative !== undefined && authoritative !== event.nodeEpoch) {
@@ -883,21 +887,27 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
       }
       const key = `${event.deviceId}\u0000${event.agent}\u0000${event.sessionId}`
       const floor = floors.get(key)
-      if (floor !== undefined && event.seq <= floor) return
-      floors.set(key, event.seq)
+      // hub 派生通知（session.updated/removed、capability.changed）带 seq 0，不参与底价去重。
+      if (event.seq > 0 && floor !== undefined && event.seq <= floor) return
+      if (event.seq > 0) floors.set(key, event.seq)
+      // 会话已删除，长连接不再为它保留底价条目。
+      if (event.kind === 'session.removed') floors.delete(key)
       sendEvent(event, cursor)
     }
 
     let unsubscribe: (() => void) | null = null
     try {
       unsubscribe = relay.subscribe((event, cursor) => {
+        // 记录观察时的清理代次；purge 之后这张流不再发出更早观测的帧。
+        const purge = relay.purgeGeneration(event.deviceId)
+        purgeBase.set(event.deviceId, purge)
         if (phase === 'buffer') {
           const size = JSON.stringify(event).length
           if (staged.length >= MAX_STAGED_EVENTS || stagedChars + size > MAX_STAGED_CHARS) {
             overflow = true
             return
           }
-          staged.push({ event, cursor })
+          staged.push({ event, cursor, purge })
           stagedChars += size
           return
         }
@@ -1001,6 +1011,8 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
               gap: !complete || replay.gap,
               dropped: replay.dropped,
               truncated: replay.truncated,
+              // 最后一条实际回放事件；被截断时客户端可从这里继续。
+              cursor: replay.cursor,
             },
           }),
     })
@@ -1012,12 +1024,16 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
         for (const item of replay.events) {
           if (degraded.has(item.event.deviceId)) continue
           if (!relay.isDeviceKnown(item.event.deviceId)) continue
+          // 回放事件在本轮读取时观测；与 purge 同期读取的帧按当前代次判断。
+          purgeBase.set(item.event.deviceId, relay.purgeGeneration(item.event.deviceId))
           deliver(item.event, item.cursor)
         }
       }
       for (const item of staged) {
         if (degraded.has(item.event.deviceId)) continue
         if (!relay.isDeviceKnown(item.event.deviceId)) continue
+        // 用暂存时的代次判断：purge 之前观测到的旧帧即使还在队列里也不能放行。
+        purgeBase.set(item.event.deviceId, item.purge)
         deliver(item.event, item.cursor)
       }
     }

@@ -58,4 +58,23 @@ describe('public seq after projection', () => {
     expect(withPublicSeq(allocator, event('session.updated', {}, { nodeEpoch: 'epoch-2' }))).toMatchObject({ seq: 1 })
     expect(withPublicSeq(allocator, event('session.updated', {}, { sessionId: 's2' }))).toMatchObject({ seq: 1 })
   })
+
+  it('带 scope 的高水位只反映该会话，未出现的会话为 0；无参仍是全局峰值', () => {
+    const allocator = createSeqAllocator()
+    const s1 = { deviceId: 'mac', agent: 'dsh', sessionId: 's1', nodeEpoch: 'epoch-1' }
+    const s2 = { deviceId: 'mac', agent: 'dsh', sessionId: 's2', nodeEpoch: 'epoch-1' }
+    const unseen = { deviceId: 'mac', agent: 'dsh', sessionId: 's3', nodeEpoch: 'epoch-1' }
+    // 两个会话交错分配，避免高水位恰好等于全局峰值而掩盖问题。
+    withPublicSeq(allocator, event('session.updated', {}, { sessionId: 's1' }))
+    withPublicSeq(allocator, event('session.updated', {}, { sessionId: 's2' }))
+    withPublicSeq(allocator, event('session.updated', {}, { sessionId: 's1' }))
+    withPublicSeq(allocator, event('session.updated', {}, { sessionId: 's1' }))
+    withPublicSeq(allocator, event('session.updated', {}, { sessionId: 's2' }))
+
+    expect(allocator.highWatermark(s1)).toBe(3)
+    expect(allocator.highWatermark(s2)).toBe(2)
+    expect(allocator.highWatermark(unseen)).toBe(0)
+    // 同步屏障仍要设备级峰值。
+    expect(allocator.highWatermark()).toBe(3)
+  })
 })

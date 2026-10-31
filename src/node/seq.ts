@@ -10,8 +10,15 @@ export interface SeqScope {
 export interface SeqAllocator {
   /** 为已通过投影/过滤的出站帧分配公开序号。 */
   next(scope: SeqScope): number
-  /** 已分配的最大公开序号；同步高水位使用同一序列，不做版本猜测。 */
-  highWatermark(): number
+  /**
+   * 已分配的最大公开序号。带 scope 时返回该会话自己的计数（契约 §11 的
+   * 每会话公开高水位）；省略 scope 时返回设备级 peak，供同步屏障使用。
+   */
+  highWatermark(scope?: SeqScope): number
+}
+
+function scopeKey(scope: SeqScope): string {
+  return [scope.deviceId, scope.agent, scope.sessionId, scope.nodeEpoch].join('\u0000')
 }
 
 /**
@@ -19,18 +26,20 @@ export interface SeqAllocator {
  * `(deviceId, agent, sessionId, nodeEpoch)`。
  * 被隐私层丢弃的帧不占号，分片帧按输出顺序取连续号。
  */
-export function createSeqAllocator(): SeqAllocator {
-  const counters = new Map<string, number>()
+export function createSeqAllocator(): SeqAllocator {  const counters = new Map<string, number>()
   let peak = 0
   return {
     next(scope: SeqScope): number {
-      const key = [scope.deviceId, scope.agent, scope.sessionId, scope.nodeEpoch].join('\u0000')
+      const key = scopeKey(scope)
       const value = (counters.get(key) ?? 0) + 1
       counters.set(key, value)
       if (value > peak) peak = value
       return value
     },
-    highWatermark(): number { return peak },
+    highWatermark(scope?: SeqScope): number {
+      if (scope === undefined) return peak
+      return counters.get(scopeKey(scope)) ?? 0
+    },
   }
 }
 

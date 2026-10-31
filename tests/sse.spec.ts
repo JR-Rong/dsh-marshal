@@ -202,6 +202,32 @@ describe('hub sse', () => {
     second.res.destroy()
   })
 
+  it('回放的 replay.cursor 指向最后一条实际回放事件', async () => {
+    const { web: target, relay, sent } = start()
+    publishSession(relay)
+    const cursor = relay.historyCursor()
+    expect(cursor).toBe('hub-test:1')
+    publishDelta(relay, 2, 'replay-two')
+    publishDelta(relay, 3, 'replay-three')
+
+    const { res, done } = target.start('/marshal/api/stream', {
+      headers: { ...AUTH, 'last-event-id': cursor },
+    })
+    // 高水位 1 让 seq 2/3 的增量进入回放。
+    await settleSnapshot(sent, relay, 1)
+    await waitFor(() => resetPayload(res) !== undefined, 'reset')
+    // reset.cursor 仍是快照时刻的高水位，replay.cursor 是可续读的最后一条回放。
+    expect(resetPayload(res)).toMatchObject({
+      cursor: 'hub-test:3',
+      replay: { gap: false, truncated: false, cursor: 'hub-test:3' },
+    })
+    await waitFor(() => res.body.includes('replay-three'), 'replayed deltas')
+    const ids = [...res.body.matchAll(/^id: (\S+)$/gm)].map(match => match[1])
+    expect(ids[ids.length - 1]).toBe('hub-test:3')
+    await done
+    res.destroy()
+  })
+
   it('过期或跨 epoch 游标只 reset 并报告缺口', async () => {
     const { web: target, relay } = await start()
     publishDelta(relay, 1, 'cached-should-not-replay')
@@ -258,6 +284,30 @@ describe('hub sse', () => {
     await waitFor(() => resetPayload(res) !== undefined, 'reset')
     expect(resetPayload(res)).toMatchObject({ replay: { gap: true } })
     expect(res.body).not.toContain('purged-payload')
+    await done
+    res.destroy()
+  })
+
+  it('暂存期间发生内容清理后不再发出旧帧', async () => {
+    const { web: target, relay, sent } = start()
+    publishSession(relay)
+    const { res, done } = target.start('/marshal/api/stream', { headers: AUTH })
+    // 屏障停在 inputs.snapshot：订阅已建立，之后的事件先进入 staged。
+    const frame = await waitForFrame(sent, 'inputs.snapshot')
+    publishDelta(relay, 2, 'staged-before-purge')
+    // 内容清理发生在事件已暂存、尚未放行之间。
+    expect(relay.purgeHistory('mac')).toBe(2)
+    relay.settleInputs({
+      v: 2, type: 'inputs.snapshot.result', requestId: frame.requestId as string,
+      runtimeEpoch: 'epoch-1', highWatermark: 1, cards: [],
+    } satisfies InputsSnapshotResultFrame, { deviceId: 'mac', connectionId: 'conn-1', nodeEpoch: 'epoch-1' })
+    await waitFor(() => resetPayload(res) !== undefined, 'reset')
+    await new Promise(resolve => setTimeout(resolve, 10))
+    // 高水位 1 本应放行 seq 2，但它在清理之前已被观测，必须整条丢弃。
+    expect(res.body).not.toContain('staged-before-purge')
+    // 清理之后观测到的增量仍要正常放行，不能把整条流永久毒化。
+    publishDelta(relay, 3, 'after-purge-live')
+    await waitFor(() => res.body.includes('after-purge-live'), 'post-purge delta')
     await done
     res.destroy()
   })

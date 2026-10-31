@@ -465,7 +465,7 @@ describe('hub socket', () => {
     expect(await code).toBe(4409)
   })
 
-  it('内容授权收紧回调一次，重连 metadata 不再回调', async () => {
+  it('内容授权收紧回调一次，重连 metadata 补一次在途清理后不再回调', async () => {
     const registry = new DeviceRegistry()
     const revoked: string[] = []
     const record: DeviceRecord = { ...DEVICE, allowContent: true }
@@ -484,10 +484,38 @@ describe('hub socket', () => {
     expect(await code).toBe(4409)
     expect(revoked).toEqual([DEVICE_ID])
 
-    // 已经清空的设备重连只报 metadata：没有“由真变假”的瞬间，不能再清一次。
+    // 收紧后的重连只报 metadata：reload 清理时可能还有在途帧，必须再清一次。
     const second = await hello(registry, port)
-    expect(revoked).toEqual([DEVICE_ID])
+    expect(revoked).toEqual([DEVICE_ID, DEVICE_ID])
     second.close()
+  })
+
+  it('撤权后的新 hello 恰好补一次在途清理', async () => {
+    const registry = new DeviceRegistry()
+    const revoked: string[] = []
+    const record: DeviceRecord = { ...DEVICE, allowContent: true }
+    const { port, mounted, devicesPath } = await serve(registry, [], [record], {
+      onContentRevoked: deviceId => revoked.push(deviceId),
+    })
+    const first = await hello(registry, port, { privacy: 'content' })
+    const code = closeCode(first)
+    writeFileSync(
+      devicesPath,
+      serializeDevicesState({ version: 2, devices: [{ ...record, allowContent: false, policyRevision: 2 }] }),
+      { mode: 0o600 },
+    )
+    mounted.reload()
+    expect(await code).toBe(4409)
+    expect(revoked).toEqual([DEVICE_ID])
+
+    // 撤权后的第一次重连补一次，接住 reload 清理时仍在途的帧。
+    const second = await hello(registry, port)
+    expect(revoked).toEqual([DEVICE_ID, DEVICE_ID])
+    second.close()
+    // 再重连时已经没有“报告过 content”的残留，不会重复清理。
+    const third = await hello(registry, port)
+    expect(revoked).toEqual([DEVICE_ID, DEVICE_ID])
+    third.close()
   })
 
   it('修订回退的 reload 不清内容历史', async () => {

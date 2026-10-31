@@ -302,6 +302,8 @@ export class HubRelay {
   /** 设备 -> agent -> 已提交能力文档；只在 sync 提交或 capability.changed 时更新。 */
   private readonly capabilityIndex = new Map<string, Map<string, Record<string, unknown>>>()
   private readonly epochs = new Map<string, string>()
+  /** 每个设备经历过多少次内容清理；SSE 用它在发出前拦截跨过 purge 的旧帧。 */
+  private readonly purgeGenerations = new Map<string, number>()
   /** 每个会话当前活动 turnId；只用于避免迟到的 completed 把新回合置闲。 */
   private readonly activeTurns = new Map<string, string>()
   private syncGate: ((deviceId: string, connectionId: string, nodeEpoch: string) => boolean) | undefined
@@ -916,6 +918,13 @@ export class HubRelay {
 
   /** 内容授权收紧：删除该设备全部可回放历史，返回删除条数。 */
   purgeHistory(deviceId: string): number {
+    // 即使没有可删事件也要推进代次：暂存队列里可能还留着该设备的旧帧。
+    this.purgeGenerations.set(deviceId, this.purgeGeneration(deviceId) + 1)
     return this.buffer.purgeDevice(deviceId)
+  }
+
+  /** 该设备的内容清理代次；从未清理过时为 0。 */
+  purgeGeneration(deviceId: string): number {
+    return this.purgeGenerations.get(deviceId) ?? 0
   }
 }

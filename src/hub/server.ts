@@ -173,6 +173,11 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
    * “从有内容权限变为没有”的收紧瞬间。
    */
   const contentDevices = new Set<string>()
+  /**
+   * 最近一次 hello 自报 content 的设备。只在 hello 路径更新：收紧后重新握手
+   * 即使已删过 contentDevices，也要再清一次，接住在途事件。
+   */
+  const reportedContent = new Set<string>()
   /** 升级成功但还没完成 hello 的 socket 数量；超过上限直接 4408。 */
   let pendingHellos = 0
   /** 节点自报更高 revision 时只隔离该设备，不抬高全局修订。 */
@@ -472,8 +477,15 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
           options.onAttach?.(latest.id)
           // 内容授权 = 节点自报 privacy + hub 持久 allowContent；收紧时清掉历史正文。
           const effectiveContent = frame.privacy === 'content' && latest.allowContent === true
-          if (effectiveContent) contentDevices.add(latest.id)
-          else if (contentDevices.delete(latest.id)) options.onContentRevoked?.(latest.id)
+          if (effectiveContent) {
+            contentDevices.add(latest.id)
+            reportedContent.add(latest.id)
+          } else {
+            contentDevices.delete(latest.id)
+            // reload 触发的清理可能在握手前已经执行；重连时再清一次，拦住仍在途的帧。
+            // reportedContent 只在 hello 更新，因此同一次授权状态不会重复回调。
+            if (reportedContent.delete(latest.id)) options.onContentRevoked?.(latest.id)
+          }
           const ack: HelloAckFrame = {
             v: 2, type: 'hello.ack', connectionId, hubEpoch,
             contractRevision: CONTRACT_REVISION,
@@ -620,6 +632,7 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
       for (const helloTimer of helloTimers) clearTimeout(helloTimer)
       helloTimers.clear()
       contentDevices.clear()
+      reportedContent.clear()
       closePort()
       for (const ws of wss.clients) {
         stopHubHeartbeat(ws)

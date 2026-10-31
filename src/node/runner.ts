@@ -20,7 +20,8 @@ export interface CommandRuntime {
   /** 当前待答快照；只读，不写 journal，也不进入命令分派。 */
   inputs?: {
     snapshot(sessionId: string): readonly unknown[]
-    highWatermark(): number
+    /** 每会话公开高水位：hub 用它作为该会话的回放/去重底价。 */
+    highWatermark(sessionId: string): number
   }
 }
 
@@ -254,7 +255,7 @@ function runInputsSnapshot(
   let highWatermark = 0
   try {
     cards = runtime?.inputs?.snapshot(sessionId) ?? []
-    highWatermark = runtime?.inputs?.highWatermark() ?? 0
+    highWatermark = runtime?.inputs?.highWatermark(sessionId) ?? 0
   } catch {
     cards = []
     highWatermark = 0
