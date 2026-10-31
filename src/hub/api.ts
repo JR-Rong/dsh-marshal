@@ -866,8 +866,8 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
     const floors = new Map<string, number>()
     /** 设备 -> 订阅时观测到的清理代次；之后发生 purge 的旧帧即使已暂存也不能发出。 */
     const purgeBase = new Map<string, number>()
-    /** 设备 -> 快照时观测到的 runtimeEpoch；换代说明屏障已过期。 */
-    const epochs = new Map<string, string | undefined>()
+    /** 设备/agent/会话三元组 -> 该会话快照观测到的 runtimeEpoch。 */
+    const snapshotEpochs = new Map<string, string>()
     const degraded = new Set<string>()
 
     const deliver = (event: EventFrame, cursor: string | undefined): void => {
@@ -976,13 +976,11 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
           degraded.add(deviceId)
           return
         }
-        const previous = epochs.get(deviceId)
-        if (previous !== undefined && previous !== outcome.runtimeEpoch) {
-          // 同一设备的不同会话返回不同 runtimeEpoch：快照不可拼接。
-          degraded.add(deviceId)
-          return
-        }
-        epochs.set(deviceId, outcome.runtimeEpoch)
+        // 每个会话的快照由它自己的 node 校验；同设备的不同 agent 各有 runtimeEpoch，
+        // 不能要求设备级一致，否则多 agent 设备会被永久降级。
+        snapshotEpochs.set(
+          `${deviceId}\u0000${item.agent}\u0000${item.sessionId}`, outcome.runtimeEpoch,
+        )
         floors.set(`${deviceId}\u0000${item.agent}\u0000${item.sessionId}`, outcome.highWatermark)
       }))
     }))

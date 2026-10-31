@@ -20,6 +20,8 @@ export interface CommandRuntime {
   /** 当前待答快照；只读，不写 journal，也不进入命令分派。 */
   inputs?: {
     snapshot(sessionId: string): readonly unknown[]
+    /** 每会话卡片来源代次：结果帧用它标识返回的卡，而不是节点握手代次。 */
+    runtimeEpoch(sessionId: string): string
     /** 每会话公开高水位：hub 用它作为该会话的回放/去重底价。 */
     highWatermark(sessionId: string): number
   }
@@ -220,6 +222,13 @@ function bindingFor(link: NodeLink, frame: { connectionId: string; nodeEpoch: st
   return binding
 }
 
+/** 结果只接受普通对象；无 runtimeEpoch 字段的卡沿用结果代次，显式不同的卡必须丢弃。 */
+function cardMatchesEpoch(card: unknown, runtimeEpoch: string): boolean {
+  if (typeof card !== 'object' || card === null || Array.isArray(card)) return false
+  const record = card as Record<string, unknown>
+  return record['runtimeEpoch'] === undefined || record['runtimeEpoch'] === runtimeEpoch
+}
+
 /**
  * 待答快照是只读查询：不占 journal、不触发执行。
  * 身份/会话不匹配就静默忽略，由调用方超时按 unknown 处理。
@@ -239,32 +248,37 @@ function runInputsSnapshot(
   // schema 已保证非空字符串；这里再防一手运行期构造。
   if (typeof sessionId !== 'string' || sessionId === '') return
 
-  const reply = (cards: readonly unknown[], highWatermark: number): void => {
+  const reply = (cards: readonly unknown[], highWatermark: number, runtimeEpoch: string): void => {
     const body = {
       v: 2 as const,
       type: 'inputs.snapshot.result' as const,
       requestId: frame.requestId,
-      runtimeEpoch: binding.nodeEpoch,
+      runtimeEpoch,
       highWatermark,
       cards: [...cards],
     }
     link.sendRaw(encodeFrame(body))
   }
 
+  // 结果代次必须标识卡片来源：v1 每个 agent 有自己的 runtime，不能报节点握手代次。
+  const sourceEpoch = runtime?.inputs?.runtimeEpoch(sessionId)
+  const runtimeEpoch = typeof sourceEpoch === 'string' && sourceEpoch !== '' ? sourceEpoch : binding.nodeEpoch
+
   let cards: readonly unknown[] = []
   let highWatermark = 0
   try {
-    cards = runtime?.inputs?.snapshot(sessionId) ?? []
+    // 过滤在 reply 之前完成：混入其它 runtime 的卡会让 hub 接受过期内容。
+    cards = (runtime?.inputs?.snapshot(sessionId) ?? []).filter(card => cardMatchesEpoch(card, runtimeEpoch))
     highWatermark = runtime?.inputs?.highWatermark(sessionId) ?? 0
   } catch {
     cards = []
     highWatermark = 0
   }
   try {
-    reply(cards, highWatermark)
+    reply(cards, highWatermark, runtimeEpoch)
   } catch {
     // 快照编码/发送失败（例如单帧过大）：退回最小结果，不能打挂宿主。
-    try { reply([], 0) } catch { /* 连接已断：调用方超时 */ }
+    try { reply([], 0, runtimeEpoch) } catch { /* 连接已断：调用方超时 */ }
   }
 }
 

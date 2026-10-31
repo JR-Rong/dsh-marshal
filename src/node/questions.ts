@@ -36,6 +36,8 @@ const FIXED_AUTHORIZATION: InputAuthorization = {
 }
 
 export interface QuestionRelay {
+  /** 本 relay 配置的代次；快照结果用它标识卡片来源。 */
+  readonly runtimeEpoch: string
   settle(sessionId: string, requestId: string, answers: unknown): SettleResult
   /** 放弃待答：结束本进程的等待并交回本地，不触发任何会话级取消。 */
   cancel(sessionId: string, requestId: string): SettleResult
@@ -267,6 +269,7 @@ export function createQuestionRelay(options: QuestionRelayOptions): QuestionRela
   })
 
   return {
+    runtimeEpoch: options.runtimeEpoch,
     settle(sessionId, requestId, answers) {
       const denied = blocked.get(requestId)
       if (denied !== undefined) {

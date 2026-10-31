@@ -152,6 +152,8 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
         // 待答快照只读：node 内存里的当前有效卡，公开高水位与事件同源。
         inputs: {
           snapshot: sessionId => relay?.snapshot(sessionId) ?? [],
+          // 卡片由 relay 的 runtime 产出；关闭 relay 时才退回节点握手代次。
+          runtimeEpoch: () => relay?.runtimeEpoch ?? nodeEpoch,
           // 必须按会话取高水位：hub 把它当作该会话的回放/去重底价，设备级峰值会误杀低序号会话。
           highWatermark: sessionId => publicSeq.highWatermark({
             deviceId: config.deviceId!, agent: adapter.agent, sessionId, nodeEpoch,

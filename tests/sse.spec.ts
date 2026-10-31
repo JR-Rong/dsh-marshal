@@ -42,9 +42,9 @@ function start(options: { writeResult?: boolean } = {}) {
   return { web: test, relay, sent, registry }
 }
 
-function publishSession(relay: HubRelay, sessionId = 's1'): void {
+function publishSession(relay: HubRelay, sessionId = 's1', agent = 'dsh'): void {
   relay.publish({
-    v: 2, type: 'event', deviceId: 'mac', agent: 'dsh', sessionId, nodeEpoch: 'epoch-1',
+    v: 2, type: 'event', deviceId: 'mac', agent, sessionId, nodeEpoch: 'epoch-1',
     seq: 1, ts: 1, kind: 'session.updated', payload: { running: false, updatedAt: 1 },
   })
 }
@@ -82,6 +82,17 @@ async function waitForFrame(sent: string[], type: string): Promise<Record<string
     return found !== undefined
   }, type)
   return found!
+}
+
+async function waitForFrames(sent: string[], type: string, count: number): Promise<Record<string, unknown>[]> {
+  let found: Record<string, unknown>[] = []
+  await waitFor(() => {
+    found = sent
+      .map(text => JSON.parse(text) as Record<string, unknown>)
+      .filter(frame => frame.type === type)
+    return found.length >= count
+  }, `${count} x ${type}`)
+  return found
 }
 
 function resetPayload(response: MemoryResponse): Record<string, unknown> | undefined {
@@ -153,6 +164,37 @@ describe('hub sse', () => {
     expect(resetPayload(res)).toMatchObject({
       required: true, complete: false, degradedDevices: ['mac'],
     })
+    await done
+  })
+
+  it('同一设备多会话各自快照代次不触发降级', async () => {
+    const { web: target, relay, sent } = start()
+    // v1 同一节点可挂多个 agent：每个会话的 runtimeEpoch 由自己的 runtime 决定。
+    publishSession(relay, 's1', 'dsh')
+    publishSession(relay, 's2', 'codex')
+
+    const { res, done } = target.start('/marshal/api/stream', { headers: AUTH })
+    // 屏障按会话各发一条请求；分别用不同的 runtimeEpoch 结算。
+    const frames = await waitForFrames(sent, 'inputs.snapshot', 2)
+    expect(frames.map(frame => (frame['target'] as { agent: string }).agent).sort()).toEqual(['codex', 'dsh'])
+    for (const frame of frames) {
+      const origin = frame['target'] as { sessionId: string; agent: string }
+      const epoch = origin.agent === 'codex' ? 'codex-runtime' : 'dsh-runtime'
+      relay.settleInputs({
+        v: 2, type: 'inputs.snapshot.result', requestId: frame['requestId'] as string,
+        runtimeEpoch: epoch, highWatermark: 1,
+        cards: [{
+          requestId: `r-${origin.sessionId}`, sessionId: origin.sessionId, runtimeEpoch: epoch,
+          kind: 'question', expiresAt: 10, acceptOnceEligible: true, questions: [],
+        }],
+      } satisfies InputsSnapshotResultFrame, { deviceId: 'mac', connectionId: 'conn-1', nodeEpoch: 'epoch-1' })
+    }
+
+    await waitFor(() => resetPayload(res) !== undefined, 'reset')
+    // 快照卡不在 reset 载荷里；这里证明屏障没有被跨会话代次比较毒化。
+    expect(resetPayload(res)).toMatchObject({ required: true, complete: true, degradedDevices: [] })
+    expect(resetPayloads(res).some(payload => payload['complete'] === false)).toBe(false)
+    expect(res.body).not.toContain('"degradedDevices":["mac"]')
     await done
   })
 

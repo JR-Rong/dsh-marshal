@@ -6,8 +6,10 @@ import { PreCallRejection, type Adapter } from '../src/adapters/types.ts'
 import type { HandshakeBinding, NodeLink } from '../src/node/link.ts'
 import { JournalError, openJournal, type Journal } from '../src/node/journal.ts'
 import { createFollower, runCommand } from '../src/node/runner.ts'
+import { createPrivacyProjector } from '../src/node/privacy.ts'
 import type {
   AckFrame, CommandFrame, CommandStatusFrame, CommandStatusResultFrame, Frame,
+  InputsSnapshotFrame, InputsSnapshotResultFrame,
 } from '../src/wire/frames.ts'
 
 const dirs: string[] = []
@@ -328,6 +330,41 @@ describe('node command lifecycle', () => {
     await flush()
     expect(h.calls()).toBe(0)
     expect(h.acks()[0]).toMatchObject({ status: 'rejected', code: 'recovery-required' })
+  })
+
+  it('待答快照用卡片来源代次并过滤不匹配卡', () => {
+    const { journal } = setup()
+    const h = harness()
+    const snapshot: InputsSnapshotFrame = {
+      v: 2, type: 'inputs.snapshot', requestId: 'snap-1',
+      target: target(), connectionId: 'conn-1', nodeEpoch: 'epoch-1',
+    }
+    // 握手代次是 epoch-1，但卡片实际由 runtime-2 产出。
+    runCommand(h.link, h.adapter, h.follower, snapshot, 'mac', journal, Date.now, {
+      projector: () => createPrivacyProjector({
+        privacy: 'metadata', allowContent: false, questionRelay: 'off', approvalRelay: 'off',
+        allowInteractions: false, redaction: [], deviceId: 'mac', agent: 'dsh',
+      }),
+      inputs: {
+        snapshot: () => [
+          { requestId: 'r-match', runtimeEpoch: 'runtime-2' },
+          { requestId: 'r-stale', runtimeEpoch: 'runtime-1' },
+          { requestId: 'r-legacy' },
+          ['not-a-plain-object'],
+        ],
+        runtimeEpoch: () => 'runtime-2',
+        highWatermark: () => 5,
+      },
+    })
+    const result = h.sent.find(
+      (frame): frame is InputsSnapshotResultFrame => frame.type === 'inputs.snapshot.result',
+    )
+    expect(result).toMatchObject({
+      runtimeEpoch: 'runtime-2',
+      highWatermark: 5,
+      cards: [{ requestId: 'r-match', runtimeEpoch: 'runtime-2' }, { requestId: 'r-legacy' }],
+    })
+    expect(result?.cards).toHaveLength(2)
   })
 
   it('configure 没有验证回读时结算为 pending-confirmation', async () => {

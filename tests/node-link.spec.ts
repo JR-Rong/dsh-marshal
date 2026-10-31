@@ -369,6 +369,41 @@ describe('NodeLink', () => {
     expect(link.dropped).toBe(2)
   })
 
+  it('clearOutbound 丢弃积压普通帧，volatile 帧不补发', async () => {
+    const { port, received } = await listen()
+
+    const link = createLink(port, { bufferLimit: 10 })
+    const interactive: EventFrame = {
+      v: 2, type: 'event', deviceId: 'mac', agent: 'dsh', sessionId: 's', nodeEpoch: 'epoch-1',
+      seq: 9, ts: 1, kind: 'input.requested', payload: { requestId: 'r-old' },
+    }
+    link.sendEvent(event(1))
+    link.sendEvent(event(2))
+    // 未 online 的 volatile 帧直接丢弃，不进入任何队列。
+    link.sendVolatileEvent(interactive)
+    expect(link.buffered).toBe(2)
+    const droppedBefore = link.dropped
+
+    // 授权收紧后清空旧策略编码的积压；清空本身计入丢弃。
+    link.clearOutbound()
+    expect(link.buffered).toBe(0)
+    expect(link.dropped).toBe(droppedBefore + 2)
+
+    // 只有 clearOutbound 之后入队的普通帧会在同步完成后补发。
+    link.sendEvent(event(3))
+    link.sendVolatileEvent({ ...interactive, seq: 10 })
+    link.start()
+    await confirmSync(link)
+    await waitFor(
+      () => received.some(text => typeOf(text) === 'event' && seqOf(text) === 3),
+      'post-clear event',
+    )
+    await settle(80)
+    expect(received.filter(text => typeOf(text) === 'event').map(seqOf)).toEqual([3])
+    // 第二次 volatile 同样只记丢弃，不因重连被补发。
+    expect(link.dropped).toBe(droppedBefore + 3)
+  })
+
   it('contractRevision 不匹配时以 4406 终止，不再重拨', async () => {
     let connections = 0
     const errors: unknown[] = []
