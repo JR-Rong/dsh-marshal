@@ -1,5 +1,7 @@
 # dsh-marshal
 
+本文安装和协议说明对应 `feat/v0` 的现有实现（评审基线 `702ef24`）。P1 修订目标及迁移要求见[公共契约](docs/superpowers/specs/2026-10-29-marshal-contract.md)，尚未在代码中实施；不要把目标版配置直接用于当前版本。
+
 调度官：把 DSH 会话的观察、续跑与提问搬到任意浏览器，node 只做出站连接，不新开任何入站端口。
 
 ```
@@ -51,7 +53,11 @@ npx --package dsh-marshal marshal-device laptop-b
 
 设备表是一个 JSON 文件，CLI 每次写入后都会把权限收紧到 `0600`。CLI 支持 `MARSHAL_DEVICES_FILE` 环境变量覆盖路径，但 **hub 不读这个环境变量**：一旦用了覆盖，必须同时把 hub 配置里的 `devicesFile` 指到同一个绝对路径。设备表只在 hub 启动时读取，签发新设备后要重启 hub；启动时加载不到任何设备会打 `marshal: no devices loaded from …` 警告。文件存在但无法解析时 CLI 直接报错退出，不会当成空表覆盖。
 
+> 目标契约（wire v2）要求 hub 热加载设备表、撤销 5s 内生效、文件损坏时启动失败，并要求 `dashboardToken` 来自随机源；当前实现尚未满足，见 [公共契约](docs/superpowers/specs/2026-10-29-marshal-contract.md#3-配置与默认值)。
+
 hub 启动后日志会打印 `marshal: hub ready at <origin>/marshal`。
+
+当前 v0 一个插件实例只装配一个角色，hub 机器本身不自动出现在设备列表。目标契约要求 hub 管理本机时显式增加一个本地 node 配置（独立 deviceId、相同身份/策略/去重/同步管道），而不是给 hub 开特权捷径；该装配尚未实现。
 
 ## 安装 node
 
@@ -76,7 +82,7 @@ dsh plugin add dsh-marshal
 - `token` 至少 16 字符，与 hub 设备表里那台设备的 token 完全一致。
 - `deviceName` 可选，默认取宿主环境的 `HOSTNAME`，取不到时是 `unknown`；它必须等于 `marshal-device` 签发的设备 id，否则 hello 阶段的 `device` 对不上，hub 会以 `4401 auth-failed` 关闭连接。它同时是 hello 里的设备 id，也是事件里的 `device` 字段。
 
-node 断线后按指数退避（上限 30s）重连，断线期间最多缓存 1000 帧、总字节不超过 8 MiB；升级握手返回 `401` 或 hello 阶段收到 `4401` 都视为设备 token 错误，停止重连，改对 token 后再重启。每次连上都会重发会话快照。
+node 断线后按指数退避（当前实现上限 30s；目标契约要求封顶 10s 并带 jitter，以满足网络恢复后 30s 内完成同步）重连，断线期间最多缓存 1000 帧、总字节不超过 8 MiB；升级握手返回 `401` 或 hello 阶段收到 `4401` 都视为设备 token 错误，停止重连，改对 token 后再重启。每次连上都会重发会话快照。
 
 ## 打开控制台
 
@@ -86,14 +92,16 @@ node 断线后按指数退避（上限 30s）重连，断线期间最多缓存 1
 https://<hub-host>/marshal?token=<dashboard-token>
 ```
 
+这是当前 v0 的过渡方式。目标契约改为登录表单换 cookie，页面与 API 不再接受 URL token；hub 需显式配置 `publicOrigin`，登录响应和已登录 session 查询提供 operatorId 与 CSRF token，logout 撤销会话。上述 cookie/CSRF/session/publicOrigin 尚未实现，不能直接加入当前配置。迁移完成前不要把带 token 的 URL 当长期用法。
+
 token 也可以放在 `x-marshal-token` 请求头里（两者同时出现时以查询参数为准）。已落地的 `/marshal` 与 `/marshal/api/devices|sessions|command|stream` 每条路由都要 token，否则 401；其他路径不归本插件处理。
 
 页面做的事：
 
 - 左栏每 5 秒轮询 `/marshal/api/devices`，列出**当前已连接**的设备与 agent。
-- 点会话名发 `resume`，node 开始跟随并把事件推回；底部输入框发 `prompt`。
+- 点会话名发 `resume`，node 开始跟随并把事件推回；当前映射忽略原生 snapshot，没有历史读取端点。底部输入框发 `prompt`，底层固定用 DSH `mode: steer`，marshal 尚未实现忙时拒绝；实际运行中输入行为由目标 DSH 决定。
 - 事件经 `/marshal/api/stream`（SSE）实时追加。
-- hub 在设备每次连上时清空该设备的旧会话索引，再按 node 重发的快照重建，所以删掉的会话不会残留。
+- hub 每次连上时先清旧索引，再逐条加入 node 快照。当前只读取一次 list({})、无分页遍历与周期发现；turn 事件也不更新索引运行态，因此不能保证完整/持续新鲜的清单或原子恢复。
 
 页面在可用时用 `crypto.randomUUID()` 生成幂等键，不可用时退化成时间戳加随机串，所以普通 http 也能加载。但 token 在 URL 里，**请优先用 HTTPS**：页面响应带 `referrer-policy: no-referrer` 与 `cache-control: no-store`，也不要把带 token 的 URL 粘到第三方页面或聊天工具里。
 
@@ -102,7 +110,7 @@ token 也可以放在 `x-marshal-token` 请求头里（两者同时出现时以�
 `/marshal` 与 `/marshal/uplink` 必须同源：页面用相对路径调用 `/marshal/api/*`，node 也向同一主机的 `/marshal/uplink` 拨号。
 
 - 转发 `Upgrade` 与 `Connection: upgrade`，保持请求完整，不要自己终结 WebSocket。
-- 不要吃掉 query string（`?token=`）。
+- 不要吃掉 query string（当前 v0 的 `?token=`）；目标版本改为登录 cookie 后不再依赖它。
 - node 用 `Authorization: Bearer <device-token>` 握手，不要剥掉这个头；若反代自己也用 `Authorization` 做认证，需要保留原值。
 - SSE 与 WebSocket 都是长连接：关掉响应缓冲并放大读超时。
 
@@ -129,7 +137,7 @@ location /marshal {
 | `metadata`（默认） | 只发字数，`redacted: true` | 工具名 + 参数键名 | 只发字数 |
 | `content` | 发正文 | 工具名 + 参数 | 发正文 |
 
-`redaction` 是正则源字符串数组（默认空），在离开 node 前对每个字符串和键名做替换，命中部分变成 `***`；非法正则启动即失败。
+`redaction` 是正则源字符串数组（默认空），当前只对出站 event.payload 中的字符串和键名做替换，命中部分变成 `***`；非法正则启动即失败。
 
 实时思考流需要 `privacy: content`；`metadata` 下页面只显示「（思考 N 字，metadata 档）」「（回复 N 字，metadata 档）」。工具卡片两档都会出现，`metadata` 下只有工具名、参数键名与字数。
 
@@ -140,7 +148,7 @@ location /marshal {
         answerTimeoutMs: 300000   # 正整数，默认 300000
 ```
 
-打开后 node 认领 `user-questions/request`：问题与选项发到 hub。远端作答后请求直接结算，本地不再弹窗；无人作答时本地弹窗在 `answerTimeoutMs` 到期后出现，请求被 abort 时立即交回本地 UI。链路断开期间远端无法作答，提问同样要等到超时。只有构造或发送帧本身抛错（例如帧超限）才会当场交回本地。
+打开后 node 认领 `user-questions/request`：问题与选项发到 hub。远端作答后请求直接结算，本地不再弹窗；无人作答时本地弹窗在 `answerTimeoutMs` 到期后出现，请求被 abort 时清理远端等待并调用 next()；原生取消后的本地行为尚未实测，不能据此保证弹窗或认定已本地作答。链路断开期间远端无法作答，提问同样要等到超时。只有构造或发送帧本身抛错（例如帧超限）才会当场交回本地。
 
 页面上的提问卡片：
 
@@ -150,10 +158,13 @@ location /marshal {
 
 注意：`metadata` 只裁事件文本，**不裁提问**——问题与选项从 node 发出，会走 `redaction`；答案从浏览器作为指令直接下发，不经过 node 的脱敏管线；三类内容都不会被裁成计数。
 
+目标契约把远端交互当成独立内容授权：除 node 侧 `questionRelay/approvalRelay=remote` 外，还要求 hub 设备记录的 `allowInteractions=true`（默认 false）；单侧授权按 off 处理。当前 v0 尚无这个第二把钥匙。
+
 ## 只收紧，不放宽
 
 - 设计上远端只能把权限、思考强度等往紧的方向调；放宽必须回到源机器上做。
 - v0 的 `configure` 认得 `model`、`reasoning`、`permission`、`plan`、`goal`、`skill`、`plugin` 这些字段名，但只做识别与拒绝：`tighten-only` 字段传 `"wide"` 返回 `tighten-only`，其余值一律 `unsupported`；v0 不落盘、不回读任何设置。
+- 当前 `interrupt` 仅按 sessionId 调用 DSH cancel，尚无 activeTurnId/runtimeEpoch 校验；不能宣称迟到打断不会影响新回合。
 - v0 没有审批转发：`approvalRelay` 只被解析、没有接线，因此不存在把 `always allow` 下发到远端的路径。审批面板与设置回读属于 v1。
 
 ## 协议速览
@@ -171,9 +182,9 @@ WebSocket 上的 JSON 帧统一带 `v: 1`，四种 `type`：
 
 ## 安全说明
 
-- `dashboardToken` 与设备 `token` 都要求至少 16 字符；`marshal-device` 生成的是 24 字节随机数的 base64url（32 字符）。
+- 当前实现要求 `dashboardToken` 与设备 `token` 至少 16 字符；`marshal-device` 生成的是 24 字节随机数的 base64url（32 字符）。目标契约把 `dashboardToken` 也提高到 24 随机字节生成的 32 字符 base64url（≥192 bit 熵），并拒绝明显低熵值。
 - token 比较走 SHA-256 摘要 + `timingSafeEqual`，长度差异不落在时序上；401 不回显任何 token 片段。
-- 设备表由 CLI 写入后收紧到 `0600`；同一 token 指向两台设备时 hub 拒绝启动；hub 加载时剔除缺 `id`/`name`/`token` 的条目不参与握手。
+- 设备表由 CLI 写入后收紧到 `0600`；同一 token 指向两台设备时 hub 拒绝启动；hub 加载时剔除缺 `id`/`name`/`token` 的条目不参与握手。目标契约更进一步：文件存在但无法解析、含重复 ID 或重复 token 摘要时直接启动失败，不静默剔除。
 - 控制台的每个已登记路由都要 token；页面响应带 `referrer-policy: no-referrer`、`x-content-type-options: nosniff`、`cache-control: no-store`。
 - 单帧上限 1 MiB（双向）：超过上限的入站帧由 `ws` 以 `1009` 关闭；`/marshal/api/command` 的请求体超过 1 MiB 直接 413。
 - 非 localhost 一律 `https://` + `wss://`；明文链路会把 token 交出去。
@@ -189,7 +200,9 @@ WebSocket 上的 JSON 帧统一带 `v: 1`，四种 `type`：
 
 - v0 已在分支 `feat/v0` 实现并提交：hub + node，DSH↔DSH 全链路，含双向提问。
 - v1（Codex / Claude Code 适配器、设置切换与回读）尚未开始。
+- D1 跨平台讨论组仅有设计与计划：显式选择成员、只讨论与汇总、用户决定后续行动；尚未实现，也未安装或验证参考插件。
 - 两台真机上的联调与验收尚未记录；本文档中的部署步骤按代码实现编写，未附现场验收结果。
+- 当前已有 ACK 路由、hub 并发同键合并、node deadline 检查、事件设备/agent 校验及重连快照。ACK 来源绑定、node 持久去重、全通道隐私与原子同步等仍见 P1 增量计划；超时不能据此认定未执行，也不保证重启后不重复执行。
 
 ## 文档
 
@@ -197,10 +210,17 @@ WebSocket 上的 JSON 帧统一带 `v: 1`，四种 `type`：
 |---|---|
 | [设计（v0）](docs/superpowers/specs/2026-10-29-marshal-design.md) | DSH 会话的跨机观察、续跑与提问 |
 | [架构（v0）](docs/superpowers/specs/2026-10-29-marshal-architecture.md) | 模块、协议与失败路径 |
-| [计划（v0）](docs/superpowers/plans/2026-10-29-marshal-v0.md) | 可分步执行的 v0 实施计划 |
+| [原实施计划（v0）](docs/superpowers/plans/2026-10-29-marshal-v0.md) | 保留初版实现步骤，历史复选框不代表当前状态 |
+| [P1 增量计划（v0）](docs/superpowers/plans/2026-10-29-marshal-v0-p1.md) | 在现有实现上补齐缺口与迁移，不重建脚手架 |
+| [公共契约](docs/superpowers/specs/2026-10-29-marshal-contract.md) | P1 目标规则、wire v1 → v2 迁移 |
+| [复核与验收矩阵](docs/superpowers/specs/2026-10-29-marshal-acceptance.md) | 当前代码证据、剩余 P1、分层验收标准 |
+| [DSH 接缝记录](docs/superpowers/spikes/2026-10-29-dsh-seams.md) | 已有源码核对与最小实验，保留证据边界 |
 | [设计（v1）](docs/superpowers/specs/2026-10-29-marshal-v1-design.md) | Codex / Claude 的审批、设置与所有权 |
 | [架构（v1）](docs/superpowers/specs/2026-10-29-marshal-v1-architecture.md) | 适配器、状态机与兼容策略 |
 | [计划（v1）](docs/superpowers/plans/2026-10-29-marshal-v1.md) | v1 实施计划 |
+| [讨论组设计（D1）](docs/superpowers/specs/2026-10-30-marshal-discussion.md) | 跨平台讨论边界、调度/授权/恢复及 G01–G17 验收 |
+| [讨论组计划（D1）](docs/superpowers/plans/2026-10-30-marshal-discussion.md) | v1 基础完成后的独立实施阶段，全部待执行 |
+| [DSH 编排插件参考](docs/superpowers/spikes/2026-10-30-orchestration-references.md) | dsh-agent-teams、官方 Agent Team/workflow 的可复用机制与限制 |
 
 ## 开发与验证
 
