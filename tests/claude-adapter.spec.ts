@@ -518,6 +518,15 @@ describe('claude adapter', () => {
     expect(h.adapter.health().state).toBe('stopped')
   })
 
+  it('does not install canUseTool when no interaction relay is configured', async () => {
+    const h = harness()
+    const create = h.adapter.createSession
+    if (create === undefined) throw new Error('createSession missing')
+    await create({ requestId: 'req-create' }, signal())
+    expect(h.query().params.options?.canUseTool).toBeUndefined()
+    await h.adapter.stop()
+  })
+
   it('routes native AskUserQuestion through the interaction port', async () => {
     const relay = new StubInputPort()
     relay.decision = {

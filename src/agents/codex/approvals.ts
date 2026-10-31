@@ -7,7 +7,8 @@ import type { CodexServerResponse } from './peer.ts'
  * 安全边界：
  * - 唯一白名单是 accept-once / decline / cancel；`acceptForSession`、
  *   execpolicy amendment、network amendment 永不生成。
- * - 权限扩大请求无论回答什么都回空授权，绝不因一次点击放宽 fileSystem/network。
+ * - 权限扩大请求无论回答什么都回空授权，绝不因一次点击放宽 fileSystem/network；
+ *   因此该方法的卡片只提供 decline/cancel，绝不出现 accept 这种无效承诺。
  * - `requestUserInput` 的远端可答性未验证，本版本不建卡也不代答；
  *   elicitation 只允许拒绝。
  */
@@ -32,6 +33,9 @@ const WHITELIST: readonly { readonly id: string; readonly label: string }[] = [
   { id: 'decline', label: '拒绝' },
   { id: 'cancel', label: '取消' },
 ]
+
+/** 权限扩大请求恒回空授权，accept 在原生侧不产生任何放宽，故永不提供。 */
+const PERMISSION_WIDENING_DECISIONS: ReadonlySet<string> = new Set(['decline', 'cancel'])
 
 const MAX_AVAILABLE_DECISIONS = 32
 
@@ -107,7 +111,10 @@ export function classifyCodexServerRequest(method: string, params: unknown): Cod
   }
 
   if (method === PERMISSIONS_APPROVAL) {
-    return { kind: 'approval', approval: { action: '扩大权限', decisions } }
+    // 即使 availableDecisions 列出 accept 也不给：点了也只会拿到空授权。
+    const safe = decisions.filter(decision => PERMISSION_WIDENING_DECISIONS.has(decision.id))
+    if (safe.length === 0) return { kind: 'response', response: declineResponseFor(method) }
+    return { kind: 'approval', approval: { action: '请求扩大权限', decisions: safe } }
   }
   if (method === FILE_CHANGE_APPROVAL) {
     const reason = record.reason

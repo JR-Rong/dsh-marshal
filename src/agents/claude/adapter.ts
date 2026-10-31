@@ -301,8 +301,16 @@ export function createClaudeAdapter(options: ClaudeAdapterOptions): AgentAdapter
         if (entry === undefined) return
         handleMessage(entry.sessionId, message)
       },
-      canUseTool: (toolName, input, toolOptions) =>
-        handleCanUseTool(holder, toolName, input, toolOptions),
+      // 没有中继就不装回调：装了会让每次工具调用都变成显式 deny。
+      ...(options.inputRelay === undefined
+        ? {}
+        : {
+            canUseTool: (
+              toolName: string,
+              input: Record<string, unknown>,
+              toolOptions: CanUseToolOptions,
+            ) => handleCanUseTool(holder, toolName, input, toolOptions),
+          }),
       onExit: () => {
         const entry = holder.entry
         if (entry === undefined || stopping) return

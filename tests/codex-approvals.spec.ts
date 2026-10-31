@@ -51,19 +51,43 @@ describe('codex server request classification', () => {
     expect(withoutReason.approval.detail).toBeUndefined()
   })
 
-  it('classifies a permission widening request without detail', () => {
+  it('classifies a permission widening request without detail and never offers accept', () => {
     const result = classifyCodexServerRequest(PERMISSIONS, {
       threadId: 't1', itemId: 'i1', cwd: '/tmp', permissions: { network: true },
     })
     expect(result.kind).toBe('approval')
     if (result.kind !== 'approval') throw new Error('expected approval')
     expect(result.approval).toEqual({
-      action: '扩大权限',
+      action: '请求扩大权限',
       decisions: [
-        { id: 'accept', label: '允许一次' },
         { id: 'decline', label: '拒绝' },
         { id: 'cancel', label: '取消' },
       ],
+    })
+  })
+
+  it('drops accept from permission widening cards even when the agent offers it', () => {
+    const result = classifyCodexServerRequest(PERMISSIONS, {
+      threadId: 't1',
+      itemId: 'i1',
+      permissions: { network: true },
+      availableDecisions: ['accept', 'decline'],
+    })
+    expect(result.kind).toBe('approval')
+    if (result.kind !== 'approval') throw new Error('expected approval')
+    expect(ids(result.approval.decisions)).toEqual(['decline'])
+  })
+
+  it('declines a permission widening request whose only decision is accept', () => {
+    const result = classifyCodexServerRequest(PERMISSIONS, {
+      threadId: 't1',
+      itemId: 'i1',
+      permissions: { network: true },
+      availableDecisions: ['accept'],
+    })
+    expect(result).toEqual({
+      kind: 'response',
+      response: { result: { permissions: { fileSystem: null, network: null }, scope: 'turn' } },
     })
   })
 
