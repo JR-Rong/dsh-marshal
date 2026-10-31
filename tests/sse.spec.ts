@@ -39,7 +39,7 @@ function start(options: { writeResult?: boolean } = {}) {
     loginFailureDelayMs: 0,
   })
   web = test
-  return { web: test, relay, sent }
+  return { web: test, relay, sent, registry }
 }
 
 function publishSession(relay: HubRelay, sessionId = 's1'): void {
@@ -91,6 +91,22 @@ function resetPayload(response: MemoryResponse): Record<string, unknown> | undef
   const end = response.body.indexOf('\n\n', dataAt)
   if (dataAt < 0 || end < 0) return undefined
   return JSON.parse(response.body.slice(dataAt + 'data: '.length, end)) as Record<string, unknown>
+}
+
+/** 一条流可能先发屏障 reset，再因降级补发多条 reset；按顺序全部取回。 */
+function resetPayloads(response: MemoryResponse): Record<string, unknown>[] {
+  const out: Record<string, unknown>[] = []
+  let index = 0
+  for (;;) {
+    const at = response.body.indexOf('event: reset', index)
+    if (at < 0) break
+    const dataAt = response.body.indexOf('data: ', at)
+    const end = response.body.indexOf('\n\n', dataAt)
+    if (dataAt < 0 || end < 0) break
+    out.push(JSON.parse(response.body.slice(dataAt + 'data: '.length, end)) as Record<string, unknown>)
+    index = end + 2
+  }
+  return out
 }
 
 describe('hub sse', () => {
@@ -242,6 +258,59 @@ describe('hub sse', () => {
     await waitFor(() => resetPayload(res) !== undefined, 'reset')
     expect(resetPayload(res)).toMatchObject({ replay: { gap: true } })
     expect(res.body).not.toContain('purged-payload')
+    await done
+    res.destroy()
+  })
+
+  it('屏障不完整时不声称已恢复历史', async () => {
+    const { web: target, relay } = start()
+    publishSession(relay)
+    const { res, done } = target.start('/marshal/api/stream', {
+      headers: { ...AUTH, 'last-event-id': 'hub-test:0' },
+    })
+    // 不结算 inputs.snapshot：50ms 后屏障按未知失败，complete=false。
+    await waitFor(() => resetPayload(res) !== undefined, 'reset')
+    // 没有回放任何事件，即使游标本身有效也不能报告 gap:false。
+    expect(resetPayload(res)).toMatchObject({
+      required: true, complete: false, degradedDevices: ['mac'], replay: { gap: true },
+    })
+    await done
+    res.destroy()
+  })
+
+  it('换代后旧 epoch 的回放事件被丢弃并降级', async () => {
+    const { web: target, relay, sent, registry } = start()
+    publishSession(relay, 's2')
+    const cursor = relay.historyCursor()
+    expect(cursor).toBe('hub-test:1')
+    publishDelta(relay, 2, 'stale-payload', 's2')
+
+    // 设备以新 epoch 重连：注册表槽位与中继权威代次一起换代。
+    relay.beginEpoch('mac', 'epoch-2')
+    registry.attach(
+      { id: 'mac', name: 'Mac', agents: ['dsh'] },
+      { send: text => sent.push(text) },
+      0,
+      { connectionId: 'conn-2', nodeEpoch: 'epoch-2' },
+    )
+
+    const { res, done } = target.start('/marshal/api/stream', {
+      headers: { ...AUTH, 'last-event-id': cursor },
+    })
+    // 屏障按新连接身份结算，确保 complete=true 后才真正回放旧代次事件。
+    const frame = await waitForFrame(sent, 'inputs.snapshot')
+    relay.settleInputs({
+      v: 2, type: 'inputs.snapshot.result', requestId: frame.requestId as string,
+      runtimeEpoch: 'epoch-2', highWatermark: 1, cards: [],
+    } satisfies InputsSnapshotResultFrame, { deviceId: 'mac', connectionId: 'conn-2', nodeEpoch: 'epoch-2' })
+
+    await waitFor(() => resetPayload(res) !== undefined, 'reset')
+    await waitFor(() => res.body.includes('"degradedDevices":["mac"]'), 'degraded reset')
+    expect(res.body).not.toContain('stale-payload')
+    expect(resetPayloads(res).some(payload =>
+      payload['complete'] === false
+      && Array.isArray(payload['degradedDevices'])
+      && (payload['degradedDevices'] as string[]).includes('mac'))).toBe(true)
     await done
     res.destroy()
   })

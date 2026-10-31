@@ -881,6 +881,11 @@ export class HubRelay {
       (deviceId === undefined || row.deviceId === deviceId) && this.options.registry.get(row.deviceId) !== undefined)
   }
 
+  /** 设备是否仍在注册表中；回放/暂存时据此跳过已经消失的设备。 */
+  isDeviceKnown(deviceId: string): boolean {
+    return this.options.registry.get(deviceId) !== undefined
+  }
+
   subscribe(consumer: (event: EventFrame, cursor: string | undefined) => void): () => void {
     if (!this.consumers.has(consumer) && this.consumers.size >= MAX_SUBSCRIBERS) {
       throw new Error('relay: too many subscribers')
@@ -897,6 +902,11 @@ export class HubRelay {
   /** 当前高水位游标；没有可回放事件时为 `${epoch}:0`。 */
   historyCursor(): string {
     return this.buffer.cursor()
+  }
+
+  /** 权威当前代次：publish/beginEpoch/commit 都先更新它，再扇出或允许回放。 */
+  nodeEpoch(deviceId: string): string | undefined {
+    return this.epochs.get(deviceId)
   }
 
   /** cursor 省略 = 只做 live 对齐；未知/过期/跨 epoch 游标由 buffer 标 gap。 */

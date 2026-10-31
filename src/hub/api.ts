@@ -866,22 +866,19 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
     const floors = new Map<string, number>()
     /** 设备 -> 快照时观测到的 runtimeEpoch；换代说明屏障已过期。 */
     const epochs = new Map<string, string | undefined>()
-    const nodeEpochs = new Map<string, string>()
     const degraded = new Set<string>()
 
     const deliver = (event: EventFrame, cursor: string | undefined): void => {
-      // 同一设备的 nodeEpoch 变化意味着旧索引/高水位已失效，必须重新 reset。
-      const knownEpoch = nodeEpochs.get(event.deviceId)
-      if (knownEpoch === undefined) {
-        nodeEpochs.set(event.deviceId, event.nodeEpoch)
-      } else if (knownEpoch !== event.nodeEpoch) {
-        nodeEpochs.set(event.deviceId, event.nodeEpoch)
+      // 权威代次来自中继：快照后已换代的事件（含回放）一律丢弃，不能污染新时间线。
+      const authoritative = relay.nodeEpoch(event.deviceId)
+      if (authoritative !== undefined && authoritative !== event.nodeEpoch) {
+        const firstSeen = !degraded.has(event.deviceId)
         degraded.add(event.deviceId)
-        const prefix = `${event.deviceId}\u0000`
-        for (const key of [...floors.keys()]) {
-          if (key.startsWith(prefix)) floors.delete(key)
+        if (firstSeen) {
+          const prefix = `${event.deviceId}\u0000`
+          for (const key of [...floors.keys()]) if (key.startsWith(prefix)) floors.delete(key)
+          sendReset({ degraded: [...degraded], complete: false, cursor: relay.historyCursor() })
         }
-        sendReset({ degraded: [...degraded], complete: false, cursor: relay.historyCursor() })
         return
       }
       const key = `${event.deviceId}\u0000${event.agent}\u0000${event.sessionId}`
@@ -994,23 +991,33 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
         : relay.historyRead(requestedCursor)
     }
     // v0 每次建连都要求 reset：先让客户端清空时间线/卡片，再补高水位之后的增量。
+    // 屏障不完整时什么都没回放，不能报告 gap:false（否则会谎称历史已恢复）。
     sendReset({
       degraded: [...degraded], complete, capabilities: barrierCapabilities, cursor: snapshotCursor,
       ...(replay === undefined
         ? {}
-        : { replay: { gap: replay.gap, dropped: replay.dropped, truncated: replay.truncated } }),
+        : {
+            replay: {
+              gap: !complete || replay.gap,
+              dropped: replay.dropped,
+              truncated: replay.truncated,
+            },
+          }),
     })
     // 暂存超限时整段丢弃：不知道缺了哪条，就不能放行半快照。
     if (complete) {
       // 先按接收顺序补历史，再放行屏障期间的增量；重复项由每会话 seq 底价去重。
+      // 回放快照只含注册设备，已消失设备的事件不能复活幽灵会话。
       if (replay !== undefined) {
         for (const item of replay.events) {
           if (degraded.has(item.event.deviceId)) continue
+          if (!relay.isDeviceKnown(item.event.deviceId)) continue
           deliver(item.event, item.cursor)
         }
       }
       for (const item of staged) {
         if (degraded.has(item.event.deviceId)) continue
+        if (!relay.isDeviceKnown(item.event.deviceId)) continue
         deliver(item.event, item.cursor)
       }
     }

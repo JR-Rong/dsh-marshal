@@ -276,9 +276,12 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
         closeDevice(deviceId, CLOSE_CODES.STALE_CONNECTION, 'policy-changed')
       }
       // 只有 allowContent 真正由真变假（或设备消失/撤销）才算内容收紧；
-      // recovery-required 只是修订不可确认，不是收紧，不能误清历史。
-      if (previous.allowContent && (current === undefined || current.revoked || !current.allowContent)) {
-        contentDevices.delete(deviceId)
+      // 修订不可确认不是收紧证据：设备按 recovery-required 关闭，修好后重新握手。
+      // contentDevices 记录的是实际生效过的授权，重复 reload 不再重复清历史。
+      if (!store.isRecoveryRequired(deviceId)
+        && previous.allowContent
+        && (current === undefined || current.revoked || !current.allowContent)
+        && contentDevices.delete(deviceId)) {
         options.onContentRevoked?.(deviceId)
       }
     }

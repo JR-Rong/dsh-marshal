@@ -287,7 +287,7 @@ describe('hub socket', () => {
   it('sync 屏障：提交前事件被拒，重复丢弃，缺口以 4409 关闭', async () => {
     const registry = new DeviceRegistry()
     const frames: Frame[] = []
-    const relay = new HubRelay({ registry, now: Date.now })
+    const relay = new HubRelay({ registry, now: Date.now, hubEpoch: HUB_EPOCH })
     const sync = createHubSync({ relay, now: Date.now })
     cleanups.push(() => { sync.dispose(); relay.dispose() })
     const { port } = await serve(registry, frames, [DEVICE], { sync })
@@ -488,6 +488,53 @@ describe('hub socket', () => {
     const second = await hello(registry, port)
     expect(revoked).toEqual([DEVICE_ID])
     second.close()
+  })
+
+  it('修订回退的 reload 不清内容历史', async () => {
+    const registry = new DeviceRegistry()
+    const revoked: string[] = []
+    const record: DeviceRecord = { ...DEVICE, allowContent: true, policyRevision: 3 }
+    const { port, mounted, devicesPath } = await serve(registry, [], [record], {
+      onContentRevoked: deviceId => revoked.push(deviceId),
+    })
+    const ws = await hello(registry, port, { privacy: 'content' })
+    const code = closeCode(ws)
+    // 修订回退到已有高水位之下，同时把 allowContent 置假：授权不可确认，不能当成收紧证据。
+    writeFileSync(
+      devicesPath,
+      serializeDevicesState({
+        version: 2,
+        devices: [{ ...record, allowContent: false, policyRevision: 1 }],
+        revisionHighWatermarks: { [DEVICE_ID]: 3 },
+      }),
+      { mode: 0o600 },
+    )
+    mounted.reload()
+    // 设备按 recovery-required 关闭（4409 可重试），修好文件后重新握手才会重新评估。
+    expect(await code).toBe(4409)
+    expect(revoked).toEqual([])
+  })
+
+  it('已确认撤权后的重复 reload 不再回调', async () => {
+    const registry = new DeviceRegistry()
+    const revoked: string[] = []
+    const record: DeviceRecord = { ...DEVICE, allowContent: true }
+    const { port, mounted, devicesPath } = await serve(registry, [], [record], {
+      onContentRevoked: deviceId => revoked.push(deviceId),
+    })
+    const ws = await hello(registry, port, { privacy: 'content' })
+    const code = closeCode(ws)
+    writeFileSync(
+      devicesPath,
+      serializeDevicesState({ version: 2, devices: [{ ...record, allowContent: false, policyRevision: 2 }] }),
+      { mode: 0o600 },
+    )
+    mounted.reload()
+    expect(await code).toBe(4409)
+    expect(revoked).toEqual([DEVICE_ID])
+    // 同一份收紧后的设备表再次 reload：历史已经清过，不能重复回调。
+    mounted.reload()
+    expect(revoked).toEqual([DEVICE_ID])
   })
 
   it('节点自报更高 policyRevision 只隔离该设备', async () => {
