@@ -79,6 +79,8 @@ const HelloSchema = z.object({
   nodeEpoch: z.string().min(1),
   agents: z.array(z.string().min(1)),
   features: z.array(z.string().min(1)),
+  /** 节点本地 privacy 快照；hub 只按当前记录授权决定内容，不据此放宽。 */
+  privacy: z.enum(['metadata', 'content']).optional(),
   operatorId: z.string().min(1).optional(),
   policyRevision: z.number().int().nonnegative().optional(),
 }).strict().superRefine((value, ctx) => {

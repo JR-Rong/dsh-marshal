@@ -1,6 +1,9 @@
 import { randomUUID } from 'node:crypto'
 import { WebSocket } from 'ws'
-import { CONTRACT_REVISION, CLOSE_CODES, encodeFrame, type EventFrame } from '../wire/frames.ts'
+import {
+  CONTRACT_REVISION, CLOSE_CODES, decodeFrame, encodeFrame,
+  type EventFrame, type HeartbeatFrame, type HelloAckFrame,
+} from '../wire/frames.ts'
 import { OFFLINE_QUEUE_MAX_BYTES, OFFLINE_QUEUE_MAX_ITEMS } from '../wire/limits.ts'
 
 /** 断线期间最多缓存多少帧，超出后丢最旧的。 */
@@ -9,12 +12,14 @@ const DEFAULT_BUFFER_LIMIT = OFFLINE_QUEUE_MAX_ITEMS
 /** 断线缓存的字节上限：1000 个 1 MiB 帧会吃掉 1 GiB，必须再按体积封顶。 */
 const DEFAULT_BUFFER_BYTES = OFFLINE_QUEUE_MAX_BYTES
 
-/** 重连等待的上限：指数退避在此基础上叠加抖动。 */
-const MAX_BACKOFF_MS = 30_000
-const BASE_BACKOFF_MS = 500
+/** 契约 §4：可恢复网络错误从 1s 起退避，封顶 10s，±20% jitter。 */
+const MAX_BACKOFF_MS = 10_000
+const BASE_BACKOFF_MS = 1_000
 
-/** 主动 ping 的间隔；对端连续一个周期没有 pong 就认定连接已死。 */
-const DEFAULT_HEARTBEAT_MS = 30_000
+/** 契约 §11：应用心跳 5s 一次，15s 无有效应答即判定半开。 */
+const HEARTBEAT_INTERVAL_MS = 5_000
+const HEARTBEAT_TIMEOUT_MS = 15_000
+const MAX_PENDING_HEARTBEATS = 8
 
 /** 连接稳定这么久之后把退避计数清零，避免偶发一次断线就让下次重连等满上限。 */
 const STABLE_RESET_MS = 30_000
@@ -26,11 +31,15 @@ const STABLE_RESET_MS = 30_000
  */
 const TERMINAL_CLOSE_CODES: ReadonlySet<number> = new Set([4400, 4401, 4403, 4406, 4408])
 
-/** 运行实例 epoch：进程内共享，普通网络重连不变。 */
-export const NODE_EPOCH = randomUUID()
-
 /** hub 收到 hello 后回的确认帧：只有它到达才算握手完成。 */
 const HELLO_ACK_TYPE = 'hello.ack'
+
+/** 节点只保留在内存里的策略绑定；实例重建即清空，普通重连保留以便 hello 回带。 */
+export interface NodePolicyBinding {
+  readonly operatorId: string
+  readonly policyRevision: number
+  readonly policies: HelloAckFrame['policies']
+}
 
 export interface NodeLinkOptions {
   readonly url: string
@@ -38,11 +47,17 @@ export interface NodeLinkOptions {
   readonly deviceId: string
   readonly deviceName: string
   readonly agents: readonly string[]
+  /** 每次 apply()（插件实例）生成一次；普通网络重连必须复用。 */
+  readonly nodeEpoch: string
+  readonly privacy?: 'metadata' | 'content'
   readonly bufferLimit?: number
   /** 断线缓存的总字节上限，默认 8 MiB。 */
   readonly maxBufferedBytes?: number
+  /** 应用心跳间隔，默认 5s。 */
   readonly heartbeatMs?: number
-  /** 重连退避上限，默认 30s；主要给测试缩短等待。 */
+  /** 连续多久收不到 heartbeat.ack 就重连，默认 15s。 */
+  readonly heartbeatTimeoutMs?: number
+  /** 重连退避上限，默认 10s；主要给测试缩短等待。 */
   readonly maxBackoffMs?: number
   /** 连接稳定多久后清零退避计数，默认 30s。 */
   readonly stableMs?: number
@@ -51,6 +66,10 @@ export interface NodeLinkOptions {
   /** onFrame 或底层 socket 抛错时的可选出口；不传就静默，绝不外抛。 */
   readonly onError?: (error: unknown) => void
 }
+
+type HelloAckResult =
+  | { readonly kind: 'valid'; readonly frame: HelloAckFrame }
+  | { readonly kind: 'version' | 'identity' | 'none' }
 
 export class NodeLink {
   private socket: WebSocket | undefined
@@ -70,11 +89,18 @@ export class NodeLink {
   /** 当前连接是否已经收到 hello.ack。 */
   private acked = false
   private droppedCount = 0
+  private connectionId: string | undefined
+  private policyBinding: NodePolicyBinding | undefined
+  private readonly heartbeatNonces = new Set<string>()
+  private lastHeartbeatAck = 0
 
   constructor(private readonly options: NodeLinkOptions) {}
 
   get buffered(): number { return this.queue.length }
   get dropped(): number { return this.droppedCount }
+
+  /** 最近一次 hello.ack 的策略绑定；index 用它做隐私决策，不落盘。 */
+  get binding(): NodePolicyBinding | undefined { return this.policyBinding }
 
   /** 幂等：已连接、连接中或正在等待重连时都不会再拨号。 */
   start(): void {
@@ -97,6 +123,9 @@ export class NodeLink {
     this.queue.length = 0
     this.queueBytes = 0
     this.acked = false
+    this.connectionId = undefined
+    this.policyBinding = undefined
+    this.heartbeatNonces.clear()
     const socket = this.socket
     this.socket = undefined
     socket?.close()
@@ -144,17 +173,23 @@ export class NodeLink {
     const ws = new WebSocket(this.options.url, { headers: { authorization: `Bearer ${this.options.token}` } })
     this.socket = ws
     this.acked = false
+    this.connectionId = undefined
+    this.heartbeatNonces.clear()
 
     ws.on('open', () => {
       if (this.socket !== ws) { ws.close(); return }
+      const binding = this.policyBinding
       // hello 必须先于任何缓冲事件，hub 只认首帧 hello；它发不出去就换一条连接。
       const hello = encodeFrame({
         v: 2, type: 'hello', contractRevision: CONTRACT_REVISION,
         deviceId: this.options.deviceId, deviceName: this.options.deviceName,
-        nodeEpoch: NODE_EPOCH, agents: [...this.options.agents], features: [],
+        nodeEpoch: this.options.nodeEpoch, agents: [...this.options.agents], features: [],
+        ...(this.options.privacy === undefined ? {} : { privacy: this.options.privacy }),
+        ...(binding === undefined
+          ? {}
+          : { operatorId: binding.operatorId, policyRevision: binding.policyRevision }),
       })
       if (!this.trySend(ws, hello)) { ws.close(); return }
-      this.startHeartbeat(ws)
       // 不在 socket open 时报告在线：只有合法 hello.ack 才代表握手完成。
     })
     ws.on('message', data => this.receive(ws, String(data)))
@@ -163,6 +198,8 @@ export class NodeLink {
       if (this.socket !== ws) return
       this.socket = undefined
       this.acked = false
+      this.connectionId = undefined
+      this.heartbeatNonces.clear()
       this.pendingInbound.length = 0
       this.pendingBytes = 0
       this.stopHeartbeat()
@@ -188,6 +225,8 @@ export class NodeLink {
       if (this.socket !== ws) return
       this.socket = undefined
       this.acked = false
+      this.connectionId = undefined
+      this.heartbeatNonces.clear()
       this.pendingInbound.length = 0
       this.pendingBytes = 0
       this.stopHeartbeat()
@@ -206,11 +245,28 @@ export class NodeLink {
 
   private receive(ws: WebSocket, text: string): void {
     if (this.socket !== ws) return
-    if (this.acked) { this.deliver(text); return }
+    if (this.acked) {
+      // heartbeat.ack 只驱动本地存活判定，不进入命令分派。
+      if (this.consumeHeartbeatAck(text)) return
+      this.deliver(text)
+      return
+    }
     const ack = this.helloAckOf(text)
-    if (ack === 'valid') {
+    if (ack.kind === 'valid') {
       this.acked = true
+      this.connectionId = ack.frame.connectionId
+      const previous = this.policyBinding
+      if (previous !== undefined && previous.operatorId !== ack.frame.operatorId) {
+        // operatorId 变化即不同身份域：旧策略/待答状态全部丢弃。
+        this.heartbeatNonces.clear()
+      }
+      this.policyBinding = {
+        operatorId: ack.frame.operatorId,
+        policyRevision: ack.frame.policyRevision,
+        policies: ack.frame.policies,
+      }
       this.startStableTimer(ws)
+      this.startHeartbeat(ws)
       const pending = this.pendingInbound.splice(0)
       this.pendingBytes = 0
       for (const buffered of pending) this.deliver(buffered)
@@ -219,11 +275,11 @@ export class NodeLink {
       try { this.options.onOnline?.() } catch (error) { this.reportError(error) }
       return
     }
-    if (ack !== 'none') {
+    if (ack.kind !== 'none') {
       // 设备/实例或契约修订不匹配时握手永远无法完成：直接按终态关闭。
       ws.close(
-        ack === 'version' ? CLOSE_CODES.VERSION_UNSUPPORTED : CLOSE_CODES.DEVICE_MISMATCH,
-        ack === 'version' ? 'version-unsupported' : 'device-mismatch',
+        ack.kind === 'version' ? CLOSE_CODES.VERSION_UNSUPPORTED : CLOSE_CODES.DEVICE_MISMATCH,
+        ack.kind === 'version' ? 'version-unsupported' : 'device-mismatch',
       )
       return
     }
@@ -241,10 +297,10 @@ export class NodeLink {
   }
 
   /** 只有 type/设备/实例/契约修订全部匹配的 hello.ack 才能完成握手。 */
-  private helloAckOf(text: string): 'valid' | 'version' | 'identity' | 'none' {
+  private helloAckOf(text: string): HelloAckResult {
     try {
       const parsed: unknown = JSON.parse(text)
-      if (typeof parsed !== 'object' || parsed === null) return 'none'
+      if (typeof parsed !== 'object' || parsed === null) return { kind: 'none' }
       const frame = parsed as {
         type?: unknown
         v?: unknown
@@ -252,11 +308,37 @@ export class NodeLink {
         nodeEpoch?: unknown
         contractRevision?: unknown
       }
-      if (frame.type !== HELLO_ACK_TYPE) return 'none'
-      if (frame.v !== 2 || frame.contractRevision !== CONTRACT_REVISION) return 'version'
-      if (frame.deviceId !== this.options.deviceId || frame.nodeEpoch !== NODE_EPOCH) return 'identity'
-      return 'valid'
-    } catch { return 'none' }
+      if (frame.type !== HELLO_ACK_TYPE) return { kind: 'none' }
+      if (frame.v !== 2 || frame.contractRevision !== CONTRACT_REVISION) return { kind: 'version' }
+      if (frame.deviceId !== this.options.deviceId || frame.nodeEpoch !== this.options.nodeEpoch) {
+        return { kind: 'identity' }
+      }
+      const decoded = decodeFrame(text)
+      if (decoded.type !== 'hello.ack') return { kind: 'none' }
+      return { kind: 'valid', frame: decoded }
+    } catch { return { kind: 'none' } }
+  }
+
+  private consumeHeartbeatAck(text: string): boolean {
+    let parsed: unknown
+    try { parsed = JSON.parse(text) } catch { return false }
+    if (typeof parsed !== 'object' || parsed === null) return false
+    const frame = parsed as {
+      type?: unknown
+      nonce?: unknown
+      connectionId?: unknown
+      nodeEpoch?: unknown
+    }
+    if (frame.type !== 'heartbeat.ack') return false
+    if (typeof frame.nonce === 'string'
+      && frame.connectionId === this.connectionId
+      && frame.nodeEpoch === this.options.nodeEpoch
+      && this.heartbeatNonces.has(frame.nonce)) {
+      this.heartbeatNonces.delete(frame.nonce)
+      this.lastHeartbeatAck = Date.now()
+    }
+    // 即使 nonce 不匹配，这类帧也不该交给命令分派。
+    return true
   }
 
   /**
@@ -291,16 +373,33 @@ export class NodeLink {
     try { this.options.onError?.(error) } catch { /* onError 自己抛错也不再外抛 */ }
   }
 
+  /** 应用心跳是权威存活信号；ws ping/pong 不再参与判断。 */
   private startHeartbeat(ws: WebSocket): void {
     this.stopHeartbeat()
-    let alive = true
-    ws.on('pong', () => { alive = true })
+    this.lastHeartbeatAck = Date.now()
+    const timeout = this.options.heartbeatTimeoutMs ?? HEARTBEAT_TIMEOUT_MS
     const interval = setInterval(() => {
-      if (ws.readyState !== WebSocket.OPEN) return
-      if (!alive) { ws.terminate(); return }
-      alive = false
-      ws.ping()
-    }, this.options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS)
+      if (this.socket !== ws || !this.acked) return
+      if (Date.now() - this.lastHeartbeatAck > timeout) {
+        // 半开连接上 close 握手也可能永久挂起，直接断开触发重连。
+        ws.terminate()
+        return
+      }
+      const connectionId = this.connectionId
+      if (connectionId === undefined) return
+      const nonce = randomUUID()
+      this.heartbeatNonces.add(nonce)
+      while (this.heartbeatNonces.size > MAX_PENDING_HEARTBEATS) {
+        const first = this.heartbeatNonces.values().next().value
+        if (first === undefined) break
+        this.heartbeatNonces.delete(first)
+      }
+      const heartbeat: HeartbeatFrame = {
+        v: 2, type: 'heartbeat', nonce, connectionId,
+        nodeEpoch: this.options.nodeEpoch, sentAt: Date.now(),
+      }
+      if (!this.trySend(ws, encodeFrame(heartbeat))) this.heartbeatNonces.delete(nonce)
+    }, this.options.heartbeatMs ?? HEARTBEAT_INTERVAL_MS)
     // 不因为心跳定时器拖住进程退出。
     interval.unref()
     this.heartbeat = interval
@@ -333,7 +432,8 @@ export class NodeLink {
     if (this.closed || !this.active) return
     const max = Math.max(0, this.options.maxBackoffMs ?? MAX_BACKOFF_MS)
     const base = Math.min(max, BASE_BACKOFF_MS * 2 ** this.attempts)
-    const delay = base * (0.5 + Math.random() / 2)
+    // 契约 §4：±20% jitter，避免大量节点同步重拨。
+    const delay = base * (0.8 + Math.random() * 0.4)
     this.attempts += 1
     this.clearTimer()
     this.timer = setTimeout(() => {

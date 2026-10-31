@@ -145,6 +145,14 @@ describe('parseConfig', () => {
     expect(() => parseConfig({ ...hub, devicesFile: '~/.dsh-marshal/devices.json' }, 'box')).toThrow(/literal "~"/)
   })
 
+  it('devicesFile 默认值由两端共用，不随 role 变化', () => {
+    const node = parseConfig(base, 'box')
+    const hubConfig = parseConfig(hub, 'box')
+    expect(node.devicesFile).toBe(hubConfig.devicesFile)
+    expect(parseConfig({ ...base, devicesFile: '/tmp/marshal/devices.json' }, 'box').devicesFile)
+      .toBe('/tmp/marshal/devices.json')
+  })
+
   it('allowDiscussion 必须是布尔值', () => {
     expect(parseConfig({ ...base, allowDiscussion: true }, 'box').allowDiscussion).toBe(true)
     expect(() => parseConfig({ ...base, allowDiscussion: 'yes' }, 'box')).toThrow(/config\.allowDiscussion/)

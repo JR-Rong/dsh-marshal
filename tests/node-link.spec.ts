@@ -1,16 +1,17 @@
 import { createServer, type Server } from 'node:http'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { WebSocket, WebSocketServer } from 'ws'
-import { NodeLink, NODE_EPOCH, type NodeLinkOptions } from '../src/node/link.ts'
+import { NodeLink, type NodeLinkOptions } from '../src/node/link.ts'
 import { CONTRACT_REVISION, type EventFrame } from '../src/wire/frames.ts'
 
 const TOKEN = 'z'.repeat(32)
 const POLL_INTERVAL_MS = 20
 const POLL_TIMEOUT_MS = 5_000
+const NODE_EPOCH = 'node-epoch-test'
 const HELLO_ACK = JSON.stringify({
   v: 2, type: 'hello.ack', connectionId: 'conn-1', hubEpoch: 'hub-1',
   contractRevision: CONTRACT_REVISION, features: [],
-  operatorId: 'op-1', policyRevision: 0, deviceId: 'mac', nodeEpoch: NODE_EPOCH,
+  operatorId: 'op-1', policyRevision: 1, deviceId: 'mac', nodeEpoch: NODE_EPOCH,
   policies: {
     privacy: 'metadata', questionRelay: 'off', approvalRelay: 'off',
     allowContent: false, allowInteractions: false, allowDiscussion: false,
@@ -33,6 +34,8 @@ interface ListenOptions {
   readonly onConnection?: () => void
   /** 每条连接收到 hello 时回调，便于用例自己接管握手。 */
   readonly onHello?: (ws: WebSocket) => void
+  /** 默认 true：自动回 heartbeat.ack；false 用于验证半开检测。 */
+  readonly heartbeatAck?: boolean
 }
 
 let cleanups: Array<() => void> = []
@@ -50,6 +53,14 @@ async function listen(options: ListenOptions = {}): Promise<Harness> {
     ws.on('message', data => {
       const text = String(data)
       received.push(text)
+      if (typeOf(text) === 'heartbeat' && (options.heartbeatAck ?? true)) {
+        const frame = JSON.parse(text) as { nonce: string; connectionId: string; nodeEpoch: string; sentAt: number }
+        ws.send(JSON.stringify({
+          v: 2, type: 'heartbeat.ack', nonce: frame.nonce,
+          connectionId: frame.connectionId, nodeEpoch: frame.nodeEpoch, sentAt: frame.sentAt,
+        }))
+        return
+      }
       // 只在 hello 上做握手：事件帧照旧收下。
       if (typeOf(text) !== 'hello') return
       for (const frame of options.beforeAck ?? []) ws.send(frame)
@@ -112,6 +123,7 @@ function createLink(
     deviceId: 'mac',
     deviceName: 'Mac',
     agents: ['dsh'],
+    nodeEpoch: NODE_EPOCH,
     ...options,
   })
   cleanups.push(() => link.close())
@@ -352,5 +364,59 @@ describe('NodeLink', () => {
     await waitFor(() => connections === 1, 'first connection')
     await settle(150)
     expect(connections).toBe(1)
+  })
+
+  it('hello.ack 绑定 operatorId/policyRevision，重连时 hello 回带', async () => {
+    const { port, wss, received } = await listen()
+
+    const link = createLink(port, { maxBackoffMs: 40 })
+    link.start()
+    await waitFor(() => link.binding !== undefined, 'policy binding from hello.ack')
+    expect(link.binding?.operatorId).toBe('op-1')
+    expect(link.binding?.policyRevision).toBe(1)
+
+    for (const client of wss.clients) client.terminate()
+    await waitFor(
+      () => received.filter(text => typeOf(text) === 'hello').length >= 2,
+      'second hello after reconnect',
+    )
+    const second = received.filter(text => typeOf(text) === 'hello')[1]
+    expect(second).toBeDefined()
+    expect(JSON.parse(second ?? '{}')).toMatchObject({ operatorId: 'op-1', policyRevision: 1 })
+  })
+
+  it('heartbeat.ack 超时后断开并按退避重连', async () => {
+    let connections = 0
+    const { port } = await listen({
+      heartbeatAck: false,
+      onConnection: () => { connections += 1 },
+    })
+
+    const link = createLink(port, {
+      heartbeatMs: 20,
+      heartbeatTimeoutMs: 60,
+      maxBackoffMs: 20,
+    })
+    link.start()
+    await waitFor(() => connections === 1, 'first connection')
+    // 节点发 heartbeat 但收不到 ack：超过 60ms 后必须主动重连。
+    await waitFor(() => connections >= 2, 'reconnect after heartbeat timeout')
+  })
+
+  it('operatorId 改变时丢弃旧策略绑定', async () => {
+    let operator = 'op-1'
+    const { port, wss } = await listen({
+      ack: false,
+      onHello: ws => {
+        ws.send(JSON.stringify({ ...JSON.parse(HELLO_ACK), operatorId: operator }))
+      },
+    })
+
+    const link = createLink(port, { maxBackoffMs: 20 })
+    link.start()
+    await waitFor(() => link.binding?.operatorId === 'op-1', 'first binding')
+    operator = 'op-2'
+    for (const client of wss.clients) client.terminate()
+    await waitFor(() => link.binding?.operatorId === 'op-2', 'rebound operator')
   })
 })

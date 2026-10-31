@@ -1,50 +1,153 @@
 #!/usr/bin/env node
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { dirname } from 'node:path'
+import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { mintDevice, type DeviceEntry } from '../hub/devices.ts'
+import { resolve } from 'node:path'
+import {
+  DeviceStateError, DeviceStore, migrateLegacyState,
+  readDeviceState, serializeDevicesState,
+} from '../hub/devices.ts'
+import { ensureInstall } from '../hub/identity.ts'
+import { atomicWriteFile, withFileLock } from '../hub/state-file.ts'
 
-const file = process.env.MARSHAL_DEVICES_FILE ?? `${homedir()}/.dsh-marshal/devices.json`
-const [rawId, rawName] = process.argv.slice(2)
-if (rawId === undefined || rawId === '-h' || rawId === '--help') {
-  console.error('usage: marshal-device <device-id> [display-name]')
-  process.exit(rawId === undefined ? 1 : 0)
+const DEFAULT_FILE = `${homedir()}/.dsh-marshal/devices.json`
+
+const USAGE = `usage: marshal-device <command> [args]
+
+  add <deviceId> [displayName]       register a device and print its token once
+  revoke <deviceId>                  revoke a device, keeping a tombstone
+  list                               list ids, policy flags and revisions
+  allow <deviceId> <content|interactions|discussion> <on|off>
+                                     change a local policy flag
+  migrate                            convert a v1 table to <devicesFile>.v2
+  --help                             show this message`
+
+function pathFromEnv(): string {
+  return resolve(process.env.MARSHAL_DEVICES_FILE ?? DEFAULT_FILE)
 }
-const id = rawId.trim()
-if (id === '') {
-  console.error('marshal-device: device id must not be blank')
+
+function fail(message: string): never {
+  console.error(`marshal-device: ${message}`)
   process.exit(1)
 }
-const name = rawName?.trim() || id
 
-let devices: DeviceEntry[] = []
+function openStore(file: string): DeviceStore {
+  try {
+    return new DeviceStore(file)
+  } catch (error) {
+    if (error instanceof DeviceStateError && error.code === 'legacy') {
+      fail('device table is v1; run "marshal-device migrate" and point devicesFile at the new file')
+    }
+    fail(error instanceof Error ? error.message : String(error))
+  }
+}
+
+function parseOnOff(value: string | undefined): boolean {
+  if (value === 'on') return true
+  if (value === 'off') return false
+  fail('policy value must be "on" or "off"')
+}
+
+function policyKey(value: string | undefined): 'allowContent' | 'allowInteractions' | 'allowDiscussion' {
+  if (value === 'content') return 'allowContent'
+  if (value === 'interactions') return 'allowInteractions'
+  if (value === 'discussion') return 'allowDiscussion'
+  fail('policy name must be content, interactions or discussion')
+}
+
+function add(file: string, id: string | undefined, displayName: string | undefined): void {
+  if (id === undefined || id.trim() === '') fail('add requires a non-empty device id')
+  // add 需要身份；其余命令可在身份缺失时用于恢复设备表。
+  const install = ensureInstall(file)
+  if (install.initialized) console.warn('marshal-device: empty device table')
+  const name = displayName?.trim() || id.trim()
+  const added = install.store.add(id.trim(), name)
+  console.log(`device ${added.entry.id} added to ${file}`)
+  console.log(`policyRevision=${added.revision} allowContent=off allowInteractions=off allowDiscussion=off`)
+  console.log(`token (shown once): ${added.token}`)
+}
+
+function revoke(file: string, id: string | undefined): void {
+  if (id === undefined || id.trim() === '') fail('revoke requires a device id')
+  const store = openStore(file)
+  const result = store.revoke(id.trim())
+  console.log(`device ${result.entry.id} revoked; policyRevision=${result.revision}`)
+}
+
+function list(file: string): void {
+  const store = openStore(file)
+  const devices = store.list()
+  if (devices.length === 0) console.log('(no devices)')
+  for (const device of devices) {
+    console.log([
+      device.id,
+      device.name,
+      `revoked=${device.revoked ? 'yes' : 'no'}`,
+      `content=${device.allowContent ? 'on' : 'off'}`,
+      `interactions=${device.allowInteractions ? 'on' : 'off'}`,
+      `discussion=${device.allowDiscussion ? 'on' : 'off'}`,
+      `revision=${device.policyRevision}`,
+    ].join('\t'))
+  }
+}
+
+function allow(
+  file: string,
+  id: string | undefined,
+  policy: string | undefined,
+  value: string | undefined,
+): void {
+  if (id === undefined || id.trim() === '') fail('allow requires a device id')
+  const key = policyKey(policy)
+  const on = parseOnOff(value)
+  const store = openStore(file)
+  const result = store.setPolicy(id.trim(), { [key]: on })
+  console.log(`device ${result.entry.id} ${key}=${on ? 'on' : 'off'}; policyRevision=${result.revision}`)
+  console.log(`allowContent=${result.entry.allowContent ? 'on' : 'off'} allowInteractions=${result.entry.allowInteractions ? 'on' : 'off'} allowDiscussion=${result.entry.allowDiscussion ? 'on' : 'off'}`)
+}
+
+function migrate(file: string): void {
+  const loaded = readDeviceState(file)
+  if (loaded.kind === 'missing') fail(`device table ${file} is missing`)
+  if (loaded.kind === 'current') fail(`${file} is already a v2 device table; nothing to migrate`)
+  const target = `${file}.v2`
+  if (existsSync(target)) fail(`${target} already exists; refusing to overwrite it`)
+  const state = migrateLegacyState(loaded.devices)
+  // 新表也是设备表写者，共用同一锁与原子替换；锁内再核对一次，避免并发迁移覆盖。
+  withFileLock(target, () => {
+    if (existsSync(target)) throw new Error(`${target} already exists; refusing to overwrite it`)
+    atomicWriteFile(target, serializeDevicesState(state), 0o600)
+  })
+  console.log(`migrated ${loaded.devices.length} device(s) to ${target}`)
+  console.log(`the v1 table at ${file} was left untouched`)
+  console.log(`set devicesFile to ${target}; identity.json is not created by migrate`)
+}
+
+function main(argv: readonly string[]): void {
+  const [command] = argv
+  if (command === undefined) {
+    console.error(USAGE)
+    process.exit(1)
+  }
+  if (command === '--help' || command === '-h' || command === 'help') {
+    console.log(USAGE)
+    process.exit(0)
+  }
+  const file = pathFromEnv()
+  switch (command) {
+    case 'add': add(file, argv[1], argv[2]); return
+    case 'revoke': revoke(file, argv[1]); return
+    case 'list': list(file); return
+    case 'allow': allow(file, argv[1], argv[2], argv[3]); return
+    case 'migrate': migrate(file); return
+    default:
+      console.error(USAGE)
+      fail(`unknown command "${command}"`)
+  }
+}
+
 try {
-  const parsed: unknown = JSON.parse(readFileSync(file, 'utf8'))
-  const list = typeof parsed === 'object' && parsed !== null
-    ? (parsed as { devices?: unknown }).devices
-    : undefined
-  if (!Array.isArray(list)) {
-    // 文件存在但结构不对时绝不能当成空表重写：那会静默丢掉所有已签发的 token。
-    console.error(`marshal-device: ${file} has no devices array`)
-    process.exit(1)
-  }
-  devices = list.filter((item): item is DeviceEntry =>
-    typeof item === 'object' && item !== null && typeof (item as { id?: unknown }).id === 'string')
+  main(process.argv.slice(2))
 } catch (error) {
-  if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-    console.error(`marshal-device: cannot read ${file}: ${(error as Error).message}`)
-    process.exit(1)
-  }
+  // 设备/身份错误不含 token 或摘要，直接给出分类与修复提示。
+  fail(error instanceof Error ? error.message : String(error))
 }
-if (devices.some(device => device.id === id)) {
-  console.error(`device ${id} already exists in ${file}`)
-  process.exit(1)
-}
-
-const entry = mintDevice(id, name)
-mkdirSync(dirname(file), { recursive: true })
-writeFileSync(file, `${JSON.stringify({ devices: [...devices, entry] }, null, 2)}\n`, { mode: 0o600 })
-// mode 只在创建时生效；已存在的文件也要收紧，避免 token 留在 0644。
-chmodSync(file, 0o600)
-console.log(`device ${id} added to ${file}`)
-console.log(`token (shown once): ${entry.token}`)

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import { parseConfig, type MarshalConfig } from './config.ts'
 import type { EventFrame, Frame } from './wire/frames.ts'
 import { decodeFrame } from './wire/frames.ts'
@@ -6,10 +7,10 @@ import { mountHubSocket, webServerPort } from './hub/server.ts'
 import { registerMarshalRoutes } from './hub/api.ts'
 import { DeviceRegistry } from './hub/registry.ts'
 import { HubRelay } from './hub/relay.ts'
-import { loadDevices } from './hub/devices.ts'
+import { ensureInstall } from './hub/identity.ts'
 import { createDshSurface } from './adapters/dsh/surface.ts'
 import { createDshAdapter } from './adapters/dsh/adapter.ts'
-import { NodeLink, NODE_EPOCH } from './node/link.ts'
+import { NodeLink } from './node/link.ts'
 import { createFollower, runCommand } from './node/runner.ts'
 import { createQuestionRelay, type QuestionRelay } from './node/questions.ts'
 import { redact, stripContent } from './node/redact.ts'
@@ -26,19 +27,24 @@ function applyHub(ctx: MarshalContext, config: MarshalConfig): void {
   const webServer = ctx.webServer
   if (webServer === undefined) throw new Error('marshal: hub role requires the webServer service')
   const registry = new DeviceRegistry()
-  const relay = new HubRelay({ registry, now: Date.now })
-  const devices = loadDevices(config.devicesFile)
-  if (devices.length === 0) ctx.logger.warn(`marshal: no devices loaded from ${config.devicesFile}`)
+  const install = ensureInstall(config.devicesFile)
+  if (install.initialized) ctx.logger.warn('marshal: empty device table')
+  const relay = new HubRelay({ registry, now: Date.now, operatorId: install.operatorId })
+  const hubEpoch = randomUUID()
   const socket = mountHubSocket({
     port: webServerPort(webServer),
     registry,
-    devices,
+    store: install.store,
+    operatorId: install.operatorId,
+    hubEpoch,
     now: Date.now,
+    logger: ctx.logger,
     // 设备重连时节点会重发快照：先清索引，再让快照重建。
     onAttach: deviceId => relay.clearDevice(deviceId),
     onDetach: deviceId => relay.deviceOffline(deviceId),
     onFrame: (_device, frame) => {
       // 事件进索引并扇出；ack 必须回填，否则 relay 的每条指令都会超时。
+      // TODO(V0-T03): 把 pending 完整绑定到 ack 的 connectionId/nodeEpoch；当前沿用 hello 槽位快照。
       if (frame.type === 'event') relay.publish(frame)
       else if (frame.type === 'ack') relay.settle(frame)
     },
@@ -74,10 +80,14 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
     })
   }
 
+  // nodeEpoch 只随插件实例生成；普通重连沿用同一个值。
+  const nodeEpoch = randomUUID()
   const link = new NodeLink({
     url: config.hubUrl!, token: config.token!, deviceId: config.deviceId!,
     deviceName: config.deviceName,
     agents: config.agents,
+    nodeEpoch,
+    privacy: config.privacy,
     onFrame: text => {
       let frame: Frame
       try { frame = decodeFrame(text) } catch { return }
@@ -89,7 +99,7 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
   let relay: QuestionRelay | undefined
   const adapter = createDshAdapter(createDshSurface(controller), {
     deviceId: config.deviceId!,
-    nodeEpoch: NODE_EPOCH,
+    nodeEpoch,
     answers: {
       settle: (sessionId, requestId, answers) => relay?.settle(sessionId, requestId, answers) ?? 'unknown',
     },

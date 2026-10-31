@@ -1,22 +1,37 @@
 import { createServer, request, type Server } from 'node:http'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { connect as netConnect } from 'node:net'
 import { afterEach, describe, expect, it } from 'vitest'
 import { WebSocket } from 'ws'
+import { DeviceStore, sha256Hex, serializeDevicesState, type DeviceRecord } from '../src/hub/devices.ts'
 import { DeviceRegistry, type Sender } from '../src/hub/registry.ts'
-import { mountHubSocket, nodeServerPort, type HubSocketHandle, type UpgradePort } from '../src/hub/server.ts'
+import { mountHubSocket, nodeServerPort, type HubSocketHandle } from '../src/hub/server.ts'
 import { CONTRACT_REVISION, type Frame } from '../src/wire/frames.ts'
 
 const TOKEN = 'y'.repeat(32)
-const DEVICES = [{ id: 'mac', name: 'Mac', token: TOKEN }]
+const OPERATOR_ID = 'operator-test-0123456789abcdef0123456789abcdef'
+const HUB_EPOCH = 'hub-epoch-test'
+const DEVICE_ID = 'mac'
+
+const DEVICE: DeviceRecord = {
+  id: DEVICE_ID,
+  name: 'Mac',
+  tokenDigest: sha256Hex(TOKEN),
+  revoked: false,
+  allowContent: false,
+  allowInteractions: false,
+  allowDiscussion: false,
+  policyRevision: 1,
+}
 
 const POLL_INTERVAL_MS = 30
 const POLL_TIMEOUT_MS = 1_000
 
-let active: { mounted: HubSocketHandle; server: Server } | undefined
+let cleanups: Array<() => void> = []
 afterEach(() => {
-  active?.mounted.dispose()
-  active?.server.close()
-  active = undefined
+  for (const cleanup of cleanups.splice(0).reverse()) cleanup()
 })
 
 /** 轮询直到条件成立：不用固定 sleep，失败时报出等待的是什么。 */
@@ -28,23 +43,47 @@ async function waitFor(predicate: () => boolean, what: string): Promise<void> {
   }
 }
 
-interface Served { readonly port: number; readonly mounted: HubSocketHandle; readonly server: Server }
+interface Served {
+  readonly port: number
+  readonly mounted: HubSocketHandle
+  readonly server: Server
+  readonly store: DeviceStore
+  readonly devicesPath: string
+}
 
-interface ServeOptions { readonly helloTimeoutMs?: number }
+interface ServeOptions {
+  readonly helloTimeoutMs?: number
+  readonly heartbeatTimeoutMs?: number
+  readonly livenessCheckMs?: number
+  readonly watchDevices?: boolean
+  readonly pollMs?: number
+}
+
+function writeStore(records: readonly DeviceRecord[] = [DEVICE]): { store: DeviceStore; path: string } {
+  const dir = mkdtempSync(join(tmpdir(), 'marshal-hub-'))
+  cleanups.push(() => rmSync(dir, { recursive: true, force: true }))
+  const path = join(dir, 'devices.json')
+  writeFileSync(path, serializeDevicesState({ version: 2, devices: records }), { mode: 0o600 })
+  return { store: new DeviceStore(path), path }
+}
 
 async function serve(
   registry: DeviceRegistry,
   frames: Frame[] = [],
-  devices = DEVICES,
+  records: readonly DeviceRecord[] = [DEVICE],
   options: ServeOptions = {},
 ): Promise<Served> {
+  const { store, path } = writeStore(records)
   // 卸载 upgrade handler 后，未匹配请求仍由宿主返回，而不是悬空等待。
   const server = createServer((_req, res) => { res.writeHead(404).end() })
   const mounted = mountHubSocket({
     port: nodeServerPort(server),
     registry,
-    devices,
+    store,
+    operatorId: OPERATOR_ID,
+    hubEpoch: HUB_EPOCH,
     now: Date.now,
+    watchDevices: false,
     onFrame: (_device, frame) => frames.push(frame),
     ...options,
   })
@@ -53,8 +92,12 @@ async function serve(
     if (typeof address !== 'object' || address === null) throw new Error('server has no port')
     resolve(address.port)
   }))
-  active = { mounted, server }
-  return { port, mounted, server }
+  cleanups.push(() => {
+    mounted.dispose()
+    server.closeAllConnections?.()
+    server.close()
+  })
+  return { port, mounted, server, store, devicesPath: path }
 }
 
 function openSocket(port: number, path: string, token: string | undefined): WebSocket {
@@ -86,7 +129,7 @@ async function expectRejected(port: number, path: string, token: string | undefi
   await waitFor(() => ws.readyState === WebSocket.CLOSED, 'rejected socket to be closed')
 }
 
-/** 裸 HTTP 请求观察 upgrade 响应状态码，用来区分 101 与 404。 */
+/** 裸 HTTP 请求观察 upgrade 响应状态码，用来区分 101 与 404/401/503。 */
 function upgradeStatus(port: number, path: string, extra: Record<string, string> = {}): Promise<number> {
   return new Promise<number>((resolve, reject) => {
     const req = request({
@@ -136,17 +179,25 @@ interface HelloOverrides {
   readonly contractRevision?: string
   readonly nodeEpoch?: string
   readonly agents?: readonly string[]
+  readonly operatorId?: string
+  readonly policyRevision?: number
+  readonly privacy?: 'metadata' | 'content'
 }
 
 function helloText(overrides: HelloOverrides = {}): string {
+  const previous = overrides.operatorId === undefined
+    ? {}
+    : { operatorId: overrides.operatorId, policyRevision: overrides.policyRevision ?? 1 }
   return JSON.stringify({
     v: 2, type: 'hello',
     contractRevision: overrides.contractRevision ?? CONTRACT_REVISION,
-    deviceId: overrides.deviceId ?? 'mac',
+    deviceId: overrides.deviceId ?? DEVICE_ID,
     deviceName: 'Mac',
     nodeEpoch: overrides.nodeEpoch ?? 'epoch-1',
     agents: overrides.agents ?? ['dsh'],
     features: [],
+    ...(overrides.privacy === undefined ? {} : { privacy: overrides.privacy }),
+    ...previous,
   })
 }
 
@@ -157,6 +208,16 @@ async function hello(
   overrides: HelloOverrides = {},
   path = '/marshal/uplink',
 ): Promise<WebSocket> {
+  const { ws } = await helloWithAck(registry, port, overrides, path)
+  return ws
+}
+
+async function helloWithAck(
+  registry: DeviceRegistry,
+  port: number,
+  overrides: HelloOverrides = {},
+  path = '/marshal/uplink',
+): Promise<{ ws: WebSocket; ack: Frame }> {
   const ws = await connect(port, path)
   ws.on('error', () => {})
   const acked = new Promise<Frame>(resolve => {
@@ -165,16 +226,21 @@ async function hello(
   ws.send(helloText(overrides))
   const ack = await acked
   expect(ack).toMatchObject({
-    type: 'hello.ack', deviceId: 'mac', nodeEpoch: 'epoch-1',
+    type: 'hello.ack', deviceId: DEVICE_ID, nodeEpoch: 'epoch-1',
     contractRevision: CONTRACT_REVISION, features: [],
   })
-  await waitFor(() => registry.get('mac') !== undefined, 'device to enter registry')
-  return ws
+  await waitFor(() => registry.get(DEVICE_ID) !== undefined, 'device to enter registry')
+  return { ws, ack }
 }
 
 function closeCode(ws: WebSocket): Promise<number> {
   ws.on('error', () => {})
   return new Promise<number>(resolve => ws.once('close', code => resolve(code)))
+}
+
+function closeReason(ws: WebSocket): Promise<string> {
+  ws.on('error', () => {})
+  return new Promise<string>(resolve => ws.once('close', (_code, reason) => resolve(reason.toString())))
 }
 
 /** 记录 detachIf 的返回，用来验证迟到的 close 没有摘掉新连接。 */
@@ -192,6 +258,7 @@ describe('hub socket', () => {
   it('拒绝没有 token 的连接', async () => {
     const { port } = await serve(new DeviceRegistry())
     await expectRejected(port, '/marshal/uplink', undefined)
+    expect(await upgradeStatus(port, '/marshal/uplink')).toBe(401)
   })
 
   it('hello 后设备进入注册表，事件帧交给 onFrame', async () => {
@@ -199,15 +266,127 @@ describe('hub socket', () => {
     const frames: Frame[] = []
     const { port } = await serve(registry, frames)
     const ws = await hello(registry, port)
-    expect(registry.get('mac')?.record.agents).toEqual(['dsh'])
+    expect(registry.get(DEVICE_ID)?.record.agents).toEqual(['dsh'])
     ws.send(JSON.stringify({
-      v: 2, type: 'event', deviceId: 'mac', agent: 'dsh', sessionId: 's1', nodeEpoch: 'epoch-1',
+      v: 2, type: 'event', deviceId: DEVICE_ID, agent: 'dsh', sessionId: 's1', nodeEpoch: 'epoch-1',
       seq: 1, ts: 1, kind: 'turn.started', payload: {},
     }))
     await waitFor(() => frames.length === 1, 'event frame to reach onFrame')
     expect(frames.map(frame => frame.type)).toEqual(['event'])
-    expect(registry.get('mac')?.record.lastSeen).toBeGreaterThan(0)
+    expect(registry.get(DEVICE_ID)?.record.lastSeen).toBeGreaterThan(0)
     ws.close()
+  })
+
+  it('hello.ack 绑定 operator、connection 与设备策略', async () => {
+    const registry = new DeviceRegistry()
+    const record: DeviceRecord = {
+      ...DEVICE, allowContent: true, allowInteractions: true, allowDiscussion: true, policyRevision: 4,
+    }
+    const { port } = await serve(registry, [], [record])
+    const { ws, ack } = await helloWithAck(registry, port, { privacy: 'content' })
+    expect(ack).toMatchObject({
+      type: 'hello.ack',
+      operatorId: OPERATOR_ID,
+      policyRevision: 4,
+      hubEpoch: HUB_EPOCH,
+      policies: {
+        privacy: 'content',
+        allowContent: true,
+        allowInteractions: true,
+        allowDiscussion: true,
+      },
+    })
+    if (ack.type === 'hello.ack') expect(ack.connectionId).not.toBe('')
+    ws.close()
+  })
+
+  it('ACK 的 connectionId 不匹配时被忽略，不进入 onFrame', async () => {
+    const registry = new DeviceRegistry()
+    const frames: Frame[] = []
+    const { port } = await serve(registry, frames)
+    const ws = await hello(registry, port)
+    ws.send(JSON.stringify({
+      v: 2, type: 'ack', commandId: 'c1', connectionId: 'other-connection', nodeEpoch: 'epoch-1',
+      status: 'accepted',
+    }))
+    await new Promise(resolve => setTimeout(resolve, 100))
+    expect(frames).toEqual([])
+    expect(ws.readyState).toBe(WebSocket.OPEN)
+    ws.close()
+  })
+
+  it('事件的 nodeEpoch 不是当前代次时以 4409 关闭', async () => {
+    const registry = new DeviceRegistry()
+    const frames: Frame[] = []
+    const { port } = await serve(registry, frames)
+    const ws = await hello(registry, port)
+    const code = closeCode(ws)
+    ws.send(JSON.stringify({
+      v: 2, type: 'event', deviceId: DEVICE_ID, agent: 'dsh', sessionId: 's1', nodeEpoch: 'old-epoch',
+      seq: 1, ts: 1, kind: 'turn.started', payload: {},
+    }))
+    expect(await code).toBe(4409)
+    expect(frames).toEqual([])
+  })
+
+  it('heartbeat 回显 nonce/connectionId/nodeEpoch', async () => {
+    const registry = new DeviceRegistry()
+    const { port } = await serve(registry)
+    const { ws, ack } = await helloWithAck(registry, port)
+    if (ack.type !== 'hello.ack') throw new Error('expected hello.ack')
+    const acked = new Promise<Frame>(resolve => {
+      ws.once('message', data => resolve(JSON.parse(String(data)) as Frame))
+    })
+    ws.send(JSON.stringify({
+      v: 2, type: 'heartbeat', nonce: 'n-1', connectionId: ack.connectionId,
+      nodeEpoch: 'epoch-1', sentAt: 10,
+    }))
+    const heartbeatAck = await acked
+    expect(heartbeatAck).toEqual({
+      v: 2, type: 'heartbeat.ack', nonce: 'n-1',
+      connectionId: ack.connectionId, nodeEpoch: 'epoch-1', sentAt: 10,
+    })
+    expect(ws.readyState).toBe(WebSocket.OPEN)
+    ws.close()
+  })
+
+  it('15s 内没有应用心跳即断开（测试缩短期限）', async () => {
+    const registry = new DeviceRegistry()
+    const { port } = await serve(registry, [], [DEVICE], { heartbeatTimeoutMs: 80, livenessCheckMs: 20 })
+    const ws = await hello(registry, port)
+    const closed = new Promise<boolean>(resolve => ws.once('close', () => resolve(true)))
+    expect(await closed).toBe(true)
+    await waitFor(() => registry.get(DEVICE_ID) === undefined, 'device to leave registry')
+  })
+
+  it('设备表热加载撤销后 4401 关闭且新连接 401', async () => {
+    const registry = new DeviceRegistry()
+    const { port, store } = await serve(registry, [], [DEVICE], { watchDevices: true, pollMs: 20 })
+    const ws = await hello(registry, port)
+    const code = closeCode(ws)
+    store.revoke(DEVICE_ID)
+    expect(await code).toBe(4401)
+    expect(await upgradeStatus(port, '/marshal/uplink', { authorization: `Bearer ${TOKEN}` })).toBe(401)
+  })
+
+  it('设备表热加载策略变更以 4409 要求重新握手', async () => {
+    const registry = new DeviceRegistry()
+    const { port, store } = await serve(registry, [], [DEVICE], { watchDevices: true, pollMs: 20 })
+    const ws = await hello(registry, port)
+    const code = closeCode(ws)
+    store.setPolicy(DEVICE_ID, { allowContent: true })
+    expect(await code).toBe(4409)
+  })
+
+  it('节点自报更高 policyRevision 只隔离该设备', async () => {
+    const registry = new DeviceRegistry()
+    const record: DeviceRecord = { ...DEVICE, policyRevision: 2 }
+    const { port } = await serve(registry, [], [record])
+    const ws = await connect(port)
+    const reason = closeReason(ws)
+    ws.send(helloText({ operatorId: OPERATOR_ID, policyRevision: 3 }))
+    expect(await reason).toBe('recovery-required')
+    expect(registry.get(DEVICE_ID)).toBeUndefined()
   })
 
   it('事件里的 device 与握手身份不一致时以 4403 关闭', async () => {
@@ -231,7 +410,7 @@ describe('hub socket', () => {
     const ws = await hello(registry, port)
     const code = closeCode(ws)
     ws.send(JSON.stringify({
-      v: 2, type: 'event', deviceId: 'mac', agent: 'codex', sessionId: 's1', nodeEpoch: 'epoch-1',
+      v: 2, type: 'event', deviceId: DEVICE_ID, agent: 'codex', sessionId: 's1', nodeEpoch: 'epoch-1',
       seq: 1, ts: 1, kind: 'turn.started', payload: {},
     }))
     expect(await code).toBe(4400)
@@ -243,7 +422,7 @@ describe('hub socket', () => {
     const { port } = await serve(registry)
     const ws = await hello(registry, port)
     ws.terminate()
-    await waitFor(() => registry.get('mac') === undefined, 'device to leave registry')
+    await waitFor(() => registry.get(DEVICE_ID) === undefined, 'device to leave registry')
   })
 
   it('非 uplink 路径带有效 token 也被拒绝', async () => {
@@ -251,7 +430,7 @@ describe('hub socket', () => {
     const { port } = await serve(registry)
     expect(await upgradeStatus(port, '/not-marshal', { authorization: `Bearer ${TOKEN}` })).toBe(404)
     await expectRejected(port, '/not-marshal', TOKEN)
-    expect(registry.get('mac')).toBeUndefined()
+    expect(registry.get(DEVICE_ID)).toBeUndefined()
   })
 
   it('hello 与握手设备不一致时以 4403 关闭', async () => {
@@ -263,7 +442,7 @@ describe('hub socket', () => {
     wrongDevice.send(helloText({ deviceId: 'other' }))
     expect(await wrongDeviceCode).toBe(4403)
 
-    expect(registry.get('mac')).toBeUndefined()
+    expect(registry.get(DEVICE_ID)).toBeUndefined()
     expect(registry.get('other')).toBeUndefined()
   })
 
@@ -275,7 +454,7 @@ describe('hub socket', () => {
     const code = closeCode(stale)
     stale.send(helloText({ contractRevision: 'p1-review-1' }))
     expect(await code).toBe(4406)
-    expect(registry.get('mac')).toBeUndefined()
+    expect(registry.get(DEVICE_ID)).toBeUndefined()
   })
 
   it('首帧不是 hello 时以 4400 关闭', async () => {
@@ -284,11 +463,11 @@ describe('hub socket', () => {
     const ws = await connect(port)
     const code = closeCode(ws)
     ws.send(JSON.stringify({
-      v: 2, type: 'event', deviceId: 'mac', agent: 'dsh', sessionId: 's1', nodeEpoch: 'epoch-1',
+      v: 2, type: 'event', deviceId: DEVICE_ID, agent: 'dsh', sessionId: 's1', nodeEpoch: 'epoch-1',
       seq: 1, ts: 1, kind: 'turn.started', payload: {},
     }))
     expect(await code).toBe(4400)
-    expect(registry.get('mac')).toBeUndefined()
+    expect(registry.get(DEVICE_ID)).toBeUndefined()
   })
 
   it('同一设备重连后，旧连接迟到的 close 不移除新槽位', async () => {
@@ -299,8 +478,8 @@ describe('hub socket', () => {
     // 重连已接管槽位；此时旧连接才关闭。
     first.terminate()
     await waitFor(() => registry.detaches.length === 1, 'stale close to be handled')
-    expect(registry.detaches[0]).toEqual({ id: 'mac', removed: false })
-    expect(registry.get('mac')).toBeDefined()
+    expect(registry.detaches[0]).toEqual({ id: DEVICE_ID, removed: false })
+    expect(registry.get(DEVICE_ID)).toBeDefined()
     expect(second.readyState).toBe(WebSocket.OPEN)
     second.close()
   })
@@ -313,12 +492,12 @@ describe('hub socket', () => {
     const second = await hello(registry, port)
     const code = closeCode(first)
     first.send(JSON.stringify({
-      v: 2, type: 'event', deviceId: 'mac', agent: 'dsh', sessionId: 's1', nodeEpoch: 'epoch-1',
+      v: 2, type: 'event', deviceId: DEVICE_ID, agent: 'dsh', sessionId: 's1', nodeEpoch: 'epoch-1',
       seq: 1, ts: 1, kind: 'turn.started', payload: {},
     }))
     expect(await code).toBe(4409)
     expect(frames).toEqual([])
-    expect(registry.get('mac')).toBeDefined()
+    expect(registry.get(DEVICE_ID)).toBeDefined()
     second.close()
   })
 
@@ -328,7 +507,7 @@ describe('hub socket', () => {
     const ws = await hello(registry, port)
     mounted.dispose()
     await waitFor(() => ws.readyState === WebSocket.CLOSED, 'existing socket to be terminated')
-    await waitFor(() => registry.get('mac') === undefined, 'slot to be removed on terminate')
+    await waitFor(() => registry.get(DEVICE_ID) === undefined, 'slot to be removed on terminate')
     await expectRejected(port, '/marshal/uplink', TOKEN)
   })
 
@@ -336,7 +515,7 @@ describe('hub socket', () => {
     const registry = new DeviceRegistry()
     const { port } = await serve(registry)
     const ws = await hello(registry, port, {}, '/marshal/uplink?x=1')
-    expect(registry.get('mac')?.record.agents).toEqual(['dsh'])
+    expect(registry.get(DEVICE_ID)?.record.agents).toEqual(['dsh'])
     ws.close()
   })
 
@@ -348,7 +527,7 @@ describe('hub socket', () => {
     expect(await upgradeStatus(port, 'http://example.com/other', auth)).toBe(404)
     // 绝对 URL 但 pathname 恰好是 uplink：放行。
     expect(await upgradeStatus(port, 'http://example.com/marshal/uplink', auth)).toBe(101)
-    await waitFor(() => registry.get('mac') === undefined, 'unauthenticated upgrade to stay out of registry')
+    await waitFor(() => registry.get(DEVICE_ID) === undefined, 'unauthenticated upgrade to stay out of registry')
   })
 
   it('畸形 req.url 不产生未捕获异常，也不升级', async () => {
@@ -371,12 +550,12 @@ describe('hub socket', () => {
       process.off('uncaughtException', onUncaught)
     }
     expect(uncaught).toEqual([])
-    expect(registry.get('mac')).toBeUndefined()
+    expect(registry.get(DEVICE_ID)).toBeUndefined()
   })
 
   it('hello 超时后以 4408 关闭', async () => {
     const registry = new DeviceRegistry()
-    const { port } = await serve(registry, [], DEVICES, { helloTimeoutMs: 50 })
+    const { port } = await serve(registry, [], [DEVICE], { helloTimeoutMs: 50 })
     const started = Date.now()
     const ws = await connect(port)
     ws.on('error', () => {})
@@ -384,24 +563,6 @@ describe('hub socket', () => {
     expect(await code).toBe(4408)
     expect(Date.now() - started).toBeLessThan(1_000)
     await waitFor(() => ws.readyState === WebSocket.CLOSED, 'socket to be closed after hello timeout')
-    expect(registry.get('mac')).toBeUndefined()
-  })
-
-  it('重复 token 在 mount 时抛错且不回显 token', () => {
-    const devices = [
-      { id: 'mac', name: 'Mac', token: TOKEN },
-      { id: 'pc', name: 'PC', token: TOKEN },
-    ]
-    const port: UpgradePort = { open: () => () => {} }
-    let caught: Error | undefined
-    try {
-      mountHubSocket({ port, registry: new DeviceRegistry(), devices, now: Date.now })
-    } catch (err) {
-      caught = err as Error
-    }
-    expect(caught).toBeInstanceOf(Error)
-    expect(caught?.message).toContain('mac')
-    expect(caught?.message).toContain('pc')
-    expect(caught?.message).not.toContain(TOKEN)
+    expect(registry.get(DEVICE_ID)).toBeUndefined()
   })
 })

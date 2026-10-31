@@ -25,4 +25,19 @@ describe('DeviceRegistry', () => {
     expect(registry.expire(1000 + 90_001, 90_000)).toEqual(['mac'])
     expect(registry.get('mac')).toBeUndefined()
   })
+
+  it('连接代次随槽位保存，旧 sender 的 detachIf 不影响新连接', () => {
+    const registry = new DeviceRegistry()
+    const oldSender = { send() {} }
+    const newSender = { send() {} }
+    registry.attach({ id: 'mac', name: 'Mac', agents: ['dsh'] }, oldSender, 1000, {
+      connectionId: 'conn-old', nodeEpoch: 'epoch-1',
+    })
+    registry.attach({ id: 'mac', name: 'Mac', agents: ['dsh'] }, newSender, 2000, {
+      connectionId: 'conn-new', nodeEpoch: 'epoch-1',
+    })
+    expect(registry.get('mac')?.connectionId).toBe('conn-new')
+    expect(registry.detachIf('mac', oldSender)).toBe(false)
+    expect(registry.get('mac')?.sender).toBe(newSender)
+  })
 })

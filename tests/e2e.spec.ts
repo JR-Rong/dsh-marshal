@@ -1,13 +1,13 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, rm } from 'node:fs/promises'
 import { readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { apply } from '../src/index.ts'
+import { ensureInstall } from '../src/hub/identity.ts'
 import type { MarshalContext, SessionControllerLike } from '../src/dsh-types.ts'
 import { createTestWeb } from './support/web.ts'
 
-const TOKEN = 't'.repeat(32)
 const DASHBOARD_TOKEN = 'e2e-dashboard-token-0123456789abcdef'
 const POLL_INTERVAL_MS = 20
 const POLL_TIMEOUT_MS = 2_000
@@ -65,9 +65,8 @@ describe('e2e', () => {
     process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'
     try {
       const devicesFile = join(dir, 'devices.json')
-      await writeFile(devicesFile, JSON.stringify({
-        devices: [{ id: 'mac', name: 'Mac', token: TOKEN }],
-      }))
+      // 全新安装走与 hub/CLI 相同的初始化器；token 只在本次 add 返回值里出现。
+      const token = ensureInstall(devicesFile).store.add('mac', 'Mac').token
 
       // 替身只实现插件用到的成员：其余字段由 DSH 运行时提供。
       const hubContext = {
@@ -89,7 +88,7 @@ describe('e2e', () => {
         sessionController,
       }
       apply(nodeContext as unknown as MarshalContext, {
-        role: 'node', hubUrl: `wss://127.0.0.1:${port}/marshal/uplink`, token: TOKEN,
+        role: 'node', hubUrl: `wss://127.0.0.1:${port}/marshal/uplink`, token,
         deviceId: 'mac', deviceName: 'mac',
       })
 
