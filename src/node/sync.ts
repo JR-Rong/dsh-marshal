@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import type { SyncSnapshot } from '../adapters/types.ts'
+import type { SyncCapabilityDocument, SyncSnapshot } from '../adapters/types.ts'
 import type { LoggerLike } from '../dsh-types.ts'
 import { encodeFrame, type EventFrame, type Frame, type SyncAckFrame } from '../wire/frames.ts'
 import {
@@ -9,20 +9,23 @@ import {
 import type { NodeLink } from './link.ts'
 import type { PrivacyProjector } from './privacy.ts'
 
+/** 单个 agent 的同步源；失败只降级该 agent，不影响其它源的采集。 */
+export interface NodeSyncSource {
+  readonly agent: string
+  syncSnapshot(signal: AbortSignal): Promise<SyncSnapshot>
+}
+
 export interface NodeSyncOptions {
   readonly link: NodeLink
-  readonly adapter: {
-    readonly agent: string
-    syncSnapshot(signal: AbortSignal): Promise<SyncSnapshot>
-  }
+  readonly sources: readonly NodeSyncSource[]
   /** hello 声明的全部 agent；空集合也必须显式发送。 */
   readonly agents: readonly string[]
-  /** 每次取当前投影器：握手收紧后旧能力行不能继续外发。 */
-  readonly projector: () => PrivacyProjector
+  /** 每个 agent 独立取当前投影器：握手收紧后旧能力行不能继续外发。 */
+  readonly projector: (agent: string) => PrivacyProjector
   /** 已投影并分配公开 seq 的事件出口。 */
   readonly emit: (event: EventFrame) => void
-  /** 适配器内部 seq 的帧工厂；投影层会覆盖公开 seq。 */
-  readonly frame: (sessionId: string, kind: EventFrame['kind'], payload: unknown) => EventFrame
+  /** 适配器内部 seq 的帧工厂；投影层会覆盖公开 seq。agent 必须来自行本身。 */
+  readonly frame: (agent: string, sessionId: string, kind: EventFrame['kind'], payload: unknown) => EventFrame
   /** 公开序列高水位；与快照使用同一序列。 */
   readonly highWatermark?: () => number
   readonly now?: () => number
@@ -60,6 +63,23 @@ interface Waiter {
   reject: (error: unknown) => void
 }
 
+interface GatheredSource {
+  readonly agent: string
+  /** 失败（不是整体期限/abort）时为 undefined。 */
+  readonly snapshot: SyncSnapshot | undefined
+}
+
+interface Gathered {
+  readonly sources: readonly GatheredSource[]
+  /** 任一源失败或其自身清单不完整。 */
+  readonly completeness: 'complete' | 'unconfirmed'
+}
+
+interface ProjectedGather {
+  readonly rows: readonly Row[]
+  readonly capabilities: readonly SyncCapabilityDocument[]
+}
+
 const SYNC_TIMEOUT = Symbol('sync-timeout')
 
 function stableCapability(document: Record<string, unknown> | undefined): string {
@@ -84,11 +104,21 @@ function sameRow(previous: Row | undefined, next: Row): boolean {
     && (previous.blank ?? false) === (next.blank ?? false)
 }
 
+/** 内部键必须带 agent：两个 agent 的同一 sessionId 不是同一个会话。 */
+function rowKey(agent: string, sessionId: string): string {
+  return `${agent}\u0000${sessionId}`
+}
+
+function rowAgent(row: Row): string | undefined {
+  return typeof row.agent === 'string' && row.agent !== '' ? row.agent : undefined
+}
+
 export function createNodeSync(options: NodeSyncOptions): NodeSync {
   const scanMs = Math.max(1, options.scanMs ?? SYNC_SCAN_INTERVAL_MS)
   const scanTimeoutMs = Math.max(1, options.scanTimeoutMs ?? SYNC_SCAN_TIMEOUT_MS)
   const ackTimeoutMs = Math.max(1, options.ackTimeoutMs ?? SYNC_ACK_TIMEOUT_MS)
-  const { link, adapter } = options
+  const { link } = options
+  const knownAgents = new Set(options.agents)
 
   let disposed = false
   let infight: Inflight | undefined
@@ -98,9 +128,9 @@ export function createNodeSync(options: NodeSyncOptions): NodeSync {
   let version = 0
   let stale = false
   let stalePublished = false
-  /** 最近一次完整提交的会话行与能力文档，扫描只对这些做差分。 */
+  /** 最近一次完整提交的会话行（按 agent+sessionId 键）与逐 agent 能力文档。 */
   let lastRows = new Map<string, Row>()
-  let lastCapability: Record<string, unknown> | undefined
+  const lastCapability = new Map<string, Record<string, unknown>>()
   /** 每个会话最近一次增量事件时间；用于阻止旧扫描覆盖更新的运行态/删除。 */
   const lastEventTs = new Map<string, number>()
 
@@ -109,8 +139,17 @@ export function createNodeSync(options: NodeSyncOptions): NodeSync {
     options.logger?.warn(`marshal: sync failed: ${name}`)
   }
 
-  /** 采集有硬期限：超过 10s 不求部分结果，直接按 stale 处理。 */
-  const gather = async (timeoutMs: number): Promise<SyncSnapshot> => {
+  /** 能力文档只能声明本源 agent 或配置里的 agent；其它名字整份丢弃。 */
+  const capabilityAgent = (agent: string, source: string): string | undefined => {
+    if (agent === source || knownAgents.has(agent)) return agent
+    return undefined
+  }
+
+  /**
+   * 采集有硬期限：超过 10s 不求部分结果，直接按 SYNC_TIMEOUT 处理。
+   * 单个源的异常只把该 agent 标记为不可用，不让其它 agent 一起失败。
+   */
+  const gather = async (timeoutMs: number): Promise<Gathered> => {
     const abort = new AbortController()
     let timer: ReturnType<typeof setTimeout> | undefined
     const deadline = new Promise<never>((_resolve, reject) => {
@@ -120,7 +159,21 @@ export function createNodeSync(options: NodeSyncOptions): NodeSync {
       }, timeoutMs)
     })
     try {
-      return await Promise.race([adapter.syncSnapshot(abort.signal), deadline])
+      const sources = await Promise.race([
+        Promise.all(options.sources.map(async (source): Promise<GatheredSource> => {
+          try {
+            return { agent: source.agent, snapshot: await source.syncSnapshot(abort.signal) }
+          } catch {
+            return { agent: source.agent, snapshot: undefined }
+          }
+        })),
+        deadline,
+      ])
+      const completeness = sources.every(item =>
+        item.snapshot !== undefined && item.snapshot.completeness === 'complete')
+        ? 'complete' as const
+        : 'unconfirmed' as const
+      return { sources, completeness }
     } finally {
       if (timer !== undefined) clearTimeout(timer)
     }
@@ -149,33 +202,82 @@ export function createNodeSync(options: NodeSyncOptions): NodeSync {
     link.rejectSync(reason)
   }
 
+  const emitCapability = (agent: string, sessionId: string, payload: Record<string, unknown>): void => {
+    try { options.emit(options.frame(agent, sessionId, 'capability.changed', payload)) } catch (error) { report(error) }
+  }
+
+  const sessionsOfAgent = (agent: string, rows: ReadonlyMap<string, Row>): string[] => {
+    const sessions: string[] = []
+    for (const row of rows.values()) {
+      if (rowAgent(row) !== agent) continue
+      if (typeof row.sessionId === 'string' && row.sessionId !== '') sessions.push(row.sessionId)
+    }
+    return sessions
+  }
+
+  /** 逐 agent 广播 stale；绝不把某个 agent 的能力行发给另一个 agent 的会话。 */
   const publishCapability = (flag: boolean): void => {
-    const capability = lastCapability
-    if (capability === undefined) return
-    const payload = { ...capability, stale: flag }
-    for (const row of lastRows.values()) {
-      const sessionId = row.sessionId
-      if (typeof sessionId !== 'string') continue
-      try { options.emit(options.frame(sessionId, 'capability.changed', payload)) } catch (error) { report(error) }
+    for (const [agent, capability] of lastCapability) {
+      const payload = { ...capability, stale: flag }
+      for (const sessionId of sessionsOfAgent(agent, lastRows)) emitCapability(agent, sessionId, payload)
     }
     stalePublished = flag
   }
 
-  const projectRows = (snapshot: SyncSnapshot): Row[] => {
-    const projector = options.projector()
+  /**
+   * 不完整轮次里只更新失败 agent 的不可用能力；不产生会话删除/运行态差异，
+   * 让页面看到“该 agent 当前不可观察”，而不是“会话都被删了”。
+   */
+  const publishUnavailable = (gathered: Gathered): void => {
+    for (const item of gathered.sources) {
+      if (item.snapshot !== undefined) continue
+      const capability = { unavailable: { adapter: 'capability-unavailable' } }
+      const changed = stableCapability(capability) !== stableCapability(lastCapability.get(item.agent))
+      lastCapability.set(item.agent, capability)
+      if (!changed) continue
+      const payload = { ...capability, stale: true }
+      for (const sessionId of sessionsOfAgent(item.agent, lastRows)) {
+        emitCapability(item.agent, sessionId, payload)
+      }
+    }
+  }
+
+  const projectGathered = (gathered: Gathered): ProjectedGather => {
     const rows: Row[] = []
-    for (const row of snapshot.rows) {
-      const projected = projector.syncRow({ ...row, agent: adapter.agent })
-      if (projected !== undefined) rows.push(projected)
+    const capabilities: SyncCapabilityDocument[] = []
+    for (const item of gathered.sources) {
+      const projector = options.projector(item.agent)
+      const snapshot = item.snapshot
+      if (snapshot === undefined) {
+        const document: SyncCapabilityDocument = {
+          agent: item.agent,
+          capability: { unavailable: { adapter: 'capability-unavailable' } },
+        }
+        capabilities.push(document)
+        const projected = projector.syncRow({
+          agent: document.agent,
+          capability: { ...document.capability, ...(stale ? { stale: true } : {}) },
+        })
+        if (projected !== undefined) rows.push(projected)
+        continue
+      }
+      for (const row of snapshot.rows) {
+        // agent 由来源注入，不能相信适配器行里的同名字段。
+        const projected = projector.syncRow({ ...row, agent: item.agent })
+        if (projected !== undefined) rows.push(projected)
+      }
+      for (const document of snapshot.capabilities) {
+        const agent = capabilityAgent(document.agent, item.agent)
+        if (agent === undefined) continue
+        capabilities.push({ agent, capability: document.capability })
+        const projected = projector.syncRow({
+          agent,
+          capability: { ...document.capability, ...(stale ? { stale: true } : {}) },
+        })
+        if (projected !== undefined) rows.push(projected)
+      }
     }
-    for (const item of snapshot.capabilities) {
-      const projected = projector.syncRow({
-        agent: item.agent,
-        capability: { ...item.capability, ...(stale ? { stale: true } : {}) },
-      })
-      if (projected !== undefined) rows.push(projected)
-    }
-    return rows
+    return { rows, capabilities }
   }
 
   const waitAck = (syncId: string): Promise<SyncAckFrame> =>
@@ -193,17 +295,21 @@ export function createNodeSync(options: NodeSyncOptions): NodeSync {
     })
 
   const run = async (syncId: string, flowVersion: number, signal: AbortController): Promise<void> => {
-    const snapshot = await gather(scanTimeoutMs)
+    const gathered = await gather(scanTimeoutMs)
     if (disposed || signal.signal.aborted || infight?.syncId !== syncId) return
-    if (snapshot.completeness !== 'complete') {
-      // 分页没有终止证据：不能把残缺清单当全量提交，否则会误删会话。
+    // 可达源自身列表不完整时仍不能提交，否则会把未列出的会话当成删除。
+    // 单源失败不同：该 agent 以不可用能力占位，其它 agent 仍可正常同步。
+    const listingIncomplete = gathered.sources.some(item =>
+      item.snapshot !== undefined && item.snapshot.completeness !== 'complete')
+    if (listingIncomplete) {
       fail('sync-incomplete')
       return
     }
     const binding = link.handshake
     if (binding === undefined || link.state !== 'syncing') { fail('sync-incomplete'); return }
 
-    const chunks = buildSyncChunks(projectRows(snapshot))
+    const projected = projectGathered(gathered)
+    const chunks = buildSyncChunks(projected.rows)
     const sessions = chunks.flat().filter(isSessionRow)
       .flatMap(row => typeof row.sessionId === 'string' ? [row.sessionId] : [])
     const begin = {
@@ -235,11 +341,14 @@ export function createNodeSync(options: NodeSyncOptions): NodeSync {
       // 提交成功才允许进入 online；此前队列一直关闭。
       const next = new Map<string, Row>()
       for (const row of chunks.flat()) {
-        if (isSessionRow(row) && typeof row.sessionId === 'string') next.set(row.sessionId, row)
+        if (!isSessionRow(row) || typeof row.sessionId !== 'string') continue
+        const agent = rowAgent(row)
+        if (agent === undefined) continue
+        next.set(rowKey(agent, row.sessionId), row)
       }
       lastRows = next
-      for (const item of snapshot.capabilities) {
-        if (item.agent === adapter.agent) lastCapability = item.capability
+      for (const document of projected.capabilities) {
+        lastCapability.set(document.agent, document.capability)
       }
       stale = false
       stalePublished = false
@@ -276,62 +385,66 @@ export function createNodeSync(options: NodeSyncOptions): NodeSync {
     scanning = true
     const scanStartedAt = (options.now ?? Date.now)()
     try {
-      const snapshot = await gather(scanTimeoutMs)
+      const gathered = await gather(scanTimeoutMs)
       if (disposed || !link.online) return
-      if (snapshot.completeness !== 'complete') {
-        // 不完整清单不能产生删除/运行态差异；只标 stale。
-        if (!stale) { stale = true; if (!stalePublished) publishCapability(true) }
+      if (gathered.completeness !== 'complete') {
+        // 不完整清单不能产生删除/运行态差异；只标 stale，并把失败 agent 标为不可用。
+        stale = true
+        if (!stalePublished) publishCapability(true)
+        publishUnavailable(gathered)
         return
       }
+      const projected = projectGathered(gathered)
       const next = new Map<string, Row>()
-      const projector = options.projector()
-      for (const row of snapshot.rows) {
-        const projected = projector.syncRow({ ...row, agent: adapter.agent })
-        if (projected !== undefined && typeof projected.sessionId === 'string') {
-          next.set(projected.sessionId, projected)
-        }
+      for (const row of projected.rows) {
+        if (!isSessionRow(row) || typeof row.sessionId !== 'string') continue
+        const agent = rowAgent(row)
+        if (agent === undefined) continue
+        next.set(rowKey(agent, row.sessionId), row)
       }
       // 先把差异全部算完，再一次性发事件；扫描中断不会产生半套 diff。
       const merged = new Map<string, Row>()
       const changed: Row[] = []
-      for (const [sessionId, row] of next) {
-        const previous = lastRows.get(sessionId)
+      for (const [key, row] of next) {
+        const previous = lastRows.get(key)
         if (previous === undefined) {
-          merged.set(sessionId, row)
+          merged.set(key, row)
           changed.push(row)
           continue
         }
         if (sameRow(previous, row)) {
-          merged.set(sessionId, previous)
+          merged.set(key, previous)
           continue
         }
         const updatedAt = typeof row.updatedAt === 'number' ? row.updatedAt : 0
         const previousAt = typeof previous.updatedAt === 'number' ? previous.updatedAt : 0
         // 只有快照确实更新时才覆盖；相同或更旧的清单让位给增量。
         if (updatedAt > previousAt) {
-          merged.set(sessionId, row)
+          merged.set(key, row)
           changed.push(row)
         } else {
-          merged.set(sessionId, previous)
+          merged.set(key, previous)
         }
       }
-      const removed: string[] = []
-      for (const [sessionId, previous] of lastRows) {
-        if (next.has(sessionId)) continue
+      const removed: Row[] = []
+      for (const [key, previous] of lastRows) {
+        if (next.has(key)) continue
         // 扫描期间到达的增量已证明会话仍存在：旧清单不能覆盖它。
-        if ((lastEventTs.get(sessionId) ?? 0) > scanStartedAt) merged.set(sessionId, previous)
-        else removed.push(sessionId)
+        if ((lastEventTs.get(key) ?? 0) > scanStartedAt) merged.set(key, previous)
+        else removed.push(previous)
       }
-      const capability = snapshot.capabilities.find(item => item.agent === adapter.agent)?.capability
-      const capabilityChanged = stableCapability(capability) !== stableCapability(lastCapability)
-      for (const sessionId of removed) {
-        try { options.emit(options.frame(sessionId, 'session.removed', {})) } catch (error) { report(error) }
+      for (const previous of removed) {
+        const agent = rowAgent(previous)
+        const sessionId = previous.sessionId
+        if (agent === undefined || typeof sessionId !== 'string') continue
+        try { options.emit(options.frame(agent, sessionId, 'session.removed', {})) } catch (error) { report(error) }
       }
       for (const row of changed) {
+        const agent = rowAgent(row)
         const sessionId = row.sessionId
-        if (typeof sessionId !== 'string') continue
+        if (agent === undefined || typeof sessionId !== 'string') continue
         try {
-          options.emit(options.frame(sessionId, 'session.updated', {
+          options.emit(options.frame(agent, sessionId, 'session.updated', {
             running: row.running,
             updatedAt: row.updatedAt,
             blank: row.blank,
@@ -339,14 +452,15 @@ export function createNodeSync(options: NodeSyncOptions): NodeSync {
         } catch (error) { report(error) }
       }
       lastRows = merged
-      if (capability !== undefined) {
-        lastCapability = capability
-        // readAt 每次扫描都变；只在能力实质变化时广播完整能力快照。
-        if (capabilityChanged) {
-          const payload = { ...capability, ...(stale ? { stale: true } : {}) }
-          for (const sessionId of next.keys()) {
-            try { options.emit(options.frame(sessionId, 'capability.changed', payload)) } catch (error) { report(error) }
-          }
+      // 能力变更按 agent 独立比较；只扇出该 agent 的会话。
+      for (const document of projected.capabilities) {
+        const capabilityChanged = stableCapability(document.capability)
+          !== stableCapability(lastCapability.get(document.agent))
+        lastCapability.set(document.agent, document.capability)
+        if (!capabilityChanged) continue
+        const payload = { ...document.capability, ...(stale ? { stale: true } : {}) }
+        for (const sessionId of sessionsOfAgent(document.agent, merged)) {
+          emitCapability(document.agent, sessionId, payload)
         }
       }
       if (stale) {
@@ -388,8 +502,9 @@ export function createNodeSync(options: NodeSyncOptions): NodeSync {
     observe(event: EventFrame): void {
       if (disposed) return
       const at = (options.now ?? Date.now)()
+      const key = rowKey(event.agent, event.sessionId)
       if (event.kind === 'session.updated') {
-        const previous = lastRows.get(event.sessionId)
+        const previous = lastRows.get(key)
         const payload = isRecord(event.payload) ? event.payload : {}
         // 事件可省略字段：保留最近一次已知值，不能把 unknown 变成 false/0。
         const merged: Row = {
@@ -400,29 +515,29 @@ export function createNodeSync(options: NodeSyncOptions): NodeSync {
         if (payload.running !== undefined) merged.running = payload.running
         if (payload.updatedAt !== undefined) merged.updatedAt = payload.updatedAt
         if (payload.blank !== undefined) merged.blank = payload.blank
-        lastRows.set(event.sessionId, merged)
-        lastEventTs.set(event.sessionId, at)
+        lastRows.set(key, merged)
+        lastEventTs.set(key, at)
         return
       }
       if (event.kind === 'session.removed') {
-        lastRows.delete(event.sessionId)
-        lastEventTs.set(event.sessionId, at)
+        lastRows.delete(key)
+        lastEventTs.set(key, at)
         return
       }
       if (event.kind === 'turn.started' || event.kind === 'turn.completed') {
-        const previous = lastRows.get(event.sessionId)
+        const previous = lastRows.get(key)
         if (previous === undefined) return
         const payload = isRecord(event.payload) ? event.payload : {}
         if (event.kind === 'turn.started') {
-          if (previous.running !== true) lastRows.set(event.sessionId, { ...previous, running: true })
+          if (previous.running !== true) lastRows.set(key, { ...previous, running: true })
         } else {
           // 与 hub 一致：只有非 running 终态才落 running=false，不凭空发明状态。
           const state = typeof payload.state === 'string' ? payload.state : 'completed'
           if (state !== 'running' && previous.running !== false) {
-            lastRows.set(event.sessionId, { ...previous, running: false })
+            lastRows.set(key, { ...previous, running: false })
           }
         }
-        lastEventTs.set(event.sessionId, at)
+        lastEventTs.set(key, at)
         return
       }
       if (event.kind === 'capability.changed' && isRecord(event.payload)) {
@@ -430,7 +545,7 @@ export function createNodeSync(options: NodeSyncOptions): NodeSync {
           ? event.payload.capability
           : event.payload
         const { stale: _stale, ...rest } = capability
-        lastCapability = rest
+        lastCapability.set(event.agent, rest)
       }
     },
     get stale(): boolean { return stale },

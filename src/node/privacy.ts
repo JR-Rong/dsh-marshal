@@ -33,7 +33,7 @@ const BUILTIN_PATTERNS: readonly string[] = [
 
 const RESULT_KEYS = new Set([
   'accepted', 'cancelled', 'following', 'subscriptionId', 'created',
-  'sessionId', 'status', 'state', 'count', 'bytes', 'chars', 'reason',
+  'sessionId', 'status', 'state', 'count', 'bytes', 'chars', 'reason', 'revision',
 ])
 
 const CAPABILITY_OPERATIONS: ReadonlySet<string> = new Set([

@@ -181,11 +181,12 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
     onError: error => ctx.logger.warn(`marshal: link error: ${errorName(error)}`),
   })
   nodeSync = createNodeSync({
-    link, adapter,
+    link,
+    sources: [{ agent: adapter.agent, syncSnapshot: signal => adapter.syncSnapshot(signal) }],
     agents: config.agents,
     projector: () => liveProjector,
     emit: event => emitProjected(event),
-    frame: (sessionId, kind, payload) => adapter.frame(sessionId, kind, payload),
+    frame: (agent, sessionId, kind, payload) => adapter.frame(sessionId, kind, payload),
     highWatermark: () => publicSeq.highWatermark(),
     logger: ctx.logger,
   })

@@ -122,12 +122,12 @@ function nodeHarness(
   const project = projector()
   const sync = createNodeSync({
     link: link as unknown as NodeLink,
-    adapter,
+    sources: [{ agent: 'dsh', syncSnapshot: signal => adapter.syncSnapshot(signal) }],
     agents: ['dsh'],
     projector: () => project,
     emit: event => emitted.push(event),
-    frame: (sessionId, kind, payload) => ({
-      v: 2, type: 'event', deviceId: DEVICE_ID, agent: 'dsh', sessionId,
+    frame: (agent, sessionId, kind, payload) => ({
+      v: 2, type: 'event', deviceId: DEVICE_ID, agent, sessionId,
       nodeEpoch: NODE_EPOCH, seq: 0, ts: 1, kind, payload,
     }),
     highWatermark: () => 7,

@@ -2,10 +2,10 @@ import {
   encodeFrame, type AckFrame, type CommandStatusResultFrame, type EventFrame, type Frame,
   type WireErrorCode,
 } from '../wire/frames.ts'
-import { parseCommandArgs, type ObserveArgs } from '../wire/commands.ts'
+import { parseCommandArgs, type ConfigureArgs, type ObserveArgs } from '../wire/commands.ts'
 import { PreCallRejection, type Adapter } from '../adapters/types.ts'
 import type {
-  CreateSessionRequest, CreatedSession, ForkSessionRequest,
+  CreateSessionRequest, CreatedSession, ForkSessionRequest, SettingsPort,
 } from '../agents/types.ts'
 import type { LoggerLike } from '../dsh-types.ts'
 import type { HandshakeBinding, NodeLink } from './link.ts'
@@ -137,6 +137,47 @@ interface SessionFactoryPorts {
 
 function sessionFactoryPorts(adapter: Adapter): SessionFactoryPorts {
   return adapter
+}
+
+/** configure 的期望版本串：`<runtimeEpoch>#<revision>`，epoch 自己可以含 `#`。 */
+export function formatExpectedRevision(runtimeEpoch: string, revision: number): string {
+  return `${runtimeEpoch}#${revision}`
+}
+
+/** 只按最后一个 `#` 切分；epoch/revision 都非空且 revision 必须是非负安全整数。 */
+export function parseExpectedRevision(value: string): { runtimeEpoch: string; revision: number } | undefined {
+  const index = value.lastIndexOf('#')
+  if (index <= 0) return undefined
+  const runtimeEpoch = value.slice(0, index)
+  const rawRevision = value.slice(index + 1)
+  if (rawRevision === '' || !/^\d+$/.test(rawRevision)) return undefined
+  const revision = Number(rawRevision)
+  if (!Number.isSafeInteger(revision) || revision < 0) return undefined
+  return { runtimeEpoch, revision }
+}
+
+/**
+ * v1 适配器的设置端口与实例代次不在 v0 `Adapter` 里；这里只做窄结构访问，
+ * 不往基础接口上补可选字段，也不把缺失的端口伪造成可用。
+ */
+interface SettingsSurface {
+  readonly settingsPort?: SettingsPort
+  readonly runtimeEpoch?: string
+}
+
+function settingsSurface(adapter: Adapter): SettingsSurface {
+  const candidate = adapter as unknown as {
+    settingsPort?: { configure?: unknown }
+    runtimeEpoch?: unknown
+  }
+  const port = candidate.settingsPort
+  const usable = port !== undefined && typeof port.configure === 'function'
+  return {
+    ...(usable ? { settingsPort: port as SettingsPort } : {}),
+    ...(typeof candidate.runtimeEpoch === 'string' && candidate.runtimeEpoch !== ''
+      ? { runtimeEpoch: candidate.runtimeEpoch }
+      : {}),
+  }
 }
 
 /** 只允许已声明的 wire 错误码过线；journal 里的 code 可能来自旧版本。 */
@@ -513,6 +554,29 @@ export function runCommand(
       return fork({ requestId: frame.commandId, parentSessionId: sessionId }, signal)
     }
     if (sessionId === null) return Promise.reject(new PreCallRejection('session-unknown'))
+    if (frame.op === 'configure') {
+      // 设置只能经适配器的真实回读端口；wire args 不能提供可信的 contentAuthorized。
+      const surface = settingsSurface(adapter)
+      if (surface.settingsPort === undefined) {
+        return Promise.reject(new PreCallRejection('unsupported', 'settings-readback-unavailable'))
+      }
+      const configureArgs = args as ConfigureArgs
+      const expected = parseExpectedRevision(configureArgs.expectedRevision)
+      if (expected === undefined) return Promise.reject(new PreCallRejection('invalid-args'))
+      // DSH 适配器没有实例代次，只能沿用节点握手代次；epoch 不符说明页面看的是旧实例。
+      const runtimeEpoch = surface.runtimeEpoch ?? frame.nodeEpoch
+      if (expected.runtimeEpoch !== runtimeEpoch) {
+        return Promise.reject(new PreCallRejection('stale-connection'))
+      }
+      return surface.settingsPort.configure({
+        sessionId,
+        field: configureArgs.field,
+        value: configureArgs.value,
+        expectedRevision: expected.revision,
+        runtimeEpoch,
+        contentAuthorized: (runtime?.projector() ?? fallback).content,
+      }, signal)
+    }
     return adapter.execute({ op: frame.op, target: { sessionId }, args })
   }
 
@@ -529,12 +593,20 @@ export function runCommand(
         settleAndReply('accepted', undefined, { sessionId: created.sessionId })
         return
       }
-      settleAndReply(
-        // configure 没有已验证的回读时只能是 pending-confirmation（回读由 T06/T07 提供）。
-        frame.op === 'configure' ? 'pending-confirmation' : 'accepted',
-        undefined,
-        result,
-      )
+      if (frame.op === 'configure') {
+        const configured = result as { readonly status?: unknown; readonly code?: unknown } | null
+        // 只有端口明确回报 confirmed 才能确认；其余一律留在 pending-confirmation。
+        const status: SettledStatus = typeof configured === 'object' && configured !== null
+          && configured.status === 'confirmed' ? 'confirmed' : 'pending-confirmation'
+        // 回读失败原因必须到达页面；未知字符串不能冒充确定结果，按回读超时处理。
+        const code = typeof configured === 'object' && configured !== null
+          && typeof configured.code === 'string'
+          ? asWireCode(configured.code, 'readback-timeout')
+          : undefined
+        settleAndReply(status, code, result)
+        return
+      }
+      settleAndReply('accepted', undefined, result)
     })
     .catch((error: unknown) => {
       if (error instanceof PreCallRejection) {
@@ -587,4 +659,51 @@ export function runCommand(
     }
     reply({ status, ...(code === undefined ? {} : { code }) })
   }
+}
+
+/** 单个 agent 的命令出口：适配器、跟随循环与可选的运行时投影端口。 */
+export interface AgentRoute {
+  readonly adapter: Adapter
+  readonly follower: ReturnType<typeof createFollower>
+  readonly runtime?: CommandRuntime
+}
+
+/**
+ * 按 target.agent 分派命令/状态/待答快照；未知 agent 不落 journal、不调用适配器，
+ * 只用本帧的 agent 建一个 metadata 投影器回拒绝。任何发送失败都不得抛回宿主。
+ */
+export function runRoutedCommand(
+  link: NodeLink,
+  routes: ReadonlyMap<string, AgentRoute>,
+  frame: Frame,
+  deviceId: string,
+  journal: Journal,
+  now: () => number = Date.now,
+): void {
+  if (frame.type !== 'command' && frame.type !== 'command.status' && frame.type !== 'inputs.snapshot') return
+  const route = routes.get(frame.target.agent)
+  if (route !== undefined) {
+    runCommand(link, route.adapter, route.follower, frame, deviceId, journal, now, route.runtime)
+    return
+  }
+  // 待答快照对未知 agent 只能沉默：hub 超时后按 unknown 收尾。
+  if (frame.type === 'inputs.snapshot') return
+  const projector = createPrivacyProjector({
+    privacy: 'metadata', allowContent: false, questionRelay: 'off', approvalRelay: 'off',
+    allowInteractions: false, redaction: [], deviceId, agent: frame.target.agent,
+  })
+  if (frame.type === 'command.status') {
+    const body: CommandStatusResultFrame = {
+      v: 2, type: 'command.status.result', requestId: frame.requestId,
+      status: 'rejected', code: 'session-unknown',
+    }
+    try { link.sendRaw(encodeFrame(projector.statusResult(body))) } catch { /* 回不去就等调用方超时 */ }
+    return
+  }
+  const ack: AckFrame = {
+    v: 2, type: 'ack', commandId: frame.commandId,
+    connectionId: frame.connectionId, nodeEpoch: frame.nodeEpoch,
+    status: 'rejected', code: 'session-unknown',
+  }
+  try { link.sendRaw(encodeFrame(projector.ack(ack))) } catch { /* 回不去就等调用方超时 */ }
 }

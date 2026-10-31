@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { PreCallRejection, type Adapter } from '../src/adapters/types.ts'
 import type { HandshakeBinding, NodeLink } from '../src/node/link.ts'
 import { JournalError, openJournal, type Journal } from '../src/node/journal.ts'
-import { createFollower, runCommand } from '../src/node/runner.ts'
+import { createFollower, formatExpectedRevision, runCommand } from '../src/node/runner.ts'
 import { createPrivacyProjector } from '../src/node/privacy.ts'
 import type {
   AckFrame, CommandFrame, CommandStatusFrame, CommandStatusResultFrame, Frame,
@@ -367,15 +367,22 @@ describe('node command lifecycle', () => {
     expect(result?.cards).toHaveLength(2)
   })
 
-  it('configure 没有验证回读时结算为 pending-confirmation', async () => {
+  it('configure 没有设置端口时以 unsupported 拒绝，且不调用适配器', async () => {
     const { journal } = setup()
     const h = harness()
     runCommand(h.link, h.adapter, h.follower, command({
-      key: 'configure', op: 'configure', args: { field: 'model', value: 'm' },
+      key: 'configure',
+      op: 'configure',
+      args: {
+        expectedRevision: formatExpectedRevision('epoch-1', 4),
+        field: 'model',
+        value: 'm',
+      },
     }), 'mac', journal)
     await flush()
-    expect(h.acks()[0]).toMatchObject({ status: 'pending-confirmation' })
+    expect(h.calls()).toBe(0)
+    expect(h.acks()[0]).toMatchObject({ status: 'rejected', code: 'unsupported' })
     expect(journal.lookup({ operatorId: 'operator-1', target: target(), idempotencyKey: 'configure' })?.status)
-      .toBe('pending-confirmation')
+      .toBe('rejected')
   })
 })
