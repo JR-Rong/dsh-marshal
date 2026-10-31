@@ -5,7 +5,8 @@ import type { WebServerLike } from '../../src/dsh-types.ts'
 export interface TestWeb {
   readonly webServer: WebServerLike
   readonly server: Server
-  listen(): Promise<number>
+  /** 端口 0 表示由系统分配；重启场景用同一端口重新监听。 */
+  listen(port?: number): Promise<number>
 }
 
 export interface TestWebOptions {
@@ -38,9 +39,26 @@ export function createTestWeb(options: TestWebOptions = {}): TestWeb {
   return {
     webServer,
     server,
-    listen: () => new Promise(resolve => server.listen(0, '127.0.0.1', () => {
-      const address = server.address()
-      resolve(typeof address === 'object' && address !== null ? address.port : 0)
-    })),
+    listen: (port = 0) => new Promise<number>((resolve, reject) => {
+      // 显式监听指定端口时，EADDRINUSE 要通过 reject 暴露，不能变成未处理的 error 事件。
+      const onError = (error: Error): void => { server.off('listening', onListening); reject(error) }
+      const onListening = (): void => {
+        server.off('error', onError)
+        const address = server.address()
+        resolve(typeof address === 'object' && address !== null ? address.port : 0)
+      }
+      server.once('error', onError)
+      server.once('listening', onListening)
+      server.listen(port, '127.0.0.1')
+    }),
   }
+}
+
+/** 关闭测试 server；未监听时是安全空操作，供多装配/重启场景按序释放。 */
+export async function closeTestWeb(web: TestWeb): Promise<void> {
+  if (!web.server.listening) return
+  web.server.closeAllConnections?.()
+  await new Promise<void>((resolve, reject) => {
+    web.server.close(error => { if (error === undefined) resolve(); else reject(error) })
+  })
 }
