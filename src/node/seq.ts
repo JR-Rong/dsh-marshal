@@ -26,7 +26,8 @@ function scopeKey(scope: SeqScope): string {
  * `(deviceId, agent, sessionId, nodeEpoch)`。
  * 被隐私层丢弃的帧不占号，分片帧按输出顺序取连续号。
  */
-export function createSeqAllocator(): SeqAllocator {  const counters = new Map<string, number>()
+export function createSeqAllocator(): SeqAllocator {
+  const counters = new Map<string, number>()
   let peak = 0
   return {
     next(scope: SeqScope): number {
