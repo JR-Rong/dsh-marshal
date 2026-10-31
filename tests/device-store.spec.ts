@@ -84,6 +84,38 @@ describe('device state file', () => {
     expect(state.version).toBe(2)
     expect(state.devices[0]).toEqual(record())
   })
+
+  it('修订缺失/非法或低于已存高水位时整表仍可启动，但该设备拒绝新写', () => {
+    const path = tempPath()
+    writeFileSync(path, JSON.stringify({
+      version: 2,
+      devices: [{
+        id: 'mac', name: 'Mac', tokenDigest: sha256Hex(TOKEN), revoked: false,
+        allowContent: false, allowInteractions: false, allowDiscussion: false,
+      }],
+    }))
+    const loaded = readDeviceState(path)
+    expect(loaded.kind).toBe('current')
+    if (loaded.kind !== 'current') return
+    expect(loaded.revisionUnconfirmed).toEqual(['mac'])
+
+    const store = new DeviceStore(path)
+    expect(store.isRecoveryRequired('mac')).toBe(true)
+    expect(() => store.setPolicy('mac', { allowContent: true }))
+      .toThrowError(/recovery-required/)
+    // 不把缺失修订静默写成 0。
+    expect(readFileSync(path, 'utf8')).not.toContain('"policyRevision": 0')
+
+    const rolledBack = tempPath()
+    writeFileSync(rolledBack, JSON.stringify({
+      version: 2,
+      revisionHighWatermarks: { mac: 5 },
+      devices: [record({ policyRevision: 3 })],
+    }))
+    const rollbackStore = new DeviceStore(rolledBack)
+    expect(rollbackStore.isRecoveryRequired('mac')).toBe(true)
+    expect(rollbackStore.findById('mac')?.policyRevision).toBe(3)
+  })
 })
 
 describe('DeviceStore', () => {

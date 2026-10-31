@@ -3,6 +3,22 @@ import { HubRelay } from '../src/hub/relay.ts'
 import { DeviceRegistry } from '../src/hub/registry.ts'
 import type { AckFrame } from '../src/wire/frames.ts'
 
+const CONNECTION_ID = 'conn-1'
+const NODE_EPOCH = 'epoch-1'
+
+function origin(deviceId = 'mac'): { deviceId: string; connectionId: string; nodeEpoch: string } {
+  return { deviceId, connectionId: CONNECTION_ID, nodeEpoch: NODE_EPOCH }
+}
+
+function attach(registry: DeviceRegistry, id: string, sent: string[] = []): void {
+  registry.attach(
+    { id, name: id, agents: ['dsh'] },
+    { send: t => sent.push(t) },
+    0,
+    { connectionId: CONNECTION_ID, nodeEpoch: NODE_EPOCH },
+  )
+}
+
 function target(deviceId = 'mac') {
   return { deviceId, agent: 'dsh', sessionId: 's1' }
 }
@@ -10,7 +26,7 @@ function target(deviceId = 'mac') {
 function ack(commandId: string, overrides: Partial<AckFrame> = {}): AckFrame {
   return {
     v: 2, type: 'ack', commandId,
-    connectionId: 'conn-1', nodeEpoch: 'epoch-1', status: 'accepted',
+    connectionId: CONNECTION_ID, nodeEpoch: NODE_EPOCH, status: 'accepted',
     ...overrides,
   }
 }
@@ -18,9 +34,7 @@ function ack(commandId: string, overrides: Partial<AckFrame> = {}): AckFrame {
 function setup(ids: readonly string[] = ['mac']) {
   const registry = new DeviceRegistry()
   const sent: string[] = []
-  for (const id of ids) {
-    registry.attach({ id, name: id, agents: ['dsh'] }, { send: t => sent.push(t) }, 0)
-  }
+  for (const id of ids) attach(registry, id, sent)
   return { registry, sent }
 }
 
@@ -28,7 +42,7 @@ describe('HubRelay', () => {
   it('把指令投递给目标设备', async () => {
     const registry = new DeviceRegistry()
     const sent: string[] = []
-    registry.attach({ id: 'mac', name: 'Mac', agents: ['dsh'] }, { send: t => sent.push(t) }, 0)
+    attach(registry, 'mac', sent)
     const relay = new HubRelay({ registry, now: () => 1000, timeoutMs: 50 })
 
     const promise = relay.command({ op: 'prompt', target: target(), args: { text: 'hi' }, idempotencyKey: 'k1' })
@@ -36,7 +50,7 @@ describe('HubRelay', () => {
     expect(frame.type).toBe('command')
     expect(frame.op).toBe('prompt')
 
-    relay.settle(ack(frame.commandId, { result: { accepted: true } }))
+    relay.settle(ack(frame.commandId, { result: { accepted: true } }), origin())
     await expect(promise).resolves.toEqual({ ok: true, result: { accepted: true } })
   })
 
@@ -44,11 +58,11 @@ describe('HubRelay', () => {
     const { registry, sent } = setup()
     const relay = new HubRelay({ registry, now: () => 0, timeoutMs: 50 })
     const accepted = relay.command({ op: 'prompt', target: target(), args: { text: 'a' }, idempotencyKey: 'a' })
-    relay.settle(ack(JSON.parse(sent[0]!).commandId, { status: 'accepted', result: 1 }))
+    relay.settle(ack(JSON.parse(sent[0]!).commandId, { status: 'accepted', result: 1 }), origin())
     await expect(accepted).resolves.toEqual({ ok: true, result: 1 })
 
     const confirmed = relay.command({ op: 'prompt', target: target(), args: { text: 'b' }, idempotencyKey: 'b' })
-    relay.settle(ack(JSON.parse(sent[1]!).commandId, { status: 'confirmed', result: 2 }))
+    relay.settle(ack(JSON.parse(sent[1]!).commandId, { status: 'confirmed', result: 2 }), origin())
     await expect(confirmed).resolves.toEqual({ ok: true, result: 2 })
   })
 
@@ -56,7 +70,7 @@ describe('HubRelay', () => {
     const { registry, sent } = setup()
     const relay = new HubRelay({ registry, now: () => 0, timeoutMs: 50 })
     const promise = relay.command({ op: 'prompt', target: target(), args: { text: 'hi' }, idempotencyKey: 'r' })
-    relay.settle(ack(JSON.parse(sent[0]!).commandId, { status: 'rejected' }))
+    relay.settle(ack(JSON.parse(sent[0]!).commandId, { status: 'rejected' }), origin())
     await expect(promise).resolves.toEqual({ ok: false, code: 'unsupported' })
   })
 
@@ -64,13 +78,46 @@ describe('HubRelay', () => {
     const { registry, sent } = setup()
     const relay = new HubRelay({ registry, now: () => 0, timeoutMs: 50 })
     const pending = relay.command({ op: 'prompt', target: target(), args: { text: 'p' }, idempotencyKey: 'p' })
-    relay.settle(ack(JSON.parse(sent[0]!).commandId, { status: 'pending-confirmation' }))
+    relay.settle(ack(JSON.parse(sent[0]!).commandId, { status: 'pending-confirmation' }), origin())
     await expect(pending).resolves.toEqual({ ok: false, code: 'pending-confirmation' })
 
     const unknown = relay.command({ op: 'prompt', target: target(), args: { text: 'u' }, idempotencyKey: 'u' })
-    relay.settle(ack(JSON.parse(sent[1]!).commandId, { status: 'outcome-unknown' }))
+    relay.settle(ack(JSON.parse(sent[1]!).commandId, { status: 'outcome-unknown' }), origin())
     await expect(unknown).resolves.toEqual({ ok: false, code: 'outcome-unknown' })
   })
+
+  it('ACK 必须匹配绑定的 connectionId/nodeEpoch，错配只计数不结算', async () => {
+    const { registry, sent } = setup()
+    const relay = new HubRelay({ registry, now: () => 0, timeoutMs: 50 })
+    const promise = relay.command({ op: 'prompt', target: target(), args: {}, idempotencyKey: 'bind' })
+    const commandId = JSON.parse(sent[0]!).commandId as string
+
+    relay.settle(ack(commandId, { connectionId: 'other' }), origin())
+    relay.settle(ack(commandId, { nodeEpoch: 'other' }), origin())
+    relay.settle(ack(commandId), origin('pc'))
+    expect(relay.rejectedAcks).toBe(3)
+    expect(sent).toHaveLength(1)
+
+    relay.settle(ack(commandId, { result: 9 }), origin())
+    await expect(promise).resolves.toEqual({ ok: true, result: 9 })
+  })
+
+  it('设备重连后的旧连接 ACK 不结算新绑定', async () => {
+    const { registry, sent } = setup()
+    const relay = new HubRelay({ registry, now: () => 0, timeoutMs: 50 })
+    const promise = relay.command({ op: 'prompt', target: target(), args: {}, idempotencyKey: 'old' })
+    const commandId = JSON.parse(sent[0]!).commandId as string
+    // 同一设备换到新连接：旧连接身份不再等于注册表当前槽位。
+    registry.attach(
+      { id: 'mac', name: 'mac', agents: ['dsh'] },
+      { send: () => {} }, 1, { connectionId: 'conn-2', nodeEpoch: 'epoch-1' },
+    )
+    relay.settle(ack(commandId), origin())
+    expect(relay.rejectedAcks).toBe(1)
+    relay.deviceOffline('mac')
+    await expect(promise).resolves.toEqual({ ok: false, code: 'device-offline' })
+  })
+
 
   it('目标离线直接失败', async () => {
     const relay = new HubRelay({ registry: new DeviceRegistry(), now: () => 0, timeoutMs: 50 })
@@ -81,7 +128,7 @@ describe('HubRelay', () => {
   it('超时失败', async () => {
     vi.useFakeTimers()
     const registry = new DeviceRegistry()
-    registry.attach({ id: 'mac', name: 'Mac', agents: [] }, { send: () => {} }, 0)
+    attach(registry, 'mac')
     const relay = new HubRelay({ registry, now: () => 0, timeoutMs: 100 })
     const promise = relay.command({ op: 'prompt', target: target(), args: {}, idempotencyKey: 'k' })
     vi.advanceTimersByTime(150)
@@ -92,10 +139,10 @@ describe('HubRelay', () => {
   it('同幂等键只执行一次', async () => {
     const registry = new DeviceRegistry()
     const sent: string[] = []
-    registry.attach({ id: 'mac', name: 'Mac', agents: [] }, { send: t => sent.push(t) }, 0)
+    attach(registry, 'mac', sent)
     const relay = new HubRelay({ registry, now: () => 0, timeoutMs: 50 })
     const first = relay.command({ op: 'interrupt', target: target(), args: {}, idempotencyKey: 'same' })
-    relay.settle(ack(JSON.parse(sent[0]!).commandId))
+    relay.settle(ack(JSON.parse(sent[0]!).commandId), origin())
     await first
     await expect(relay.command({ op: 'interrupt', target: target(), args: {}, idempotencyKey: 'same' }))
       .resolves.toMatchObject({ ok: true })
@@ -134,7 +181,7 @@ describe('HubRelay', () => {
     // 幂等：再次 dispose 不抛错。
     expect(() => relay.dispose()).not.toThrow()
     // 迟到的 ack 与后续指令都不再改变状态。
-    relay.settle(ack(JSON.parse(sent[0]!).commandId, { result: 1 }))
+    relay.settle(ack(JSON.parse(sent[0]!).commandId, { result: 1 }), origin())
     await expect(relay.command({ op: 'prompt', target: target(), args: {}, idempotencyKey: 'c' }))
       .resolves.toEqual({ ok: false, code: 'disposed', message: 'relay: disposed' })
     expect(sent).toHaveLength(2)
@@ -148,7 +195,7 @@ describe('HubRelay', () => {
     const second = relay.command({ op: 'prompt', target: target(), args: {}, idempotencyKey: 'dup' })
     expect(sent).toHaveLength(1)
 
-    relay.settle(ack(JSON.parse(sent[0]!).commandId, { result: 7 }))
+    relay.settle(ack(JSON.parse(sent[0]!).commandId, { result: 7 }), origin())
     await expect(Promise.all([first, second])).resolves.toEqual([{ ok: true, result: 7 }, { ok: true, result: 7 }])
     expect(sent).toHaveLength(1)
   })
@@ -161,7 +208,10 @@ describe('HubRelay', () => {
     expect(sent).toHaveLength(2)
     expect(sent.map(text => JSON.parse(text).target.deviceId)).toEqual(['mac', 'pc'])
 
-    for (const text of sent) relay.settle(ack(JSON.parse(text).commandId))
+    for (const text of sent) {
+      const frame = JSON.parse(text) as { commandId: string; target: { deviceId: string } }
+      relay.settle(ack(frame.commandId), origin(frame.target.deviceId))
+    }
     await expect(Promise.all([onMac, onPc])).resolves.toMatchObject([{ ok: true }, { ok: true }])
   })
 
@@ -178,7 +228,7 @@ describe('HubRelay', () => {
     // 同键重试必须重新下发，而不是复用已失败的 in-flight Promise。
     const retry = relay.command({ op: 'prompt', target: target(), args: {}, idempotencyKey: 'bad' })
     expect(sent).toHaveLength(1)
-    relay.settle(ack(JSON.parse(sent[0]!).commandId))
+    relay.settle(ack(JSON.parse(sent[0]!).commandId), origin())
     await expect(retry).resolves.toMatchObject({ ok: true })
   })
 

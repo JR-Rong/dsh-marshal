@@ -53,8 +53,10 @@ interface Served {
 
 interface ServeOptions {
   readonly helloTimeoutMs?: number
+  readonly heartbeatMs?: number
   readonly heartbeatTimeoutMs?: number
   readonly livenessCheckMs?: number
+  readonly maxPendingHellos?: number
   readonly watchDevices?: boolean
   readonly pollMs?: number
 }
@@ -300,19 +302,44 @@ describe('hub socket', () => {
     ws.close()
   })
 
-  it('ACK 的 connectionId 不匹配时被忽略，不进入 onFrame', async () => {
+  it('错代次 ACK 不关闭连接，交给 relay 做绑定校验', async () => {
     const registry = new DeviceRegistry()
     const frames: Frame[] = []
     const { port } = await serve(registry, frames)
-    const ws = await hello(registry, port)
+    const { ws, ack } = await helloWithAck(registry, port)
+    if (ack.type !== 'hello.ack') throw new Error('expected hello.ack')
     ws.send(JSON.stringify({
       v: 2, type: 'ack', commandId: 'c1', connectionId: 'other-connection', nodeEpoch: 'epoch-1',
       status: 'accepted',
     }))
-    await new Promise(resolve => setTimeout(resolve, 100))
-    expect(frames).toEqual([])
+    await waitFor(() => frames.length === 1, 'mismatched ack to reach relay')
+    // 连接仍可用；relay 依据传入的连接身份拒绝结算。
+    expect(frames[0]?.type).toBe('ack')
     expect(ws.readyState).toBe(WebSocket.OPEN)
     ws.close()
+  })
+
+  it('HEARTBEAT.ack 必须匹配当前连接与未应答 nonce', async () => {
+    const registry = new DeviceRegistry()
+    const { port } = await serve(registry, [], [DEVICE], { heartbeatMs: 20, heartbeatTimeoutMs: 90, livenessCheckMs: 10 })
+    const { ws, ack } = await helloWithAck(registry, port)
+    if (ack.type !== 'hello.ack') throw new Error('expected hello.ack')
+    const hubHeartbeat = await new Promise<Frame>(resolve => {
+      const onMessage = (data: unknown): void => {
+        const frame = JSON.parse(String(data)) as Frame
+        if (frame.type === 'heartbeat') { ws.off('message', onMessage); resolve(frame) }
+      }
+      ws.on('message', onMessage)
+    })
+    if (hubHeartbeat.type !== 'heartbeat') throw new Error('expected heartbeat')
+    // 错误 nonce 不刷新，连接最终因无有效 ack 被断开。
+    ws.send(JSON.stringify({
+      v: 2, type: 'heartbeat.ack', nonce: 'wrong',
+      connectionId: ack.connectionId, nodeEpoch: 'epoch-1', sentAt: hubHeartbeat.sentAt,
+    }))
+    const code = await closeCode(ws)
+    expect(code).toBe(1006)
+    await waitFor(() => registry.get(DEVICE_ID) === undefined, 'device removed after heartbeat timeout')
   })
 
   it('事件的 nodeEpoch 不是当前代次时以 4409 关闭', async () => {
@@ -384,8 +411,11 @@ describe('hub socket', () => {
     const { port } = await serve(registry, [], [record])
     const ws = await connect(port)
     const reason = closeReason(ws)
+    const code = closeCode(ws)
     ws.send(helloText({ operatorId: OPERATOR_ID, policyRevision: 3 }))
     expect(await reason).toBe('recovery-required')
+    // 4409 可重试：节点修正后能重新握手，而不是被 4406 永久拒绝。
+    expect(await code).toBe(4409)
     expect(registry.get(DEVICE_ID)).toBeUndefined()
   })
 
@@ -551,6 +581,17 @@ describe('hub socket', () => {
     }
     expect(uncaught).toEqual([])
     expect(registry.get(DEVICE_ID)).toBeUndefined()
+  })
+
+  it('未完成 hello 的 socket 超过上限时以 4408 立即关闭', async () => {
+    const registry = new DeviceRegistry()
+    const { port } = await serve(registry, [], [DEVICE], { maxPendingHellos: 1 })
+    const first = await connect(port)
+    const second = await connect(port)
+    const code = closeCode(second)
+    expect(await code).toBe(4408)
+    expect(registry.get(DEVICE_ID)).toBeUndefined()
+    first.terminate()
   })
 
   it('hello 超时后以 4408 关闭', async () => {

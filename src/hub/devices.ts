@@ -21,6 +21,8 @@ export interface DeviceRecord {
 export interface DevicesState {
   readonly version: typeof DEVICES_FILE_VERSION
   readonly devices: readonly DeviceRecord[]
+  /** 每设备已提交过的最高 revision；已有高水位时可据此发现整表回退。 */
+  readonly revisionHighWatermarks?: Readonly<Record<string, number>>
 }
 
 export interface LegacyDeviceRecord {
@@ -32,12 +34,17 @@ export interface LegacyDeviceRecord {
 export type DeviceStateLoad =
   | { readonly kind: 'missing' }
   | { readonly kind: 'legacy'; readonly devices: readonly LegacyDeviceRecord[] }
-  | { readonly kind: 'current'; readonly state: DevicesState }
+  | {
+      readonly kind: 'current'
+      readonly state: DevicesState
+      /** 修订缺失/非法/回退的设备：可启动，但授权不可确认且拒绝新写。 */
+      readonly revisionUnconfirmed: readonly string[]
+    }
 
 export type DeviceStateErrorCode =
   | 'missing' | 'unreadable' | 'invalid' | 'legacy'
   | 'duplicate-id' | 'duplicate-digest' | 'unknown-device' | 'revoked'
-  | 'invalid-policy'
+  | 'invalid-policy' | 'recovery-required'
 
 export class DeviceStateError extends Error {
   override readonly name = 'DeviceStateError'
@@ -85,7 +92,12 @@ function assertUnique(records: readonly DeviceRecord[], context: string): void {
   }
 }
 
-function validateRecord(value: unknown, index: number): DeviceRecord {
+interface ValidatedRecord {
+  readonly record: DeviceRecord
+  readonly revisionUnconfirmed: boolean
+}
+
+function validateRecord(value: unknown, index: number): ValidatedRecord {
   if (!isObject(value)) throw new DeviceStateError('invalid', `devices[${index}] is not an object`)
   const { id, name, tokenDigest, revoked, allowContent, allowInteractions, allowDiscussion, policyRevision, revokedAt } = value
   if (!nonEmptyString(id)) throw new DeviceStateError('invalid', `devices[${index}].id must be a non-empty string`)
@@ -99,30 +111,65 @@ function validateRecord(value: unknown, index: number): DeviceRecord {
       throw new DeviceStateError('invalid', `devices[${index}].${key} must be a boolean`)
     }
   }
-  if (typeof policyRevision !== 'number' || !Number.isInteger(policyRevision) || policyRevision < 1) {
-    throw new DeviceStateError('invalid', `devices[${index}].policyRevision must be an integer >= 1`)
-  }
+  // 修订字段异常不拖垮整张表：设备仍在，但授权不可确认，拒绝新写。
+  const revisionUnconfirmed = typeof policyRevision !== 'number'
+    || !Number.isInteger(policyRevision)
+    || policyRevision < 1
   if (revokedAt !== undefined && (typeof revokedAt !== 'number' || !Number.isInteger(revokedAt) || revokedAt < 0)) {
     throw new DeviceStateError('invalid', `devices[${index}].revokedAt must be an integer >= 0`)
   }
   return {
-    id, name, tokenDigest, revoked,
-    allowContent: allowContent as boolean,
-    allowInteractions: allowInteractions as boolean,
-    allowDiscussion: allowDiscussion as boolean,
-    policyRevision,
-    ...(revokedAt === undefined ? {} : { revokedAt }),
+    record: {
+      id, name, tokenDigest, revoked,
+      allowContent: allowContent as boolean,
+      allowInteractions: allowInteractions as boolean,
+      allowDiscussion: allowDiscussion as boolean,
+      // 占位值只用于内存；任何写盘都会因 unconfirmed 而被拒绝，不会把 0 持久化。
+      policyRevision: revisionUnconfirmed ? 0 : policyRevision,
+      ...(revokedAt === undefined ? {} : { revokedAt }),
+    },
+    revisionUnconfirmed,
   }
 }
 
-function parseCurrent(value: Record<string, unknown>): DevicesState {
+function parseHighWatermarks(value: unknown): Readonly<Record<string, number>> | undefined {
+  if (value === undefined) return undefined
+  if (!isObject(value)) throw new DeviceStateError('invalid', 'revisionHighWatermarks must be an object')
+  const marks: Record<string, number> = {}
+  for (const [id, mark] of Object.entries(value)) {
+    if (typeof mark !== 'number' || !Number.isInteger(mark) || mark < 0) {
+      throw new DeviceStateError('invalid', `revisionHighWatermarks["${id}"] must be an integer >= 0`)
+    }
+    marks[id] = mark
+  }
+  return marks
+}
+
+function parseCurrent(value: Record<string, unknown>): Extract<DeviceStateLoad, { kind: 'current' }> {
   if (value.version !== DEVICES_FILE_VERSION) {
     throw new DeviceStateError('invalid', `devices file version must be ${DEVICES_FILE_VERSION}`)
   }
   if (!Array.isArray(value.devices)) throw new DeviceStateError('invalid', 'devices must be an array')
-  const devices = value.devices.map((item, index) => validateRecord(item, index))
+  const validated = value.devices.map((item, index) => validateRecord(item, index))
+  const devices = validated.map(item => item.record)
   assertUnique(devices, 'devices file')
-  return { version: DEVICES_FILE_VERSION, devices }
+  const watermarks = parseHighWatermarks(value.revisionHighWatermarks)
+  const unconfirmed = new Set<string>()
+  validated.forEach((item, index) => {
+    if (item.revisionUnconfirmed) unconfirmed.add(item.record.id)
+    const mark = watermarks?.[item.record.id]
+    // 只有确实存过高水位时才把较低 revision 视为回退；否则不同设备各自递增是正常的。
+    if (mark !== undefined && item.record.policyRevision < mark) unconfirmed.add(devices[index]!.id)
+  })
+  return {
+    kind: 'current',
+    state: {
+      version: DEVICES_FILE_VERSION,
+      devices,
+      ...(watermarks === undefined ? {} : { revisionHighWatermarks: watermarks }),
+    },
+    revisionUnconfirmed: [...unconfirmed],
+  }
 }
 
 function looksLegacy(value: Record<string, unknown>): boolean {
@@ -168,7 +215,7 @@ export function readDeviceState(path: string): DeviceStateLoad {
     throw new DeviceStateError('unreadable', `${path} is not valid JSON`)
   }
   if (!isObject(parsed)) throw new DeviceStateError('invalid', `${path} must contain an object`)
-  if (parsed.version === DEVICES_FILE_VERSION) return { kind: 'current', state: parseCurrent(parsed) }
+  if (parsed.version === DEVICES_FILE_VERSION) return parseCurrent(parsed)
   if (looksLegacy(parsed)) return { kind: 'legacy', devices: parseLegacy(parsed) }
   throw new DeviceStateError('invalid', `${path} is not a v1 or v2 device table`)
 }
@@ -217,6 +264,8 @@ export interface DeviceStoreOptions {
 export class DeviceStore {
   private state: DevicesState
   private readonly now: () => number
+  /** 修订异常设备：可启动但授权不可确认，任何整表写入都会拒绝以保留原始证据。 */
+  private unconfirmed = new Set<string>()
 
   constructor(private readonly path: string, options: DeviceStoreOptions = {}) {
     this.now = options.now ?? Date.now
@@ -230,6 +279,11 @@ export class DeviceStore {
   }
 
   list(): readonly DeviceRecord[] { return [...this.state.devices] }
+
+  /** 该设备是否因修订缺失/非法/回退而不能确认授权。 */
+  isRecoveryRequired(id: string): boolean { return this.unconfirmed.has(id) }
+
+  recoveryRequired(): readonly string[] { return [...this.unconfirmed] }
 
   findById(id: string): DeviceRecord | undefined {
     return this.state.devices.find(device => device.id === id)
@@ -317,16 +371,39 @@ export class DeviceStore {
         `device table ${this.path} is v1; run "marshal-device migrate" and point devicesFile at the new file`,
       )
     }
+    this.unconfirmed = new Set(loaded.revisionUnconfirmed)
     return loaded.state
+  }
+
+  /** 已有高水位只能升不能降；新写入的 revision 同时推进高水位。 */
+  private withWatermarks(state: DevicesState): DevicesState {
+    const marks: Record<string, number> = { ...(state.revisionHighWatermarks ?? {}) }
+    for (const entry of state.devices) {
+      marks[entry.id] = Math.max(marks[entry.id] ?? entry.policyRevision, entry.policyRevision)
+    }
+    return { ...state, revisionHighWatermarks: marks }
+  }
+
+  private assertWritable(): void {
+    if (this.unconfirmed.size === 0) return
+    const ids = [...this.unconfirmed].join(', ')
+    throw new DeviceStateError(
+      'recovery-required',
+      `device authorization is unconfirmable for ${ids}; repair policyRevision before writing`,
+    )
   }
 
   private mutate<T>(fn: (state: DevicesState) => { state: DevicesState; result: T }): T {
     return withFileLock(this.path, () => {
       // 锁内重读：并发的 CLI/另一个 hub 写者可能已经提交了更新。
       const current = this.load()
+      this.assertWritable()
       const next = fn(current)
-      atomicWriteFile(this.path, serializeDevicesState(next.state))
-      this.state = next.state
+      // 写入前再确认目标行没有被锁外修改成修订异常。
+      this.assertWritable()
+      const committed = this.withWatermarks(next.state)
+      atomicWriteFile(this.path, serializeDevicesState(committed))
+      this.state = committed
       return next.result
     })
   }

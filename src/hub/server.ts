@@ -14,14 +14,20 @@ import {
   DeviceStateError, sha256Hex, type DeviceRecord, type DeviceStore,
 } from './devices.ts'
 import type { DeviceRegistry, Sender } from './registry.ts'
+import type { FrameIdentity } from './relay.ts'
 
 export const UPLINK_PATH = '/marshal/uplink'
 
 /** 握手成功后多久之内必须收到合法 hello，否则断开（可被 options.helloTimeoutMs 覆盖）。 */
 const HELLO_TIMEOUT_MS = 10_000
-/** 契约 §11：应用心跳 5s，15s 无有效心跳即判定半开连接。 */
+/** 契约 §11：双方应用心跳 5s 一次，15s 无有效应答即判定半开连接。 */
+const HEARTBEAT_INTERVAL_MS = 5_000
 const HEARTBEAT_TIMEOUT_MS = 15_000
 const LIVENESS_CHECK_MS = 1_000
+/** 同时等待 hello 的未认证 socket 上限，防止匿名连接堆积。 */
+const MAX_PENDING_HELLOS = 32
+/** 单连接最多保留多少个未应答心跳 nonce。 */
+const MAX_PENDING_HEARTBEATS = 8
 /** ws ping 只作为传输层存活检查，应用心跳才是授权/半开判定依据。 */
 const WS_PING_MS = 30_000
 /** 原子 rename 会替换 inode，必须 watch 目录而不是文件本身。 */
@@ -60,16 +66,21 @@ export interface HubSocketOptions {
   readonly now: () => number
   /** 握手后等待合法 hello 的上限，默认 10_000ms。 */
   readonly helloTimeoutMs?: number
+  /** 应用心跳发送间隔，默认 5_000ms。 */
+  readonly heartbeatMs?: number
   /** 应用心跳应答期限，默认 15_000ms。 */
   readonly heartbeatTimeoutMs?: number
   /** 心跳超时检查间隔，默认 1_000ms。 */
   readonly livenessCheckMs?: number
+  /** 同时等待 hello 的 socket 上限，默认 32。 */
+  readonly maxPendingHellos?: number
   /** 是否热加载设备表；默认开启。 */
   readonly watchDevices?: boolean
   /** 轮询兜底间隔，默认 2_000ms。 */
   readonly pollMs?: number
   readonly logger?: HubLogger
-  readonly onFrame?: (deviceId: string, frame: Frame) => void
+  /** 帧到达时的连接身份一并交给 relay，ACK 绑定校验不能只看 commandId。 */
+  readonly onFrame?: (identity: FrameIdentity, frame: Frame) => void
   /** hello 通过、设备进入注册表之后调用；会话索引据此按设备重建。 */
   readonly onAttach?: (deviceId: string) => void
   /** 设备连接真正被摘除后调用；用于立刻结束发给它的等待中指令。 */
@@ -91,6 +102,13 @@ interface Connection {
   readonly agents: ReadonlySet<string>
   readonly sender: Sender
   readonly ws: WebSocket
+}
+
+/** 每个已握手连接的双向心跳状态；host 发 heartbeat，node 回 heartbeat.ack。 */
+interface LivenessState {
+  lastAck: number
+  readonly nonces: Set<string>
+  timer?: ReturnType<typeof setInterval>
 }
 
 function bearerToken(req: IncomingMessage): string {
@@ -143,7 +161,9 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
   const ponged = new WeakMap<WebSocket, boolean>()
   const connections = new WeakMap<WebSocket, Connection>()
   const socketOf = new Map<string, WebSocket>()
-  const lastHeartbeat = new WeakMap<WebSocket, number>()
+  const liveness = new WeakMap<WebSocket, LivenessState>()
+  /** 升级成功但还没完成 hello 的 socket 数量；超过上限直接 4408。 */
+  let pendingHellos = 0
   /** 节点自报更高 revision 时只隔离该设备，不抬高全局修订。 */
   const recoveryFloor = new Map<string, number>()
   const helloTimers = new Set<ReturnType<typeof setTimeout>>()
@@ -167,6 +187,50 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
       && slot.connectionId === connection.connectionId
   }
 
+  const identityOf = (connection: Connection): FrameIdentity => ({
+    deviceId: connection.deviceId,
+    connectionId: connection.connectionId,
+    nodeEpoch: connection.nodeEpoch,
+  })
+
+  const stopHubHeartbeat = (ws: WebSocket): void => {
+    const state = liveness.get(ws)
+    if (state?.timer !== undefined) clearInterval(state.timer)
+    liveness.delete(ws)
+  }
+
+  /** hub 主动发 heartbeat；刷新只认带当前 connectionId/nodeEpoch 且 nonce 匹配的应答。 */
+  const startHubHeartbeat = (ws: WebSocket, connection: Connection): void => {
+    const state: LivenessState = { lastAck: now(), nonces: new Set() }
+    liveness.set(ws, state)
+    const timer = setInterval(() => {
+      if (ws.readyState !== WebSocket.OPEN || !isCurrent(connection)) return
+      const nonce = randomUUID()
+      state.nonces.add(nonce)
+      while (state.nonces.size > MAX_PENDING_HEARTBEATS) {
+        const first = state.nonces.values().next().value
+        if (first === undefined) break
+        state.nonces.delete(first)
+      }
+      sendFrame(ws, {
+        v: 2, type: 'heartbeat', nonce,
+        connectionId: connection.connectionId,
+        nodeEpoch: connection.nodeEpoch,
+        sentAt: now(),
+      })
+    }, options.heartbeatMs ?? HEARTBEAT_INTERVAL_MS)
+    timer.unref()
+    state.timer = timer
+  }
+
+  const acceptHeartbeatAck = (ws: WebSocket, connection: Connection, nonce: string, connectionId: string, nodeEpoch: string): void => {
+    const state = liveness.get(ws)
+    if (state === undefined) return
+    if (connectionId !== connection.connectionId || nodeEpoch !== connection.nodeEpoch) return
+    if (!state.nonces.delete(nonce)) return
+    state.lastAck = now()
+  }
+
   const closeDevice = (deviceId: string, code: number, reason: string): void => {
     const ws = socketOf.get(deviceId)
     if (ws !== undefined && ws.readyState === WebSocket.OPEN) ws.close(code, reason)
@@ -176,7 +240,8 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
     stateUnconfirmed = true
     const code = error instanceof DeviceStateError ? error.code : 'invalid'
     options.logger?.error(`marshal: device-state-${code}: reload rejected; closing device connections`)
-    for (const deviceId of [...socketOf.keys()]) closeDevice(deviceId, CLOSE_CODES.AUTH_FAILED, 'policy-unconfirmed')
+    // 4409 可重试：操作者修好文件后节点会重新握手，而不是把节点钉死在 4401。
+    for (const deviceId of [...socketOf.keys()]) closeDevice(deviceId, CLOSE_CODES.STALE_CONNECTION, 'invalid-reload')
   }
 
   const reload = (): void => {
@@ -192,6 +257,9 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
       const current = next.get(deviceId)
       if (current === undefined || current.revoked) {
         closeDevice(deviceId, CLOSE_CODES.AUTH_FAILED, 'device-revoked')
+      } else if (store.isRecoveryRequired(deviceId)) {
+        // 修订不可确认：可重试关闭，修好后重新握手，不把修订重置为零。
+        closeDevice(deviceId, CLOSE_CODES.STALE_CONNECTION, 'recovery-required')
       } else if (current.policyRevision !== previous.policyRevision) {
         // 授权变化必须让节点重新握手拿到新 ack；4409 可重试且不更换 nodeEpoch。
         closeDevice(deviceId, CLOSE_CODES.STALE_CONNECTION, 'policy-changed')
@@ -226,15 +294,35 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
       endHttp(socket, '401 Unauthorized')
       return
     }
+    const maxPendingHellos = options.maxPendingHellos ?? MAX_PENDING_HELLOS
+    if (pendingHellos >= maxPendingHellos) {
+      // 未认证 socket 不能无限堆积：完成升级后立即用 4408 关闭并强拆。
+      wss.handleUpgrade(req, socket, head, ws => {
+        ws.on('error', () => ws.terminate())
+        ws.close(CLOSE_CODES.HANDSHAKE_TIMEOUT, 'handshake-timeout')
+        const force = setTimeout(() => ws.terminate(), 1_000)
+        force.unref()
+        helloTimers.add(force)
+      })
+      return
+    }
+    pendingHellos += 1
 
     wss.handleUpgrade(req, socket, head, ws => {
       // 没有 error 监听器时，底层 socket 错误会变成 uncaught。
       ws.on('error', () => ws.terminate())
       ponged.set(ws, true)
       ws.on('pong', () => ponged.set(ws, true))
+      let helloDone = false
+      const completeHello = (): void => {
+        if (helloDone) return
+        helloDone = true
+        pendingHellos = Math.max(0, pendingHellos - 1)
+      }
 
       const connectionId = randomUUID()
       const helloTimer = setTimeout(() => {
+        completeHello()
         // 先发 4408 关闭帧；对端不回应关闭握手时再强拆，避免半开连接常驻。
         ws.close(CLOSE_CODES.HANDSHAKE_TIMEOUT, 'handshake-timeout')
         const force = setTimeout(() => ws.terminate(), 1_000)
@@ -252,8 +340,9 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
       }
 
       ws.on('close', () => {
+        completeHello()
         clearHelloTimer()
-        lastHeartbeat.delete(ws)
+        stopHubHeartbeat(ws)
         const connection = connections.get(ws)
         if (connection === undefined) return
         // 同一设备重连后，旧连接迟到的 close 不能摘掉新连接的槽位。
@@ -293,14 +382,19 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
             ws.close(CLOSE_CODES.AUTH_FAILED, 'device-revoked')
             return
           }
+          if (store.isRecoveryRequired(latest.id)) {
+            // 修订不可确认：拒绝授权但保持可重试，修复文件后重新握手。
+            ws.close(CLOSE_CODES.STALE_CONNECTION, 'recovery-required')
+            return
+          }
           const floor = recoveryFloor.get(latest.id)
           if (floor !== undefined && latest.policyRevision < floor) {
             // 隔离该设备：连现有连接一起关闭，避免旧连接继续写入。
             const existing = socketOf.get(latest.id)
             if (existing !== undefined && existing !== ws) {
-              existing.close(CLOSE_CODES.VERSION_UNSUPPORTED, 'recovery-required')
+              existing.close(CLOSE_CODES.STALE_CONNECTION, 'recovery-required')
             }
-            ws.close(CLOSE_CODES.VERSION_UNSUPPORTED, 'recovery-required')
+            ws.close(CLOSE_CODES.STALE_CONNECTION, 'recovery-required')
             return
           }
           if (floor !== undefined) recoveryFloor.delete(latest.id)
@@ -315,9 +409,9 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
             )
             const existing = socketOf.get(latest.id)
             if (existing !== undefined && existing !== ws) {
-              existing.close(CLOSE_CODES.VERSION_UNSUPPORTED, 'recovery-required')
+              existing.close(CLOSE_CODES.STALE_CONNECTION, 'recovery-required')
             }
-            ws.close(CLOSE_CODES.VERSION_UNSUPPORTED, 'recovery-required')
+            ws.close(CLOSE_CODES.STALE_CONNECTION, 'recovery-required')
             return
           }
 
@@ -337,9 +431,10 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
             ws,
           }
           clearHelloTimer()
+          completeHello()
           connections.set(ws, connection)
           socketOf.set(latest.id, ws)
-          lastHeartbeat.set(ws, now())
+          startHubHeartbeat(ws, connection)
           registry.attach(
             { id: latest.id, name: latest.name, agents: frame.agents },
             sender,
@@ -384,22 +479,27 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
         if (frame.type === 'hello') { ws.close(CLOSE_CODES.FRAME_INVALID, 'frame-invalid'); return }
 
         const frameConnectionId = 'connectionId' in frame ? frame.connectionId : undefined
-        if (frameConnectionId !== undefined && frameConnectionId !== current.connectionId) {
-          // ACK 用错代次时静默丢弃，不能结算新命令；其它帧则说明 socket 已过期。
-          if (frame.type === 'ack') return
-          ws.close(CLOSE_CODES.STALE_CONNECTION, 'stale-connection')
+        const frameNodeEpoch = 'nodeEpoch' in frame ? frame.nodeEpoch : undefined
+        // 心跳应答不参与业务分派；只有匹配当前连接和未应答 nonce 才刷新存活。
+        if (frame.type === 'heartbeat.ack') {
+          if (frameConnectionId !== undefined && frameNodeEpoch !== undefined) {
+            acceptHeartbeatAck(ws, current, frame.nonce, frameConnectionId, frameNodeEpoch)
+          }
           return
         }
-        const frameNodeEpoch = 'nodeEpoch' in frame ? frame.nodeEpoch : undefined
-        if (frameNodeEpoch !== undefined && frameNodeEpoch !== current.nodeEpoch) {
-          if (frame.type === 'ack' || frame.type === 'heartbeat') return
+        const connectionMismatch = frameConnectionId !== undefined && frameConnectionId !== current.connectionId
+        const epochMismatch = frameNodeEpoch !== undefined && frameNodeEpoch !== current.nodeEpoch
+        if (connectionMismatch || epochMismatch) {
+          // 错代次 ACK 交给 relay 拒绝并计数，绝不结算；迟到的节点心跳直接忽略。
+          if (frame.type === 'ack') { options.onFrame?.(identityOf(current), frame); return }
+          if (frame.type === 'heartbeat') return
           ws.close(CLOSE_CODES.STALE_CONNECTION, 'stale-connection')
           return
         }
 
         registry.touch(current.deviceId, now())
         if (frame.type === 'heartbeat') {
-          lastHeartbeat.set(ws, now())
+          // 节点发来的 heartbeat 立即回执；hub 自己的存活只由 heartbeat.ack 刷新。
           sendFrame(ws, {
             v: 2, type: 'heartbeat.ack',
             nonce: frame.nonce,
@@ -421,7 +521,7 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
             return
           }
         }
-        options.onFrame?.(current.deviceId, frame)
+        options.onFrame?.(identityOf(current), frame)
       })
     })
   }
@@ -442,8 +542,8 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
     const timeout = options.heartbeatTimeoutMs ?? HEARTBEAT_TIMEOUT_MS
     for (const ws of wss.clients) {
       if (ws.readyState !== WebSocket.OPEN) continue
-      const last = lastHeartbeat.get(ws)
-      if (last !== undefined && at - last > timeout) ws.terminate()
+      const state = liveness.get(ws)
+      if (state !== undefined && at - state.lastAck > timeout) ws.terminate()
     }
   }, options.livenessCheckMs ?? LIVENESS_CHECK_MS)
   livenessTimer.unref()
@@ -474,7 +574,10 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
       for (const helloTimer of helloTimers) clearTimeout(helloTimer)
       helloTimers.clear()
       closePort()
-      for (const ws of wss.clients) ws.terminate()
+      for (const ws of wss.clients) {
+        stopHubHeartbeat(ws)
+        ws.terminate()
+      }
       wss.close()
     },
     closeDevice,

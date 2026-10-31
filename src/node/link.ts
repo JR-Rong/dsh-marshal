@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { WebSocket } from 'ws'
 import {
   CONTRACT_REVISION, CLOSE_CODES, decodeFrame, encodeFrame,
-  type EventFrame, type HeartbeatFrame, type HelloAckFrame,
+  type EventFrame, type HeartbeatAckFrame, type HeartbeatFrame, type HelloAckFrame,
 } from '../wire/frames.ts'
 import { OFFLINE_QUEUE_MAX_BYTES, OFFLINE_QUEUE_MAX_ITEMS } from '../wire/limits.ts'
 
@@ -245,6 +245,8 @@ export class NodeLink {
 
   private receive(ws: WebSocket, text: string): void {
     if (this.socket !== ws) return
+    // hub 主动发来的 heartbeat 只回执，不进入命令分派，也不刷新本地存活期限。
+    if (this.replyToHeartbeat(ws, text)) return
     if (this.acked) {
       // heartbeat.ack 只驱动本地存活判定，不进入命令分派。
       if (this.consumeHeartbeatAck(text)) return
@@ -317,6 +319,37 @@ export class NodeLink {
       if (decoded.type !== 'hello.ack') return { kind: 'none' }
       return { kind: 'valid', frame: decoded }
     } catch { return { kind: 'none' } }
+  }
+
+  /** 只对当前连接、当前 nodeEpoch 的 hub heartbeat 回显 nonce；其它一律忽略。 */
+  private replyToHeartbeat(ws: WebSocket, text: string): boolean {
+    let parsed: unknown
+    try { parsed = JSON.parse(text) } catch { return false }
+    if (typeof parsed !== 'object' || parsed === null) return false
+    const frame = parsed as {
+      type?: unknown
+      nonce?: unknown
+      connectionId?: unknown
+      nodeEpoch?: unknown
+      sentAt?: unknown
+    }
+    if (frame.type !== 'heartbeat') return false
+    const connectionId = this.connectionId
+    if (!this.acked
+      || connectionId === undefined
+      || typeof frame.nonce !== 'string'
+      || frame.nonce === ''
+      || frame.connectionId !== connectionId
+      || frame.nodeEpoch !== this.options.nodeEpoch) {
+      return true
+    }
+    const ack: HeartbeatAckFrame = {
+      v: 2, type: 'heartbeat.ack', nonce: frame.nonce,
+      connectionId, nodeEpoch: this.options.nodeEpoch,
+      sentAt: typeof frame.sentAt === 'number' ? frame.sentAt : 0,
+    }
+    this.trySend(ws, encodeFrame(ack))
+    return true
   }
 
   private consumeHeartbeatAck(text: string): boolean {

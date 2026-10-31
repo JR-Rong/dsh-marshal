@@ -106,6 +106,24 @@ describe('ensureInstall', () => {
     expect(existsSync(join(dir, 'identity.json'))).toBe(true)
   })
 
+  it('匹配意图也不能在身份已存在时重建缺失的设备表', () => {
+    const { dir, devicesFile } = setup()
+    const install = ensureInstall(devicesFile)
+    rmSync(devicesFile)
+    writeJson(join(dir, 'init-intent.json'), {
+      version: 1, operatorId: install.operatorId, devicesPath: devicesFile, createdAt: Date.now(),
+    })
+    expect(() => ensureInstall(devicesFile)).toThrowError(StateDevicesMissingError)
+    expect(existsSync(devicesFile)).toBe(false)
+  })
+
+  it('身份记录绑定设备表路径', () => {
+    const { dir, devicesFile } = setup()
+    ensureInstall(devicesFile)
+    const identity = JSON.parse(readFileSync(join(dir, 'identity.json'), 'utf8')) as { devicesPath?: string }
+    expect(identity.devicesPath).toBe(devicesFile)
+  })
+
   it('意图指向别的设备表时转人工恢复', () => {
     const { dir, devicesFile } = setup()
     writeJson(join(dir, 'init-intent.json'), {

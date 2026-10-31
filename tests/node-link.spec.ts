@@ -385,6 +385,42 @@ describe('NodeLink', () => {
     expect(JSON.parse(second ?? '{}')).toMatchObject({ operatorId: 'op-1', policyRevision: 1 })
   })
 
+  it('回复 hub heartbeat，回显 nonce/connectionId/nodeEpoch', async () => {
+    const { port, wss, received } = await listen()
+
+    const link = createLink(port, { maxBackoffMs: 40 })
+    link.start()
+    await waitFor(() => link.binding !== undefined, 'hello.ack binding')
+    const client = [...wss.clients][0]
+    if (client === undefined) throw new Error('server socket missing')
+    client.send(JSON.stringify({
+      v: 2, type: 'heartbeat', nonce: 'hub-nonce',
+      connectionId: 'conn-1', nodeEpoch: NODE_EPOCH, sentAt: 5,
+    }))
+    await waitFor(() => received.some(text => typeOf(text) === 'heartbeat.ack'), 'heartbeat.ack reply')
+    const reply = JSON.parse(received.find(text => typeOf(text) === 'heartbeat.ack') ?? '{}')
+    expect(reply).toEqual({
+      v: 2, type: 'heartbeat.ack', nonce: 'hub-nonce',
+      connectionId: 'conn-1', nodeEpoch: NODE_EPOCH, sentAt: 5,
+    })
+  })
+
+  it('不回复错代次或错 nodeEpoch 的 hub heartbeat', async () => {
+    const { port, wss, received } = await listen()
+
+    const link = createLink(port, { maxBackoffMs: 40 })
+    link.start()
+    await waitFor(() => link.binding !== undefined, 'hello.ack binding')
+    const client = [...wss.clients][0]
+    if (client === undefined) throw new Error('server socket missing')
+    client.send(JSON.stringify({
+      v: 2, type: 'heartbeat', nonce: 'late',
+      connectionId: 'other-connection', nodeEpoch: NODE_EPOCH, sentAt: 5,
+    }))
+    await settle(80)
+    expect(received.some(text => typeOf(text) === 'heartbeat.ack')).toBe(false)
+  })
+
   it('heartbeat.ack 超时后断开并按退避重连', async () => {
     let connections = 0
     const { port } = await listen({

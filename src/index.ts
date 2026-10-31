@@ -42,11 +42,10 @@ function applyHub(ctx: MarshalContext, config: MarshalConfig): void {
     // 设备重连时节点会重发快照：先清索引，再让快照重建。
     onAttach: deviceId => relay.clearDevice(deviceId),
     onDetach: deviceId => relay.deviceOffline(deviceId),
-    onFrame: (_device, frame) => {
-      // 事件进索引并扇出；ack 必须回填，否则 relay 的每条指令都会超时。
-      // TODO(V0-T03): 把 pending 完整绑定到 ack 的 connectionId/nodeEpoch；当前沿用 hello 槽位快照。
+    onFrame: (identity, frame) => {
+      // 事件进索引并扇出；ACK 必须同时匹配 commandId 与连接身份才结算。
       if (frame.type === 'event') relay.publish(frame)
-      else if (frame.type === 'ack') relay.settle(frame)
+      else if (frame.type === 'ack') relay.settle(frame, identity)
     },
   })
   ctx.effect(() => { socket.dispose(); relay.dispose() }, 'marshal: uplink socket')

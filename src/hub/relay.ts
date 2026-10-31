@@ -37,6 +37,16 @@ const MAX_SUBSCRIBERS = 200
 /** dispose 之后所有未完成与新到的指令都以这个固定错误结束。 */
 const DISPOSED_MESSAGE = 'relay: disposed'
 
+/** 被拒绝 ACK 的计数上限：只用于观测，不能被对端无限推高。 */
+const MAX_REJECTED_ACKS = 1_000
+
+/** 帧到达时的连接身份；ACK 必须与命令绑定及当前连接同时匹配。 */
+export interface FrameIdentity {
+  readonly deviceId: string
+  readonly connectionId: string
+  readonly nodeEpoch: string
+}
+
 function disposedOutcome(): CommandOutcome {
   return { ok: false, code: 'disposed', message: DISPOSED_MESSAGE }
 }
@@ -45,6 +55,8 @@ interface Pending {
   resolve: (outcome: CommandOutcome) => void
   timer: NodeJS.Timeout
   readonly deviceId: string
+  readonly connectionId: string
+  readonly nodeEpoch: string
 }
 
 export class HubRelay {
@@ -56,6 +68,7 @@ export class HubRelay {
   private readonly index = new Map<string, SessionRow>()
   private readonly epochs = new Map<string, string>()
   private disposed = false
+  private rejectedAckTotal = 0
 
   constructor(private readonly options: {
     registry: DeviceRegistry
@@ -63,6 +76,15 @@ export class HubRelay {
     timeoutMs?: number
     operatorId?: string
   }) {}
+
+  /** 身份不匹配或已超时的 ACK 计数，饱和在上限内。 */
+  get rejectedAcks(): number { return this.rejectedAckTotal }
+
+  get rejectedAckCount(): number { return this.rejectedAckTotal }
+
+  private rejectAck(): void {
+    if (this.rejectedAckTotal < MAX_REJECTED_ACKS) this.rejectedAckTotal += 1
+  }
 
   async command(input: CommandInput): Promise<CommandOutcome> {
     if (this.disposed) return disposedOutcome()
@@ -95,6 +117,8 @@ export class HubRelay {
     const commandId = randomUUID()
     const timeoutMs = this.options.timeoutMs ?? COMMAND_TTL_MS
     const issuedAt = this.options.now()
+    const connectionId = slot.connectionId ?? UNBOUND_CONNECTION_ID
+    const nodeEpoch = slot.nodeEpoch ?? UNBOUND_NODE_EPOCH
     const frame: CommandFrame = {
       v: 2, type: 'command', commandId, idempotencyKey: input.idempotencyKey,
       operatorId: this.options.operatorId ?? PLACEHOLDER_OPERATOR_ID,
@@ -103,8 +127,8 @@ export class HubRelay {
       args: input.args ?? {},
       issuedAt,
       deadline: issuedAt + timeoutMs,
-      connectionId: slot.connectionId ?? UNBOUND_CONNECTION_ID,
-      nodeEpoch: slot.nodeEpoch ?? UNBOUND_NODE_EPOCH,
+      connectionId,
+      nodeEpoch,
     }
 
     const outcome = await new Promise<CommandOutcome>((resolve, reject) => {
@@ -112,7 +136,9 @@ export class HubRelay {
         this.pending.delete(commandId)
         resolve({ ok: false, code: 'timeout' })
       }, timeoutMs)
-      this.pending.set(commandId, { resolve, timer, deviceId: input.target.deviceId })
+      this.pending.set(commandId, {
+        resolve, timer, deviceId: input.target.deviceId, connectionId, nodeEpoch,
+      })
       let text: string
       try {
         text = encodeFrame(frame)
@@ -136,9 +162,27 @@ export class HubRelay {
     return outcome
   }
 
-  settle(ack: AckFrame): void {
+  /**
+   * 只有 commandId、绑定连接身份与当前注册槽位全部匹配的 ACK 才能结算；
+   * 旧连接/旧代次的 ACK 一律忽略并计入有界拒绝计数（契约 §4.6）。
+   */
+  settle(ack: AckFrame, origin: FrameIdentity): void {
     const entry = this.pending.get(ack.commandId)
-    if (entry === undefined) return
+    if (entry === undefined) {
+      this.rejectAck()
+      return
+    }
+    const slot = this.options.registry.get(entry.deviceId)
+    const currentConnection = slot !== undefined
+      && (slot.connectionId ?? UNBOUND_CONNECTION_ID) === origin.connectionId
+      && (slot.nodeEpoch ?? UNBOUND_NODE_EPOCH) === origin.nodeEpoch
+    if (origin.deviceId !== entry.deviceId
+      || !currentConnection
+      || ack.connectionId !== entry.connectionId
+      || ack.nodeEpoch !== entry.nodeEpoch) {
+      this.rejectAck()
+      return
+    }
     clearTimeout(entry.timer)
     this.pending.delete(ack.commandId)
     switch (ack.status) {

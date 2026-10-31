@@ -6,7 +6,7 @@ import {
   DeviceStateError, DeviceStore, migrateLegacyState,
   readDeviceState, serializeDevicesState,
 } from '../hub/devices.ts'
-import { ensureInstall } from '../hub/identity.ts'
+import { ensureInstall, ensureMigratedIdentity } from '../hub/identity.ts'
 import { atomicWriteFile, withFileLock } from '../hub/state-file.ts'
 
 const DEFAULT_FILE = `${homedir()}/.dsh-marshal/devices.json`
@@ -18,7 +18,9 @@ const USAGE = `usage: marshal-device <command> [args]
   list                               list ids, policy flags and revisions
   allow <deviceId> <content|interactions|discussion> <on|off>
                                      change a local policy flag
-  migrate                            convert a v1 table to <devicesFile>.v2
+  migrate [--create-identity]        convert a v1 table to <devicesFile>.v2;
+                                     --create-identity also adopts the migrated
+                                     table as this install's operator identity
   --help                             show this message`
 
 function pathFromEnv(): string {
@@ -105,21 +107,42 @@ function allow(
   console.log(`allowContent=${result.entry.allowContent ? 'on' : 'off'} allowInteractions=${result.entry.allowInteractions ? 'on' : 'off'} allowDiscussion=${result.entry.allowDiscussion ? 'on' : 'off'}`)
 }
 
-function migrate(file: string): void {
+function migrate(file: string, createIdentity: boolean): void {
   const loaded = readDeviceState(file)
   if (loaded.kind === 'missing') fail(`device table ${file} is missing`)
   if (loaded.kind === 'current') fail(`${file} is already a v2 device table; nothing to migrate`)
   const target = `${file}.v2`
-  if (existsSync(target)) fail(`${target} already exists; refusing to overwrite it`)
-  const state = migrateLegacyState(loaded.devices)
-  // 新表也是设备表写者，共用同一锁与原子替换；锁内再核对一次，避免并发迁移覆盖。
-  withFileLock(target, () => {
-    if (existsSync(target)) throw new Error(`${target} already exists; refusing to overwrite it`)
-    atomicWriteFile(target, serializeDevicesState(state), 0o600)
-  })
-  console.log(`migrated ${loaded.devices.length} device(s) to ${target}`)
-  console.log(`the v1 table at ${file} was left untouched`)
-  console.log(`set devicesFile to ${target}; identity.json is not created by migrate`)
+  if (existsSync(target)) {
+    if (!createIdentity) fail(`${target} already exists; refusing to overwrite it`)
+    // 允许在已迁移的表上补做一次身份对账，但不再重写表内容。
+    const existing = readDeviceState(target)
+    if (existing.kind !== 'current') fail(`${target} is not a valid v2 device table`)
+  } else {
+    const state = migrateLegacyState(loaded.devices)
+    // 新表也是设备表写者，共用同一锁与原子替换；锁内再核对一次，避免并发迁移覆盖。
+    withFileLock(target, () => {
+      if (existsSync(target)) throw new Error(`${target} already exists; refusing to overwrite it`)
+      atomicWriteFile(target, serializeDevicesState(state), 0o600)
+    })
+    console.log(`migrated ${loaded.devices.length} device(s) to ${target}`)
+    console.log(`the v1 table at ${file} was left untouched`)
+  }
+
+  if (!createIdentity) {
+    console.log(`set devicesFile to ${target}`)
+    console.log('identity.json was not created; adopt the migrated table with the one-time command:')
+    console.log('  marshal-device migrate --create-identity')
+    return
+  }
+
+  // 与 hub/CLI 的其他写者共用 <devicesFile>.lock；身份要么新建要么核对后沿用。
+  const adopted = ensureMigratedIdentity(target)
+  console.log(`operatorId=${adopted.operatorId}`)
+  console.log(`identity.json now points at ${target}`)
+  console.warn(
+    'WARNING: this is the one-time reconciliation step for a migrated install; '
+    + 'keep identity.json and the .v2 table together, and do not run it again with a different table.',
+  )
 }
 
 function main(argv: readonly string[]): void {
@@ -138,7 +161,7 @@ function main(argv: readonly string[]): void {
     case 'revoke': revoke(file, argv[1]); return
     case 'list': list(file); return
     case 'allow': allow(file, argv[1], argv[2], argv[3]); return
-    case 'migrate': migrate(file); return
+    case 'migrate': migrate(file, argv[1] === '--create-identity'); return
     default:
       console.error(USAGE)
       fail(`unknown command "${command}"`)

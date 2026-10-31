@@ -80,13 +80,43 @@ function tryLock(lockPath: string): LockHandle | undefined {
   }
 }
 
-function lockIsStale(lockPath: string, now: () => number): boolean {
+/** 锁文件里记录的 pid；不存在或不可解析都视为没有存活证据。 */
+function recordedPid(lockPath: string): number | undefined {
   try {
-    return now() - statSync(lockPath).mtimeMs > LOCK_STALE_MS
+    const parsed: unknown = JSON.parse(readFileSync(lockPath, 'utf8'))
+    if (typeof parsed !== 'object' || parsed === null) return undefined
+    const pid = (parsed as { pid?: unknown }).pid
+    return typeof pid === 'number' && Number.isInteger(pid) && pid > 0 ? pid : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** EPERM 说明进程存在但属于别的用户，仍然算存活。 */
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+    return (error as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
+/**
+ * 陈旧判定只取获取锁当下的 mtime（不是内存里的创建时间），
+ * 且必须没有存活的记录 pid：长任务持有锁超过阈值时不能误抢。
+ */
+function lockIsStale(lockPath: string, now: () => number): boolean {
+  let mtimeMs: number
+  try {
+    mtimeMs = statSync(lockPath).mtimeMs
+  } catch {
     return false
   }
+  if (now() - mtimeMs <= LOCK_STALE_MS) return false
+  const pid = recordedPid(lockPath)
+  if (pid !== undefined && pid !== process.pid && pidAlive(pid)) return false
+  return true
 }
 
 /**
