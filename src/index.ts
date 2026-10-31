@@ -11,12 +11,17 @@ import { createHubSync } from './hub/sync.ts'
 import { ensureInstall } from './hub/identity.ts'
 import { createDshSurface } from './adapters/dsh/surface.ts'
 import { createDshAdapter } from './adapters/dsh/adapter.ts'
+import type { Adapter } from './adapters/types.ts'
+import { createCodexAdapter } from './agents/codex/adapter.ts'
+import { createClaudeAdapter } from './agents/claude/adapter.ts'
+import type { AgentAdapter, NativeInputPort } from './agents/types.ts'
 import { NodeLink } from './node/link.ts'
 import { createNodeSync, type NodeSync } from './node/sync.ts'
 import { openJournal } from './node/journal.ts'
-import { createFollower, runCommand } from './node/runner.ts'
+import { createFollower, runRoutedCommand, type AgentRoute } from './node/runner.ts'
 import { createSeqAllocator, withPublicSeq } from './node/seq.ts'
 import { createQuestionRelay, type QuestionRelay } from './node/questions.ts'
+import { createInteractionRelay } from './node/interactions.ts'
 import { createAuditLog } from './node/audit.ts'
 import { createPrivacyProjector, type PrivacyProjector } from './node/privacy.ts'
 
@@ -71,9 +76,44 @@ function applyHub(ctx: MarshalContext, config: MarshalConfig): void {
   ctx.logger.info(`marshal: hub ready at ${webServer.getOrigin()}/marshal`)
 }
 
+/** 各 agent 独立投影器；agent 名嵌在指纹里，绝不能共用一个实例。 */
+interface NodeBinding {
+  readonly agent: string
+  readonly adapter: Adapter
+  readonly runtimeEpoch: string
+  readonly follower: ReturnType<typeof createFollower>
+  readonly liveProjector: PrivacyProjector
+  /** DSH 问题表或 Codex/Claude 交互中继；两者都只做卡片与结算。 */
+  readonly relayPort: RelayPort | undefined
+  emit(event: EventFrame): void
+  emitVolatile(event: EventFrame): void
+  readonly inputs: {
+    snapshot(sessionId: string): readonly unknown[]
+    runtimeEpoch(sessionId: string): string
+    highWatermark(sessionId: string): number
+  }
+}
+
+/** QuestionRelay 与 NativeInputPort 的公共只读/生命周期面。 */
+interface RelayPort {
+  snapshot(sessionId: string): readonly unknown[]
+  revalidate(): void
+  dispose(): void
+}
+
+const SUPPORTED_AGENTS: ReadonlySet<string> = new Set(['dsh', 'codex', 'claude'])
+
 function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
-  const controller = ctx.sessionController
-  if (controller === undefined) throw new Error('marshal: node role requires the sessionController service')
+  // 未知 agent 是启动配置错误：不能带着无法投影的适配器上线。
+  for (const agent of config.agents) {
+    if (!SUPPORTED_AGENTS.has(agent)) {
+      throw new Error(`marshal: unsupported agent in config.agents: ${agent}`)
+    }
+  }
+  // DSH 需要宿主的 sessionController；codex/claude 是独立子进程，不依赖它。
+  if (config.agents.includes('dsh') && ctx.sessionController === undefined) {
+    throw new Error('marshal: node role requires the sessionController service')
+  }
 
   // journal 在发起任何调用前打开并持有进程间锁；损坏/缺失时直接启动失败，
   // 不能带着空去重表继续接受写命令。
@@ -81,21 +121,20 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
   // nodeEpoch 只随插件实例生成；普通重连沿用同一个值。
   const nodeEpoch = randomUUID()
   const errorName = (error: unknown): string => error instanceof Error && error.name !== '' ? error.name : 'error'
-  let relay: QuestionRelay | undefined
-  const adapter = createDshAdapter(createDshSurface(controller), {
-    deviceId: config.deviceId!,
-    nodeEpoch,
-    answers: {
-      settle: (sessionId, requestId, answers) => relay?.settle(sessionId, requestId, answers) ?? 'unknown',
-      // 普通提问的 cancel 只结算本进程待答表，不是原生会话取消。
-      cancel: (sessionId, requestId) => relay?.cancel(sessionId, requestId) ?? 'unknown',
-    },
-  })
   const audit = createAuditLog({ warn: message => ctx.logger.warn(message) })
 
-  // 单一投影端口：策略在每次握手后重建，所有出口都通过 liveProjector 取当前实例。
-  const buildProjector = (allowContent: boolean, allowInteractions: boolean): PrivacyProjector =>
-    createPrivacyProjector({
+  // 公开 seq 全节点共用一个分配器；适配器预分配的序号在出站前被覆盖。
+  const publicSeq = createSeqAllocator()
+  const bindings = new Map<string, NodeBinding>()
+  const routes = new Map<string, AgentRoute>()
+  /** 每次握手重建；缺失时一律退回最严格投影。 */
+  const projectors = new Map<string, PrivacyProjector>()
+  /** 握手前的策略基线：内容/交互必须同时获得两端授权。 */
+  const policies = { allowContent: false, allowInteractions: false }
+
+  const buildProjector = (agent: string, allowContent: boolean, allowInteractions: boolean): PrivacyProjector => {
+    const nextSeq = bindings.get(agent)?.adapter.nextSeq
+    return createPrivacyProjector({
       privacy: config.privacy,
       allowContent,
       questionRelay: config.questionRelay,
@@ -103,38 +142,219 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
       allowInteractions,
       redaction: config.redaction,
       deviceId: config.deviceId!,
-      agent: adapter.agent,
+      agent,
       nodeEpoch,
       now: Date.now,
-      nextSeq: sessionId => adapter.nextSeq?.(sessionId) ?? 0,
+      ...(nextSeq === undefined ? {} : { nextSeq: (sessionId: string) => nextSeq(sessionId) }),
     })
-  // 握手前一律按最严格策略出站；内容/交互必须同时获得两端授权。
-  let projector = buildProjector(false, false)
-  const liveProjector: PrivacyProjector = {
-    get content() { return projector.content },
-    event: frame => projector.event(frame),
-    ack: ack => projector.ack(ack),
-    error: (origin, code, meta) => projector.error(origin, code, meta),
-    syncRow: row => projector.syncRow(row),
-    statusResult: result => projector.statusResult(result),
-    card: card => projector.card(card),
-    auditFields: fields => projector.auditFields(fields),
   }
+  const fallbackProjectors = new Map<string, PrivacyProjector>()
+  const currentProjector = (agent: string): PrivacyProjector => {
+    const current = projectors.get(agent)
+    if (current !== undefined) return current
+    // 握手前的兜底也按 agent 缓存，避免每次出口都重编译脱敏规则。
+    let strict = fallbackProjectors.get(agent)
+    if (strict === undefined) {
+      strict = buildProjector(agent, false, false)
+      fallbackProjectors.set(agent, strict)
+    }
+    return strict
+  }
+  /** 稳定的委托端口：握手重建后无需重新装配 relay/适配器。 */
+  const liveProjector = (agent: string): PrivacyProjector => ({
+    get content() { return currentProjector(agent).content },
+    event: frame => currentProjector(agent).event(frame),
+    ack: ack => currentProjector(agent).ack(ack),
+    error: (origin, code, meta) => currentProjector(agent).error(origin, code, meta),
+    syncRow: row => currentProjector(agent).syncRow(row),
+    statusResult: result => currentProjector(agent).statusResult(result),
+    card: card => currentProjector(agent).card(card),
+    auditFields: fields => currentProjector(agent).auditFields(fields),
+  })
 
-  // 公开 seq 只在投影/过滤之后分配；适配器预分配的序号在出站前被覆盖。
-  const publicSeq = createSeqAllocator()
-  const emitProjected = (event: EventFrame): void => {
-    for (const projected of projector.event(event)) {
-      // 同步层记录已投影的增量，扫描时不能用更旧的清单覆盖它。
-      nodeSync?.observe(projected)
-      link.sendEvent(withPublicSeq(publicSeq, projected))
+  let nodeSync: NodeSync | undefined
+  /** 逐事件兜底：单帧超限或投影失败只丢这一帧，不能终止跟随循环。 */
+  const emitProjected = (agent: string, event: EventFrame): void => {
+    let projected: EventFrame[]
+    try {
+      projected = currentProjector(agent).event(event)
+    } catch (error) {
+      ctx.logger.warn(`marshal: project ${agent} dropped event: ${errorName(error)}`)
+      return
+    }
+    for (const item of projected) {
+      try {
+        // 同步层记录已投影的增量，扫描时不能用更旧的清单覆盖它。
+        nodeSync?.observe(item)
+        link.sendEvent(withPublicSeq(publicSeq, item))
+      } catch (error) {
+        ctx.logger.warn(`marshal: send ${agent} dropped event: ${errorName(error)}`)
+      }
     }
   }
-  const emitVolatileProjected = (event: EventFrame): void => {
+  // 卡片/通知是交互帧：只走 volatile 出口，断线即丢，绝不进入离线队列。
+  // 序号在投影之后统一分配；卡片 payload 已由 relay 投影，这里只补公开 seq。
+  const emitVolatile = (event: EventFrame): void => {
     link.sendVolatileEvent(withPublicSeq(publicSeq, event))
   }
 
-  let nodeSync: NodeSync | undefined
+  const register = (
+    agent: string,
+    adapter: Adapter,
+    runtimeEpoch: string,
+    relayPort: RelayPort | undefined,
+  ): void => {
+    const emit = (event: EventFrame): void => { emitProjected(agent, event) }
+    const follower = createFollower({ adapter, send: emit, logger: ctx.logger })
+    const inputs = {
+      // 待答快照只读：node 内存里的当前有效卡，公开高水位与事件同源。
+      snapshot: (sessionId: string) => relayPort?.snapshot(sessionId) ?? [],
+      // 卡片由 relay 的实例代次产出；没有 relay 时退回节点握手代次。
+      runtimeEpoch: () => runtimeEpoch,
+      // 必须按会话取高水位：hub 把它当作该会话的回放/去重底价。
+      highWatermark: (sessionId: string) => publicSeq.highWatermark({
+        deviceId: config.deviceId!, agent, sessionId, nodeEpoch,
+      }),
+    }
+    bindings.set(agent, {
+      agent, adapter, runtimeEpoch, follower,
+      liveProjector: liveProjector(agent),
+      relayPort,
+      emit,
+      emitVolatile,
+      inputs,
+    })
+    // 命令/状态/待答快照都按 target.agent 走各自的投影器与审计。
+    routes.set(agent, { adapter, follower, runtime: { projector: () => currentProjector(agent), audit, inputs } })
+  }
+
+  if (config.agents.includes('dsh')) {
+    let dshRelay: QuestionRelay | undefined
+    const dshAdapter = createDshAdapter(createDshSurface(ctx.sessionController!), {
+      deviceId: config.deviceId!,
+      nodeEpoch,
+      answers: {
+        settle: (sessionId, requestId, answers) => dshRelay?.settle(sessionId, requestId, answers) ?? 'unknown',
+        // 普通提问的 cancel 只结算本进程待答表，不是原生会话取消。
+        cancel: (sessionId, requestId) => dshRelay?.cancel(sessionId, requestId) ?? 'unknown',
+      },
+    })
+    if (config.questionRelay !== 'off') {
+      dshRelay = createQuestionRelay({
+        ctx, timeoutMs: config.answerTimeoutMs,
+        projector: liveProjector('dsh'),
+        runtimeEpoch: nodeEpoch,
+        send: event => emitVolatile(event),
+        frame: dshAdapter.frame,
+        // 断线/syncing 期间暂停新认领；已认领的请求仍按原 monoDeadline 等待。
+        available: () => link.online,
+        now: Date.now,
+        monoNow: () => globalThis.performance.now(),
+        deviceId: config.deviceId!,
+        agent: 'dsh',
+        // 当前协商授权；DSH 只有普通提问，relay 字段必须显式带上。
+        authorization: () => {
+          const current = link.binding
+          if (current === undefined) return undefined
+          return {
+            relay: config.questionRelay,
+            operatorId: current.operatorId,
+            policyRevision: current.policyRevision,
+            allowInteractions: current.policies.allowInteractions,
+            content: liveProjector('dsh').content,
+          }
+        },
+      })
+    }
+    register('dsh', dshAdapter, nodeEpoch, dshRelay)
+  }
+
+  /**
+   * Codex/Claude 的交互中继：authorization 不含 relay（由 relay 按 kind 组合），
+   * stillOwned 用适配器自己的写权端口判断，不能把只读会话的卡交给远答。
+   */
+  const interactionRelay = (
+    agent: 'codex' | 'claude',
+    adapter: () => AgentAdapter,
+    runtimeEpoch: string,
+  ): NativeInputPort | undefined => {
+    if (config.questionRelay === 'off' && config.approvalRelay === 'off') return undefined
+    return createInteractionRelay({
+      questionRelay: config.questionRelay,
+      approvalRelay: config.approvalRelay,
+      questionTimeoutMs: config.answerTimeoutMs,
+      approvalTimeoutMs: config.approvalTimeoutMs,
+      projector: liveProjector(agent),
+      runtimeEpoch,
+      send: event => emitVolatile(event),
+      // 帧工厂由适配器给出；claim 只会在适配器构造完成后发生。
+      frame: (sessionId, kind, payload) => adapter().frame(sessionId, kind, payload),
+      authorization: () => handshakeAuthorization(agent),
+      available: () => link.online,
+      stillOwned: sessionId => adapter().ownershipPort?.ownership(sessionId) === 'ours',
+      deviceId: config.deviceId!,
+      agent,
+      now: Date.now,
+      monoNow: () => globalThis.performance.now(),
+    })
+  }
+  const handshakeAuthorization = (agent: string) => {
+    const current = link.binding
+    if (current === undefined) return undefined
+    return {
+      operatorId: current.operatorId,
+      policyRevision: current.policyRevision,
+      allowInteractions: current.policies.allowInteractions,
+      content: projectors.get(agent)?.content === true,
+    }
+  }
+
+  if (config.agents.includes('codex')) {
+    const codexEpoch = `${nodeEpoch}:codex:${randomUUID()}`
+    let codexAdapter: AgentAdapter
+    const codexRelay = interactionRelay('codex', () => codexAdapter, codexEpoch)
+    codexAdapter = createCodexAdapter({
+      deviceId: config.deviceId!,
+      nodeEpoch,
+      runtimeEpoch: codexEpoch,
+      questionRelay: config.questionRelay,
+      approvalRelay: config.approvalRelay,
+      ...(codexRelay === undefined ? {} : { inputRelay: codexRelay }),
+      // 设置正文是否可见只看当前投影器，不看 wire 或请求参数。
+      contentAuthorized: () => projectors.get('codex')?.content === true,
+      ...(config.codexExecutable === undefined ? {} : { explicitPath: config.codexExecutable }),
+    })
+    register('codex', codexAdapter, codexEpoch, codexRelay)
+  }
+
+  if (config.agents.includes('claude')) {
+    const claudeEpoch = `${nodeEpoch}:claude:${randomUUID()}`
+    let claudeAdapter: AgentAdapter
+    const claudeRelay = interactionRelay('claude', () => claudeAdapter, claudeEpoch)
+    claudeAdapter = createClaudeAdapter({
+      deviceId: config.deviceId!,
+      nodeEpoch,
+      runtimeEpoch: claudeEpoch,
+      questionRelay: config.questionRelay,
+      approvalRelay: config.approvalRelay,
+      ...(claudeRelay === undefined ? {} : { inputRelay: claudeRelay }),
+      ...(config.claudeExecutable === undefined
+        ? {}
+        : { pathToClaudeCodeExecutable: config.claudeExecutable }),
+    })
+    register('claude', claudeAdapter, claudeEpoch, claudeRelay)
+  }
+
+  /** 未知 agent 的帧工厂：同步层理论上不会走到这里，但也不能抛。 */
+  const frameFor = (agent: string, sessionId: string, kind: EventFrame['kind'], payload: unknown): EventFrame => {
+    const source = bindings.get(agent)
+    if (source !== undefined) return source.adapter.frame(sessionId, kind, payload)
+    return {
+      v: 2, type: 'event', deviceId: config.deviceId!, agent, sessionId,
+      nodeEpoch, seq: 0, ts: Date.now(), kind, payload,
+    }
+  }
+
   const link = new NodeLink({
     url: config.hubUrl!, token: config.token!, deviceId: config.deviceId!,
     deviceName: config.deviceName,
@@ -146,89 +366,59 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
       try { frame = decodeFrame(text) } catch { return }
       // sync.ack 是生命周期控制帧，不能进入命令分派。
       if (frame.type === 'sync.ack') { nodeSync?.onFrame(frame); return }
-      runCommand(link, adapter, follower, frame, config.deviceId!, journal, Date.now, {
-        projector: () => projector,
-        audit,
-        // 待答快照只读：node 内存里的当前有效卡，公开高水位与事件同源。
-        inputs: {
-          snapshot: sessionId => relay?.snapshot(sessionId) ?? [],
-          // 卡片由 relay 的 runtime 产出；关闭 relay 时才退回节点握手代次。
-          runtimeEpoch: () => relay?.runtimeEpoch ?? nodeEpoch,
-          // 必须按会话取高水位：hub 把它当作该会话的回放/去重底价，设备级峰值会误杀低序号会话。
-          highWatermark: sessionId => publicSeq.highWatermark({
-            deviceId: config.deviceId!, agent: adapter.agent, sessionId, nodeEpoch,
-          }),
-        },
-      })
+      // 按 target.agent 分派到该 agent 的适配器/跟随表/投影器；未知 agent 只回拒绝。
+      runRoutedCommand(link, routes, frame, config.deviceId!, journal, Date.now)
     },
     onHandshake: (binding, previous) => {
       const tightened = (previous?.policies.allowContent === true && binding.policies.allowContent !== true)
         || (previous?.policies.allowInteractions === true && binding.policies.allowInteractions !== true)
-      // 每次合法 hello.ack 都重新核验旧卡授权（含仅 revision 变化）；
-      // 必须在重建投影器之前发出 invalidated，否则收紧后连终态都发不出去。
-      relay?.revalidate()
-      projector = buildProjector(binding.policies.allowContent, binding.policies.allowInteractions)
+      // 每个 relay 都先按新协商复核旧卡：授权变化（含仅 revision 变化）立即结算，
+      // 且必须发生在重建投影器之前，否则收紧后连 invalidated 终态都发不出去。
+      for (const item of bindings.values()) item.relayPort?.revalidate()
+      policies.allowContent = binding.policies.allowContent
+      policies.allowInteractions = binding.policies.allowInteractions
+      // 每个 agent 各自重建：agent 名参与投影，不能共享实例。
+      for (const agent of config.agents) projectors.set(agent, buildProjector(agent, policies.allowContent, policies.allowInteractions))
       // 旧队列按更宽策略编码，不能在新握手上补发。
       if (tightened) link.clearOutbound()
     },
     // hello.ack 后进入 syncing：先完成原子快照屏障，绝不能在这里冲刷普通事件。
     onSyncNeeded: () => { nodeSync?.begin() },
-    // 订阅绑定当前连接：断线即清空引用，重连后由 hub 重新订阅。
+    // 订阅绑定当前连接：断线即清空每个 agent 的跟随引用。
     onOffline: () => {
       nodeSync?.abort()
-      follower.stopAll()
+      for (const item of bindings.values()) item.follower.stopAll()
     },
     onError: error => ctx.logger.warn(`marshal: link error: ${errorName(error)}`),
   })
+
   nodeSync = createNodeSync({
     link,
-    sources: [{ agent: adapter.agent, syncSnapshot: signal => adapter.syncSnapshot(signal) }],
+    sources: [...bindings.values()].map(item => ({
+      agent: item.agent,
+      syncSnapshot: (signal: AbortSignal) => item.adapter.syncSnapshot(signal),
+    })),
     agents: config.agents,
-    projector: () => liveProjector,
-    emit: event => emitProjected(event),
-    frame: (agent, sessionId, kind, payload) => adapter.frame(sessionId, kind, payload),
+    projector: agent => currentProjector(agent),
+    emit: event => {
+      const item = bindings.get(event.agent)
+      if (item !== undefined) item.emit(event)
+      else emitProjected(event.agent, event)
+    },
+    frame: (agent, sessionId, kind, payload) => frameFor(agent, sessionId, kind, payload),
     highWatermark: () => publicSeq.highWatermark(),
-    logger: ctx.logger,
-  })
-  relay = config.questionRelay === 'off'
-    ? undefined
-    : createQuestionRelay({
-        ctx, timeoutMs: config.answerTimeoutMs,
-        projector: liveProjector,
-        runtimeEpoch: nodeEpoch,
-        // 卡片/通知是交互帧：只走 volatile 出口，断线即丢，绝不进入离线队列。
-        // 序号在投影之后统一分配，卡片 payload 已投影，这里只补公开 seq。
-        send: event => emitVolatileProjected(event),
-        frame: adapter.frame,
-        // 断线/syncing 期间暂停新认领；已认领的请求仍按原 monoDeadline 等待。
-        available: () => link.online,
-        now: Date.now,
-        monoNow: () => globalThis.performance.now(),
-        deviceId: config.deviceId!,
-        agent: adapter.agent,
-        // 当前协商授权；卡片创建、answer/cancel 结算与每次 hello.ack 都按它复核。
-        authorization: () => {
-          const binding = link.binding
-          if (binding === undefined) return undefined
-          return {
-            relay: config.questionRelay,
-            operatorId: binding.operatorId,
-            policyRevision: binding.policyRevision,
-            allowInteractions: binding.policies.allowInteractions,
-            content: liveProjector.content,
-          }
-        },
-      })
-  const follower = createFollower({
-    adapter,
-    send: event => emitProjected(event),
     logger: ctx.logger,
   })
 
   ctx.effect(() => {
     nodeSync?.dispose()
-    follower.stopAll()
-    relay?.dispose()
+    for (const item of bindings.values()) {
+      item.follower.stopAll()
+      item.relayPort?.dispose()
+      // 只有 AgentAdapter 有 stop；DSH 适配器随宿主卸载，不能伪造生命周期。
+      const stoppable = item.adapter as Partial<AgentAdapter>
+      if (typeof stoppable.stop === 'function') void stoppable.stop().catch(() => {})
+    }
     link.close()
     journal.close()
   }, 'marshal: node link')
