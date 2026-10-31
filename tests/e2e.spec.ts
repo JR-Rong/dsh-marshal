@@ -63,6 +63,11 @@ describe('e2e', () => {
     // node 配置只接受 wss://；测试用自签证书，需要临时关闭校验。
     const previousTlsSetting = process.env.NODE_TLS_REJECT_UNAUTHORIZED
     process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'
+    const previousJournal = process.env.MARSHAL_JOURNAL_FILE
+    const previousJournalKey = process.env.MARSHAL_JOURNAL_KEY_FILE
+    // node 启动即打开 journal；测试必须用临时路径，不能碰真实 $HOME 状态。
+    process.env.MARSHAL_JOURNAL_FILE = join(dir, 'journal.json')
+    process.env.MARSHAL_JOURNAL_KEY_FILE = join(dir, 'journal.key')
     try {
       const devicesFile = join(dir, 'devices.json')
       // 全新安装走与 hub/CLI 相同的初始化器；token 只在本次 add 返回值里出现。
@@ -117,6 +122,15 @@ describe('e2e', () => {
       const recorded = prompts[0] as { content?: { text?: string }[] }
       expect(recorded.content?.[0]?.text).toBe('hi')
 
+      // 已受理命令可通过只读查询恢复；查询本身不触发第二次 prompt。
+      const statusResponse = await fetch(
+        `${base}/marshal/api/command-status?deviceId=mac&agent=dsh&sessionId=s1&op=prompt&key=e2e-1`,
+        { headers: AUTH },
+      )
+      expect(statusResponse.status).toBe(200)
+      expect(await statusResponse.json()).toMatchObject({ ok: true, status: 'accepted' })
+      expect(prompts).toHaveLength(1)
+
       const observeResponse = await fetch(`${base}/marshal/api/command`, {
         method: 'POST',
         headers: { ...AUTH, 'content-type': 'application/json' },
@@ -137,6 +151,10 @@ describe('e2e', () => {
       await rm(dir, { recursive: true, force: true })
       if (previousTlsSetting === undefined) delete process.env.NODE_TLS_REJECT_UNAUTHORIZED
       else process.env.NODE_TLS_REJECT_UNAUTHORIZED = previousTlsSetting
+      if (previousJournal === undefined) delete process.env.MARSHAL_JOURNAL_FILE
+      else process.env.MARSHAL_JOURNAL_FILE = previousJournal
+      if (previousJournalKey === undefined) delete process.env.MARSHAL_JOURNAL_KEY_FILE
+      else process.env.MARSHAL_JOURNAL_KEY_FILE = previousJournalKey
     }
     // 卸载本身不应产生任何告警。
     expect(warns).toEqual([])

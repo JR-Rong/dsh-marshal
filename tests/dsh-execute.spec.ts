@@ -18,10 +18,10 @@ function surface() {
 const options = { deviceId: 'mac', nodeEpoch: 'epoch-1' }
 
 describe('dsh adapter', () => {
-  it('未知会话被拒绝并附已知列表', async () => {
+  it('未知会话被拒绝且不泄露已知会话列表', async () => {
     const adapter = createDshAdapter(surface(), options)
     await expect(adapter.execute({ op: 'prompt', target: { sessionId: 'ghost' }, args: { text: 'x' } }))
-      .rejects.toThrow(/session-unknown: ghost, known s1/)
+      .rejects.toThrow(/session-unknown/)
   })
 
   it('prompt 透传文本与请求 id', async () => {

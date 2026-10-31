@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { HubRelay } from '../src/hub/relay.ts'
 import { DeviceRegistry } from '../src/hub/registry.ts'
-import type { AckFrame } from '../src/wire/frames.ts'
+import type { AckFrame, CommandStatusResultFrame } from '../src/wire/frames.ts'
 
 const CONNECTION_ID = 'conn-1'
 const NODE_EPOCH = 'epoch-1'
@@ -51,7 +51,7 @@ describe('HubRelay', () => {
     expect(frame.op).toBe('prompt')
 
     relay.settle(ack(frame.commandId, { result: { accepted: true } }), origin())
-    await expect(promise).resolves.toEqual({ ok: true, result: { accepted: true } })
+    await expect(promise).resolves.toEqual({ ok: true, status: 'accepted', result: { accepted: true } })
   })
 
   it('accepted 与 confirmed 都表示成功', async () => {
@@ -59,11 +59,11 @@ describe('HubRelay', () => {
     const relay = new HubRelay({ registry, now: () => 0, timeoutMs: 50 })
     const accepted = relay.command({ op: 'prompt', target: target(), args: { text: 'a' }, idempotencyKey: 'a' })
     relay.settle(ack(JSON.parse(sent[0]!).commandId, { status: 'accepted', result: 1 }), origin())
-    await expect(accepted).resolves.toEqual({ ok: true, result: 1 })
+    await expect(accepted).resolves.toEqual({ ok: true, status: 'accepted', result: 1 })
 
     const confirmed = relay.command({ op: 'prompt', target: target(), args: { text: 'b' }, idempotencyKey: 'b' })
     relay.settle(ack(JSON.parse(sent[1]!).commandId, { status: 'confirmed', result: 2 }), origin())
-    await expect(confirmed).resolves.toEqual({ ok: true, result: 2 })
+    await expect(confirmed).resolves.toEqual({ ok: true, status: 'confirmed', result: 2 })
   })
 
   it('rejected 缺 code 时默认 unsupported', async () => {
@@ -71,7 +71,7 @@ describe('HubRelay', () => {
     const relay = new HubRelay({ registry, now: () => 0, timeoutMs: 50 })
     const promise = relay.command({ op: 'prompt', target: target(), args: { text: 'hi' }, idempotencyKey: 'r' })
     relay.settle(ack(JSON.parse(sent[0]!).commandId, { status: 'rejected' }), origin())
-    await expect(promise).resolves.toEqual({ ok: false, code: 'unsupported' })
+    await expect(promise).resolves.toEqual({ ok: false, status: 'rejected', code: 'unsupported' })
   })
 
   it('pending-confirmation 与 outcome-unknown 保留各自 code', async () => {
@@ -79,11 +79,11 @@ describe('HubRelay', () => {
     const relay = new HubRelay({ registry, now: () => 0, timeoutMs: 50 })
     const pending = relay.command({ op: 'prompt', target: target(), args: { text: 'p' }, idempotencyKey: 'p' })
     relay.settle(ack(JSON.parse(sent[0]!).commandId, { status: 'pending-confirmation' }), origin())
-    await expect(pending).resolves.toEqual({ ok: false, code: 'pending-confirmation' })
+    await expect(pending).resolves.toEqual({ ok: false, status: 'pending-confirmation', code: 'pending-confirmation' })
 
     const unknown = relay.command({ op: 'prompt', target: target(), args: { text: 'u' }, idempotencyKey: 'u' })
     relay.settle(ack(JSON.parse(sent[1]!).commandId, { status: 'outcome-unknown' }), origin())
-    await expect(unknown).resolves.toEqual({ ok: false, code: 'outcome-unknown' })
+    await expect(unknown).resolves.toEqual({ ok: false, status: 'outcome-unknown', code: 'outcome-unknown' })
   })
 
   it('ACK 必须匹配绑定的 connectionId/nodeEpoch，错配只计数不结算', async () => {
@@ -99,7 +99,7 @@ describe('HubRelay', () => {
     expect(sent).toHaveLength(1)
 
     relay.settle(ack(commandId, { result: 9 }), origin())
-    await expect(promise).resolves.toEqual({ ok: true, result: 9 })
+    await expect(promise).resolves.toEqual({ ok: true, status: 'accepted', result: 9 })
   })
 
   it('设备重连后的旧连接 ACK 不结算新绑定', async () => {
@@ -115,14 +115,14 @@ describe('HubRelay', () => {
     relay.settle(ack(commandId), origin())
     expect(relay.rejectedAcks).toBe(1)
     relay.deviceOffline('mac')
-    await expect(promise).resolves.toEqual({ ok: false, code: 'device-offline' })
+    await expect(promise).resolves.toEqual({ ok: false, status: 'outcome-unknown', code: 'device-offline' })
   })
 
 
   it('目标离线直接失败', async () => {
     const relay = new HubRelay({ registry: new DeviceRegistry(), now: () => 0, timeoutMs: 50 })
     await expect(relay.command({ op: 'prompt', target: target('ghost'), args: {}, idempotencyKey: 'k' }))
-      .resolves.toEqual({ ok: false, code: 'device-offline' })
+      .resolves.toEqual({ ok: false, status: 'rejected', code: 'device-offline' })
   })
 
   it('超时失败', async () => {
@@ -132,7 +132,8 @@ describe('HubRelay', () => {
     const relay = new HubRelay({ registry, now: () => 0, timeoutMs: 100 })
     const promise = relay.command({ op: 'prompt', target: target(), args: {}, idempotencyKey: 'k' })
     vi.advanceTimersByTime(150)
-    await expect(promise).resolves.toEqual({ ok: false, code: 'timeout' })
+    // 发送后丢 ACK 只能是结果未知，不能当作可重试的传输失败。
+    await expect(promise).resolves.toEqual({ ok: false, status: 'outcome-unknown', code: 'outcome-unknown' })
     vi.useRealTimers()
   })
 
@@ -175,15 +176,15 @@ describe('HubRelay', () => {
 
     relay.dispose()
     expect(vi.getTimerCount()).toBe(0)
-    await expect(first).resolves.toEqual({ ok: false, code: 'disposed', message: 'relay: disposed' })
-    await expect(second).resolves.toEqual({ ok: false, code: 'disposed', message: 'relay: disposed' })
+    await expect(first).resolves.toEqual({ ok: false, status: 'outcome-unknown', code: 'disposed', message: 'relay: disposed' })
+    await expect(second).resolves.toEqual({ ok: false, status: 'outcome-unknown', code: 'disposed', message: 'relay: disposed' })
 
     // 幂等：再次 dispose 不抛错。
     expect(() => relay.dispose()).not.toThrow()
     // 迟到的 ack 与后续指令都不再改变状态。
     relay.settle(ack(JSON.parse(sent[0]!).commandId, { result: 1 }), origin())
     await expect(relay.command({ op: 'prompt', target: target(), args: {}, idempotencyKey: 'c' }))
-      .resolves.toEqual({ ok: false, code: 'disposed', message: 'relay: disposed' })
+      .resolves.toEqual({ ok: false, status: 'outcome-unknown', code: 'disposed', message: 'relay: disposed' })
     expect(sent).toHaveLength(2)
     vi.useRealTimers()
   })
@@ -196,8 +197,91 @@ describe('HubRelay', () => {
     expect(sent).toHaveLength(1)
 
     relay.settle(ack(JSON.parse(sent[0]!).commandId, { result: 7 }), origin())
-    await expect(Promise.all([first, second])).resolves.toEqual([{ ok: true, result: 7 }, { ok: true, result: 7 }])
+    await expect(Promise.all([first, second])).resolves.toEqual([{ ok: true, status: 'accepted', result: 7 }, { ok: true, status: 'accepted', result: 7 }])
     expect(sent).toHaveLength(1)
+  })
+
+  it('100 个同键同载荷并发只下发一次', async () => {
+    const { registry, sent } = setup()
+    const relay = new HubRelay({ registry, now: () => 0, timeoutMs: 50 })
+    const calls = Array.from({ length: 100 }, () => relay.command({
+      op: 'prompt', target: target(), args: { text: 'hello' }, idempotencyKey: 'burst',
+    }))
+    expect(sent).toHaveLength(1)
+    relay.settle(ack(JSON.parse(sent[0]!).commandId, { result: { accepted: true } }), origin())
+    const outcomes = await Promise.all(calls)
+    expect(new Set(outcomes.map(outcome => JSON.stringify(outcome))).size).toBe(1)
+    expect(outcomes[0]).toEqual({ ok: true, status: 'accepted', result: { accepted: true } })
+    expect(sent).toHaveLength(1)
+  })
+
+  it('同域不同载荷返回 idempotency-conflict 且不二次下发', async () => {
+    const { registry, sent } = setup()
+    const relay = new HubRelay({ registry, now: () => 0, timeoutMs: 50 })
+    const first = relay.command({ op: 'prompt', target: target(), args: { text: 'a' }, idempotencyKey: 'same' })
+    await expect(relay.command({ op: 'prompt', target: target(), args: { text: 'b' }, idempotencyKey: 'same' }))
+      .resolves.toEqual({ ok: false, status: 'rejected', code: 'idempotency-conflict' })
+    expect(sent).toHaveLength(1)
+    relay.settle(ack(JSON.parse(sent[0]!).commandId), origin())
+    await expect(first).resolves.toMatchObject({ ok: true, status: 'accepted' })
+  })
+
+  it('不同 agent/session 同键不互相命中', async () => {
+    const { registry, sent } = setup()
+    const relay = new HubRelay({ registry, now: () => 0, timeoutMs: 50 })
+    const first = relay.command({
+      op: 'prompt', target: { deviceId: 'mac', agent: 'dsh', sessionId: 's1' }, args: {}, idempotencyKey: 'shared',
+    })
+    const second = relay.command({
+      op: 'prompt', target: { deviceId: 'mac', agent: 'dsh', sessionId: 's2' }, args: {}, idempotencyKey: 'shared',
+    })
+    const third = relay.command({
+      op: 'prompt', target: { deviceId: 'mac', agent: 'other', sessionId: 's1' }, args: {}, idempotencyKey: 'shared',
+    })
+    expect(sent).toHaveLength(3)
+    for (const text of sent) relay.settle(ack(JSON.parse(text).commandId), origin())
+    await expect(Promise.all([first, second, third])).resolves.toHaveLength(3)
+  })
+
+  it('outcome-unknown 不允许同键重发', async () => {
+    const { registry, sent } = setup()
+    const relay = new HubRelay({ registry, now: () => 0, timeoutMs: 50 })
+    const first = relay.command({ op: 'prompt', target: target(), args: {}, idempotencyKey: 'unknown' })
+    relay.settle(ack(JSON.parse(sent[0]!).commandId, { status: 'outcome-unknown' }), origin())
+    await expect(first).resolves.toEqual({ ok: false, status: 'outcome-unknown', code: 'outcome-unknown' })
+    await expect(relay.command({ op: 'prompt', target: target(), args: {}, idempotencyKey: 'unknown' }))
+      .resolves.toEqual({ ok: false, status: 'outcome-unknown', code: 'outcome-unknown' })
+    expect(sent).toHaveLength(1)
+  })
+
+  it('状态查询发送 command.status 并按绑定连接结算', async () => {
+    const { registry, sent } = setup()
+    const relay = new HubRelay({ registry, now: () => 0, timeoutMs: 50 })
+    const query = relay.commandStatus({ op: 'prompt', target: target(), idempotencyKey: 'k-status' })
+    const frame = JSON.parse(sent[0]!) as { type: string; requestId: string; idempotencyKey: string }
+    expect(frame).toMatchObject({ type: 'command.status', idempotencyKey: 'k-status' })
+
+    const result: CommandStatusResultFrame = {
+      v: 2, type: 'command.status.result', requestId: frame.requestId, status: 'accepted',
+    }
+    // 错连接的结果不能结算；正确绑定才生效。
+    relay.settleStatus(result, { deviceId: 'mac', connectionId: 'other', nodeEpoch: NODE_EPOCH })
+    expect(relay.rejectedAcks).toBe(1)
+    relay.settleStatus(result, origin())
+    await expect(query).resolves.toEqual({ status: 'accepted' })
+    expect(sent).toHaveLength(1)
+  })
+
+  it('状态查询超时按 outcome-unknown 返回且不重发原命令', async () => {
+    vi.useFakeTimers()
+    const { registry, sent } = setup()
+    const relay = new HubRelay({ registry, now: () => 0, timeoutMs: 20 })
+    const query = relay.commandStatus({ op: 'prompt', target: target(), idempotencyKey: 'k-timeout' })
+    vi.advanceTimersByTime(50)
+    await expect(query).resolves.toEqual({ status: 'outcome-unknown', code: 'outcome-unknown' })
+    expect(sent).toHaveLength(1)
+    expect(JSON.parse(sent[0]!).type).toBe('command.status')
+    vi.useRealTimers()
   })
 
   it('不同设备同键各自下发', async () => {

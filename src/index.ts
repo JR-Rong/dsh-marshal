@@ -11,6 +11,7 @@ import { ensureInstall } from './hub/identity.ts'
 import { createDshSurface } from './adapters/dsh/surface.ts'
 import { createDshAdapter } from './adapters/dsh/adapter.ts'
 import { NodeLink } from './node/link.ts'
+import { openJournal } from './node/journal.ts'
 import { createFollower, runCommand } from './node/runner.ts'
 import { createQuestionRelay, type QuestionRelay } from './node/questions.ts'
 import { redact, stripContent } from './node/redact.ts'
@@ -46,6 +47,8 @@ function applyHub(ctx: MarshalContext, config: MarshalConfig): void {
       // 事件进索引并扇出；ACK 必须同时匹配 commandId 与连接身份才结算。
       if (frame.type === 'event') relay.publish(frame)
       else if (frame.type === 'ack') relay.settle(frame, identity)
+      // 只读状态查询走独立完成逻辑，不能混进 ACK 或 event。
+      else if (frame.type === 'command.status.result') relay.settleStatus(frame, identity)
     },
   })
   ctx.effect(() => { socket.dispose(); relay.dispose() }, 'marshal: uplink socket')
@@ -59,6 +62,9 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
   const controller = ctx.sessionController
   if (controller === undefined) throw new Error('marshal: node role requires the sessionController service')
 
+  // journal 在发起任何调用前打开并持有进程间锁；损坏/缺失时直接启动失败，
+  // 不能带着空去重表继续接受写命令。
+  const journal = openJournal()
   const patterns = config.redaction.map(source => new RegExp(source, 'gi'))
   const pipeline = (event: EventFrame): EventFrame => {
     const masked = config.privacy === 'content' ? event : stripContent(event)
@@ -90,7 +96,7 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
     onFrame: text => {
       let frame: Frame
       try { frame = decodeFrame(text) } catch { return }
-      runCommand(link, adapter, follower, frame, config.deviceId!)
+      runCommand(link, adapter, follower, frame, config.deviceId!, journal)
     },
     onOnline: sendSnapshot,
     onError: error => ctx.logger.warn(`marshal: link error: ${String(error)}`),
@@ -116,6 +122,12 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
     logger: ctx.logger,
   })
 
-  ctx.effect(() => { snapshot?.abort(); follower.stopAll(); relay?.dispose(); link.close() }, 'marshal: node link')
+  ctx.effect(() => {
+    snapshot?.abort()
+    follower.stopAll()
+    relay?.dispose()
+    link.close()
+    journal.close()
+  }, 'marshal: node link')
   link.start()
 }

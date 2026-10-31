@@ -1,9 +1,12 @@
 import { randomUUID } from 'node:crypto'
-import { CommandLog } from '../wire/idempotency.ts'
 import {
-  encodeFrame, type AckFrame, type CommandFrame, type CommandOp, type EventFrame,
+  encodeFrame, type AckFrame, type CommandFrame, type CommandOp,
+  type CommandStatusFrame, type CommandStatusResultFrame, type EventFrame,
 } from '../wire/frames.ts'
 import { COMMAND_TTL_MS } from '../wire/limits.ts'
+import { commandPayloadDigest } from '../wire/commands.ts'
+import { commandDomainKey } from '../wire/idempotency.ts'
+import { HubIdempotency } from './idempotency.ts'
 import type { DeviceRegistry, Sender } from './registry.ts'
 
 /** T02 会换成持久化 owner 身份；当前显式占位，不能当作安全声明。 */
@@ -18,9 +21,32 @@ export interface CommandInput {
   readonly idempotencyKey: string
 }
 
+/**
+ * `status` 是命令生命周期状态，HTTP 只按它决定 200/202/409，不靠错误字符串。
+ * 传输层/前置失败（device-offline、idempotency-conflict、disposed）用 rejected 表示
+ * “没有产生执行”；发送后结果不明一律 outcome-unknown。
+ */
 export type CommandOutcome =
-  | { ok: true; result: unknown }
-  | { ok: false; code: 'device-offline' | 'timeout' | string; message?: string }
+  | { ok: true; status: 'accepted' | 'confirmed'; result: unknown }
+  | {
+    ok: false
+    status: 'rejected' | 'pending-confirmation' | 'outcome-unknown'
+    code: string
+    message?: string
+  }
+
+/** 只读状态查询；op 仅用于 HTTP 形状校验，不属于幂等域。 */
+export interface CommandStatusInput {
+  readonly op: CommandOp
+  readonly target: CommandFrame['target']
+  readonly idempotencyKey: string
+}
+
+export interface CommandStatusOutcome {
+  readonly status: AckFrame['status']
+  readonly code?: string
+  readonly result?: unknown
+}
 
 export interface SessionRow {
   readonly deviceId: string
@@ -48,7 +74,7 @@ export interface FrameIdentity {
 }
 
 function disposedOutcome(): CommandOutcome {
-  return { ok: false, code: 'disposed', message: DISPOSED_MESSAGE }
+  return { ok: false, status: 'outcome-unknown', code: 'disposed', message: DISPOSED_MESSAGE }
 }
 
 interface Pending {
@@ -59,11 +85,18 @@ interface Pending {
   readonly nodeEpoch: string
 }
 
+interface PendingStatus {
+  resolve: (outcome: CommandStatusOutcome) => void
+  timer: NodeJS.Timeout
+  readonly deviceId: string
+  readonly connectionId: string
+  readonly nodeEpoch: string
+}
+
 export class HubRelay {
   private readonly pending = new Map<string, Pending>()
-  /** 幂等键 → 正在等待结果的指令；同键并发请求复用同一个 Promise。 */
-  private readonly inflight = new Map<string, Promise<CommandOutcome>>()
-  private readonly log = new CommandLog()
+  private readonly statusPending = new Map<string, PendingStatus>()
+  private readonly idempotency = new HubIdempotency<CommandOutcome>()
   private readonly consumers = new Set<(event: EventFrame) => void>()
   private readonly index = new Map<string, SessionRow>()
   private readonly epochs = new Map<string, string>()
@@ -86,32 +119,56 @@ export class HubRelay {
     if (this.rejectedAckTotal < MAX_REJECTED_ACKS) this.rejectedAckTotal += 1
   }
 
+  private operatorId(): string {
+    return this.options.operatorId ?? PLACEHOLDER_OPERATOR_ID
+  }
+
+  private domainKey(target: CommandFrame['target'], idempotencyKey: string): string {
+    return commandDomainKey({
+      operatorId: this.operatorId(),
+      target,
+      idempotencyKey,
+    })
+  }
+
   async command(input: CommandInput): Promise<CommandOutcome> {
     if (this.disposed) return disposedOutcome()
 
-    // 幂等范围按设备与 op 隔离：不同设备/不同 op 用同名 key 也各自下发。
-    const cacheKey = `${input.target.deviceId}:${input.op}:${input.idempotencyKey}`
-    const cached = this.log.lookup(cacheKey)
-    if (cached.hit) return { ok: true, result: cached.result }
-
-    const running = this.inflight.get(cacheKey)
-    if (running !== undefined) return running
+    // 先算载荷摘要：同域不同载荷必须 conflict，不能因为 key 相同就复用结果。
+    const digest = commandPayloadDigest(input.op, input.target, input.args ?? {})
+    const key = this.domainKey(input.target, input.idempotencyKey)
+    const prior = this.idempotency.lookup(key, digest)
+    if (prior !== undefined) {
+      if (prior.kind === 'conflict') {
+        return { ok: false, status: 'rejected', code: 'idempotency-conflict' }
+      }
+      if (prior.kind === 'inflight') return prior.promise
+      return prior.value
+    }
 
     const slot = this.options.registry.get(input.target.deviceId)
-    if (slot === undefined) return { ok: false, code: 'device-offline' }
+    if (slot === undefined) {
+      return { ok: false, status: 'rejected', code: 'device-offline' }
+    }
 
-    const promise = this.dispatch(input, cacheKey, slot)
-    this.inflight.set(cacheKey, promise)
+    // 登记必须发生在任何 await 之前；同一轮事件循环里的并发调用只能有一个赢家。
+    const promise = this.dispatch(input, slot)
+    this.idempotency.begin(key, digest, promise)
     try {
-      return await promise
+      const outcome = await promise
+      if (outcome.ok || outcome.code !== 'disposed') {
+        // accepted/confirmed/rejected 是终态；pending/unknown 只阻止重发，不算成功缓存。
+        const resolved = outcome.ok || outcome.status === 'rejected'
+        this.idempotency.complete(key, digest, outcome, resolved)
+      }
+      return outcome
     } finally {
-      if (this.inflight.get(cacheKey) === promise) this.inflight.delete(cacheKey)
+      this.idempotency.end(key, promise)
     }
   }
 
   private async dispatch(
     input: CommandInput,
-    cacheKey: string,
     slot: { readonly sender: Sender; readonly connectionId?: string; readonly nodeEpoch?: string },
   ): Promise<CommandOutcome> {
     const commandId = randomUUID()
@@ -121,7 +178,7 @@ export class HubRelay {
     const nodeEpoch = slot.nodeEpoch ?? UNBOUND_NODE_EPOCH
     const frame: CommandFrame = {
       v: 2, type: 'command', commandId, idempotencyKey: input.idempotencyKey,
-      operatorId: this.options.operatorId ?? PLACEHOLDER_OPERATOR_ID,
+      operatorId: this.operatorId(),
       target: input.target,
       op: input.op,
       args: input.args ?? {},
@@ -134,7 +191,8 @@ export class HubRelay {
     const outcome = await new Promise<CommandOutcome>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(commandId)
-        resolve({ ok: false, code: 'timeout' })
+        // 命令已经发出：没有 ACK 不能推断未执行，只能按结果未知处理。
+        resolve({ ok: false, status: 'outcome-unknown', code: 'outcome-unknown' })
       }, timeoutMs)
       this.pending.set(commandId, {
         resolve, timer, deviceId: input.target.deviceId, connectionId, nodeEpoch,
@@ -158,7 +216,6 @@ export class HubRelay {
       }
     })
 
-    if (outcome.ok) this.log.remember(cacheKey, outcome.result)
     return outcome
   }
 
@@ -172,12 +229,7 @@ export class HubRelay {
       this.rejectAck()
       return
     }
-    const slot = this.options.registry.get(entry.deviceId)
-    const currentConnection = slot !== undefined
-      && (slot.connectionId ?? UNBOUND_CONNECTION_ID) === origin.connectionId
-      && (slot.nodeEpoch ?? UNBOUND_NODE_EPOCH) === origin.nodeEpoch
-    if (origin.deviceId !== entry.deviceId
-      || !currentConnection
+    if (!this.currentBinding(entry, origin)
       || ack.connectionId !== entry.connectionId
       || ack.nodeEpoch !== entry.nodeEpoch) {
       this.rejectAck()
@@ -187,27 +239,106 @@ export class HubRelay {
     this.pending.delete(ack.commandId)
     switch (ack.status) {
       case 'accepted':
+        entry.resolve({ ok: true, status: 'accepted', result: ack.result })
+        return
       case 'confirmed':
-        entry.resolve({ ok: true, result: ack.result })
+        entry.resolve({ ok: true, status: 'confirmed', result: ack.result })
         return
       case 'rejected':
-        entry.resolve({ ok: false, code: ack.code ?? 'unsupported' })
+        entry.resolve({ ok: false, status: 'rejected', code: ack.code ?? 'unsupported' })
         return
       case 'pending-confirmation':
+        entry.resolve({ ok: false, status: 'pending-confirmation', code: ack.code ?? 'pending-confirmation' })
+        return
       case 'outcome-unknown':
-        // 两种状态都不是失败重试信号：保留各自的机器可读 code，不能折叠成 unknown。
-        entry.resolve({ ok: false, code: ack.status })
+        // 状态保持 unknown，code 可以是 recovery-required 等细节；不折叠成失败。
+        entry.resolve({ ok: false, status: 'outcome-unknown', code: ack.code ?? 'outcome-unknown' })
         return
     }
   }
 
-  /** 设备掉线时立刻结束发给它的指令，不让调用方干等到超时。 */
+  /** 只读状态查询：发送 command.status，绝不重放原命令。 */
+  async commandStatus(input: CommandStatusInput): Promise<CommandStatusOutcome> {
+    if (this.disposed) return { status: 'outcome-unknown', code: 'disposed' }
+    const slot = this.options.registry.get(input.target.deviceId)
+    if (slot === undefined) return { status: 'outcome-unknown', code: 'device-offline' }
+
+    const requestId = randomUUID()
+    const timeoutMs = this.options.timeoutMs ?? COMMAND_TTL_MS
+    const connectionId = slot.connectionId ?? UNBOUND_CONNECTION_ID
+    const nodeEpoch = slot.nodeEpoch ?? UNBOUND_NODE_EPOCH
+    const frame: CommandStatusFrame = {
+      v: 2, type: 'command.status', requestId,
+      operatorId: this.operatorId(),
+      target: input.target,
+      idempotencyKey: input.idempotencyKey,
+      connectionId,
+      nodeEpoch,
+    }
+
+    return await new Promise<CommandStatusOutcome>((resolve) => {
+      const timer = setTimeout(() => {
+        this.statusPending.delete(requestId)
+        resolve({ status: 'outcome-unknown', code: 'outcome-unknown' })
+      }, timeoutMs)
+      this.statusPending.set(requestId, {
+        resolve, timer, deviceId: input.target.deviceId, connectionId, nodeEpoch,
+      })
+      try {
+        slot.sender.send(encodeFrame(frame))
+      } catch {
+        clearTimeout(timer)
+        this.statusPending.delete(requestId)
+        // 查询没有发出去：没有执行任何命令，仍按结果未知返回，调用方可重查。
+        resolve({ status: 'outcome-unknown', code: 'outcome-unknown' })
+      }
+    })
+  }
+
+  /** 状态查询结果必须来自当前绑定连接；旧连接不能冒充新确认。 */
+  settleStatus(frame: CommandStatusResultFrame, origin: FrameIdentity): void {
+    const entry = this.statusPending.get(frame.requestId)
+    if (entry === undefined) {
+      this.rejectAck()
+      return
+    }
+    if (!this.currentBinding(entry, origin)) {
+      this.rejectAck()
+      return
+    }
+    clearTimeout(entry.timer)
+    this.statusPending.delete(frame.requestId)
+    entry.resolve({
+      status: frame.status,
+      ...(frame.code === undefined ? {} : { code: frame.code }),
+      ...(frame.result === undefined ? {} : { result: frame.result }),
+    })
+  }
+
+  private currentBinding(
+    entry: { readonly deviceId: string; readonly connectionId: string; readonly nodeEpoch: string },
+    origin: FrameIdentity,
+  ): boolean {
+    const slot = this.options.registry.get(entry.deviceId)
+    return origin.deviceId === entry.deviceId
+      && slot !== undefined
+      && (slot.connectionId ?? UNBOUND_CONNECTION_ID) === origin.connectionId
+      && (slot.nodeEpoch ?? UNBOUND_NODE_EPOCH) === origin.nodeEpoch
+  }
+
+  /** 设备掉线时立刻结束发给它的指令：已发送的命令只能记为结果未知。 */
   deviceOffline(deviceId: string): void {
     for (const [commandId, entry] of [...this.pending]) {
       if (entry.deviceId !== deviceId) continue
       clearTimeout(entry.timer)
       this.pending.delete(commandId)
-      entry.resolve({ ok: false, code: 'device-offline' })
+      entry.resolve({ ok: false, status: 'outcome-unknown', code: 'device-offline' })
+    }
+    for (const [requestId, entry] of [...this.statusPending]) {
+      if (entry.deviceId !== deviceId) continue
+      clearTimeout(entry.timer)
+      this.statusPending.delete(requestId)
+      entry.resolve({ status: 'outcome-unknown', code: 'device-offline' })
     }
   }
 
@@ -230,10 +361,16 @@ export class HubRelay {
     this.disposed = true
     const waiting = [...this.pending.values()]
     this.pending.clear()
-    this.inflight.clear()
+    const waitingStatus = [...this.statusPending.values()]
+    this.statusPending.clear()
+    this.idempotency.clear()
     for (const entry of waiting) {
       clearTimeout(entry.timer)
       entry.resolve(disposedOutcome())
+    }
+    for (const entry of waitingStatus) {
+      clearTimeout(entry.timer)
+      entry.resolve({ status: 'outcome-unknown', code: 'disposed' })
     }
   }
 

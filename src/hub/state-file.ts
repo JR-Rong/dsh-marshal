@@ -145,6 +145,25 @@ export function withFileLock<T>(path: string, fn: () => T, now: () => number = D
   }
 }
 
+/**
+ * 取得 `<path>.lock` 并在返回后一直持有，直到 `release()`。
+ * 与 `withFileLock` 共用陈旧判定；但这里不排队等待——journal 由单个运行实例
+ * 长期持有，第二个实例必须立刻失败，不能等 5 秒后各自继续。
+ */
+export function acquireFileLock(path: string, now: () => number = Date.now): LockHandle {
+  const lockPath = `${path}.lock`
+  ensurePrivateDir(dirname(path))
+  for (;;) {
+    const handle = tryLock(lockPath)
+    if (handle !== undefined) return handle
+    if (lockIsStale(lockPath, now)) {
+      try { unlinkSync(lockPath) } catch { /* 另一写者刚释放 */ }
+      continue
+    }
+    throw new FileLockError(`timed out waiting for ${lockPath}`)
+  }
+}
+
 export function readTextIfExists(path: string): string | undefined {
   try {
     return readFileSync(path, 'utf8')

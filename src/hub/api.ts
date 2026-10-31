@@ -5,7 +5,7 @@ import { COMMAND_OPS, type CommandFrame, type CommandOp, type EventFrame } from 
 import { parseCommandArgs } from '../wire/commands.ts'
 import { MAX_FRAME_BYTES } from '../wire/limits.ts'
 import type { DeviceRegistry } from './registry.ts'
-import type { HubRelay } from './relay.ts'
+import type { CommandOutcome, CommandStatusOutcome, HubRelay } from './relay.ts'
 import { PAGE_HTML } from './page.ts'
 
 export interface ApiOptions {
@@ -25,6 +25,49 @@ interface CommandBody {
 }
 
 const digest = (value: string): Buffer => createHash('sha256').update(value, 'utf8').digest()
+
+/** 契约 §6：先按命令生命周期状态，再用 code 细分前置失败。 */
+function commandHttpStatus(outcome: CommandOutcome): number {
+  if (outcome.ok) return 200
+  if (outcome.status === 'pending-confirmation' || outcome.status === 'outcome-unknown') return 202
+  switch (outcome.code) {
+    case 'device-offline':
+    case 'disposed':
+    case 'recovery-required':
+      return 503
+    case 'size-limit':
+      return 413
+    case 'deadline-expired':
+      return 410
+    case 'invalid-args':
+    case 'unsupported':
+    case 'tighten-only':
+    case 'device-mismatch':
+      return 400
+    case 'session-unknown':
+      return 404
+    case 'idempotency-conflict':
+    case 'conflict':
+    case 'revision-conflict':
+    case 'session-mismatch':
+    case 'invalid':
+    case 'unknown':
+      return 409
+    default:
+      return 502
+  }
+}
+
+/**
+ * 只读状态查询的 HTTP 语义：200 已知、202 等待/未知、404 无记录。
+ * 离线/恢复不可信是 503；这里绝不触发执行。
+ */
+function commandStatusHttpStatus(outcome: CommandStatusOutcome): number {
+  if (outcome.code === 'device-offline' || outcome.code === 'disposed') return 503
+  if (outcome.code === 'record-unavailable') return 404
+  if (outcome.status === 'pending-confirmation' || outcome.status === 'outcome-unknown') return 202
+  return 200
+}
 
 function isTarget(value: unknown): value is CommandFrame['target'] {
   if (typeof value !== 'object' || value === null) return false
@@ -150,21 +193,38 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
       const outcome = await relay.command({
         op: op as CommandFrame['op'], target, args, idempotencyKey,
       })
-      if (!outcome.ok) {
-        // 明确区分「设备不在线」「参数/会话错误」「执行失败」，别把一切都报成 504。
-        const status = outcome.code === 'pending-confirmation' || outcome.code === 'outcome-unknown' ? 202
-          : outcome.code === 'device-offline' ? 409
-          : outcome.code === 'disposed' ? 503
-          : outcome.code === 'timeout' ? 504
-          : outcome.code === 'invalid-args' || outcome.code === 'unsupported'
-            || outcome.code === 'tighten-only' || outcome.code === 'device-mismatch' ? 400
-          : outcome.code === 'session-unknown' ? 404
-          : outcome.code === 'session-mismatch' || outcome.code === 'invalid' || outcome.code === 'unknown' ? 409
-          : 502
-        json(res, status, outcome)
+      json(res, commandHttpStatus(outcome), outcome)
+    }),
+  }))
+
+  disposers.push(webServer.register({
+    kind: 'exact', path: '/marshal/api/command-status',
+    handler: guard(async (req, res) => {
+      if (req.method !== 'GET') { res.writeHead(405, { allow: 'GET' }).end(); return }
+      const query = new URL(req.url ?? '/', 'http://localhost').searchParams
+      const deviceId = query.get('deviceId') ?? ''
+      const agent = query.get('agent') ?? ''
+      const op = query.get('op') ?? ''
+      const key = query.get('key') ?? ''
+      const sessionParam = query.get('sessionId')
+      const sessionId = sessionParam === null || sessionParam === '' ? null : sessionParam
+      if (deviceId === '' || agent === '' || key === ''
+        || !(COMMAND_OPS as readonly string[]).includes(op)) {
+        json(res, 400, { ok: false, code: 'invalid-args' })
         return
       }
-      json(res, 200, outcome)
+      const outcome = await relay.commandStatus({
+        op: op as CommandOp,
+        target: { deviceId, agent, sessionId },
+        idempotencyKey: key,
+      })
+      const ok = outcome.status === 'accepted' || outcome.status === 'confirmed'
+      json(res, commandStatusHttpStatus(outcome), {
+        ok,
+        status: outcome.status,
+        ...(outcome.code === undefined ? {} : { code: outcome.code }),
+        ...(outcome.result === undefined ? {} : { result: outcome.result }),
+      })
     }),
   }))
 

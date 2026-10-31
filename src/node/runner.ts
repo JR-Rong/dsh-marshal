@@ -1,9 +1,13 @@
 import { randomUUID } from 'node:crypto'
-import { encodeFrame, type AckFrame, type EventFrame, type Frame, type WireErrorCode } from '../wire/frames.ts'
+import {
+  encodeFrame, type AckFrame, type CommandStatusResultFrame, type EventFrame, type Frame,
+  type WireErrorCode,
+} from '../wire/frames.ts'
 import { parseCommandArgs, type ObserveArgs } from '../wire/commands.ts'
-import type { Adapter } from '../adapters/types.ts'
+import { PreCallRejection, type Adapter } from '../adapters/types.ts'
 import type { LoggerLike } from '../dsh-types.ts'
 import type { NodeLink } from './link.ts'
+import { JournalError, type Journal, type JournalDomain, type JournalEntry, type SettledStatus } from './journal.ts'
 
 /**
  * 每会话一条跟随循环；`observe` 指令只启动一次。
@@ -68,6 +72,16 @@ function codeOf(error: unknown): WireErrorCode {
   return code !== undefined && WIRE_CODES.has(code) ? code as WireErrorCode : 'agent-crashed'
 }
 
+/** 只允许已声明的 wire 错误码过线；journal 里的 code 可能来自旧版本。 */
+function asWireCode(code: string | undefined, fallback: WireErrorCode): WireErrorCode {
+  return code !== undefined && WIRE_CODES.has(code) ? code as WireErrorCode : fallback
+}
+
+function entryStatus(entry: JournalEntry): AckFrame['status'] {
+  // admitted 表示已持久登记、尚未拿到结果；对查询方只能诚实回答 unknown。
+  return entry.status === 'admitted' ? 'outcome-unknown' : entry.status
+}
+
 /** subscriptionId 由 runner 生成，按会话存放；link 每连接一个，因此状态天然绑定连接。 */
 const subscriptions = new WeakMap<ReturnType<typeof createFollower>, Map<string, string>>()
 
@@ -77,13 +91,60 @@ function subscriptionsOf(follower: ReturnType<typeof createFollower>): Map<strin
   return map
 }
 
+/** 只读状态查询：不占 journal、不触发执行。 */
+function runStatusQuery(
+  link: NodeLink,
+  adapter: Adapter,
+  journal: Journal | undefined,
+  frame: Extract<Frame, { type: 'command.status' }>,
+  deviceId: string,
+): void {
+  const reply = (status: AckFrame['status'], code?: WireErrorCode): void => {
+    const result: CommandStatusResultFrame = {
+      v: 2, type: 'command.status.result', requestId: frame.requestId, status,
+      ...(code === undefined ? {} : { code }),
+    }
+    try { link.sendRaw(encodeFrame(result)) } catch { /* 回不去就保持未知，调用方超时 */ }
+  }
+  if (frame.target.deviceId !== deviceId) { reply('rejected', 'device-mismatch'); return }
+  if (frame.target.agent !== adapter.agent) { reply('rejected', 'session-unknown'); return }
+  if (journal === undefined) { reply('outcome-unknown', 'record-unavailable'); return }
+  const domain: JournalDomain = {
+    operatorId: frame.operatorId,
+    target: frame.target,
+    idempotencyKey: frame.idempotencyKey,
+  }
+  let entry: JournalEntry | undefined
+  try {
+    entry = journal.lookup(domain)
+  } catch {
+    // 读取失败无法证明“没有记录”，只能按不可用处理。
+    reply('outcome-unknown', 'record-unavailable')
+    return
+  }
+  if (entry === undefined) {
+    // 无记录（包括已过保留期）不能推断未执行，只报 record-unavailable。
+    reply('outcome-unknown', 'record-unavailable')
+    return
+  }
+  const status = entryStatus(entry)
+  const fallback: WireErrorCode = status === 'rejected' ? 'unsupported' : 'outcome-unknown'
+  reply(status, entry.code === undefined ? undefined : asWireCode(entry.code, fallback))
+}
+
 export function runCommand(
   link: NodeLink,
   adapter: Adapter,
   follower: ReturnType<typeof createFollower>,
   frame: Frame,
   deviceId: string,
+  journal?: Journal,
+  now: () => number = Date.now,
 ): void {
+  if (frame.type === 'command.status') {
+    runStatusQuery(link, adapter, journal, frame, deviceId)
+    return
+  }
   if (frame.type !== 'command') return
   // ack 绝不能再抛：未处理的拒绝会直接打挂 DSH 宿主进程。
   const reply = (body: {
@@ -115,7 +176,7 @@ export function runCommand(
     return
   }
   // hub 已经超时并可能让用户重试过：迟到的指令再执行会跑两遍。
-  if (frame.deadline < Date.now()) {
+  if (frame.deadline < now()) {
     reply({ status: 'rejected', code: 'deadline-expired' })
     return
   }
@@ -129,7 +190,7 @@ export function runCommand(
   try {
     args = parseCommandArgs(frame.op, frame.args)
   } catch {
-    // 参数不合法就不执行；不能让未校验的 args 进入适配器。
+    // 参数不合法就不执行；不能让未校验的 args 进入适配器，也不占用幂等域。
     reply({ status: 'rejected', code: 'invalid-args' })
     return
   }
@@ -172,7 +233,111 @@ export function runCommand(
     reply({ status: 'accepted', result: { following: false, subscriptionId } })
     return
   }
+
+  // 副作用操作：validate → deadline → journal → 调用 → settle。
+  if (journal === undefined) {
+    // 兼容直接调用 runner 的测试装配；正式入口始终注入 journal。
+    void adapter.execute({ op: frame.op, target: { sessionId }, args })
+      .then(result => reply({ status: 'accepted', result }))
+      .catch((error: unknown) => reply({
+        status: 'rejected',
+        code: error instanceof PreCallRejection ? error.code : codeOf(error),
+      }))
+    return
+  }
+
+  // 闭包不保留参数的类型收窄；显式取一次已确认存在的 journal。
+  const activeJournal = journal
+  const domain: JournalDomain = {
+    operatorId: frame.operatorId,
+    target: frame.target,
+    idempotencyKey: frame.idempotencyKey,
+  }
+  let digest: string
+  let existing: JournalEntry | undefined
+  try {
+    digest = journal.digestPayload(frame.op, frame.target, args)
+    existing = journal.lookup(domain)
+  } catch {
+    // journal 不可读/已关闭时绝不调用 agent；这不是参数问题，必须转人工恢复。
+    reply({ status: 'rejected', code: 'recovery-required' })
+    return
+  }
+  if (existing !== undefined) {
+    if (existing.payloadDigest !== digest) {
+      reply({ status: 'rejected', code: 'idempotency-conflict' })
+      return
+    }
+    replyExisting(existing)
+    return
+  }
+
+  // lookup→admit 是同步临界区（无 await），并发同键只可能有一个 admitted 赢家。
+  if (frame.deadline < now()) {
+    reply({ status: 'rejected', code: 'deadline-expired' })
+    return
+  }
+  try {
+    journal.admit({ domain, op: frame.op, args })
+  } catch (error) {
+    // journal 不可写时绝不调用 agent；容量满用 size-limit，其它写失败转人工恢复。
+    const code: WireErrorCode = error instanceof JournalError && error.code === 'size-limit'
+      ? 'size-limit'
+      : 'recovery-required'
+    reply({ status: 'rejected', code })
+    return
+  }
+  // 持久化本身也消耗时间：调用前再检查一次，过期命令零调用。
+  if (frame.deadline < now()) {
+    settleAndReply('rejected', 'deadline-expired')
+    return
+  }
+
   void adapter.execute({ op: frame.op, target: { sessionId }, args })
-    .then(result => reply({ status: 'accepted', result }))
-    .catch((error: unknown) => reply({ status: 'rejected', code: codeOf(error) }))
+    .then(result => settleAndReply(frame.op === 'configure' ? 'confirmed' : 'accepted', undefined, result))
+    .catch((error: unknown) => {
+      if (error instanceof PreCallRejection) {
+        settleAndReply('rejected', error.code)
+        return
+      }
+      // 调用可能已经发生：没有受理/未执行证据时只记 outcome-unknown，绝不报 rejected。
+      settleAndReply('outcome-unknown', 'outcome-unknown')
+    })
+
+  function replyExisting(entry: JournalEntry): void {
+    switch (entry.status) {
+      case 'admitted':
+        // 同键传输重试：已登记但尚未有结果，等待即可，不能二次调用。
+        reply({ status: 'pending-confirmation' })
+        return
+      case 'accepted':
+      case 'confirmed':
+        reply({ status: entry.status })
+        return
+      case 'rejected':
+        reply({ status: 'rejected', code: asWireCode(entry.code, 'unsupported') })
+        return
+      case 'pending-confirmation':
+        reply({ status: 'pending-confirmation' })
+        return
+      case 'outcome-unknown':
+        reply({ status: 'outcome-unknown', code: asWireCode(entry.code, 'outcome-unknown') })
+        return
+    }
+  }
+
+  function settleAndReply(status: SettledStatus, code?: WireErrorCode, result?: unknown): void {
+    try {
+      activeJournal.settle(domain, status, code)
+    } catch {
+      // 调用已发生但结果无法持久化：仍必须是 unknown，不能让调用方以为失败可重试。
+      reply({ status: 'outcome-unknown', code: 'recovery-required' })
+      return
+    }
+    if (status === 'accepted' || status === 'confirmed') {
+      reply({ status, ...(result === undefined ? {} : { result }) })
+      return
+    }
+    reply({ status, ...(code === undefined ? {} : { code }) })
+  }
 }

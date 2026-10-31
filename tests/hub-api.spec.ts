@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { DeviceRegistry } from '../src/hub/registry.ts'
 import { HubRelay } from '../src/hub/relay.ts'
 import { registerMarshalRoutes } from '../src/hub/api.ts'
+import type { AckFrame, CommandStatusResultFrame } from '../src/wire/frames.ts'
 import { createTestWeb, type TestWeb } from './support/web.ts'
 
 const AUTH = { 'x-marshal-token': 'secret' }
@@ -17,7 +18,12 @@ afterEach(async () => {
 async function start() {
   const registry = new DeviceRegistry()
   const sent: string[] = []
-  registry.attach({ id: 'mac', name: 'Mac', agents: ['dsh'] }, { send: text => sent.push(text) }, 0)
+  registry.attach(
+    { id: 'mac', name: 'Mac', agents: ['dsh'] },
+    { send: text => sent.push(text) },
+    0,
+    { connectionId: 'conn-1', nodeEpoch: 'epoch-1' },
+  )
   const relay = new HubRelay({ registry, now: Date.now, timeoutMs: 50 })
   relay.publish({
     v: 2, type: 'event', deviceId: 'mac', agent: 'dsh', sessionId: 's1', nodeEpoch: 'epoch-1',
@@ -27,7 +33,22 @@ async function start() {
   const routes = registerMarshalRoutes({ webServer: test.webServer, registry, relay, requireToken: 'secret' })
   web = test
   const port = await test.listen()
-  return { port, routes, sent }
+  return { port, routes, relay, sent }
+}
+
+const ORIGIN = { deviceId: 'mac', connectionId: 'conn-1', nodeEpoch: 'epoch-1' }
+
+/** 等待 relay 写出指定类型的帧；HTTP handler 是异步启动的。 */
+async function waitForFrame(sent: string[], type: string): Promise<Record<string, unknown>> {
+  const deadline = Date.now() + 2_000
+  for (;;) {
+    for (const text of sent) {
+      const frame = JSON.parse(text) as Record<string, unknown>
+      if (frame.type === type) return frame
+    }
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${type}`)
+    await new Promise(resolve => setTimeout(resolve, 5))
+  }
 }
 
 describe('hub api', () => {
@@ -85,7 +106,8 @@ describe('hub api', () => {
       headers: { ...AUTH, 'content-type': 'application/json' },
       body: JSON.stringify({ op: 'prompt', target: { deviceId: 'ghost', agent: 'dsh', sessionId: 's' }, args: { text: 'hi' }, idempotencyKey: 'k' }),
     })
-    expect(response.status).toBe(409)
+    expect(response.status).toBe(503)
+    expect(await response.json()).toMatchObject({ status: 'rejected', code: 'device-offline' })
   })
 
   it('未知 op 返回 400 invalid-args', async () => {
@@ -117,5 +139,79 @@ describe('hub api', () => {
   it('不接管其它路径', async () => {
     const { port } = await start()
     expect((await fetch(`http://127.0.0.1:${port}/other`, { headers: AUTH })).status).toBe(404)
+  })
+
+  it('同键不同载荷的第二个请求返回 409 idempotency-conflict', async () => {
+    const { port, relay, sent } = await start()
+    const body = (text: string): string => JSON.stringify({
+      op: 'prompt', target: { deviceId: 'mac', agent: 'dsh', sessionId: 's1' }, args: { text }, idempotencyKey: 'conflict',
+    })
+    const first = fetch(`http://127.0.0.1:${port}/marshal/api/command`, {
+      method: 'POST', headers: { ...AUTH, 'content-type': 'application/json' }, body: body('a'),
+    })
+    const frame = await waitForFrame(sent, 'command')
+    const second = await fetch(`http://127.0.0.1:${port}/marshal/api/command`, {
+      method: 'POST', headers: { ...AUTH, 'content-type': 'application/json' }, body: body('b'),
+    })
+    expect(second.status).toBe(409)
+    expect(await second.json()).toMatchObject({ status: 'rejected', code: 'idempotency-conflict' })
+    relay.settle({
+      v: 2, type: 'ack', commandId: frame.commandId as string,
+      connectionId: 'conn-1', nodeEpoch: 'epoch-1', status: 'accepted', result: { accepted: true },
+    } satisfies AckFrame, ORIGIN)
+    expect((await first).status).toBe(200)
+  })
+
+  it('command-status 已知状态返回 200', async () => {
+    const { port, relay, sent } = await start()
+    const response = fetch(
+      `http://127.0.0.1:${port}/marshal/api/command-status?deviceId=mac&agent=dsh&sessionId=s1&op=prompt&key=k1`,
+      { headers: AUTH },
+    )
+    const frame = await waitForFrame(sent, 'command.status')
+    relay.settleStatus({
+      v: 2, type: 'command.status.result', requestId: frame.requestId as string, status: 'accepted',
+    } satisfies CommandStatusResultFrame, ORIGIN)
+    const result = await response
+    expect(result.status).toBe(200)
+    expect(await result.json()).toEqual({ ok: true, status: 'accepted' })
+  })
+
+  it('command-status 等待/未知返回 202，无记录返回 404', async () => {
+    const { port, relay, sent } = await start()
+    const pending = fetch(
+      `http://127.0.0.1:${port}/marshal/api/command-status?deviceId=mac&agent=dsh&sessionId=s1&op=prompt&key=pending`,
+      { headers: AUTH },
+    )
+    const pendingFrame = await waitForFrame(sent, 'command.status')
+    relay.settleStatus({
+      v: 2, type: 'command.status.result', requestId: pendingFrame.requestId as string, status: 'outcome-unknown',
+    } satisfies CommandStatusResultFrame, ORIGIN)
+    expect((await pending).status).toBe(202)
+
+    sent.length = 0
+    const missing = fetch(
+      `http://127.0.0.1:${port}/marshal/api/command-status?deviceId=mac&agent=dsh&sessionId=s1&op=prompt&key=missing`,
+      { headers: AUTH },
+    )
+    const missingFrame = await waitForFrame(sent, 'command.status')
+    relay.settleStatus({
+      v: 2, type: 'command.status.result', requestId: missingFrame.requestId as string,
+      status: 'outcome-unknown', code: 'record-unavailable',
+    } satisfies CommandStatusResultFrame, ORIGIN)
+    const result = await missing
+    expect(result.status).toBe(404)
+    expect(await result.json()).toEqual({ ok: false, status: 'outcome-unknown', code: 'record-unavailable' })
+  })
+
+  it('command-status 缺参数返回 400，非 GET 返回 405', async () => {
+    const { port } = await start()
+    expect((await fetch(`http://127.0.0.1:${port}/marshal/api/command-status?deviceId=mac`, { headers: AUTH })).status)
+      .toBe(400)
+    const response = await fetch(`http://127.0.0.1:${port}/marshal/api/command-status`, {
+      method: 'POST', headers: AUTH,
+    })
+    expect(response.status).toBe(405)
+    expect(response.headers.get('allow')).toBe('GET')
   })
 })

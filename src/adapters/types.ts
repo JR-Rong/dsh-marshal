@@ -1,4 +1,19 @@
-import type { EventFrame } from '../wire/frames.ts'
+import type { EventFrame, WireErrorCode } from '../wire/frames.ts'
+
+/**
+ * 适配器在**发起原生调用之前**给出的明确拒绝：会话不存在、参数非法、
+ * 能力不支持等。只有这种错误可以安全记为 `rejected`；调用之后的异常
+ * 没有可靠证据，必须由 runner 记为 `outcome-unknown`。
+ */
+export class PreCallRejection extends Error {
+  override readonly name = 'PreCallRejection'
+  readonly code: WireErrorCode
+
+  constructor(code: WireErrorCode, detail?: string) {
+    super(detail === undefined ? `marshal: ${code}: ${code}` : `marshal: ${code}: ${detail}`)
+    this.code = code
+  }
+}
 
 export interface Tunable {
   readonly id: 'model' | 'reasoning' | 'permission' | 'plan' | 'goal' | 'skill' | 'plugin'
