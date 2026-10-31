@@ -15,6 +15,7 @@ import {
 } from './devices.ts'
 import type { DeviceRegistry, Sender } from './registry.ts'
 import type { FrameIdentity } from './relay.ts'
+import type { HubSync, SyncHost } from './sync.ts'
 
 export const UPLINK_PATH = '/marshal/uplink'
 
@@ -81,6 +82,8 @@ export interface HubSocketOptions {
   readonly logger?: HubLogger
   /** 帧到达时的连接身份一并交给 relay，ACK 绑定校验不能只看 commandId。 */
   readonly onFrame?: (identity: FrameIdentity, frame: Frame) => void
+  /** 配置后启用同步屏障：sync.* 帧只走协调器，普通事件先去重。 */
+  readonly sync?: HubSync
   /** hello 通过、设备进入注册表之后调用；会话索引据此按设备重建。 */
   readonly onAttach?: (deviceId: string) => void
   /** 设备连接真正被摘除后调用；用于立刻结束发给它的等待中指令。 */
@@ -338,6 +341,10 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
       const sender: Sender = {
         send: text => { if (ws.readyState === WebSocket.OPEN) ws.send(text) },
       }
+      const syncHost: SyncHost = {
+        send: frame => sendFrame(ws, frame),
+        close: (code, reason) => ws.close(code, reason),
+      }
 
       ws.on('close', () => {
         completeHello()
@@ -350,6 +357,8 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
           if (socketOf.get(connection.deviceId) === ws) socketOf.delete(connection.deviceId)
           options.onDetach?.(connection.deviceId)
         }
+        // 协调器自己按连接身份忽略旧连接的迟到 close。
+        options.sync?.detach(identityOf(connection))
       })
 
       ws.on('message', data => {
@@ -441,7 +450,8 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
             now(),
             { connectionId, nodeEpoch: frame.nodeEpoch },
           )
-          // 节点重连后会重发快照：先清掉该设备的旧索引，已删除的会话不会残留。
+          // 节点重连后会重新同步：协调器保留旧索引并标 stale，或按新 epoch 丢弃旧能力。
+          options.sync?.attach(identityOf(connection), frame.agents)
           options.onAttach?.(latest.id)
           const ack: HelloAckFrame = {
             v: 2, type: 'hello.ack', connectionId, hubEpoch,
@@ -518,6 +528,21 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
           }
           if (!current.agents.has(frame.agent)) {
             ws.close(CLOSE_CODES.FRAME_INVALID, 'frame-invalid')
+            return
+          }
+          if (options.sync !== undefined) {
+            const verdict = options.sync.acceptEvent(identityOf(current), frame)
+            // 缺口不能跳过：要求节点重连并重新走完整同步屏障。
+            if (verdict === 'gap') {
+              ws.close(CLOSE_CODES.STALE_CONNECTION, 'sync-gap')
+              return
+            }
+            if (verdict !== 'accept') return
+          }
+        }
+        if (frame.type === 'sync.begin' || frame.type === 'sync.chunk' || frame.type === 'sync.end') {
+          if (options.sync !== undefined) {
+            options.sync.onFrame(identityOf(current), frame, syncHost)
             return
           }
         }

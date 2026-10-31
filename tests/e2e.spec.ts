@@ -15,6 +15,7 @@ const AUTH = { 'x-marshal-token': DASHBOARD_TOKEN }
 /** 合成哨兵：所有出站字节、journal 与审计都不允许出现。 */
 const PROMPT_SENTINEL = 'sk-e2e-sentinel-0123456789abcdef'
 const CWD_SENTINEL = '/home/example/secret-project'
+const ALIAS_SENTINEL = 'e2e-private-alias'
 
 const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -43,7 +44,10 @@ describe('e2e', () => {
     const cleanups: (() => void | Promise<void>)[] = []
     const prompts: unknown[] = []
     const follows: unknown[] = []
-    const session = { sessionId: 's1', running: false, blank: false, updatedAt: 1, cwd: CWD_SENTINEL }
+    const session = {
+      sessionId: 's1', running: false, blank: false, updatedAt: 1,
+      cwd: CWD_SENTINEL, publicAlias: ALIAS_SENTINEL,
+    }
     const sessionController: SessionControllerLike = {
       list: async () => ({ items: [session] }),
       follow(request) {
@@ -114,9 +118,18 @@ describe('e2e', () => {
         return body.sessions
       }, 1, 'session')
       const sessionsBody = await (await fetch(`${base}/marshal/api/sessions`, { headers: AUTH })).json() as SessionBody
-      // metadata 快照不含 cwd；HTTP 出口也不回显本机路径。
+      // metadata 快照不含 cwd/别名；HTTP 出口也不回显本机路径。
       expect(JSON.stringify(sessionsBody.sessions)).not.toContain('cwd')
       expect(JSON.stringify(sessionsBody.sessions)).not.toContain(CWD_SENTINEL)
+      expect(JSON.stringify(sessionsBody.sessions)).not.toContain(ALIAS_SENTINEL)
+
+      // 设备只有原子提交后才 online；能力来自同步提交且不含路径。
+      const devicesBody = await (await fetch(`${base}/marshal/api/devices`, { headers: AUTH })).json() as {
+        devices: Array<{ syncing?: boolean; stale?: boolean; capabilities?: Record<string, unknown> }>
+      }
+      expect(devicesBody.devices[0]).toMatchObject({ syncing: false, stale: false })
+      expect(devicesBody.devices[0]?.capabilities?.dsh).toBeDefined()
+      expect(JSON.stringify(devicesBody)).not.toContain(CWD_SENTINEL)
 
       const promptResponse = await fetch(`${base}/marshal/api/command`, {
         method: 'POST',

@@ -41,6 +41,12 @@ export interface NodePolicyBinding {
   readonly policies: HelloAckFrame['policies']
 }
 
+/**
+ * 连接生命周期：open → handshaking → syncing → online。
+ * 只有收到匹配的 sync.ack 才进入 online；此前不得冲刷普通事件队列。
+ */
+export type NodeLinkState = 'idle' | 'dialing' | 'handshaking' | 'syncing' | 'online' | 'stopped'
+
 /** 当前握手绑定：命令帧必须与它匹配；serverTimeOffset 用于把本地时钟校正到 hub。 */
 export interface HandshakeBinding {
   readonly connectionId: string
@@ -70,7 +76,8 @@ export interface NodeLinkOptions {
   /** 连接稳定多久后清零退避计数，默认 30s。 */
   readonly stableMs?: number
   readonly onFrame?: (text: string) => void
-  readonly onOnline?: () => void
+  /** hello.ack 后触发：上层必须开始完整同步，不得在此前把事件视为在线。 */
+  readonly onSyncNeeded?: () => void
   /** 连接断开（含握手前失败）：订阅引用按连接清理，原生 follower 不能跨连接存活。 */
   readonly onOffline?: () => void
   /** 每次合法 hello.ack 后触发；index 用它重建投影器并在收紧时清空旧队列。 */
@@ -100,6 +107,9 @@ export class NodeLink {
   private active = false
   /** 当前连接是否已经收到 hello.ack。 */
   private acked = false
+  private linkState: NodeLinkState = 'idle'
+  /** 当前期待 sync.ack 的 syncId；只有匹配它才允许 online。 */
+  private activeSyncId: string | undefined
   private droppedCount = 0
   private connectionId: string | undefined
   private policyBinding: NodePolicyBinding | undefined
@@ -115,6 +125,42 @@ export class NodeLink {
 
   get buffered(): number { return this.queue.length }
   get dropped(): number { return this.droppedCount }
+
+  /** 暴露生命周期，便于同步/命令层判断是否允许写。 */
+  get state(): NodeLinkState { return this.linkState }
+  get online(): boolean { return this.linkState === 'online' }
+
+  /** 同步开始：登记本次 syncId；同一时间只允许一个在途同步。 */
+  beginSync(syncId: string): boolean {
+    if (this.closed || this.activeSyncId !== undefined) return false
+    if (this.linkState !== 'syncing' && this.linkState !== 'handshaking') return false
+    this.activeSyncId = syncId
+    return true
+  }
+
+  /** 只有匹配的 sync.ack(accepted=true) 才能进入 online 并冲刷普通事件。 */
+  confirmSync(syncId: string): boolean {
+    if (this.linkState !== 'syncing' || this.activeSyncId !== syncId) return false
+    this.activeSyncId = undefined
+    this.linkState = 'online'
+    const socket = this.socket
+    if (socket !== undefined) this.flush(socket)
+    return true
+  }
+
+  /** 同步被拒/超时/畸形：4409 可重试，让节点重新握手并重新同步。 */
+  rejectSync(reason = 'sync-rejected'): void {
+    this.activeSyncId = undefined
+    this.closeForSync(reason)
+  }
+
+  /** 控制帧（sync.* / heartbeat.*）立即发送，绝不进入普通事件队列。 */
+  sendControl(text: string): void {
+    if (this.closed) return
+    if (!this.acked || this.socket === undefined || !this.trySend(this.socket, text)) {
+      this.droppedCount += 1
+    }
+  }
 
   /** 最近一次 hello.ack 的策略绑定；index 用它做隐私决策，不落盘。 */
   get binding(): NodePolicyBinding | undefined { return this.policyBinding }
@@ -146,6 +192,8 @@ export class NodeLink {
     if (this.closed) return
     this.closed = true
     this.active = false
+    this.linkState = 'stopped'
+    this.activeSyncId = undefined
     this.clearTimer()
     this.clearStableTimer()
     this.stopHeartbeat()
@@ -168,8 +216,9 @@ export class NodeLink {
   sendRaw(text: string): void {
     // 关掉之后没有消费者了；再排队只会把快照/尾巴事件永久攒在内存里。
     if (this.closed) return
-    // 握手完成且没有更早的积压帧时才直发，否则排队，避免越过队首。
-    if (this.acked && this.queue.length === 0 && this.socket !== undefined && this.trySend(this.socket, text)) return
+    // 只有 online 才直发；handshaking/syncing 期间普通帧一律排队。
+    if (this.linkState === 'online' && this.queue.length === 0 && this.socket !== undefined
+      && this.trySend(this.socket, text)) return
     this.enqueue(text)
   }
 
@@ -187,7 +236,8 @@ export class NodeLink {
    * 重连后由当前待答表重新投影（T07）；旧卡不能从缓存补发。
    */
   sendVolatileRaw(text: string): void {
-    if (this.closed || !this.acked || this.socket === undefined) {
+    // 交互正文/卡片只在 online 且已握手时直发，绝不进入离线队列。
+    if (this.closed || !this.acked || this.linkState !== 'online' || this.socket === undefined) {
       this.droppedCount += 1
       return
     }
@@ -231,12 +281,15 @@ export class NodeLink {
     if (this.socket !== undefined) return
     const ws = new WebSocket(this.options.url, { headers: { authorization: `Bearer ${this.options.token}` } })
     this.socket = ws
+    this.linkState = 'dialing'
+    this.activeSyncId = undefined
     this.acked = false
     this.connectionId = undefined
     this.heartbeatNonces.clear()
 
     ws.on('open', () => {
       if (this.socket !== ws) { ws.close(); return }
+      this.linkState = 'handshaking'
       this.resetSkew()
       const binding = this.policyBinding
       // hello 必须先于任何缓冲事件，hub 只认首帧 hello；它发不出去就换一条连接。
@@ -259,6 +312,8 @@ export class NodeLink {
       if (this.socket !== ws) return
       this.socket = undefined
       this.acked = false
+      this.linkState = this.closed ? 'stopped' : 'idle'
+      this.activeSyncId = undefined
       this.connectionId = undefined
       this.heartbeatNonces.clear()
       this.pendingInbound.length = 0
@@ -270,6 +325,7 @@ export class NodeLink {
       if (TERMINAL_CLOSE_CODES.has(code)) {
         // 鉴权/撤销/协议不兼容重拨没有意义：停下进 stopped，等显式 start()。
         this.active = false
+        this.linkState = 'stopped'
         this.attempts = 0
         this.clearTimer()
         this.reportError(new Error(`marshal: link closed with terminal code ${code}`))
@@ -287,6 +343,8 @@ export class NodeLink {
       if (this.socket !== ws) return
       this.socket = undefined
       this.acked = false
+      this.linkState = 'idle'
+      this.activeSyncId = undefined
       this.connectionId = undefined
       this.heartbeatNonces.clear()
       this.pendingInbound.length = 0
@@ -297,6 +355,7 @@ export class NodeLink {
       this.reportOffline()
       if (response.statusCode === 401) {
         this.active = false
+        this.linkState = 'stopped'
         this.attempts = 0
         this.clearTimer()
         this.reportError(new Error('marshal: hub rejected device token (401)'))
@@ -313,12 +372,24 @@ export class NodeLink {
     if (this.acked) {
       // heartbeat.ack 只驱动本地存活判定，不进入命令分派。
       if (this.consumeHeartbeatAck(text)) return
+      // sync.ack 是控制帧：畸形/未匹配的 ack 必须关闭重试，不能当普通帧忽略。
+      if (this.frameTypeOf(text) === 'sync.ack' && !this.validSyncAck(text)) {
+        this.closeForSync('sync-invalid')
+        return
+      }
+      // 同步屏障完成前不接收写命令：hub 会按未同步拒绝，这里再兜底一次。
+      const type = this.frameTypeOf(text)
+      if (this.linkState === 'syncing'
+        && (type === 'command' || type === 'command.status' || type === 'inputs.snapshot')) {
+        return
+      }
       this.deliver(text)
       return
     }
     const ack = this.helloAckOf(text)
     if (ack.kind === 'valid') {
       this.acked = true
+      this.linkState = 'syncing'
       this.connectionId = ack.frame.connectionId
       this.sampleServerTime(ack.frame.serverTime, this.helloStartedAt, Date.now())
       const previous = this.policyBinding
@@ -338,9 +409,8 @@ export class NodeLink {
       const pending = this.pendingInbound.splice(0)
       this.pendingBytes = 0
       for (const buffered of pending) this.deliver(buffered)
-      this.flush(ws)
-      // 只有合法 hello.ack 之后才算在线；同步由上层在 onOnline 里发起。
-      try { this.options.onOnline?.() } catch (error) { this.reportError(error) }
+      // 握手确认后进入 syncing：先完成快照屏障，绝不在这里冲刷普通事件。
+      try { this.options.onSyncNeeded?.() } catch (error) { this.reportError(error) }
       return
     }
     if (ack.kind !== 'none') {
@@ -362,6 +432,26 @@ export class NodeLink {
       this.pendingBytes = Math.max(0, this.pendingBytes - Buffer.byteLength(dropped, 'utf8'))
       this.droppedCount += 1
     }
+  }
+
+  /** 只读解析 type；不合法 JSON 返回 undefined，由具体处理决定后果。 */
+  private frameTypeOf(text: string): string | undefined {
+    try {
+      const parsed: unknown = JSON.parse(text)
+      if (typeof parsed !== 'object' || parsed === null) return undefined
+      const type = (parsed as { type?: unknown }).type
+      return typeof type === 'string' ? type : undefined
+    } catch { return undefined }
+  }
+
+  /** 结构不合法的 sync.ack 不能进入分派，否则节点会永远等不到 online。 */
+  private validSyncAck(text: string): boolean {
+    try { return decodeFrame(text).type === 'sync.ack' } catch { return false }
+  }
+
+  private closeForSync(reason: string): void {
+    if (this.linkState !== 'syncing' && this.linkState !== 'online') return
+    this.socket?.close(CLOSE_CODES.STALE_CONNECTION, reason)
   }
 
   /** 只有 type/设备/实例/契约修订全部匹配的 hello.ack 才能完成握手。 */
@@ -447,7 +537,7 @@ export class NodeLink {
    * 该帧留在队首，等下一次连接补发，不会被算成已发。
    */
   private flush(ws: WebSocket): void {
-    if (this.socket !== ws || !this.acked) return
+    if (this.socket !== ws || !this.acked || this.linkState !== 'online') return
     while (this.queue.length > 0) {
       const text = this.queue[0]
       if (text === undefined) return

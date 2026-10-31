@@ -113,6 +113,14 @@ async function settle(ms: number): Promise<void> {
   await new Promise<void>(resolve => { setTimeout(() => { resolve() }, ms) })
 }
 
+/** hello.ack 之后 link 只到 syncing；显式完成一次同步屏障才放行普通事件。 */
+async function confirmSync(link: NodeLink, syncId = 'sync-test'): Promise<void> {
+  await waitFor(() => link.state === 'syncing', 'link to enter syncing')
+  expect(link.beginSync(syncId)).toBe(true)
+  expect(link.confirmSync(syncId)).toBe(true)
+  expect(link.online).toBe(true)
+}
+
 function createLink(
   port: number,
   options: Partial<Omit<NodeLinkOptions, 'url' | 'token' | 'deviceId' | 'deviceName' | 'agents'>> = {},
@@ -175,6 +183,7 @@ describe('NodeLink', () => {
     expect(link.buffered).toBe(2)
 
     link.start()
+    await confirmSync(link)
     await waitFor(() => received.length >= 3, 'hello and buffered events')
     expect(received.map(typeOf)).toEqual(['hello', 'event', 'event'])
     expect(received.slice(1).map(seqOf)).toEqual([1, 2])
@@ -197,7 +206,12 @@ describe('NodeLink', () => {
     expect(received.map(typeOf)).toEqual(['hello'])
 
     client?.send(HELLO_ACK)
-    await waitFor(() => received.length >= 3, 'events released after ack')
+    await waitFor(() => link.state === 'syncing', 'syncing after hello.ack')
+    // 同步屏障完成前，普通事件仍不能越过队列。
+    expect(received.map(typeOf)).toEqual(['hello'])
+    expect(link.buffered).toBe(2)
+    await confirmSync(link)
+    await waitFor(() => received.length >= 3, 'events released after sync.ack')
     expect(received.map(typeOf)).toEqual(['hello', 'event', 'event'])
     expect(received.slice(1).map(seqOf)).toEqual([1, 2])
     expect(link.buffered).toBe(0)
@@ -237,8 +251,11 @@ describe('NodeLink', () => {
     link.sendEvent(event(1))
     link.sendEvent(event(2))
     clients[0]?.send(HELLO_ACK)
+    await waitFor(() => link.state === 'syncing', 'syncing after first hello.ack')
     // ack 已在途，此刻让发送失败：模拟 flush 时 socket 已经不可写。
     failSends = true
+    expect(link.beginSync('sync-1')).toBe(true)
+    expect(link.confirmSync('sync-1')).toBe(true)
     await settle(100)
     expect(link.buffered).toBe(2)
     expect(received.filter(text => typeOf(text) === 'event')).toHaveLength(0)
@@ -247,6 +264,7 @@ describe('NodeLink', () => {
     clients[0]?.terminate()
     await waitFor(() => clients.length >= 2, 'reconnected socket')
     clients[1]?.send(HELLO_ACK)
+    await confirmSync(link, 'sync-2')
     await waitFor(() => received.filter(text => typeOf(text) === 'event').length === 2, 'replayed events')
     expect(received.filter(text => typeOf(text) === 'event').map(seqOf)).toEqual([1, 2])
     expect(link.buffered).toBe(0)
@@ -317,19 +335,38 @@ describe('NodeLink', () => {
     expect(received.filter(text => typeOf(text) === 'hello')).toHaveLength(2)
   })
 
-  it('onOnline 只在合法 hello.ack 之后触发', async () => {
+  it('onSyncNeeded 只在合法 hello.ack 之后触发，确认前不 online', async () => {
     let client: WebSocket | undefined
-    const online: number[] = []
+    const syncNeeded: number[] = []
     const { port } = await listen({ ack: false, onHello: ws => { client = ws } })
 
-    const link = createLink(port, { onOnline: () => { online.push(Date.now()) } })
+    const link = createLink(port, { onSyncNeeded: () => { syncNeeded.push(Date.now()) } })
     link.start()
     await waitFor(() => client !== undefined, 'server side socket')
     await settle(100)
-    expect(online).toHaveLength(0)
+    expect(syncNeeded).toHaveLength(0)
+    expect(link.online).toBe(false)
 
     client?.send(HELLO_ACK)
-    await waitFor(() => online.length === 1, 'onOnline after hello.ack')
+    await waitFor(() => syncNeeded.length === 1, 'onSyncNeeded after hello.ack')
+    expect(link.state).toBe('syncing')
+    expect(link.online).toBe(false)
+    expect(link.beginSync('sync-1')).toBe(true)
+    expect(link.confirmSync('sync-1')).toBe(true)
+    expect(link.state).toBe('online')
+    expect(link.online).toBe(true)
+  })
+
+  it('交互帧在未 online 时直接丢弃，绝不进入离线队列', async () => {
+    const link = createLink(1, { bufferLimit: 10 })
+    const interactive: EventFrame = {
+      v: 2, type: 'event', deviceId: 'mac', agent: 'dsh', sessionId: 's', nodeEpoch: 'epoch-1',
+      seq: 1, ts: 1, kind: 'input.requested', payload: { requestId: 'r1' },
+    }
+    link.sendEvent(interactive)
+    link.sendVolatileEvent(interactive)
+    expect(link.buffered).toBe(0)
+    expect(link.dropped).toBe(2)
   })
 
   it('contractRevision 不匹配时以 4406 终止，不再重拨', async () => {

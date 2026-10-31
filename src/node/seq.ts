@@ -10,6 +10,8 @@ export interface SeqScope {
 export interface SeqAllocator {
   /** 为已通过投影/过滤的出站帧分配公开序号。 */
   next(scope: SeqScope): number
+  /** 已分配的最大公开序号；同步高水位使用同一序列，不做版本猜测。 */
+  highWatermark(): number
 }
 
 /**
@@ -19,13 +21,16 @@ export interface SeqAllocator {
  */
 export function createSeqAllocator(): SeqAllocator {
   const counters = new Map<string, number>()
+  let peak = 0
   return {
     next(scope: SeqScope): number {
       const key = [scope.deviceId, scope.agent, scope.sessionId, scope.nodeEpoch].join('\u0000')
       const value = (counters.get(key) ?? 0) + 1
       counters.set(key, value)
+      if (value > peak) peak = value
       return value
     },
+    highWatermark(): number { return peak },
   }
 }
 

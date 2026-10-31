@@ -71,6 +71,26 @@ export interface AnswerSink {
   cancel?(sessionId: string, requestId: string): SettleResult
 }
 
+/** 同步快照的会话行：只含可公开状态，不含 cwd/标题/正文。 */
+export interface SyncSessionRow {
+  readonly sessionId: string
+  readonly running: boolean
+  readonly updatedAt: number
+  readonly blank: boolean
+}
+
+/** 每个 agent 一份完整能力文档；投影后仍不含本机路径或设置正文。 */
+export interface SyncCapabilityDocument {
+  readonly agent: string
+  readonly capability: Record<string, unknown>
+}
+
+export interface SyncSnapshot {
+  readonly rows: readonly SyncSessionRow[]
+  readonly capabilities: readonly SyncCapabilityDocument[]
+  readonly completeness: SnapshotCompleteness
+}
+
 export interface Adapter {
   readonly agent: string
   capabilities(sessionId: string): Capability
@@ -79,6 +99,11 @@ export interface Adapter {
    * “不完整”标记，不能把首个结果集当全量。
    */
   readonly snapshotCompleteness: SnapshotCompleteness
+  /**
+   * 完整分页清单 + 每 agent 能力文档。同步（T06）只接受 `complete`；
+   * `unconfirmed` 时不得提交替换快照，否则会把未列出的会话误删。
+   */
+  syncSnapshot(signal: AbortSignal): Promise<SyncSnapshot>
   /** 当前会话清单，已转成 `session.updated`/`capability.changed` 事件。 */
   snapshot(signal: AbortSignal): Promise<readonly EventFrame[]>
   /** 跟随一个会话；这里的 seq 只是适配器内部序号，出站前会被公开序号覆盖。 */

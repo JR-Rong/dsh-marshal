@@ -6,12 +6,14 @@ import { parseCommandArgs } from '../wire/commands.ts'
 import { MAX_FRAME_BYTES } from '../wire/limits.ts'
 import type { DeviceRegistry } from './registry.ts'
 import type { CommandOutcome, CommandStatusOutcome, HubRelay } from './relay.ts'
+import type { HubSync } from './sync.ts'
 import { PAGE_HTML } from './page.ts'
 
 export interface ApiOptions {
   readonly webServer: WebServerLike
   readonly registry: DeviceRegistry
   readonly relay: HubRelay
+  readonly sync?: Pick<HubSync, 'status'>
   readonly requireToken: string
 }
 
@@ -104,7 +106,7 @@ function publicOutcome(outcome: CommandOutcome): Record<string, unknown> {
 /** 会话索引只暴露契约字段；cwd/标题等本机信息不经过 HTTP。 */
 function publicSession(row: {
   deviceId: string; agent: string; sessionId: string;
-  running: boolean; updatedAt: number;
+  running: boolean; updatedAt: number; blank?: boolean;
   ownership?: string; counts?: Readonly<Record<string, number>>
 }): Record<string, unknown> {
   return {
@@ -113,6 +115,7 @@ function publicSession(row: {
     sessionId: row.sessionId,
     running: row.running,
     updatedAt: row.updatedAt,
+    ...(row.blank === undefined ? {} : { blank: row.blank }),
     ...(row.ownership === undefined ? {} : { ownership: row.ownership }),
     ...(row.counts === undefined ? {} : { counts: row.counts }),
   }
@@ -122,13 +125,16 @@ function publicSession(row: {
 function publicDevice(row: {
   id: string; name: string; agents: readonly string[];
   connectedAt: number; lastSeen: number
-}): Record<string, unknown> {
+}, relay: HubRelay, sync: Pick<HubSync, 'status'> | undefined): Record<string, unknown> {
+  const status = sync?.status(row.id)
   return {
     id: row.id,
     name: row.name,
     agents: [...row.agents],
     connectedAt: row.connectedAt,
     lastSeen: row.lastSeen,
+    ...(status === undefined ? {} : { syncing: status.syncing, stale: status.stale }),
+    capabilities: relay.capabilities(row.id),
   }
 }
 
@@ -145,7 +151,7 @@ function isTarget(value: unknown): value is CommandFrame['target'] {
  * 只登记 exact 路径：`/marshal` 与 `/marshal/api/*`，其余请求仍归 DSH。
  */
 export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } {
-  const { webServer, registry, relay, requireToken } = options
+  const { webServer, registry, relay, sync, requireToken } = options
   const disposers: (() => void)[] = []
   // 每条 SSE 流一个清理函数：取消订阅、清心跳，并把自己从集合里移除。
   const streams = new Set<() => void>()
@@ -200,7 +206,9 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
 
   disposers.push(webServer.register({
     kind: 'exact', path: '/marshal/api/devices',
-    handler: guard((_req, res) => { json(res, 200, { devices: registry.list(Date.now()).map(publicDevice) }) }),
+    handler: guard((_req, res) => {
+      json(res, 200, { devices: registry.list(Date.now()).map(row => publicDevice(row, relay, sync)) })
+    }),
   }))
 
   disposers.push(webServer.register({

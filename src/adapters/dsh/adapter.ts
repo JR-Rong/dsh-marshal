@@ -1,4 +1,7 @@
-import { PreCallRejection, type Capability, type AnswerSink, type Operation, type SnapshotCompleteness } from '../types.ts'
+import {
+  PreCallRejection, type Capability, type AnswerSink, type Operation, type SnapshotCompleteness,
+  type SyncSnapshot,
+} from '../types.ts'
 import type { EventFrame } from '../../wire/frames.ts'
 import { createEventDeduper, toMarshalEvents } from './map.ts'
 import type { DshSurface } from './surface.ts'
@@ -107,6 +110,20 @@ export function createDshAdapter(surface: DshSurface, options: DshAdapterOptions
     }
   }
 
+  const syncSnapshot = async (signal: AbortSignal): Promise<SyncSnapshot> => {
+    const listed = await list(signal)
+    return {
+      rows: listed.items.map(session => ({
+        sessionId: session.sessionId,
+        running: session.running,
+        updatedAt: session.updatedAt,
+        blank: session.blank,
+      })),
+      capabilities: [{ agent: 'dsh', capability: capabilityPayload() }],
+      completeness: listed.completeness,
+    }
+  }
+
   return {
     agent: 'dsh',
     capabilities(_sessionId: string): Capability { return capability },
@@ -114,20 +131,24 @@ export function createDshAdapter(surface: DshSurface, options: DshAdapterOptions
     frame,
     nextSeq,
 
+    async syncSnapshot(signal: AbortSignal): Promise<SyncSnapshot> {
+      return await syncSnapshot(signal)
+    },
+
     async snapshot(signal: AbortSignal): Promise<EventFrame[]> {
-      const listed = await list(signal)
+      const listed = await syncSnapshot(signal)
       const events: EventFrame[] = []
-      for (const session of listed.items) {
+      const capability = listed.capabilities.find(item => item.agent === 'dsh')
+      for (const session of listed.rows) {
         // 只发可公开状态：cwd/标题/正文一律不出适配器。
         events.push(frame(session.sessionId, 'session.updated', {
           running: session.running,
           updatedAt: session.updatedAt,
           blank: session.blank,
-          ...(session.publicAlias === undefined
-            ? {}
-            : { publicAlias: true, title: session.publicAlias }),
         }))
-        events.push(frame(session.sessionId, 'capability.changed', capabilityPayload()))
+        if (capability !== undefined) {
+          events.push(frame(session.sessionId, 'capability.changed', capability.capability))
+        }
       }
       return events
     },

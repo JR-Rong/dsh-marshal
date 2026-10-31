@@ -7,8 +7,11 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { WebSocket } from 'ws'
 import { DeviceStore, sha256Hex, serializeDevicesState, type DeviceRecord } from '../src/hub/devices.ts'
 import { DeviceRegistry, type Sender } from '../src/hub/registry.ts'
+import { HubRelay } from '../src/hub/relay.ts'
 import { mountHubSocket, nodeServerPort, type HubSocketHandle } from '../src/hub/server.ts'
+import { createHubSync, type HubSync } from '../src/hub/sync.ts'
 import { CONTRACT_REVISION, type Frame } from '../src/wire/frames.ts'
+import { buildSyncChunks, syncChecksum } from '../src/wire/sync.ts'
 
 const TOKEN = 'y'.repeat(32)
 const OPERATOR_ID = 'operator-test-0123456789abcdef0123456789abcdef'
@@ -59,6 +62,7 @@ interface ServeOptions {
   readonly maxPendingHellos?: number
   readonly watchDevices?: boolean
   readonly pollMs?: number
+  readonly sync?: HubSync
 }
 
 function writeStore(records: readonly DeviceRecord[] = [DEVICE]): { store: DeviceStore; path: string } {
@@ -277,6 +281,61 @@ describe('hub socket', () => {
     expect(frames.map(frame => frame.type)).toEqual(['event'])
     expect(registry.get(DEVICE_ID)?.record.lastSeen).toBeGreaterThan(0)
     ws.close()
+  })
+
+  it('sync 屏障：提交前事件被拒，重复丢弃，缺口以 4409 关闭', async () => {
+    const registry = new DeviceRegistry()
+    const frames: Frame[] = []
+    const relay = new HubRelay({ registry, now: Date.now })
+    const sync = createHubSync({ relay, now: Date.now })
+    cleanups.push(() => { sync.dispose(); relay.dispose() })
+    const { port } = await serve(registry, frames, [DEVICE], { sync })
+    const { ws, ack } = await helloWithAck(registry, port)
+    if (ack.type !== 'hello.ack') throw new Error('expected hello.ack')
+
+    const syncId = 'sync-1'
+    const rows = [{ sessionId: 's1', agent: 'dsh', running: false, updatedAt: 1 }]
+    const chunks = buildSyncChunks(rows)
+    const syncAck = new Promise<Frame>(resolve => {
+      const onMessage = (data: unknown): void => {
+        const frame = JSON.parse(String(data)) as Frame
+        if (frame.type !== 'sync.ack') return
+        ws.off('message', onMessage)
+        resolve(frame)
+      }
+      ws.on('message', onMessage)
+    })
+    ws.send(JSON.stringify({
+      v: 2, type: 'sync.begin', syncId, nodeEpoch: 'epoch-1', connectionId: ack.connectionId,
+      scope: { agents: ['dsh'], sessions: ['s1'] }, version: 1,
+      chunkCount: chunks.length, highWatermark: 5,
+    }))
+    chunks.forEach((chunk, index) => ws.send(JSON.stringify({
+      v: 2, type: 'sync.chunk', syncId, nodeEpoch: 'epoch-1',
+      connectionId: ack.connectionId, index, total: chunks.length, rows: chunk,
+    })))
+    ws.send(JSON.stringify({
+      v: 2, type: 'sync.end', syncId, nodeEpoch: 'epoch-1',
+      connectionId: ack.connectionId, checksum: syncChecksum(chunks),
+    }))
+    expect(await syncAck).toMatchObject({ type: 'sync.ack', syncId, accepted: true, version: 1 })
+
+    const event = (seq: number): string => JSON.stringify({
+      v: 2, type: 'event', deviceId: DEVICE_ID, agent: 'dsh', sessionId: 's1',
+      nodeEpoch: 'epoch-1', seq, ts: 1, kind: 'turn.started', payload: {},
+    })
+    ws.send(event(1))
+    await waitFor(() => frames.length === 1, 'accepted event')
+    ws.send(event(1))
+    await new Promise(resolve => setTimeout(resolve, 30))
+    expect(frames).toHaveLength(1)
+
+    const reason = closeReason(ws)
+    const code = closeCode(ws)
+    ws.send(event(3))
+    expect(await code).toBe(4409)
+    expect(await reason).toBe('sync-gap')
+    expect(frames).toHaveLength(1)
   })
 
   it('hello.ack 绑定 operator、connection 与设备策略', async () => {

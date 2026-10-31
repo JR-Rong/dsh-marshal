@@ -60,8 +60,28 @@ export interface SessionRow {
   readonly sessionId: string
   readonly running: boolean
   readonly updatedAt: number
+  readonly blank?: boolean
   readonly ownership?: string
   readonly counts?: Readonly<Record<string, number>>
+}
+
+/** 完整同步提交的会话行；hub 只接受这些字段，不存 cwd/标题/正文。 */
+export interface CommitRow {
+  readonly agent: string
+  readonly sessionId: string
+  readonly running: boolean
+  readonly updatedAt: number
+  readonly blank?: boolean
+  readonly ownership?: string
+  readonly counts?: Readonly<Record<string, number>>
+}
+
+export interface DeviceCommit {
+  readonly deviceId: string
+  readonly nodeEpoch: string
+  readonly version: number
+  readonly rows: readonly CommitRow[]
+  readonly capabilities: Readonly<Record<string, unknown>>
 }
 
 /** 订阅者数量上限，避免单个 hub 被无限个监听者拖垮。 */
@@ -102,6 +122,117 @@ function indexCounts(value: unknown): Readonly<Record<string, number>> | undefin
   return seen === 0 ? undefined : out
 }
 
+const CAPABILITY_OPERATIONS: ReadonlySet<string> = new Set([
+  'prompt', 'interrupt', 'answer', 'cancel', 'configure', 'create', 'fork',
+])
+const CAPABILITY_OWNERSHIP: ReadonlySet<string> = new Set([
+  'ours', 'foreign-unknown', 'foreign-running', 'unverified',
+])
+const CAPABILITY_TOOL_DETAIL: ReadonlySet<string> = new Set(['args+output', 'args', 'none'])
+const CAPABILITY_PROMPT_FIDELITY: ReadonlySet<string> = new Set(['native', 'relay', 'dom', 'none'])
+const CAPABILITY_FOLLOW: ReadonlySet<string> = new Set(['stream', 'poll', 'none'])
+const CAPABILITY_TUNABLE_IDS: ReadonlySet<string> = new Set([
+  'model', 'reasoning', 'permission', 'plan', 'goal', 'skill', 'plugin',
+])
+const CAPABILITY_TUNABLE_SCOPES: ReadonlySet<string> = new Set(['next-turn', 'next-session', 'host'])
+const CAPABILITY_TUNABLE_EFFECTS: ReadonlySet<string> = new Set(['immediate', 'needs-restart', 'next-session'])
+const CAPABILITY_TUNABLE_DIRECTIONS: ReadonlySet<string> = new Set(['tighten-only'])
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined
+}
+
+function safeShortString(value: unknown, max: number): string | undefined {
+  return typeof value === 'string' && value !== '' ? value.slice(0, max) : undefined
+}
+
+/**
+ * capability 只在 hub 侧再做一次白名单重建：即使节点/适配器出错，
+ * cwd、标题、工具参数正文或未知字段也不会进入索引与 HTTP。
+ */
+export function publicCapability(value: unknown): Record<string, unknown> | undefined {
+  const record = asRecord(value)
+  if (record === undefined) return undefined
+  const out: Record<string, unknown> = {}
+  const observe = asRecord(record.observe)
+  if (observe !== undefined) {
+    const projected: Record<string, unknown> = {}
+    if (typeof observe.history === 'boolean') projected.history = observe.history
+    const follow = safeShortString(observe.follow, 16)
+    if (follow !== undefined && CAPABILITY_FOLLOW.has(follow)) projected.follow = follow
+    if (Object.keys(projected).length > 0) out.observe = projected
+  }
+  if (Array.isArray(record.operations)) {
+    out.operations = [...new Set(record.operations
+      .filter((item): item is string => typeof item === 'string' && CAPABILITY_OPERATIONS.has(item)))]
+      .slice(0, 32)
+  }
+  const ownership = safeShortString(record.ownership, 32)
+  if (ownership !== undefined && CAPABILITY_OWNERSHIP.has(ownership)) out.ownership = ownership
+  const toolDetail = safeShortString(record.toolDetail, 32)
+  if (toolDetail !== undefined && CAPABILITY_TOOL_DETAIL.has(toolDetail)) out.toolDetail = toolDetail
+  const promptFidelity = safeShortString(record.promptFidelity, 32)
+  if (promptFidelity !== undefined && CAPABILITY_PROMPT_FIDELITY.has(promptFidelity)) {
+    out.promptFidelity = promptFidelity
+  }
+  if (typeof record.reasoning === 'boolean') out.reasoning = record.reasoning
+  if (typeof record.stale === 'boolean') out.stale = record.stale
+  for (const key of ['revision', 'readAt'] as const) {
+    const item = record[key]
+    if (typeof item === 'number' && Number.isInteger(item) && item >= 0) out[key] = item
+  }
+  if (Array.isArray(record.tunables)) {
+    out.tunables = record.tunables.slice(0, 16).flatMap(item => {
+      const tunable = asRecord(item)
+      if (tunable === undefined) return []
+      const id = safeShortString(tunable.id, 32)
+      if (id === undefined || !CAPABILITY_TUNABLE_IDS.has(id)) return []
+      const entry: Record<string, unknown> = { id }
+      const scope = safeShortString(tunable.scope, 32)
+      if (scope !== undefined && CAPABILITY_TUNABLE_SCOPES.has(scope)) entry.scope = scope
+      const effect = safeShortString(tunable.effect, 32)
+      if (effect !== undefined && CAPABILITY_TUNABLE_EFFECTS.has(effect)) entry.effect = effect
+      const direction = safeShortString(tunable.direction, 32)
+      if (direction !== undefined && CAPABILITY_TUNABLE_DIRECTIONS.has(direction)) entry.direction = direction
+      if (typeof tunable.editable === 'boolean') entry.editable = tunable.editable
+      const reason = safeShortString(tunable.reason, 64)
+      if (reason !== undefined) entry.reason = reason
+      return [entry]
+    })
+  }
+  const unavailable = asRecord(record.unavailable)
+  if (unavailable !== undefined) {
+    const projected: Record<string, string> = {}
+    let seen = 0
+    for (const [key, item] of Object.entries(unavailable)) {
+      if (seen >= 16) break
+      const reason = safeShortString(item, 64)
+      if (reason === undefined) continue
+      projected[key.slice(0, 64)] = reason
+      seen += 1
+    }
+    if (seen > 0) out.unavailable = projected
+  }
+  return out
+}
+
+function stableCapability(document: Record<string, unknown> | undefined): string {
+  if (document === undefined) return ''
+  const { readAt: _readAt, stale: _stale, ...rest } = document
+  return JSON.stringify(rest)
+}
+
+function sameSessionRow(previous: SessionRow | undefined, next: SessionRow): boolean {
+  if (previous === undefined) return false
+  return previous.running === next.running
+    && previous.updatedAt === next.updatedAt
+    && (previous.blank ?? false) === (next.blank ?? false)
+    && previous.ownership === next.ownership
+    && JSON.stringify(previous.counts ?? {}) === JSON.stringify(next.counts ?? {})
+}
+
 /** 断线/收紧后缓存只能保留生命周期结论，结果正文一律丢弃。 */
 function withoutBody(outcome: CommandOutcome): CommandOutcome {
   if (!outcome.ok) return outcome
@@ -138,7 +269,12 @@ export class HubRelay {
   private readonly cacheDevices = new Map<string, string>()
   private readonly consumers = new Set<(event: EventFrame) => void>()
   private readonly index = new Map<string, SessionRow>()
+  /** 设备 -> agent -> 已提交能力文档；只在 sync 提交或 capability.changed 时更新。 */
+  private readonly capabilityIndex = new Map<string, Map<string, Record<string, unknown>>>()
   private readonly epochs = new Map<string, string>()
+  /** 每个会话当前活动 turnId；只用于避免迟到的 completed 把新回合置闲。 */
+  private readonly activeTurns = new Map<string, string>()
+  private syncGate: ((deviceId: string, connectionId: string, nodeEpoch: string) => boolean) | undefined
   private disposed = false
   private rejectedAckTotal = 0
 
@@ -148,6 +284,11 @@ export class HubRelay {
     timeoutMs?: number
     operatorId?: string
   }) {}
+
+  /** hub 装配同步协调器后注入：未完成原子提交的设备不得收到写命令。 */
+  setSyncGate(gate: ((deviceId: string, connectionId: string, nodeEpoch: string) => boolean) | undefined): void {
+    this.syncGate = gate
+  }
 
   /** 身份不匹配或已超时的 ACK 计数，饱和在上限内。 */
   get rejectedAcks(): number { return this.rejectedAckTotal }
@@ -208,6 +349,14 @@ export class HubRelay {
     const slot = this.options.registry.get(input.target.deviceId)
     if (slot === undefined) {
       return { ok: false, status: 'rejected', code: 'device-offline' }
+    }
+    // 原子同步屏障完成前禁用写请求；已缓存的幂等结果仍可返回（上面已处理）。
+    if (this.syncGate !== undefined && !this.syncGate(
+      input.target.deviceId,
+      slot.connectionId ?? UNBOUND_CONNECTION_ID,
+      slot.nodeEpoch ?? UNBOUND_NODE_EPOCH,
+    )) {
+      return { ok: false, status: 'rejected', code: 'sync-required' }
     }
 
     // 登记必须发生在任何 await 之前；同一轮事件循环里的并发调用只能有一个赢家。
@@ -410,19 +559,98 @@ export class HubRelay {
     }
   }
 
-  /** 节点重连后以快照为准：先清掉该设备的旧索引，并把移除通知给订阅者。 */
-  clearDevice(deviceId: string): void {
-    // 新连接可能带来更紧的授权：旧结果正文不再回放给页面。
-    this.stripDeviceBodies(deviceId)
-    for (const [key, row] of [...this.index]) {
-      if (row.deviceId !== deviceId) continue
-      this.index.delete(key)
-      this.publish({
-        v: 2, type: 'event', deviceId: row.deviceId, agent: row.agent, sessionId: row.sessionId,
-        nodeEpoch: this.epochs.get(deviceId) ?? UNBOUND_NODE_EPOCH,
-        seq: 0, ts: this.options.now(), kind: 'session.removed', payload: {},
+  /**
+   * 新连接带来 nodeEpoch：同 epoch 的普通重连保留旧索引（stale）；
+   * 不同 epoch 立即丢弃旧能力（不能继续当可写），但旧会话行保留到新提交，
+   * 删除通知只在原子提交时发布。
+   */
+  beginEpoch(deviceId: string, nodeEpoch: string): void {
+    const previous = this.epochs.get(deviceId)
+    this.epochs.set(deviceId, nodeEpoch)
+    if (previous === undefined || previous === nodeEpoch) return
+    this.capabilityIndex.delete(deviceId)
+    const prefix = `${deviceId}\u0000`
+    for (const key of [...this.activeTurns.keys()]) {
+      if (key.startsWith(prefix)) this.activeTurns.delete(key)
+    }
+  }
+
+  /**
+   * 同步提交：整台设备的会话行与能力文档一次性替换。
+   * 只有校验全部通过后调用；提交过程中不 await，因此对订阅者与 HTTP 是原子的。
+   */
+  commitDevice(commit: DeviceCommit): boolean {
+    if (this.disposed) return false
+    const epoch = this.epochs.get(commit.deviceId)
+    if (epoch !== undefined && epoch !== commit.nodeEpoch) return false
+    this.epochs.set(commit.deviceId, commit.nodeEpoch)
+
+    const previous = new Map<string, SessionRow>()
+    for (const [key, row] of this.index) {
+      if (row.deviceId === commit.deviceId) previous.set(key, row)
+    }
+    const next = new Map<string, SessionRow>()
+    for (const row of commit.rows) {
+      const key = `${commit.deviceId}\u0000${row.agent}\u0000${row.sessionId}`
+      next.set(key, {
+        deviceId: commit.deviceId,
+        agent: row.agent,
+        sessionId: row.sessionId,
+        running: row.running,
+        updatedAt: row.updatedAt,
+        ...(row.blank === undefined ? {} : { blank: row.blank }),
+        ...(row.ownership === undefined ? {} : { ownership: row.ownership }),
+        ...(row.counts === undefined ? {} : { counts: row.counts }),
       })
     }
+    const removed = [...previous.entries()].filter(([key]) => !next.has(key))
+    const changed = [...next.entries()].filter(([key, row]) => !sameSessionRow(previous.get(key), row))
+
+    const previousCapabilities = this.capabilityIndex.get(commit.deviceId)
+    const capabilities = new Map<string, Record<string, unknown>>()
+    for (const [agent, document] of Object.entries(commit.capabilities)) {
+      const clean = publicCapability(document)
+      if (clean !== undefined) capabilities.set(agent, clean)
+    }
+
+    for (const [key] of removed) {
+      this.index.delete(key)
+      this.activeTurns.delete(key)
+    }
+    for (const [key, row] of changed) this.index.set(key, row)
+    this.capabilityIndex.set(commit.deviceId, capabilities)
+
+    // 删除与新/变更都在同一轮同步代码内发布；失败路径不会走到这里。
+    for (const [, row] of removed) {
+      this.fanout({
+        v: 2, type: 'event', deviceId: commit.deviceId, agent: row.agent, sessionId: row.sessionId,
+        nodeEpoch: commit.nodeEpoch, seq: 0, ts: this.options.now(), kind: 'session.removed', payload: {},
+      })
+    }
+    for (const [, row] of changed) {
+      this.fanout(this.sessionEvent(row, commit.nodeEpoch))
+    }
+    for (const [agent, document] of capabilities) {
+      if (stableCapability(previousCapabilities?.get(agent)) === stableCapability(document)) continue
+      for (const [, row] of next) {
+        if (row.agent !== agent) continue
+        this.fanout({
+          v: 2, type: 'event', deviceId: commit.deviceId, agent, sessionId: row.sessionId,
+          nodeEpoch: commit.nodeEpoch, seq: 0, ts: this.options.now(), kind: 'capability.changed',
+          payload: document,
+        })
+      }
+    }
+    return true
+  }
+
+  /** 已提交的能力文档；没有提交过的 agent 不会出现。 */
+  capabilities(deviceId: string): Record<string, Record<string, unknown>> {
+    const out: Record<string, Record<string, unknown>> = {}
+    const map = this.capabilityIndex.get(deviceId)
+    if (map === undefined) return out
+    for (const [agent, document] of map) out[agent] = document
+    return out
   }
 
   /** 停止接收新指令：清定时器、以固定错误结束所有等待中的指令。幂等。 */
@@ -444,30 +672,91 @@ export class HubRelay {
     }
   }
 
-  /** 记录会话索引并扇出；索引只存设备/agent/sessionId/运行态/所有权/计数，不存 cwd/标题或正文。 */
-  publish(event: EventFrame): void {
-    const key = `${event.deviceId}\u0000${event.agent}\u0000${event.sessionId}`
-    this.epochs.set(event.deviceId, event.nodeEpoch)
-    if (event.kind === 'session.removed') {
-      this.index.delete(key)
-    } else if (event.kind === 'session.updated') {
-      const payload = (event.payload ?? {}) as {
-        running?: unknown; updatedAt?: unknown; ownership?: unknown; counts?: unknown
-      }
-      const ownership = typeof payload.ownership === 'string' ? payload.ownership.slice(0, 32) : undefined
-      const counts = indexCounts(payload.counts)
-      this.index.set(key, {
-        deviceId: event.deviceId, agent: event.agent, sessionId: event.sessionId,
-        running: payload.running === true,
-        updatedAt: typeof payload.updatedAt === 'number' ? payload.updatedAt : event.ts,
-        ...(ownership === undefined ? {} : { ownership }),
-        ...(counts === undefined ? {} : { counts }),
-      })
+  private sessionEvent(row: SessionRow, nodeEpoch: string): EventFrame {
+    return {
+      v: 2, type: 'event', deviceId: row.deviceId, agent: row.agent, sessionId: row.sessionId,
+      nodeEpoch, seq: 0, ts: this.options.now(), kind: 'session.updated',
+      payload: {
+        running: row.running,
+        updatedAt: row.updatedAt,
+        ...(row.blank === undefined ? {} : { blank: row.blank }),
+        ...(row.ownership === undefined ? {} : { ownership: row.ownership }),
+        ...(row.counts === undefined ? {} : { counts: row.counts }),
+      },
     }
-    // 单个订阅者抛错不影响其它订阅者，也不影响调用方。
+  }
+
+  /** 单个订阅者抛错不影响其它订阅者，也不影响调用方。 */
+  private fanout(event: EventFrame): void {
     for (const consumer of [...this.consumers]) {
       try { consumer(event) } catch { /* 忽略单个订阅者的失败 */ }
     }
+  }
+
+  /**
+   * 记录会话索引并扇出；索引只存设备/agent/sessionId/运行态/所有权/计数，
+   * 不存 cwd/标题或正文。省略字段保留旧值；turn 事件只在已有行上改运行态。
+   */
+  publish(event: EventFrame): void {
+    const key = `${event.deviceId}\u0000${event.agent}\u0000${event.sessionId}`
+    this.epochs.set(event.deviceId, event.nodeEpoch)
+    const payload: Record<string, unknown> = event.kind === 'session.removed'
+      ? {}
+      : asRecord(event.payload) ?? {}
+    if (event.kind === 'session.removed') {
+      this.index.delete(key)
+      this.activeTurns.delete(key)
+    } else if (event.kind === 'session.updated') {
+      const previous = this.index.get(key)
+      const running = typeof payload.running === 'boolean' ? payload.running : previous?.running
+      const updatedAt = typeof payload.updatedAt === 'number'
+        && Number.isInteger(payload.updatedAt) && payload.updatedAt >= 0
+        ? payload.updatedAt
+        : previous?.updatedAt ?? event.ts
+      const blank = typeof payload.blank === 'boolean' ? payload.blank : previous?.blank
+      const ownership = typeof payload.ownership === 'string'
+        ? payload.ownership.slice(0, 32)
+        : previous?.ownership
+      const counts = indexCounts(payload.counts) ?? previous?.counts
+      this.index.set(key, {
+        deviceId: event.deviceId, agent: event.agent, sessionId: event.sessionId,
+        running: running === true, updatedAt,
+        ...(blank === undefined ? {} : { blank }),
+        ...(ownership === undefined ? {} : { ownership }),
+        ...(counts === undefined ? {} : { counts }),
+      })
+    } else if (event.kind === 'turn.started' || event.kind === 'turn.completed') {
+      // 没有会话行时绝不用 turn 事件凭空创建状态。
+      const row = this.index.get(key)
+      const turnId = typeof payload.turnId === 'string'
+        ? payload.turnId
+        : typeof payload.turn === 'string' ? payload.turn : undefined
+      if (row !== undefined) {
+        if (event.kind === 'turn.started') {
+          if (turnId !== undefined) this.activeTurns.set(key, turnId)
+          if (!row.running) this.index.set(key, { ...row, running: true })
+        } else {
+          const state = typeof payload.state === 'string' ? payload.state : 'completed'
+          const active = this.activeTurns.get(key)
+          // 迟到的 A.completed 不能结束已经开始的 B；没有 turnId 时按当前活动回合处理。
+          if (state !== 'running' && (turnId === undefined || active === undefined || active === turnId)) {
+            if (row.running) this.index.set(key, { ...row, running: false })
+            if (turnId === undefined || active === turnId) this.activeTurns.delete(key)
+          }
+        }
+      }
+    } else if (event.kind === 'capability.changed') {
+      const document = publicCapability(payload.capability ?? payload)
+      if (document !== undefined) {
+        let map = this.capabilityIndex.get(event.deviceId)
+        if (map === undefined) {
+          map = new Map()
+          this.capabilityIndex.set(event.deviceId, map)
+        }
+        map.set(event.agent, document)
+      }
+    }
+    this.fanout(event)
   }
 
   /** 只返回注册表里仍存在设备的会话，设备断线后不再残留。 */

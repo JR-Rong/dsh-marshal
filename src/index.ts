@@ -7,10 +7,12 @@ import { mountHubSocket, webServerPort } from './hub/server.ts'
 import { registerMarshalRoutes } from './hub/api.ts'
 import { DeviceRegistry } from './hub/registry.ts'
 import { HubRelay } from './hub/relay.ts'
+import { createHubSync } from './hub/sync.ts'
 import { ensureInstall } from './hub/identity.ts'
 import { createDshSurface } from './adapters/dsh/surface.ts'
 import { createDshAdapter } from './adapters/dsh/adapter.ts'
 import { NodeLink } from './node/link.ts'
+import { createNodeSync, type NodeSync } from './node/sync.ts'
 import { openJournal } from './node/journal.ts'
 import { createFollower, runCommand } from './node/runner.ts'
 import { createSeqAllocator, withPublicSeq } from './node/seq.ts'
@@ -33,6 +35,10 @@ function applyHub(ctx: MarshalContext, config: MarshalConfig): void {
   const install = ensureInstall(config.devicesFile)
   if (install.initialized) ctx.logger.warn('marshal: empty device table')
   const relay = new HubRelay({ registry, now: Date.now, operatorId: install.operatorId })
+  const sync = createHubSync({ relay, now: Date.now, logger: ctx.logger })
+  // 只能在匹配的 sync.ack 原子提交后写入；同步期间一律 sync-required。
+  relay.setSyncGate((deviceId, connectionId, nodeEpoch) =>
+    sync.isSynced({ deviceId, connectionId, nodeEpoch }))
   const hubEpoch = randomUUID()
   const socket = mountHubSocket({
     port: webServerPort(webServer),
@@ -42,8 +48,7 @@ function applyHub(ctx: MarshalContext, config: MarshalConfig): void {
     hubEpoch,
     now: Date.now,
     logger: ctx.logger,
-    // 设备重连时节点会重发快照：先清索引，再让快照重建。
-    onAttach: deviceId => relay.clearDevice(deviceId),
+    sync,
     onDetach: deviceId => relay.deviceOffline(deviceId),
     onFrame: (identity, frame) => {
       // 事件进索引并扇出；ACK 必须同时匹配 commandId 与连接身份才结算。
@@ -53,9 +58,9 @@ function applyHub(ctx: MarshalContext, config: MarshalConfig): void {
       else if (frame.type === 'command.status.result') relay.settleStatus(frame, identity)
     },
   })
-  ctx.effect(() => { socket.dispose(); relay.dispose() }, 'marshal: uplink socket')
+  ctx.effect(() => { socket.dispose(); sync.dispose(); relay.dispose() }, 'marshal: uplink socket')
   ctx.effect(registerMarshalRoutes({
-    webServer, registry, relay, requireToken: config.dashboardToken!,
+    webServer, registry, relay, sync, requireToken: config.dashboardToken!,
   }).dispose, 'marshal: dashboard routes')
   ctx.logger.info(`marshal: hub ready at ${webServer.getOrigin()}/marshal`)
 }
@@ -110,33 +115,20 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
     auditFields: fields => projector.auditFields(fields),
   }
 
-  let snapshot: AbortController | undefined
-  const sendSnapshot = (): void => {
-    // 每次连上都重发快照：hub 在 hello 时清掉了本设备的旧索引，必须以最新列表重建。
-    snapshot?.abort()
-    const abort = new AbortController()
-    snapshot = abort
-    void (async () => {
-      for (const event of await adapter.snapshot(abort.signal)) emitProjected(event)
-      // 分页没有终止证据时只报告“不完整”，T06 的同步必须据此标记而不是当全量。
-      if (adapter.snapshotCompleteness === 'unconfirmed') {
-        ctx.logger.warn('marshal: snapshot incomplete: pagination unconfirmed')
-      }
-    })().catch((error: unknown) => {
-      // 主动取消导致的失败不是故障，不写日志；日志只留错误类型。
-      if (!abort.signal.aborted) ctx.logger.warn('marshal: snapshot failed: ' + errorName(error))
-    })
-  }
-
   // 公开 seq 只在投影/过滤之后分配；适配器预分配的序号在出站前被覆盖。
   const publicSeq = createSeqAllocator()
   const emitProjected = (event: EventFrame): void => {
-    for (const projected of projector.event(event)) link.sendEvent(withPublicSeq(publicSeq, projected))
+    for (const projected of projector.event(event)) {
+      // 同步层记录已投影的增量，扫描时不能用更旧的清单覆盖它。
+      nodeSync?.observe(projected)
+      link.sendEvent(withPublicSeq(publicSeq, projected))
+    }
   }
   const emitVolatileProjected = (event: EventFrame): void => {
     link.sendVolatileEvent(withPublicSeq(publicSeq, event))
   }
 
+  let nodeSync: NodeSync | undefined
   const link = new NodeLink({
     url: config.hubUrl!, token: config.token!, deviceId: config.deviceId!,
     deviceName: config.deviceName,
@@ -146,6 +138,8 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
     onFrame: text => {
       let frame: Frame
       try { frame = decodeFrame(text) } catch { return }
+      // sync.ack 是生命周期控制帧，不能进入命令分派。
+      if (frame.type === 'sync.ack') { nodeSync?.onFrame(frame); return }
       runCommand(link, adapter, follower, frame, config.deviceId!, journal, Date.now, {
         projector: () => projector,
         audit,
@@ -161,10 +155,23 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
       // 旧队列按更宽策略编码，不能在新握手上补发。
       if (tightened) link.clearOutbound()
     },
-    onOnline: sendSnapshot,
+    // hello.ack 后进入 syncing：先完成原子快照屏障，绝不能在这里冲刷普通事件。
+    onSyncNeeded: () => { nodeSync?.begin() },
     // 订阅绑定当前连接：断线即清空引用，重连后由 hub 重新订阅。
-    onOffline: () => follower.stopAll(),
+    onOffline: () => {
+      nodeSync?.abort()
+      follower.stopAll()
+    },
     onError: error => ctx.logger.warn(`marshal: link error: ${errorName(error)}`),
+  })
+  nodeSync = createNodeSync({
+    link, adapter,
+    agents: config.agents,
+    projector: () => liveProjector,
+    emit: event => emitProjected(event),
+    frame: (sessionId, kind, payload) => adapter.frame(sessionId, kind, payload),
+    highWatermark: () => publicSeq.highWatermark(),
+    logger: ctx.logger,
   })
   relay = config.questionRelay === 'off'
     ? undefined
@@ -196,7 +203,7 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
   })
 
   ctx.effect(() => {
-    snapshot?.abort()
+    nodeSync?.dispose()
     follower.stopAll()
     relay?.dispose()
     link.close()

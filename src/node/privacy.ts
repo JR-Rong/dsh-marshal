@@ -506,6 +506,8 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
     }
     const reasoning = safeBool(payload.reasoning)
     if (reasoning !== undefined) out.reasoning = reasoning
+    const stale = safeBool(payload.stale)
+    if (stale !== undefined) out.stale = stale
     for (const key of ['revision', 'readAt'] as const) {
       const value = safeInt(payload[key])
       if (value !== undefined) out[key] = value
@@ -943,6 +945,16 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
     syncRow(row: unknown): Record<string, unknown> | undefined {
       const record = asRecord(row)
       if (record === undefined) return undefined
+      // 能力行是每 agent 一份完整文档；不能按会话行处理，也不扩写未知字段。
+      if (record.capability !== undefined) {
+        const agent = safeString(record.agent, 64)
+        const capability = asRecord(record.capability)
+        if (agent === undefined || capability === undefined) return undefined
+        const out: Record<string, unknown> = { agent: scrub(agent).text, capability: capabilityPayload(capability) }
+        const stale = safeBool(record.stale)
+        if (stale !== undefined) out.stale = stale
+        return out
+      }
       const sessionId = safeString(record.sessionId, 128)
       if (sessionId === undefined) return undefined
       const out: Record<string, unknown> = { sessionId: scrub(sessionId).text }
@@ -952,6 +964,8 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
       if (running !== undefined) out.running = running
       const updatedAt = safeInt(record.updatedAt)
       if (updatedAt !== undefined) out.updatedAt = updatedAt
+      const blank = safeBool(record.blank)
+      if (blank !== undefined) out.blank = blank
       const ownership = safeString(record.ownership, 32)
       if (ownership !== undefined) out.ownership = scrub(ownership).text
       const counts = countsOf(record.counts)
