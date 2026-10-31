@@ -6,7 +6,7 @@ import type { EventFrame, WireErrorCode } from '../wire/frames.ts'
  * 没有可靠证据，必须由 runner 记为 `outcome-unknown`。
  */
 export class PreCallRejection extends Error {
-  override readonly name = 'PreCallRejection'
+  override readonly name: string = 'PreCallRejection'
   readonly code: WireErrorCode
 
   constructor(code: WireErrorCode, detail?: string) {

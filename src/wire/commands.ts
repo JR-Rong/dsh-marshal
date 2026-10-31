@@ -55,13 +55,36 @@ const ConfigureArgsSchema = z.object({
   value: z.unknown(),
 }).strict()
 
+// acquire 不携带参数：是否可取得写权只能由适配器按排他证据裁定。
+const AcquireArgsSchema = z.object({}).strict()
+
+const CreateArgsSchema = z.object({
+  // cwd 只接受显式、有界路径；缺省由适配器决定，不猜机器目录。
+  cwd: z.string().min(1).max(4096).optional(),
+}).strict()
+
+// fork 的目标是父会话，新会话身份由原生返回。
+const ForkArgsSchema = z.object({}).strict()
+
 export type ObserveArgs = z.infer<typeof ObserveArgsSchema>
 export type PromptArgs = z.infer<typeof PromptArgsSchema>
 export type InterruptArgs = z.infer<typeof InterruptArgsSchema>
 export type AnswerArgs = z.infer<typeof AnswerArgsSchema>
 export type CancelArgs = z.infer<typeof CancelArgsSchema>
 export type ConfigureArgs = z.infer<typeof ConfigureArgsSchema>
-export type CommandArgs = ObserveArgs | PromptArgs | InterruptArgs | AnswerArgs | CancelArgs | ConfigureArgs
+export type AcquireArgs = z.infer<typeof AcquireArgsSchema>
+export type CreateArgs = z.infer<typeof CreateArgsSchema>
+export type ForkArgs = z.infer<typeof ForkArgsSchema>
+export type CommandArgs =
+  | ObserveArgs
+  | PromptArgs
+  | InterruptArgs
+  | AnswerArgs
+  | CancelArgs
+  | ConfigureArgs
+  | AcquireArgs
+  | CreateArgs
+  | ForkArgs
 
 const ARG_SCHEMAS = {
   observe: ObserveArgsSchema,
@@ -70,6 +93,9 @@ const ARG_SCHEMAS = {
   answer: AnswerArgsSchema,
   cancel: CancelArgsSchema,
   configure: ConfigureArgsSchema,
+  acquire: AcquireArgsSchema,
+  create: CreateArgsSchema,
+  fork: ForkArgsSchema,
 } as const
 
 export function parseCommandArgs(op: 'observe', args: unknown): ObserveArgs
@@ -78,6 +104,9 @@ export function parseCommandArgs(op: 'interrupt', args: unknown): InterruptArgs
 export function parseCommandArgs(op: 'answer', args: unknown): AnswerArgs
 export function parseCommandArgs(op: 'cancel', args: unknown): CancelArgs
 export function parseCommandArgs(op: 'configure', args: unknown): ConfigureArgs
+export function parseCommandArgs(op: 'acquire', args: unknown): AcquireArgs
+export function parseCommandArgs(op: 'create', args: unknown): CreateArgs
+export function parseCommandArgs(op: 'fork', args: unknown): ForkArgs
 export function parseCommandArgs(op: CommandOp, args: unknown): CommandArgs
 export function parseCommandArgs(op: CommandOp, args: unknown): CommandArgs {
   const schema = ARG_SCHEMAS[op]

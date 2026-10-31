@@ -4,6 +4,9 @@ import {
 } from '../wire/frames.ts'
 import { parseCommandArgs, type ObserveArgs } from '../wire/commands.ts'
 import { PreCallRejection, type Adapter } from '../adapters/types.ts'
+import type {
+  CreateSessionRequest, CreatedSession, ForkSessionRequest,
+} from '../agents/types.ts'
 import type { LoggerLike } from '../dsh-types.ts'
 import type { HandshakeBinding, NodeLink } from './link.ts'
 import { JournalError, type Journal, type JournalDomain, type JournalEntry, type SettledStatus } from './journal.ts'
@@ -121,6 +124,17 @@ const WIRE_CODES: ReadonlySet<string> = new Set([
 
 /** 超过这个偏差就不接受带副作用的命令：期限判断已经不可信。 */
 const MAX_CLOCK_SKEW_MS = 60_000
+
+/** v0 Adapter 尚未声明 create/fork；这里只做窄的结构检查，不伪造实现。 */
+interface SessionFactoryPorts {
+  readonly agent: string
+  createSession?(request: CreateSessionRequest, signal: AbortSignal): Promise<CreatedSession>
+  forkSession?(request: ForkSessionRequest, signal: AbortSignal): Promise<CreatedSession>
+}
+
+function sessionFactoryPorts(adapter: Adapter): SessionFactoryPorts {
+  return adapter
+}
 
 /** 只允许已声明的 wire 错误码过线；journal 里的 code 可能来自旧版本。 */
 function asWireCode(code: string | undefined, fallback: WireErrorCode): WireErrorCode {
@@ -354,8 +368,14 @@ export function runCommand(
     return
   }
   const sessionId = frame.target.sessionId
-  if (sessionId === null) {
-    // v0 的 op 都要求实际会话；create/fork 在 v1 才允许 sessionId: null。
+  if (frame.op === 'create') {
+    // create 是 agent 级操作：带具体会话的 create 无法安全解释。
+    if (sessionId !== null) {
+      reply({ status: 'rejected', code: 'invalid-args' })
+      return
+    }
+  } else if (sessionId === null) {
+    // create 之外的 op（含 fork/acquire）都必须指向具体会话。
     reply({ status: 'rejected', code: 'session-unknown' })
     return
   }
@@ -368,6 +388,11 @@ export function runCommand(
     return
   }
   if (frame.op === 'observe') {
+    if (sessionId === null) {
+      // 目标校验已经拦下；这里只帮助类型收窄，防御运行期构造。
+      reply({ status: 'rejected', code: 'session-unknown' })
+      return
+    }
     const observe = args as ObserveArgs
     if (observe.kind === 'history') {
       // 已验证的 DSH surface 没有只读历史入口；明确拒绝，不能让调用方自己猜。
@@ -432,6 +457,16 @@ export function runCommand(
     reply({ status: 'rejected', code: 'deadline-expired' })
     return
   }
+  // create/fork 没有原生端口时必须在登记 journal 之前拒绝，避免留下无调用证据的 admitted。
+  const ports = sessionFactoryPorts(adapter)
+  if (frame.op === 'create' && typeof ports.createSession !== 'function') {
+    reply({ status: 'rejected', code: 'unsupported', result: { reason: 'capability-unavailable' } })
+    return
+  }
+  if (frame.op === 'fork' && typeof ports.forkSession !== 'function') {
+    reply({ status: 'rejected', code: 'unsupported', result: { reason: 'capability-unavailable' } })
+    return
+  }
   try {
     journal.admit({ domain, op: frame.op, args })
   } catch (error) {
@@ -448,13 +483,44 @@ export function runCommand(
     return
   }
 
-  void adapter.execute({ op: frame.op, target: { sessionId }, args })
-    .then(result => settleAndReply(
-      // configure 没有已验证的回读时只能是 pending-confirmation（回读由 T06/T07 提供）。
-      frame.op === 'configure' ? 'pending-confirmation' : 'accepted',
-      undefined,
-      result,
-    ))
+  const signal = new AbortController().signal
+  const invoke = (): Promise<unknown> => {
+    if (frame.op === 'create') {
+      const create = ports.createSession
+      if (typeof create !== 'function') return Promise.reject(new PreCallRejection('unsupported'))
+      const cwd = 'cwd' in args ? args.cwd : undefined
+      return create({ requestId: frame.commandId, ...(cwd === undefined ? {} : { cwd }) }, signal)
+    }
+    if (frame.op === 'fork') {
+      const fork = ports.forkSession
+      if (typeof fork !== 'function') return Promise.reject(new PreCallRejection('unsupported'))
+      if (sessionId === null) return Promise.reject(new PreCallRejection('session-unknown'))
+      return fork({ requestId: frame.commandId, parentSessionId: sessionId }, signal)
+    }
+    if (sessionId === null) return Promise.reject(new PreCallRejection('session-unknown'))
+    return adapter.execute({ op: frame.op, target: { sessionId }, args })
+  }
+
+  void invoke()
+    .then(result => {
+      if (frame.op === 'create' || frame.op === 'fork') {
+        // 新会话只回传 ID；runtimeEpoch 留在本机，不落 journal、不外发。
+        const created = result as { readonly sessionId?: unknown } | null
+        if (typeof created !== 'object' || created === null
+          || typeof created.sessionId !== 'string' || created.sessionId === '') {
+          // 原生调用可能已发生：没有可用新 ID 只能按 unknown 结算，绝不重试或伪造。
+          throw new Error('marshal: created session id missing')
+        }
+        settleAndReply('accepted', undefined, { sessionId: created.sessionId })
+        return
+      }
+      settleAndReply(
+        // configure 没有已验证的回读时只能是 pending-confirmation（回读由 T06/T07 提供）。
+        frame.op === 'configure' ? 'pending-confirmation' : 'accepted',
+        undefined,
+        result,
+      )
+    })
     .catch((error: unknown) => {
       if (error instanceof PreCallRejection) {
         settleAndReply('rejected', error.code)

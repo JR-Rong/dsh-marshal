@@ -58,8 +58,10 @@ export const MARSHAL_KINDS = [
 export const MarshalKind = z.enum(MARSHAL_KINDS)
 export type MarshalKind = z.infer<typeof MarshalKind>
 
-/** v0 op set; create/fork/acquire/decide arrive with v1. Append here and in wire/commands.ts. */
-export const COMMAND_OPS = ['observe', 'prompt', 'interrupt', 'answer', 'cancel', 'configure'] as const
+/** v0 op set; create/fork/acquire arrive with v1 (decide remains T05). Append here and in wire/commands.ts. */
+export const COMMAND_OPS = [
+  'observe', 'prompt', 'interrupt', 'answer', 'cancel', 'configure', 'acquire', 'create', 'fork',
+] as const
 export const CommandOpSchema = z.enum(COMMAND_OPS)
 export type CommandOp = z.infer<typeof CommandOpSchema>
 

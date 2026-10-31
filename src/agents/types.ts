@@ -12,9 +12,9 @@ import type { EventFrame } from '../wire/frames.ts'
  * Ownership/SnapshotCompleteness/SyncSnapshot 仍是唯一语义来源，本文件只做扩展，
  * 不另造一套能力枚举。
  *
- * T01 只交付类型：ownership / configure / readSettings / handleNativeInput 以独立
- * 端口类型留给 T02、T05 实现；本文件不提供任何空实现。AgentHost 也不绕过
- * node runner/journal/privacy 接受远端写命令（见 host.ts）。
+ * T01 交付类型边界；T02 在此补上所有权快照/证据与 create/fork 端口，
+ * configure/readSettings/handleNativeInput 仍留给 T05。本文件不提供空实现。
+ * AgentHost 也不绕过 node runner/journal/privacy 接受远端写命令（见 host.ts）。
  */
 
 export type AgentName = string
@@ -132,22 +132,66 @@ export interface ControlResult {
 }
 
 /**
- * T02 的写权端口占位。持续排他证据必须带机制、持有者与代次，不能只记 boolean。
- * T01 不实现、不挂到 host 路由。
+ * 每会话的本地有效所有权状态。`foreign-unknown` 是默认值：
+ * “不在本地 Map 里”只表示没有证据，绝不等于 idle。
+ */
+export type OwnershipState =
+  | 'foreign-unknown'
+  | 'foreign-running'
+  | 'acquiring'
+  | 'ours-idle'
+  | 'ours-running'
+
+/**
+ * 持续排他证据必须带机制、持有者与代次，不能只记 boolean。
+ * `invalidatesOn` 至少一项，说明哪些事件会让这份证据失效。
  */
 export interface OwnershipEvidence {
+  readonly sessionId: string
   readonly mechanism: string
   readonly holder: string
   readonly runtimeEpoch: RuntimeEpoch
   readonly acquiredAt: number
   readonly expiresAt?: number
+  readonly invalidatesOn: readonly string[]
 }
 
+export interface OwnershipSnapshot {
+  readonly sessionId: string
+  readonly state: OwnershipState
+  readonly wire: Ownership
+  readonly evidence?: OwnershipEvidence
+  readonly reason?: string
+}
+
+/**
+ * 写权端口：acquire 是显式动作，不能由 resume/observe 隐式触发。
+ * release/revoke 只撤销本地登记；真实失效条件由适配器的证据机制负责。
+ */
 export interface OwnershipPort {
-  acquire(sessionId: string, signal: AbortSignal): Promise<OwnershipEvidence>
+  acquire(sessionId: string, signal: AbortSignal): Promise<OwnershipSnapshot>
   release(sessionId: string): Promise<void>
   ownership(sessionId: string): Ownership
   evidence(sessionId: string): OwnershipEvidence | undefined
+  controlReason(sessionId: string): string | undefined
+}
+
+/** create 必须用 agent 级 `sessionId: null` 提交；requestId 用于关联原生调用。 */
+export interface CreateSessionRequest {
+  readonly requestId: string
+  readonly cwd?: string
+}
+
+/** fork 指向父会话；新会话获得独立身份，不是原会话接管。 */
+export interface ForkSessionRequest {
+  readonly requestId: string
+  readonly parentSessionId: string
+}
+
+export interface CreatedSession {
+  readonly sessionId: string
+  readonly runtimeEpoch: RuntimeEpoch
+  readonly parentSessionId?: string
 }
 
 /**
@@ -266,6 +310,10 @@ export interface AgentAdapter extends Adapter {
   prompt(request: PromptRequest, signal: AbortSignal): Promise<ControlResult>
   steer(request: SteerRequest, signal: AbortSignal): Promise<ControlResult>
   interrupt(request: InterruptRequest, signal: AbortSignal): Promise<ControlResult>
+
+  // 显式新建/fork；未实现时保持 undefined，runner 以 capability-unavailable 拒绝。
+  createSession?(request: CreateSessionRequest, signal: AbortSignal): Promise<CreatedSession>
+  forkSession?(request: ForkSessionRequest, signal: AbortSignal): Promise<CreatedSession>
 
   // 以下端口由 T02/T05 实现；T01 只定义类型，不提供空实现。
   readonly ownershipPort?: OwnershipPort
