@@ -38,7 +38,8 @@ async function serve(
   devices = DEVICES,
   options: ServeOptions = {},
 ): Promise<Served> {
-  const server = createServer()
+  // 卸载 upgrade handler 后，未匹配请求仍由宿主返回，而不是悬空等待。
+  const server = createServer((_req, res) => { res.writeHead(404).end() })
   const mounted = mountHubSocket({
     port: nodeServerPort(server),
     registry,
@@ -73,7 +74,7 @@ async function connect(port: number, path = '/marshal/uplink', token: string | u
 }
 
 /** 断言这条握手最终没有建立：既可能握手失败，也可能握手后立刻被关掉。 */
-async function expectRejected(port: number, path = '/marshal/uplink', token: string | undefined = TOKEN): Promise<void> {
+async function expectRejected(port: number, path: string, token: string | undefined): Promise<void> {
   const ws = openSocket(port, path, token)
   ws.on('error', () => {})
   const opened = await new Promise<boolean>(resolve => {
@@ -294,7 +295,7 @@ describe('hub socket', () => {
     mounted.dispose()
     await waitFor(() => ws.readyState === WebSocket.CLOSED, 'existing socket to be terminated')
     await waitFor(() => registry.get('mac') === undefined, 'slot to be removed on terminate')
-    await expectRejected(port)
+    await expectRejected(port, '/marshal/uplink', TOKEN)
   })
 
   it('带查询串的合法路径仍能握手', async () => {
