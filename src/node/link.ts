@@ -41,6 +41,14 @@ export interface NodePolicyBinding {
   readonly policies: HelloAckFrame['policies']
 }
 
+/** 当前握手绑定：命令帧必须与它匹配；serverTimeOffset 用于把本地时钟校正到 hub。 */
+export interface HandshakeBinding {
+  readonly connectionId: string
+  readonly nodeEpoch: string
+  /** hub 时钟 - 本地时钟（毫秒）；只在收到合法 hello.ack 后才有意义。 */
+  readonly serverTimeOffset: number
+}
+
 export interface NodeLinkOptions {
   readonly url: string
   readonly token: string
@@ -93,6 +101,11 @@ export class NodeLink {
   private policyBinding: NodePolicyBinding | undefined
   private readonly heartbeatNonces = new Set<string>()
   private lastHeartbeatAck = 0
+  /** hello 发出时刻，用于估计 RTT；只有成功 ack 才会参与时钟校正。 */
+  private helloStartedAt = 0
+  private serverTimeOffset = 0
+  private bestRtt = Number.POSITIVE_INFINITY
+  private hasSkewSample = false
 
   constructor(private readonly options: NodeLinkOptions) {}
 
@@ -101,6 +114,20 @@ export class NodeLink {
 
   /** 最近一次 hello.ack 的策略绑定；index 用它做隐私决策，不落盘。 */
   get binding(): NodePolicyBinding | undefined { return this.policyBinding }
+
+  /**
+   * 当前连接身份与时钟偏移；握手未完成时为 undefined（此时任何命令都不可执行）。
+   * runner 用 connectionId/nodeEpoch 拒绝过期帧，用 offset 校正确认期限。
+   */
+  get handshake(): HandshakeBinding | undefined {
+    const connectionId = this.connectionId
+    if (!this.acked || connectionId === undefined) return undefined
+    return {
+      connectionId,
+      nodeEpoch: this.options.nodeEpoch,
+      serverTimeOffset: this.serverTimeOffset,
+    }
+  }
 
   /** 幂等：已连接、连接中或正在等待重连时都不会再拨号。 */
   start(): void {
@@ -178,6 +205,7 @@ export class NodeLink {
 
     ws.on('open', () => {
       if (this.socket !== ws) { ws.close(); return }
+      this.resetSkew()
       const binding = this.policyBinding
       // hello 必须先于任何缓冲事件，hub 只认首帧 hello；它发不出去就换一条连接。
       const hello = encodeFrame({
@@ -189,6 +217,7 @@ export class NodeLink {
           ? {}
           : { operatorId: binding.operatorId, policyRevision: binding.policyRevision }),
       })
+      this.helloStartedAt = Date.now()
       if (!this.trySend(ws, hello)) { ws.close(); return }
       // 不在 socket open 时报告在线：只有合法 hello.ack 才代表握手完成。
     })
@@ -257,6 +286,7 @@ export class NodeLink {
     if (ack.kind === 'valid') {
       this.acked = true
       this.connectionId = ack.frame.connectionId
+      this.sampleServerTime(ack.frame.serverTime, this.helloStartedAt, Date.now())
       const previous = this.policyBinding
       if (previous !== undefined && previous.operatorId !== ack.frame.operatorId) {
         // operatorId 变化即不同身份域：旧策略/待答状态全部丢弃。
@@ -348,6 +378,8 @@ export class NodeLink {
       connectionId, nodeEpoch: this.options.nodeEpoch,
       sentAt: typeof frame.sentAt === 'number' ? frame.sentAt : 0,
     }
+    // 只允许不扩大偏差的微调；心跳时间不能把校正后的时钟往回拽。
+    if (typeof frame.sentAt === 'number') this.refineServerTime(frame.sentAt, Date.now())
     this.trySend(ws, encodeFrame(ack))
     return true
   }
@@ -404,6 +436,34 @@ export class NodeLink {
 
   private reportError(error: unknown): void {
     try { this.options.onError?.(error) } catch { /* onError 自己抛错也不再外抛 */ }
+  }
+
+  private resetSkew(): void {
+    this.serverTimeOffset = 0
+    this.bestRtt = Number.POSITIVE_INFINITY
+    this.hasSkewSample = false
+  }
+
+  /**
+   * offset = serverTime - 本地收到时刻。只有 RTT 不大于已观测最小值的样本才被采纳，
+   * 避免一次慢握手把校正后的时钟整体推偏；被拒绝的样本不改变已有估计。
+   */
+  private sampleServerTime(serverTime: number, sentAt: number, receivedAt: number): void {
+    const rtt = receivedAt - sentAt
+    if (!Number.isFinite(serverTime) || serverTime < 0 || !Number.isFinite(rtt) || rtt < 0) return
+    if (this.hasSkewSample && rtt > this.bestRtt) return
+    this.serverTimeOffset = serverTime - receivedAt
+    this.bestRtt = rtt
+    this.hasSkewSample = true
+  }
+
+  /** 心跳 sentAt 只能在不扩大偏差（不超过最小 RTT 的钳制）时微调估计。 */
+  private refineServerTime(hubSentAt: number, receivedAt: number): void {
+    if (!this.hasSkewSample || this.bestRtt === Number.POSITIVE_INFINITY) return
+    if (!Number.isFinite(hubSentAt) || hubSentAt <= 0) return
+    const candidate = hubSentAt - receivedAt
+    if (Math.abs(candidate - this.serverTimeOffset) > this.bestRtt) return
+    this.serverTimeOffset = candidate
   }
 
   /** 应用心跳是权威存活信号；ws ping/pong 不再参与判断。 */

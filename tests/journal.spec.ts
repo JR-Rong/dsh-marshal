@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto'
 import {
   mkdtempSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync,
 } from 'node:fs'
@@ -16,9 +17,9 @@ function tempDir(): string {
   return dir
 }
 
-function paths(): { file: string; keyFile: string } {
+function paths(): { file: string; keyFile: string; initFile: string } {
   const dir = join(tempDir(), 'state')
-  return { file: join(dir, 'journal.json'), keyFile: join(dir, 'journal.key') }
+  return { file: join(dir, 'journal.json'), keyFile: join(dir, 'journal.key'), initFile: join(dir, 'journal.init') }
 }
 
 function domain(idempotencyKey: string, sessionId = 's1'): JournalDomain {
@@ -192,6 +193,102 @@ describe('journal', () => {
       else process.env.MARSHAL_JOURNAL_FILE = previousFile
       if (previousKey === undefined) delete process.env.MARSHAL_JOURNAL_KEY_FILE
       else process.env.MARSHAL_JOURNAL_KEY_FILE = previousKey
+    }
+  })
+
+  it('首次初始化先写 0600 标记，指纹与代次同步到 journal 头', () => {
+    const { file, keyFile, initFile } = paths()
+    const journal = openJournal({ file, keyFile, initFile })
+    journal.close()
+
+    expect(statSync(initFile).mode & 0o777).toBe(0o600)
+    const marker = JSON.parse(readFileSync(initFile, 'utf8')) as {
+      version: number; keyFingerprint: string; generation: number; createdAt: number
+    }
+    const header = JSON.parse(readFileSync(file, 'utf8')) as {
+      keyFingerprint: string; generation: number
+    }
+    expect(marker.keyFingerprint).toMatch(/^[0-9a-f]{64}$/)
+    expect(header.keyFingerprint).toBe(marker.keyFingerprint)
+    expect(marker.generation).toBe(header.generation)
+    expect(marker.createdAt).toBeGreaterThan(0)
+  })
+
+  it('缺少标记（journal/key 已存在）进入 recovery-required，不静默接管', () => {
+    const { file, keyFile, initFile } = paths()
+    const journal = openJournal({ file, keyFile, initFile })
+    journal.admit({ domain: domain('k'), op: 'prompt', args: {} })
+    journal.close()
+
+    unlinkSync(initFile)
+    fails(() => openJournal({ file, keyFile, initFile }).close(), 'recovery-required')
+
+    // 标记恢复后删掉 journal：标记存在但 journal 缺失同样拒绝。
+    writeFileSync(initFile, JSON.stringify({
+      version: 1,
+      keyFingerprint: JSON.parse(readFileSync(file, 'utf8')).keyFingerprint,
+      generation: 1,
+      createdAt: 1,
+    }))
+    unlinkSync(file)
+    fails(() => openJournal({ file, keyFile, initFile }).close(), 'recovery-required')
+  })
+
+  it('journal 被旧备份回滚（标记代次更高）进入 recovery-required', () => {
+    const { file, keyFile, initFile } = paths()
+    const journal = openJournal({ file, keyFile, initFile })
+    journal.admit({ domain: domain('a'), op: 'prompt', args: {} })
+    const backup = readFileSync(file, 'utf8')
+    journal.settle(domain('a'), 'accepted')
+    journal.close()
+
+    // 代次继续推进后把更旧的 journal 放回去：不能据此重放旧状态。
+    writeFileSync(file, backup)
+    fails(() => openJournal({ file, keyFile, initFile }).close(), 'recovery-required')
+  })
+
+  it('密钥被替换（指纹不匹配）进入 recovery-required', () => {
+    const { file, keyFile, initFile } = paths()
+    const journal = openJournal({ file, keyFile, initFile })
+    journal.close()
+
+    writeFileSync(keyFile, `${randomBytes(32).toString('base64url')}\n`)
+    fails(() => openJournal({ file, keyFile, initFile }).close(), 'recovery-required')
+  })
+
+  it('只持久化白名单内的最小结果，重放时原样返回', () => {
+    const { file, keyFile, initFile } = paths()
+    const journal = openJournal({ file, keyFile, initFile })
+    journal.admit({ domain: domain('ok'), op: 'prompt', args: {} })
+    journal.settle(domain('ok'), 'accepted', undefined, {
+      sessionId: 's1',
+      accepted: true,
+      revision: 3,
+      following: { accepted: false, secret: 'NESTED-SECRET' },
+      prompt: 'RESULT-SECRET',
+      list: [1, 2],
+    })
+    journal.admit({ domain: domain('big'), op: 'prompt', args: {} })
+    journal.settle(domain('big'), 'accepted', undefined, {
+      accepted: true,
+      sessionId: 'x'.repeat(5000),
+    })
+    journal.close()
+
+    const raw = readFileSync(file, 'utf8')
+    expect(raw).not.toContain('RESULT-SECRET')
+    expect(raw).not.toContain('NESTED-SECRET')
+
+    const reopened = openJournal({ file, keyFile, initFile })
+    try {
+      expect(reopened.lookup(domain('ok'))?.result).toEqual({
+        sessionId: 's1', accepted: true, revision: 3,
+        following: { accepted: false },
+      })
+      // 超过 4096 字节的结果按“无结果”处理。
+      expect(reopened.lookup(domain('big'))?.result).toBeUndefined()
+    } finally {
+      reopened.close()
     }
   })
 })

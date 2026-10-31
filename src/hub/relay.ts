@@ -27,7 +27,13 @@ export interface CommandInput {
  * “没有产生执行”；发送后结果不明一律 outcome-unknown。
  */
 export type CommandOutcome =
-  | { ok: true; status: 'accepted' | 'confirmed'; result: unknown }
+  | {
+    ok: true
+    status: 'accepted' | 'confirmed'
+    result: unknown
+    /** 成功仍可能带通知性 code（如 result-too-large）；它不是失败，必须原样可见。 */
+    code?: string
+  }
   | {
     ok: false
     status: 'rejected' | 'pending-confirmation' | 'outcome-unknown'
@@ -239,10 +245,18 @@ export class HubRelay {
     this.pending.delete(ack.commandId)
     switch (ack.status) {
       case 'accepted':
-        entry.resolve({ ok: true, status: 'accepted', result: ack.result })
+        // accepted/confirmed 永远按成功结算；code 只是通知（例如结果过大未回传），
+        // 既不能折叠成 rejected，也不能让幂等缓存把它记成失败。
+        entry.resolve({
+          ok: true, status: 'accepted', result: ack.result,
+          ...(ack.code === undefined ? {} : { code: ack.code }),
+        })
         return
       case 'confirmed':
-        entry.resolve({ ok: true, status: 'confirmed', result: ack.result })
+        entry.resolve({
+          ok: true, status: 'confirmed', result: ack.result,
+          ...(ack.code === undefined ? {} : { code: ack.code }),
+        })
         return
       case 'rejected':
         entry.resolve({ ok: false, status: 'rejected', code: ack.code ?? 'unsupported' })

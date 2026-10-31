@@ -3,8 +3,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { PreCallRejection, type Adapter } from '../src/adapters/types.ts'
-import type { NodeLink } from '../src/node/link.ts'
-import { openJournal, type Journal } from '../src/node/journal.ts'
+import type { HandshakeBinding, NodeLink } from '../src/node/link.ts'
+import { JournalError, openJournal, type Journal } from '../src/node/journal.ts'
 import { createFollower, runCommand } from '../src/node/runner.ts'
 import type {
   AckFrame, CommandFrame, CommandStatusFrame, CommandStatusResultFrame, Frame,
@@ -18,9 +18,10 @@ function setup(capacity?: number) {
   dirs.push(dir)
   const file = join(dir, 'journal.json')
   const keyFile = join(dir, 'journal.key')
-  const journal = openJournal({ file, keyFile, ...(capacity === undefined ? {} : { capacity }) })
+  const initFile = join(dir, 'journal.init')
+  const journal = openJournal({ file, keyFile, initFile, ...(capacity === undefined ? {} : { capacity }) })
   journals.push(journal)
-  return { dir, file, keyFile, journal }
+  return { dir, file, keyFile, initFile, journal }
 }
 
 function target(sessionId = 's1') {
@@ -34,6 +35,8 @@ function command(options: {
   id?: string
   deadline?: number
   sessionId?: string
+  connectionId?: string
+  nodeEpoch?: string
 }): CommandFrame {
   return {
     v: 2, type: 'command',
@@ -45,12 +48,18 @@ function command(options: {
     args: options.args ?? { text: 'hi' },
     issuedAt: 0,
     deadline: options.deadline ?? Date.now() + 10_000,
-    connectionId: 'conn-1',
-    nodeEpoch: 'epoch-1',
+    connectionId: options.connectionId ?? 'conn-1',
+    nodeEpoch: options.nodeEpoch ?? 'epoch-1',
   }
 }
 
-function statusQuery(key: string, overrides: { deviceId?: string; agent?: string; requestId?: string } = {}): CommandStatusFrame {
+function statusQuery(key: string, overrides: {
+  deviceId?: string
+  agent?: string
+  requestId?: string
+  connectionId?: string
+  nodeEpoch?: string
+} = {}): CommandStatusFrame {
   const base = target()
   return {
     v: 2, type: 'command.status',
@@ -62,26 +71,31 @@ function statusQuery(key: string, overrides: { deviceId?: string; agent?: string
       sessionId: base.sessionId,
     },
     idempotencyKey: key,
-    connectionId: 'conn-1',
-    nodeEpoch: 'epoch-1',
+    connectionId: overrides.connectionId ?? 'conn-1',
+    nodeEpoch: overrides.nodeEpoch ?? 'epoch-1',
   }
 }
 
 function harness() {
   let calls = 0
-  let mode: 'ok' | 'reject' | 'after-call' = 'ok'
+  let mode: 'ok' | 'reject' | 'after-call' | 'huge' = 'ok'
+  let binding: HandshakeBinding | undefined = {
+    connectionId: 'conn-1', nodeEpoch: 'epoch-1', serverTimeOffset: 0,
+  }
   const adapter = {
     agent: 'dsh',
     async execute() {
       calls += 1
       if (mode === 'reject') throw new PreCallRejection('session-unknown')
       if (mode === 'after-call') throw new Error('native transport lost')
+      if (mode === 'huge') return { accepted: true, blob: 'x'.repeat(2 * 1024 * 1024) }
       return { accepted: true }
     },
   } as unknown as Adapter
   const sent: Frame[] = []
   const link = {
     sendRaw(text: string) { sent.push(JSON.parse(text) as Frame) },
+    get handshake(): HandshakeBinding | undefined { return binding },
   } as unknown as NodeLink
   const follower = createFollower({ adapter, send: () => {}, logger: { warn() {} } })
   return {
@@ -90,7 +104,8 @@ function harness() {
     link,
     sent,
     calls: () => calls,
-    setMode(next: 'ok' | 'reject' | 'after-call') { mode = next },
+    setMode(next: 'ok' | 'reject' | 'after-call' | 'huge') { mode = next },
+    setBinding(next: HandshakeBinding | undefined) { binding = next },
     acks(): AckFrame[] { return sent.filter((frame): frame is AckFrame => frame.type === 'ack') },
     statusResults(): CommandStatusResultFrame[] {
       return sent.filter((frame): frame is CommandStatusResultFrame => frame.type === 'command.status.result')
@@ -241,5 +256,76 @@ describe('node command lifecycle', () => {
     await flush()
     expect(journal.size).toBe(0)
     expect(h.acks()[0]).toMatchObject({ status: 'accepted' })
+  })
+
+  it('结果超过帧上限时保留真实状态并只回 result-too-large', async () => {
+    const { journal } = setup()
+    const h = harness()
+    h.setMode('huge')
+    runCommand(h.link, h.adapter, h.follower, command({ key: 'huge' }), 'mac', journal)
+    await flush()
+    expect(h.calls()).toBe(1)
+    expect(h.acks()).toHaveLength(1)
+    expect(h.acks()[0]).toMatchObject({ status: 'accepted', code: 'result-too-large' })
+    // 真实结果没有回传，但幂等登记仍是 accepted，不能被当成 rejected。
+    expect(h.acks()[0]?.result).toBeUndefined()
+    expect(journal.lookup({ operatorId: 'operator-1', target: target(), idempotencyKey: 'huge' })?.status)
+      .toBe('accepted')
+  })
+
+  it('旧连接/旧代次的命令与状态查询返回 stale-connection', async () => {
+    const { journal } = setup()
+    const h = harness()
+    runCommand(h.link, h.adapter, h.follower, command({ key: 'old-conn', connectionId: 'conn-old' }), 'mac', journal)
+    runCommand(h.link, h.adapter, h.follower, command({ key: 'old-epoch', nodeEpoch: 'epoch-0' }), 'mac', journal)
+    runCommand(h.link, h.adapter, h.follower, statusQuery('old-conn', { connectionId: 'conn-old' }), 'mac', journal)
+    await flush()
+    expect(h.calls()).toBe(0)
+    expect(h.acks()).toMatchObject([
+      { status: 'rejected', code: 'stale-connection' },
+      { status: 'rejected', code: 'stale-connection' },
+    ])
+    expect(h.statusResults()[0]).toMatchObject({ status: 'rejected', code: 'stale-connection' })
+    expect(journal.size).toBe(0)
+
+    // 没有握手证据（未完成握手）同样不能执行。
+    h.setBinding(undefined)
+    runCommand(h.link, h.adapter, h.follower, command({ key: 'unbound' }), 'mac', journal)
+    await flush()
+    expect(h.calls()).toBe(0)
+    expect(h.acks().at(-1)).toMatchObject({ status: 'rejected', code: 'stale-connection' })
+  })
+
+  it('时钟偏差超过 60s 时拒绝副作用命令且零写入', async () => {
+    const { journal } = setup()
+    const h = harness()
+    h.setBinding({ connectionId: 'conn-1', nodeEpoch: 'epoch-1', serverTimeOffset: 60_001 })
+    runCommand(h.link, h.adapter, h.follower, command({ key: 'skewed' }), 'mac', journal)
+    await flush()
+    expect(h.calls()).toBe(0)
+    expect(h.acks()[0]).toMatchObject({ status: 'rejected', code: 'clock-skew' })
+    expect(journal.size).toBe(0)
+  })
+
+  it('journal 写入失败时拒绝且零调用', async () => {
+    const { journal } = setup()
+    const h = harness()
+    journal.admit = () => { throw new JournalError('recovery-required', 'disk full') }
+    runCommand(h.link, h.adapter, h.follower, command({ key: 'nowrite' }), 'mac', journal)
+    await flush()
+    expect(h.calls()).toBe(0)
+    expect(h.acks()[0]).toMatchObject({ status: 'rejected', code: 'recovery-required' })
+  })
+
+  it('configure 没有验证回读时结算为 pending-confirmation', async () => {
+    const { journal } = setup()
+    const h = harness()
+    runCommand(h.link, h.adapter, h.follower, command({
+      key: 'configure', op: 'configure', args: { field: 'model', value: 'm' },
+    }), 'mac', journal)
+    await flush()
+    expect(h.acks()[0]).toMatchObject({ status: 'pending-confirmation' })
+    expect(journal.lookup({ operatorId: 'operator-1', target: target(), idempotencyKey: 'configure' })?.status)
+      .toBe('pending-confirmation')
   })
 })

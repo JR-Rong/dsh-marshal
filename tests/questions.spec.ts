@@ -1,12 +1,37 @@
-import { describe, expect, it } from 'vitest'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterEach, describe, expect, it } from 'vitest'
 import { createDshAdapter } from '../src/adapters/dsh/adapter.ts'
 import type { AskUserQuestionAnswerLike, AskUserQuestionRequestLike, MarshalContext, UserQuestionLike } from '../src/dsh-types.ts'
+import { openJournal, type Journal } from '../src/node/journal.ts'
 import { createQuestionRelay, parseAnswers, type QuestionRelay } from '../src/node/questions.ts'
 import { createFollower, runCommand } from '../src/node/runner.ts'
 import type { NodeLink } from '../src/node/link.ts'
 import type { EventFrame, Frame } from '../src/wire/frames.ts'
 
 const questions = [{ id: 'q1', question: '选哪个？', options: [{ label: 'A' }, { label: 'B' }] }]
+
+const dirs: string[] = []
+const journals: Journal[] = []
+
+/** journal 是副作用命令的硬依赖：测试必须用隔离的临时状态，不能碰真实 $HOME。 */
+function isolatedJournal(): Journal {
+  const dir = mkdtempSync(join(tmpdir(), 'marshal-questions-'))
+  dirs.push(dir)
+  const journal = openJournal({
+    file: join(dir, 'journal.json'),
+    keyFile: join(dir, 'journal.key'),
+    initFile: join(dir, 'journal.init'),
+  })
+  journals.push(journal)
+  return journal
+}
+
+afterEach(() => {
+  for (const journal of journals.splice(0)) journal.close()
+  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
+})
 
 type Handler = (request: AskUserQuestionRequestLike, next: () => Promise<AskUserQuestionAnswerLike>) => Promise<AskUserQuestionAnswerLike>
 
@@ -267,17 +292,23 @@ describe('question relay end to end', () => {
       connectionId: 'conn-1', nodeEpoch: 'epoch-1',
     })
     const received: Frame[] = []
-    const link = { sendRaw(text: string) { received.push(JSON.parse(text) as Frame) } } as unknown as NodeLink
+    const journal = isolatedJournal()
+    const link = {
+      sendRaw(text: string) { received.push(JSON.parse(text) as Frame) },
+      get handshake() {
+        return { connectionId: 'conn-1', nodeEpoch: 'epoch-1', serverTimeOffset: 0 }
+      },
+    } as unknown as NodeLink
     const follower = createFollower({ adapter, send: () => {}, logger: { warn() {} } })
     const flush = (): Promise<void> => new Promise(resolve => setTimeout(resolve, 1))
 
     // 线上 args.answers 是数组（设计 §7.2），适配器负责包成 DSH 的 `{ answers }`。
-    runCommand(link, adapter, follower, command('c1', [{ id: 'q1', selected: ['A'] }]), 'mac')
+    runCommand(link, adapter, follower, command('c1', [{ id: 'q1', selected: ['A'] }]), 'mac', journal)
     await expect(pending).resolves.toEqual({ answers: [{ id: 'q1', selected: ['A'] }] })
     await flush()
     expect(received[0]).toMatchObject({ type: 'ack', commandId: 'c1', status: 'accepted', result: { accepted: true } })
 
-    runCommand(link, adapter, follower, command('c2', [{ id: 'q1', selected: ['B'] }]), 'mac')
+    runCommand(link, adapter, follower, command('c2', [{ id: 'q1', selected: ['B'] }]), 'mac', journal)
     await flush()
     expect(received[1]).toMatchObject({ type: 'ack', commandId: 'c2', status: 'rejected', code: 'unknown' })
     relay.dispose()

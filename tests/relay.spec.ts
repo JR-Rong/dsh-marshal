@@ -54,6 +54,25 @@ describe('HubRelay', () => {
     await expect(promise).resolves.toEqual({ ok: true, status: 'accepted', result: { accepted: true } })
   })
 
+  it('accepted 带通知 code 仍按成功结算，不被缓存成失败', async () => {
+    const { registry, sent } = setup()
+    const relay = new HubRelay({ registry, now: () => 0, timeoutMs: 50 })
+    const input = { op: 'prompt' as const, target: target(), args: { text: 'big' }, idempotencyKey: 'big' }
+
+    const promise = relay.command(input)
+    const frame = JSON.parse(sent[0]!)
+    relay.settle(ack(frame.commandId, { code: 'result-too-large' }), origin())
+    await expect(promise).resolves.toMatchObject({
+      ok: true, status: 'accepted', code: 'result-too-large',
+    })
+
+    // 同键重试命中成功缓存：code 仍可见，且不会重新下发。
+    await expect(relay.command(input)).resolves.toMatchObject({
+      ok: true, status: 'accepted', code: 'result-too-large',
+    })
+    expect(sent).toHaveLength(1)
+  })
+
   it('accepted 与 confirmed 都表示成功', async () => {
     const { registry, sent } = setup()
     const relay = new HubRelay({ registry, now: () => 0, timeoutMs: 50 })

@@ -6,7 +6,7 @@ import {
 import { parseCommandArgs, type ObserveArgs } from '../wire/commands.ts'
 import { PreCallRejection, type Adapter } from '../adapters/types.ts'
 import type { LoggerLike } from '../dsh-types.ts'
-import type { NodeLink } from './link.ts'
+import type { HandshakeBinding, NodeLink } from './link.ts'
 import { JournalError, type Journal, type JournalDomain, type JournalEntry, type SettledStatus } from './journal.ts'
 
 /**
@@ -62,7 +62,11 @@ export function createFollower(options: {
 const WIRE_CODES: ReadonlySet<string> = new Set([
   'session-unknown', 'invalid-args', 'unsupported', 'device-mismatch', 'agent-crashed', 'result-too-large',
   'unknown', 'invalid', 'session-mismatch', 'tighten-only', 'deadline-expired',
+  'stale-connection', 'clock-skew',
 ])
+
+/** 超过这个偏差就不接受带副作用的命令：期限判断已经不可信。 */
+const MAX_CLOCK_SKEW_MS = 60_000
 
 /** 错误前缀即 wire 错误码：`session-unknown: ...` 或 `marshal: session-unknown: ...` → `session-unknown`。 */
 function codeOf(error: unknown): WireErrorCode {
@@ -95,20 +99,28 @@ function subscriptionsOf(follower: ReturnType<typeof createFollower>): Map<strin
 function runStatusQuery(
   link: NodeLink,
   adapter: Adapter,
-  journal: Journal | undefined,
+  journal: Journal,
   frame: Extract<Frame, { type: 'command.status' }>,
   deviceId: string,
 ): void {
-  const reply = (status: AckFrame['status'], code?: WireErrorCode): void => {
-    const result: CommandStatusResultFrame = {
+  const reply = (status: AckFrame['status'], code?: WireErrorCode, result?: unknown): void => {
+    const body: CommandStatusResultFrame = {
       v: 2, type: 'command.status.result', requestId: frame.requestId, status,
       ...(code === undefined ? {} : { code }),
+      ...(result === undefined ? {} : { result }),
     }
-    try { link.sendRaw(encodeFrame(result)) } catch { /* 回不去就保持未知，调用方超时 */ }
+    try { link.sendRaw(encodeFrame(body)) } catch { /* 回不去就保持未知，调用方超时 */ }
+  }
+  const binding = link.handshake
+  if (binding === undefined
+    || frame.connectionId !== binding.connectionId
+    || frame.nodeEpoch !== binding.nodeEpoch) {
+    // 握手未完成或帧来自旧连接/旧实例：不能读，更不能据此执行。
+    reply('rejected', 'stale-connection')
+    return
   }
   if (frame.target.deviceId !== deviceId) { reply('rejected', 'device-mismatch'); return }
   if (frame.target.agent !== adapter.agent) { reply('rejected', 'session-unknown'); return }
-  if (journal === undefined) { reply('outcome-unknown', 'record-unavailable'); return }
   const domain: JournalDomain = {
     operatorId: frame.operatorId,
     target: frame.target,
@@ -129,7 +141,20 @@ function runStatusQuery(
   }
   const status = entryStatus(entry)
   const fallback: WireErrorCode = status === 'rejected' ? 'unsupported' : 'outcome-unknown'
-  reply(status, entry.code === undefined ? undefined : asWireCode(entry.code, fallback))
+  reply(
+    status,
+    entry.code === undefined ? undefined : asWireCode(entry.code, fallback),
+    entry.result,
+  )
+}
+
+/** 命令帧必须落在当前握手上；没有绑定证据时同样按过期连接处理。 */
+function bindingFor(link: NodeLink, frame: { connectionId: string; nodeEpoch: string }): HandshakeBinding | undefined {
+  const binding = link.handshake
+  if (binding === undefined
+    || binding.connectionId !== frame.connectionId
+    || binding.nodeEpoch !== frame.nodeEpoch) return undefined
+  return binding
 }
 
 export function runCommand(
@@ -138,7 +163,7 @@ export function runCommand(
   follower: ReturnType<typeof createFollower>,
   frame: Frame,
   deviceId: string,
-  journal?: Journal,
+  journal: Journal,
   now: () => number = Date.now,
 ): void {
   if (frame.type === 'command.status') {
@@ -162,21 +187,30 @@ export function runCommand(
     try {
       link.sendRaw(encodeFrame(ack))
     } catch {
-      // 结果超过帧上限时，只回固定的小体积错误帧。
+      // 结果超过帧上限：保留真实生命周期状态，只去掉 result 并标注原因。
+      // 绝不改写成 rejected——副作用可能已经发生。
       link.sendRaw(encodeFrame({
         v: 2, type: 'ack', commandId: frame.commandId,
         connectionId: frame.connectionId, nodeEpoch: frame.nodeEpoch,
-        status: 'rejected', code: 'result-too-large',
+        status: body.status, code: 'result-too-large',
       }))
     }
   }
+  const binding = bindingFor(link, frame)
+  if (binding === undefined) {
+    // 旧连接/旧实例的帧：执行会重复副作用，必须丢弃。
+    reply({ status: 'rejected', code: 'stale-connection' })
+    return
+  }
+  // 期限由 hub 用服务端时钟填写；本地判断必须先做偏移校正。
+  const deadlineNow = (): number => now() + binding.serverTimeOffset
   if (frame.target.deviceId !== deviceId) { reply({ status: 'rejected', code: 'device-mismatch' }); return }
   if (frame.target.agent !== adapter.agent) {
     reply({ status: 'rejected', code: 'session-unknown' })
     return
   }
   // hub 已经超时并可能让用户重试过：迟到的指令再执行会跑两遍。
-  if (frame.deadline < now()) {
+  if (frame.deadline < deadlineNow()) {
     reply({ status: 'rejected', code: 'deadline-expired' })
     return
   }
@@ -234,20 +268,14 @@ export function runCommand(
     return
   }
 
-  // 副作用操作：validate → deadline → journal → 调用 → settle。
-  if (journal === undefined) {
-    // 兼容直接调用 runner 的测试装配；正式入口始终注入 journal。
-    void adapter.execute({ op: frame.op, target: { sessionId }, args })
-      .then(result => reply({ status: 'accepted', result }))
-      .catch((error: unknown) => reply({
-        status: 'rejected',
-        code: error instanceof PreCallRejection ? error.code : codeOf(error),
-      }))
+  // 副作用操作：validate → clock → deadline → journal → 调用 → settle。
+  // journal 是硬依赖：没有持久登记就不能产生副作用（也不再有 journal-less 回退）。
+  if (Math.abs(binding.serverTimeOffset) > MAX_CLOCK_SKEW_MS) {
+    // 偏差过大时期限判断不可信；必须在任何 journal 写入与 agent 调用之前拒绝。
+    reply({ status: 'rejected', code: 'clock-skew' })
     return
   }
 
-  // 闭包不保留参数的类型收窄；显式取一次已确认存在的 journal。
-  const activeJournal = journal
   const domain: JournalDomain = {
     operatorId: frame.operatorId,
     target: frame.target,
@@ -273,7 +301,7 @@ export function runCommand(
   }
 
   // lookup→admit 是同步临界区（无 await），并发同键只可能有一个 admitted 赢家。
-  if (frame.deadline < now()) {
+  if (frame.deadline < deadlineNow()) {
     reply({ status: 'rejected', code: 'deadline-expired' })
     return
   }
@@ -288,13 +316,18 @@ export function runCommand(
     return
   }
   // 持久化本身也消耗时间：调用前再检查一次，过期命令零调用。
-  if (frame.deadline < now()) {
+  if (frame.deadline < deadlineNow()) {
     settleAndReply('rejected', 'deadline-expired')
     return
   }
 
   void adapter.execute({ op: frame.op, target: { sessionId }, args })
-    .then(result => settleAndReply(frame.op === 'configure' ? 'confirmed' : 'accepted', undefined, result))
+    .then(result => settleAndReply(
+      // configure 没有已验证的回读时只能是 pending-confirmation（回读由 T06/T07 提供）。
+      frame.op === 'configure' ? 'pending-confirmation' : 'accepted',
+      undefined,
+      result,
+    ))
     .catch((error: unknown) => {
       if (error instanceof PreCallRejection) {
         settleAndReply('rejected', error.code)
@@ -312,7 +345,11 @@ export function runCommand(
         return
       case 'accepted':
       case 'confirmed':
-        reply({ status: entry.status })
+        reply({
+          status: entry.status,
+          ...(entry.code === undefined ? {} : { code: asWireCode(entry.code, 'unsupported') }),
+          ...(entry.result === undefined ? {} : { result: entry.result }),
+        })
         return
       case 'rejected':
         reply({ status: 'rejected', code: asWireCode(entry.code, 'unsupported') })
@@ -328,7 +365,7 @@ export function runCommand(
 
   function settleAndReply(status: SettledStatus, code?: WireErrorCode, result?: unknown): void {
     try {
-      activeJournal.settle(domain, status, code)
+      journal.settle(domain, status, code, result)
     } catch {
       // 调用已发生但结果无法持久化：仍必须是 unknown，不能让调用方以为失败可重试。
       reply({ status: 'outcome-unknown', code: 'recovery-required' })

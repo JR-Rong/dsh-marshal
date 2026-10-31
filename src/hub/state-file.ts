@@ -35,10 +35,29 @@ export function ensurePrivateDir(dir: string): void {
 
 export interface LockHandle { release(): void }
 
+/**
+ * rename 只保证目录项在内存里换名；目录 fsync 才能保证崩溃后仍然可见。
+ * Linux 上打不开/fsync 目录句柄属于真实故障，必须让调用方看到；其它平台尽力而为。
+ */
+function fsyncDir(dir: string): void {
+  let fd: number | undefined
+  try {
+    fd = openSync(dir, 'r')
+    fsyncSync(fd)
+  } catch (error) {
+    if (process.platform === 'linux') throw error
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd) } catch { /* 已关闭或从未打开 */ }
+    }
+  }
+}
+
 /** 原子写入同目录 tmp 后 rename；mode 只在创建时生效，所以 tmp 与目标都要收紧。 */
 export function atomicWriteFile(path: string, data: string, mode = 0o600): void {
-  ensurePrivateDir(dirname(path))
-  const tmp = join(dirname(path), `.${basename(path)}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`)
+  const dir = dirname(path)
+  ensurePrivateDir(dir)
+  const tmp = join(dir, `.${basename(path)}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`)
   let fd: number | undefined
   try {
     fd = openSync(tmp, 'wx', mode)
@@ -48,6 +67,7 @@ export function atomicWriteFile(path: string, data: string, mode = 0o600): void 
     fd = undefined
     chmodSync(tmp, mode)
     renameSync(tmp, path)
+    fsyncDir(dir)
   } catch (error) {
     if (fd !== undefined) {
       try { closeSync(fd) } catch { /* 已经关闭或创建失败 */ }
