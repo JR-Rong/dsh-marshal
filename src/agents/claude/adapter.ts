@@ -29,6 +29,7 @@ import {
   type ClaudeRuntime, type ClaudeSdk,
 } from './runtime.ts'
 import { createClaudeSessionRegistry } from './session.ts'
+import { createClaudeSettingsPort } from './settings.ts'
 
 /**
  * Claude 基础适配器（`@anthropic-ai/claude-agent-sdk@0.3.316`）。
@@ -124,6 +125,8 @@ export function createClaudeAdapter(options: ClaudeAdapterOptions): AgentAdapter
   const runtimeEpoch = options.runtimeEpoch ?? `${options.nodeEpoch}:claude:${randomUUID()}`
   const initTimeoutMs = options.initTimeoutMs ?? DEFAULT_INIT_TIMEOUT_MS
   const probeTimeoutMs = options.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS
+  // 0.3.316 没有可验证的当前值读回，端口只返回空值并拒绝全部 configure。
+  const settingsPort = createClaudeSettingsPort({ runtimeEpoch })
 
   const sessions = createClaudeSessionRegistry()
   const coordinator: OwnershipCoordinator = createOwnershipCoordinator({
@@ -802,6 +805,7 @@ export function createClaudeAdapter(options: ClaudeAdapterOptions): AgentAdapter
     },
 
     ownershipPort,
+    settingsPort,
 
     ...(options.inputRelay === undefined ? {} : { nativeInputPort: options.inputRelay }),
 

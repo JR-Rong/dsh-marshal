@@ -1,9 +1,13 @@
+import type { PermissionScope } from '../../tunables/catalog.ts'
+
 /**
  * Codex app-server 协议最小子集，pin 到 `rust-v0.166.0` 的生成 schema
  * （`codex_app_server_protocol.v2.schemas.json`）。这里只声明适配器实际使用
  * 的字段；字段缺失/类型不符一律按协议错误处理，不做“尽量兼容”。
  *
  * 0.166.0 没有 `protocolVersion`：版本只按 `initialize.userAgent` 旁证。
+ * 设置快照解析器对未知附加字段保持宽容，但对已知字段不做猜测：无法表达的
+ * sandbox/approval 形状直接省略整个 permission，绝不合成“更安全”的值。
  */
 
 export const CODEX_SUPPORTED_VERSION = '0.166.0'
@@ -331,4 +335,200 @@ export function threadWaitKind(thread: CodexThread): 'approval' | 'question' | u
   if (status.activeFlags.includes('waitingOnApproval')) return 'approval'
   if (status.activeFlags.includes('waitingOnUserInput')) return 'question'
   return undefined
+}
+
+export interface CodexThreadSettings {
+  readonly model?: string
+  readonly reasoning?: string
+  readonly permission?: PermissionScope
+  readonly plan?: 'on' | 'off'
+}
+
+/** `thread/resume` 的已归一化设置视图；缺失字段表示本版本没有可表达的值。 */
+export interface CodexThreadSettingsSnapshot extends CodexThreadSettings {
+  readonly threadId: string
+}
+
+export interface CodexThreadSettingsUpdated {
+  readonly threadId: string
+  readonly snapshot: CodexThreadSettingsSnapshot
+}
+
+/**
+ * approvalPolicy 只接受字符串形式。granular 对象形式在 0.166.0 的确切语义
+ * 未验证，连同 sandbox 一起省略 permission，而不是只保留一半。
+ */
+function sandboxMapping(value: unknown):
+  | { readonly applicable: boolean; readonly scope?: PermissionScope['sandbox']; readonly additionalDirectories?: readonly string[] }
+  | undefined {
+  const record = asRecord(value)
+  if (record === undefined) return undefined
+  switch (record.type) {
+    case 'readOnly': {
+      const network = typeof record.networkAccess === 'boolean' ? record.networkAccess : undefined
+      return {
+        applicable: true,
+        scope: { fileSystem: 'read-only', ...(network === undefined ? {} : { network }) },
+      }
+    }
+    case 'workspaceWrite': {
+      const network = typeof record.networkAccess === 'boolean' ? record.networkAccess : undefined
+      const writableRoots = record.writableRoots
+      const roots = Array.isArray(writableRoots) && writableRoots.every(root => typeof root === 'string')
+        ? [...writableRoots] as string[]
+        : undefined
+      return {
+        applicable: true,
+        scope: { fileSystem: 'workspace-write', ...(network === undefined ? {} : { network }) },
+        ...(roots === undefined ? {} : { additionalDirectories: roots }),
+      }
+    }
+    case 'dangerFullAccess':
+      // 0.166.0 的该分支没有 networkAccess；不能推断网络范围。
+      return { applicable: true, scope: { fileSystem: 'danger-full-access' } }
+    case 'externalSandbox':
+      // 外部 sandbox 的有效范围未知：整个 permission 省略。
+      return { applicable: false }
+    default:
+      // 未识别的联合分支是协议演进，同样不能伪造可比较范围。
+      return { applicable: false }
+  }
+}
+
+function permissionScope(approvalValue: unknown, sandboxValue: unknown): PermissionScope | undefined {
+  const approvalPolicy = nonEmptyString(approvalValue)
+  const sandbox = sandboxMapping(sandboxValue)
+  if (sandbox !== undefined && !sandbox.applicable) return undefined
+  const scope = sandbox?.scope
+  const additionalDirectories = sandbox?.additionalDirectories
+  if (approvalPolicy === undefined && scope === undefined) return undefined
+  return {
+    ...(approvalPolicy === undefined ? {} : { approvalPolicy }),
+    ...(scope === undefined ? {} : { sandbox: scope }),
+    ...(additionalDirectories === undefined ? {} : { additionalDirectories }),
+  }
+}
+
+function planFromCollaborationMode(value: unknown): 'on' | 'off' | undefined {
+  const record = asRecord(value)
+  if (record === undefined) return undefined
+  if (record.mode === 'plan') return 'on'
+  if (record.mode === 'default') return 'off'
+  return undefined
+}
+
+function threadSettings(
+  threadId: string,
+  modelValue: unknown,
+  reasoningValue: unknown,
+  approvalValue: unknown,
+  sandboxValue: unknown,
+  collaborationValue: unknown,
+): CodexThreadSettingsSnapshot | undefined {
+  const model = nonEmptyString(modelValue)
+  if (model === undefined) return undefined
+  // 0.166.0 用 string|null 表示“未设置 effort”；null 等价于缺失。
+  const reasoning = optionalString(reasoningValue)
+  const permission = permissionScope(approvalValue, sandboxValue)
+  const plan = planFromCollaborationMode(collaborationValue)
+  return {
+    threadId,
+    model,
+    ...(reasoning === undefined ? {} : { reasoning }),
+    ...(permission === undefined ? {} : { permission }),
+    ...(plan === undefined ? {} : { plan }),
+  }
+}
+
+/** `thread/resume` 响应：`sandbox` 是 SandboxPolicy 联合。 */
+export function parseThreadSettingsSnapshot(value: unknown): CodexThreadSettingsSnapshot | undefined {
+  const record = asRecord(value)
+  if (record === undefined) return undefined
+  const thread = parseThread(record.thread)
+  if (thread === undefined) return undefined
+  return threadSettings(
+    thread.id,
+    record.model,
+    record.reasoningEffort,
+    record.approvalPolicy,
+    record.sandbox,
+    record.collaborationMode,
+  )
+}
+
+/**
+ * `thread/settings/updated` 只有 threadId + threadSettings，没有版次或请求关联：
+ * 只能更新长期 current，绝不能用来确认 pending。
+ */
+export function parseThreadSettingsUpdated(params: unknown): CodexThreadSettingsUpdated | undefined {
+  const record = asRecord(params)
+  if (record === undefined) return undefined
+  const threadId = nonEmptyString(record.threadId)
+  if (threadId === undefined) return undefined
+  const settings = asRecord(record.threadSettings)
+  if (settings === undefined) return undefined
+  const snapshot = threadSettings(
+    threadId,
+    settings.model,
+    settings.effort,
+    settings.approvalPolicy,
+    settings.sandboxPolicy,
+    settings.collaborationMode,
+  )
+  return snapshot === undefined ? undefined : { threadId, snapshot }
+}
+
+export interface CodexGoal {
+  readonly objective: string
+}
+
+export type CodexGoalGetResponse = { readonly goal: CodexGoal | null }
+
+/** goal get 的权威结果；objective 是内容型字段，调用方不得外传。 */
+export function parseGoalGetResponse(value: unknown): CodexGoalGetResponse | undefined {
+  const record = asRecord(value)
+  if (record === undefined || !('goal' in record)) return undefined
+  if (record.goal === null) return { goal: null }
+  const goal = asRecord(record.goal)
+  if (goal === undefined) return undefined
+  const objective = optionalString(goal.objective)
+  return objective === undefined ? undefined : { goal: { objective } }
+}
+
+/**
+ * set 响应不是权威值（可能回显请求），这里只做形状校验，调用方仍以
+ * 紧随其后的 goal/get 为准。
+ */
+export function parseGoalSetResponse(value: unknown): { readonly goal: CodexGoal } | undefined {
+  const record = asRecord(value)
+  const goal = asRecord(record?.goal)
+  if (goal === undefined) return undefined
+  const objective = optionalString(goal.objective)
+  return objective === undefined ? undefined : { goal: { objective } }
+}
+
+export function parseGoalClearResponse(value: unknown): { readonly cleared: boolean } | undefined {
+  const record = asRecord(value)
+  if (record === undefined || typeof record.cleared !== 'boolean') return undefined
+  return { cleared: record.cleared }
+}
+
+export function parseGoalUpdatedNotification(
+  params: unknown,
+): { readonly threadId: string; readonly objective: string } | undefined {
+  const record = asRecord(params)
+  if (record === undefined) return undefined
+  const threadId = nonEmptyString(record.threadId)
+  if (threadId === undefined) return undefined
+  const goal = asRecord(record.goal)
+  const objective = optionalString(goal?.objective)
+  if (objective === undefined) return undefined
+  return { threadId, objective }
+}
+
+export function parseGoalClearedNotification(
+  params: unknown,
+): { readonly threadId: string } | undefined {
+  const threadId = nonEmptyString(asRecord(params)?.threadId)
+  return threadId === undefined ? undefined : { threadId }
 }

@@ -1,0 +1,353 @@
+import { randomUUID } from 'node:crypto'
+import { PreCallRejection } from '../../adapters/types.ts'
+import type {
+  ConfigureRequest, ConfigureResult, SettingsPort, SettingsReadRequest, SettingsReadResult,
+  SettingsValue,
+} from '../types.ts'
+import type { TunableCatalog } from '../../tunables/catalog.ts'
+import { decideConfigure } from '../../tunables/policy.ts'
+import {
+  SettingsReadback,
+  type ReadbackHandle, type ReadbackOptions, type ReadbackSnapshot,
+} from '../../tunables/readback.ts'
+import type { CodexRequest } from './discover.ts'
+import { CodexPeerError } from './peer.ts'
+import {
+  parseGoalClearResponse, parseGoalClearedNotification, parseGoalGetResponse,
+  parseGoalSetResponse, parseGoalUpdatedNotification, parseThreadSettingsSnapshot,
+  parseThreadSettingsUpdated,
+  type CodexGoal, type CodexThreadSettingsSnapshot,
+} from './protocol.ts'
+
+/**
+ * Codex 设置端口。
+ *
+ * 0.166.0 没有 `thread/settings/update`：model/approval/sandbox 只能通过
+ * `thread/resume` override 写入，而 resume override 在受管活动线程上的行为
+ * 未验证，effort/collaborationMode 更是没有 override。因此 v1 只开放 goal
+ * 编辑，其余字段只从真实回读发布 current。
+ *
+ * 关联确认只来自请求之后的 goal/get：set 响应和请求文本都不是证据。
+ * 通知没有版次/请求 id，只能更新长期 current，永不结算 pending。
+ */
+
+export interface CodexSettingsDeps {
+  readonly request: CodexRequest
+  readonly runtimeEpoch: string
+  /** 受管且写权属于本实例。 */
+  readonly writable: (sessionId: string) => boolean
+  /** 写权状态恰好是 ours-idle。 */
+  readonly idle: (sessionId: string) => boolean
+  readonly beginConfigure: (sessionId: string) => void
+  readonly endConfigure: (sessionId: string) => void
+  readonly now?: () => number
+  readonly readbackTimeoutMs?: number
+  /** 测试注入假调度器；不能覆盖 initial。 */
+  readonly readbackOptions?: Omit<ReadbackOptions, 'initial'>
+}
+
+export interface CodexSettingsPort extends SettingsPort {
+  observeNotification(method: string, params: unknown): void
+  snapshot(sessionId: string): ReadbackSnapshot | undefined
+  /** peer 退出/重启：拒绝 pending、清空逐会话回读，实例仍可继续使用。 */
+  reset(): void
+  /** stop/unload：reset 并永久拒绝后续设置调用。 */
+  dispose(): void
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined
+}
+
+function rpcRejection(error: CodexPeerError): PreCallRejection {
+  switch (error.rpcCode) {
+    case -32602: return new PreCallRejection('invalid-args')
+    case -32601: return new PreCallRejection('unsupported')
+    default: return new PreCallRejection('conflict')
+  }
+}
+
+function goalObjective(value: unknown): string | undefined {
+  const objective = asRecord(value)?.objective
+  return typeof objective === 'string' && objective.trim() !== '' ? objective : undefined
+}
+
+export function createCodexSettingsPort(deps: CodexSettingsDeps): CodexSettingsPort {
+  const readbacks = new Map<string, SettingsReadback>()
+  let disposed = false
+
+  const ensureUsable = (): void => {
+    if (disposed) throw new PreCallRejection('unsupported', 'settings-readback-unavailable')
+  }
+
+  const readbackFor = (sessionId: string): SettingsReadback => {
+    const existing = readbacks.get(sessionId)
+    if (existing !== undefined) return existing
+    const created = new SettingsReadback({
+      ...deps.readbackOptions,
+      initial: { revision: 0 },
+      ...(deps.now === undefined ? {} : { now: deps.now }),
+      ...(deps.readbackTimeoutMs === undefined ? {} : { timeoutMs: deps.readbackTimeoutMs }),
+    })
+    readbacks.set(sessionId, created)
+    return created
+  }
+
+  /** epoch → 非空会话 → 写权；任何一条不满足都在原生调用前拒绝。 */
+  const authorize = (
+    request: { readonly sessionId: string; readonly runtimeEpoch: string },
+  ): SettingsReadback => {
+    ensureUsable()
+    if (request.runtimeEpoch !== deps.runtimeEpoch) throw new PreCallRejection('stale-connection')
+    if (request.sessionId === '') throw new PreCallRejection('invalid-args', 'sessionId is required')
+    if (!deps.writable(request.sessionId)) throw new PreCallRejection('ownership-unverified')
+    return readbackFor(request.sessionId)
+  }
+
+  const observeSnapshot = (
+    readback: SettingsReadback,
+    snapshot: CodexThreadSettingsSnapshot,
+  ): void => {
+    if (snapshot.model !== undefined) readback.observe({ field: 'model', value: snapshot.model })
+    if (snapshot.reasoning !== undefined) readback.observe({ field: 'reasoning', value: snapshot.reasoning })
+    if (snapshot.permission !== undefined) readback.observe({ field: 'permission', value: snapshot.permission })
+    if (snapshot.plan !== undefined) readback.observe({ field: 'plan', value: snapshot.plan })
+  }
+
+  const readSettings = async (
+    request: SettingsReadRequest,
+    signal: AbortSignal,
+  ): Promise<SettingsReadResult> => {
+    const readback = authorize(request)
+    if (signal.aborted) throw signal.reason
+
+    let resumed: CodexThreadSettingsSnapshot
+    try {
+      resumed = await deps.request(
+        'thread/resume',
+        { threadId: request.sessionId, excludeTurns: true },
+        signal,
+        parseThreadSettingsSnapshot,
+      )
+    } catch (error) {
+      // RPC 错误意味着没有受理；其它错误（超时/断连）原样上抛，绝不伪造值。
+      if (error instanceof CodexPeerError && error.code === 'rpc') throw rpcRejection(error)
+      throw error
+    }
+    if (resumed.threadId !== request.sessionId) {
+      // resume 成功但身份不一致：不能把别的线程设置写进本会话。
+      throw new Error('marshal: codex settings thread mismatch')
+    }
+
+    let goal: boolean
+    try {
+      const response = await deps.request(
+        'thread/goal/get',
+        { threadId: request.sessionId },
+        signal,
+        parseGoalGetResponse,
+      )
+      goal = response.goal !== null
+    } catch (error) {
+      if (error instanceof CodexPeerError && error.code === 'rpc') throw rpcRejection(error)
+      throw error
+    }
+
+    observeSnapshot(readback, resumed)
+    // objective 不进入 current；这里只归一化为存在性。
+    readback.observe({ field: 'goal', value: goal })
+
+    const current = readback.snapshot().current
+    const revision = current.revision
+    const values: SettingsValue[] = []
+    if (current.model !== undefined) values.push({ field: 'model', current: current.model, revision, confirmed: true })
+    if (current.reasoning !== undefined) values.push({ field: 'reasoning', current: current.reasoning, revision, confirmed: true })
+    if (current.permission !== undefined) values.push({ field: 'permission', current: current.permission, revision, confirmed: true })
+    if (current.plan !== undefined) values.push({ field: 'plan', current: current.plan, revision, confirmed: true })
+    if (current.goal !== undefined) values.push({ field: 'goal', current: current.goal, revision, confirmed: true })
+
+    return { values, runtimeEpoch: deps.runtimeEpoch, revision }
+  }
+
+  /**
+   * 原生写入 + 以 goal/get 为唯一真值。RPC 错误可安全 abort；其它错误
+   * 保持 pending，由 10s 回读超时给出 pending-confirmation。
+   */
+  const writeGoal = async (
+    readback: SettingsReadback,
+    handle: ReadbackHandle,
+    requestId: string,
+    threadId: string,
+    objective: string | undefined,
+    signal: AbortSignal,
+  ): Promise<void> => {
+    try {
+      if (objective === undefined) {
+        await deps.request(
+          'thread/goal/clear',
+          { threadId },
+          signal,
+          parseGoalClearResponse,
+        )
+      } else {
+        await deps.request(
+          'thread/goal/set',
+          { threadId, objective },
+          signal,
+          parseGoalSetResponse,
+        )
+      }
+    } catch (error) {
+      if (error instanceof CodexPeerError && error.code === 'rpc') {
+        // 写调用被明确拒绝：没有受理证据，清除 pending 后按调用前拒绝返回。
+        handle.abort()
+        throw rpcRejection(error)
+      }
+      // 超时/断连/write/aborted：写可能已生效，保持 pending 等回读超时。
+      return
+    }
+
+    let currentGoal: CodexGoal | null
+    try {
+      // 只认 get：set/clear 响应和请求文本都不能合成确认值。
+      currentGoal = (await deps.request(
+        'thread/goal/get',
+        { threadId },
+        signal,
+        parseGoalGetResponse,
+      )).goal
+    } catch {
+      // 写已发出后 get 失败：实际值未知，不能 abort 成“未受理”。
+      return
+    }
+    const exists = currentGoal !== null
+    const matches = objective === undefined
+      ? !exists
+      : currentGoal !== null && currentGoal.objective === objective
+    readback.confirm({
+      requestId,
+      field: 'goal',
+      value: exists,
+      ...(matches ? {} : { matches: false }),
+    })
+  }
+
+  const configure = async (
+    request: ConfigureRequest,
+    signal: AbortSignal,
+  ): Promise<ConfigureResult> => {
+    const readback = authorize(request)
+    if (signal.aborted) throw signal.reason
+
+    const base = readback.snapshot()
+    if (request.expectedRevision !== base.current.revision) {
+      throw new PreCallRejection('revision-conflict', 'settings-revision-mismatch')
+    }
+
+    // 保守目录：只有 goal 声明了真实回读；不提供任何模型/等级 lattice。
+    const catalog: TunableCatalog = { agent: 'codex', models: [], readback: { goal: true } }
+    const decision = decideConfigure(request, {
+      agent: 'codex',
+      runtimeEpoch: deps.runtimeEpoch,
+      state: deps.idle(request.sessionId) ? 'idle' : 'running',
+      settingsRevision: base.current.revision,
+      current: base.current,
+      catalog,
+      contentAuthorized: request.contentAuthorized,
+      ...(base.pending === undefined
+        ? {}
+        : { pending: { requestId: base.pending.requestId, field: base.pending.field } }),
+    })
+    if (decision.outcome === 'reject') {
+      throw new PreCallRejection(decision.code, decision.reason)
+    }
+    // v1 只有 goal 有可验证写面；其余字段即使决策放行也不触达原生。
+    if (request.field !== 'goal') {
+      throw new PreCallRejection('unsupported', 'settings-readback-unavailable')
+    }
+
+    if (decision.outcome === 'no-op') {
+      return {
+        status: 'confirmed',
+        revision: base.current.revision,
+        runtimeEpoch: deps.runtimeEpoch,
+      }
+    }
+
+    const clear = request.value === null
+    const objective = clear ? undefined : goalObjective(request.value)
+    if (!clear && objective === undefined) {
+      throw new PreCallRejection('invalid-args', 'goal-objective-invalid')
+    }
+
+    deps.beginConfigure(request.sessionId)
+    try {
+      if (readback.snapshot().unsafe) {
+        throw new PreCallRejection('conflict', 'settings-unsafe')
+      }
+      const requestId = randomUUID()
+      // 先注册 waiter 再发原生调用：通知先于响应时不能丢确认。
+      const handle = readback.begin(requestId, 'goal', clear ? false : true)
+      // 预调用 abort 后 outcome 的拒绝已由抛出路径处理；这里避免悬空 unhandled。
+      void handle.outcome.catch(() => {})
+
+      await writeGoal(readback, handle, requestId, request.sessionId, objective, signal)
+      const outcome = await handle.outcome
+      const snapshot = readback.snapshot()
+      return {
+        status: outcome.status,
+        revision: snapshot.current.revision,
+        runtimeEpoch: deps.runtimeEpoch,
+        ...(snapshot.unsafe
+          ? { code: 'settings-unsafe' as const }
+          : outcome.code === undefined ? {} : { code: outcome.code }),
+      }
+    } finally {
+      deps.endConfigure(request.sessionId)
+    }
+  }
+
+  const observeNotification = (method: string, params: unknown): void => {
+    if (disposed) return
+    if (method === 'thread/settings/updated') {
+      const update = parseThreadSettingsUpdated(params)
+      if (update === undefined) return
+      const readback = readbacks.get(update.threadId)
+      if (readback === undefined) return
+      observeSnapshot(readback, update.snapshot)
+      return
+    }
+    if (method === 'thread/goal/updated') {
+      const update = parseGoalUpdatedNotification(params)
+      if (update === undefined) return
+      // 只为已有回读的会话更新；未知会话不创建状态。
+      readbacks.get(update.threadId)?.observe({ field: 'goal', value: true })
+      return
+    }
+    if (method === 'thread/goal/cleared') {
+      const update = parseGoalClearedNotification(params)
+      if (update === undefined) return
+      readbacks.get(update.threadId)?.observe({ field: 'goal', value: false })
+    }
+  }
+
+  return {
+    readSettings,
+    configure,
+    observeNotification,
+    snapshot(sessionId: string): ReadbackSnapshot | undefined {
+      return readbacks.get(sessionId)?.snapshot()
+    },
+    reset(): void {
+      for (const readback of readbacks.values()) readback.dispose()
+      readbacks.clear()
+    },
+    dispose(): void {
+      for (const readback of readbacks.values()) readback.dispose()
+      readbacks.clear()
+      disposed = true
+    },
+  }
+}

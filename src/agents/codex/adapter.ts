@@ -32,6 +32,7 @@ import {
   supportsVersion, threadRunning,
 } from './protocol.ts'
 import { createCodexSessionRegistry } from './session.ts'
+import { createCodexSettingsPort } from './settings.ts'
 
 /**
  * Codex 基础适配器（app-server over stdio）。
@@ -204,6 +205,8 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
       // 进程退出/重启即丢失受管身份与写权证据；重启不会恢复控制。
       sessions.clear()
       coordinator.clear()
+      // peer 断开后旧回读不再可信；端口本身保持可用，等新连接重建。
+      settings.reset()
       lastVersion = undefined
       if (!stopping && reason !== 'stopped') phase = 'unavailable'
     },
@@ -215,6 +218,16 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
     const peer = await ensurePeer(signal)
     return await peer.request(method, params, signal, parse)
   }
+
+  const settings = createCodexSettingsPort({
+    request,
+    runtimeEpoch,
+    writable: id => sessions.isManaged(id) && coordinator.ownership(id) === 'ours',
+    idle: id => coordinator.state(id) === 'ours-idle',
+    beginConfigure: id => coordinator.beginConfigure(id),
+    endConfigure: id => coordinator.endConfigure(id),
+    ...(options.now === undefined ? {} : { now: options.now }),
+  })
 
   const relayEnabled = (): boolean => options.inputRelay !== undefined
     && (options.questionRelay === 'remote' || options.approvalRelay === 'remote')
@@ -291,6 +304,13 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
       const turn = parseTurn(asRecord(params)?.turn)
       if (turn !== undefined) coordinator.endTurn(sessionId, turn.id)
       coordinator.noteObserved(sessionId, false)
+    }
+
+    // 设置/goal 通知只更新长期 current，没有版次也不是 pending 的确认来源。
+    if (method === 'thread/settings/updated'
+      || method === 'thread/goal/updated'
+      || method === 'thread/goal/cleared') {
+      settings.observeNotification(method, params)
     }
 
     const meta: CodexEventMeta = {
@@ -698,6 +718,8 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
       abortPendingApprovals()
       sessions.clear()
       coordinator.clear()
+      // 停止后不再提供设置端口；onExit 的 reset 在 dispose 之后是幂等的。
+      settings.dispose()
       await supervisor.stop()
       phase = 'stopped'
     },
@@ -846,6 +868,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
     },
 
     ownershipPort,
+    settingsPort: settings,
 
     ...(options.inputRelay === undefined ? {} : { nativeInputPort: options.inputRelay }),
 
@@ -897,6 +920,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
           return { cancelled: true }
         }
         case 'configure':
+          // wire args 不能提供可信的 contentAuthorized；T09 由 node runner 直接调用 settingsPort。
           throw new PreCallRejection('unsupported', 'settings-readback-unavailable')
         default:
           throw new PreCallRejection('unsupported')
