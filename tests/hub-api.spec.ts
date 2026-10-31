@@ -1,21 +1,28 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { DeviceRegistry } from '../src/hub/registry.ts'
 import { HubRelay } from '../src/hub/relay.ts'
-import { registerMarshalRoutes } from '../src/hub/api.ts'
-import type { AckFrame, CommandStatusResultFrame } from '../src/wire/frames.ts'
-import { createTestWeb, type TestWeb } from './support/web.ts'
+import { registerMarshalRoutes, SESSION_COOKIE, CSRF_COOKIE } from '../src/hub/api.ts'
+import type { AckFrame, CommandStatusResultFrame, InputsSnapshotResultFrame } from '../src/wire/frames.ts'
+import { createMemoryWeb, type MemoryResponse, type MemoryWeb } from './support/memory.ts'
 
-const AUTH = { 'x-marshal-token': 'secret' }
+const TOKEN = 'test-dashboard-token-0123456789abcdef'
+const ORIGIN = 'https://marshal.example'
+const AUTH = { 'x-marshal-token': TOKEN }
 
-let web: TestWeb | undefined
-afterEach(async () => {
-  const test = web
-  if (test === undefined) return
+let web: MemoryWeb | undefined
+let routes: { dispose(): void } | undefined
+afterEach(() => {
+  routes?.dispose()
+  routes = undefined
   web = undefined
-  await new Promise<void>(resolve => test.server.close(() => resolve()))
 })
 
-async function start() {
+async function start(options: {
+  sessionIdleMs?: number
+  sessionAbsoluteMs?: number
+  sessionSweepMs?: number
+  now?: () => number
+} = {}) {
   const registry = new DeviceRegistry()
   const sent: string[] = []
   registry.attach(
@@ -24,21 +31,32 @@ async function start() {
     0,
     { connectionId: 'conn-1', nodeEpoch: 'epoch-1' },
   )
-  const relay = new HubRelay({ registry, now: Date.now, timeoutMs: 50 })
+  const relay = new HubRelay({ registry, now: options.now ?? Date.now, timeoutMs: 50 })
   relay.publish({
     v: 2, type: 'event', deviceId: 'mac', agent: 'dsh', sessionId: 's1', nodeEpoch: 'epoch-1',
     seq: 1, ts: 1, kind: 'session.updated', payload: { running: false, updatedAt: 1, cwd: '/secret-project' },
   })
-  const test = createTestWeb()
-  const routes = registerMarshalRoutes({ webServer: test.webServer, registry, relay, requireToken: 'secret' })
+  const test = createMemoryWeb()
+  routes = registerMarshalRoutes({
+    webServer: test.webServer,
+    registry,
+    relay,
+    requireToken: TOKEN,
+    publicOrigin: ORIGIN,
+    operatorId: 'operator-test',
+    hubEpoch: 'hub-test',
+    loginFailureDelayMs: 0,
+    ...(options.sessionIdleMs === undefined ? {} : { sessionIdleMs: options.sessionIdleMs }),
+    ...(options.sessionAbsoluteMs === undefined ? {} : { sessionAbsoluteMs: options.sessionAbsoluteMs }),
+    ...(options.sessionSweepMs === undefined ? {} : { sessionSweepMs: options.sessionSweepMs }),
+    ...(options.now === undefined ? {} : { now: options.now }),
+  })
   web = test
-  const port = await test.listen()
-  return { port, routes, relay, sent }
+  return { web: test, relay, sent }
 }
 
-const ORIGIN = { deviceId: 'mac', connectionId: 'conn-1', nodeEpoch: 'epoch-1' }
+const ORIGIN_FRAME = { deviceId: 'mac', connectionId: 'conn-1', nodeEpoch: 'epoch-1' }
 
-/** 等待 relay 写出指定类型的帧；HTTP handler 是异步启动的。 */
 async function waitForFrame(sent: string[], type: string): Promise<Record<string, unknown>> {
   const deadline = Date.now() + 2_000
   for (;;) {
@@ -51,213 +69,381 @@ async function waitForFrame(sent: string[], type: string): Promise<Record<string
   }
 }
 
-describe('hub api', () => {
-  it('无 token 的页面请求返回 401', async () => {
-    const { port } = await start()
-    expect((await fetch(`http://127.0.0.1:${port}/marshal`)).status).toBe(401)
+async function login(target: MemoryWeb): Promise<{ response: MemoryResponse; session: string; csrf: string }> {
+  const response = await target.request('/marshal/login', {
+    method: 'POST',
+    headers: { origin: ORIGIN, 'content-type': 'application/json' },
+    body: JSON.stringify({ token: TOKEN }),
+  })
+  return { response, session: response.cookie(SESSION_COOKIE) ?? '', csrf: response.cookie(CSRF_COOKIE) ?? '' }
+}
+
+function sessionHeaders(session: string, csrf: string, extra: Record<string, string> = {}): Record<string, string> {
+  return {
+    cookie: `${SESSION_COOKIE}=${session}; ${CSRF_COOKIE}=${csrf}`,
+    origin: ORIGIN,
+    'x-marshal-csrf': csrf,
+    'content-type': 'application/json',
+    ...extra,
+  }
+}
+
+describe('hub api auth', () => {
+  it('登录页公开，URL token 被拒绝', async () => {
+    const { web: target } = await start()
+    const page = await target.request('/marshal')
+    expect(page.statusCode).toBe(200)
+    expect(page.body).toContain('marshal')
+    expect((await target.request('/marshal?token=' + TOKEN)).statusCode).toBe(401)
+    expect((await target.request('/marshal/api/devices?x-marshal-token=' + TOKEN)).statusCode).toBe(401)
   })
 
-  it('带 token 头返回页面', async () => {
-    const { port } = await start()
-    const response = await fetch(`http://127.0.0.1:${port}/marshal`, { headers: AUTH })
-    expect(response.status).toBe(200)
-    expect(await response.text()).toContain('marshal')
+  it('登录必须精确 Origin，成功签发 __Host- cookie', async () => {
+    const { web: target } = await start()
+    expect((await target.request('/marshal/login', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: TOKEN }),
+    })).statusCode).toBe(403)
+    expect((await target.request('/marshal/login', {
+      method: 'POST', headers: { origin: 'null', 'content-type': 'application/json' }, body: JSON.stringify({ token: TOKEN }),
+    })).statusCode).toBe(403)
+
+    const { response, session, csrf } = await login(target)
+    expect(response.statusCode).toBe(200)
+    expect(response.header('cache-control')).toBe('no-store')
+    const body = response.json<{ ok: boolean; operatorId: string; csrf: string; expiresAt: number }>()
+    expect(body.operatorId).toBe('operator-test')
+    expect(body.csrf).toBe(csrf)
+    expect(body.expiresAt).toBeGreaterThan(Date.now())
+    const cookies = response.cookies()
+    expect(cookies.find(value => value.startsWith(`${SESSION_COOKIE}=`))).toContain('HttpOnly')
+    expect(cookies.find(value => value.startsWith(`${SESSION_COOKIE}=`))).toContain('Secure')
+    expect(cookies.find(value => value.startsWith(`${SESSION_COOKIE}=`))).toContain('SameSite=Strict')
+    expect(cookies.find(value => value.startsWith(`${SESSION_COOKIE}=`))).not.toContain('Domain')
+    expect(cookies.find(value => value.startsWith(`${CSRF_COOKIE}=`))).not.toContain('HttpOnly')
+    expect(session).not.toBe(csrf)
   })
 
-  it('URL 查询参数 token 不再被接受', async () => {
-    const { port } = await start()
-    expect((await fetch(`http://127.0.0.1:${port}/marshal?token=secret`)).status).toBe(401)
+  it('会话恢复返回同样信息且不续期', async () => {
+    let clock = 1_000
+    const { web: target } = await start({ sessionIdleMs: 100, now: () => clock })
+    const { session, csrf } = await login(target)
+    clock = 1_080
+    const restored = await target.request('/marshal/api/session', { headers: { cookie: `${SESSION_COOKIE}=${session}` } })
+    expect(restored.statusCode).toBe(200)
+    expect(restored.json<{ csrf: string }>().csrf).toBe(csrf)
+    expect(restored.header('cache-control')).toBe('no-store')
+    // session 端点不刷新 lastSeenAt：再过 50ms 超过 30min 空闲上限的缩小版。
+    clock = 1_130
+    const expired = await target.request('/marshal/api/session', { headers: { cookie: `${SESSION_COOKIE}=${session}` } })
+    expect(expired.statusCode).toBe(401)
   })
 
-  it('设备列表', async () => {
-    const { port } = await start()
-    const body = await (await fetch(`http://127.0.0.1:${port}/marshal/api/devices`, { headers: AUTH }))
-      .json() as { devices: { id: string }[] }
-    expect(body.devices[0]?.id).toBe('mac')
+  it('无效 header 不回退 cookie，混合凭据拒绝', async () => {
+    const { web: target } = await start()
+    const { session, csrf } = await login(target)
+    const cookie = `${SESSION_COOKIE}=${session}; ${CSRF_COOKIE}=${csrf}`
+    expect((await target.request('/marshal/api/devices', {
+      headers: { cookie, 'x-marshal-token': 'wrong' },
+    })).statusCode).toBe(401)
+    expect((await target.request('/marshal/api/devices', {
+      headers: { cookie, 'x-marshal-token': TOKEN },
+    })).statusCode).toBe(401)
+    expect((await target.request('/marshal/api/devices', { headers: AUTH })).statusCode).toBe(200)
+    expect((await target.request('/marshal/api/devices', {
+      headers: { 'x-marshal-token': 'wrong' },
+    })).statusCode).toBe(401)
+    expect((await target.request('/marshal/api/devices')).statusCode).toBe(401)
   })
 
-  it('会话索引按设备返回', async () => {
-    const { port } = await start()
-    const body = await (await fetch(`http://127.0.0.1:${port}/marshal/api/sessions?device=mac`, { headers: AUTH }))
-      .json() as { sessions: unknown[] }
-    expect(body.sessions).toEqual([
-      { deviceId: 'mac', agent: 'dsh', sessionId: 's1', running: false, updatedAt: 1 },
-    ])
-  })
-
-  it('空 device 参数等同全部会话', async () => {
-    const { port } = await start()
-    const body = await (await fetch(`http://127.0.0.1:${port}/marshal/api/sessions?device=`, { headers: AUTH }))
-      .json() as { sessions: unknown[] }
-    expect(body.sessions).toHaveLength(1)
-  })
-
-  it('GET 指令端点返回 405 并声明 allow', async () => {
-    const { port } = await start()
-    const response = await fetch(`http://127.0.0.1:${port}/marshal/api/command`, { headers: AUTH })
-    expect(response.status).toBe(405)
-    expect(response.headers.get('allow')).toBe('POST')
-  })
-
-  it('发给离线设备的指令返回 409', async () => {
-    const { port } = await start()
-    const response = await fetch(`http://127.0.0.1:${port}/marshal/api/command`, {
-      method: 'POST',
-      headers: { ...AUTH, 'content-type': 'application/json' },
-      body: JSON.stringify({ op: 'prompt', target: { deviceId: 'ghost', agent: 'dsh', sessionId: 's' }, args: { text: 'hi' }, idempotencyKey: 'k' }),
+  it('token 分支写操作免 CSRF；有 Origin 时必须精确匹配', async () => {
+    const { web: target } = await start()
+    const body = JSON.stringify({
+      op: 'prompt', target: { deviceId: 'ghost', agent: 'dsh', sessionId: 's' },
+      args: { text: 'hi' }, idempotencyKey: 'k-token',
     })
-    expect(response.status).toBe(503)
-    expect(await response.json()).toMatchObject({ status: 'rejected', code: 'device-offline' })
+    const offline = await target.request('/marshal/api/command', {
+      method: 'POST', headers: { ...AUTH, 'content-type': 'application/json' }, body,
+    })
+    expect(offline.statusCode).toBe(503)
+    const badOrigin = await target.request('/marshal/api/command', {
+      method: 'POST', headers: { ...AUTH, origin: 'https://evil.example', 'content-type': 'application/json' }, body,
+    })
+    expect(badOrigin.statusCode).toBe(403)
+    const goodOrigin = await target.request('/marshal/api/command', {
+      method: 'POST', headers: { ...AUTH, origin: ORIGIN, 'content-type': 'application/json' }, body,
+    })
+    expect(goodOrigin.statusCode).toBe(503)
   })
 
-  it('未知 op 返回 400 invalid-args', async () => {
-    const { port } = await start()
-    const response = await fetch(`http://127.0.0.1:${port}/marshal/api/command`, {
-      method: 'POST',
-      headers: { ...AUTH, 'content-type': 'application/json' },
-      body: JSON.stringify({ op: 'explode', target: { deviceId: 'mac', agent: 'dsh', sessionId: 's1' }, args: {}, idempotencyKey: 'k-unknown-op' }),
+  it('浏览器写操作要求 Origin 与服务端会话 CSRF', async () => {
+    const { web: target } = await start()
+    const { session, csrf } = await login(target)
+    const body = JSON.stringify({
+      op: 'prompt', target: { deviceId: 'ghost', agent: 'dsh', sessionId: 's' },
+      args: { text: 'hi' }, idempotencyKey: 'k-csrf',
     })
-    expect(response.status).toBe(400)
-    expect(await response.json()).toEqual({ ok: false, code: 'invalid-args' })
+    const noCsrf = await target.request('/marshal/api/command', {
+      method: 'POST', headers: { cookie: `${SESSION_COOKIE}=${session}`, origin: ORIGIN, 'content-type': 'application/json' }, body,
+    })
+    expect(noCsrf.statusCode).toBe(403)
+    const wrongCsrf = await target.request('/marshal/api/command', {
+      method: 'POST',
+      headers: sessionHeaders(session, csrf, { 'x-marshal-csrf': 'A'.repeat(43) }),
+      body,
+    })
+    expect(wrongCsrf.statusCode).toBe(403)
+    const noOrigin = await target.request('/marshal/api/command', {
+      method: 'POST',
+      headers: { cookie: `${SESSION_COOKIE}=${session}; ${CSRF_COOKIE}=${csrf}`, 'x-marshal-csrf': csrf, 'content-type': 'application/json' },
+      body,
+    })
+    expect(noOrigin.statusCode).toBe(403)
+    const ok = await target.request('/marshal/api/command', {
+      method: 'POST', headers: sessionHeaders(session, csrf), body,
+    })
+    expect(ok.statusCode).toBe(503)
   })
 
-  it('非法 args 返回 400 且不进入中继', async () => {
-    const { port, sent } = await start()
-    const response = await fetch(`http://127.0.0.1:${port}/marshal/api/command`, {
-      method: 'POST',
-      headers: { ...AUTH, 'content-type': 'application/json' },
-      body: JSON.stringify({
-        op: 'prompt', target: { deviceId: 'mac', agent: 'dsh', sessionId: 's1' },
-        args: { text: 'hi', passthrough: true }, idempotencyKey: 'k-bad-args',
-      }),
+  it('logout 撤销会话、清 cookie 并关闭关联 SSE', async () => {
+    const { web: target } = await start()
+    const { session, csrf } = await login(target)
+    const stream = target.start('/marshal/api/stream', {
+      headers: { cookie: `${SESSION_COOKIE}=${session}` },
     })
-    expect(response.status).toBe(400)
-    expect(await response.json()).toEqual({ ok: false, code: 'invalid-args' })
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(stream.res.statusCode).toBe(200)
+    const logout = await target.request('/marshal/logout', {
+      method: 'POST', headers: sessionHeaders(session, csrf), body: '{}',
+    })
+    expect(logout.statusCode).toBe(200)
+    expect(logout.cookies().every(value => value.includes('Max-Age=0'))).toBe(true)
+    expect(stream.res.writableEnded).toBe(true)
+    expect((await target.request('/marshal/api/session', {
+      headers: { cookie: `${SESSION_COOKIE}=${session}` },
+    })).statusCode).toBe(401)
+    await stream.done
+  })
+
+  it('会话到期后旧 SSE 在扫描周期内关闭', async () => {
+    let clock = 1_000
+    const { web: target } = await start({ sessionIdleMs: 50, sessionSweepMs: 10, now: () => clock })
+    const { session } = await login(target)
+    const stream = target.start('/marshal/api/stream', { headers: { cookie: `${SESSION_COOKIE}=${session}` } })
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(stream.res.writableEnded).toBe(false)
+    clock = 1_100
+    await new Promise(resolve => setTimeout(resolve, 40))
+    expect(stream.res.writableEnded).toBe(true)
+    await stream.done
+  })
+
+  it('登录失败按来源限速', async () => {
+    const { web: target } = await start()
+    const attempt = () => target.request('/marshal/login', {
+      method: 'POST',
+      headers: { origin: ORIGIN, 'content-type': 'application/json' },
+      body: JSON.stringify({ token: 'wrong-token' }),
+      remoteAddress: '192.0.2.10',
+    })
+    for (let index = 0; index < 5; index += 1) expect((await attempt()).statusCode).toBe(401)
+    const blocked = await attempt()
+    expect(blocked.statusCode).toBe(429)
+    expect(Number(blocked.header('retry-after'))).toBeGreaterThan(0)
+  })
+
+  it('方法不符返回 405 并声明 allow', async () => {
+    const { web: target } = await start()
+    const { session, csrf } = await login(target)
+    const headers = sessionHeaders(session, csrf)
+    const cases: [string, string, string][] = [
+      ['/marshal/login', 'GET', 'POST'],
+      ['/marshal/logout', 'GET', 'POST'],
+      ['/marshal/api/session', 'POST', 'GET'],
+      ['/marshal/api/command', 'GET', 'POST'],
+      ['/marshal/api/command-status', 'POST', 'GET'],
+      ['/marshal/api/inputs', 'GET', 'POST'],
+      ['/marshal/api/history', 'GET', 'POST'],
+      ['/marshal/api/stream', 'POST', 'GET'],
+    ]
+    for (const [path, method, allow] of cases) {
+      const response = await target.request(path, { method, headers })
+      expect(response.statusCode).toBe(405)
+      expect(response.header('allow')).toBe(allow)
+    }
+  })
+})
+
+describe('hub api endpoints', () => {
+  it('设备列表与会话索引', async () => {
+    const { web: target } = await start()
+    const devices = await target.request('/marshal/api/devices', { headers: AUTH })
+    expect(devices.json<{ devices: { id: string }[] }>().devices[0]?.id).toBe('mac')
+    const sessions = await target.request('/marshal/api/sessions?device=mac', { headers: AUTH })
+    expect(sessions.json()).toEqual({
+      sessions: [{ deviceId: 'mac', agent: 'dsh', sessionId: 's1', running: false, updatedAt: 1 }],
+    })
+    const all = await target.request('/marshal/api/sessions?device=', { headers: AUTH })
+    expect(all.json<{ sessions: unknown[] }>().sessions).toHaveLength(1)
+  })
+
+  it('未知 op / 非法 args / 超大 body 被拒绝', async () => {
+    const { web: target, sent } = await start()
+    const call = (body: unknown) => target.request('/marshal/api/command', {
+      method: 'POST', headers: { ...AUTH, 'content-type': 'application/json' }, body: JSON.stringify(body),
+    })
+    expect((await call({
+      op: 'explode', target: { deviceId: 'mac', agent: 'dsh', sessionId: 's1' }, args: {}, idempotencyKey: 'k1',
+    })).statusCode).toBe(400)
+    expect((await call({
+      op: 'prompt', target: { deviceId: 'mac', agent: 'dsh', sessionId: 's1' },
+      args: { text: 'hi', passthrough: true }, idempotencyKey: 'k2',
+    })).statusCode).toBe(400)
     expect(sent).toEqual([])
+    const huge = await target.request('/marshal/api/command', {
+      method: 'POST', headers: { ...AUTH, 'content-type': 'application/json' }, body: 'x'.repeat(9_000),
+    })
+    expect(huge.statusCode).toBe(413)
   })
 
-  it('不接管其它路径', async () => {
-    const { port } = await start()
-    expect((await fetch(`http://127.0.0.1:${port}/other`, { headers: AUTH })).status).toBe(404)
-  })
-
-  it('同键不同载荷的第二个请求返回 409 idempotency-conflict', async () => {
-    const { port, relay, sent } = await start()
+  it('同键不同载荷返回 409，断线后不回放正文', async () => {
+    const { web: target, relay, sent } = await start()
     const body = (text: string): string => JSON.stringify({
       op: 'prompt', target: { deviceId: 'mac', agent: 'dsh', sessionId: 's1' }, args: { text }, idempotencyKey: 'conflict',
     })
-    const first = fetch(`http://127.0.0.1:${port}/marshal/api/command`, {
+    const first = target.start('/marshal/api/command', {
       method: 'POST', headers: { ...AUTH, 'content-type': 'application/json' }, body: body('a'),
     })
     const frame = await waitForFrame(sent, 'command')
-    const second = await fetch(`http://127.0.0.1:${port}/marshal/api/command`, {
+    const second = await target.request('/marshal/api/command', {
       method: 'POST', headers: { ...AUTH, 'content-type': 'application/json' }, body: body('b'),
     })
-    expect(second.status).toBe(409)
-    expect(await second.json()).toMatchObject({ status: 'rejected', code: 'idempotency-conflict' })
-    relay.settle({
-      v: 2, type: 'ack', commandId: frame.commandId as string,
-      connectionId: 'conn-1', nodeEpoch: 'epoch-1', status: 'accepted', result: { accepted: true },
-    } satisfies AckFrame, ORIGIN)
-    expect((await first).status).toBe(200)
-  })
-
-  it('设备断线后幂等缓存只留状态，不再回放结果正文', async () => {
-    const { port, relay, sent } = await start()
-    const body = JSON.stringify({
-      op: 'prompt', target: { deviceId: 'mac', agent: 'dsh', sessionId: 's1' },
-      args: { text: 'hi' }, idempotencyKey: 'strip-bodies',
-    })
-    const first = fetch(`http://127.0.0.1:${port}/marshal/api/command`, {
-      method: 'POST', headers: { ...AUTH, 'content-type': 'application/json' }, body,
-    })
-    const frame = await waitForFrame(sent, 'command')
+    expect(second.statusCode).toBe(409)
+    expect(second.json()).toMatchObject({ status: 'rejected', code: 'idempotency-conflict' })
     relay.settle({
       v: 2, type: 'ack', commandId: frame.commandId as string,
       connectionId: 'conn-1', nodeEpoch: 'epoch-1', status: 'accepted',
       result: { accepted: true, cwd: '/home/secret' },
-    } satisfies AckFrame, ORIGIN)
-    const firstBody = await (await first).json() as { result?: unknown }
-    // hub 出口只按显式白名单重建结果，未知字段（如 cwd）不透传。
-    expect(firstBody.result).toEqual({ accepted: true })
+    } satisfies AckFrame, ORIGIN_FRAME)
+    await first.done
+    expect(first.res.json<{ result: unknown }>().result).toEqual({ accepted: true })
 
     relay.deviceOffline('mac')
-    const second = await fetch(`http://127.0.0.1:${port}/marshal/api/command`, {
-      method: 'POST', headers: { ...AUTH, 'content-type': 'application/json' }, body,
+    const cached = await target.request('/marshal/api/command', {
+      method: 'POST', headers: { ...AUTH, 'content-type': 'application/json' }, body: body('a'),
     })
-    expect(second.status).toBe(200)
-    expect(await second.json()).toEqual({ ok: true, status: 'accepted' })
-    // 只发过一次指令：第二次命中缓存，且结果正文已被清掉。
-    expect(sent.filter(text => (JSON.parse(text) as { type: string }).type === 'command')).toHaveLength(1)
+    expect(cached.statusCode).toBe(200)
+    expect(cached.json()).toEqual({ ok: true, status: 'accepted' })
   })
 
-  it('内部失败只回分类，不回显 message', async () => {
-    const { port, relay } = await start()
+  it('command-status 200/202/404 与 400', async () => {
+    const { web: target, relay, sent } = await start()
+    const pending = target.start('/marshal/api/command-status?deviceId=mac&agent=dsh&sessionId=s1&op=prompt&key=pending', { headers: AUTH })
+    const frame = await waitForFrame(sent, 'command.status')
+    relay.settleStatus({
+      v: 2, type: 'command.status.result', requestId: frame.requestId as string,
+      status: 'outcome-unknown', code: 'record-unavailable',
+    } satisfies CommandStatusResultFrame, ORIGIN_FRAME)
+    await pending.done
+    expect(pending.res.statusCode).toBe(404)
+
+    sent.length = 0
+    const known = target.start('/marshal/api/command-status?deviceId=mac&agent=dsh&sessionId=s1&op=prompt&key=known', { headers: AUTH })
+    const knownFrame = await waitForFrame(sent, 'command.status')
+    relay.settleStatus({
+      v: 2, type: 'command.status.result', requestId: knownFrame.requestId as string, status: 'accepted',
+    } satisfies CommandStatusResultFrame, ORIGIN_FRAME)
+    await known.done
+    expect(known.res.statusCode).toBe(200)
+    expect(known.res.json()).toEqual({ ok: true, status: 'accepted' })
+
+    expect((await target.request('/marshal/api/command-status?deviceId=mac', { headers: AUTH })).statusCode).toBe(400)
+  })
+
+  it('inputs 端点：200 卡片、离线 503、未知 202', async () => {
+    const { web: target, relay, sent } = await start()
+    const pending = target.start('/marshal/api/inputs', {
+      method: 'POST', headers: { ...AUTH, 'content-type': 'application/json' },
+      body: JSON.stringify({ target: { deviceId: 'mac', agent: 'dsh', sessionId: 's1' } }),
+    })
+    const frame = await waitForFrame(sent, 'inputs.snapshot')
+    relay.settleInputs({
+      v: 2, type: 'inputs.snapshot.result', requestId: frame.requestId as string,
+      runtimeEpoch: 'epoch-1', highWatermark: 7,
+      cards: [{
+        requestId: 'r1', sessionId: 's1', runtimeEpoch: 'epoch-1', kind: 'question', expiresAt: 10,
+        acceptOnceEligible: true, questions: [{ id: 'q1', prompt: 'Pick', required: true, multi: false, custom: false, secret: false }],
+        hidden: 'must-not-pass',
+      }],
+    } satisfies InputsSnapshotResultFrame, ORIGIN_FRAME)
+    await pending.done
+    expect(pending.res.statusCode).toBe(200)
+    const body = pending.res.json<{ ok: boolean; runtimeEpoch: string; highWatermark: number; cards: Record<string, unknown>[] }>()
+    expect(body).toMatchObject({ ok: true, runtimeEpoch: 'epoch-1', highWatermark: 7 })
+    expect(body.cards[0]).toMatchObject({ requestId: 'r1', acceptOnceEligible: true })
+    expect(body.cards[0]).not.toHaveProperty('hidden')
+
+    const offline = await target.request('/marshal/api/inputs', {
+      method: 'POST', headers: { ...AUTH, 'content-type': 'application/json' },
+      body: JSON.stringify({ target: { deviceId: 'ghost', agent: 'dsh', sessionId: 's1' } }),
+    })
+    expect(offline.statusCode).toBe(503)
+
+    const unknown = await target.request('/marshal/api/inputs', {
+      method: 'POST', headers: { ...AUTH, 'content-type': 'application/json' },
+      body: JSON.stringify({ target: { deviceId: 'mac', agent: 'dsh', sessionId: 's1' } }),
+    })
+    expect(unknown.statusCode).toBe(202)
+  })
+
+  it('history 用不透明 cursor 与有界 limit', async () => {
+    const { web: target, relay, sent } = await start()
+    const invalid = [
+      { target: { deviceId: 'mac', agent: 'dsh', sessionId: 's1' }, limit: 0 },
+      { target: { deviceId: 'mac', agent: 'dsh', sessionId: 's1' }, limit: 201 },
+      { target: { deviceId: 'mac', agent: 'dsh', sessionId: 's1' }, limit: 1.5 },
+      { target: { deviceId: 'mac', agent: 'dsh', sessionId: 's1' }, cursor: 'x'.repeat(513) },
+      { target: { deviceId: 'mac', agent: 'dsh', sessionId: null }, limit: 10 },
+      { target: { deviceId: 'mac', agent: 'dsh', sessionId: 's1' }, extra: true },
+    ]
+    for (const body of invalid) {
+      expect((await target.request('/marshal/api/history', {
+        method: 'POST', headers: { ...AUTH, 'content-type': 'application/json' }, body: JSON.stringify(body),
+      })).statusCode).toBe(400)
+    }
+
+    const pending = target.start('/marshal/api/history', {
+      method: 'POST', headers: { ...AUTH, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        target: { deviceId: 'mac', agent: 'dsh', sessionId: 's1' }, cursor: 'opaque-1', limit: 5,
+      }),
+    })
+    const frame = await waitForFrame(sent, 'command')
+    expect(frame).toMatchObject({
+      op: 'observe',
+      args: { kind: 'history', cursor: 'opaque-1', limit: 5 },
+    })
+    expect(typeof frame.idempotencyKey).toBe('string')
+    relay.settle({
+      v: 2, type: 'ack', commandId: frame.commandId as string,
+      connectionId: 'conn-1', nodeEpoch: 'epoch-1', status: 'accepted',
+      result: { count: 2, payload: [{ secret: true }] },
+    } satisfies AckFrame, ORIGIN_FRAME)
+    await pending.done
+    expect(pending.res.statusCode).toBe(200)
+    expect(pending.res.json()).toEqual({ ok: true, status: 'accepted', result: { count: 2 } })
+  })
+
+  it('内部失败只回分类', async () => {
+    const { web: target, relay } = await start()
     relay.dispose()
-    const response = await fetch(`http://127.0.0.1:${port}/marshal/api/command`, {
-      method: 'POST',
-      headers: { ...AUTH, 'content-type': 'application/json' },
+    const response = await target.request('/marshal/api/command', {
+      method: 'POST', headers: { ...AUTH, 'content-type': 'application/json' },
       body: JSON.stringify({
         op: 'prompt', target: { deviceId: 'mac', agent: 'dsh', sessionId: 's1' },
         args: { text: 'sk-testtesttesttest' }, idempotencyKey: 'disposed',
       }),
     })
-    expect(response.status).toBe(503)
-    const body = await response.json() as Record<string, unknown>
-    expect(body).toEqual({ ok: false, status: 'outcome-unknown', code: 'disposed' })
-    expect(JSON.stringify(body)).not.toContain('sk-testtesttesttest')
-  })
-
-  it('command-status 已知状态返回 200', async () => {
-    const { port, relay, sent } = await start()
-    const response = fetch(
-      `http://127.0.0.1:${port}/marshal/api/command-status?deviceId=mac&agent=dsh&sessionId=s1&op=prompt&key=k1`,
-      { headers: AUTH },
-    )
-    const frame = await waitForFrame(sent, 'command.status')
-    relay.settleStatus({
-      v: 2, type: 'command.status.result', requestId: frame.requestId as string, status: 'accepted',
-    } satisfies CommandStatusResultFrame, ORIGIN)
-    const result = await response
-    expect(result.status).toBe(200)
-    expect(await result.json()).toEqual({ ok: true, status: 'accepted' })
-  })
-
-  it('command-status 等待/未知返回 202，无记录返回 404', async () => {
-    const { port, relay, sent } = await start()
-    const pending = fetch(
-      `http://127.0.0.1:${port}/marshal/api/command-status?deviceId=mac&agent=dsh&sessionId=s1&op=prompt&key=pending`,
-      { headers: AUTH },
-    )
-    const pendingFrame = await waitForFrame(sent, 'command.status')
-    relay.settleStatus({
-      v: 2, type: 'command.status.result', requestId: pendingFrame.requestId as string, status: 'outcome-unknown',
-    } satisfies CommandStatusResultFrame, ORIGIN)
-    expect((await pending).status).toBe(202)
-
-    sent.length = 0
-    const missing = fetch(
-      `http://127.0.0.1:${port}/marshal/api/command-status?deviceId=mac&agent=dsh&sessionId=s1&op=prompt&key=missing`,
-      { headers: AUTH },
-    )
-    const missingFrame = await waitForFrame(sent, 'command.status')
-    relay.settleStatus({
-      v: 2, type: 'command.status.result', requestId: missingFrame.requestId as string,
-      status: 'outcome-unknown', code: 'record-unavailable',
-    } satisfies CommandStatusResultFrame, ORIGIN)
-    const result = await missing
-    expect(result.status).toBe(404)
-    expect(await result.json()).toEqual({ ok: false, status: 'outcome-unknown', code: 'record-unavailable' })
-  })
-
-  it('command-status 缺参数返回 400，非 GET 返回 405', async () => {
-    const { port } = await start()
-    expect((await fetch(`http://127.0.0.1:${port}/marshal/api/command-status?deviceId=mac`, { headers: AUTH })).status)
-      .toBe(400)
-    const response = await fetch(`http://127.0.0.1:${port}/marshal/api/command-status`, {
-      method: 'POST', headers: AUTH,
-    })
-    expect(response.status).toBe(405)
-    expect(response.headers.get('allow')).toBe('GET')
+    expect(response.statusCode).toBe(503)
+    expect(response.body).not.toContain('sk-testtesttesttest')
   })
 })

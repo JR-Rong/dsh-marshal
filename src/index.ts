@@ -63,6 +63,7 @@ function applyHub(ctx: MarshalContext, config: MarshalConfig): void {
   ctx.effect(() => { socket.dispose(); sync.dispose(); relay.dispose() }, 'marshal: uplink socket')
   ctx.effect(registerMarshalRoutes({
     webServer, registry, relay, sync, requireToken: config.dashboardToken!,
+    publicOrigin: config.publicOrigin!, operatorId: install.operatorId, hubEpoch,
   }).dispose, 'marshal: dashboard routes')
   ctx.logger.info(`marshal: hub ready at ${webServer.getOrigin()}/marshal`)
 }
