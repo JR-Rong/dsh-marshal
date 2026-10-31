@@ -155,6 +155,17 @@ describe('EventBuffer 常量与 kind 白名单', () => {
 })
 
 describe('EventBuffer 游标回放', () => {
+  it('全新空缓冲的高水位为 :0，read(undefined) 与 cursor() 一致', () => {
+    const buffer = makeBuffer()
+    expect(buffer.cursor()).toBe(`${HUB}:0`)
+    expect(buffer.read(`${HUB}:0`).gap).toBe(false)
+
+    const live = buffer.read(undefined)
+    expect(live.gap).toBe(false)
+    expect(live.events).toHaveLength(0)
+    expect(live.cursor).toBe(`${HUB}:0`)
+  })
+
   it('解析 hubEpoch:cursor', () => {
     expect(parseBufferCursor(`${HUB}:0`, HUB)).toBe(0)
     expect(parseBufferCursor(`${HUB}:12`, HUB)).toBe(12)
@@ -269,6 +280,25 @@ describe('EventBuffer 会话上限', () => {
     expect(size.bytes).toBeLessThanOrEqual(700)
     expect(size.sessions).toBe(1)
   })
+
+  it('中间淘汰不留下无界索引，TTL 到期后全部释放', () => {
+    let now = 10_000
+    const buffer = makeBuffer({ sessionEventMax: 1, ttlMs: 100, now: () => now })
+    const old = appendEvent(buffer, { deviceId: 'dev-a', sessionId: 's-a' })
+    expect(old).toBe(`${HUB}:1`)
+
+    // B 会话大量 churn：每次 append 都触发 B 自身会话上限淘汰。
+    for (let i = 0; i < 50; i += 1) {
+      appendEvent(buffer, { deviceId: 'dev-b', sessionId: 's-b' })
+    }
+    const churned = buffer.size()
+    expect(churned.events).toBe(2)
+    expect(churned.sessions).toBe(2)
+
+    now += 101
+    expect(buffer.size()).toEqual({ events: 0, bytes: 0, sessions: 0 })
+    expect(buffer.read(old).gap).toBe(true)
+  })
 })
 
 describe('EventBuffer hub 总字节上限', () => {
@@ -302,7 +332,22 @@ describe('EventBuffer 保留窗', () => {
     expect(buffer.read(cursor).gap).toBe(true)
     expect(buffer.size().events).toBe(0)
     expect(buffer.size().bytes).toBe(0)
-    expect(buffer.cursor()).toBe(`${HUB}:0`)
+    // 全部过期后高水位仍是最后分配的游标，而不是 :0。
+    const high = buffer.cursor()
+    expect(high).toBe(`${HUB}:2`)
+
+    const reset = buffer.read(high)
+    expect(reset.gap).toBe(false)
+    expect(reset.events).toHaveLength(0)
+    expect(reset.cursor).toBe(`${HUB}:2`)
+
+    // 高水位之前（已过期）的旧游标仍然是 gap。
+    expect(buffer.read(`${HUB}:1`).gap).toBe(true)
+
+    const live = buffer.read(undefined)
+    expect(live.gap).toBe(false)
+    expect(live.events).toHaveLength(0)
+    expect(live.cursor).toBe(high)
   })
 
   it('仅调用 read 也会先清理过期项', () => {
@@ -337,7 +382,7 @@ describe('EventBuffer purge/clear/dispose', () => {
     expect(buffer.purgeDevice('missing')).toBe(0)
   })
 
-  it('clear 后旧游标 gap，游标号继续单调递增', () => {
+  it('clear 后高水位保留，reset 游标对未来事件有效且继续单调', () => {
     const buffer = makeBuffer()
     appendEvent(buffer)
     appendEvent(buffer)
@@ -346,14 +391,26 @@ describe('EventBuffer purge/clear/dispose', () => {
 
     buffer.clear()
     expect(buffer.size()).toEqual({ events: 0, bytes: 0, sessions: 0 })
-    expect(buffer.cursor()).toBe(`${HUB}:0`)
-    expect(buffer.read(old).gap).toBe(true)
+    // clear 不会把高水位退回 :0，reset 发给浏览器的游标仍是最后分配过的 n。
+    expect(buffer.cursor()).toBe(`${HUB}:2`)
+
+    const reset = buffer.read(old)
+    expect(reset.gap).toBe(false)
+    expect(reset.events).toHaveLength(0)
+    expect(reset.cursor).toBe(`${HUB}:2`)
+
+    // 比 clear 前最后分配更早的游标才是 gap。
+    expect(buffer.read(`${HUB}:1`).gap).toBe(true)
     expect(buffer.read(`${HUB}:0`).gap).toBe(true)
 
     const next = appendEvent(buffer)
     expect(next).toBe(`${HUB}:3`)
     expect(buffer.cursor()).toBe(`${HUB}:3`)
-    expect(buffer.read(old).gap).toBe(true)
+    // reset 游标对未来事件继续有效，不需要再次 reset。
+    const resumed = buffer.read(old)
+    expect(resumed.gap).toBe(false)
+    expect(resumed.events.map((entry) => entry.cursor)).toEqual([`${HUB}:3`])
+    expect(buffer.read(`${HUB}:3`).gap).toBe(false)
     expect(buffer.read(`${HUB}:3`).events).toHaveLength(0)
   })
 

@@ -4,10 +4,12 @@
  * 只缓存允许回放的 kind；`input.requested`/`input.resolved` 与载荷里出现的
  * 交互、审批、答案、密钥键一律拒收，避免结构化派生副本绕过 kind 白名单。
  *
- * 存储按 hub 接收顺序排列：全局数组保存连续游标 `n`（1 起），`head` 前移到
- * 最旧存活项，压缩时才丢弃 tombstone；每个会话另有一条只存游标号的 FIFO，
- * 淘汰不会扫描全局数组，也不会重复序列化事件。所有读取/计数/追加都先按
- * 接收时间清理过期项，事件自身的 `ts` 不参与保留窗计算。
+ * 存储按 hub 接收顺序分配单调游标 `n`（1 起）：活跃项放在
+ * `Map<number, BufferedEntry>` 里按 `n` 直接索引，淘汰时从 Map 删除，不保留
+ * tombstone 或指向大对象的辅助索引。另维护一条只存游标号的全局 FIFO
+ * （`globalNs` + `head`，惰性压缩）用于按接收顺序做 TTL/全局字节淘汰，
+ * 每个会话另有一条同样格式的 FIFO。所有读取/计数/追加都先按接收时间清理
+ * 过期项，事件自身的 `ts` 不参与保留窗计算。
  */
 
 import { MARSHAL_KINDS, type EventFrame, type MarshalKind } from '../wire/frames.ts'
@@ -102,7 +104,7 @@ export interface EventBuffer {
   read(cursor: string | undefined): BufferReadResult
   /** 先 evict 过期项。 */
   size(): BufferSize
-  /** 当前高水位游标；空缓冲为 `${hubEpoch}:0`。 */
+  /** 最后分配过的高水位游标；从未分配时为 `${hubEpoch}:0`。 */
   cursor(): string
   /** 内容授权收紧：删除该设备全部缓存事件，返回删除条数。 */
   purgeDevice(deviceId: string): number
@@ -132,8 +134,7 @@ interface BufferedEntry {
   readonly sessionKey: string
   readonly receivedAt: number
   readonly bytes: number
-  /** 淘汰后置空，压缩时丢弃，避免辅助索引继续持有大对象。 */
-  event: EventFrame | null
+  readonly event: EventFrame
 }
 
 interface SessionState {
@@ -206,20 +207,19 @@ class HubEventBuffer implements EventBuffer {
   private readonly replayMax: number
   private readonly replayBytesMax: number
 
-  private entries: BufferedEntry[] = []
-  /** entries 中第一个仍可能存活（或尚未压缩的 tombstone）的下标。 */
-  private head = 0
-  /** entries[0] 对应的游标号；entries 为空时等于 nextN。 */
-  private baseN = 1
+  /** 活跃项按游标号直接索引；淘汰即删除，不留 tombstone。 */
+  private readonly live = new Map<number, BufferedEntry>()
+  /** 全局接收顺序的游标 FIFO；head 之前是已淘汰项，惰性压缩。 */
+  private globalNs: number[] = []
+  private globalHead = 0
   /** 下一个可分配的游标号。clear/dispose 也不回退，避免旧游标复用。 */
   private nextN = 1
   /** 已淘汰的最高游标号；严格小于它的请求游标必定有缺口。 */
   private evictedMax = 0
-  /** clear 明确的失效边界（含）；旧游标即使等于边界也必须 reset。 */
+  /** clear 明确的失效边界（不含）；严格小于它的旧游标必须 reset。 */
   private purgedThrough = -1
   private droppedTotal = 0
   private hubBytes = 0
-  private liveCount = 0
   private lastReceivedAt = Number.NEGATIVE_INFINITY
   private readonly sessions = new Map<string, SessionState>()
   private disposed = false
@@ -265,19 +265,14 @@ class HubEventBuffer implements EventBuffer {
     const n = this.nextN
     this.nextN += 1
     const cursor = `${this.hubEpoch}:${n}`
-    if (this.head >= this.entries.length) {
-      // 没有可复用的槽位（全部已淘汰/尚未压缩），直接从新的基址开始。
-      this.entries = []
-      this.head = 0
-      this.baseN = n
-    }
     const receivedAt = Math.max(now, this.lastReceivedAt)
     this.lastReceivedAt = receivedAt
     const sessionKey = `${event.deviceId}\u0000${event.agent}\u0000${event.sessionId}`
     const entry: BufferedEntry = {
       n, cursor, deviceId: event.deviceId, sessionKey, receivedAt, bytes, event,
     }
-    this.entries.push(entry)
+    this.live.set(n, entry)
+    this.globalNs.push(n)
 
     let session = this.sessions.get(sessionKey)
     if (session === undefined) {
@@ -287,7 +282,6 @@ class HubEventBuffer implements EventBuffer {
     session.ns.push(n)
     session.count += 1
     session.bytes += bytes
-    this.liveCount += 1
     this.hubBytes += bytes
 
     while (session.count > this.sessionEventMax || session.bytes > this.sessionBytesMax) {
@@ -296,7 +290,7 @@ class HubEventBuffer implements EventBuffer {
     while (this.hubBytes > this.hubBytesMax) {
       if (!this.evictGlobalOldest()) break
     }
-    this.compact()
+    this.compactGlobal()
 
     return { accepted: true, cursor, dropped: this.droppedTotal - startDropped }
   }
@@ -321,7 +315,7 @@ class HubEventBuffer implements EventBuffer {
       if (
         parsed === undefined
         || parsed < this.evictedMax
-        || parsed <= this.purgedThrough
+        || parsed < this.purgedThrough
         || parsed > lastAssigned
       ) {
         return {
@@ -337,8 +331,8 @@ class HubEventBuffer implements EventBuffer {
     let truncated = false
     for (let n = requestN + 1; n <= lastAssigned; n += 1) {
       const entry = this.entryAt(n)
-      if (entry === undefined || entry.event === null) {
-        // 游标校验保证其后的号段没有空洞；防御性转为 reset，避免静默丢内容。
+      if (entry === undefined) {
+        // 有效游标之后出现空洞说明索引与游标失配；防御性转为 reset，避免静默丢内容。
         return {
           events: [], cursor: current, gap: true,
           dropped: this.droppedTotal, truncated: false,
@@ -370,7 +364,7 @@ class HubEventBuffer implements EventBuffer {
   size(): BufferSize {
     if (this.disposed) return { events: 0, bytes: 0, sessions: 0 }
     this.evictExpired(this.clock())
-    return { events: this.liveCount, bytes: this.hubBytes, sessions: this.sessions.size }
+    return { events: this.live.size, bytes: this.hubBytes, sessions: this.sessions.size }
   }
 
   cursor(): string {
@@ -384,14 +378,12 @@ class HubEventBuffer implements EventBuffer {
     this.evictExpired(this.clock())
     let deleted = 0
     // 内容授权收紧是低频管理操作；这里允许一次顺序扫描，不暴露为读取 API。
-    for (let index = this.head; index < this.entries.length; index += 1) {
-      const entry = this.entries[index]
-      if (entry === undefined || entry.event === null) continue
+    for (const entry of this.live.values()) {
       if (entry.deviceId !== deviceId) continue
       this.evictEntry(entry)
       deleted += 1
     }
-    this.compact()
+    this.compactGlobal()
     return deleted
   }
 
@@ -399,59 +391,61 @@ class HubEventBuffer implements EventBuffer {
     if (this.disposed) return
     this.evictExpired(this.clock())
     const lastAssigned = this.nextN - 1
-    this.droppedTotal += this.liveCount
+    this.droppedTotal += this.live.size
     if (lastAssigned > this.evictedMax) this.evictedMax = lastAssigned
     if (lastAssigned > 0 && lastAssigned > this.purgedThrough) {
       this.purgedThrough = lastAssigned
     }
-    this.entries = []
-    this.head = 0
-    this.baseN = this.nextN
+    this.live.clear()
+    this.globalNs = []
+    this.globalHead = 0
     this.sessions.clear()
-    this.liveCount = 0
     this.hubBytes = 0
   }
 
   dispose(): void {
     if (this.disposed) return
     this.disposed = true
-    this.entries = []
-    this.head = 0
-    this.baseN = this.nextN
+    this.live.clear()
+    this.globalNs = []
+    this.globalHead = 0
     this.sessions.clear()
-    this.liveCount = 0
     this.hubBytes = 0
   }
 
+  /** 始终返回最后分配过的高水位；全新缓冲 nextN===1 时为 `:0`。 */
   private displayCursor(): string {
-    if (this.liveCount === 0) return `${this.hubEpoch}:0`
     return `${this.hubEpoch}:${this.nextN - 1}`
   }
 
   private entryAt(n: number): BufferedEntry | undefined {
-    const index = n - this.baseN
-    if (index < 0 || index >= this.entries.length) return undefined
-    return this.entries[index]
+    return this.live.get(n)
   }
 
-  private advanceHead(): void {
-    while (this.head < this.entries.length) {
-      const entry = this.entries[this.head]
-      if (entry !== undefined && entry.event !== null) return
-      this.head += 1
+  /** 跳过 globalNs 头部已淘汰的游标号。 */
+  private advanceGlobalHead(): void {
+    while (this.globalHead < this.globalNs.length) {
+      const n = this.globalNs[this.globalHead]
+      if (n !== undefined && this.live.has(n)) return
+      this.globalHead += 1
     }
   }
 
-  /** 按接收时间从全局头部清理到期项；没有新 append 也会执行。 */
+  /** 按接收顺序从全局 FIFO 头部清理到期项；没有新 append 也会执行。 */
   private evictExpired(now: number): void {
     for (;;) {
-      this.advanceHead()
-      const entry = this.entries[this.head]
-      if (entry === undefined) break
+      this.advanceGlobalHead()
+      const n = this.globalNs[this.globalHead]
+      if (n === undefined) break
+      const entry = this.live.get(n)
+      if (entry === undefined) {
+        this.globalHead += 1
+        continue
+      }
       if (now - entry.receivedAt < this.ttlMs) break
       this.evictEntry(entry)
     }
-    this.compact()
+    this.compactGlobal()
   }
 
   /** 淘汰会话最旧项；返回 false 表示队列已空。 */
@@ -463,7 +457,7 @@ class HubEventBuffer implements EventBuffer {
         continue
       }
       const entry = this.entryAt(n)
-      if (entry === undefined || entry.event === null) {
+      if (entry === undefined) {
         session.head += 1
         continue
       }
@@ -475,21 +469,21 @@ class HubEventBuffer implements EventBuffer {
 
   /** 淘汰全局最旧存活项；返回 false 表示缓冲已空。 */
   private evictGlobalOldest(): boolean {
-    this.advanceHead()
-    const entry = this.entries[this.head]
-    if (entry === undefined || entry.event === null) return false
+    this.advanceGlobalHead()
+    const n = this.globalNs[this.globalHead]
+    if (n === undefined) return false
+    const entry = this.live.get(n)
+    if (entry === undefined) return false
     this.evictEntry(entry)
     return true
   }
 
   /**
-   * 唯一淘汰入口：清空事件引用、扣减全局/会话计数，并把游标号从会话 FIFO
-   * 头部移除。调用方保证该事件是所属会话的最旧存活项。
+   * 唯一淘汰入口：从活跃 Map 中删除并扣减全局/会话计数，再把游标号从会话
+   * FIFO 头部移除。调用方保证该事件是所属会话的最旧存活项。
    */
   private evictEntry(entry: BufferedEntry): void {
-    if (entry.event === null) return
-    entry.event = null
-    this.liveCount -= 1
+    if (!this.live.delete(entry.n)) return
     this.hubBytes -= entry.bytes
     this.droppedTotal += 1
     if (entry.n > this.evictedMax) this.evictedMax = entry.n
@@ -518,21 +512,18 @@ class HubEventBuffer implements EventBuffer {
     if (session.count <= 0) this.sessions.delete(entry.sessionKey)
   }
 
-  /** 丢弃头部 tombstone；只在超过阈值时复制数组，避免每条事件都 splice。 */
-  private compact(): void {
-    if (this.head >= this.entries.length) {
-      if (this.entries.length > 0) {
-        this.entries = []
-        this.head = 0
-        this.baseN = this.nextN
+  /** 丢弃 globalNs 头部已失效的游标号；只在超过阈值时复制，避免每条事件都 splice。 */
+  private compactGlobal(): void {
+    if (this.globalHead >= this.globalNs.length) {
+      if (this.globalNs.length > 0) {
+        this.globalNs = []
+        this.globalHead = 0
       }
       return
     }
-    if (this.head > COMPACT_MIN && this.head * 2 >= this.entries.length) {
-      this.entries = this.entries.slice(this.head)
-      const first = this.entries[0]
-      this.baseN = first === undefined ? this.nextN : first.n
-      this.head = 0
+    if (this.globalHead > COMPACT_MIN && this.globalHead * 2 >= this.globalNs.length) {
+      this.globalNs = this.globalNs.slice(this.globalHead)
+      this.globalHead = 0
     }
   }
 }
