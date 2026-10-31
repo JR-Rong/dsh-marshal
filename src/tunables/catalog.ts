@@ -7,9 +7,8 @@ import type { Tunable } from '../adapters/types.ts'
  * 版本实测后显式写入；数组顺序只是展示顺序，任何比较都不看下标。
  *
  * 注意：`catalog-unavailable` / `permission-lattice-unavailable` /
- * `privacy-readback-unavailable` 是稳定的原因码，但当前
- * `src/node/privacy.ts` 的 reason 白名单尚未收录；投影会丢弃未知 reason，
- * 不会泄露正文。补齐投影属于 v1 后续任务，本模块不修改投影层。
+ * `privacy-readback-unavailable` 是稳定的原因码，已收录进
+ * `src/node/privacy.ts` 的 reason 白名单；投影只会保留白名单内的原因码。
  */
 
 export type SettingsField = 'model' | 'reasoning' | 'permission' | 'plan' | 'goal' | 'skill' | 'plugin'
@@ -170,10 +169,13 @@ export function buildTunables(
   const reasoningValues = rankedEfforts.length === 0
     ? undefined
     : rankedEfforts.map(level => ({ id: level.id, label: level.id }))
+  // 与 decideConfigure 的确认基线要求对齐，避免页面展示必然被拒绝的可编辑项。
   const reasoningEditable = readback.reasoning === true && rankedEfforts.length >= 2
+    && current?.model !== undefined && current?.reasoning !== undefined
 
   const permissionEditable = readback.permission === true && catalog.permissionLattice !== undefined
-  const planEditable = readback.plan === true
+    && current?.permission !== undefined
+  const planEditable = readback.plan === true && current?.plan !== undefined
   const goalEditable = readback.goal === true && contentAuthorized
   const skillValues = directoryFor(catalog, 'skill')
   const pluginValues = directoryFor(catalog, 'plugin')

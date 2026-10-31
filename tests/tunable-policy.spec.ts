@@ -148,6 +148,13 @@ describe('decideConfigure gate order', () => {
     )).toEqual({ outcome: 'reject', code: 'unsupported', reason: 'read-only-in-v0' })
   })
 
+  it('catalog 与 agent 不一致时拒绝', () => {
+    expect(decideConfigure(
+      request(),
+      context({ agent: 'codex', catalog: { ...CATALOG, agent: 'claude' } }),
+    )).toEqual({ outcome: 'reject', code: 'unsupported', reason: 'catalog-agent-mismatch' })
+  })
+
   it('runtimeEpoch 不一致先于 busy/pending/revision', () => {
     expect(decideConfigure(
       request({ runtimeEpoch: 'epoch-0', expectedRevision: 99 }),

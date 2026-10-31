@@ -110,7 +110,7 @@ describe('可编辑性需要回读与目录/等级同时成立', () => {
     expect(tunable(noModels, 'model').values).toBeUndefined()
   })
 
-  it('reasoning 要求当前模型至少两个有等级档位', () => {
+  it('reasoning 要求当前模型至少两个有等级档位与已确认基线', () => {
     const single: ConfirmedSettings = { ...CONFIRMED, model: 'alpha', reasoning: 'low' }
     const tunables = buildTunables(CATALOG, single, { contentAuthorized: true })
     expect(tunable(tunables, 'reasoning').editable).toBe(false)
@@ -125,9 +125,14 @@ describe('可编辑性需要回读与目录/等级同时成立', () => {
 
     const noCurrent = buildTunables(CATALOG, undefined, { contentAuthorized: true })
     expect(tunable(noCurrent, 'reasoning').editable).toBe(false)
+
+    // 只有 model 没有已确认 reasoning：decideConfigure 会报 current-unknown。
+    const noBaseline = buildTunables(CATALOG, { revision: 5, model: 'zeta' }, { contentAuthorized: true })
+    expect(tunable(noBaseline, 'reasoning').editable).toBe(false)
+    expect(tunable(noBaseline, 'reasoning').reason).toBe('catalog-unavailable')
   })
 
-  it('permission 要求 readback 与 lattice 同时成立', () => {
+  it('permission 要求 readback、lattice 与已确认基线同时成立', () => {
     const noLattice = buildTunables(
       {
         agent: CATALOG.agent,
@@ -148,11 +153,16 @@ describe('可编辑性需要回读与目录/等级同时成立', () => {
     expect(tunable(noReadback, 'permission').editable).toBe(false)
     expect(tunable(noReadback, 'permission').reason).toBe('permission-lattice-unavailable')
 
+    // 已确认快照缺少 permission：decideConfigure 会报 permission-unverifiable。
+    const noBaseline = buildTunables(CATALOG, { revision: 5, model: 'zeta' }, { contentAuthorized: true })
+    expect(tunable(noBaseline, 'permission').editable).toBe(false)
+    expect(tunable(noBaseline, 'permission').reason).toBe('permission-lattice-unavailable')
+
     expect(tunable(buildTunables(CATALOG, CONFIRMED, { contentAuthorized: true }), 'permission').editable)
       .toBe(true)
   })
 
-  it('plan 只要求回读渠道', () => {
+  it('plan 要求回读渠道与已确认基线', () => {
     const noReadback = buildTunables(
       { ...CATALOG, readback: { ...CATALOG.readback, plan: false } },
       CONFIRMED,
@@ -160,6 +170,16 @@ describe('可编辑性需要回读与目录/等级同时成立', () => {
     )
     expect(tunable(noReadback, 'plan').editable).toBe(false)
     expect(tunable(noReadback, 'plan').reason).toBe('settings-readback-unavailable')
+
+    // 已确认快照缺少 plan：decideConfigure 会报 current-unknown。
+    const noBaseline = buildTunables(
+      CATALOG,
+      { revision: 5, model: 'zeta', reasoning: 'high' },
+      { contentAuthorized: true },
+    )
+    expect(tunable(noBaseline, 'plan').editable).toBe(false)
+    expect(tunable(noBaseline, 'plan').reason).toBe('settings-readback-unavailable')
+
     expect(tunable(buildTunables(CATALOG, CONFIRMED, { contentAuthorized: true }), 'plan').editable)
       .toBe(true)
   })

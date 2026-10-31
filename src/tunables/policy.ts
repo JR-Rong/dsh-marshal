@@ -262,6 +262,9 @@ export function decideConfigure(
   if (context.agent !== 'codex' && context.agent !== 'claude') {
     return reject('unsupported', 'read-only-in-v0')
   }
+  if (context.catalog.agent !== context.agent) {
+    return reject('unsupported', 'catalog-agent-mismatch')
+  }
   if (request.runtimeEpoch !== context.runtimeEpoch) {
     return reject('stale-connection', 'runtime-epoch-mismatch')
   }

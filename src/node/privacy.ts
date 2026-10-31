@@ -64,7 +64,10 @@ const CAPABILITY_REASON_CODES: ReadonlySet<string> = new Set([
   'ownership-unverified',
   'session-not-owned',
   'native-steer-unverified',
+  'catalog-unavailable',
+  'permission-lattice-unavailable',
   'settings-readback-unavailable',
+  'privacy-readback-unavailable',
   'interaction-relay-unavailable',
 ])
 
