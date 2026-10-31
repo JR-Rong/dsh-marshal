@@ -241,7 +241,8 @@ export function createQuestionRelay(options: QuestionRelayOptions): QuestionRela
           if (signal !== undefined && onAbort !== undefined) signal.removeEventListener('abort', onAbort)
           table.remove(entry)
           if (outcome !== undefined) emitResolved(sessionId, requestId, outcome)
-          resolve(answer)
+          // finish 现在接受 unknown（审批也会用），问题通道的回写形状仍是 DSH 答案。
+          resolve(answer as AskUserQuestionAnswerLike | undefined)
         },
       }
 

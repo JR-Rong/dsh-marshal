@@ -11,8 +11,9 @@ export interface InputAuthorization {
   readonly content: boolean
 }
 
-/** 结算/失效的终态；`timeout`/`expired` 对外都映射为 `expired`。 */
-export type InputOutcome = 'remote' | 'timeout' | 'expired' | 'local' | 'invalidated'
+/** 结算/失效的终态；`timeout`/`expired` 对外都映射为 `expired`，`aborted` 映射为 `cancelled`。 */
+export type InputOutcome =
+  | 'remote' | 'timeout' | 'expired' | 'local' | 'invalidated' | 'declined' | 'cancelled' | 'aborted'
 
 export interface PendingInput {
   readonly deviceId: string
@@ -20,16 +21,20 @@ export interface PendingInput {
   readonly runtimeEpoch: string
   readonly sessionId: string
   readonly requestId: string
-  /** 原生问题（含原始 label），回写只用它，不用投影文本。 */
+  /** 缺省为普通问题（v0 兼容）；审批卡记为 approval。 */
+  readonly kind?: 'question' | 'approval'
+  /** 原生问题（含原始 label），回写只用它，不用投影文本；审批卡为空数组。 */
   readonly questions: readonly UserQuestionLike[]
   readonly mapping: CardMapping
+  /** 审批卡投影决策 id -> 原生写回值（一次只接受其中之一）；问题卡不设置。 */
+  readonly decisions?: ReadonlyMap<string, string>
   readonly authorization: InputAuthorization | undefined
   readonly expiresAt: number
   /** 认领时固定的单调截止时刻；墙钟回拨/重连都不能延长。 */
   readonly monoDeadline: number
   settled: boolean
   /** outcome 为 undefined 时只结束等待，不发 `input.resolved`（发送失败或 dispose）。 */
-  finish(answer?: AskUserQuestionAnswerLike, outcome?: InputOutcome): void
+  finish(value?: unknown, outcome?: InputOutcome): void
 }
 
 /**

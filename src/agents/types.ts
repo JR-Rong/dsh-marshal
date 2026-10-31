@@ -1,5 +1,5 @@
 import type {
-  Adapter, Capability, ObserveCapability, Operation, Ownership, SnapshotCompleteness,
+  Adapter, Capability, ObserveCapability, Operation, Ownership, SettleResult, SnapshotCompleteness,
   SyncCapabilityDocument, SyncSessionRow, SyncSnapshot, Tunable,
 } from '../adapters/types.ts'
 import type { EventFrame } from '../wire/frames.ts'
@@ -13,7 +13,8 @@ import type { EventFrame } from '../wire/frames.ts'
  * 不另造一套能力枚举。
  *
  * T01 交付类型边界；T02 在此补上所有权快照/证据与 create/fork 端口，
- * configure/readSettings/handleNativeInput 仍留给 T05。本文件不提供空实现。
+ * configure/readSettings 仍留给 T07。原生输入由 node 的统一中继（interactions.ts）
+ * 实现 NativeInputPort，适配器只做分类并等待决定。本文件不提供空实现。
  * AgentHost 也不绕过 node runner/journal/privacy 接受远端写命令（见 host.ts）。
  */
 
@@ -195,7 +196,7 @@ export interface CreatedSession {
 }
 
 /**
- * T05/T07 的设置端口占位：current/confirmed 与 requested/pending 分离，
+ * T07 的设置端口占位：current/confirmed 与 requested/pending 分离，
  * runtimeEpoch + settingsRevision 参与比较。T01 不实现回读。
  */
 export interface SettingsReadRequest {
@@ -237,24 +238,38 @@ export interface SettingsPort {
 }
 
 /**
- * T05 的原生输入端口占位：两项中继策略、完整输入 schema、允许集合与
- * 原生 `nativeExpiresAt`（缺失为空）都由适配器在这里处理。
+ * T05 的共享原生输入契约：适配器只把已分类的阻塞请求交给 node 中继，
+ * 卡片、授权、期限与单次结算都由 node 负责；适配器不能自行默认 remote。
  */
-export interface NativeInputRequest {
+export type RelayPolicy = 'off' | 'notify' | 'remote'
+
+/** 适配器把已分类的原生阻塞请求交给 node 中继；node 负责卡片、授权、期限与结算。 */
+export interface NativeInputClaim {
+  readonly kind: 'question' | 'approval'
   readonly sessionId: string
-  readonly requestId: string
   readonly runtimeEpoch: RuntimeEpoch
-  readonly nativeExpiresAt?: number
-  readonly schema: unknown
+  /** 原生问题数组；relay 只交给 projector，不自行解释正文。 */
+  readonly questions?: readonly unknown[]
+  /** 原生审批描述（action/title/detail + decisions[{id,label}] 白名单）。 */
+  readonly approval?: unknown
+  /** 原生期限，按 inputs.ts 的 node-clock / foreign-clock 形状；缺失表示无原生期限。 */
+  readonly nativeExpiry?: unknown
 }
 
-export interface NativeInputDecision {
-  readonly decision: 'answer' | 'decline' | 'cancel'
-  readonly value?: unknown
-}
+export type NativeInputDecision =
+  | { readonly decision: 'answer'; readonly value: unknown }
+  | { readonly decision: 'decline' }
+  | { readonly decision: 'cancel' }
 
 export interface NativeInputPort {
-  handleNativeInput(request: NativeInputRequest, signal: AbortSignal): Promise<NativeInputDecision>
+  /** claim 是唯一创建卡片/等待决定的入口；off/notify/未授权/不可答都必须立即返回保守决定。 */
+  claim(input: NativeInputClaim, signal: AbortSignal): Promise<NativeInputDecision>
+  answer(sessionId: string, requestId: string, value: unknown): SettleResult
+  cancel(sessionId: string, requestId: string): SettleResult
+  snapshot(sessionId: string): readonly unknown[]
+  revalidate(): void
+  invalidate(): void
+  dispose(): void
 }
 
 /** 上报的最近状态；Host 以 registry 记录为准，读取 health 不改变记录。 */
@@ -315,7 +330,7 @@ export interface AgentAdapter extends Adapter {
   createSession?(request: CreateSessionRequest, signal: AbortSignal): Promise<CreatedSession>
   forkSession?(request: ForkSessionRequest, signal: AbortSignal): Promise<CreatedSession>
 
-  // 以下端口由 T02/T05 实现；T01 只定义类型，不提供空实现。
+  // 以下端口由 T02/T05/T07 实现；T01 只定义类型，不提供空实现。
   readonly ownershipPort?: OwnershipPort
   readonly settingsPort?: SettingsPort
   readonly nativeInputPort?: NativeInputPort
