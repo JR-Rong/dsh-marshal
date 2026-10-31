@@ -123,6 +123,8 @@ const WIRE_CODES: ReadonlySet<string> = new Set([
   'session-unknown', 'invalid-args', 'unsupported', 'device-mismatch', 'agent-crashed', 'result-too-large',
   'unknown', 'invalid', 'session-mismatch', 'tighten-only', 'deadline-expired',
   'stale-connection', 'clock-skew', 'writer-busy', 'conflict',
+  // configure 的真实回读结论必须原样过线，不能被归成 timeout。
+  'readback-timeout', 'readback-mismatch', 'settings-unsafe',
 ])
 
 /** 超过这个偏差就不接受带副作用的命令：期限判断已经不可信。 */
