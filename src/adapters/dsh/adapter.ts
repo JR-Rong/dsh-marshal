@@ -1,7 +1,7 @@
 import { PreCallRejection, type Capability, type AnswerSink, type Operation, type SnapshotCompleteness } from '../types.ts'
 import type { EventFrame } from '../../wire/frames.ts'
 import { createEventDeduper, toMarshalEvents } from './map.ts'
-import { NativeWriterBusyError, type DshSurface } from './surface.ts'
+import type { DshSurface } from './surface.ts'
 
 /** 能力快照的版本；字段含义变化时递增，页面据此丢弃旧解读。 */
 const CAPABILITY_REVISION = 1
@@ -11,6 +11,10 @@ const TURN_BINDING_MISSING = 'interrupt requires an atomic turn binding'
 /**
  * DSH v0 的能力。`observe.history=false` 来自已验证的原生 surface：
  * `list`/`follow` 之外没有可用的只读历史入口，不是“没实现所以猜 false”。
+ *
+ * ownership 保持 `unverified`：`prompt` 之所以仍出现在 operations，是
+ * 因为进程内原生 `prompt` 的“受理”本身就是控制边界；它只证明本适配器
+ * 没有绕过原生受理，不证明外部写者不会并发写同一会话。
  */
 function buildCapability(surface: DshSurface): Capability {
   const operations = new Set<Operation>(['prompt', 'answer', 'cancel'])
@@ -34,14 +38,15 @@ function buildCapability(surface: DshSurface): Capability {
     reasoning: true,
     toolDetail: 'args+output',
     promptFidelity: 'native',
+    // reason 只放稳定原因码，页面文案由页面按码渲染；不把自由文本当能力字段。
     tunables: [
-      { id: 'model', scope: 'next-turn', effect: 'immediate', editable: false, reason: 'v0 只认出字段；保存与回读顺延' },
-      { id: 'reasoning', scope: 'next-turn', effect: 'immediate', direction: 'tighten-only', editable: false, reason: 'v0 只认出字段；保存与回读顺延' },
-      { id: 'permission', scope: 'next-session', effect: 'next-session', direction: 'tighten-only', editable: false, reason: 'v0 只拒绝放宽；切换顺延' },
-      { id: 'plan', scope: 'next-turn', effect: 'immediate', editable: false, reason: 'v0 只认出字段；保存与回读顺延' },
-      { id: 'goal', scope: 'next-turn', effect: 'immediate', editable: false, reason: 'v0 只认出字段；保存与回读顺延' },
-      { id: 'skill', scope: 'host', effect: 'needs-restart', editable: false, reason: '技能是宿主级配置，远端只能查看' },
-      { id: 'plugin', scope: 'host', effect: 'needs-restart', editable: false, reason: '插件是宿主级配置，远端只能查看' },
+      { id: 'model', scope: 'next-turn', effect: 'immediate', editable: false, reason: 'v0-field-only' },
+      { id: 'reasoning', scope: 'next-turn', effect: 'immediate', direction: 'tighten-only', editable: false, reason: 'v0-field-only' },
+      { id: 'permission', scope: 'next-session', effect: 'next-session', direction: 'tighten-only', editable: false, reason: 'v0-tighten-only' },
+      { id: 'plan', scope: 'next-turn', effect: 'immediate', editable: false, reason: 'v0-field-only' },
+      { id: 'goal', scope: 'next-turn', effect: 'immediate', editable: false, reason: 'v0-field-only' },
+      { id: 'skill', scope: 'host', effect: 'needs-restart', editable: false, reason: 'host-config' },
+      { id: 'plugin', scope: 'host', effect: 'needs-restart', editable: false, reason: 'host-config' },
     ],
     unavailable,
   }
@@ -75,7 +80,10 @@ export function createDshAdapter(surface: DshSurface, options: DshAdapterOptions
     return result
   }
 
-  /** 会话存在性只作为调用前校验；清单不完整时“没找到”不是否定的证据。 */
+  /**
+   * 会话存在性只作为调用前校验；清单不完整时“没找到”不是否定的证据。
+   * 只有遍历到终止页（complete）的清单才允许给出 `session-unknown`。
+   */
   const verifySession = async (sessionId: string): Promise<void> => {
     const listed = await list(new AbortController().signal)
     if (listed.items.some(item => item.sessionId === sessionId)) return
@@ -147,32 +155,37 @@ export function createDshAdapter(surface: DshSurface, options: DshAdapterOptions
           if (typeof args.text !== 'string' || args.text.trim() === '') {
             throw new PreCallRejection('invalid-args', 'text is required')
           }
-          await verifySession(sessionId)
-          // 清单里的 running 只作参考：它不是跨进程互斥证据，不能据此宣称 busy/空闲。
-          // 受理原子性完全依赖原生 prompt；忙拒绝映射为调用前拒绝。
-          const requestId = args.requestId ?? crypto.randomUUID()
-          try {
-            return await surface.prompt({ sessionId, text: args.text, requestId })
-          } catch (error) {
-            if (error instanceof NativeWriterBusyError) {
-              throw new PreCallRejection('writer-busy')
-            }
-            throw error
+          // 调用前重新列一次会话：只把原生清单里的 running 当“可能忙”的
+          // 保守/提示性证据；清单不完整且没找到会话时不作否定判断。
+          const listed = await list(new AbortController().signal)
+          const session = listed.items.find(item => item.sessionId === sessionId)
+          if (session?.running === true) throw new PreCallRejection('writer-busy')
+          if (session === undefined && listed.completeness === 'complete') {
+            throw new PreCallRejection('session-unknown')
           }
+          // 受理原子性完全依赖原生 prompt；调用之后的异常原样上抛，
+          // 由 runner 记为 outcome-unknown（不伪造 writer-busy，也不重试）。
+          const requestId = args.requestId ?? crypto.randomUUID()
+          return await surface.prompt({ sessionId, text: args.text, requestId })
         }
         case 'interrupt': {
           if (surface.activeTurn === undefined || surface.cancelTurn === undefined) {
             // 没有 cancelTurn 时不退回 sessionId-only cancel：那会打断新回合。
             throw new PreCallRejection('unsupported', TURN_BINDING_MISSING)
           }
-          const requested = (command.args ?? {}) as { turnId?: string }
+          const requested = (command.args ?? {}) as { turnId?: string; runtimeEpoch?: string }
+          if (requested.runtimeEpoch !== options.nodeEpoch) {
+            throw new PreCallRejection('stale-connection')
+          }
           const active = await surface.activeTurn(sessionId)
           if (active === undefined) throw new PreCallRejection('conflict', 'no active turn')
           if (requested.turnId !== undefined && requested.turnId !== active.turnId) {
             throw new PreCallRejection('conflict', 'active turn changed')
           }
-          // 回合 id 与取消在同一次原生调用里给出；原生侧负责与当前回合比较。
-          return await surface.cancelTurn({ sessionId, turnId: active.turnId })
+          // 回合 id、runtimeEpoch 与取消在同一次原生调用里给出；原生侧负责比较。
+          return await surface.cancelTurn({
+            sessionId, turnId: active.turnId, runtimeEpoch: requested.runtimeEpoch,
+          })
         }
         case 'cancel': {
           const requestId = (command.args as { requestId?: string } | undefined)?.requestId

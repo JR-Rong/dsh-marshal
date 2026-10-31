@@ -1,4 +1,4 @@
-import { createHash, timingSafeEqual } from 'node:crypto'
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { WebServerLike } from '../dsh-types.ts'
 import { COMMAND_OPS, type CommandFrame, type CommandOp, type EventFrame } from '../wire/frames.ts'
@@ -246,10 +246,21 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
       if (!(COMMAND_OPS as readonly string[]).includes(op)) {
         json(res, 400, { ok: false, code: 'invalid-args' }); return
       }
+      // 每次 subscribe 都由 hub 签发新的不透明 id；页面在 HTTP 结果里取回并按 tab
+      // 保存，unsubscribe 必须带同一个 id（缺 id/未知 id 由校验与节点拒绝）。
+      const rawArgs: unknown = (() => {
+        const candidate = body.args
+        if (op !== 'observe' || typeof candidate !== 'object' || candidate === null || Array.isArray(candidate)) {
+          return candidate
+        }
+        const record = candidate as Record<string, unknown>
+        if (record.kind !== 'follow' || record.action !== 'subscribe') return candidate
+        return { ...record, subscriptionId: randomUUID() }
+      })()
       // 参数在 hub 侧先按 op 校验；非法参数不进入中继，也不消耗幂等键。
       let args: ReturnType<typeof parseCommandArgs>
       try {
-        args = parseCommandArgs(op as CommandOp, body.args)
+        args = parseCommandArgs(op as CommandOp, rawArgs)
       } catch {
         json(res, 400, { ok: false, code: 'invalid-args' }); return
       }

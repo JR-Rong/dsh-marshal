@@ -5,39 +5,9 @@ import type { SnapshotCompleteness } from '../types.ts'
 const MAX_PAGES = 100
 const MAX_SESSIONS = 20_000
 
-/**
- * DSH 的 `list` 没有公开每页大小，只能按“已知的最大页”判断终止页是否是满页。
- * 小于这个下限的终止页不按满页处理，避免小清单被误报为不完整。
- */
-const DEFAULT_PAGE_SIZE_FLOOR = 20
-
 export interface DshSurfaceListResult {
   readonly items: readonly SessionSummaryLike[]
   readonly completeness: SnapshotCompleteness
-}
-
-/**
- * 原生忙拒绝。只有携带结构化 code/kind/reason 的拒绝才会被认出；
- * 消息文本不参与分类（契约 §12 禁止用字符串推断错误类别），
- * 认不出的异常交给 runner 记 outcome-unknown。
- */
-export class NativeWriterBusyError extends Error {
-  override readonly name = 'NativeWriterBusyError'
-  constructor() { super('marshal: writer-busy: native writer is busy') }
-}
-
-const NATIVE_BUSY_CODES: ReadonlySet<string> = new Set([
-  'writer-busy', 'session-busy', 'prompt-busy', 'turn-active', 'busy',
-])
-
-function isNativeBusy(error: unknown): boolean {
-  if (typeof error !== 'object' || error === null) return false
-  const record = error as Record<string, unknown>
-  for (const key of ['code', 'kind', 'reason'] as const) {
-    const value = record[key]
-    if (typeof value === 'string' && NATIVE_BUSY_CODES.has(value)) return true
-  }
-  return false
 }
 
 export interface DshSurface {
@@ -50,36 +20,42 @@ export interface DshSurface {
    * 先读回合再无条件 cancel 无法排除打断新回合。
    */
   activeTurn?(sessionId: string): Promise<ActiveTurnLike | undefined>
-  cancelTurn?(input: { sessionId: string; turnId: string }): Promise<unknown>
+  cancelTurn?(input: { sessionId: string; turnId: string; runtimeEpoch: string }): Promise<unknown>
 }
 
 export interface DshSurfaceOptions {
-  /** 终止页达到这个长度且没有 cursor 时按满页处理（默认 20）。 */
-  readonly pageSizeFloor?: number
   readonly maxPages?: number
   readonly maxSessions?: number
 }
 
 /** DSH 升级导致签名变化时，只改这一个文件。 */
 export function createDshSurface(controller: SessionControllerLike, options: DshSurfaceOptions = {}): DshSurface {
-  const pageSizeFloor = Math.max(1, options.pageSizeFloor ?? DEFAULT_PAGE_SIZE_FLOOR)
   const maxPages = Math.max(1, options.maxPages ?? MAX_PAGES)
   const maxSessions = Math.max(1, options.maxSessions ?? MAX_SESSIONS)
 
+  /**
+   * 完整性只有一个证据：遍历到 `nextCursor` 缺失的终止页。
+   * 页大小、页长短、条目数都不是证据；达到上限、cursor 停滞或中途取消
+   * 一律返回 `unconfirmed`，绝不把残缺清单当全量。
+   */
   const list = async (signal: AbortSignal): Promise<DshSurfaceListResult> => {
     const items: SessionSummaryLike[] = []
     const seen = new Set<string>()
     let cursor: string | undefined
     let pages = 0
-    let largestPage = 0
     let completeness: SnapshotCompleteness = 'complete'
 
+    signal.throwIfAborted()
     for (;;) {
-      signal.throwIfAborted()
-      const page = await controller.list(cursor === undefined ? {} : { cursor }, signal)
-      signal.throwIfAborted()
+      let page: { items: readonly SessionSummaryLike[]; nextCursor?: string | undefined }
+      try {
+        page = await controller.list(cursor === undefined ? {} : { cursor }, signal)
+      } catch (error) {
+        // 原生调用因取消而失败时没有终止页证据；其它异常仍交给调用方。
+        if (signal.aborted) { completeness = 'unconfirmed'; break }
+        throw error
+      }
       pages += 1
-      largestPage = Math.max(largestPage, page.items.length)
       for (const item of page.items) {
         if (seen.has(item.sessionId)) continue
         seen.add(item.sessionId)
@@ -87,22 +63,15 @@ export function createDshSurface(controller: SessionControllerLike, options: Dsh
         items.push(item)
       }
       if (completeness === 'unconfirmed') break
-      // 恰好到达上限也同样没有“还有下一页”的证据。
       if (items.length >= maxSessions) { completeness = 'unconfirmed'; break }
 
       const next = page.nextCursor
-      if (next === undefined) {
-        // 终止页没有 cursor。若它与已知最大页同宽（且不是小清单），
-        // 很可能是被截断的默认页：不能沉默地当全量。
-        if (page.items.length >= pageSizeFloor && page.items.length === largestPage) {
-          completeness = 'unconfirmed'
-        }
-        break
-      }
+      if (next === undefined) break
       // cursor 不前进会形成死循环；按不可确认处理，绝不重复请求同一页。
       if (next === cursor) { completeness = 'unconfirmed'; break }
       cursor = next
       if (pages >= maxPages) { completeness = 'unconfirmed'; break }
+      if (signal.aborted) { completeness = 'unconfirmed'; break }
     }
 
     return { items, completeness }
@@ -112,23 +81,20 @@ export function createDshSurface(controller: SessionControllerLike, options: Dsh
     sessionId: string; text: string; requestId: string
   }): Promise<unknown> => {
     const abort = new AbortController()
-    try {
-      // 不传 mode：普通 prompt 的“idle + 受理”必须由原生控制器一步完成。
-      return await controller.prompt(
-        { requestId, sessionId, content: [{ type: 'text', text }] },
-        abort.signal,
-      )
-    } catch (error) {
-      if (isNativeBusy(error)) throw new NativeWriterBusyError()
-      throw error
-    }
+    // 不传 mode：普通 prompt 的“idle + 受理”必须由原生控制器一步完成。
+    // 原生异常原样上抛：没有“受理前”证据，适配器不能自行分类成 rejected。
+    return await controller.prompt(
+      { requestId, sessionId, content: [{ type: 'text', text }] },
+      abort.signal,
+    )
   }
 
   const activeTurn = typeof controller.activeTurn === 'function'
     ? async (sessionId: string): Promise<ActiveTurnLike | undefined> => controller.activeTurn?.(sessionId)
     : undefined
   const cancelTurn = typeof controller.cancelTurn === 'function'
-    ? async (input: { sessionId: string; turnId: string }): Promise<unknown> => controller.cancelTurn?.(input)
+    ? async (input: { sessionId: string; turnId: string; runtimeEpoch: string }): Promise<unknown> =>
+        controller.cancelTurn?.(input)
     : undefined
 
   return {

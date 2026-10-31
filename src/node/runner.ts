@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto'
 import {
   encodeFrame, type AckFrame, type CommandStatusResultFrame, type EventFrame, type Frame,
   type WireErrorCode,
@@ -23,9 +22,10 @@ function errorClass(error: unknown): string {
 }
 
 /**
- * 每会话一条原生跟随循环，按观察者引用计数。
- * subscriptionId 由服务端签发、绑定认证观察者（operatorId + 当前 connectionId）：
- * 同一调用者重复订阅返回同一个 id；取消只移除自己的引用，最后一个观察者退出才释放原生 follower。
+ * 每会话一条原生跟随循环，严格按 hub 签发的 subscriptionId 引用计数。
+ * subscriptionId 是唯一计数键；operator/connection 只用于判断“同一调用者”。
+ * 同一 id 同调用者重复订阅返回同一订阅；不同调用者复用同一 id 是 conflict。
+ * 最后一个订阅移除时才释放原生 follower。
  */
 export function createFollower(options: {
   adapter: Adapter
@@ -34,7 +34,7 @@ export function createFollower(options: {
 }) {
   interface SessionFollow {
     readonly abort: AbortController
-    /** observer key -> subscriptionId；不同观察者各自持有一个 id。 */
+    /** subscriptionId -> caller；调用者身份不参与计数。 */
     readonly refs: Map<string, string>
   }
   const sessions = new Map<string, SessionFollow>()
@@ -66,34 +66,36 @@ export function createFollower(options: {
   }
 
   return {
-    /** 同一观察者重复订阅不会新增引用，直接返回已签发的 id。 */
-    subscribe(sessionId: string, observer: string): string {
+    /**
+     * 同 id 同调用者幂等返回现有订阅；同 id 不同调用者返回 conflict。
+     * 同一调用者持多个不同 id（例如同一连接下的两个 tab）是允许的。
+     */
+    subscribe(sessionId: string, subscriptionId: string, caller: string): 'ok' | 'conflict' {
       const existing = sessions.get(sessionId)
-      const known = existing?.refs.get(observer)
-      if (existing !== undefined && known !== undefined) return known
+      const owner = existing?.refs.get(subscriptionId)
+      if (owner !== undefined) return owner === caller ? 'ok' : 'conflict'
       const entry: SessionFollow = existing ?? { abort: new AbortController(), refs: new Map() }
       if (existing === undefined) {
         sessions.set(sessionId, entry)
         run(sessionId, entry)
       }
-      const subscriptionId = randomUUID()
-      entry.refs.set(observer, subscriptionId)
-      return subscriptionId
+      entry.refs.set(subscriptionId, caller)
+      return 'ok'
     },
-    subscriptionOf(sessionId: string, observer: string): string | undefined {
-      return sessions.get(sessionId)?.refs.get(observer)
-    },
-    unsubscribe(sessionId: string, observer: string, subscriptionId: string): boolean {
+    /** 只按 id 删除，且调用者必须是该 id 的登记人；未知 id 一律拒绝。 */
+    unsubscribe(sessionId: string, subscriptionId: string, caller: string): boolean {
       const entry = sessions.get(sessionId)
-      if (entry === undefined || entry.refs.get(observer) !== subscriptionId) return false
-      entry.refs.delete(observer)
+      if (entry === undefined || entry.refs.get(subscriptionId) !== caller) return false
+      entry.refs.delete(subscriptionId)
       release(sessionId, entry)
       return true
     },
-    /** 断线时清掉该连接的全部引用；只有归零的会话才停止原生跟随。 */
-    unsubscribeObserver(observer: string): void {
+    /** 断线时清掉该调用者的全部订阅 id；只有归零的会话才停止原生跟随。 */
+    unsubscribeCaller(caller: string): void {
       for (const [sessionId, entry] of [...sessions]) {
-        entry.refs.delete(observer)
+        for (const [subscriptionId, owner] of [...entry.refs]) {
+          if (owner === caller) entry.refs.delete(subscriptionId)
+        }
         release(sessionId, entry)
       }
     },
@@ -316,20 +318,18 @@ export function runCommand(
     }
     const observer = observerKey(frame)
     if (observe.action === 'subscribe') {
-      const existing = follower.subscriptionOf(sessionId, observer)
-      if (existing !== undefined) {
-        // 同一观察者重复订阅是幂等的：返回已有订阅，不启动第二条跟随循环。
-        reply({ status: 'accepted', result: { following: true, subscriptionId: existing } })
+      const subscriptionId = observe.subscriptionId
+      if (follower.subscribe(sessionId, subscriptionId, observer) === 'conflict') {
+        // 同一 id 已被另一调用者持有：不能把别人的订阅交给当前调用者。
+        reply({ status: 'rejected', code: 'conflict' })
         return
       }
-      // 原生跟随已因会话终止而结束时，旧 id 自然失效；subscribe 会签发新 id。
-      const subscriptionId = follower.subscribe(sessionId, observer)
       reply({ status: 'accepted', result: { following: true, subscriptionId } })
       return
     }
     const subscriptionId = observe.subscriptionId
-    if (subscriptionId === undefined
-      || !follower.unsubscribe(sessionId, observer, subscriptionId)) {
+    if (!follower.unsubscribe(sessionId, subscriptionId, observer)) {
+      // 缺 id 已在参数校验阶段拒绝；未知 id 或非本人持有都按 conflict。
       reply({ status: 'rejected', code: 'conflict' })
       return
     }

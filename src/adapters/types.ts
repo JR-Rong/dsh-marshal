@@ -81,14 +81,14 @@ export interface Adapter {
   readonly snapshotCompleteness: SnapshotCompleteness
   /** 当前会话清单，已转成 `session.updated`/`capability.changed` 事件。 */
   snapshot(signal: AbortSignal): Promise<readonly EventFrame[]>
-  /** 跟随一个会话；seq 由适配器按 sessionId 单调分配。 */
+  /** 跟随一个会话；这里的 seq 只是适配器内部序号，出站前会被公开序号覆盖。 */
   follow(sessionId: string, signal: AbortSignal): AsyncIterable<EventFrame>
   /**
-   * 造一个走同一 seq 计数器的帧。快照、跟随、提问三类事件共用一条序列，
-   * 别处（如 `node/questions.ts`）发事件也必须走它，否则 seq 会撞。
+   * 造一个走适配器内部序号的帧。公开 `seq` 只在投影/过滤之后由 node 层
+   * 按 `(deviceId, agent, sessionId, nodeEpoch)` 重新分配。
    */
   frame(sessionId: string, kind: EventFrame['kind'], payload: unknown): EventFrame
-  /** 投影层分片需要从同一计数器取 seq，避免多个分片共用信封序号。 */
+  /** 投影层分片需要内部序号；公开序号不以它为准。 */
   nextSeq?(sessionId: string): number
   execute(command: { op: string; target: { sessionId: string }; args?: unknown }): Promise<unknown>
 }

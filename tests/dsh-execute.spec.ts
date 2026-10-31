@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { createDshAdapter } from '../src/adapters/dsh/adapter.ts'
-import { NativeWriterBusyError, type DshSurface } from '../src/adapters/dsh/surface.ts'
+import type { DshSurface } from '../src/adapters/dsh/surface.ts'
 import type { EventFrame } from '../src/wire/frames.ts'
 
 const summaries = [{ sessionId: 's1', running: false, blank: false, updatedAt: 1, cwd: '/w' }]
@@ -42,11 +42,25 @@ describe('dsh adapter', () => {
     expect(s.prompt).toHaveBeenCalledWith({ sessionId: 's1', text: 'hello', requestId: 'r1' })
   })
 
-  it('原生忙拒绝映射成调用前 writer-busy', async () => {
-    const s = surface({ prompt: vi.fn(async () => { throw new NativeWriterBusyError() }) })
+  it('清单 running=true 时在调用前拒绝 writer-busy', async () => {
+    const s = surface({
+      list: vi.fn(async () => ({
+        items: [{ sessionId: 's1', running: true, blank: false, updatedAt: 1 }],
+        completeness: 'complete' as const,
+      })),
+    })
     const adapter = createDshAdapter(s, options)
     await expect(adapter.execute({ op: 'prompt', target: { sessionId: 's1' }, args: { text: 'x' } }))
       .rejects.toMatchObject({ name: 'PreCallRejection', code: 'writer-busy' })
+    expect(s.prompt).not.toHaveBeenCalled()
+  })
+
+  it('调用后的 prompt 异常原样上抛，不伪造 writer-busy', async () => {
+    const native = Object.assign(new Error('busy'), { code: 'writer-busy' })
+    const s = surface({ prompt: vi.fn(async () => { throw native }) })
+    const adapter = createDshAdapter(s, options)
+    await expect(adapter.execute({ op: 'prompt', target: { sessionId: 's1' }, args: { text: 'x' } }))
+      .rejects.toBe(native)
   })
 
   it('没有 cancelTurn 时 interrupt 关闭，且不调用 session-only cancel', async () => {
@@ -64,10 +78,22 @@ describe('dsh adapter', () => {
     const s = surface({ activeTurn, cancelTurn })
     const adapter = createDshAdapter(s, options)
     expect(adapter.capabilities('s1').operations.has('interrupt')).toBe(true)
-    await expect(adapter.execute({ op: 'interrupt', target: { sessionId: 's1' } }))
-      .resolves.toEqual({ cancelled: true })
+    await expect(adapter.execute({
+      op: 'interrupt', target: { sessionId: 's1' }, args: { runtimeEpoch: 'epoch-1' },
+    })).resolves.toEqual({ cancelled: true })
     expect(activeTurn).toHaveBeenCalledWith('s1')
-    expect(cancelTurn).toHaveBeenCalledWith({ sessionId: 's1', turnId: 't1' })
+    expect(cancelTurn).toHaveBeenCalledWith({ sessionId: 's1', turnId: 't1', runtimeEpoch: 'epoch-1' })
+  })
+
+  it('runtimeEpoch 不符时拒绝 stale-connection 且不调用原生取消', async () => {
+    const cancelTurn = vi.fn(async () => ({ cancelled: true }))
+    const adapter = createDshAdapter(surface({
+      activeTurn: async () => ({ turnId: 't1' }), cancelTurn,
+    }), options)
+    await expect(adapter.execute({
+      op: 'interrupt', target: { sessionId: 's1' }, args: { runtimeEpoch: 'epoch-old' },
+    })).rejects.toMatchObject({ name: 'PreCallRejection', code: 'stale-connection' })
+    expect(cancelTurn).not.toHaveBeenCalled()
   })
 
   it('显式 turnId 与当前回合不符时拒绝', async () => {
@@ -75,8 +101,9 @@ describe('dsh adapter', () => {
     const adapter = createDshAdapter(surface({
       activeTurn: async () => ({ turnId: 't2' }), cancelTurn,
     }), options)
-    await expect(adapter.execute({ op: 'interrupt', target: { sessionId: 's1' }, args: { turnId: 't1' } }))
-      .rejects.toThrow(/conflict/)
+    await expect(adapter.execute({
+      op: 'interrupt', target: { sessionId: 's1' }, args: { runtimeEpoch: 'epoch-1', turnId: 't1' },
+    })).rejects.toThrow(/conflict/)
     expect(cancelTurn).not.toHaveBeenCalled()
   })
 
@@ -145,6 +172,10 @@ describe('dsh adapter', () => {
     })
     expect(capability.tunables.find(t => t.id === 'reasoning')?.direction).toBe('tighten-only')
     expect(capability.tunables.every(t => !t.editable && t.reason !== undefined)).toBe(true)
+    expect(capability.tunables.map(t => t.reason)).toEqual([
+      'v0-field-only', 'v0-field-only', 'v0-tighten-only',
+      'v0-field-only', 'v0-field-only', 'host-config', 'host-config',
+    ])
   })
 
   it('snapshot 不发 cwd，并为每个会话发 capability.changed', async () => {

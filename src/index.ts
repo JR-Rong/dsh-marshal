@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { parseConfig, type MarshalConfig } from './config.ts'
 import type { Frame } from './wire/frames.ts'
-import { decodeFrame } from './wire/frames.ts'
+import { decodeFrame, type EventFrame } from './wire/frames.ts'
 import type { MarshalContext } from './dsh-types.ts'
 import { mountHubSocket, webServerPort } from './hub/server.ts'
 import { registerMarshalRoutes } from './hub/api.ts'
@@ -13,6 +13,7 @@ import { createDshAdapter } from './adapters/dsh/adapter.ts'
 import { NodeLink } from './node/link.ts'
 import { openJournal } from './node/journal.ts'
 import { createFollower, runCommand } from './node/runner.ts'
+import { createSeqAllocator, withPublicSeq } from './node/seq.ts'
 import { createQuestionRelay, type QuestionRelay } from './node/questions.ts'
 import { createAuditLog } from './node/audit.ts'
 import { createPrivacyProjector, type PrivacyProjector } from './node/privacy.ts'
@@ -116,9 +117,7 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
     const abort = new AbortController()
     snapshot = abort
     void (async () => {
-      for (const event of await adapter.snapshot(abort.signal)) {
-        for (const projected of projector.event(event)) link.sendEvent(projected)
-      }
+      for (const event of await adapter.snapshot(abort.signal)) emitProjected(event)
       // 分页没有终止证据时只报告“不完整”，T06 的同步必须据此标记而不是当全量。
       if (adapter.snapshotCompleteness === 'unconfirmed') {
         ctx.logger.warn('marshal: snapshot incomplete: pagination unconfirmed')
@@ -127,6 +126,15 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
       // 主动取消导致的失败不是故障，不写日志；日志只留错误类型。
       if (!abort.signal.aborted) ctx.logger.warn('marshal: snapshot failed: ' + errorName(error))
     })
+  }
+
+  // 公开 seq 只在投影/过滤之后分配；适配器预分配的序号在出站前被覆盖。
+  const publicSeq = createSeqAllocator()
+  const emitProjected = (event: EventFrame): void => {
+    for (const projected of projector.event(event)) link.sendEvent(withPublicSeq(publicSeq, projected))
+  }
+  const emitVolatileProjected = (event: EventFrame): void => {
+    link.sendVolatileEvent(withPublicSeq(publicSeq, event))
   }
 
   const link = new NodeLink({
@@ -165,7 +173,8 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
         projector: liveProjector,
         runtimeEpoch: nodeEpoch,
         // 卡片/通知是交互帧：只走 volatile 出口，断线即丢，绝不进入离线队列。
-        send: event => link.sendVolatileEvent(event),
+        // 序号在投影之后统一分配，卡片 payload 已投影，这里只补公开 seq。
+        send: event => emitVolatileProjected(event),
         frame: adapter.frame,
         // 当前协商授权；卡片创建、answer/cancel 结算与每次 hello.ack 都按它复核。
         authorization: () => {
@@ -182,9 +191,7 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
       })
   const follower = createFollower({
     adapter,
-    send: event => {
-      for (const projected of projector.event(event)) link.sendEvent(projected)
-    },
+    send: event => emitProjected(event),
     logger: ctx.logger,
   })
 

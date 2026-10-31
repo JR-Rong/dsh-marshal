@@ -79,7 +79,7 @@ describe('capability projection', () => {
     const projected = projector().event(event('capability.changed', {
       tunables: [{
         id: 'model', scope: 'next-turn', effect: 'immediate', editable: false,
-        reason: 'v0 只认出字段', current: SENTINEL,
+        reason: 'v0-field-only', current: SENTINEL,
         values: [{ id: 'opus', label: SENTINEL }],
       }],
       unavailable,
@@ -89,11 +89,31 @@ describe('capability projection', () => {
       unavailable: Record<string, string>
     }
     expect(payload.tunables[0]).toEqual({
-      id: 'model', scope: 'next-turn', effect: 'immediate', editable: false, reason: 'v0 只认出字段',
+      id: 'model', scope: 'next-turn', effect: 'immediate', editable: false, reason: 'v0-field-only',
     })
     expect(Object.keys(payload.unavailable)).toHaveLength(16)
     expect(payload.unavailable['observe.history']).toBe('history-unavailable')
     expect(JSON.stringify(projected)).not.toContain(SENTINEL)
+  })
+
+  it('未知枚举与自由文本一律丢弃，不把陌生值当能力', () => {
+    const projected = projector().event(event('capability.changed', {
+      toolDetail: 'full-transcript',
+      promptFidelity: 'best-effort',
+      operations: ['prompt', 'teleport'],
+      tunables: [
+        { id: 'shell', scope: 'next-turn', effect: 'immediate' },
+        { id: 'model', scope: 'forever', effect: 'immediate', direction: 'widen', reason: 'free text reason' },
+        { id: 'reasoning', scope: 'next-turn', effect: 'immediate', direction: 'tighten-only', reason: 'host-config' },
+      ],
+    }))
+    expect(projected[0]?.payload).toEqual({
+      operations: ['prompt'],
+      tunables: [
+        { id: 'model', effect: 'immediate' },
+        { id: 'reasoning', scope: 'next-turn', effect: 'immediate', direction: 'tighten-only', reason: 'host-config' },
+      ],
+    })
   })
 
   it('内容档也不把 capability 当正文通道', () => {

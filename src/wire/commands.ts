@@ -14,15 +14,9 @@ const ObserveHistorySchema = z.object({
 const ObserveFollowSchema = z.object({
   kind: z.literal('follow'),
   action: z.enum(['subscribe', 'unsubscribe']),
-  subscriptionId: z.string().min(1).optional(),
-}).strict().superRefine((value, ctx) => {
-  if (value.action === 'subscribe' && value.subscriptionId !== undefined) {
-    ctx.addIssue({ code: 'custom', message: 'subscribe must not carry subscriptionId', path: ['subscriptionId'] })
-  }
-  if (value.action === 'unsubscribe' && value.subscriptionId === undefined) {
-    ctx.addIssue({ code: 'custom', message: 'unsubscribe requires subscriptionId', path: ['subscriptionId'] })
-  }
-})
+  // 订阅身份由 hub 签发；subscribe 与 unsubscribe 都必须携带同一个不透明 id。
+  subscriptionId: z.string().min(1).max(128),
+}).strict()
 
 const ObserveArgsSchema = z.discriminatedUnion('kind', [ObserveHistorySchema, ObserveFollowSchema])
 
@@ -32,6 +26,8 @@ const PromptArgsSchema = z.object({
 }).strict()
 
 const InterruptArgsSchema = z.object({
+  // 只有当前 runtime 才能安全打断；epoch 不符由适配器拒绝为 stale-connection。
+  runtimeEpoch: z.string().min(1),
   turnId: z.string().min(1).optional(),
 }).strict()
 
@@ -42,7 +38,8 @@ const AnswerArgsSchema = z.object({
 }).strict()
 
 const CancelArgsSchema = z.object({
-  requestId: z.string().min(1).optional(),
+  // cancel 只放弃一个已知待答请求，不允许退化成会话级取消。
+  requestId: z.string().min(1),
 }).strict()
 
 const ConfigureArgsSchema = z.object({

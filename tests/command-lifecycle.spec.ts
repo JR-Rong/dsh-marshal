@@ -251,7 +251,7 @@ describe('node command lifecycle', () => {
     const { journal } = setup()
     const h = harness()
     runCommand(h.link, h.adapter, h.follower, command({
-      key: 'observe', op: 'observe', args: { kind: 'follow', action: 'subscribe' },
+      key: 'observe', op: 'observe', args: { kind: 'follow', action: 'subscribe', subscriptionId: 'sub-1' },
     }), 'mac', journal)
     await flush()
     expect(journal.size).toBe(0)

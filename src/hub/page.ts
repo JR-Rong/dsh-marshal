@@ -43,12 +43,72 @@ const log = document.getElementById('log');
 const devicesRoot = document.getElementById('devices');
 const status = document.getElementById('status');
 
+// 每个 tab 是自己的 sessionStorage：订阅 id 按会话保存在本 tab，
+// 另一个 tab 看不到也取消不了。id 由 hub 在 subscribe 响应中签发。
+const SUB_PREFIX = 'marshal-sub:';
+function subKey(target) {
+  return SUB_PREFIX + JSON.stringify([target.deviceId, target.agent, target.sessionId]);
+}
+function storeSubscription(target, id) {
+  if (typeof id === 'string' && id !== '') sessionStorage.setItem(subKey(target), id);
+}
+
 // 非安全上下文（局域网 http）没有 crypto.randomUUID，退化成时间戳+随机串。
 const newKey = () => (globalThis.crypto && typeof crypto.randomUUID === 'function')
   ? crypto.randomUUID()
   : Date.now().toString(36) + Math.random().toString(36).slice(2);
 
 function append(node) { log.append(node); log.scrollTop = log.scrollHeight; }
+
+function parseSubKey(key) {
+  try {
+    const value = JSON.parse(key.slice(SUB_PREFIX.length));
+    if (!Array.isArray(value) || value.length !== 3) return null;
+    if (typeof value[0] !== 'string' || typeof value[1] !== 'string' || typeof value[2] !== 'string') return null;
+    return { deviceId: value[0], agent: value[1], sessionId: value[2] };
+  } catch { return null; }
+}
+
+// 只取消本 tab 持有的 id；未知/别人的 id 由节点拒绝。
+async function releaseSubscription(target) {
+  if (target === null) return;
+  const key = subKey(target);
+  const subscriptionId = sessionStorage.getItem(key);
+  sessionStorage.removeItem(key);
+  if (typeof subscriptionId !== 'string' || subscriptionId === '') return;
+  await command('observe',
+    { kind: 'follow', action: 'unsubscribe', subscriptionId },
+    target);
+}
+
+// 卸载/断开时清掉本 tab 的全部订阅；keepalive 让请求在页面消失后仍尽量送达。
+function releaseAll() {
+  const keys = [];
+  for (let index = 0; index < sessionStorage.length; index += 1) {
+    const key = sessionStorage.key(index);
+    if (key !== null && key.indexOf(SUB_PREFIX) === 0) keys.push(key);
+  }
+  for (const key of keys) {
+    const target = parseSubKey(key);
+    const subscriptionId = sessionStorage.getItem(key);
+    sessionStorage.removeItem(key);
+    if (target === null || typeof subscriptionId !== 'string' || subscriptionId === '') continue;
+    try {
+      void fetch(api('/marshal/api/command'), {
+        method: 'POST',
+        keepalive: true,
+        headers: headers({ 'content-type': 'application/json' }),
+        body: JSON.stringify({
+          op: 'observe',
+          target,
+          args: { kind: 'follow', action: 'unsubscribe', subscriptionId },
+          idempotencyKey: newKey(),
+        }),
+      });
+    } catch { /* 页面正在卸载，失败也无法补救 */ }
+  }
+}
+window.addEventListener('pagehide', releaseAll);
 
 function dot(running) {
   const span = document.createElement('span');
@@ -89,10 +149,12 @@ async function refresh() {
 }
 
 async function loadSessions(device, agent) {
-  // 换设备/agent 后旧选中不再属于当前列表，先作废，避免指令发到上一个会话。
+  // 换设备/agent 后旧选中不再属于当前列表，先作废并释放旧订阅，避免指令发到上一个会话。
   if (current !== null && (current.deviceId !== device || current.agent !== agent)) {
+    const previous = current;
     current = null;
     status.textContent = '';
+    await releaseSubscription(previous);
   }
   let data = null;
   try {
@@ -113,11 +175,17 @@ async function loadSessions(device, agent) {
       if (current !== null && current.deviceId === device && current.agent === agent && current.sessionId === session.sessionId) return;
       const target = { deviceId: device, agent, sessionId: session.sessionId };
       const previous = current;
+      // 先释放旧会话在本 tab 的订阅，再切目标；两个 tab 各持自己的 id。
+      if (previous !== null) await releaseSubscription(previous);
       // 先切目标再发 resume：跟随事件可能先于 HTTP 响应到达 SSE，晚切会永久丢掉开头几条。
       current = target;
-      const ok = await command('observe', { kind: 'follow', action: 'subscribe' }, target);
+      const body = await command('observe', { kind: 'follow', action: 'subscribe' }, target);
       // 只回滚仍然指向这次目标的状态：期间用户已选别的会话时不能把旧目标恢复回来。
-      if (!ok) { if (current === target) current = previous; return; }
+      if (body === null) { if (current === target) current = previous; return; }
+      const result = body.result;
+      if (result && typeof result.subscriptionId === 'string') {
+        storeSubscription(target, result.subscriptionId);
+      }
       status.textContent = '';
       for (const other of log.querySelectorAll('.row')) other.classList.remove('active');
       row.classList.add('active');
@@ -126,10 +194,11 @@ async function loadSessions(device, agent) {
   }
 }
 
-// 失败统一写进 #status 并返回 false，调用方据此决定是否更新本地状态。
+// 失败统一写进 #status 并返回 null，调用方据此决定是否更新本地状态；
+// 成功返回响应体（含 result，例如 subscribe 签发的 subscriptionId）。
 async function command(op, args, target, idempotencyKey) {
   const to = target || current;
-  if (to === null) { status.textContent = '失败：请先选择会话'; return false; }
+  if (to === null) { status.textContent = '失败：请先选择会话'; return null; }
   let response;
   try {
     response = await fetch(api('/marshal/api/command'), {
@@ -139,7 +208,7 @@ async function command(op, args, target, idempotencyKey) {
     });
   } catch {
     status.textContent = '失败：网络错误';
-    return false;
+    return null;
   }
   if (!response.ok) {
     let message = 'HTTP ' + response.status;
@@ -148,9 +217,9 @@ async function command(op, args, target, idempotencyKey) {
       if (body && typeof body.message === 'string' && body.message) message = body.message;
     } catch { /* 非 JSON 错误体就用状态码 */ }
     status.textContent = '失败：' + message;
-    return false;
+    return null;
   }
-  return true;
+  try { return await response.json(); } catch { return { ok: true }; }
 }
 
 const stream = new EventSource(api('/marshal/api/stream'));
@@ -213,8 +282,8 @@ stream.onmessage = (message) => {
       const answers = ids.map(id => ({ id, selected: [...(selections.get(id) || [])] }));
       for (const button of allButtons) button.disabled = true;
       if (submit !== null) submit.disabled = true;
-      const ok = await command('answer', { requestId: payload.requestId, answers }, target);
-      if (!ok) {
+      const body = await command('answer', { requestId: payload.requestId, answers }, target);
+      if (body === null) {
         // 失败时清空选择、恢复按钮，卡片留着让用户重试；错误已由 command 写进 #status。
         busy = false;
         selections.clear();

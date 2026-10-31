@@ -42,6 +42,26 @@ const CAPABILITY_OPERATIONS: ReadonlySet<string> = new Set([
 const CAPABILITY_OWNERSHIP: ReadonlySet<string> = new Set([
   'ours', 'foreign-unknown', 'foreign-running', 'unverified',
 ])
+const CAPABILITY_TOOL_DETAIL: ReadonlySet<string> = new Set(['args+output', 'args', 'none'])
+const CAPABILITY_PROMPT_FIDELITY: ReadonlySet<string> = new Set(['native', 'relay', 'dom', 'none'])
+const CAPABILITY_FOLLOW: ReadonlySet<string> = new Set(['stream', 'poll', 'none'])
+const CAPABILITY_TUNABLE_IDS: ReadonlySet<string> = new Set([
+  'model', 'reasoning', 'permission', 'plan', 'goal', 'skill', 'plugin',
+])
+const CAPABILITY_TUNABLE_SCOPES: ReadonlySet<string> = new Set(['next-turn', 'next-session', 'host'])
+const CAPABILITY_TUNABLE_EFFECTS: ReadonlySet<string> = new Set(['immediate', 'needs-restart', 'next-session'])
+const CAPABILITY_TUNABLE_DIRECTIONS: ReadonlySet<string> = new Set(['tighten-only'])
+/** tunable 的 reason 只能是稳定原因码，不能是自由文本。 */
+const CAPABILITY_REASON_CODES: ReadonlySet<string> = new Set([
+  'history-unavailable',
+  'not-exposed-in-v0',
+  'read-only-in-v0',
+  'unverified-in-v0',
+  'no-atomic-turn-binding',
+  'v0-field-only',
+  'v0-tighten-only',
+  'host-config',
+])
 
 const TURN_STATES = new Set(['running', 'completed', 'failed', 'interrupted'])
 const TOOL_STATES = new Set(['running', 'completed', 'failed', 'interrupted', 'error', 'ok', 'cancelled'])
@@ -465,22 +485,24 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
       const history = safeBool(observe.history)
       if (history !== undefined) projected.history = history
       const follow = safeString(observe.follow, 16)
-      if (follow === 'stream' || follow === 'poll' || follow === 'none') projected.follow = follow
+      if (follow !== undefined && CAPABILITY_FOLLOW.has(follow)) projected.follow = follow
       // 未知 follow 值连字段都不发，避免页面把陌生枚举当能力。
       if (Object.keys(projected).length > 0) out.observe = projected
     }
     if (Array.isArray(payload.operations)) {
       out.operations = [...new Set(payload.operations
         .filter((item): item is string => typeof item === 'string' && CAPABILITY_OPERATIONS.has(item)))]
-        .slice(0, 32).map(item => scrub(item).text)
+        .slice(0, 32)
     }
     const ownership = safeString(payload.ownership, 32)
     if (ownership !== undefined && CAPABILITY_OWNERSHIP.has(ownership)) {
-      out.ownership = scrub(ownership).text
+      out.ownership = ownership
     }
-    for (const key of ['toolDetail', 'promptFidelity'] as const) {
-      const value = safeString(payload[key], 32)
-      if (value !== undefined) out[key] = scrub(value).text
+    const toolDetail = safeString(payload.toolDetail, 32)
+    if (toolDetail !== undefined && CAPABILITY_TOOL_DETAIL.has(toolDetail)) out.toolDetail = toolDetail
+    const promptFidelity = safeString(payload.promptFidelity, 32)
+    if (promptFidelity !== undefined && CAPABILITY_PROMPT_FIDELITY.has(promptFidelity)) {
+      out.promptFidelity = promptFidelity
     }
     const reasoning = safeBool(payload.reasoning)
     if (reasoning !== undefined) out.reasoning = reasoning
@@ -489,21 +511,25 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
       if (value !== undefined) out[key] = value
     }
     if (Array.isArray(payload.tunables)) {
-      // 只留标识与可编辑性；current/values/pending 等设置对象一律丢弃。
+      // 只留固定枚举内的标识与可编辑性；current/values/pending 等设置对象一律丢弃。
       out.tunables = payload.tunables.slice(0, 16).flatMap(item => {
         const tunable = asRecord(item)
         if (tunable === undefined) return []
         const id = safeString(tunable.id, 32)
-        if (id === undefined) return []
-        const entry: Record<string, unknown> = { id: scrub(id).text }
-        for (const key of ['scope', 'effect', 'direction'] as const) {
-          const value = safeString(tunable[key], 32)
-          if (value !== undefined) entry[key] = scrub(value).text
+        if (id === undefined || !CAPABILITY_TUNABLE_IDS.has(id)) return []
+        const entry: Record<string, unknown> = { id }
+        const scope = safeString(tunable.scope, 32)
+        if (scope !== undefined && CAPABILITY_TUNABLE_SCOPES.has(scope)) entry.scope = scope
+        const effect = safeString(tunable.effect, 32)
+        if (effect !== undefined && CAPABILITY_TUNABLE_EFFECTS.has(effect)) entry.effect = effect
+        const direction = safeString(tunable.direction, 32)
+        if (direction !== undefined && CAPABILITY_TUNABLE_DIRECTIONS.has(direction)) {
+          entry.direction = direction
         }
         const editable = safeBool(tunable.editable)
         if (editable !== undefined) entry.editable = editable
-        const reason = safeText(tunable.reason, 200)
-        if (reason !== undefined) entry.reason = reason
+        const reason = safeString(tunable.reason, 64)
+        if (reason !== undefined && CAPABILITY_REASON_CODES.has(reason)) entry.reason = reason
         return [entry]
       })
     }

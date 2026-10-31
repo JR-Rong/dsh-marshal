@@ -1,8 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { createDshAdapter } from '../src/adapters/dsh/adapter.ts'
-import {
-  NativeWriterBusyError, createDshSurface, type DshSurfaceOptions,
-} from '../src/adapters/dsh/surface.ts'
+import { createDshSurface, type DshSurfaceOptions } from '../src/adapters/dsh/surface.ts'
 import { createFollower } from '../src/node/runner.ts'
 import type { Adapter } from '../src/adapters/types.ts'
 import type { SessionControllerLike, SessionSummaryLike } from '../src/dsh-types.ts'
@@ -47,22 +45,32 @@ describe('dsh surface: paged list', () => {
     expect(raw.requests).toEqual([{}, { cursor: 'c1' }, { cursor: 'c2' }])
   })
 
-  it('终止页是满页且没有 cursor 时报完整性不可确认', async () => {
+  it('终止页没有 cursor 就是完整，即使页更短', async () => {
+    const raw = controller([
+      { items: [summary('s1'), summary('s2')], nextCursor: 'c1' },
+      { items: [summary('s3')] },
+    ])
+    const result = await surfaceOf(raw).list(new AbortController().signal)
+    expect(result.items.map(item => item.sessionId)).toEqual(['s1', 's2', 's3'])
+    expect(result.completeness).toBe('complete')
+  })
+
+  it('终止页是满页但没有 cursor 时仍算完整（页大小不是证据）', async () => {
     const fullPage = Array.from({ length: 20 }, (_, index) => summary(`s${index}`))
     const raw = controller([{ items: fullPage }])
     const result = await surfaceOf(raw).list(new AbortController().signal)
     expect(result.items).toHaveLength(20)
-    expect(result.completeness).toBe('unconfirmed')
+    expect(result.completeness).toBe('complete')
   })
 
-  it('终止页与已观测最大页同宽时报不完整，跨页重复 id 只保留一条', async () => {
+  it('跨页重复 id 只保留一条，终止页缺 cursor 即完整', async () => {
     const raw = controller([
       { items: [summary('s1'), summary('s2')], nextCursor: 'c1' },
       { items: [summary('s2'), summary('s3')] },
     ])
-    const result = await surfaceOf(raw, { pageSizeFloor: 2 }).list(new AbortController().signal)
+    const result = await surfaceOf(raw).list(new AbortController().signal)
     expect(result.items.map(item => item.sessionId)).toEqual(['s1', 's2', 's3'])
-    expect(result.completeness).toBe('unconfirmed')
+    expect(result.completeness).toBe('complete')
   })
 
   it('页数上限触发时停止并报不完整', async () => {
@@ -94,6 +102,18 @@ describe('dsh surface: paged list', () => {
     expect(raw.requests).toHaveLength(2)
   })
 
+  it('遍历中途取消时只报不完整，不把半份清单当全量', async () => {
+    const raw = controller([])
+    const abort = new AbortController()
+    raw.list.mockImplementation(async () => {
+      abort.abort()
+      return { items: [summary('s1')], nextCursor: 'c1' }
+    })
+    const result = await surfaceOf(raw).list(abort.signal)
+    expect(result.items.map(item => item.sessionId)).toEqual(['s1'])
+    expect(result.completeness).toBe('unconfirmed')
+  })
+
   it('已取消的 signal 不会发起任何原生调用', async () => {
     const raw = controller([{ items: [summary('s1')] }])
     const abort = new AbortController()
@@ -116,16 +136,9 @@ describe('dsh surface: prompt and turn binding', () => {
     expect('mode' in sent).toBe(false)
   })
 
-  it('结构化忙拒绝映射为 NativeWriterBusyError', async () => {
+  it('prompt 原生异常原样上抛，surface 不自行分类', async () => {
     const raw = controller([])
-    raw.prompt.mockRejectedValueOnce({ code: 'writer-busy' })
-    await expect(surfaceOf(raw).prompt({ sessionId: 's1', text: 'x', requestId: 'r1' }))
-      .rejects.toBeInstanceOf(NativeWriterBusyError)
-  })
-
-  it('没有结构码的异常不按忙处理', async () => {
-    const raw = controller([])
-    const native = new Error('session is busy')
+    const native = Object.assign(new Error('busy'), { code: 'writer-busy' })
     raw.prompt.mockRejectedValueOnce(native)
     await expect(surfaceOf(raw).prompt({ sessionId: 's1', text: 'x', requestId: 'r1' }))
       .rejects.toBe(native)
@@ -140,15 +153,18 @@ describe('dsh surface: prompt and turn binding', () => {
     expect('cancel' in surface).toBe(false)
   })
 
-  it('控制器提供回合绑定时原样透传', async () => {
+  it('控制器提供回合绑定时原样透传 runtimeEpoch', async () => {
     const raw = controller([])
+    const cancelTurn = vi.fn(async () => ({ cancelled: true }))
     Object.assign(raw, {
       activeTurn: vi.fn(async () => ({ turnId: 't1' })),
-      cancelTurn: vi.fn(async () => ({ cancelled: true })),
+      cancelTurn,
     })
     const surface = surfaceOf(raw)
     await expect(surface.activeTurn?.('s1')).resolves.toEqual({ turnId: 't1' })
-    await expect(surface.cancelTurn?.({ sessionId: 's1', turnId: 't1' })).resolves.toEqual({ cancelled: true })
+    await expect(surface.cancelTurn?.({ sessionId: 's1', turnId: 't1', runtimeEpoch: 'e' }))
+      .resolves.toEqual({ cancelled: true })
+    expect(cancelTurn).toHaveBeenCalledWith({ sessionId: 's1', turnId: 't1', runtimeEpoch: 'e' })
   })
 })
 
@@ -172,57 +188,54 @@ describe('dsh surface: refcounted subscriptions', () => {
     return { follower, starts: () => starts, aborts: () => aborts }
   }
   const flush = (): Promise<void> => new Promise(resolve => setTimeout(resolve, 0))
+  const caller = 'op\u0000conn-1'
 
-  it('同一观察者重复订阅拿到同一个 id，只启动一条原生跟随', async () => {
+  it('同一 id 同调用者重复订阅是幂等的，只启动一条原生跟随', async () => {
     const h = harness()
-    const first = h.follower.subscribe('s1', 'op\u0000conn-1')
-    const second = h.follower.subscribe('s1', 'op\u0000conn-1')
+    expect(h.follower.subscribe('s1', 'sub-a', caller)).toBe('ok')
+    expect(h.follower.subscribe('s1', 'sub-a', caller)).toBe('ok')
     await flush()
-    expect(second).toBe(first)
     expect(h.starts()).toBe(1)
   })
 
-  it('不同观察者各自持有 id，最后一个退出才释放原生跟随', async () => {
+  it('两个 tab 用不同 id 订阅，互不取消，最后一个退出才释放原生跟随', async () => {
     const h = harness()
-    const a = h.follower.subscribe('s1', 'op\u0000conn-1')
-    const b = h.follower.subscribe('s1', 'op\u0000conn-2')
+    expect(h.follower.subscribe('s1', 'sub-a', caller)).toBe('ok')
+    expect(h.follower.subscribe('s1', 'sub-b', caller)).toBe('ok')
     await flush()
-    expect(b).not.toBe(a)
     expect(h.starts()).toBe(1)
 
-    expect(h.follower.unsubscribe('s1', 'op\u0000conn-1', a)).toBe(true)
+    expect(h.follower.unsubscribe('s1', 'sub-a', caller)).toBe(true)
     await flush()
     expect(h.aborts()).toBe(0)
-    expect(h.follower.subscriptionOf('s1', 'op\u0000conn-2')).toBe(b)
 
-    expect(h.follower.unsubscribe('s1', 'op\u0000conn-2', b)).toBe(true)
+    expect(h.follower.unsubscribe('s1', 'sub-b', caller)).toBe(true)
     await flush()
     expect(h.aborts()).toBe(1)
     expect(h.follower.has('s1')).toBe(false)
   })
 
-  it('错误 id 或未持有引用的取消被拒绝', async () => {
+  it('不同调用者复用已有 id 是 conflict，未知 id 的取消被拒绝', async () => {
     const h = harness()
-    h.follower.subscribe('s1', 'op\u0000conn-1')
+    expect(h.follower.subscribe('s1', 'sub-a', caller)).toBe('ok')
+    expect(h.follower.subscribe('s1', 'sub-a', 'op\u0000conn-2')).toBe('conflict')
     await flush()
-    expect(h.follower.unsubscribe('s1', 'op\u0000conn-1', 'forged')).toBe(false)
-    expect(h.follower.unsubscribe('s1', 'op\u0000conn-2', 'forged')).toBe(false)
+    expect(h.follower.unsubscribe('s1', 'forged', caller)).toBe(false)
     expect(h.follower.has('s1')).toBe(true)
   })
 
-  it('断线只清该连接的引用，卸载清空全部', async () => {
+  it('断线只清该调用者的 id，卸载清空全部', async () => {
     const h = harness()
-    h.follower.subscribe('s1', 'op\u0000conn-1')
-    h.follower.subscribe('s2', 'op\u0000conn-1')
-    h.follower.subscribe('s1', 'op\u0000conn-2')
+    h.follower.subscribe('s1', 'sub-a', caller)
+    h.follower.subscribe('s2', 'sub-b', caller)
+    h.follower.subscribe('s1', 'sub-c', 'op\u0000conn-2')
     await flush()
     expect(h.starts()).toBe(2)
 
-    h.follower.unsubscribeObserver('op\u0000conn-1')
+    h.follower.unsubscribeCaller(caller)
     await flush()
     expect(h.follower.has('s1')).toBe(true)
     expect(h.follower.has('s2')).toBe(false)
-    expect(h.follower.subscriptionOf('s1', 'op\u0000conn-2')).toBeDefined()
 
     h.follower.stopAll()
     await flush()
@@ -238,5 +251,26 @@ describe('dsh adapter: list verification', () => {
     const adapter = createDshAdapter(surface, { deviceId: 'mac', nodeEpoch: 'e' })
     await expect(adapter.execute({ op: 'prompt', target: { sessionId: 'ghost' }, args: { text: 'x' } }))
       .rejects.toThrow('marshal: session-unknown: session-unknown')
+  })
+
+  it('清单里 running=true 时在调用前拒绝 writer-busy', async () => {
+    const running = { ...summary('s1'), running: true }
+    const raw = controller([{ items: [running] }])
+    const surface = surfaceOf(raw)
+    const adapter = createDshAdapter(surface, { deviceId: 'mac', nodeEpoch: 'e' })
+    await expect(adapter.execute({ op: 'prompt', target: { sessionId: 's1' }, args: { text: 'x' } }))
+      .rejects.toMatchObject({ name: 'PreCallRejection', code: 'writer-busy' })
+    expect(raw.prompt).not.toHaveBeenCalled()
+  })
+
+  it('清单不完整且没找到会话时不预判 session-unknown，交给原生', async () => {
+    const raw = controller([])
+    raw.list.mockResolvedValue({ items: [], nextCursor: 'c1' })
+    const surface = createDshSurface(raw as unknown as SessionControllerLike, { maxPages: 1 })
+    // maxPages=1 且还有 cursor ⇒ 完整性不可确认。
+    const adapter = createDshAdapter(surface, { deviceId: 'mac', nodeEpoch: 'e' })
+    await expect(adapter.execute({ op: 'prompt', target: { sessionId: 'maybe' }, args: { text: 'x' } }))
+      .resolves.toEqual({ accepted: true })
+    expect(raw.prompt).toHaveBeenCalled()
   })
 })
