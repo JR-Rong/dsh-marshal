@@ -123,6 +123,60 @@ describe('SettingsReadback 关联确认', () => {
   })
 })
 
+describe('SettingsReadback goal 归一化', () => {
+  it('goal clear 请求 null、确认 false 视为一致', async () => {
+    const { readback } = setup({ revision: 3, goal: true })
+    const handle = readback.begin('r1', 'goal', null)
+
+    // 请求值在 begin 时就归一化为存在性，不能保留 null。
+    expect(readback.snapshot().pending?.requested).toBe(false)
+    expect(readback.confirm({ requestId: 'r1', field: 'goal', value: false }))
+      .toBe('confirmed')
+
+    const snapshot = readback.snapshot()
+    expect(snapshot.current).toEqual({ revision: 4, goal: false })
+    await expect(handle.outcome).resolves.toEqual({ status: 'confirmed', revision: 4 })
+  })
+
+  it('goal set 请求对象、确认 true 视为一致，且快照不泄露 objective', async () => {
+    const { readback } = setup({ revision: 3 })
+    const handle = readback.begin('r1', 'goal', { objective: 'x' })
+
+    expect(readback.snapshot().pending?.requested).toBe(true)
+    expect(readback.confirm({ requestId: 'r1', field: 'goal', value: true }))
+      .toBe('confirmed')
+
+    const snapshot = readback.snapshot()
+    expect(snapshot.current).toEqual({ revision: 4, goal: true })
+    expect(JSON.stringify(snapshot)).not.toContain('objective')
+    await expect(handle.outcome).resolves.toEqual({ status: 'confirmed', revision: 4 })
+  })
+})
+
+describe('SettingsReadback matches 覆盖', () => {
+  it('matches:true 覆盖深比较（目录顺序不同），只发布实际值', async () => {
+    const { readback } = setup({ revision: 2 })
+    const handle = readback.begin('r1', 'permission', { additionalDirectories: ['src', 'docs'] })
+    const actual: PermissionScope = { additionalDirectories: ['docs', 'src'] }
+
+    expect(readback.confirm({ requestId: 'r1', field: 'permission', value: actual, matches: true }))
+      .toBe('confirmed')
+    expect(readback.snapshot().current).toEqual({ revision: 3, permission: actual })
+    await expect(handle.outcome).resolves.toEqual({ status: 'confirmed', revision: 3 })
+  })
+
+  it('matches:false 即使值相等也判 mismatch，current 仍是实际值', async () => {
+    const { readback } = setup({ revision: 2, model: 'large' })
+    const handle = readback.begin('r1', 'model', 'small')
+
+    expect(readback.confirm({ requestId: 'r1', field: 'model', value: 'small', matches: false }))
+      .toBe('mismatch')
+    expect(readback.snapshot().current).toEqual({ revision: 3, model: 'small' })
+    await expect(handle.outcome).resolves
+      .toEqual({ status: 'confirmed', revision: 3, code: 'readback-mismatch' })
+  })
+})
+
 describe('SettingsReadback 超时与迟到确认', () => {
   it('超时保留旧 current 与 timeout pending，迟到确认在无新 revision 时更新', async () => {
     const { timers, readback } = setup({ revision: 4, model: 'large' })
@@ -139,7 +193,7 @@ describe('SettingsReadback 超时与迟到确认', () => {
       requestId: 'r1',
       field: 'model',
       requested: 'small',
-      baseRevision: 4,
+      baseFieldRevision: -1,
       status: 'readback-timeout',
     })
 
@@ -150,22 +204,57 @@ describe('SettingsReadback 超时与迟到确认', () => {
     expect(late.pending?.status).toBe('confirmed')
   })
 
-  it('已有更新 revision 时迟到旧值被完全忽略', async () => {
+  it('其他字段推进全局 revision 时，迟到确认仍被采用', async () => {
     const { timers, readback } = setup({ revision: 4, model: 'large' })
     const handle = readback.begin('r1', 'model', 'small')
     timers.fire()
     await expect(handle.outcome).resolves
       .toEqual({ status: 'pending-confirmation', code: 'readback-timeout', revision: 4 })
 
-    // 新确认把 revision 推高后，旧请求的迟到值不能覆盖它。
+    // reasoning 的变化推进全局 revision，但 model 字段从未更新，旧请求仍然有效。
     expect(readback.observe({ field: 'reasoning', value: 'high' })).toBe(true)
     expect(readback.confirm({ requestId: 'r1', field: 'model', value: 'small' }))
-      .toBe('ignored')
+      .toBe('confirmed')
 
     const snapshot = readback.snapshot()
-    expect(snapshot.current).toEqual({ revision: 5, model: 'large', reasoning: 'high' })
-    expect(snapshot.pending?.status).toBe('readback-timeout')
+    expect(snapshot.current).toEqual({ revision: 6, model: 'small', reasoning: 'high' })
+    expect(snapshot.pending?.status).toBe('confirmed')
     expect(timers.activeCount).toBe(0)
+  })
+
+  it('同字段出现新值后，迟到的旧 goal 确认被忽略', async () => {
+    const { timers, readback } = setup({ revision: 4, goal: true })
+    const handle = readback.begin('r1', 'goal', null)
+    timers.fire()
+    await expect(handle.outcome).resolves
+      .toEqual({ status: 'pending-confirmation', code: 'readback-timeout', revision: 4 })
+
+    // goal 字段自身出现更新值（clear），推进 goal 的字段版本。
+    expect(readback.observe({ field: 'goal', value: false })).toBe(true)
+    expect(readback.snapshot().current).toEqual({ revision: 5, goal: false })
+
+    // 旧请求的迟到确认携带更早的 goal=true，不得覆盖更新的 false。
+    expect(readback.confirm({ requestId: 'r1', field: 'goal', value: true }))
+      .toBe('ignored')
+    const snapshot = readback.snapshot()
+    expect(snapshot.current).toEqual({ revision: 5, goal: false })
+    expect(snapshot.pending?.status).toBe('readback-timeout')
+  })
+
+  it('不同字段推进全局 revision 后，迟到的 goal 确认仍被采用', async () => {
+    const { timers, readback } = setup({ revision: 4 })
+    const handle = readback.begin('r1', 'goal', { objective: 'x' })
+    timers.fire()
+    await expect(handle.outcome).resolves
+      .toEqual({ status: 'pending-confirmation', code: 'readback-timeout', revision: 4 })
+
+    expect(readback.observe({ field: 'model', value: 'large' })).toBe(true)
+    expect(readback.snapshot().current.revision).toBe(5)
+
+    expect(readback.confirm({ requestId: 'r1', field: 'goal', value: true })).toBe('confirmed')
+    const snapshot = readback.snapshot()
+    expect(snapshot.current).toEqual({ revision: 6, model: 'large', goal: true })
+    expect(snapshot.pending?.status).toBe('confirmed')
   })
 })
 

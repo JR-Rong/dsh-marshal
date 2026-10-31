@@ -8,9 +8,9 @@ import { nextSettingsRevision } from './policy.ts'
  * pending 记录，current 只能由关联确认或长期原生通知更新。所有时钟与定时器
  * 都可注入，测试不用真实等待 10 秒。
  *
- * 不发起原生调用、不重试、不回滚：超时只移除 waiter，迟到确认只在没有更新
- * revision 时采用，避免旧值覆盖新确认值。settings-unsafe 是永久闩锁，恢复
- * 只能由源端人工完成。
+ * 不发起原生调用、不重试、不回滚：超时只移除 waiter，迟到确认只在该字段
+ * 没有更新值时采用，避免旧值覆盖同字段新确认值。settings-unsafe 是永久闩锁，
+ * 恢复只能由源端人工完成。
  */
 
 /** 契约 §9 的确认等待上限。 */
@@ -18,13 +18,14 @@ export const READBACK_TIMEOUT_MS = 10_000
 
 export type ReadbackPendingStatus = 'pending' | 'confirmed' | 'readback-timeout'
 
-/** 一次设置请求的待确认记录；requested 是请求值，不是已确认值。 */
+/** 一次设置请求的待确认记录；requested 是归一化后的请求值，不是已确认值。 */
 export interface PendingReadback {
   readonly requestId: string
   readonly field: SettingsField
   readonly requested: unknown
   readonly requestedAt: number
-  readonly baseRevision: number
+  /** begin 时该字段的版本；从未变化的字段为 -1。 */
+  readonly baseFieldRevision: number
   readonly status: ReadbackPendingStatus
 }
 
@@ -65,6 +66,11 @@ export interface ReadbackConfirmInput {
   readonly requestId: string
   readonly field: SettingsField
   readonly value: unknown
+  /**
+   * 适配器给出的等价判断（如 goal objective 相等、权限集合与目录顺序无关）。
+   * 只决定 confirmed/mismatch，绝不改变发布到 current 的归一化实际值。
+   */
+  readonly matches?: boolean
 }
 
 export interface ReadbackObserveInput {
@@ -165,6 +171,8 @@ export class SettingsReadback {
   private pending: PendingReadback | undefined
   private waiter: Waiter | undefined
   private timer: { readonly handle: unknown } | undefined
+  /** 每个字段最近一次真实变化的版本；缺失视为 -1。 */
+  private readonly fieldRevisions = new Map<SettingsField, number>()
   private unsafe = false
   private disposed = false
 
@@ -197,9 +205,10 @@ export class SettingsReadback {
     this.pending = {
       requestId,
       field,
-      requested,
+      // 请求值同样归一化，否则 goal clear(null) 与确认值 false 会被误判为 mismatch。
+      requested: normalizedValue(field, requested),
       requestedAt: this.now(),
-      baseRevision: this.current.revision,
+      baseFieldRevision: this.fieldRevision(field),
       status: 'pending',
     }
 
@@ -232,7 +241,7 @@ export class SettingsReadback {
       this.waiter = undefined
       this.applyConfirmed(input.field, input.value)
       this.pending = undefined
-      const mismatch = !deepEqual(input.value, pending.requested)
+      const mismatch = !this.matches(pending, input)
       // 先应用实际值再结算，保证 readback-mismatch 返回时 current 已是真实值。
       waiter?.resolve(mismatch
         ? { status: 'confirmed', revision: this.current.revision, code: 'readback-mismatch' }
@@ -241,13 +250,12 @@ export class SettingsReadback {
     }
 
     if (pending.status === 'readback-timeout') {
-      // 已有更新 revision 时，迟到旧值不得覆盖新确认值，也不能改动 pending。
-      if (this.current.revision !== pending.baseRevision) return 'ignored'
+      // 只有同字段已出现更新值时才丢弃迟到确认；其他字段推进 revision 不影响。
+      if (this.fieldRevision(input.field) > pending.baseFieldRevision) return 'ignored'
       this.applyConfirmed(input.field, input.value)
       this.pending = { ...pending, status: 'confirmed' }
-      const mismatch = !deepEqual(input.value, pending.requested)
       // outcome 已 resolved，不能再结算一次。
-      return mismatch ? 'mismatch' : 'confirmed'
+      return this.matches(pending, input) ? 'confirmed' : 'mismatch'
     }
 
     return 'ignored'
@@ -315,15 +323,23 @@ export class SettingsReadback {
   private applyConfirmed(field: SettingsField, rawValue: unknown): boolean {
     const value = normalizedValue(field, rawValue)
     if (deepEqual(confirmedField(this.current, field), value)) return false
-    const next = nextConfirmed(
-      this.current,
-      field,
-      value,
-      nextSettingsRevision(this.current.revision),
-    )
+    const revision = nextSettingsRevision(this.current.revision)
+    const next = nextConfirmed(this.current, field, value, revision)
     if (next === undefined) return false
     this.current = next
+    // 只有值真正变化才推进字段版本，供迟到确认判断是否已被同字段新值覆盖。
+    this.fieldRevisions.set(field, revision)
     return true
+  }
+
+  private fieldRevision(field: SettingsField): number {
+    return this.fieldRevisions.get(field) ?? -1
+  }
+
+  /** matches 覆盖只决定结论；current 始终只发布归一化实际值。 */
+  private matches(pending: PendingReadback, input: ReadbackConfirmInput): boolean {
+    if (input.matches !== undefined) return input.matches
+    return deepEqual(pending.requested, normalizedValue(input.field, input.value))
   }
 
   private clearTimer(): void {
