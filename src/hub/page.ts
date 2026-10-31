@@ -101,6 +101,7 @@ var devicesData = null;
 var currentCapability = null;
 var capabilityNotice = '';
 var acquirePending = false;
+var configuringField = null;
 var loadToken = 0;
 var selectionToken = 0;
 var db = null;
@@ -427,7 +428,9 @@ function applyWriteState() {
   var disabled = writeState !== 'ready';
   sendForm.querySelector('button').disabled = disabled;
   textInput.disabled = disabled;
-  if (disabled && writeReason) setStatus('写入已禁用：' + writeReason);
+  if (disabled && writeReason) { setStatus('写入已禁用：' + writeReason); return; }
+  // 只有之前那条“写入已禁用”提示可以清除；其它状态（错误/受理）不能被覆盖。
+  if (status.textContent && status.textContent.indexOf('写入已禁用：') === 0) setStatus('');
 }
 
 function deviceForCurrent() {
@@ -514,9 +517,9 @@ function renderCapability() {
     capabilityRoot.append(textNode('div', '设置修订：' + String(capability.settingsRevision)));
   }
   if (capability.pending && typeof capability.pending === 'object') {
-    var status = capability.pending.status;
-    var label = status === 'readback-timeout' ? '回读超时（未自动重试）'
-      : status === 'pending' ? '回读确认中' : '';
+    var pendingStatus = capability.pending.status;
+    var label = pendingStatus === 'readback-timeout' ? '回读超时（未自动重试）'
+      : pendingStatus === 'pending' ? '回读确认中' : '';
     if (label !== '') {
       var field = typeof capability.pending.field === 'string' ? capability.pending.field : '';
       capabilityRoot.append(textNode('div', '待回读：' + field + ' · ' + label, 'reason'));
@@ -607,6 +610,8 @@ function configureLabel(body) {
 }
 
 async function configureTunable(tunable, value, target) {
+  // 同一时间只允许一笔配置在途，避免双击产生两个不同幂等键的重复写。
+  if (configuringField !== null) return;
   if (target === null || current === null || sessionKey(current) !== sessionKey(target)) return;
   var capability = currentCapability;
   if (capability === null || typeof capability !== 'object'
@@ -622,24 +627,34 @@ async function configureTunable(tunable, value, target) {
     id: intentId(key, target, 'configure'), owner: origin + '|' + (session ? session.operatorId : ''),
     key: key, op: 'configure', target: target, status: 'pending', at: Date.now(),
   };
-  var stored = await persistIntent(intent);
-  if (!stored) { setStatus('持久存储不可用，拒绝发送'); return; }
-  var body = await command('configure', { expectedRevision: expectedRevision, field: tunable.id, value },
-    target, false, key);
-  if (body === null) {
-    await updateIntent(intent.id, { status: 'unknown' });
+  configuringField = tunable.id;
+  try {
+    var stored = await persistIntent(intent);
+    if (!stored) { setStatus('持久存储不可用，拒绝发送'); return; }
     if (current !== null && sessionKey(current) === sessionKey(target)) {
-      capabilityNotice = '配置 ' + tunable.id + '：未确认（结果未知，先查状态，不自动重发）';
+      // 明确提示“在途”，但绝不提前修改 current；超时也不自动重发。
+      capabilityNotice = '配置 ' + tunable.id + '：已发送，等待源端回读';
       renderCapability();
     }
-    return;
+    var body = await command('configure', { expectedRevision: expectedRevision, field: tunable.id, value },
+      target, false, key);
+    if (body === null) {
+      await updateIntent(intent.id, { status: 'unknown' });
+      if (current !== null && sessionKey(current) === sessionKey(target)) {
+        capabilityNotice = '配置 ' + tunable.id + '：未确认（结果未知，先查状态，不自动重发）';
+        renderCapability();
+      }
+      return;
+    }
+    await updateIntent(intent.id, { status: intentStatus(body) });
+    if (current === null || sessionKey(current) !== sessionKey(target)) return;
+    // 只显示受理/拒绝状态；current 永远等源端 capability.changed 回读。
+    capabilityNotice = '配置 ' + tunable.id + '：' + configureLabel(body);
+    renderCapability();
+    refreshCurrentCapability();
+  } finally {
+    configuringField = null;
   }
-  await updateIntent(intent.id, { status: intentStatus(body) });
-  if (current === null || sessionKey(current) !== sessionKey(target)) return;
-  // 只显示受理/拒绝状态；current 永远等源端 capability.changed 回读。
-  capabilityNotice = '配置 ' + tunable.id + '：' + configureLabel(body);
-  renderCapability();
-  refreshCurrentCapability();
 }
 
 async function acquireWrite() {
@@ -705,7 +720,15 @@ async function refreshCurrentCapability() {
 
 function applyCapabilityDocument(document) {
   if (current === null) return;
-  currentCapability = document && typeof document === 'object' && !Array.isArray(document) ? document : null;
+  var next = document && typeof document === 'object' && !Array.isArray(document) ? document : null;
+  if (next === null) return;
+  // 旧文档（readAt 更小）或重复投递不能覆盖更新的能力/清空在编辑的控件。
+  if (currentCapability !== null && typeof currentCapability === 'object'
+    && Number.isInteger(next.readAt) && Number.isInteger(currentCapability.readAt)
+    && next.readAt < currentCapability.readAt) return;
+  var changed = capabilityDigest(next) !== capabilityDigest(currentCapability);
+  currentCapability = next;
+  if (!changed) { evaluateCurrentWriteState(); return; }
   capabilityNotice = '';
   renderCapability();
   evaluateCurrentWriteState();
