@@ -8,6 +8,19 @@ import { PreCallRejection, type Adapter } from '../adapters/types.ts'
 import type { LoggerLike } from '../dsh-types.ts'
 import type { HandshakeBinding, NodeLink } from './link.ts'
 import { JournalError, type Journal, type JournalDomain, type JournalEntry, type SettledStatus } from './journal.ts'
+import { createPrivacyProjector, type PrivacyProjector } from './privacy.ts'
+import type { AuditSink } from './audit.ts'
+
+/** 命令出口的投影端口与审计：每次调用都现取，握手收紧后立即生效。 */
+export interface CommandRuntime {
+  projector(): PrivacyProjector
+  audit?: AuditSink
+}
+
+/** 日志只留错误类型：原始 message 可能夹带会话正文或密钥。 */
+function errorClass(error: unknown): string {
+  return error instanceof Error && error.name !== '' ? error.name : 'error'
+}
 
 /**
  * 每会话一条跟随循环；`observe` 指令只启动一次。
@@ -31,11 +44,11 @@ export function createFollower(options: {
             try {
               options.send(event)
             } catch (error) {
-              options.logger.warn('marshal: follow ' + sessionId + ' dropped event: ' + String(error))
+              options.logger.warn('marshal: follow ' + sessionId + ' dropped event: ' + errorClass(error))
             }
           }
         } catch (error) {
-          if (!abort.signal.aborted) options.logger.warn('marshal: follow ' + sessionId + ' ended: ' + String(error))
+          if (!abort.signal.aborted) options.logger.warn('marshal: follow ' + sessionId + ' ended: ' + errorClass(error))
         } finally {
           // 只清掉本循环自己登记的条目，避免把重启后的新循环踢出 map。
           if (active.get(sessionId)?.abort === abort) active.delete(sessionId)
@@ -102,14 +115,20 @@ function runStatusQuery(
   journal: Journal,
   frame: Extract<Frame, { type: 'command.status' }>,
   deviceId: string,
+  runtime?: CommandRuntime,
 ): void {
+  const fallbackProjector = createPrivacyProjector({
+    privacy: 'metadata', allowContent: false, questionRelay: 'off', approvalRelay: 'off',
+    allowInteractions: false, redaction: [], deviceId, agent: adapter.agent,
+  })
+  const project = (): PrivacyProjector => runtime?.projector() ?? fallbackProjector
   const reply = (status: AckFrame['status'], code?: WireErrorCode, result?: unknown): void => {
     const body: CommandStatusResultFrame = {
       v: 2, type: 'command.status.result', requestId: frame.requestId, status,
       ...(code === undefined ? {} : { code }),
       ...(result === undefined ? {} : { result }),
     }
-    try { link.sendRaw(encodeFrame(body)) } catch { /* 回不去就保持未知，调用方超时 */ }
+    try { link.sendRaw(encodeFrame(project().statusResult(body))) } catch { /* 回不去就保持未知，调用方超时 */ }
   }
   const binding = link.handshake
   if (binding === undefined
@@ -140,10 +159,10 @@ function runStatusQuery(
     return
   }
   const status = entryStatus(entry)
-  const fallback: WireErrorCode = status === 'rejected' ? 'unsupported' : 'outcome-unknown'
+  const fallbackCode: WireErrorCode = status === 'rejected' ? 'unsupported' : 'outcome-unknown'
   reply(
     status,
-    entry.code === undefined ? undefined : asWireCode(entry.code, fallback),
+    entry.code === undefined ? undefined : asWireCode(entry.code, fallbackCode),
     entry.result,
   )
 }
@@ -165,12 +184,35 @@ export function runCommand(
   deviceId: string,
   journal: Journal,
   now: () => number = Date.now,
+  runtime?: CommandRuntime,
 ): void {
+  const fallback = createPrivacyProjector({
+    privacy: 'metadata', allowContent: false, questionRelay: 'off', approvalRelay: 'off',
+    allowInteractions: false, redaction: [], deviceId, agent: adapter.agent,
+  })
+  const project = (): PrivacyProjector => runtime?.projector() ?? fallback
   if (frame.type === 'command.status') {
-    runStatusQuery(link, adapter, journal, frame, deviceId)
+    runStatusQuery(link, adapter, journal, frame, deviceId, runtime)
     return
   }
   if (frame.type !== 'command') return
+  /** 审计只带身份/操作/状态/错误分类；命令正文与答案不在白名单里。 */
+  const audit = (body: { status: AckFrame['status']; code?: WireErrorCode }): void => {
+    if (runtime?.audit === undefined) return
+    try {
+      runtime.audit.write(project().auditFields({
+        operatorId: frame.operatorId,
+        deviceId,
+        agent: adapter.agent,
+        ...(frame.target.sessionId === null ? {} : { sessionId: frame.target.sessionId }),
+        op: frame.op,
+        requestId: frame.commandId,
+        decision: body.status,
+        status: body.status,
+        ...(body.code === undefined ? {} : { errorClass: body.code }),
+      }))
+    } catch { /* 审计失败绝不能影响命令结果 */ }
+  }
   // ack 绝不能再抛：未处理的拒绝会直接打挂 DSH 宿主进程。
   const reply = (body: {
     status: AckFrame['status']
@@ -184,16 +226,31 @@ export function runCommand(
       ...(body.code === undefined ? {} : { code: body.code }),
       ...(body.result === undefined ? {} : { result: body.result }),
     }
+    audit(body)
     try {
-      link.sendRaw(encodeFrame(ack))
+      link.sendRaw(encodeFrame(project().ack(ack)))
     } catch {
       // 结果超过帧上限：保留真实生命周期状态，只去掉 result 并标注原因。
       // 绝不改写成 rejected——副作用可能已经发生。
-      link.sendRaw(encodeFrame({
+      const fallbackAck: AckFrame = {
         v: 2, type: 'ack', commandId: frame.commandId,
         connectionId: frame.connectionId, nodeEpoch: frame.nodeEpoch,
         status: body.status, code: 'result-too-large',
-      }))
+      }
+      link.sendRaw(encodeFrame(project().ack(fallbackAck)))
+    }
+  }
+  /** 结果与 journal 共用同一白名单：超限只留分类，绝不落盘正文。 */
+  const safeResult = (result: unknown): { result?: unknown; code?: WireErrorCode } => {
+    if (result === undefined) return {}
+    const projected = project().ack({
+      v: 2, type: 'ack', commandId: frame.commandId,
+      connectionId: frame.connectionId, nodeEpoch: frame.nodeEpoch,
+      status: 'accepted', result,
+    })
+    return {
+      ...(projected.result === undefined ? {} : { result: projected.result }),
+      ...(projected.code === undefined ? {} : { code: projected.code }),
     }
   }
   const binding = bindingFor(link, frame)
@@ -364,15 +421,17 @@ export function runCommand(
   }
 
   function settleAndReply(status: SettledStatus, code?: WireErrorCode, result?: unknown): void {
+    const safe = safeResult(result)
+    const settleCode = code ?? safe.code
     try {
-      journal.settle(domain, status, code, result)
+      journal.settle(domain, status, settleCode, safe.result)
     } catch {
       // 调用已发生但结果无法持久化：仍必须是 unknown，不能让调用方以为失败可重试。
       reply({ status: 'outcome-unknown', code: 'recovery-required' })
       return
     }
     if (status === 'accepted' || status === 'confirmed') {
-      reply({ status, ...(result === undefined ? {} : { result }) })
+      reply({ status, ...(settleCode === undefined ? {} : { code: settleCode }), ...(safe.result === undefined ? {} : { result: safe.result }) })
       return
     }
     reply({ status, ...(code === undefined ? {} : { code }) })

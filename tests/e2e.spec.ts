@@ -12,6 +12,9 @@ const DASHBOARD_TOKEN = 'e2e-dashboard-token-0123456789abcdef'
 const POLL_INTERVAL_MS = 20
 const POLL_TIMEOUT_MS = 2_000
 const AUTH = { 'x-marshal-token': DASHBOARD_TOKEN }
+/** 合成哨兵：所有出站字节、journal 与审计都不允许出现。 */
+const PROMPT_SENTINEL = 'sk-e2e-sentinel-0123456789abcdef'
+const CWD_SENTINEL = '/home/example/secret-project'
 
 const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -40,7 +43,7 @@ describe('e2e', () => {
     const cleanups: (() => void | Promise<void>)[] = []
     const prompts: unknown[] = []
     const follows: unknown[] = []
-    const session = { sessionId: 's1', running: false, blank: false, updatedAt: 1 }
+    const session = { sessionId: 's1', running: false, blank: false, updatedAt: 1, cwd: CWD_SENTINEL }
     const sessionController: SessionControllerLike = {
       list: async () => ({ items: [session] }),
       follow(request) {
@@ -49,7 +52,8 @@ describe('e2e', () => {
       },
       prompt: async (request) => {
         prompts.push(request)
-        return { accepted: true }
+        // 额外字段必须在 ACK 投影里被丢弃。
+        return { accepted: true, token: PROMPT_SENTINEL }
       },
       cancel: async () => ({}),
     }
@@ -65,9 +69,13 @@ describe('e2e', () => {
     process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'
     const previousJournal = process.env.MARSHAL_JOURNAL_FILE
     const previousJournalKey = process.env.MARSHAL_JOURNAL_KEY_FILE
+    const previousAudit = process.env.MARSHAL_AUDIT_FILE
+    const journalFile = join(dir, 'journal.json')
+    const auditFile = join(dir, 'audit.jsonl')
     // node 启动即打开 journal；测试必须用临时路径，不能碰真实 $HOME 状态。
-    process.env.MARSHAL_JOURNAL_FILE = join(dir, 'journal.json')
+    process.env.MARSHAL_JOURNAL_FILE = journalFile
     process.env.MARSHAL_JOURNAL_KEY_FILE = join(dir, 'journal.key')
+    process.env.MARSHAL_AUDIT_FILE = auditFile
     try {
       const devicesFile = join(dir, 'devices.json')
       // 全新安装走与 hub/CLI 相同的初始化器；token 只在本次 add 返回值里出现。
@@ -105,22 +113,35 @@ describe('e2e', () => {
         const body = await (await fetch(`${base}/marshal/api/sessions`, { headers: AUTH })).json() as SessionBody
         return body.sessions
       }, 1, 'session')
+      const sessionsBody = await (await fetch(`${base}/marshal/api/sessions`, { headers: AUTH })).json() as SessionBody
+      // metadata 快照不含 cwd；HTTP 出口也不回显本机路径。
+      expect(JSON.stringify(sessionsBody.sessions)).not.toContain('cwd')
+      expect(JSON.stringify(sessionsBody.sessions)).not.toContain(CWD_SENTINEL)
 
       const promptResponse = await fetch(`${base}/marshal/api/command`, {
         method: 'POST',
         headers: { ...AUTH, 'content-type': 'application/json' },
         body: JSON.stringify({
           op: 'prompt', target: { deviceId: 'mac', agent: 'dsh', sessionId: 's1' },
-          args: { text: 'hi' }, idempotencyKey: 'e2e-1',
+          args: { text: PROMPT_SENTINEL }, idempotencyKey: 'e2e-1',
         }),
       })
       expect(promptResponse.status).toBe(200)
       const promptBody = await promptResponse.json() as { ok?: boolean; result?: unknown }
       expect(promptBody.ok).toBe(true)
+      // ACK 结果只保留白名单键，适配器返回的额外 token 字段必须消失。
       expect(promptBody.result).toEqual({ accepted: true })
+      expect(JSON.stringify(promptBody)).not.toContain(PROMPT_SENTINEL)
       expect(prompts).toHaveLength(1)
       const recorded = prompts[0] as { content?: { text?: string }[] }
-      expect(recorded.content?.[0]?.text).toBe('hi')
+      expect(recorded.content?.[0]?.text).toBe(PROMPT_SENTINEL)
+
+      // journal 只存幂等元数据，审计只存身份/操作/状态，均不得出现正文哨兵。
+      expect(readFileSync(journalFile, 'utf8')).not.toContain(PROMPT_SENTINEL)
+      const auditRaw = readFileSync(auditFile, 'utf8')
+      expect(auditRaw).toContain('"op":"prompt"')
+      expect(auditRaw).toContain('"status":"accepted"')
+      expect(auditRaw).not.toContain(PROMPT_SENTINEL)
 
       // 已受理命令可通过只读查询恢复；查询本身不触发第二次 prompt。
       const statusResponse = await fetch(
@@ -155,6 +176,8 @@ describe('e2e', () => {
       else process.env.MARSHAL_JOURNAL_FILE = previousJournal
       if (previousJournalKey === undefined) delete process.env.MARSHAL_JOURNAL_KEY_FILE
       else process.env.MARSHAL_JOURNAL_KEY_FILE = previousJournalKey
+      if (previousAudit === undefined) delete process.env.MARSHAL_AUDIT_FILE
+      else process.env.MARSHAL_AUDIT_FILE = previousAudit
     }
     // 卸载本身不应产生任何告警。
     expect(warns).toEqual([])

@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import type { SettleResult } from '../adapters/types.ts'
 import type { AskUserQuestionAnswerLike, MarshalContext, UserQuestionLike } from '../dsh-types.ts'
 import type { EventFrame } from '../wire/frames.ts'
+import type { PrivacyProjector } from './privacy.ts'
 
 interface Pending {
   readonly sessionId: string
@@ -14,6 +15,14 @@ interface Pending {
   finish(answer: AskUserQuestionAnswerLike | undefined, outcome?: 'remote' | 'timeout' | 'local'): void
 }
 
+/** 不可远答的卡：仍记住 requestId，伪造答案要明确拒绝而不是“未知”。 */
+interface BlockedCard {
+  readonly sessionId: string
+  readonly expiresAt: number
+}
+
+const MAX_BLOCKED_CARDS = 64
+
 export interface QuestionRelay {
   settle(sessionId: string, requestId: string, answers: unknown): SettleResult
   dispose(): void
@@ -22,6 +31,9 @@ export interface QuestionRelay {
 export interface QuestionRelayOptions {
   readonly ctx: Pick<MarshalContext, 'on'>
   readonly timeoutMs: number
+  /** 单一投影端口：卡片策略、字段白名单和 4096 字节上限都由它决定。 */
+  readonly projector: PrivacyProjector
+  readonly runtimeEpoch: string
   readonly send: (event: EventFrame) => void
   readonly frame: (sessionId: string, kind: EventFrame['kind'], payload: unknown) => EventFrame
 }
@@ -80,16 +92,44 @@ function validateAnswers(
  */
 export function createQuestionRelay(options: QuestionRelayOptions): QuestionRelay {
   const pending = new Map<string, Pending>()
+  const blocked = new Map<string, BlockedCard>()
   let disposed = false
 
-  /** 帧超过 1 MiB 时 send 会抛错；提问链路上的发送绝不能把异常带出 waterfall。 */
-  const emit = (sessionId: string, kind: EventFrame['kind'], payload: unknown): boolean => {
+  const pruneBlocked = (): void => {
+    const at = Date.now()
+    for (const [requestId, card] of blocked) {
+      if (card.expiresAt <= at) blocked.delete(requestId)
+    }
+    while (blocked.size > MAX_BLOCKED_CARDS) {
+      const first = blocked.keys().next().value
+      if (first === undefined) break
+      blocked.delete(first)
+    }
+  }
+
+  /**
+   * 卡片 payload 已是投影结果，直接交给 link；`input.resolved` 仍走 projector 的
+   * 白名单，避免答案或正文从这条出口漏出。
+   */
+  const emitRequested = (sessionId: string, payload: unknown): boolean => {
     try {
-      options.send(options.frame(sessionId, kind, payload))
+      options.send(options.frame(sessionId, 'input.requested', payload))
       return true
     } catch {
       return false
     }
+  }
+
+  const emitResolved = (sessionId: string, requestId: string, outcome: 'remote' | 'timeout' | 'local'): boolean => {
+    const state = outcome === 'remote' ? 'answered' : outcome === 'timeout' ? 'expired' : 'cancelled'
+    const projected = options.projector.event(
+      options.frame(sessionId, 'input.resolved', { requestId, state }),
+    )
+    let sent = false
+    for (const event of projected) {
+      try { options.send(event); sent = true } catch { return false }
+    }
+    return sent
   }
 
   const unsubscribe = options.ctx.on('user-questions/request', async (request, next) => {
@@ -106,6 +146,30 @@ export function createQuestionRelay(options: QuestionRelayOptions): QuestionRela
     const requestId = `q-${randomUUID()}`
     const signal = request.signal
 
+    const card = options.projector.card({
+      kind: 'question',
+      requestId,
+      sessionId,
+      runtimeEpoch: options.runtimeEpoch,
+      expiresAt: Date.now() + options.timeoutMs,
+      questions,
+    })
+
+    // off：不发任何东西，本地 waterfall 原样继续。
+    if (card.mode === 'off') return next()
+    // notify：只发无正文等待提示，不能远答，立即交回本地。
+    if (card.mode === 'notify') {
+      emitRequested(sessionId, card.payload)
+      return next()
+    }
+    // 不可远答（脱敏歧义、secret、超限）：保留身份/到期/原因，但立即走本地路径。
+    if (!card.answerable) {
+      pruneBlocked()
+      blocked.set(requestId, { sessionId, expiresAt: Date.now() + options.timeoutMs })
+      emitRequested(sessionId, card.payload)
+      return next()
+    }
+
     const answered = await new Promise<AskUserQuestionAnswerLike | undefined>(resolve => {
       let timer: NodeJS.Timeout | undefined
       let onAbort: (() => void) | undefined
@@ -121,7 +185,7 @@ export function createQuestionRelay(options: QuestionRelayOptions): QuestionRela
           if (timer !== undefined) clearTimeout(timer)
           if (signal !== undefined && onAbort !== undefined) signal.removeEventListener('abort', onAbort)
           pending.delete(requestId)
-          if (outcome !== undefined) emit(sessionId, 'input.resolved', { requestId, outcome })
+          if (outcome !== undefined) emitResolved(sessionId, requestId, outcome)
           resolve(answer)
         },
       }
@@ -136,7 +200,7 @@ export function createQuestionRelay(options: QuestionRelayOptions): QuestionRela
       }
 
       // 发不出去就按超时收拾：清掉 pending 与监听，且不再尝试发 input.resolved。
-      if (!emit(sessionId, 'input.requested', { requestId, questions })) {
+      if (!emitRequested(sessionId, card.payload)) {
         entry.finish(undefined)
       }
     })
@@ -146,6 +210,11 @@ export function createQuestionRelay(options: QuestionRelayOptions): QuestionRela
 
   return {
     settle(sessionId, requestId, answers) {
+      const denied = blocked.get(requestId)
+      if (denied !== undefined) {
+        // 卡片不可远答：即使 requestId 正确也不能把决定送进原生请求。
+        return denied.sessionId === sessionId ? 'decision-invalid' : 'session-mismatch'
+      }
       const entry = pending.get(requestId)
       if (entry === undefined) return 'unknown'
       if (entry.sessionId !== sessionId) return 'session-mismatch'
@@ -163,6 +232,7 @@ export function createQuestionRelay(options: QuestionRelayOptions): QuestionRela
       // 卸载时连接即将关闭：只结束等待（交回本地），不再发任何事件。
       for (const entry of [...pending.values()]) entry.finish(undefined)
       pending.clear()
+      blocked.clear()
     },
   }
 }

@@ -71,6 +71,8 @@ export interface NodeLinkOptions {
   readonly stableMs?: number
   readonly onFrame?: (text: string) => void
   readonly onOnline?: () => void
+  /** 每次合法 hello.ack 后触发；index 用它重建投影器并在收紧时清空旧队列。 */
+  readonly onHandshake?: (binding: NodePolicyBinding, previous: NodePolicyBinding | undefined) => void
   /** onFrame 或底层 socket 抛错时的可选出口；不传就静默，绝不外抛。 */
   readonly onError?: (error: unknown) => void
 }
@@ -170,6 +172,13 @@ export class NodeLink {
   }
 
   sendEvent(frame: EventFrame): void { this.sendRaw(encodeFrame(frame)) }
+
+  /** 授权收紧时丢弃按旧策略编码的积压帧；快照会以新策略重建可见状态。 */
+  clearOutbound(): void {
+    this.droppedCount += this.queue.length
+    this.queue.length = 0
+    this.queueBytes = 0
+  }
 
   private enqueue(text: string): void {
     this.queue.push(text)
@@ -297,6 +306,8 @@ export class NodeLink {
         policyRevision: ack.frame.policyRevision,
         policies: ack.frame.policies,
       }
+      // 上层必须先按新策略重建投影器，再放行任何积压事件/发送快照。
+      try { this.options.onHandshake?.(this.policyBinding, previous) } catch (error) { this.reportError(error) }
       this.startStableTimer(ws)
       this.startHeartbeat(ws)
       const pending = this.pendingInbound.splice(0)

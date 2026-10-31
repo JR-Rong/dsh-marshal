@@ -73,6 +73,19 @@ export class HubIdempotency<T> {
     this.unresolved.clear()
   }
 
+  /**
+   * 就地去掉已缓存的结果正文（断线/授权收紧）。只改完成表；in-flight 的
+   * promise 无法收回，调用方仍需按未知处理。digest 保持不变以维持幂等域。
+   */
+  stripBodies(matches: (key: string) => boolean, transform: (value: T) => T): void {
+    for (const table of [this.completed, this.unresolved]) {
+      for (const [key, entry] of [...table]) {
+        if (!matches(key)) continue
+        table.set(key, { digest: entry.digest, value: transform(entry.value) })
+      }
+    }
+  }
+
   private lookupStored(
     table: Map<string, Stored<T>>,
     key: string,

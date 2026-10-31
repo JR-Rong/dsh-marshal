@@ -42,6 +42,7 @@ export function createDshAdapter(surface: DshSurface, options: DshAdapterOptions
     agent: 'dsh',
     capabilities(_sessionId: string): Capability { return CAPABILITY },
     frame,
+    nextSeq,
 
     async snapshot(signal: AbortSignal): Promise<EventFrame[]> {
       const sessions = await surface.list(signal)

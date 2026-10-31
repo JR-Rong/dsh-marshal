@@ -69,6 +69,33 @@ function commandStatusHttpStatus(outcome: CommandStatusOutcome): number {
   return 200
 }
 
+/** 出口只给分类/结果白名单字段；内部 message 与原始异常绝不回显。 */
+function publicOutcome(outcome: CommandOutcome): Record<string, unknown> {
+  if (outcome.ok) {
+    return {
+      ok: true,
+      status: outcome.status,
+      ...(outcome.code === undefined ? {} : { code: outcome.code }),
+      ...(outcome.result === undefined ? {} : { result: outcome.result }),
+    }
+  }
+  return { ok: false, status: outcome.status, code: outcome.code }
+}
+
+/** 会话索引只暴露契约字段；cwd/标题等本机信息不经过 HTTP。 */
+function publicSession(row: {
+  deviceId: string; agent: string; sessionId: string;
+  running: boolean; updatedAt: number
+}): Record<string, unknown> {
+  return {
+    deviceId: row.deviceId,
+    agent: row.agent,
+    sessionId: row.sessionId,
+    running: row.running,
+    updatedAt: row.updatedAt,
+  }
+}
+
 function isTarget(value: unknown): value is CommandFrame['target'] {
   if (typeof value !== 'object' || value === null) return false
   const target = value as Record<string, unknown>
@@ -110,11 +137,11 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
     if (!authorized(req)) { res.writeHead(401).end('unauthorized'); return }
     try {
       await handler(req, res)
-    } catch (error) {
-      // 不把内部错误文本回显给客户端，只留在服务端日志。
-      console.error('marshal: handler failed', error)
+    } catch {
+      // 不把内部错误文本回显给客户端，也不把原始异常写进日志。
+      console.error('marshal: handler failed: internal')
       if (!res.headersSent) {
-        json(res, 500, { ok: false, code: 'internal', message: 'marshal: internal error' })
+        json(res, 500, { ok: false, code: 'internal' })
       } else {
         res.end()
       }
@@ -145,7 +172,7 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
     handler: guard((req, res) => {
       // 空串 `?device=` 与缺参等价。
       const device = new URL(req.url ?? '/', 'http://localhost').searchParams.get('device') || undefined
-      json(res, 200, { sessions: relay.sessions(device) })
+      json(res, 200, { sessions: relay.sessions(device).map(publicSession) })
     }),
   }))
 
@@ -193,7 +220,7 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
       const outcome = await relay.command({
         op: op as CommandFrame['op'], target, args, idempotencyKey,
       })
-      json(res, commandHttpStatus(outcome), outcome)
+      json(res, commandHttpStatus(outcome), publicOutcome(outcome))
     }),
   }))
 
@@ -243,9 +270,9 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
       let unsubscribe: (() => void) | null = null
       try {
         unsubscribe = relay.subscribe(send)
-      } catch (error) {
-        const message = error instanceof Error ? error.message : 'relay: too many subscribers'
-        res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' }).end(message)
+      } catch {
+        // 订阅者上限是内部容量问题，不回显异常文本。
+        res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' }).end('unavailable')
         return
       }
 

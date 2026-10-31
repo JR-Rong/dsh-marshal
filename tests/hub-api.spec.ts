@@ -27,7 +27,7 @@ async function start() {
   const relay = new HubRelay({ registry, now: Date.now, timeoutMs: 50 })
   relay.publish({
     v: 2, type: 'event', deviceId: 'mac', agent: 'dsh', sessionId: 's1', nodeEpoch: 'epoch-1',
-    seq: 1, ts: 1, kind: 'session.updated', payload: { running: false, updatedAt: 1 },
+    seq: 1, ts: 1, kind: 'session.updated', payload: { running: false, updatedAt: 1, cwd: '/secret-project' },
   })
   const test = createTestWeb()
   const routes = registerMarshalRoutes({ webServer: test.webServer, registry, relay, requireToken: 'secret' })
@@ -160,6 +160,51 @@ describe('hub api', () => {
       connectionId: 'conn-1', nodeEpoch: 'epoch-1', status: 'accepted', result: { accepted: true },
     } satisfies AckFrame, ORIGIN)
     expect((await first).status).toBe(200)
+  })
+
+  it('设备断线后幂等缓存只留状态，不再回放结果正文', async () => {
+    const { port, relay, sent } = await start()
+    const body = JSON.stringify({
+      op: 'prompt', target: { deviceId: 'mac', agent: 'dsh', sessionId: 's1' },
+      args: { text: 'hi' }, idempotencyKey: 'strip-bodies',
+    })
+    const first = fetch(`http://127.0.0.1:${port}/marshal/api/command`, {
+      method: 'POST', headers: { ...AUTH, 'content-type': 'application/json' }, body,
+    })
+    const frame = await waitForFrame(sent, 'command')
+    relay.settle({
+      v: 2, type: 'ack', commandId: frame.commandId as string,
+      connectionId: 'conn-1', nodeEpoch: 'epoch-1', status: 'accepted',
+      result: { accepted: true, cwd: '/home/secret' },
+    } satisfies AckFrame, ORIGIN)
+    const firstBody = await (await first).json() as { result?: unknown }
+    expect(firstBody.result).toEqual({ accepted: true, cwd: '/home/secret' })
+
+    relay.deviceOffline('mac')
+    const second = await fetch(`http://127.0.0.1:${port}/marshal/api/command`, {
+      method: 'POST', headers: { ...AUTH, 'content-type': 'application/json' }, body,
+    })
+    expect(second.status).toBe(200)
+    expect(await second.json()).toEqual({ ok: true, status: 'accepted' })
+    // 只发过一次指令：第二次命中缓存，且结果正文已被清掉。
+    expect(sent.filter(text => (JSON.parse(text) as { type: string }).type === 'command')).toHaveLength(1)
+  })
+
+  it('内部失败只回分类，不回显 message', async () => {
+    const { port, relay } = await start()
+    relay.dispose()
+    const response = await fetch(`http://127.0.0.1:${port}/marshal/api/command`, {
+      method: 'POST',
+      headers: { ...AUTH, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        op: 'prompt', target: { deviceId: 'mac', agent: 'dsh', sessionId: 's1' },
+        args: { text: 'sk-testtesttesttest' }, idempotencyKey: 'disposed',
+      }),
+    })
+    expect(response.status).toBe(503)
+    const body = await response.json() as Record<string, unknown>
+    expect(body).toEqual({ ok: false, status: 'outcome-unknown', code: 'disposed' })
+    expect(JSON.stringify(body)).not.toContain('sk-testtesttesttest')
   })
 
   it('command-status 已知状态返回 200', async () => {

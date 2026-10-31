@@ -37,7 +37,8 @@ export interface Capability {
   readonly tunables: readonly Tunable[]
 }
 
-export type SettleResult = 'ok' | 'unknown' | 'invalid' | 'session-mismatch'
+/** `decision-invalid`：卡片因脱敏/超限被标为不可远答，答案必须拒绝。 */
+export type SettleResult = 'ok' | 'unknown' | 'invalid' | 'session-mismatch' | 'decision-invalid'
 
 /** 远端答案回到本机时走它；只有 `ok` 表示这次答案被采纳。 */
 export interface AnswerSink {
@@ -56,5 +57,7 @@ export interface Adapter {
    * 别处（如 `node/questions.ts`）发事件也必须走它，否则 seq 会撞。
    */
   frame(sessionId: string, kind: EventFrame['kind'], payload: unknown): EventFrame
+  /** 投影层分片需要从同一计数器取 seq，避免多个分片共用信封序号。 */
+  nextSeq?(sessionId: string): number
   execute(command: { op: string; target: { sessionId: string }; args?: unknown }): Promise<unknown>
 }

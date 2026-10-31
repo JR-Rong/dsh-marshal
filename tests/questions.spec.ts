@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { createDshAdapter } from '../src/adapters/dsh/adapter.ts'
 import type { AskUserQuestionAnswerLike, AskUserQuestionRequestLike, MarshalContext, UserQuestionLike } from '../src/dsh-types.ts'
 import { openJournal, type Journal } from '../src/node/journal.ts'
+import { createPrivacyProjector, type PrivacyProjector } from '../src/node/privacy.ts'
 import { createQuestionRelay, parseAnswers, type QuestionRelay } from '../src/node/questions.ts'
 import { createFollower, runCommand } from '../src/node/runner.ts'
 import type { NodeLink } from '../src/node/link.ts'
@@ -39,6 +40,23 @@ interface HarnessOptions {
   readonly questions?: readonly UserQuestionLike[]
   readonly send?: (event: EventFrame) => void
   readonly next?: () => Promise<AskUserQuestionAnswerLike>
+  readonly questionRelay?: 'off' | 'notify' | 'remote'
+  readonly allowInteractions?: boolean
+}
+
+function projectorFor(options: HarnessOptions): PrivacyProjector {
+  return createPrivacyProjector({
+    privacy: 'metadata',
+    allowContent: false,
+    questionRelay: options.questionRelay ?? 'remote',
+    approvalRelay: 'off',
+    allowInteractions: options.allowInteractions ?? true,
+    redaction: [],
+    deviceId: 'mac',
+    agent: 'dsh',
+    nodeEpoch: 'epoch-1',
+    now: () => 1,
+  })
 }
 
 function harness(timeoutMs = 50, options: HarnessOptions = {}) {
@@ -55,6 +73,8 @@ function harness(timeoutMs = 50, options: HarnessOptions = {}) {
   const relay = createQuestionRelay({
     ctx,
     timeoutMs,
+    projector: projectorFor(options),
+    runtimeEpoch: 'epoch-1',
     send: options.send ?? (event => sent.push(event)),
     frame: (sessionId, kind, payload): EventFrame => ({
       v: 2, type: 'event', deviceId: 'mac', agent: 'dsh', sessionId, nodeEpoch: 'epoch-1',
@@ -91,7 +111,7 @@ describe('question relay', () => {
     expect(h.relay.settle('s1', requestId, { answers: [{ id: 'q1', selected: ['A'] }] })).toBe('ok')
     await expect(pending).resolves.toEqual({ answers: [{ id: 'q1', selected: ['A'] }] })
     expect(h.sent.map(event => event.kind)).toEqual(['input.requested', 'input.resolved'])
-    expect((h.sent[1]?.payload as { outcome: string }).outcome).toBe('remote')
+    expect((h.sent[1]?.payload as { state: string }).state).toBe('answered')
   })
 
   it('同一请求第二次结算返回 unknown', async () => {
@@ -125,7 +145,7 @@ describe('question relay', () => {
     const h = harness(5)
     await expect(h.ask()).rejects.toThrow(/fell through/)
     expect(h.sent.map(event => event.kind)).toEqual(['input.requested', 'input.resolved'])
-    expect((h.sent[1]?.payload as { outcome: string }).outcome).toBe('timeout')
+    expect((h.sent[1]?.payload as { state: string }).state).toBe('expired')
   })
 
   it('abort 后发出 local 并交回本地', async () => {
@@ -136,7 +156,7 @@ describe('question relay', () => {
     abort.abort()
     await expect(pending).rejects.toThrow(/fell through/)
     expect(h.sent.map(event => event.kind)).toEqual(['input.requested', 'input.resolved'])
-    expect((h.sent[1]?.payload as { outcome: string }).outcome).toBe('local')
+    expect((h.sent[1]?.payload as { state: string }).state).toBe('cancelled')
     expect(h.relay.settle('s1', requestId, { answers: [{ id: 'q1', selected: ['A'] }] })).toBe('unknown')
   })
 
@@ -231,6 +251,49 @@ describe('question relay', () => {
     expect(h.relay.settle('s1', 'q-any', { answers: [{ id: 'q1', selected: ['A'] }] })).toBe('unknown')
   })
 
+  it('off 不发任何事件，直接交回本地', async () => {
+    const h = harness(10_000, { questionRelay: 'off', next: async () => ({ answers: [] }) })
+    await expect(h.ask()).resolves.toEqual({ answers: [] })
+    expect(h.sent).toEqual([])
+  })
+
+  it('notify 只发无正文提示，立即交回本地', async () => {
+    const h = harness(10_000, { questionRelay: 'notify', next: async () => ({ answers: [] }) })
+    await expect(h.ask()).resolves.toEqual({ answers: [] })
+    expect(h.sent.map(event => event.kind)).toEqual(['input.requested'])
+    const payload = h.sent[0]?.payload as Record<string, unknown>
+    expect(payload.waitKind).toBe('question')
+    expect(payload.questions).toBeUndefined()
+    expect(payload.acceptOnceEligible).toBe(false)
+  })
+
+  it('secret 问题不跨机，伪造答案返回 decision-invalid', async () => {
+    const secret = [{
+      id: 'q1', question: '口令？', secret: true, options: [{ label: 'A' }],
+    }] as unknown as readonly UserQuestionLike[]
+    const h = harness(10_000, { questions: secret, next: async () => ({ answers: [] }) })
+    await expect(h.ask()).resolves.toEqual({ answers: [] })
+    const requestId = requestIdOf(h.sent[0])
+    expect((h.sent[0]?.payload as { reason: string }).reason).toBe('secret-local-only')
+    expect(h.relay.settle('s1', requestId, { answers: [{ id: 'q1', selected: ['A'] }] })).toBe('decision-invalid')
+  })
+
+  it('超过 4096 字节的卡片不可远答，伪造答案返回 decision-invalid', async () => {
+    const huge = Array.from({ length: 8 }, (_, index) => ({
+      id: `q${index + 1}`,
+      question: 'x'.repeat(1_000),
+      options: [{ label: 'A' }, { label: 'B' }],
+    }))
+    const h = harness(10_000, { questions: huge, next: async () => ({ answers: [] }) })
+    await expect(h.ask()).resolves.toEqual({ answers: [] })
+    const requestId = requestIdOf(h.sent[0])
+    const payload = h.sent[0]?.payload as { truncated?: boolean; acceptOnceEligible?: boolean; reason?: string }
+    expect(payload.truncated).toBe(true)
+    expect(payload.acceptOnceEligible).toBe(false)
+    expect(payload.reason).toBe('card-too-large')
+    expect(h.relay.settle('s1', requestId, { answers: [{ id: 'q1', selected: ['A'] }] })).toBe('decision-invalid')
+  })
+
   it('parseAnswers 要求每个问题恰好一次', () => {
     expect(parseAnswers({ answers: [{ id: 'q1', selected: ['A'] }] }, ['q1'])).toEqual({
       answers: [{ id: 'q1', selected: ['A'] }],
@@ -271,6 +334,8 @@ describe('question relay end to end', () => {
     relay = createQuestionRelay({
       ctx,
       timeoutMs: 1_000,
+      projector: projectorFor({}),
+      runtimeEpoch: 'epoch-1',
       send: event => sent.push(event),
       frame: adapter.frame,
     })

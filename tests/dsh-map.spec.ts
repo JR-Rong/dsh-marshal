@@ -29,9 +29,24 @@ describe('toMarshalEvents', () => {
     const events = toMarshalEvents(frames[6], meta, () => 1)
     expect(events[0]?.payload).toEqual({
       callId: 'call-1',
+      status: 'ok',
       content: [{ type: 'text', text: 'a.txt' }],
-      isError: false,
     })
+  })
+
+  it('工具参数里的交互正文在源端剔除', () => {
+    const frame = {
+      type: 'event',
+      event: {
+        type: 'tool/call', seq: 1, time: 1,
+        data: {
+          turn: 1, step: 1, callId: 'call-1', name: 'ask',
+          arguments: { questions: [{ id: 'q1', question: '选哪个？' }], note: 'ok' },
+        },
+      },
+    }
+    const events = toMarshalEvents(frame, meta, () => 1)
+    expect(events[0]?.payload).toEqual({ callId: 'call-1', tool: 'ask', status: 'running', arguments: { note: 'ok' } })
   })
 
   it('忽略不认识的帧', () => {

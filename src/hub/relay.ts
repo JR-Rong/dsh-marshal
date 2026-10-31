@@ -72,6 +72,9 @@ const DISPOSED_MESSAGE = 'relay: disposed'
 /** 被拒绝 ACK 的计数上限：只用于观测，不能被对端无限推高。 */
 const MAX_REJECTED_ACKS = 1_000
 
+/** 幂等键→设备的有界映射，只用于断线时定位要清正文的缓存。 */
+const MAX_CACHE_DEVICES = 4_096
+
 /** 帧到达时的连接身份；ACK 必须与命令绑定及当前连接同时匹配。 */
 export interface FrameIdentity {
   readonly deviceId: string
@@ -81,6 +84,18 @@ export interface FrameIdentity {
 
 function disposedOutcome(): CommandOutcome {
   return { ok: false, status: 'outcome-unknown', code: 'disposed', message: DISPOSED_MESSAGE }
+}
+
+/** 断线/收紧后缓存只能保留生命周期结论，结果正文一律丢弃。 */
+function withoutBody(outcome: CommandOutcome): CommandOutcome {
+  if (!outcome.ok) return outcome
+  return {
+    ok: true,
+    status: outcome.status,
+    // result 在成功分支是必填字段；undefined 表示正文已按策略丢弃。
+    result: undefined,
+    ...(outcome.code === undefined ? {} : { code: outcome.code }),
+  }
 }
 
 interface Pending {
@@ -103,6 +118,8 @@ export class HubRelay {
   private readonly pending = new Map<string, Pending>()
   private readonly statusPending = new Map<string, PendingStatus>()
   private readonly idempotency = new HubIdempotency<CommandOutcome>()
+  /** 幂等键归属：断线时按设备清掉缓存里的结果正文。 */
+  private readonly cacheDevices = new Map<string, string>()
   private readonly consumers = new Set<(event: EventFrame) => void>()
   private readonly index = new Map<string, SessionRow>()
   private readonly epochs = new Map<string, string>()
@@ -137,12 +154,29 @@ export class HubRelay {
     })
   }
 
+  private trackCacheKey(key: string, deviceId: string): void {
+    this.cacheDevices.delete(key)
+    this.cacheDevices.set(key, deviceId)
+    while (this.cacheDevices.size > MAX_CACHE_DEVICES) {
+      const oldest = this.cacheDevices.keys().next().value
+      if (oldest === undefined) break
+      this.cacheDevices.delete(oldest)
+    }
+  }
+
+  /** 只清该设备的结果正文，保留状态与 code；幂等键仍会阻止重放。 */
+  private stripDeviceBodies(deviceId: string): void {
+    if (this.cacheDevices.size === 0) return
+    this.idempotency.stripBodies(key => this.cacheDevices.get(key) === deviceId, withoutBody)
+  }
+
   async command(input: CommandInput): Promise<CommandOutcome> {
     if (this.disposed) return disposedOutcome()
 
     // 先算载荷摘要：同域不同载荷必须 conflict，不能因为 key 相同就复用结果。
     const digest = commandPayloadDigest(input.op, input.target, input.args ?? {})
     const key = this.domainKey(input.target, input.idempotencyKey)
+    this.trackCacheKey(key, input.target.deviceId)
     const prior = this.idempotency.lookup(key, digest)
     if (prior !== undefined) {
       if (prior.kind === 'conflict') {
@@ -342,6 +376,7 @@ export class HubRelay {
 
   /** 设备掉线时立刻结束发给它的指令：已发送的命令只能记为结果未知。 */
   deviceOffline(deviceId: string): void {
+    this.stripDeviceBodies(deviceId)
     for (const [commandId, entry] of [...this.pending]) {
       if (entry.deviceId !== deviceId) continue
       clearTimeout(entry.timer)
@@ -358,6 +393,8 @@ export class HubRelay {
 
   /** 节点重连后以快照为准：先清掉该设备的旧索引，并把移除通知给订阅者。 */
   clearDevice(deviceId: string): void {
+    // 新连接可能带来更紧的授权：旧结果正文不再回放给页面。
+    this.stripDeviceBodies(deviceId)
     for (const [key, row] of [...this.index]) {
       if (row.deviceId !== deviceId) continue
       this.index.delete(key)

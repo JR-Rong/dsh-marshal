@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { parseConfig, type MarshalConfig } from './config.ts'
-import type { EventFrame, Frame } from './wire/frames.ts'
+import type { Frame } from './wire/frames.ts'
 import { decodeFrame } from './wire/frames.ts'
 import type { MarshalContext } from './dsh-types.ts'
 import { mountHubSocket, webServerPort } from './hub/server.ts'
@@ -14,7 +14,8 @@ import { NodeLink } from './node/link.ts'
 import { openJournal } from './node/journal.ts'
 import { createFollower, runCommand } from './node/runner.ts'
 import { createQuestionRelay, type QuestionRelay } from './node/questions.ts'
-import { redact, stripContent } from './node/redact.ts'
+import { createAuditLog } from './node/audit.ts'
+import { createPrivacyProjector, type PrivacyProjector } from './node/privacy.ts'
 
 export const name = 'marshal'
 
@@ -65,10 +66,45 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
   // journal 在发起任何调用前打开并持有进程间锁；损坏/缺失时直接启动失败，
   // 不能带着空去重表继续接受写命令。
   const journal = openJournal()
-  const patterns = config.redaction.map(source => new RegExp(source, 'gi'))
-  const pipeline = (event: EventFrame): EventFrame => {
-    const masked = config.privacy === 'content' ? event : stripContent(event)
-    return { ...masked, payload: redact(masked.payload, patterns) }
+  // nodeEpoch 只随插件实例生成；普通重连沿用同一个值。
+  const nodeEpoch = randomUUID()
+  const errorName = (error: unknown): string => error instanceof Error && error.name !== '' ? error.name : 'error'
+  let relay: QuestionRelay | undefined
+  const adapter = createDshAdapter(createDshSurface(controller), {
+    deviceId: config.deviceId!,
+    nodeEpoch,
+    answers: {
+      settle: (sessionId, requestId, answers) => relay?.settle(sessionId, requestId, answers) ?? 'unknown',
+    },
+  })
+  const audit = createAuditLog({ warn: message => ctx.logger.warn(message) })
+
+  // 单一投影端口：策略在每次握手后重建，所有出口都通过 liveProjector 取当前实例。
+  const buildProjector = (allowContent: boolean, allowInteractions: boolean): PrivacyProjector =>
+    createPrivacyProjector({
+      privacy: config.privacy,
+      allowContent,
+      questionRelay: config.questionRelay,
+      approvalRelay: config.approvalRelay,
+      allowInteractions,
+      redaction: config.redaction,
+      deviceId: config.deviceId!,
+      agent: adapter.agent,
+      nodeEpoch,
+      now: Date.now,
+      nextSeq: sessionId => adapter.nextSeq?.(sessionId) ?? 0,
+    })
+  // 握手前一律按最严格策略出站；内容/交互必须同时获得两端授权。
+  let projector = buildProjector(false, false)
+  const liveProjector: PrivacyProjector = {
+    get content() { return projector.content },
+    event: frame => projector.event(frame),
+    ack: ack => projector.ack(ack),
+    error: (origin, code, meta) => projector.error(origin, code, meta),
+    syncRow: row => projector.syncRow(row),
+    statusResult: result => projector.statusResult(result),
+    card: card => projector.card(card),
+    auditFields: fields => projector.auditFields(fields),
   }
 
   let snapshot: AbortController | undefined
@@ -78,15 +114,15 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
     const abort = new AbortController()
     snapshot = abort
     void (async () => {
-      for (const event of await adapter.snapshot(abort.signal)) link.sendEvent(pipeline(event))
+      for (const event of await adapter.snapshot(abort.signal)) {
+        for (const projected of projector.event(event)) link.sendEvent(projected)
+      }
     })().catch((error: unknown) => {
-      // 主动取消导致的失败不是故障，不写日志。
-      if (!abort.signal.aborted) ctx.logger.warn('marshal: snapshot failed: ' + String(error))
+      // 主动取消导致的失败不是故障，不写日志；日志只留错误类型。
+      if (!abort.signal.aborted) ctx.logger.warn('marshal: snapshot failed: ' + errorName(error))
     })
   }
 
-  // nodeEpoch 只随插件实例生成；普通重连沿用同一个值。
-  const nodeEpoch = randomUUID()
   const link = new NodeLink({
     url: config.hubUrl!, token: config.token!, deviceId: config.deviceId!,
     deviceName: config.deviceName,
@@ -96,29 +132,36 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
     onFrame: text => {
       let frame: Frame
       try { frame = decodeFrame(text) } catch { return }
-      runCommand(link, adapter, follower, frame, config.deviceId!, journal)
+      runCommand(link, adapter, follower, frame, config.deviceId!, journal, Date.now, {
+        projector: () => projector,
+        audit,
+      })
+    },
+    onHandshake: (binding, previous) => {
+      projector = buildProjector(binding.policies.allowContent, binding.policies.allowInteractions)
+      const tightened = (previous?.policies.allowContent === true && binding.policies.allowContent !== true)
+        || (previous?.policies.allowInteractions === true && binding.policies.allowInteractions !== true)
+      // 旧队列按更宽策略编码，不能在新握手上补发。
+      if (tightened) link.clearOutbound()
     },
     onOnline: sendSnapshot,
-    onError: error => ctx.logger.warn(`marshal: link error: ${String(error)}`),
+    onError: error => ctx.logger.warn(`marshal: link error: ${errorName(error)}`),
   })
-  let relay: QuestionRelay | undefined
-  const adapter = createDshAdapter(createDshSurface(controller), {
-    deviceId: config.deviceId!,
-    nodeEpoch,
-    answers: {
-      settle: (sessionId, requestId, answers) => relay?.settle(sessionId, requestId, answers) ?? 'unknown',
-    },
-  })
-  relay = config.questionRelay === 'remote'
-    ? createQuestionRelay({
+  relay = config.questionRelay === 'off'
+    ? undefined
+    : createQuestionRelay({
         ctx, timeoutMs: config.answerTimeoutMs,
-        send: event => link.sendEvent(pipeline(event)),
+        projector: liveProjector,
+        runtimeEpoch: nodeEpoch,
+        // 卡片 payload 已由 projector.card 投影；resolved 也已在 relay 内投影。
+        send: event => link.sendEvent(event),
         frame: adapter.frame,
       })
-    : undefined
   const follower = createFollower({
     adapter,
-    send: event => link.sendEvent(pipeline(event)),
+    send: event => {
+      for (const projected of projector.event(event)) link.sendEvent(projected)
+    },
     logger: ctx.logger,
   })
 
