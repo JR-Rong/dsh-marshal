@@ -34,6 +34,21 @@ export const PAGE_HTML = `<!doctype html>
   #status { padding:0 12px 8px; color:#c33; min-height:1.2em; white-space:pre-wrap; }
   #who { font-size:12px; color:#888; word-break:break-all; }
   #pending div { font-size:12px; color:#888; padding:2px 0; white-space:pre-wrap; }
+  #capability { padding:0 12px; }
+  #capability .tunable { border-top:1px solid #8883; padding:6px 0; }
+  #capability .tunable label { display:block; font-family:ui-monospace,monospace; }
+  #capability select, #capability input[type=text] { display:block; max-width:100%; box-sizing:border-box; margin-top:4px; padding:5px 6px; }
+  #capability button { margin-top:6px; padding:4px 10px; }
+  @media (max-width:720px) {
+    body { height:auto; }
+    #appView { flex-direction:column; height:auto; min-height:100vh; }
+    aside { width:auto; border-right:0; border-bottom:1px solid #8883; max-height:45vh; }
+    main { min-height:55vh; }
+    #cards, #log { max-height:none; overflow:visible; }
+    #log { flex:none; }
+    .ask button, #send button, #capability button { min-height:40px; padding:8px 14px; }
+    #send input, #capability select, #capability input[type=text] { min-height:40px; }
+  }
 </style></head>
 <body>
 <div id="loginView" hidden>
@@ -55,6 +70,7 @@ export const PAGE_HTML = `<!doctype html>
   </aside>
   <main>
     <div id="status"></div>
+    <div id="capability"></div>
     <div id="cards"></div>
     <div id="log"></div>
     <form id="send"><input id="text" placeholder="给选中会话发一条消息"><button>发送</button></form>
@@ -81,12 +97,19 @@ var queuedEvents = [];
 var MAX_QUEUED_EVENTS = 256;
 var lastSeq = new Map();
 var cardMap = new Map();
+var devicesData = null;
+var currentCapability = null;
+var capabilityNotice = '';
+var acquirePending = false;
+var loadToken = 0;
+var selectionToken = 0;
 var db = null;
 var dbUnavailable = false;
 var loginStatus = document.getElementById('loginStatus');
 var status = document.getElementById('status');
 var log = document.getElementById('log');
 var cardsRoot = document.getElementById('cards');
+var capabilityRoot = document.getElementById('capability');
 var devicesRoot = document.getElementById('devices');
 var pendingRoot = document.getElementById('pending');
 var sendForm = document.getElementById('send');
@@ -276,6 +299,10 @@ function showLogin(message) {
   closeStream();
   session = null;
   current = null;
+  currentRow = null;
+  devicesData = null;
+  selectionToken += 1;
+  loadToken += 1;
   writeState = 'unknown';
   barrierBlocked = true;
   rebuilding = false;
@@ -283,6 +310,7 @@ function showLogin(message) {
   queuedEvents.length = 0;
   clearNode(cardsRoot);
   clearNode(log);
+  clearCapability();
   cardMap.clear();
   lastSeq.clear();
   document.getElementById('appView').hidden = true;
@@ -362,20 +390,33 @@ function capabilitiesOf(device, agent) {
   return doc && typeof doc === 'object' ? doc : null;
 }
 
-function evaluateWriteState(device, row) {
+/**
+ * 只读选择与写权分离：写权只认源端能力文档，选择会话本身绝不移交写权。
+ * capability 参数优先于设备列表里的 agent 级文档，页面从不自行推断 ownership。
+ */
+function evaluateWriteState(device, row, capability) {
   if (barrierBlocked) { writeReason = '状态未知、暂不可答'; return 'unknown'; }
   if (unknownDevices[device.id]) { writeReason = '状态未知、暂不可答'; return 'unknown'; }
   if (device.syncing === true) { writeReason = '正在同步'; return 'stale'; }
   if (device.stale === true) { writeReason = '会话索引已过期'; return 'stale'; }
-  var caps = capabilitiesOf(device, row.agent);
-  if (caps === null) { writeReason = '能力未知'; return 'unknown'; }
+  var caps = capability && typeof capability === 'object' ? capability : capabilitiesOf(device, row.agent);
+  if (caps === null || caps === undefined) { writeReason = '能力未知'; return 'unknown'; }
   if (caps.stale === true) { writeReason = '能力已过期'; return 'stale'; }
-  if (row.running === true) { writeReason = '会话忙碌'; return 'busy'; }
-  // 契约 §7 的已验证写权是 ours；适配器未验证写权时保持只读。
-  if (caps.ownership !== 'ours' && caps.ownership !== 'ours-idle') {
-    writeReason = caps.ownership === 'foreign-running' ? '外部写者运行中' : '所有权未确认';
-    return caps.ownership === 'foreign-running' ? 'busy' : 'unknown';
+  // 契约 §7 的已验证写权是 ours；其它 ownership 一律不可写。
+  if (caps.ownership === 'foreign-running') { writeReason = '外部写者运行中'; return 'busy'; }
+  if (caps.ownership === 'unverified') { writeReason = '写权未确认（ownership-unverified）'; return 'unknown'; }
+  if (caps.ownership !== 'ours') {
+    var offered = Array.isArray(caps.operations) ? caps.operations : [];
+    if (caps.ownership === 'foreign-unknown' && offered.indexOf('acquire') >= 0) {
+      writeReason = '写权未确认（ownership-unverified），需先取得写权';
+    } else if (caps.ownership === 'foreign-unknown') {
+      writeReason = '所有权未确认（ownership-unverified）';
+    } else {
+      writeReason = '所有权未确认';
+    }
+    return 'unknown';
   }
+  if (row.running === true) { writeReason = '会话忙碌'; return 'busy'; }
   var operations = Array.isArray(caps.operations) ? caps.operations : [];
   if (operations.indexOf('prompt') < 0) { writeReason = '不支持写入'; return 'unknown'; }
   writeReason = '';
@@ -389,6 +430,287 @@ function applyWriteState() {
   if (disabled && writeReason) setStatus('写入已禁用：' + writeReason);
 }
 
+function deviceForCurrent() {
+  if (current === null) return null;
+  return findDevice(devicesData, current.deviceId);
+}
+
+/** 用当前能力文档重新评估写状态；设备列表只提供 syncing/stale 与兜底能力。 */
+function evaluateCurrentWriteState() {
+  if (current === null) return;
+  var device = deviceForCurrent();
+  if (device === null) { writeState = 'unknown'; writeReason = '能力未知'; applyWriteState(); return; }
+  writeState = evaluateWriteState(device, currentRow || { agent: current.agent, running: false }, currentCapability);
+  applyWriteState();
+}
+
+var OWNERSHIP_LABELS = {
+  ours: '自有写权（ours）',
+  'foreign-unknown': '写权未取得（foreign-unknown）',
+  'foreign-running': '外部写者运行中（foreign-running）',
+  unverified: '写权未验证（unverified）',
+};
+
+function formatValue(value) {
+  if (typeof value === 'string') return value;
+  try {
+    var text = JSON.stringify(value);
+    return typeof text === 'string' ? text : String(value);
+  } catch (error) {
+    return String(value);
+  }
+}
+
+/** 只读刷新时忽略每次读取都会变的 readAt，避免无谓重渲染清空用户选择。 */
+function capabilityDigest(document) {
+  if (!document || typeof document !== 'object') return '';
+  try {
+    var copy = {};
+    for (var key in document) {
+      if (key === 'readAt') continue;
+      copy[key] = document[key];
+    }
+    return JSON.stringify(copy);
+  } catch (error) {
+    return '';
+  }
+}
+
+/** 取得写权只对“能力声明 acquire 且 ownership 未取得”的当前会话开放。 */
+function acquireEligible() {
+  if (acquirePending || current === null || currentCapability === null
+    || typeof currentCapability !== 'object') return false;
+  if (barrierBlocked || unknownDevices[current.deviceId]) return false;
+  var device = deviceForCurrent();
+  if (device === null || device.syncing === true || device.stale === true) return false;
+  if (currentCapability.ownership !== 'foreign-unknown') return false;
+  var operations = Array.isArray(currentCapability.operations) ? currentCapability.operations : [];
+  return operations.indexOf('acquire') >= 0;
+}
+
+function clearCapability() {
+  currentCapability = null;
+  capabilityNotice = '';
+  acquirePending = false;
+  if (capabilityRoot) clearNode(capabilityRoot);
+}
+
+function renderCapability() {
+  clearNode(capabilityRoot);
+  if (current === null) return;
+  capabilityRoot.append(textNode('div', '能力', 'group'));
+  if (currentCapability === null || typeof currentCapability !== 'object') {
+    capabilityRoot.append(textNode('div', '能力未知', 'reason'));
+    return;
+  }
+  var capability = currentCapability;
+  if (typeof capability.ownership === 'string') {
+    capabilityRoot.append(textNode('div', '所有权：' + (OWNERSHIP_LABELS[capability.ownership] || capability.ownership)));
+  }
+  if (typeof capability.runtimeEpoch === 'string' && capability.runtimeEpoch !== '') {
+    capabilityRoot.append(textNode('div', '实例代次：' + capability.runtimeEpoch));
+  }
+  if (Number.isInteger(capability.settingsRevision)) {
+    capabilityRoot.append(textNode('div', '设置修订：' + String(capability.settingsRevision)));
+  }
+  if (capability.pending && typeof capability.pending === 'object') {
+    var status = capability.pending.status;
+    var label = status === 'readback-timeout' ? '回读超时（未自动重试）'
+      : status === 'pending' ? '回读确认中' : '';
+    if (label !== '') {
+      var field = typeof capability.pending.field === 'string' ? capability.pending.field : '';
+      capabilityRoot.append(textNode('div', '待回读：' + field + ' · ' + label, 'reason'));
+    }
+  }
+  if (capabilityNotice) capabilityRoot.append(textNode('div', capabilityNotice, 'reason'));
+  if (acquireEligible()) {
+    var acquire = document.createElement('button');
+    acquire.type = 'button';
+    acquire.textContent = '取得写权';
+    acquire.onclick = function() { acquireWrite(); };
+    capabilityRoot.append(acquire);
+  }
+  var tunables = Array.isArray(capability.tunables) ? capability.tunables : [];
+  for (var index = 0; index < tunables.length; index += 1) {
+    var tunable = tunables[index];
+    if (!tunable || typeof tunable !== 'object' || typeof tunable.id !== 'string') continue;
+    renderTunable(capability, tunable);
+  }
+}
+
+/**
+ * 每个可编辑设置一个控件和“应用”；不回写 current，只把用户输入作为新值发送。
+ * 值为枚举时用 select，goal 用文本框，其余没有可靠输入形态就不渲染控件。
+ */
+function renderTunable(capability, tunable) {
+  var target = current;
+  if (target === null) return;
+  var row = document.createElement('div');
+  row.className = 'tunable';
+  row.append(textNode('label', tunable.id));
+  if (tunable.current !== undefined) row.append(textNode('div', formatValue(tunable.current)));
+  if (tunable.editable !== true) {
+    if (typeof tunable.reason === 'string' && tunable.reason !== '') {
+      row.append(textNode('div', '不可编辑：' + tunable.reason, 'reason'));
+    }
+    capabilityRoot.append(row);
+    return;
+  }
+  var revisionReady = typeof capability.runtimeEpoch === 'string' && capability.runtimeEpoch !== ''
+    && Number.isInteger(capability.settingsRevision);
+  var control = null;
+  var values = Array.isArray(tunable.values) ? tunable.values.filter(function(value) {
+    return value && typeof value.id === 'string' && typeof value.label === 'string';
+  }) : [];
+  if (values.length > 0) {
+    control = document.createElement('select');
+    for (var index = 0; index < values.length; index += 1) {
+      var option = document.createElement('option');
+      option.value = values[index].id;
+      option.textContent = values[index].label;
+      if (typeof tunable.current === 'string' && tunable.current === values[index].id) option.selected = true;
+      control.append(option);
+    }
+    row.append(control);
+  } else if (tunable.id === 'goal') {
+    control = document.createElement('input');
+    control.type = 'text';
+    row.append(control);
+  }
+  if (control === null) {
+    capabilityRoot.append(row);
+    return;
+  }
+  var apply = document.createElement('button');
+  apply.type = 'button';
+  apply.textContent = '应用';
+  if (!revisionReady) {
+    apply.disabled = true;
+    row.append(apply, textNode('div', '实例代次未知，不能配置', 'reason'));
+  } else {
+    apply.onclick = function() {
+      // goal 的原生值是 { objective }；其它字段按控件原始值发送，由后端校验。
+      var value = tunable.id === 'goal' ? { objective: control.value } : control.value;
+      configureTunable(tunable, value, target);
+    };
+    row.append(apply);
+  }
+  capabilityRoot.append(row);
+}
+
+function configureLabel(body) {
+  if (body && body.status === 'rejected') return '拒绝：' + (body.code || 'invalid');
+  if (body && (body.status === 'pending-confirmation' || body.status === 'readback-timeout'
+    || body.code === 'readback-timeout')) return '回读未确认，不自动重试';
+  if (body && (body.ok || body.status === 'accepted' || body.status === 'confirmed')) return '已受理，等待源端回读';
+  return '未确认（结果未知，先查状态，不自动重发）';
+}
+
+async function configureTunable(tunable, value, target) {
+  if (target === null || current === null || sessionKey(current) !== sessionKey(target)) return;
+  var capability = currentCapability;
+  if (capability === null || typeof capability !== 'object'
+    || typeof capability.runtimeEpoch !== 'string' || capability.runtimeEpoch === ''
+    || !Number.isInteger(capability.settingsRevision)) {
+    capabilityNotice = '实例代次未知，不能配置';
+    renderCapability();
+    return;
+  }
+  var expectedRevision = capability.runtimeEpoch + '#' + capability.settingsRevision;
+  var key = newKey();
+  var intent = {
+    id: intentId(key, target, 'configure'), owner: origin + '|' + (session ? session.operatorId : ''),
+    key: key, op: 'configure', target: target, status: 'pending', at: Date.now(),
+  };
+  var stored = await persistIntent(intent);
+  if (!stored) { setStatus('持久存储不可用，拒绝发送'); return; }
+  var body = await command('configure', { expectedRevision: expectedRevision, field: tunable.id, value },
+    target, false, key);
+  if (body === null) {
+    await updateIntent(intent.id, { status: 'unknown' });
+    if (current !== null && sessionKey(current) === sessionKey(target)) {
+      capabilityNotice = '配置 ' + tunable.id + '：未确认（结果未知，先查状态，不自动重发）';
+      renderCapability();
+    }
+    return;
+  }
+  await updateIntent(intent.id, { status: intentStatus(body) });
+  if (current === null || sessionKey(current) !== sessionKey(target)) return;
+  // 只显示受理/拒绝状态；current 永远等源端 capability.changed 回读。
+  capabilityNotice = '配置 ' + tunable.id + '：' + configureLabel(body);
+  renderCapability();
+  refreshCurrentCapability();
+}
+
+async function acquireWrite() {
+  var target = current;
+  if (target === null || !acquireEligible()) return;
+  acquirePending = true;
+  var key = newKey();
+  var intent = {
+    id: intentId(key, target, 'acquire'), owner: origin + '|' + (session ? session.operatorId : ''),
+    key: key, op: 'acquire', target: target, status: 'pending', at: Date.now(),
+  };
+  var stored = await persistIntent(intent);
+  if (!stored) {
+    acquirePending = false;
+    setStatus('持久存储不可用，拒绝发送');
+    renderCapability();
+    return;
+  }
+  if (current === target) {
+    capabilityNotice = '取得写权：已发送，等待源端确认';
+    renderCapability();
+  }
+  var body = await command('acquire', {}, target, false, key);
+  await updateIntent(intent.id, { status: body === null ? 'unknown' : intentStatus(body) });
+  acquirePending = false;
+  if (current !== target) return;
+  var label = body === null ? '未确认（结果未知，先查状态，不自动重发）'
+    : outcomeLabel(body.status === 'rejected' ? 200 : (body.ok ? 200 : 202), body);
+  // 不乐观设置 ownership/writeState：只提示受理结果，等 capability.changed 或刷新。
+  capabilityNotice = '取得写权：' + label;
+  renderCapability();
+  refreshCurrentCapability();
+}
+
+/** 重新读取当前会话的能力文档；响应迟到时不覆盖更新的选择。 */
+async function refreshCurrentCapability() {
+  var target = current;
+  if (target === null) return;
+  var response;
+  try {
+    response = await request('/marshal/api/sessions?device=' + encodeURIComponent(target.deviceId), { method: 'GET' });
+  } catch (error) { return; }
+  if (!response.ok) return;
+  var data;
+  try { data = await response.json(); } catch (error) { return; }
+  if (current !== target) return;
+  if (!data || !Array.isArray(data.sessions)) return;
+  var key = sessionKey(target);
+  for (var index = 0; index < data.sessions.length; index += 1) {
+    var rowData = data.sessions[index];
+    if (!rowData || sessionKey({
+      deviceId: rowData.deviceId, agent: rowData.agent, sessionId: rowData.sessionId,
+    }) !== key) continue;
+    var next = rowData.capability && typeof rowData.capability === 'object' ? rowData.capability : null;
+    currentRow = rowData;
+    var changed = capabilityDigest(next) !== capabilityDigest(currentCapability);
+    currentCapability = next;
+    if (changed) renderCapability();
+    evaluateCurrentWriteState();
+    return;
+  }
+}
+
+function applyCapabilityDocument(document) {
+  if (current === null) return;
+  currentCapability = document && typeof document === 'object' && !Array.isArray(document) ? document : null;
+  capabilityNotice = '';
+  renderCapability();
+  evaluateCurrentWriteState();
+}
+
 async function refreshDevices() {
   var response;
   try { response = await request('/marshal/api/devices', { method: 'GET' }); } catch (error) { return null; }
@@ -399,6 +721,8 @@ async function refreshDevices() {
   var data;
   try { data = await response.json(); } catch (error) { return null; }
   if (!data || !Array.isArray(data.devices)) return null;
+  // 保留最近一次设备载荷：acquire 资格与 ownership 兜底都要看 syncing/stale。
+  devicesData = data;
   clearNode(devicesRoot);
   for (var index = 0; index < data.devices.length; index += 1) {
     var device = data.devices[index];
@@ -415,13 +739,7 @@ async function refreshDevices() {
       devicesRoot.append(row);
     }
   }
-  if (current !== null) {
-    var found = findDevice(data, current.deviceId);
-    if (found !== null) {
-      writeState = evaluateWriteState(found, currentRow || { agent: current.agent, running: false });
-      applyWriteState();
-    }
-  }
+  if (current !== null) evaluateCurrentWriteState();
   return data;
 }
 
@@ -442,21 +760,29 @@ function selectAgent(device, agent, row) {
 }
 
 async function loadSessions(deviceId, agent, device) {
+  // 单调加载令牌：旧响应晚到不能覆盖后发起的列表。
+  var token = ++loadToken;
   // 换设备/agent 后旧选中不再属于当前列表，先作废并释放旧订阅。
   if (current !== null && (current.deviceId !== deviceId || current.agent !== agent)) {
     var previous = current;
+    selectionToken += 1;
     current = null;
+    currentRow = null;
+    clearCapability();
     clearNode(cardsRoot);
     cardMap.clear();
     await releaseSubscription(previous);
+    if (token !== loadToken) return;
   }
   var response;
   try {
     response = await request('/marshal/api/sessions?device=' + encodeURIComponent(deviceId), { method: 'GET' });
   } catch (error) { setStatus('加载会话失败'); return; }
+  if (token !== loadToken) return;
   if (!response.ok) { setStatus('加载会话失败'); return; }
   var data;
   try { data = await response.json(); } catch (error) { return; }
+  if (token !== loadToken) return;
   if (!data || !Array.isArray(data.sessions)) { setStatus('加载会话失败'); return; }
   clearNode(log);
   for (var index = 0; index < data.sessions.length; index += 1) {
@@ -473,27 +799,45 @@ function selectSession(device, rowData, row) {
   return async function() {
     if (current !== null && current.deviceId === device.id && current.agent === rowData.agent
       && current.sessionId === rowData.sessionId) return;
+    // 选择令牌：任一 await 之后只有仍然是最新选择才允许应用状态。
+    var token = ++selectionToken;
     var target = { deviceId: device.id, agent: rowData.agent, sessionId: rowData.sessionId };
     var previous = current;
-    if (previous !== null) await releaseSubscription(previous);
+    if (previous !== null) {
+      await releaseSubscription(previous);
+      if (token !== selectionToken) return;
+    }
     // 先切目标再发 subscribe：跟随事件可能先于 HTTP 响应到达 SSE。
     current = target;
     currentRow = rowData;
     clearNode(cardsRoot);
     cardMap.clear();
     lastSeq.delete(sessionKey(target));
-    writeState = evaluateWriteState(device, rowData);
-    applyWriteState();
+    currentCapability = rowData.capability && typeof rowData.capability === 'object' ? rowData.capability : null;
+    capabilityNotice = '';
+    renderCapability();
+    evaluateCurrentWriteState();
     for (var other of log.querySelectorAll('.row')) other.classList.remove('active');
     row.classList.add('active');
     var body = await command('observe', { kind: 'follow', action: 'subscribe' }, target, true);
-    if (body === null) { if (current === target) { current = previous; } return; }
+    if (token !== selectionToken) return;
+    if (body === null) {
+      if (current === target) {
+        current = previous;
+        currentRow = null;
+        clearCapability();
+        renderCapability();
+        evaluateCurrentWriteState();
+      }
+      return;
+    }
     var result = body.result;
     if (result && typeof result.subscriptionId === 'string') {
       try { sessionStorage.setItem('marshal-sub:' + sessionKey(target), result.subscriptionId); } catch (error) {}
     }
     // 选择会话只 observe；待答卡来自只读快照，不触发任何原生动作。
     await loadInputs(target, device);
+    if (token !== selectionToken) return;
   };
 }
 
@@ -554,34 +898,115 @@ async function loadInputs(target, device) {
   var data;
   try { data = await response.json(); } catch (error) { return; }
   if (!data || !Array.isArray(data.cards)) return;
+  // 迟到的旧响应不得把卡片渲染进另一个会话。
+  if (current === null || sessionKey(current) !== sessionKey(target)) return;
   var key = sessionKey(target);
   var high = typeof data.highWatermark === 'number' ? data.highWatermark : 0;
   lastSeq.set(key, Math.max(lastSeq.get(key) || 0, high));
   if (device) {
-    writeState = evaluateWriteState(device, currentRow || { agent: target.agent, running: false });
+    writeState = evaluateWriteState(device, currentRow || { agent: target.agent, running: false }, currentCapability);
     applyWriteState();
   }
   for (var index = 0; index < data.cards.length; index += 1) renderCard(data.cards[index], target);
 }
 
+/** 任何“总是/记住/会话内/别再问”语义的审批选项都不得渲染，也不得发送。 */
+function decisionIsSafe(decision) {
+  if (!decision || typeof decision.id !== 'string' || typeof decision.label !== 'string') return false;
+  var unsafe = /always|persist|remember|session|don'?t\\s*ask|总是|始终|会话内/i;
+  return !unsafe.test(decision.id) && !unsafe.test(decision.label);
+}
+
+/**
+ * 审批卡只呈现“这一次”的决定：每个安全 decision 一个按钮，一次点击一题答案，
+ * 没有文本输入、没有多选、也没有会话级 allow 按钮。
+ */
+function renderApprovalCard(element, card, target, interactive) {
+  var approval = card.approval && typeof card.approval === 'object' ? card.approval : null;
+  var action = card.approval && typeof card.approval === 'object'
+    && typeof card.approval.action === 'string' && card.approval.action !== ''
+    ? card.approval.action : '审批请求';
+  element.append(textNode('div', '审批：' + action));
+  if (approval && typeof approval.detail === 'string' && approval.detail !== '') {
+    element.append(textNode('div', approval.detail, 'tool'));
+  }
+  var raw = approval && Array.isArray(approval.decisions) ? approval.decisions : [];
+  var decisions = raw.filter(decisionIsSafe);
+  if (!interactive || decisions.length === 0) {
+    var why = !interactive
+      ? (barrierBlocked ? '状态未知、暂不可答' : (card.reason || '需在本机处理'))
+      : '没有可安全表达的本机决定';
+    element.append(textNode('div', '此卡不能远端作答（' + why + '）', 'reason'));
+    return;
+  }
+  var buttons = [];
+  var busy = false;
+  for (var index = 0; index < decisions.length; index += 1) {
+    (function(decision) {
+      var button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = decision.label;
+      button.onclick = async function() {
+        if (busy) return;
+        busy = true;
+        for (var b = 0; b < buttons.length; b += 1) buttons[b].disabled = true;
+        var key = newKey();
+        var intent = {
+          id: intentId(key, target, 'answer'), owner: origin + '|' + (session ? session.operatorId : ''),
+          key: key, op: 'answer', target: target, status: 'pending', at: Date.now(),
+        };
+        var stored = await persistIntent(intent);
+        if (!stored) {
+          setStatus('持久存储不可用，拒绝发送');
+          busy = false;
+          for (var r = 0; r < buttons.length; r += 1) buttons[r].disabled = false;
+          return;
+        }
+        var payload = { requestId: card.requestId, answers: [{ id: decision.id, selectedOptionIds: [] }] };
+        var body = await command('answer', payload, target, false, key);
+        if (body === null) {
+          busy = false;
+          await updateIntent(intent.id, { status: 'unknown' });
+          for (var u = 0; u < buttons.length; u += 1) buttons[u].disabled = false;
+          return;
+        }
+        await updateIntent(intent.id, { status: intentStatus(body) });
+        if (body.status === 'rejected') {
+          element.append(textNode('div', '拒绝：' + (body.code || 'invalid'), 'reason'));
+        } else if (body.ok) {
+          element.append(textNode('div', '已受理，等待源端确认', 'reason'));
+        } else {
+          element.append(textNode('div', '未确认（结果未知，先查状态，不自动重发）', 'reason'));
+        }
+      };
+      buttons.push(button);
+      element.append(button);
+    })(decisions[index]);
+  }
+}
+
 function renderCard(card, target) {
   if (!card || typeof card.requestId !== 'string') return;
+  // 卡片闭包固定使用创建时的完整 target，不读取可变的 current。
+  var cardTarget = { deviceId: target.deviceId, agent: target.agent, sessionId: target.sessionId };
   var runtimeEpoch = typeof card.runtimeEpoch === 'string' ? card.runtimeEpoch : 'unknown';
-  var key = cardKey(target, runtimeEpoch, card.requestId);
+  var key = cardKey(cardTarget, runtimeEpoch, card.requestId);
   var existing = cardMap.get(key);
   if (existing) return;
   var element = document.createElement('div');
   element.className = 'ask';
   element.dataset.requestId = card.requestId;
-  var interactive = !barrierBlocked && card.kind === 'question' && card.acceptOnceEligible === true
-    && card.ambiguous !== true && card.truncated !== true;
   // acceptOnceEligible 是 node 侧 relay=remote 与 hub allowInteractions 双授权后的结果；
   // 页面只按它渲染可答控件，最终仍由后端校验。
-  var questions = Array.isArray(card.questions) ? card.questions : [];
+  var interactive = !barrierBlocked && card.acceptOnceEligible === true
+    && card.ambiguous !== true && card.truncated !== true;
   if (card.kind === 'approval' || card.approval) {
-    element.append(textNode('div', '审批请求：仅本机可处理', 'reason'));
-    interactive = false;
+    renderApprovalCard(element, card, cardTarget, interactive);
+    cardsRoot.append(element);
+    cardMap.set(key, { element: element, card: card, target: cardTarget });
+    return;
   }
+  var questions = Array.isArray(card.questions) ? card.questions : [];
   if (!interactive) {
     var why = barrierBlocked ? '状态未知、暂不可答' : (card.reason || '需在本机处理');
     element.append(textNode('div', '此卡不能远端作答（' + why + '）', 'reason'));
@@ -666,8 +1091,8 @@ function renderCard(card, target) {
       var payload = { requestId: card.requestId, answers: answers };
       var key = newKey();
       var intent = {
-        id: intentId(key, target, 'answer'), owner: origin + '|' + (session ? session.operatorId : ''),
-        key: key, op: 'answer', target: target, status: 'pending', at: Date.now(),
+        id: intentId(key, cardTarget, 'answer'), owner: origin + '|' + (session ? session.operatorId : ''),
+        key: key, op: 'answer', target: cardTarget, status: 'pending', at: Date.now(),
       };
       var stored = await persistIntent(intent);
       if (!stored) {
@@ -676,7 +1101,7 @@ function renderCard(card, target) {
         submit.disabled = false;
         return;
       }
-      var body = await command('answer', payload, target, false, key);
+      var body = await command('answer', payload, cardTarget, false, key);
       if (body === null) {
         busy = false;
         submit.disabled = false;
@@ -695,20 +1120,26 @@ function renderCard(card, target) {
     element.append(submit);
   }
   cardsRoot.append(element);
-  cardMap.set(key, { element: element, card: card, target: target });
+  cardMap.set(key, { element: element, card: card, target: cardTarget });
 }
 
 function resolveCard(event, state) {
+  var target = { deviceId: event.deviceId, agent: event.agent, sessionId: event.sessionId };
+  var targetKey = sessionKey(target);
   var runtimeEpoch = typeof event.payload?.runtimeEpoch === 'string' ? event.payload.runtimeEpoch : 'unknown';
-  var key = cardKey({ deviceId: event.deviceId, agent: event.agent, sessionId: event.sessionId },
-    runtimeEpoch, String(event.payload?.requestId || ''));
+  var requestId = String(event.payload?.requestId || '');
+  var key = cardKey(target, runtimeEpoch, requestId);
   var entry = cardMap.get(key);
+  var matchedKey = key;
   if (!entry) {
-    // runtimeEpoch 缺失时按 requestId 在同类卡片里兜底匹配。
-    cardMap.forEach(function(value) {
-      if (!entry && value.card.requestId === event.payload?.requestId) entry = value;
+    // 代次缺失/不一致时只在同一完整 target 内按 requestId 兜底。
+    cardMap.forEach(function(value, mapKey) {
+      if (entry || sessionKey(value.target) !== targetKey || value.card.requestId !== requestId) return;
+      entry = value;
+      matchedKey = mapKey;
     });
   }
+  // 未知键（重复/过期终态）直接忽略，不影响其它会话的卡片。
   if (!entry) return;
   var labels = {
     answered: '已由另一处回答',
@@ -719,7 +1150,7 @@ function resolveCard(event, state) {
     failed: '未确认',
   };
   entry.element.textContent = labels[state] || '已结束（' + state + '）';
-  cardMap.delete(key);
+  cardMap.delete(matchedKey);
 }
 
 /* ---------------- 写入命令 ---------------- */
@@ -800,12 +1231,16 @@ async function onReset(payload) {
   var generation = ++rebuildGeneration;
   rebuilding = true;
   queuedEvents.length = 0;
+  // 换代后旧的列表/选择/能力响应都不再可信。
+  loadToken += 1;
+  selectionToken += 1;
   barrierBlocked = payload.complete === false;
   // reset-required：先丢弃本地时间线和卡片，再按索引/能力/待答快照重建。
   clearNode(cardsRoot);
   clearNode(log);
   cardMap.clear();
   lastSeq.clear();
+  clearCapability();
   unknownDevices = {};
   if (Array.isArray(payload.degradedDevices)) {
     for (var index = 0; index < payload.degradedDevices.length; index += 1) {
@@ -830,11 +1265,9 @@ async function onReset(payload) {
   var queued = queuedEvents.splice(0);
   for (var q = 0; q < queued.length; q += 1) onEvent(queued[q]);
   if (current !== null && data !== null) {
-    var found = findDevice(data, current.deviceId);
-    if (found !== null) {
-      writeState = evaluateWriteState(found, currentRow || { agent: current.agent, running: false });
-      applyWriteState();
-    }
+    // 事件可能已给出新能力；再读一次当前会话的能力文档作为权威快照。
+    await refreshCurrentCapability();
+    evaluateCurrentWriteState();
   }
 }
 
@@ -854,6 +1287,11 @@ function onEvent(event) {
   // 同一 sessionId 在不同 agent 下不是同一条会话，必须连 agent 一起比对。
   if (event.deviceId !== current.deviceId || event.agent !== current.agent
     || event.sessionId !== current.sessionId) return;
+  // 能力文档可能由 hub 派生为 seq 0，不能按内容序号丢弃；重复投递只是重渲染。
+  if (event.kind === 'capability.changed') {
+    applyCapabilityDocument(event.payload);
+    return;
+  }
   var key = sessionKey(current);
   if (typeof event.seq === 'number') {
     var previous = lastSeq.get(key) || 0;
@@ -922,7 +1360,10 @@ sendForm.onsubmit = async function(event) {
 
 applyWriteState();
 restore();
-setInterval(function() { if (session !== null) refreshDevices(); }, 5000);
+setInterval(function() {
+  if (session === null) return;
+  refreshDevices().then(function() { return refreshCurrentCapability(); }).catch(function() {});
+}, 5000);
 try {
   var channel = new BroadcastChannel('marshal-intents');
   channel.onmessage = function() { if (session !== null) reconcilePending(); };
