@@ -6,6 +6,7 @@ import {
     HASH_DIM, HASH_PROVIDER, bufferToVector, contentHash, cosine,
     hashEmbed, memorySearchText, vectorToBuffer,
 } from './hash-vector.js';
+import { neutralizeMemory, queryTerms } from './lifecycle.js';
 
 const SCHEMA_VERSION = 1;
 const MAX_CONTENT = 20_000;
@@ -43,6 +44,11 @@ function mapMemory(row) {
         updatedAt: Number(row.updated_at),
         lastAccessedAt: row.last_accessed_at === null ? undefined : Number(row.last_accessed_at),
         accessCount: Number(row.access_count),
+        recallCount: Number(row.recall_count ?? row.access_count ?? 0),
+        clarity: row.clarity ?? 'vivid',
+        retention: Number(row.retention ?? 50),
+        lastSeenAt: row.last_seen_at === null || row.last_seen_at === undefined ? undefined : Number(row.last_seen_at),
+        archived: Number(row.archived ?? 0) === 1,
         supersededBy: row.superseded_by ?? undefined,
     };
 }
@@ -101,7 +107,22 @@ export class MemoryStore {
                 last_accessed_at INTEGER,
                 access_count INTEGER NOT NULL DEFAULT 0,
                 superseded_by TEXT,
-                content_hash TEXT NOT NULL
+                content_hash TEXT NOT NULL,
+                clarity TEXT NOT NULL DEFAULT 'vivid',
+                retention REAL NOT NULL DEFAULT 55,
+                last_seen_at INTEGER,
+                recall_count INTEGER NOT NULL DEFAULT 0,
+                archived INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS memory_archive (
+                id TEXT PRIMARY KEY, scope TEXT NOT NULL, owner_id TEXT NOT NULL, kind TEXT NOT NULL,
+                title TEXT NOT NULL, content TEXT NOT NULL, importance REAL NOT NULL DEFAULT 0.5,
+                pinned INTEGER NOT NULL DEFAULT 0, visibility TEXT NOT NULL DEFAULT 'private',
+                tags TEXT NOT NULL DEFAULT '[]', source_session TEXT, source_device TEXT,
+                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, last_accessed_at INTEGER,
+                access_count INTEGER NOT NULL DEFAULT 0, superseded_by TEXT, content_hash TEXT NOT NULL,
+                clarity TEXT NOT NULL DEFAULT 'vivid', retention REAL NOT NULL DEFAULT 55,
+                last_seen_at INTEGER, recall_count INTEGER NOT NULL DEFAULT 0, archived_at INTEGER NOT NULL
             );
             CREATE UNIQUE INDEX IF NOT EXISTS memories_hash ON memories(content_hash);
             CREATE INDEX IF NOT EXISTS memories_owner ON memories(scope, owner_id, updated_at DESC);
@@ -130,6 +151,17 @@ export class MemoryStore {
                 created_at INTEGER NOT NULL
             );
         `);
+        const columns = new Set(db.prepare('PRAGMA table_info(memories)').all().map(row => row.name));
+        const additions = [
+            ['clarity', "TEXT NOT NULL DEFAULT 'vivid'"],
+            ['retention', 'REAL NOT NULL DEFAULT 55'],
+            ['last_seen_at', 'INTEGER'],
+            ['recall_count', 'INTEGER NOT NULL DEFAULT 0'],
+            ['archived', 'INTEGER NOT NULL DEFAULT 0'],
+        ];
+        for (const [name, type] of additions) {
+            if (!columns.has(name)) db.exec('ALTER TABLE memories ADD COLUMN ' + name + ' ' + type);
+        }
         const current = db.prepare("SELECT value FROM memory_meta WHERE key='schema_version'").get();
         if (current === undefined) db.prepare("INSERT INTO memory_meta(key,value) VALUES('schema_version',?)").run(String(SCHEMA_VERSION));
     }
@@ -141,8 +173,8 @@ export class MemoryStore {
     }
 
     remember(scope, ownerId, entry, context = {}) {
-        const title = String(entry.title ?? '').trim();
-        const content = String(entry.content ?? '').trim();
+        const title = neutralizeMemory(entry.title ?? '').trim().slice(0, 160);
+        const content = neutralizeMemory(entry.content ?? '').trim();
         if (title === '' || content === '') throw new Error('memory title and content are required');
         if (content.length > MAX_CONTENT) throw new Error('memory content is too long');
         const kind = String(entry.kind ?? 'fact');
@@ -169,9 +201,9 @@ export class MemoryStore {
         db.exec('BEGIN IMMEDIATE');
         try {
             db.prepare(`INSERT INTO memories
-                (id,scope,owner_id,kind,title,content,importance,pinned,visibility,tags,source_session,source_device,created_at,updated_at,last_accessed_at,access_count,superseded_by,content_hash)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-                .run(memory.id, scope, ownerId, kind, title, content, importance, pinned, visibility, JSON.stringify(tags), memory.sourceSession, memory.sourceDevice, at, at, null, 0, null, hash);
+                (id,scope,owner_id,kind,title,content,importance,pinned,visibility,tags,source_session,source_device,created_at,updated_at,last_accessed_at,access_count,superseded_by,content_hash,clarity,retention,last_seen_at,recall_count,archived)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+                .run(memory.id, scope, ownerId, kind, title, content, importance, pinned, visibility, JSON.stringify(tags), memory.sourceSession, memory.sourceDevice, at, at, null, 0, null, hash, 'vivid', Math.max(55, importance * 100), at, 0, 0);
             this.insertFts(db, { ...memory, tags });
             const vector = hashEmbed(title + '\n' + content, HASH_DIM);
             db.prepare('INSERT INTO memory_vectors(memory_id,provider,model,dim,vector) VALUES(?,?,?,?,?)')
@@ -194,20 +226,26 @@ export class MemoryStore {
         const db = this.db(scope, ownerId);
         const cap = Math.max(1, Math.min(500, Number(limit) || 100));
         const rows = Array.isArray(kinds) && kinds.length > 0
-            ? db.prepare(`SELECT * FROM memories WHERE scope=? AND owner_id=? AND kind IN (${kinds.map(() => '?').join(',')}) ORDER BY pinned DESC, importance DESC, updated_at DESC LIMIT ?`).all(scope, ownerId, ...kinds, cap)
-            : db.prepare('SELECT * FROM memories WHERE scope=? AND owner_id=? ORDER BY pinned DESC, importance DESC, updated_at DESC LIMIT ?').all(scope, ownerId, cap);
+            ? db.prepare(`SELECT * FROM memories WHERE scope=? AND owner_id=? AND archived=0 AND kind IN (${kinds.map(() => '?').join(',')}) ORDER BY pinned DESC, importance DESC, updated_at DESC LIMIT ?`).all(scope, ownerId, ...kinds, cap)
+            : db.prepare('SELECT * FROM memories WHERE scope=? AND owner_id=? AND archived=0 ORDER BY pinned DESC, importance DESC, updated_at DESC LIMIT ?').all(scope, ownerId, cap);
         return rows.map(mapMemory);
     }
 
     forget(scope, ownerId, id) {
         const db = this.db(scope, ownerId);
+        const row = db.prepare('SELECT * FROM memories WHERE id=?').get(String(id));
+        if (row === undefined) return false;
         db.exec('BEGIN IMMEDIATE');
         try {
+            db.prepare(`INSERT OR REPLACE INTO memory_archive
+                (id,scope,owner_id,kind,title,content,importance,pinned,visibility,tags,source_session,source_device,created_at,updated_at,last_accessed_at,access_count,superseded_by,content_hash,clarity,retention,last_seen_at,recall_count,archived_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+                .run(row.id, row.scope, row.owner_id, row.kind, row.title, row.content, row.importance, row.pinned, row.visibility, row.tags, row.source_session, row.source_device, row.created_at, row.updated_at, row.last_accessed_at, row.access_count, row.superseded_by, row.content_hash, row.clarity, row.retention, row.last_seen_at, row.recall_count, nowMs(this.now));
             db.prepare('DELETE FROM memories_fts WHERE memory_id=?').run(String(id));
             db.prepare('DELETE FROM memory_vectors WHERE memory_id=?').run(String(id));
-            const result = db.prepare('DELETE FROM memories WHERE id=?').run(String(id));
+            db.prepare('DELETE FROM memories WHERE id=?').run(String(id));
             db.exec('COMMIT');
-            return Number(result.changes) > 0;
+            return true;
         }
         catch (error) {
             try { db.exec('ROLLBACK'); } catch { /* closed */ }
@@ -218,7 +256,8 @@ export class MemoryStore {
     fts(db, query, limit) {
         const text = String(query ?? '').trim();
         if (text === '') return [];
-        const tokens = memorySearchText(text).split(' ').filter(Boolean).slice(0, 24);
+        const terms = queryTerms(text);
+        const tokens = [...terms.whole, ...terms.grams].filter(Boolean).slice(0, 24);
         if (tokens.length > 0) {
             const expression = tokens.map(token => '"' + token.replace(/"/g, '""') + '"').join(' OR ');
             try {
@@ -252,7 +291,7 @@ export class MemoryStore {
         const items = [];
         for (const candidate of byId.values()) {
             const row = db.prepare('SELECT * FROM memories WHERE id=?').get(candidate.id);
-            if (row === undefined || row.superseded_by !== null) continue;
+            if (row === undefined || row.superseded_by !== null || Number(row.archived) === 1) continue;
             const memory = mapMemory(row);
             const rrfFts = candidate.ftsRank === undefined ? 0 : 1 / (60 + candidate.ftsRank);
             const rrfVector = candidate.vectorRank === undefined ? 0 : 1 / (60 + candidate.vectorRank);
@@ -261,8 +300,10 @@ export class MemoryStore {
             const recency = Math.pow(0.5, ageDays / HALF_LIFE_DAYS);
             const access = Math.min(1, Math.log1p(memory.accessCount) / 6);
             const scopeWeight = scope === 'agent' ? 1 : scope === 'workspace' ? 0.85 : 0.7;
-            const score = 0.40 * Math.min(1, rrf) + 0.25 * memory.importance + 0.15 * recency + 0.10 * access + 0.05 * scopeWeight + (memory.pinned ? 0.10 : 0);
-            items.push({ ...memory, score, why: [candidate.ftsRank === undefined ? undefined : 'fts', candidate.vectorRank === undefined ? undefined : 'vector'].filter(Boolean) });
+            const clarityWeight = memory.clarity === 'vivid' ? 1 : memory.clarity === 'clear' ? 0.8 : memory.clarity === 'fuzzy' ? 0.45 : 0.2;
+            const exact = String(query ?? '').trim() !== '' && (memory.title.toLowerCase().includes(String(query).toLowerCase()) || memory.content.toLowerCase().includes(String(query).toLowerCase()));
+            const score = 0.35 * Math.min(1, rrf) + 0.20 * memory.importance + 0.15 * recency + 0.10 * access + 0.05 * scopeWeight + 0.10 * clarityWeight + (memory.pinned ? 0.05 : 0) + (exact ? 0.08 : 0);
+            items.push({ ...memory, score, why: [candidate.ftsRank === undefined ? undefined : 'fts', candidate.vectorRank === undefined ? undefined : 'vector', clarityWeight < 1 ? 'faded-' + memory.clarity : undefined, exact ? 'exact' : undefined].filter(Boolean) });
         }
         return items;
     }
@@ -286,8 +327,8 @@ export class MemoryStore {
         if (result.length > 0) {
             for (const { scope, ownerId } of scopes) {
                 const db = this.db(scope, ownerId);
-                const update = db.prepare('UPDATE memories SET last_accessed_at=?, access_count=access_count+1 WHERE id=?');
-                for (const item of result.filter(entry => entry.scope === scope && entry.ownerId === ownerId)) update.run(nowMs(this.now), item.id);
+                const update = db.prepare('UPDATE memories SET last_accessed_at=?, last_seen_at=?, access_count=access_count+1, recall_count=recall_count+1 WHERE id=?');
+                for (const item of result.filter(entry => entry.scope === scope && entry.ownerId === ownerId)) update.run(nowMs(this.now), nowMs(this.now), item.id);
             }
         }
         return result;
@@ -331,7 +372,8 @@ export class MemoryStore {
         return { nodes: nodes.map(node => ({
             id: node.id, title: node.title, kind: node.kind, scope: node.scope,
             importance: node.importance, pinned: node.pinned, tags: node.tags,
-            accessCount: node.accessCount, createdAt: node.createdAt, updatedAt: node.updatedAt,
+            accessCount: node.accessCount, clarity: node.clarity, retention: node.retention,
+            createdAt: node.createdAt, updatedAt: node.updatedAt,
         })), edges };
     }
 
@@ -356,13 +398,63 @@ export class MemoryStore {
         }, { sessionId: record.sourceSession, deviceId: record.sourceDevice });
     }
 
+    decay(scope, ownerId) {
+        const db = this.db(scope, ownerId);
+        const at = nowMs(this.now);
+        const rows = db.prepare('SELECT * FROM memories WHERE archived=0').all();
+        let changed = 0;
+        const update = db.prepare('UPDATE memories SET clarity=?, retention=? WHERE id=?');
+        db.exec('BEGIN IMMEDIATE');
+        try {
+            for (const row of rows) {
+                const created = Number(row.created_at) || at;
+                const seen = Number(row.last_seen_at ?? row.updated_at ?? created);
+                const ageDays = Math.max(0, (at - created) / 86_400_000);
+                const sinceSeen = Math.max(0, (at - seen) / 86_400_000);
+                const important = Number(row.pinned) === 1 || row.kind === 'profile' || row.kind === 'handoff' || row.kind === 'decision';
+                if (Number(row.pinned) === 1) {
+                    if (row.clarity !== 'vivid' || Number(row.retention) !== 100) { update.run('vivid', 100, row.id); changed++; }
+                    continue;
+                }
+                let retention = Number(row.importance) * 100;
+                retention += Math.min(12, Number(row.recall_count ?? 0) * 2);
+                if (ageDays <= 7) retention += 18;
+                if (sinceSeen <= 2) retention += 8;
+                retention -= Math.min(80, Math.max(0, ageDays - 7) * (important ? 0.12 : 0.35));
+                if (important) retention = Math.max(retention, 55);
+                retention = Math.max(8, Math.min(100, retention));
+                const clarity = retention >= 68 ? 'vivid' : retention >= 46 ? 'clear' : retention >= 24 ? 'fuzzy' : 'trace';
+                if (row.clarity !== clarity || Math.abs(Number(row.retention) - retention) > 0.01) { update.run(clarity, retention, row.id); changed++; }
+            }
+            db.exec('COMMIT');
+        }
+        catch (error) {
+            try { db.exec('ROLLBACK'); } catch { /* closed */ }
+            throw error;
+        }
+        return changed;
+    }
+
+    health(scopes) {
+        return scopes.map(({ scope, ownerId }) => {
+            const db = this.db(scope, ownerId);
+            const byClarity = db.prepare('SELECT clarity, count(*) AS n FROM memories WHERE archived=0 GROUP BY clarity').all();
+            const archived = Number(db.prepare('SELECT count(*) AS n FROM memory_archive').get().n);
+            const fuzzy = byClarity.filter(row => row.clarity === 'fuzzy' || row.clarity === 'trace').reduce((sum, row) => sum + Number(row.n), 0);
+            const total = byClarity.reduce((sum, row) => sum + Number(row.n), 0);
+            return { scope, ownerId, total, archived, fuzzy, byClarity };
+        });
+    }
+
     stats(scopes) {
         return scopes.map(({ scope, ownerId }) => {
             const db = this.db(scope, ownerId);
             const total = Number(db.prepare('SELECT count(*) AS n FROM memories').get().n);
             const pinned = Number(db.prepare('SELECT count(*) AS n FROM memories WHERE pinned=1').get().n);
-            const byKind = db.prepare('SELECT kind, count(*) AS n FROM memories GROUP BY kind').all();
-            return { scope, ownerId, total, pinned, byKind, file: this.dbPath(scope, ownerId) };
+            const byKind = db.prepare('SELECT kind, count(*) AS n FROM memories WHERE archived=0 GROUP BY kind').all();
+            const byClarity = db.prepare('SELECT clarity, count(*) AS n FROM memories WHERE archived=0 GROUP BY clarity').all();
+            const archived = Number(db.prepare('SELECT count(*) AS n FROM memory_archive').get().n);
+            return { scope, ownerId, total, pinned, byKind, byClarity, archived, file: this.dbPath(scope, ownerId) };
         });
     }
 

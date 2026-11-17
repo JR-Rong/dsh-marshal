@@ -332,7 +332,8 @@ window.__ModuleLoader__.load({
             const node = entry.node;
             const base = 3.2 + Math.sqrt(Math.max(0.01, Number(node.importance))) * 8 + Math.log1p(Number(node.accessCount || 0)) * 1.6;
             const radius = Math.max(2, base * entry.scale);
-            const alpha = Math.max(0.22, Math.min(1, 1 - (entry.depth + 350) / 900));
+            const clarityAlpha = node.clarity === 'fuzzy' ? 0.5 : node.clarity === 'trace' ? 0.28 : node.clarity === 'clear' ? 0.85 : 1;
+            const alpha = Math.max(0.12, Math.min(1, 1 - (entry.depth + 350) / 900)) * clarityAlpha;
             const colors = { profile: '#f6c35c', decision: '#5aa7ff', fact: '#4fd1c5', episode: '#b18cff', handoff: '#ff9f5a', scene: '#7bd88f' };
             const color = colors[node.kind] || '#8fb4ff';
             if (selectedRef.current === node.id) {
@@ -417,6 +418,7 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = React.useState(false);
       const [syncNotice, setSyncNotice] = React.useState('');
       const [settings, setSettings] = React.useState(null);
+      const [health, setHealth] = React.useState(null);
       const [settingsOpen, setSettingsOpen] = React.useState(false);
       const agents = library?.agents ?? [];
       const agent = agents.find(item => item.id === agentId);
@@ -435,6 +437,7 @@ window.__ModuleLoader__.load({
         try {
           const data = await fetchJson('marshal/memory/graph?agentId=' + encodeURIComponent(agentId) + (workspaceId ? '&workspaceId=' + encodeURIComponent(workspaceId) : ''));
           setGraph(data.graph || { nodes: [], edges: [] });
+          try { setHealth(await fetchJson('marshal/memory/health?agentId=' + encodeURIComponent(agentId) + (workspaceId ? '&workspaceId=' + encodeURIComponent(workspaceId) : ''))); } catch { setHealth(null); }
           setError('');
         }
         catch (e) { setError(friendlyError(e, '记忆')); }
@@ -476,14 +479,17 @@ window.__ModuleLoader__.load({
           h('button', { type: 'button', style: uiButton(false), onClick: () => { void search(); } }, '搜索'),
           h('button', { type: 'button', style: uiButton(false), onClick: () => { setFormOpen(value => !value); } }, '＋ 记忆'),
           h('button', { type: 'button', style: uiButton(false), onClick: () => setSettingsOpen(value => !value) }, '设置'),
-          h('span', { style: { marginLeft: 'auto', fontSize: 11, color: dswTheme.dim } }, graph.nodes.length + ' 个节点 · ' + graph.edges.length + ' 条关联'),
+          h('span', { style: { marginLeft: 'auto', fontSize: 11, color: dswTheme.dim } }, graph.nodes.length + ' 个节点 · ' + graph.edges.length + ' 条关联' + (health?.health?.length ? ' · 模糊 ' + health.health.reduce((sum, item) => sum + (item.fuzzy || 0), 0) + ' · 档案 ' + health.health.reduce((sum, item) => sum + (item.archived || 0), 0) : '')),
           h('button', { type: 'button', style: uiButton(false), onClick: async () => { setSyncNotice('同步中…'); try { const result = await fetchJson('marshal/memory/sync', { agentId, workspaceId }); setSyncNotice('推送 ' + (result.pushed ?? 0) + ' · 拉取 ' + (result.pulled ?? 0)); await loadGraph(); } catch (e) { setSyncNotice(String(e.message || e)); } } }, '同步'),
           h('button', { type: 'button', style: uiButton(false), onClick: () => { void loadGraph(); } }, '刷新')),
         syncNotice !== '' && h('div', { style: { padding: '6px 18px', fontSize: 11, color: dswTheme.dim } }, syncNotice),
         settingsOpen && settings && h('div', { style: { padding: '10px 18px', display: 'flex', gap: 16, flexWrap: 'wrap', fontSize: 12, borderBottom: '1px solid #8883' } },
           [['autoSummary', '会话结束自动摘要'], ['autoRecall', '每轮自动召回'], ['allowGroupQuote', '群聊允许引用私有记忆']].map(([key, label]) => h('label', { key, style: { display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' } },
             h('input', { type: 'checkbox', checked: settings[key] !== false, onChange: async event => { const next = { ...settings, [key]: event.target.checked }; setSettings(next); try { const saved = await fetchJson('marshal/memory/settings', { [key]: event.target.checked }); setSettings(saved.settings); } catch { /* keep local */ } } }), label)),
-          h('span', { style: { color: dswTheme.dim, marginLeft: 'auto' } }, '摘要模型：本地启发式（可配置模型）')),
+          h('span', { style: { color: dswTheme.dim, marginLeft: 'auto' } }, '摘要模型：空 = 本地启发式')),
+        settingsOpen && settings && h('div', { style: { padding: '0 18px 10px', display: 'flex', gap: 12, flexWrap: 'wrap', fontSize: 12, borderBottom: '1px solid #8883' } },
+          h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } }, '摘要 provider', h('input', { defaultValue: settings.summaryProvider ?? '', placeholder: 'empty = 本地', onBlur: async event => { const value = event.target.value.trim(); try { const saved = await fetchJson('marshal/memory/settings', { summaryProvider: value }); setSettings(saved.settings); } catch { /* keep local */ } }, style: { ...uiInput, width: 150 } })),
+          h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } }, '摘要模型', h('input', { defaultValue: settings.summaryModel ?? '', placeholder: 'empty = 本地', onBlur: async event => { const value = event.target.value.trim(); try { const saved = await fetchJson('marshal/memory/settings', { summaryModel: value }); setSettings(saved.settings); } catch { /* keep local */ } }, style: { ...uiInput, width: 180 } }))),
         error !== '' && h('div', { style: { padding: '8px 18px', color: dswTheme.danger, fontSize: 12 } }, error),
         formOpen && h('div', { style: { padding: '12px 18px', display: 'grid', gap: 8, borderBottom: '1px solid #8883' } },
           h('div', { style: { display: 'flex', gap: 8 } },
@@ -500,7 +506,7 @@ window.__ModuleLoader__.load({
             h('h3', { style: { margin: '6px 0 10px', fontSize: 16 } }, selected.title),
             h('p', { style: { whiteSpace: 'pre-wrap', fontSize: 13, lineHeight: 1.65 } }, selected.content),
             h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 12 } }, (selected.tags || []).map(tag => h('span', { key: tag, style: { fontSize: 11, padding: '3px 7px', borderRadius: 999, background: 'color-mix(in srgb, currentColor 8%, transparent)' } }, tag))),
-            h('div', { style: { marginTop: 14, fontSize: 11, color: dswTheme.dim } }, '重要性 ' + Math.round((selected.importance || 0) * 100) + '% · 访问 ' + (selected.accessCount || 0) + ' 次' + (selected.pinned ? ' · 已固定' : '')),
+            h('div', { style: { marginTop: 14, fontSize: 11, color: dswTheme.dim } }, '清晰度 ' + ({ vivid: '清晰', clear: '清楚', fuzzy: '模糊', trace: '只剩印象' }[selected.clarity] || selected.clarity || '清晰') + ' · 重要性 ' + Math.round((selected.importance || 0) * 100) + '% · 访问 ' + (selected.accessCount || 0) + ' 次' + (selected.pinned ? ' · 已固定' : '')),
             h('div', { style: { display: 'flex', gap: 8, marginTop: 16 } },
               h('button', { type: 'button', style: uiButton(false), onClick: () => { void forget(selected); } }, '删除'),
               h('button', { type: 'button', style: uiButton(false), onClick: () => setSelected(null) }, '关闭')))),

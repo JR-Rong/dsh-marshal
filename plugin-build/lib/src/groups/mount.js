@@ -163,6 +163,17 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource = 
             if (memory === undefined) { write(res, 503, { ok: false, code: 'no-agent-memory' }); return; }
             write(res, 200, { ok: true, settings: memory.settings });
         }),
+        exact('GET', '/marshal/memory/health', async (req, res) => {
+            if (memory === undefined) { write(res, 503, { ok: false, code: 'no-agent-memory' }); return; }
+            const url = new URL(req.url ?? '/', 'http://marshal.local');
+            const agentId = url.searchParams.get('agentId') ?? undefined;
+            const workspaceId = url.searchParams.get('workspaceId') ?? undefined;
+            const scopes = [];
+            if (agentId !== undefined) scopes.push({ scope: 'agent', ownerId: agentId });
+            if (workspaceId !== undefined) scopes.push({ scope: 'workspace', ownerId: workspaceId });
+            scopes.push({ scope: 'global', ownerId: 'global' });
+            write(res, 200, { ok: true, health: memory.store.health(scopes), stats: memory.settings });
+        }),
         exact('POST', '/marshal/memory/settings', async (req, res) => {
             if (memory === undefined) { write(res, 503, { ok: false, code: 'no-agent-memory' }); return; }
             const body = await readBody(req);

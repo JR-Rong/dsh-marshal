@@ -21,17 +21,26 @@ Agent 进入一个工作区时，同时读取该工作区的共享记忆；换�
 
 ## 检索
 
-- FTS5 unicode61 + 中文 bigram/trigram 预处理；
+- FTS5 unicode61 + 中文 bigram/trigram 预处理，查询侧剔除功能词 bigram；
 - 384 维本地哈希向量（默认，无外部依赖）；
-- 最终分数 = FTS/向量 RRF + importance + recency + access + pinned；
+- 最终分数 = FTS/向量命中 + importance + clarity + recency + access；
 - 可后续切换真实 embedding，表结构不换。
+
+## 清晰度与归档
+
+- `vivid → clear → fuzzy → trace`，不自动进入 forgotten；
+- 重要 / pinned / profile / handoff / decision 衰减更慢；
+- 注入时模糊记忆会带“细节记不清了”的措辞；
+- 手动删除进入 `memory_archive`，不物理销毁。
 
 ## 自动记忆
 
 - 会话开始：注入 Agent profile/handoff、当前 Workspace 交接、Global 规则；
 - 每条新用户消息：按最后一条用户消息做一次 top-k 召回；
-- 会话 turn/end 后 60 秒：本地启发式摘要写入 Agent episode；
-- 设置页可关闭自动摘要/自动召回。
+- 系统提示按“固定区 + 相关区”拼装，超预算整条裁剪；
+- 会话 turn/end 后 60 秒：过滤 → summaryModel 提炼 → 规则打分 → 写 Agent episode；
+- summaryProvider/summaryModel 留空时退回本地启发式；
+- 设置页可关闭自动摘要/自动召回，并配置摘要 provider/model。
 
 ## 加密同步
 
