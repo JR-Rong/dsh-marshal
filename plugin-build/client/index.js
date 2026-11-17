@@ -1539,23 +1539,43 @@ window.__ModuleLoader__.load({
             boardButton.onclick = () => { if (!openPanel('task-board')) goTab('tasks'); };
             nav.appendChild(boardButton);
             document.body.appendChild(nav);
+            const findCenter = () => {
+              let best = null;
+              let bestArea = 0;
+              for (const node of document.querySelectorAll('[class*="centerCol"]')) {
+                const rect = node.getBoundingClientRect();
+                if (rect.width < 300 || rect.height < 200) continue;
+                const style = getComputedStyle(node);
+                if (style.display === 'none' || style.visibility === 'hidden') continue;
+                const area = rect.width * rect.height;
+                if (area > bestArea) { best = node; bestArea = area; }
+              }
+              return best;
+            };
+            const findRightControl = () => {
+              const control = document.querySelector('[aria-label="Open right sidebar"], [aria-label="Close right sidebar"], [aria-label*="right sidebar" i], [aria-label*="右侧"], [aria-label*="右栏"], [aria-label*="侧边栏"]');
+              return control === null ? null : control.getBoundingClientRect();
+            };
             const positionNav = () => {
-              const center = document.querySelector('[class*="centerCol"]');
+              const center = findCenter();
+              const control = findRightControl();
               if (center === null) {
                 nav.style.left = 'auto';
                 nav.style.right = '150px';
                 return;
               }
               const rect = center.getBoundingClientRect();
-              const rightControl = document.querySelector('[aria-label="Open right sidebar"], [aria-label="Close right sidebar"], [aria-label*="right sidebar" i], [aria-label*="右侧"], [aria-label*="右栏"], [aria-label*="侧边栏"]');
-              const controlLeft = rightControl === null ? rect.right - 56 : rightControl.getBoundingClientRect().left - 8;
-              const limit = Math.min(rect.right - 12, controlLeft, rect.right - 56);
+              let limit = rect.right - 56;
+              if (control !== null && control.left > rect.left && control.left <= rect.right + 8) {
+                limit = Math.min(limit, control.left - 8);
+              }
+              const left = Math.max(rect.left + 8, Math.min(limit - nav.offsetWidth, rect.right - 12 - nav.offsetWidth));
               nav.style.right = 'auto';
-              nav.style.left = Math.max(8, Math.round(limit - nav.offsetWidth)) + 'px';
+              nav.style.left = Math.round(left) + 'px';
             };
             let attachAttempts = 0;
             const attachCenter = () => {
-              const center = document.querySelector('[class*="centerCol"]');
+              const center = findCenter();
               if (center === null) {
                 if (attachAttempts++ < 40) setTimeout(attachCenter, 250);
                 return;
