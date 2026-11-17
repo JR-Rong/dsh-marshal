@@ -241,9 +241,17 @@ window.__ModuleLoader__.load({
         window.addEventListener('marshal:tab', onTab);
         return () => { window.removeEventListener('marshal:tab', onTab); };
       }, []);
+      React.useEffect(() => {
+        let alive = true;
+        fetchJson('marshal/health')
+          .then(next => { if (alive) setHealth(next); })
+          .catch(() => { if (alive) setHealth(null); });
+        return () => { alive = false; };
+      }, [attempt]);
       const [address, setAddress] = React.useState(null);
       const [setup, setSetup] = React.useState(null);
       const [state, setState] = React.useState({ authenticated: false });
+      const [health, setHealth] = React.useState(null);
       const [binding, setBinding] = React.useState(null);
       const [notice, setNotice] = React.useState('正在连接调度官…');
       const [older, setOlder] = React.useState(null);
@@ -439,11 +447,15 @@ window.__ModuleLoader__.load({
       return h('section', { 'aria-label': '调度官', style: { height: '100%', minHeight: 0, width: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden' } },
         h('header', { style: { padding: '12px 20px', minHeight: 54, display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderBottom: '1px solid #8883', flexShrink: 0 } },
           h('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } }, h(MarshalIcon), h('h1', { style: { fontSize: 16, fontWeight: 600, margin: 0 } }, '调度官'), h('span', { style: { fontSize: 12, opacity: .55 } }, state.account ? state.account.name + ' · ' + state.workspaceName : '原生会话')),
-          h('div', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+          h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' } },
+            h(MarshalNav, { active: tab, onTab: chooseTab, openPanel, compact: true }),
+            health && (!health.capabilities?.agents || !health.capabilities?.taskBoard) && h('span', { style: { fontSize: 11, color: dswTheme.danger } },
+              '缺少：' + [!health.capabilities?.agents ? '智能体后端' : '', !health.capabilities?.taskBoard ? '任务看板后端' : ''].filter(Boolean).join('、')),
             h('button', { type: 'button', style: buttonStyle, onClick: () => retry(value => value + 1) }, '重新连接'))),
         tab === 'groups' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex' } }, h(GroupsPage, { openSession, onOpenAgents: () => chooseTab('agents') })),
         tab === 'agents' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex' } }, h(AgentsPage, { onOpenGroups: () => chooseTab('groups'), openSession, workspaceService })),
         tab === 'cross' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex' } }, h(CrossGroupsPage)),
+        tab === 'tasks' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex' } }, h(TaskBoardPage, { openSession })),
         tab === 'session' && h('div', { style: { display: 'flex', flex: 1, minHeight: 0 } },
           address && h('iframe', { ref: iframe, onLoad: connect, title: '调度官设备与群聊', src: address,
             sandbox: 'allow-scripts allow-same-origin allow-forms', allow: 'clipboard-write', referrerPolicy: 'no-referrer',
@@ -524,6 +536,14 @@ window.__ModuleLoader__.load({
       outline: 'none',
     };
     const uiMuted = { color: dswTheme.faint, fontSize: 12 };
+
+    function friendlyError(error, area) {
+      const message = String(error && error.message ? error.message : error);
+      if (message.includes('404')) return area + '后端未挂载：智能体需要 @linxin666/dsh-agents，任务看板需要 task-board；安装后重启 DSH';
+      if (message.includes('no-task-board') || message.includes('503')) return area + '后端未挂载：请安装 task-board 插件，或升级到带内置看板的构建';
+      if (message.includes('no-ledger') || message.includes('no-web-server')) return area + '后端未就绪：请先打开一次智能体并确认 @linxin666/dsh-agents 已启用';
+      return area + '失败：' + message;
+    }
 
     async function fetchJson(path, body) {
       const init = body === undefined ? {} : {
@@ -639,6 +659,45 @@ window.__ModuleLoader__.load({
       }, agentInitial(name));
     }
 
+    function MarshalNav({ active, onTab, openPanel, compact = false }) {
+      const tabs = [['session', '会话'], ['groups', '群聊'], ['agents', '智能体'], ['cross', '跨设备']];
+      const button = (key, label) => h('button', {
+        key, type: 'button', 'aria-pressed': active === key,
+        style: {
+          border: 0, borderRadius: 999, cursor: 'pointer', whiteSpace: 'nowrap',
+          font: (compact ? '11px/1' : '12px/1') + ' inherit',
+          padding: compact ? '6px 9px' : '7px 11px',
+          background: active === key ? 'color-mix(in srgb, currentColor 16%, transparent)' : 'transparent',
+          color: 'inherit', fontWeight: active === key ? 600 : 400,
+          transition: 'background .15s ease',
+        },
+        onClick: () => onTab(key),
+      }, label);
+      return h('div', {
+        id: 'marshal-quick-nav',
+        'data-active': active,
+        role: 'navigation', 'aria-label': '调度官快速切换',
+        style: {
+          display: 'flex', alignItems: 'center', gap: 2, padding: 3,
+          borderRadius: 999, border: '1px solid color-mix(in srgb, currentColor 14%, transparent)',
+          background: 'color-mix(in srgb, currentColor 5%, transparent)',
+          flexShrink: 0, maxWidth: '100%', overflowX: 'auto',
+        },
+      },
+        ...tabs.map(([key, label]) => button(key, label)),
+        h('button', {
+          type: 'button', 'aria-pressed': active === 'tasks',
+          style: {
+            border: 0, borderRadius: 999, cursor: 'pointer', whiteSpace: 'nowrap',
+            font: (compact ? '11px/1' : '12px/1') + ' inherit',
+            padding: compact ? '6px 9px' : '7px 11px',
+            background: active === 'tasks' ? 'color-mix(in srgb, currentColor 16%, transparent)' : 'transparent',
+            color: 'inherit', fontWeight: active === 'tasks' ? 600 : 400,
+          },
+          onClick: () => { if (openPanel && openPanel('task-board')) return; onTab('tasks'); },
+        }, '任务看板'));
+    }
+
     function Field({ label, children }) {
       return h('label', { style: { display: 'grid', gap: 6, fontSize: 12, color: dswTheme.dim } }, label, children);
     }
@@ -679,7 +738,7 @@ window.__ModuleLoader__.load({
           setLibrary(agentLibrary);
           setError('');
         }
-        catch (e) { setError('加载失败：' + (e.message || e)); }
+        catch (e) { setError(friendlyError(e, '智能体/群聊')); }
       };
       const reloadGroup = async () => {
         if (!group) return;
@@ -1084,7 +1143,7 @@ window.__ModuleLoader__.load({
 
       const load = async () => {
         try { const data = await fetchJson('marshal/tasks/state'); setTasks(data.tasks || []); setError(''); }
-        catch (e) { setError('加载失败：' + (e.message || e)); }
+        catch (e) { setError(friendlyError(e, '任务看板')); }
       };
       React.useEffect(() => {
         void load();
@@ -1182,7 +1241,7 @@ window.__ModuleLoader__.load({
 
       const load = async () => {
         try { setLibrary(await loadAgentLibrary()); setError(''); }
-        catch (e) { setError('加载失败：' + (e.message || e)); }
+        catch (e) { setError(friendlyError(e, '智能体')); }
       };
       React.useEffect(() => { void load(); }, []);
 
@@ -1471,7 +1530,7 @@ window.__ModuleLoader__.load({
           if (!document.getElementById('marshal-consolidated-rows')) {
             const style = document.createElement('style');
             style.id = 'marshal-consolidated-rows';
-            style.textContent = 'button:has([data-dsh-panel-entry="agents"]),[role="button"]:has([data-dsh-panel-entry="agents"]),li:has([data-dsh-panel-entry="agents"]),button:has([data-dsh-panel-entry="task-board"]),[role="button"]:has([data-dsh-panel-entry="task-board"]),li:has([data-dsh-panel-entry="task-board"]){display:none!important}[data-dsh-taskboard-view]{padding-top:44px!important;box-sizing:border-box!important;position:relative}[data-dsh-taskboard-view]::before{content:"";position:absolute;left:0;right:0;top:0;height:44px;background:var(--dsw-alias-bg-base);border-bottom:1px solid var(--dsw-alias-border-l1);pointer-events:none}';
+            style.textContent = 'button:has([data-dsh-panel-entry="agents"]),[role="button"]:has([data-dsh-panel-entry="agents"]),li:has([data-dsh-panel-entry="agents"]),button:has([data-dsh-panel-entry="task-board"]),[role="button"]:has([data-dsh-panel-entry="task-board"]),li:has([data-dsh-panel-entry="task-board"]){display:none!important}[data-dsh-taskboard-view]{padding-top:44px!important;box-sizing:border-box!important;position:relative}';
             document.head.appendChild(style);
           }
         } catch (error) { /* a DOM-less host keeps its own panel list */ }
@@ -1483,8 +1542,9 @@ window.__ModuleLoader__.load({
         const openPanel = id => {
           try {
             const layout = ctx.get && ctx.get('layout');
-            if (layout && typeof layout.selectPanel === 'function') layout.selectPanel(id);
+            if (layout && typeof layout.selectPanel === 'function') { layout.selectPanel(id); return true; }
           } catch (error) { /* layout unavailable */ }
+          return false;
         };
         const goTab = tab => {
           pendingTab = tab;
@@ -1494,33 +1554,45 @@ window.__ModuleLoader__.load({
           }, 60);
         };
         try {
-          if (!document.getElementById('marshal-quick-nav')) {
-            const nav = document.createElement('div');
-            nav.id = 'marshal-quick-nav';
-            nav.setAttribute('role', 'navigation');
-            nav.setAttribute('aria-label', '调度官快速切换');
-            nav.style.cssText = 'position:fixed;top:9px;right:150px;display:flex;gap:2px;padding:3px;border-radius:999px;border:1px solid color-mix(in srgb, currentColor 14%, transparent);background:color-mix(in srgb, #151517 78%, transparent);backdrop-filter:blur(14px);z-index:2147483000;box-shadow:0 6px 20px rgba(0,0,0,.25);font-family:inherit';
-            for (const [key, label] of [['session', '会话'], ['groups', '群聊'], ['agents', '智能体'], ['cross', '跨设备']]) {
-              const button = document.createElement('button');
-              button.type = 'button';
-              button.textContent = label;
-              button.style.cssText = 'border:0;background:transparent;color:#e9e7e4;font:12px/1 inherit;padding:7px 12px;border-radius:999px;cursor:pointer';
-              button.onmouseenter = () => { button.style.background = 'rgba(255,255,255,.10)'; };
-              button.onmouseleave = () => { button.style.background = 'transparent'; };
-              button.onclick = () => goTab(key);
-              nav.appendChild(button);
-            }
-            const boardButton = document.createElement('button');
-            boardButton.type = 'button';
-            boardButton.textContent = '任务看板';
-            boardButton.style.cssText = 'border:0;background:transparent;color:#e9e7e4;font:12px/1 inherit;padding:7px 12px;border-radius:999px;cursor:pointer';
-            boardButton.onmouseenter = () => { boardButton.style.background = 'rgba(255,255,255,.10)'; };
-            boardButton.onmouseleave = () => { boardButton.style.background = 'transparent'; };
-            boardButton.onclick = () => openPanel('task-board');
-            nav.appendChild(boardButton);
-            document.body.appendChild(nav);
-          }
-        } catch (error) { /* DOM-less host */ }
+          ctx.slots.inject('conversation.session.header.actions', () => ctx.slots.register({
+            name: 'conversation.session.header.actions',
+            id: 'marshal-quick-nav',
+            order: 40,
+          }, () => h(MarshalNav, { active: 'session', onTab: goTab, openPanel, compact: true })));
+        } catch (error) { /* older host without the conversation header action slot */ }
+        const ensureTaskboardHeader = () => {
+          const root = document.querySelector('[data-dsh-taskboard-view]');
+          if (root === null || root.querySelector('#marshal-taskboard-head') !== null) return;
+          const bar = document.createElement('div');
+          bar.id = 'marshal-taskboard-head';
+          bar.style.cssText = 'position:absolute;top:0;left:0;right:0;height:44px;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:0 16px;box-sizing:border-box;background:var(--dsw-alias-bg-base);border-bottom:1px solid var(--dsw-alias-border-l1);z-index:6;color:inherit;font-family:inherit';
+          const title = document.createElement('div');
+          title.textContent = '任务看板';
+          title.style.cssText = 'font-size:14px;font-weight:600;white-space:nowrap';
+          const nav = document.createElement('div');
+          nav.style.cssText = 'display:flex;align-items:center;gap:2px;padding:3px;border-radius:999px;border:1px solid color-mix(in srgb, currentColor 14%, transparent);background:color-mix(in srgb, currentColor 5%, transparent);overflow-x:auto;max-width:100%';
+          const add = (label, key) => {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.textContent = label;
+            button.setAttribute('aria-pressed', key === 'tasks' ? 'true' : 'false');
+            button.style.cssText = 'border:0;border-radius:999px;cursor:pointer;white-space:nowrap;font:11px/1 inherit;padding:6px 9px;color:inherit;background:' + (key === 'tasks' ? 'color-mix(in srgb, currentColor 16%, transparent)' : 'transparent') + ';font-weight:' + (key === 'tasks' ? '600' : '400');
+            button.onclick = () => {
+              if (key === 'tasks') return;
+              goTab(key);
+            };
+            nav.appendChild(button);
+          };
+          add('会话', 'session');
+          add('群聊', 'groups');
+          add('智能体', 'agents');
+          add('跨设备', 'cross');
+          add('任务看板', 'tasks');
+          bar.append(title, nav);
+          root.prepend(bar);
+        };
+        ensureTaskboardHeader();
+        setInterval(ensureTaskboardHeader, 1000);
         ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({ name: 'sidebar.panellist', id: PANEL, order: 25, label: () => '调度官' }, MarshalIcon));
         ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: PANEL,
           children: { 'marshal.native.body': { kind: 'single', scope: 'session' } },

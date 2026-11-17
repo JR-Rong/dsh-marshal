@@ -1,23 +1,29 @@
 {
   "name": "dsh-marshal",
-  "version": "0.2.0-agent-groups.1",
-  "description": "Dispatch marshal: cross-device agent groups, resident sessions, task board and two-level memory.",
+  "version": "0.2.0-agent-groups.2",
+  "description": "Cross-device agent groups with resident DSH sessions, task board and memory.",
+  "icon": "icon.svg",
   "type": "module",
   "engines": { "node": ">=24" },
   "exports": {
     ".": "./lib/src/index.js",
-    "./client": "./client/index.js"
+    "./client": "./client/index.js",
+    "./locale/en.json": "./locale/en.json",
+    "./locale/zh.json": "./locale/zh.json",
+    "./package.json": "./package.json"
   },
-  "files": ["lib", "client", "cordis.patch.yml"],
+  "files": ["lib", "client", "locale", "cordis.patch.yml", "icon.svg", "README.md", "INSTALL.md"],
   "dsh": {
     "bundle": { "patch": "cordis.patch.yml" },
     "client": { "platform": "web" }
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "0.3.316",
     "entities": "9.0.0",
     "marked": "18.1.2",
     "ws": "^8.21.3",
     "zod": "^4.4.3"
+  },
+  "optionalDependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.316"
   }
 }
