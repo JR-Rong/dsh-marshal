@@ -935,6 +935,88 @@ window.__ModuleLoader__.load({
       }, agentInitial(name));
     }
 
+
+    function installSidebarWorkspaceSwitch() {
+      if (typeof document === 'undefined' || window.__marshalSidebarSwitch === true) return;
+      window.__marshalSidebarSwitch = true;
+      const KEY = 'marshal.sidebar.scope';
+      let mode = localStorage.getItem(KEY) === 'agents' ? 'agents' : 'workspace';
+      if (!document.getElementById('marshal-scope-style')) {
+        const style = document.createElement('style');
+        style.id = 'marshal-scope-style';
+        style.textContent = '[data-marshal-scope-hidden="1"]{display:none!important}'
+          + '#marshal-scope-switch{display:flex;align-items:center;gap:2px;padding:2px;margin:4px 8px 5px;border-radius:999px;border:1px solid color-mix(in srgb, currentColor 14%, transparent);background:color-mix(in srgb, currentColor 5%, transparent);flex-shrink:0;align-self:flex-start}'
+          + '#marshal-scope-switch button{border:0;background:transparent;color:inherit;font:10px/1 inherit;padding:4px 7px;border-radius:999px;cursor:pointer;white-space:nowrap}'
+          + '#marshal-scope-switch button[data-active="1"]{background:color-mix(in srgb, currentColor 14%, transparent);font-weight:600}';
+        document.head.appendChild(style);
+      }
+      const groupFor = row => {
+        let node = row;
+        while (node.parentElement !== null && node.parentElement.getAttribute('role') !== 'tree') node = node.parentElement;
+        return node.parentElement === null ? undefined : node;
+      };
+      const isAgentRow = row => {
+        const title = row.querySelector('[class*="title"]')?.textContent?.trim() ?? row.textContent.trim();
+        return title.startsWith('Agent · ');
+      };
+      const apply = () => {
+        const wrapper = document.querySelector('[data-slot="sidebar.workspaces"]');
+        if (wrapper === null) return;
+        const rows = [...wrapper.querySelectorAll('[data-row-key^="workspace:"]')];
+        const seen = new Set();
+        for (const row of rows) {
+          const group = groupFor(row);
+          if (group === undefined || seen.has(group)) continue;
+          seen.add(group);
+          const agent = isAgentRow(row);
+          group.setAttribute('data-marshal-scope-hidden', (mode === 'agents') === agent ? '0' : '1');
+        }
+        for (const group of wrapper.querySelectorAll('[class*="groupSection"]')) {
+          if (seen.has(group)) continue;
+          group.setAttribute('data-marshal-scope-hidden', mode === 'agents' ? '1' : '0');
+        }
+      };
+      const ensure = () => {
+        const header = document.querySelector('[data-sidebar-workspace-header]');
+        if (header === null) return;
+        let toggle = header.parentElement.querySelector('#marshal-scope-switch') ?? header.querySelector('#marshal-scope-switch');
+        if (toggle === null) {
+          toggle = document.createElement('div');
+          toggle.id = 'marshal-scope-switch';
+          toggle.setAttribute('role', 'tablist');
+          toggle.setAttribute('aria-label', '切换工作区 / Agents');
+          for (const [key, label] of [['workspace', '工作区'], ['agents', 'Agents']]) {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.dataset.scope = key;
+            button.textContent = label;
+            button.onclick = event => {
+              event.preventDefault();
+              event.stopPropagation();
+              mode = key;
+              localStorage.setItem(KEY, key);
+              refresh();
+              apply();
+            };
+            toggle.appendChild(button);
+          }
+          header.parentElement.insertBefore(toggle, header.nextSibling);
+        }
+        refresh();
+        apply();
+      };
+      const refresh = () => {
+        const toggle = document.getElementById('marshal-scope-switch');
+        if (toggle === null) return;
+        for (const button of toggle.querySelectorAll('button')) button.dataset.active = button.dataset.scope === mode ? '1' : '0';
+      };
+      const schedule = () => { requestAnimationFrame(() => { ensure(); }); };
+      const observer = new MutationObserver(schedule);
+      observer.observe(document.body, { childList: true, subtree: true });
+      setInterval(ensure, 1200);
+      ensure();
+    }
+
     function MarshalNav({ active, onTab, openPanel, compact = false }) {
       const tabs = [['session', '会话'], ['groups', '群聊'], ['agents', '智能体'], ['cross', '跨设备'], ['memory', '记忆']];
       const button = (key, label) => h('button', {
@@ -1810,6 +1892,7 @@ window.__ModuleLoader__.load({
             document.head.appendChild(style);
           }
         } catch (error) { /* a DOM-less host keeps its own panel list */ }
+        installSidebarWorkspaceSwitch();
         const openSessionRef = { current: undefined };
         ctx.inject(['uiWorkspace'], inner => {
           const workspace = inner.get('uiWorkspace');

@@ -48,6 +48,7 @@
 - FTS5 + 384 维本地哈希向量，可升级真实 embedding；
 - 会话结束自动摘要，可关闭；
 - 记忆页可搜索、查看节点详情、手动写入、删除、同步；
+- 左侧栏增加“工作区 / Agents”切换，工作区会话和 Agent 工作区分开显示；
 - Hub 加密同步使用 `DSH_MARSHAL_MEMORY_SYNC_KEY` 共享口令，hub 只保存密文。
 
 详细设计、路径、同步和限制见 [Agent 记忆说明](docs/agent-memory.md)。
