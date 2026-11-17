@@ -40,6 +40,18 @@
 >
 > **必须同时安装** `@linxin666/dsh-agents`（智能体/群聊/跨设备后端）；**建议安装** `@linxin666/dsh-client-ui-task-board`（完整看板）。它们都是 DSH 插件，不是 marshal 的 npm 普通依赖。完整依赖表、命令和排障见 [INSTALL.md](INSTALL.md)。
 
+## Agent 记忆
+
+调度官给每个 Agent 增加 SQLite 长期记忆，并在胶囊里提供“记忆”3D 星系：
+
+- Agent 私有 / 当前工作区共享 / Global 三层；
+- FTS5 + 384 维本地哈希向量，可升级真实 embedding；
+- 会话结束自动摘要，可关闭；
+- 记忆页可搜索、查看节点详情、手动写入、删除、同步；
+- Hub 加密同步使用 `DSH_MARSHAL_MEMORY_SYNC_KEY` 共享口令，hub 只保存密文。
+
+详细设计、路径、同步和限制见 [Agent 记忆说明](docs/agent-memory.md)。
+
 ## 安装 hub
 
 hub 不自己监听端口，它把 `/marshal` 与 `/marshal/api/*` 挂到 DSH 的 web server 上，因此 hub 机器上必须先有可用的 DSH web。

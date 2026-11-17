@@ -25,6 +25,7 @@ import { createPrivacyProjector } from "./node/privacy.js";
 import { mountSetup } from "./setup.js";
 import { mountDispatch } from "./dispatch/mount.js";
 import { mountMemory } from "./memory/mount.js";
+import { mountAgentMemory } from "./memory/agent-memory.js";
 import { mountGroups } from "./groups/mount.js";
 import { mountWorkspaceIdentity } from "./groups/workspace-identity.js";
 export const name = 'marshal';
@@ -406,12 +407,19 @@ function applyNode(ctx, config) {
     // 调度台（派单台账 + 记忆）：刻意放在中继装配之后，失败只降级这两个能力，
     // 绝不影响 node ↔ hub 的会话中继本身。
     let memoryService;
+    let agentMemoryService;
     if (config.memory) {
         try {
             memoryService = mountMemory(ctx, config, { logger: ctx.logger });
         }
         catch (error) {
             ctx.logger.warn(`marshal: memory unavailable: ${errorName(error)}`);
+        }
+        try {
+            agentMemoryService = mountAgentMemory(ctx, config, { logger: ctx.logger });
+        }
+        catch (error) {
+            ctx.logger.warn(`marshal: agent memory unavailable: ${errorName(error)}`);
         }
     }
     if (config.dispatch) {
@@ -424,7 +432,7 @@ function applyNode(ctx, config) {
     }
     if (config.groups) {
         try {
-            mountGroups(ctx, config, { logger: ctx.logger });
+            mountGroups(ctx, config, { logger: ctx.logger, memory: agentMemoryService });
         }
         catch (error) {
             ctx.logger.warn(`marshal: groups unavailable: ${errorName(error)}`);

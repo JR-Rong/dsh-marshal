@@ -232,6 +232,281 @@ window.__ModuleLoader__.load({
         h('style', null, '.marshal-native-conversation button[aria-haspopup],.marshal-native-conversation button[aria-label^="访问模式"],.marshal-native-conversation button[aria-label^="计划模式"],.marshal-native-conversation button[aria-label*="分支"],.marshal-native-conversation button[aria-label="好的回答"],.marshal-native-conversation button[aria-label="有问题的回答"] { display:none }'),
         renderFactorySlot('conversation.content', { variant: 'embedded', phase: 'active', hero: false }));
     }
+
+    function MemoryGalaxy({ graph, selectedId, onSelect }) {
+      const canvasRef = React.useRef(null);
+      const stateRef = React.useRef(null);
+      const selectRef = React.useRef(onSelect);
+      selectRef.current = onSelect;
+      const selectedRef = React.useRef(selectedId);
+      selectedRef.current = selectedId;
+      React.useEffect(() => {
+        const canvas = canvasRef.current;
+        if (!canvas || !graph) return undefined;
+        const nodes = (graph.nodes || []).slice(0, 420).map((node, index) => {
+          const hash = (value) => { let h = 2166136261; for (let i = 0; i < value.length; i++) { h ^= value.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; };
+          const h = hash(node.id || String(index));
+          const angle = (h % 1000) / 1000 * Math.PI * 2;
+          const radius = 70 + ((h >>> 10) % 1000) / 1000 * 300;
+          return { ...node, x: Math.cos(angle) * radius, y: ((h >>> 20) % 1000) / 1000 * 420 - 210, z: Math.sin(angle) * radius, vx: 0, vy: 0, vz: 0 };
+        });
+        const ids = new Map(nodes.map((node, index) => [node.id, index]));
+        const edges = (graph.edges || []).map(edge => ({ ...edge, a: ids.get(edge.source), b: ids.get(edge.target) })).filter(edge => edge.a !== undefined && edge.b !== undefined && edge.a !== edge.b).slice(0, 1400);
+        for (let iteration = 0; iteration < 110; iteration++) {
+          for (let i = 0; i < nodes.length; i++) {
+            const a = nodes[i];
+            for (let j = i + 1; j < nodes.length; j++) {
+              const b = nodes[j];
+              let dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
+              let d2 = dx * dx + dy * dy + dz * dz + 12;
+              const force = 5200 / d2;
+              const d = Math.sqrt(d2);
+              dx /= d; dy /= d; dz /= d;
+              a.vx += dx * force; a.vy += dy * force; a.vz += dz * force;
+              b.vx -= dx * force; b.vy -= dy * force; b.vz -= dz * force;
+            }
+            a.vx -= a.x * 0.0007; a.vy -= a.y * 0.0007; a.vz -= a.z * 0.0007;
+          }
+          for (const edge of edges) {
+            const a = nodes[edge.a], b = nodes[edge.b];
+            const dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
+            const d = Math.sqrt(dx * dx + dy * dy + dz * dz) + 0.01;
+            const force = (d - 170) * 0.008 * (0.4 + Number(edge.weight || 0.4));
+            const fx = dx / d * force, fy = dy / d * force, fz = dz / d * force;
+            a.vx += fx; a.vy += fy; a.vz += fz;
+            b.vx -= fx; b.vy -= fy; b.vz -= fz;
+          }
+          for (const node of nodes) { node.vx *= 0.72; node.vy *= 0.72; node.vz *= 0.72; node.x += node.vx; node.y += node.vy; node.z += node.vz; }
+        }
+        let maxRadius = 1;
+        for (const node of nodes) maxRadius = Math.max(maxRadius, Math.hypot(node.x, node.y, node.z));
+        const spread = nodes.length <= 4 ? 360 : 300;
+        for (const node of nodes) { const factor = spread / maxRadius; node.x *= factor; node.y *= factor; node.z *= factor; }
+        const stars = Array.from({ length: 220 }, (_, index) => ({ x: (index * 73 % 997) / 997, y: (index * 151 % 991) / 991, r: (index % 7) / 7 * 1.2 + 0.2, phase: index }));
+        const labelIds = new Set([...nodes].sort((a, b) => (Number(b.pinned) - Number(a.pinned)) || (Number(b.importance) - Number(a.importance))).slice(0, 8).map(node => node.id));
+        const camera = { yaw: 0.35, pitch: -0.16, zoom: 1, auto: true, dragging: false, moved: false, lastX: 0, lastY: 0, hover: undefined };
+        stateRef.current = { nodes, edges, stars, camera, width: 0, height: 0 };
+        let raf = 0;
+        let disposed = false;
+        const toScreen = (node, width, height) => {
+          const cy = Math.cos(camera.yaw), sy = Math.sin(camera.yaw);
+          const cp = Math.cos(camera.pitch), sp = Math.sin(camera.pitch);
+          let x = node.x * cy - node.z * sy;
+          let z = node.x * sy + node.z * cy;
+          let y = node.y * cp - z * sp;
+          z = node.y * sp + z * cp;
+          const focal = 900;
+          const scale = focal / (focal + z) * camera.zoom;
+          return { x: width / 2 + x * scale, y: height / 2 + y * scale, scale, depth: z };
+        };
+        const draw = () => {
+          if (disposed) return;
+          const dpr = Math.min(2, window.devicePixelRatio || 1);
+          const width = canvas.clientWidth || 600, height = canvas.clientHeight || 480;
+          if (canvas.width !== Math.round(width * dpr) || canvas.height !== Math.round(height * dpr)) {
+            canvas.width = Math.round(width * dpr); canvas.height = Math.round(height * dpr);
+          }
+          stateRef.current.width = width; stateRef.current.height = height;
+          const ctx = canvas.getContext('2d');
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          const gradient = ctx.createRadialGradient(width * 0.5, height * 0.45, 20, width * 0.5, height * 0.5, Math.max(width, height) * 0.75);
+          gradient.addColorStop(0, '#111827'); gradient.addColorStop(1, '#05070d');
+          ctx.fillStyle = gradient; ctx.fillRect(0, 0, width, height);
+          for (const star of stars) {
+            const alpha = 0.18 + 0.35 * (0.5 + 0.5 * Math.sin((performance.now() / 2400) + star.phase));
+            ctx.fillStyle = 'rgba(180,210,255,' + alpha + ')';
+            ctx.beginPath(); ctx.arc(star.x * width, star.y * height, star.r, 0, Math.PI * 2); ctx.fill();
+          }
+          if (camera.auto && !camera.dragging) camera.yaw += 0.00045;
+          const projected = nodes.map(node => ({ node, ...toScreen(node, width, height) })).sort((a, b) => b.depth - a.depth);
+          for (const edge of edges) {
+            const a = projected.find(entry => entry.node === nodes[edge.a]);
+            const b = projected.find(entry => entry.node === nodes[edge.b]);
+            if (!a || !b) continue;
+            ctx.strokeStyle = edge.relation === 'session' ? 'rgba(120,180,255,0.10)' : 'rgba(160,140,255,0.13)';
+            ctx.lineWidth = 0.7;
+            ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+          }
+          let hover = undefined;
+          for (const entry of projected) {
+            const node = entry.node;
+            const base = 3.2 + Math.sqrt(Math.max(0.01, Number(node.importance))) * 8 + Math.log1p(Number(node.accessCount || 0)) * 1.6;
+            const radius = Math.max(2, base * entry.scale);
+            const alpha = Math.max(0.22, Math.min(1, 1 - (entry.depth + 350) / 900));
+            const colors = { profile: '#f6c35c', decision: '#5aa7ff', fact: '#4fd1c5', episode: '#b18cff', handoff: '#ff9f5a', scene: '#7bd88f' };
+            const color = colors[node.kind] || '#8fb4ff';
+            if (selectedRef.current === node.id) {
+              ctx.strokeStyle = 'rgba(255,255,255,0.85)'; ctx.lineWidth = 1.4;
+              ctx.beginPath(); ctx.arc(entry.x, entry.y, radius + 5, 0, Math.PI * 2); ctx.stroke();
+            }
+            const glow = ctx.createRadialGradient(entry.x, entry.y, 0, entry.x, entry.y, radius * 3.2);
+            glow.addColorStop(0, color); glow.addColorStop(0.24, color + '55'); glow.addColorStop(1, 'rgba(0,0,0,0)');
+            ctx.globalAlpha = alpha * 0.55; ctx.fillStyle = glow;
+            ctx.beginPath(); ctx.arc(entry.x, entry.y, radius * 3.2, 0, Math.PI * 2); ctx.fill();
+            ctx.globalAlpha = alpha; ctx.fillStyle = color;
+            ctx.beginPath(); ctx.arc(entry.x, entry.y, radius, 0, Math.PI * 2); ctx.fill();
+            if (node.pinned) { ctx.strokeStyle = 'rgba(255,220,150,0.8)'; ctx.lineWidth = 1; ctx.beginPath(); ctx.arc(entry.x, entry.y, radius + 3, 0, Math.PI * 2); ctx.stroke(); }
+            if (camera.hover === node.id || selectedRef.current === node.id || labelIds.has(node.id)) {
+              hover = entry;
+              ctx.globalAlpha = 0.95; ctx.fillStyle = '#e8edf7'; ctx.font = '11px sans-serif';
+              const label = String(node.title || '').slice(0, 42);
+              ctx.fillText(label, entry.x + radius + 7, entry.y + 3);
+            }
+          }
+          ctx.globalAlpha = 1;
+          ctx.fillStyle = 'rgba(200,215,235,0.55)'; ctx.font = '11px sans-serif';
+          ctx.fillText(nodes.length + ' memories · drag to orbit · wheel to zoom', 14, height - 14);
+          raf = requestAnimationFrame(draw);
+        };
+        const onPointerDown = event => { camera.dragging = true; camera.moved = false; camera.lastX = event.clientX; camera.lastY = event.clientY; canvas.setPointerCapture?.(event.pointerId); canvas.style.cursor = 'grabbing'; };
+        const onPointerMove = event => {
+          if (camera.dragging) {
+            const dx = event.clientX - camera.lastX, dy = event.clientY - camera.lastY;
+            if (Math.abs(dx) + Math.abs(dy) > 2) camera.moved = true;
+            camera.yaw += dx * 0.008; camera.pitch = Math.max(-1.2, Math.min(1.2, camera.pitch + dy * 0.008));
+            camera.lastX = event.clientX; camera.lastY = event.clientY;
+            return;
+          }
+          const rect = canvas.getBoundingClientRect();
+          const mx = event.clientX - rect.left, my = event.clientY - rect.top;
+          let best; let bestDistance = 18;
+          for (const node of nodes) {
+            const p = toScreen(node, stateRef.current.width, stateRef.current.height);
+            const distance = Math.hypot(p.x - mx, p.y - my);
+            if (distance < bestDistance) { best = node; bestDistance = distance; }
+          }
+          camera.hover = best?.id;
+          canvas.style.cursor = best ? 'pointer' : 'grab';
+        };
+        const onPointerUp = event => {
+          if (camera.dragging && !camera.moved) {
+            const rect = canvas.getBoundingClientRect();
+            const mx = event.clientX - rect.left, my = event.clientY - rect.top;
+            let best; let bestDistance = 24;
+            for (const node of nodes) { const p = toScreen(node, stateRef.current.width, stateRef.current.height); const distance = Math.hypot(p.x - mx, p.y - my); if (distance < bestDistance) { best = node; bestDistance = distance; } }
+            if (best) selectRef.current?.(best);
+          }
+          camera.dragging = false; canvas.style.cursor = 'grab';
+        };
+        const onWheel = event => { event.preventDefault(); camera.zoom = Math.max(0.35, Math.min(2.8, camera.zoom * (event.deltaY > 0 ? 0.92 : 1.08))); };
+        canvas.addEventListener('pointerdown', onPointerDown);
+        canvas.addEventListener('pointermove', onPointerMove);
+        canvas.addEventListener('pointerup', onPointerUp);
+        canvas.addEventListener('pointerleave', () => { camera.dragging = false; });
+        canvas.addEventListener('wheel', onWheel, { passive: false });
+        const observer = new ResizeObserver(() => {});
+        observer.observe(canvas);
+        raf = requestAnimationFrame(draw);
+        return () => { disposed = true; cancelAnimationFrame(raf); observer.disconnect(); canvas.removeEventListener('pointerdown', onPointerDown); canvas.removeEventListener('pointermove', onPointerMove); canvas.removeEventListener('pointerup', onPointerUp); canvas.removeEventListener('wheel', onWheel); };
+      }, [graph]);
+      return h('canvas', { ref: canvasRef, style: { width: '100%', height: '100%', display: 'block', borderRadius: 14, background: '#05070d', cursor: 'grab', touchAction: 'none' } });
+    }
+
+    function MemoryPage() {
+      const [library, setLibrary] = React.useState(null);
+      const [agentId, setAgentId] = React.useState('');
+      const [graph, setGraph] = React.useState({ nodes: [], edges: [] });
+      const [selected, setSelected] = React.useState(null);
+      const [error, setError] = React.useState('');
+      const [query, setQuery] = React.useState('');
+      const [results, setResults] = React.useState(null);
+      const [formOpen, setFormOpen] = React.useState(false);
+      const [title, setTitle] = React.useState('');
+      const [text, setText] = React.useState('');
+      const [scope, setScope] = React.useState('agent');
+      const [busy, setBusy] = React.useState(false);
+      const [syncNotice, setSyncNotice] = React.useState('');
+      const [settings, setSettings] = React.useState(null);
+      const [settingsOpen, setSettingsOpen] = React.useState(false);
+      const agents = library?.agents ?? [];
+      const agent = agents.find(item => item.id === agentId);
+      const workspaceId = agent?.workspaceId;
+      const load = async () => {
+        try {
+          const data = await loadAgentLibrary();
+          setLibrary(data);
+          setError('');
+          setAgentId(current => current || data.agents?.[0]?.id || '');
+        }
+        catch (e) { setError(friendlyError(e, '记忆')); }
+      };
+      const loadGraph = async () => {
+        if (agentId === '') return;
+        try {
+          const data = await fetchJson('marshal/memory/graph?agentId=' + encodeURIComponent(agentId) + (workspaceId ? '&workspaceId=' + encodeURIComponent(workspaceId) : ''));
+          setGraph(data.graph || { nodes: [], edges: [] });
+          setError('');
+        }
+        catch (e) { setError(friendlyError(e, '记忆')); }
+      };
+      React.useEffect(() => { void load(); void fetchJson('marshal/memory/settings/get').then(setSettings).catch(() => {}); }, []);
+      React.useEffect(() => { void loadGraph(); }, [agentId, workspaceId]);
+      const search = async () => {
+        if (query.trim() === '') { setResults(null); return; }
+        try {
+          const data = await fetchJson('marshal/memory/list?agentId=' + encodeURIComponent(agentId) + (workspaceId ? '&workspaceId=' + encodeURIComponent(workspaceId) : '') + '&query=' + encodeURIComponent(query));
+          setResults(data.items || []);
+        }
+        catch (e) { setError(friendlyError(e, '记忆检索')); }
+      };
+      const create = async () => {
+        if (title.trim() === '' || text.trim() === '') return;
+        setBusy(true);
+        try {
+          await fetchJson('marshal/memory/remember', { agentId, workspaceId, scope, title: title.trim(), text: text.trim(), kind: scope === 'workspace' ? 'fact' : 'fact', importance: 0.6, tags: [] });
+          setTitle(''); setText(''); setFormOpen(false); await loadGraph();
+        }
+        catch (e) { setError(friendlyError(e, '写入记忆')); }
+        finally { setBusy(false); }
+      };
+      const forget = async item => {
+        if (!item || !window.confirm('删除这条记忆？')) return;
+        try {
+          await fetchJson('marshal/memory/forget', { agentId, workspaceId, id: item.id });
+          setSelected(null); setResults(null); await loadGraph();
+        }
+        catch (e) { setError(friendlyError(e, '删除记忆')); }
+      };
+      return h('div', { style: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' } },
+        h('div', { style: { padding: '14px 18px', display: 'flex', alignItems: 'center', gap: 10, borderBottom: '1px solid #8883', flexWrap: 'wrap' } },
+          h('div', { style: { fontSize: 14, fontWeight: 600 } }, '记忆'),
+          h('select', { value: agentId, onChange: event => { setAgentId(event.target.value); setSelected(null); setResults(null); }, style: { ...uiInput, width: 180 } },
+            agents.map(item => h('option', { key: item.id, value: item.id }, item.name))),
+          h('input', { value: query, onChange: event => setQuery(event.target.value), onKeyDown: event => { if (event.key === 'Enter') void search(); }, placeholder: '搜索记忆…', style: { ...uiInput, width: 220 } }),
+          h('button', { type: 'button', style: uiButton(false), onClick: () => { void search(); } }, '搜索'),
+          h('button', { type: 'button', style: uiButton(false), onClick: () => { setFormOpen(value => !value); } }, '＋ 记忆'),
+          h('button', { type: 'button', style: uiButton(false), onClick: () => setSettingsOpen(value => !value) }, '设置'),
+          h('span', { style: { marginLeft: 'auto', fontSize: 11, color: dswTheme.dim } }, graph.nodes.length + ' 个节点 · ' + graph.edges.length + ' 条关联'),
+          h('button', { type: 'button', style: uiButton(false), onClick: async () => { setSyncNotice('同步中…'); try { const result = await fetchJson('marshal/memory/sync', { agentId, workspaceId }); setSyncNotice('推送 ' + (result.pushed ?? 0) + ' · 拉取 ' + (result.pulled ?? 0)); await loadGraph(); } catch (e) { setSyncNotice(String(e.message || e)); } } }, '同步'),
+          h('button', { type: 'button', style: uiButton(false), onClick: () => { void loadGraph(); } }, '刷新')),
+        syncNotice !== '' && h('div', { style: { padding: '6px 18px', fontSize: 11, color: dswTheme.dim } }, syncNotice),
+        settingsOpen && settings && h('div', { style: { padding: '10px 18px', display: 'flex', gap: 16, flexWrap: 'wrap', fontSize: 12, borderBottom: '1px solid #8883' } },
+          [['autoSummary', '会话结束自动摘要'], ['autoRecall', '每轮自动召回'], ['allowGroupQuote', '群聊允许引用私有记忆']].map(([key, label]) => h('label', { key, style: { display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' } },
+            h('input', { type: 'checkbox', checked: settings[key] !== false, onChange: async event => { const next = { ...settings, [key]: event.target.checked }; setSettings(next); try { const saved = await fetchJson('marshal/memory/settings', { [key]: event.target.checked }); setSettings(saved.settings); } catch { /* keep local */ } } }), label)),
+          h('span', { style: { color: dswTheme.dim, marginLeft: 'auto' } }, '摘要模型：本地启发式（可配置模型）')),
+        error !== '' && h('div', { style: { padding: '8px 18px', color: dswTheme.danger, fontSize: 12 } }, error),
+        formOpen && h('div', { style: { padding: '12px 18px', display: 'grid', gap: 8, borderBottom: '1px solid #8883' } },
+          h('div', { style: { display: 'flex', gap: 8 } },
+            h('input', { value: title, onChange: event => setTitle(event.target.value), placeholder: '标题', style: { ...uiInput, flex: 1 } }),
+            h('select', { value: scope, onChange: event => setScope(event.target.value), style: { ...uiInput, width: 130 } }, h('option', { value: 'agent' }, 'Agent 私有'), h('option', { value: 'workspace' }, '工作区共享'))),
+          h('textarea', { value: text, onChange: event => setText(event.target.value), rows: 3, placeholder: '记忆内容…', style: { ...uiInput, resize: 'vertical' } }),
+          h('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8 } }, h('button', { type: 'button', style: uiButton(false), onClick: () => setFormOpen(false) }, '取消'), h('button', { type: 'button', disabled: busy, style: uiButton(true), onClick: () => { void create(); } }, busy ? '保存中…' : '保存'))),
+        results !== null && h('div', { style: { maxHeight: 180, overflow: 'auto', borderBottom: '1px solid #8883', padding: '8px 18px', display: 'grid', gap: 4 } },
+          results.length === 0 ? h('div', { style: { fontSize: 12, color: dswTheme.dim } }, '没有匹配的记忆') : results.map(item => h('button', { key: item.id, type: 'button', onClick: () => setSelected(item), style: { textAlign: 'left', border: 0, background: 'transparent', color: 'inherit', cursor: 'pointer', padding: '5px 0' } }, '[' + item.scope + '] ' + item.title))),
+        h('div', { style: { flex: 1, minHeight: 0, display: 'flex', padding: 14, gap: 14 } },
+          h('div', { style: { flex: 1, minWidth: 0, minHeight: 0, borderRadius: 14, overflow: 'hidden', border: '1px solid #8883' } }, h(MemoryGalaxy, { graph, selectedId: selected?.id, onSelect: setSelected })),
+          selected && h('aside', { style: { width: 300, flexShrink: 0, overflow: 'auto', padding: 16, border: '1px solid #8883', borderRadius: 14, background: 'color-mix(in srgb, currentColor 3%, transparent)' } },
+            h('div', { style: { fontSize: 11, color: dswTheme.dim, textTransform: 'uppercase', letterSpacing: '.06em' } }, selected.scope + ' · ' + selected.kind),
+            h('h3', { style: { margin: '6px 0 10px', fontSize: 16 } }, selected.title),
+            h('p', { style: { whiteSpace: 'pre-wrap', fontSize: 13, lineHeight: 1.65 } }, selected.content),
+            h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 12 } }, (selected.tags || []).map(tag => h('span', { key: tag, style: { fontSize: 11, padding: '3px 7px', borderRadius: 999, background: 'color-mix(in srgb, currentColor 8%, transparent)' } }, tag))),
+            h('div', { style: { marginTop: 14, fontSize: 11, color: dswTheme.dim } }, '重要性 ' + Math.round((selected.importance || 0) * 100) + '% · 访问 ' + (selected.accessCount || 0) + ' 次' + (selected.pinned ? ' · 已固定' : '')),
+            h('div', { style: { display: 'flex', gap: 8, marginTop: 16 } },
+              h('button', { type: 'button', style: uiButton(false), onClick: () => { void forget(selected); } }, '删除'),
+              h('button', { type: 'button', style: uiButton(false), onClick: () => setSelected(null) }, '关闭')))),
+        graph.nodes.length === 0 && results === null && h('div', { style: { padding: '0 18px 18px', fontSize: 12, color: dswTheme.dim } }, '这个 Agent 还没有记忆。会话结束后会自动生成摘要，也可以点“＋ 记忆”手动写入。'));
+    }
+
     function MarshalPanel({ marshalContext, openSession, openPanel, workspaceService, SessionProvider, renderSlot }) {
       const [attempt, retry] = React.useState(0);
       const [tab, setTab] = React.useState(() => pendingTab || 'session');
@@ -455,6 +730,7 @@ window.__ModuleLoader__.load({
         tab === 'groups' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex' } }, h(GroupsPage, { openSession, onOpenAgents: () => chooseTab('agents') })),
         tab === 'agents' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex' } }, h(AgentsPage, { onOpenGroups: () => chooseTab('groups'), openSession, workspaceService })),
         tab === 'cross' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex' } }, h(CrossGroupsPage)),
+        tab === 'memory' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex' } }, h(MemoryPage)),
         tab === 'tasks' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex' } }, h(TaskBoardPage, { openSession })),
         tab === 'session' && h('div', { style: { display: 'flex', flex: 1, minHeight: 0 } },
           address && h('iframe', { ref: iframe, onLoad: connect, title: '调度官设备与群聊', src: address,
@@ -660,7 +936,7 @@ window.__ModuleLoader__.load({
     }
 
     function MarshalNav({ active, onTab, openPanel, compact = false }) {
-      const tabs = [['session', '会话'], ['groups', '群聊'], ['agents', '智能体'], ['cross', '跨设备']];
+      const tabs = [['session', '会话'], ['groups', '群聊'], ['agents', '智能体'], ['cross', '跨设备'], ['memory', '记忆']];
       const button = (key, label) => h('button', {
         key, type: 'button', 'aria-pressed': active === key,
         style: {
@@ -1587,6 +1863,7 @@ window.__ModuleLoader__.load({
           add('群聊', 'groups');
           add('智能体', 'agents');
           add('跨设备', 'cross');
+          add('记忆', 'memory');
           add('任务看板', 'tasks');
           bar.append(title, nav);
           root.prepend(bar);
