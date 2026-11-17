@@ -1591,6 +1591,7 @@ window.__ModuleLoader__.load({
             setTimeout(positionNav, 1000);
             setTimeout(positionNav, 3000);
             window.addEventListener('resize', positionNav);
+            setInterval(positionNav, 1000);
             nav.__marshalPosition = positionNav;
           }
         } catch (error) { /* DOM-less host */ }
