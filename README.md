@@ -32,6 +32,12 @@
 - **默认只发元数据**：`privacy: metadata` 下正文被裁成计数；提问卡片是显式的内容例外。
 - **设置只能收紧**：远端不能放宽权限，也不能禁用 marshal 自身。
 
+## 安装当前版本
+
+> **不要从仓库根目录 `dsh plugin add dsh-marshal`。** 根 `package.json` 的 `src/` 是历史核心，不包含智能体/群聊/跨设备代码。
+>
+> 当前可安装产物：**`plugin-build/dsh-marshal-0.2.0-agent-groups.2.tgz`**。Desktop 从 **Plugins → Add plugin** 选择该 tarball；有 `dsh` 的环境用 `dsh plugin --profile desktop add <abs path>.tgz`。依赖、Node 24、重装/重载、健康检查详见 [INSTALL.md](INSTALL.md)。
+
 ## 安装 hub
 
 hub 不自己监听端口，它把 `/marshal` 与 `/marshal/api/*` 挂到 DSH 的 web server 上，因此 hub 机器上必须先有可用的 DSH web。

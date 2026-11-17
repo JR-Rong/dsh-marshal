@@ -7,8 +7,9 @@ function textOutput(value) {
     return { type: 'string' };
 }
 
-function render(value) {
-    return [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }];
+function render(args, value) {
+    const text = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+    return [{ type: 'text', text }];
 }
 
 export function createAgentsHttpClient({ baseUrl, fetchImpl = fetch } = {}) {
@@ -77,8 +78,10 @@ export function createAgentsHttpClient({ baseUrl, fetchImpl = fetch } = {}) {
         },
         async remove(memberId) {
             const agent = await findAgent(memberId);
-            if (agent.legacy) return (await request('/dsh-agents/api/member/delete', { teamId: agent.squadId, memberId })).team;
-            return (await request('/dsh-agents/api/team/delete', { teamId: agent.squadId })).team;
+            const data = agent.legacy
+                ? await request('/dsh-agents/api/member/delete', { teamId: agent.squadId, memberId })
+                : await request('/dsh-agents/api/team/delete', { teamId: agent.squadId });
+            return data?.team ?? { members: [] };
         },
         async chat(memberId) {
             const agent = await findAgent(memberId);

@@ -6,6 +6,7 @@ import { createGroupService } from './service.js';
 import { readAgentsLedger } from './inventory.js';
 import { createAgentDrafter } from './draft.js';
 import { createCrossClient } from './cross-client.js';
+import { createLocalBoard } from './local-board.js';
 import { createAgentsHttpClient, agentToolDefinitions } from './agent-tools.js';
 import { createDshSurface } from '../adapters/dsh/surface.js';
 
@@ -91,7 +92,7 @@ async function readBody(req) {
     }
 }
 
-function exact(method, path, handler) {
+function exact(method, path, handler, open = false) {
     return {
         kind: 'exact',
         path,
@@ -101,7 +102,7 @@ function exact(method, path, handler) {
                 res.end();
                 return;
             }
-            if (!trusted(req)) {
+            if (!open && !trusted(req)) {
                 write(res, 403, { ok: false, code: 'forbidden' });
                 return;
             }
@@ -138,8 +139,25 @@ function taskView(task) {
     };
 }
 
-function makeRoutes(service, drafter, getBoard, initiator, cross) {
+function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource = () => 'local') {
     return [
+        exact('GET', '/marshal/health', async (req, res) => {
+            const ledger = readAgentsLedger();
+            write(res, 200, {
+                ok: true,
+                name: 'dsh-marshal',
+                version: '0.2.0-agent-groups.2',
+                deviceId: initiator.replace(/^marshal:/, ''),
+                capabilities: {
+                    groups: true,
+                    agents: ledger.available,
+                    agentsCode: ledger.code ?? null,
+                    taskBoard: true,
+                    taskBoardSource: boardSource(),
+                    crossGroups: cross !== undefined,
+                },
+            });
+        }, true),
         exact('GET', '/marshal/tasks/state', async (req, res) => {
             const board = getBoard();
             if (board === undefined) {
@@ -352,6 +370,8 @@ function makeRoutes(service, drafter, getBoard, initiator, cross) {
 
 export function mountGroups(ctx, config, options = {}) {
     const root = config.groupsRoot ?? join(homedir(), '.dsh-marshal', 'groups');
+    const localBoard = createLocalBoard(join(root, 'tasks.json'));
+    const getBoard = () => taskBoard ?? localBoard;
     let taskBoard;
     let webServer;
     const crossClient = createCrossClient({ hubUrl: config.hubUrl, token: config.token });
@@ -409,6 +429,8 @@ export function mountGroups(ctx, config, options = {}) {
         ? (() => { try { return ctx.get('llm'); } catch { return undefined; } })()
         : ctx.llm;
     const drafter = createAgentDrafter({ llm, defaultModel: readDefaultModel });
+    const promptAbort = new AbortController();
+    if (typeof ctx.effect === 'function') ctx.effect(() => () => promptAbort.abort(), 'marshal: groups prompt lifetime');
     const service = createGroupService({
         root,
         deviceId: config.deviceId,
@@ -417,7 +439,7 @@ export function mountGroups(ctx, config, options = {}) {
             requestId,
             sessionId,
             content: [{ type: 'text', text }],
-        }),
+        }, promptAbort.signal),
         reader: createReplyReader(surface),
         logger: options.logger ?? ctx.logger,
     });
@@ -449,7 +471,7 @@ export function mountGroups(ctx, config, options = {}) {
     ctx.inject(['webServer'], (scoped) => {
         scoped.effect(() => {
             webServer = scoped.webServer;
-            const disposers = makeRoutes(service, drafter, () => taskBoard, `marshal:${config.deviceId}`, crossClient).map((route) => scoped.webServer.register(route));
+            const disposers = makeRoutes(service, drafter, getBoard, `marshal:${config.deviceId}`, crossClient, () => taskBoard === undefined ? 'local' : 'host').map((route) => scoped.webServer.register(route));
             return () => {
                 for (const dispose of disposers) dispose();
             };

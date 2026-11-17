@@ -241,9 +241,17 @@ window.__ModuleLoader__.load({
         window.addEventListener('marshal:tab', onTab);
         return () => { window.removeEventListener('marshal:tab', onTab); };
       }, []);
+      React.useEffect(() => {
+        let alive = true;
+        fetchJson('marshal/health')
+          .then(next => { if (alive) setHealth(next); })
+          .catch(() => { if (alive) setHealth(null); });
+        return () => { alive = false; };
+      }, [attempt]);
       const [address, setAddress] = React.useState(null);
       const [setup, setSetup] = React.useState(null);
       const [state, setState] = React.useState({ authenticated: false });
+      const [health, setHealth] = React.useState(null);
       const [binding, setBinding] = React.useState(null);
       const [notice, setNotice] = React.useState('正在连接调度官…');
       const [older, setOlder] = React.useState(null);
@@ -439,11 +447,14 @@ window.__ModuleLoader__.load({
       return h('section', { 'aria-label': '调度官', style: { height: '100%', minHeight: 0, width: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden' } },
         h('header', { style: { padding: '12px 20px', minHeight: 54, display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderBottom: '1px solid #8883', flexShrink: 0 } },
           h('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } }, h(MarshalIcon), h('h1', { style: { fontSize: 16, fontWeight: 600, margin: 0 } }, '调度官'), h('span', { style: { fontSize: 12, opacity: .55 } }, state.account ? state.account.name + ' · ' + state.workspaceName : '原生会话')),
-          h('div', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+          h('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+            health && (!health.capabilities?.agents || !health.capabilities?.taskBoard) && h('span', { style: { fontSize: 11, color: dswTheme.danger } },
+              '缺少：' + [!health.capabilities?.agents ? '智能体后端' : '', !health.capabilities?.taskBoard ? '任务看板后端' : ''].filter(Boolean).join('、')),
             h('button', { type: 'button', style: buttonStyle, onClick: () => retry(value => value + 1) }, '重新连接'))),
         tab === 'groups' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex' } }, h(GroupsPage, { openSession, onOpenAgents: () => chooseTab('agents') })),
         tab === 'agents' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex' } }, h(AgentsPage, { onOpenGroups: () => chooseTab('groups'), openSession, workspaceService })),
         tab === 'cross' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex' } }, h(CrossGroupsPage)),
+        tab === 'tasks' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex' } }, h(TaskBoardPage, { openSession })),
         tab === 'session' && h('div', { style: { display: 'flex', flex: 1, minHeight: 0 } },
           address && h('iframe', { ref: iframe, onLoad: connect, title: '调度官设备与群聊', src: address,
             sandbox: 'allow-scripts allow-same-origin allow-forms', allow: 'clipboard-write', referrerPolicy: 'no-referrer',
@@ -524,6 +535,14 @@ window.__ModuleLoader__.load({
       outline: 'none',
     };
     const uiMuted = { color: dswTheme.faint, fontSize: 12 };
+
+    function friendlyError(error, area) {
+      const message = String(error && error.message ? error.message : error);
+      if (message.includes('404')) return area + '后端未挂载：智能体需要 @linxin666/dsh-agents，任务看板需要 task-board；安装后重启 DSH';
+      if (message.includes('no-task-board') || message.includes('503')) return area + '后端未挂载：请安装 task-board 插件，或升级到带内置看板的构建';
+      if (message.includes('no-ledger') || message.includes('no-web-server')) return area + '后端未就绪：请先打开一次智能体并确认 @linxin666/dsh-agents 已启用';
+      return area + '失败：' + message;
+    }
 
     async function fetchJson(path, body) {
       const init = body === undefined ? {} : {
@@ -679,7 +698,7 @@ window.__ModuleLoader__.load({
           setLibrary(agentLibrary);
           setError('');
         }
-        catch (e) { setError('加载失败：' + (e.message || e)); }
+        catch (e) { setError(friendlyError(e, '智能体/群聊')); }
       };
       const reloadGroup = async () => {
         if (!group) return;
@@ -1084,7 +1103,7 @@ window.__ModuleLoader__.load({
 
       const load = async () => {
         try { const data = await fetchJson('marshal/tasks/state'); setTasks(data.tasks || []); setError(''); }
-        catch (e) { setError('加载失败：' + (e.message || e)); }
+        catch (e) { setError(friendlyError(e, '任务看板')); }
       };
       React.useEffect(() => {
         void load();
@@ -1182,7 +1201,7 @@ window.__ModuleLoader__.load({
 
       const load = async () => {
         try { setLibrary(await loadAgentLibrary()); setError(''); }
-        catch (e) { setError('加载失败：' + (e.message || e)); }
+        catch (e) { setError(friendlyError(e, '智能体')); }
       };
       React.useEffect(() => { void load(); }, []);
 
@@ -1483,8 +1502,9 @@ window.__ModuleLoader__.load({
         const openPanel = id => {
           try {
             const layout = ctx.get && ctx.get('layout');
-            if (layout && typeof layout.selectPanel === 'function') layout.selectPanel(id);
+            if (layout && typeof layout.selectPanel === 'function') { layout.selectPanel(id); return true; }
           } catch (error) { /* layout unavailable */ }
+          return false;
         };
         const goTab = tab => {
           pendingTab = tab;
@@ -1499,7 +1519,7 @@ window.__ModuleLoader__.load({
             nav.id = 'marshal-quick-nav';
             nav.setAttribute('role', 'navigation');
             nav.setAttribute('aria-label', '调度官快速切换');
-            nav.style.cssText = 'position:fixed;top:9px;right:150px;display:flex;gap:2px;padding:3px;border-radius:999px;border:1px solid color-mix(in srgb, currentColor 14%, transparent);background:color-mix(in srgb, #151517 78%, transparent);backdrop-filter:blur(14px);z-index:2147483000;box-shadow:0 6px 20px rgba(0,0,0,.25);font-family:inherit';
+            nav.style.cssText = 'position:fixed;top:9px;left:auto;right:150px;display:flex;gap:2px;padding:3px;border-radius:999px;border:1px solid color-mix(in srgb, currentColor 14%, transparent);background:color-mix(in srgb, #151517 78%, transparent);backdrop-filter:blur(14px);z-index:2147483000;box-shadow:0 6px 20px rgba(0,0,0,.25);font-family:inherit';
             for (const [key, label] of [['session', '会话'], ['groups', '群聊'], ['agents', '智能体'], ['cross', '跨设备']]) {
               const button = document.createElement('button');
               button.type = 'button';
@@ -1516,9 +1536,39 @@ window.__ModuleLoader__.load({
             boardButton.style.cssText = 'border:0;background:transparent;color:#e9e7e4;font:12px/1 inherit;padding:7px 12px;border-radius:999px;cursor:pointer';
             boardButton.onmouseenter = () => { boardButton.style.background = 'rgba(255,255,255,.10)'; };
             boardButton.onmouseleave = () => { boardButton.style.background = 'transparent'; };
-            boardButton.onclick = () => openPanel('task-board');
+            boardButton.onclick = () => { if (!openPanel('task-board')) goTab('tasks'); };
             nav.appendChild(boardButton);
             document.body.appendChild(nav);
+            const positionNav = () => {
+              const center = document.querySelector('[class*="centerCol"]');
+              if (center === null) {
+                nav.style.left = 'auto';
+                nav.style.right = '150px';
+                return;
+              }
+              const rect = center.getBoundingClientRect();
+              nav.style.right = 'auto';
+              nav.style.left = Math.max(8, Math.round(rect.right - nav.offsetWidth - 12)) + 'px';
+            };
+            let attachAttempts = 0;
+            const attachCenter = () => {
+              const center = document.querySelector('[class*="centerCol"]');
+              if (center === null) {
+                if (attachAttempts++ < 40) setTimeout(attachCenter, 250);
+                return;
+              }
+              positionNav();
+              try {
+                const observer = new ResizeObserver(positionNav);
+                observer.observe(center);
+                nav.__marshalCenterObserver = observer;
+              } catch (error) { /* older host */ }
+            };
+            attachCenter();
+            setTimeout(positionNav, 1000);
+            setTimeout(positionNav, 3000);
+            window.addEventListener('resize', positionNav);
+            nav.__marshalPosition = positionNav;
           }
         } catch (error) { /* DOM-less host */ }
         ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({ name: 'sidebar.panellist', id: PANEL, order: 25, label: () => '调度官' }, MarshalIcon));
