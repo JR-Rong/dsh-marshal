@@ -1513,88 +1513,30 @@ window.__ModuleLoader__.load({
             try { window.dispatchEvent(new CustomEvent('marshal:tab', { detail: tab })); } catch (error) { /* host without window */ }
           }, 60);
         };
+        const quickTabs = [['session', '会话'], ['groups', '群聊'], ['agents', '智能体'], ['cross', '跨设备']];
+        const MarshalQuickNav = () => h('div', {
+          id: 'marshal-quick-nav',
+          role: 'navigation',
+          'aria-label': '调度官快速切换',
+          style: { display: 'flex', alignItems: 'center', gap: 2, padding: 3, borderRadius: 999, border: '1px solid color-mix(in srgb, currentColor 14%, transparent)', background: 'color-mix(in srgb, currentColor 5%, transparent)', flexShrink: 0, maxWidth: 'min(52vw, 520px)', overflowX: 'auto' },
+        },
+          quickTabs.map(([key, label]) => h('button', {
+            key, type: 'button',
+            style: { border: 0, background: 'transparent', color: 'inherit', font: '11px/1 inherit', padding: '6px 9px', borderRadius: 999, cursor: 'pointer', whiteSpace: 'nowrap' },
+            onClick: () => goTab(key),
+          }, label)),
+          h('button', {
+            type: 'button',
+            style: { border: 0, background: 'transparent', color: 'inherit', font: '11px/1 inherit', padding: '6px 9px', borderRadius: 999, cursor: 'pointer', whiteSpace: 'nowrap' },
+            onClick: () => { if (!openPanel('task-board')) goTab('tasks'); },
+          }, '任务看板'));
         try {
-          if (!document.getElementById('marshal-quick-nav')) {
-            const nav = document.createElement('div');
-            nav.id = 'marshal-quick-nav';
-            nav.setAttribute('role', 'navigation');
-            nav.setAttribute('aria-label', '调度官快速切换');
-            nav.style.cssText = 'position:fixed;top:9px;left:auto;right:150px;display:flex;gap:2px;padding:3px;border-radius:999px;border:1px solid color-mix(in srgb, currentColor 14%, transparent);background:color-mix(in srgb, #151517 78%, transparent);backdrop-filter:blur(14px);z-index:2147483000;box-shadow:0 6px 20px rgba(0,0,0,.25);font-family:inherit';
-            for (const [key, label] of [['session', '会话'], ['groups', '群聊'], ['agents', '智能体'], ['cross', '跨设备']]) {
-              const button = document.createElement('button');
-              button.type = 'button';
-              button.textContent = label;
-              button.style.cssText = 'border:0;background:transparent;color:#e9e7e4;font:12px/1 inherit;padding:7px 12px;border-radius:999px;cursor:pointer';
-              button.onmouseenter = () => { button.style.background = 'rgba(255,255,255,.10)'; };
-              button.onmouseleave = () => { button.style.background = 'transparent'; };
-              button.onclick = () => goTab(key);
-              nav.appendChild(button);
-            }
-            const boardButton = document.createElement('button');
-            boardButton.type = 'button';
-            boardButton.textContent = '任务看板';
-            boardButton.style.cssText = 'border:0;background:transparent;color:#e9e7e4;font:12px/1 inherit;padding:7px 12px;border-radius:999px;cursor:pointer';
-            boardButton.onmouseenter = () => { boardButton.style.background = 'rgba(255,255,255,.10)'; };
-            boardButton.onmouseleave = () => { boardButton.style.background = 'transparent'; };
-            boardButton.onclick = () => { if (!openPanel('task-board')) goTab('tasks'); };
-            nav.appendChild(boardButton);
-            document.body.appendChild(nav);
-            const findCenter = () => {
-              let best = null;
-              let bestArea = 0;
-              for (const node of document.querySelectorAll('[class*="centerCol"]')) {
-                const rect = node.getBoundingClientRect();
-                if (rect.width < 300 || rect.height < 200) continue;
-                const style = getComputedStyle(node);
-                if (style.display === 'none' || style.visibility === 'hidden') continue;
-                const area = rect.width * rect.height;
-                if (area > bestArea) { best = node; bestArea = area; }
-              }
-              return best;
-            };
-            const findRightControl = () => {
-              const control = document.querySelector('[aria-label="Open right sidebar"], [aria-label="Close right sidebar"], [aria-label*="right sidebar" i], [aria-label*="右侧"], [aria-label*="右栏"], [aria-label*="侧边栏"]');
-              return control === null ? null : control.getBoundingClientRect();
-            };
-            const positionNav = () => {
-              const center = findCenter();
-              const control = findRightControl();
-              if (center === null) {
-                nav.style.left = 'auto';
-                nav.style.right = '150px';
-                return;
-              }
-              const rect = center.getBoundingClientRect();
-              let limit = rect.right - 56;
-              if (control !== null && control.left > rect.left && control.left <= rect.right + 8) {
-                limit = Math.min(limit, control.left - 8);
-              }
-              const left = Math.max(rect.left + 8, Math.min(limit - nav.offsetWidth, rect.right - 12 - nav.offsetWidth));
-              nav.style.right = 'auto';
-              nav.style.left = Math.round(left) + 'px';
-            };
-            let attachAttempts = 0;
-            const attachCenter = () => {
-              const center = findCenter();
-              if (center === null) {
-                if (attachAttempts++ < 40) setTimeout(attachCenter, 250);
-                return;
-              }
-              positionNav();
-              try {
-                const observer = new ResizeObserver(positionNav);
-                observer.observe(center);
-                nav.__marshalCenterObserver = observer;
-              } catch (error) { /* older host */ }
-            };
-            attachCenter();
-            setTimeout(positionNav, 1000);
-            setTimeout(positionNav, 3000);
-            window.addEventListener('resize', positionNav);
-            setInterval(positionNav, 1000);
-            nav.__marshalPosition = positionNav;
-          }
-        } catch (error) { /* DOM-less host */ }
+          ctx.slots.inject('conversation.session.header.actions', () => ctx.slots.register({
+            name: 'conversation.session.header.actions',
+            id: 'marshal-quick-nav',
+            order: 40,
+          }, MarshalQuickNav));
+        } catch (error) { /* older host without the conversation header action slot */ }
         ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({ name: 'sidebar.panellist', id: PANEL, order: 25, label: () => '调度官' }, MarshalIcon));
         ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: PANEL,
           children: { 'marshal.native.body': { kind: 'single', scope: 'session' } },
