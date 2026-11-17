@@ -955,9 +955,12 @@ window.__ModuleLoader__.load({
         while (node.parentElement !== null && node.parentElement.getAttribute('role') !== 'tree') node = node.parentElement;
         return node.parentElement === null ? undefined : node;
       };
+      const titleNode = row => row.querySelector('[class*="title"]');
       const isAgentRow = row => {
-        const title = row.querySelector('[class*="title"]')?.textContent?.trim() ?? row.textContent.trim();
-        return title.startsWith('Agent · ');
+        if (row.dataset.marshalAgent === '1') return true;
+        const title = titleNode(row)?.textContent?.trim() ?? row.textContent.trim();
+        if (title.startsWith('Agent · ')) { row.dataset.marshalAgent = '1'; return true; }
+        return false;
       };
       const apply = () => {
         const wrapper = document.querySelector('[data-slot="sidebar.workspaces"]');
@@ -969,6 +972,16 @@ window.__ModuleLoader__.load({
           if (group === undefined || seen.has(group)) continue;
           seen.add(group);
           const agent = isAgentRow(row);
+          if (agent) {
+            const title = titleNode(row);
+            if (title !== null) {
+              if (title.dataset.marshalOriginal === undefined) title.dataset.marshalOriginal = title.textContent;
+              const original = title.dataset.marshalOriginal;
+              const clean = original.replace(/^Agent\s*·\s*/, '').trim();
+              const next = mode === 'agents' ? clean : original;
+              if (title.textContent !== next) title.textContent = next;
+            }
+          }
           group.setAttribute('data-marshal-scope-hidden', (mode === 'agents') === agent ? '0' : '1');
         }
         for (const group of wrapper.querySelectorAll('[class*="groupSection"]')) {
