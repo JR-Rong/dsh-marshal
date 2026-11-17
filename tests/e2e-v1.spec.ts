@@ -168,7 +168,10 @@ describe('e2e v1 multi-agent assembly', () => {
       const hubContext = {
         webServer: web.webServer,
         logger,
-        effect(cleanup: () => void | Promise<void>) { cleanups.push(cleanup) },
+        effect(setup: () => () => void | Promise<void>) { cleanups.push(setup()) },
+        inject(services: readonly string[], callback: (ctx: MarshalContext) => void) {
+          if (services.every(service => service in this)) callback(this as unknown as MarshalContext)
+        },
       }
       apply(hubContext as unknown as MarshalContext, {
         role: 'hub', dashboardToken: DASHBOARD_TOKEN,
@@ -180,7 +183,10 @@ describe('e2e v1 multi-agent assembly', () => {
 
       const nodeContext = {
         logger,
-        effect(cleanup: () => void | Promise<void>) { cleanups.push(cleanup) },
+        effect(setup: () => () => void | Promise<void>) { cleanups.push(setup()) },
+        inject(services: readonly string[], callback: (ctx: MarshalContext) => void) {
+          if (services.every(service => service in this)) callback(this as unknown as MarshalContext)
+        },
         sessionController,
       }
       apply(nodeContext as unknown as MarshalContext, {
@@ -234,7 +240,8 @@ describe('e2e v1 multi-agent assembly', () => {
         args: { text: PROMPT_SENTINEL },
         idempotencyKey: 'e2e-v1-codex-prompt',
       })
-      expect([200, 202]).toContain(codexResponse.status)
+      expect(codexResponse.status).toBe(502)
+      expect(codexResponse.body.status).toBe('rejected')
       expect(codexResponse.body.ok).not.toBe(true)
       expect(prompts).toHaveLength(0)
 
@@ -287,7 +294,10 @@ describe('e2e v1 multi-agent assembly', () => {
     const cleanups: (() => void | Promise<void>)[] = []
     const ctx = {
       logger,
-      effect(cleanup: () => void | Promise<void>) { cleanups.push(cleanup) },
+      effect(setup: () => () => void | Promise<void>) { cleanups.push(setup()) },
+        inject(services: readonly string[], callback: (ctx: MarshalContext) => void) {
+          if (services.every(service => service in this)) callback(this as unknown as MarshalContext)
+        },
     }
     // 校验发生在 sessionController 与 journal 之前：既不需要主机服务，也不碰真实环境。
     expect(() => apply(ctx as unknown as MarshalContext, {
@@ -309,7 +319,10 @@ describe('e2e v1 multi-agent assembly', () => {
       const { logger } = fakeLogger()
       const ctx = {
         logger,
-        effect(cleanup: () => void | Promise<void>) { cleanups.push(cleanup) },
+        effect(setup: () => () => void | Promise<void>) { cleanups.push(setup()) },
+        inject(services: readonly string[], callback: (ctx: MarshalContext) => void) {
+          if (services.every(service => service in this)) callback(this as unknown as MarshalContext)
+        },
       }
       // 不等待连接：拨号失败必须是异步告警，不能从 apply 同步抛出。
       expect(() => apply(ctx as unknown as MarshalContext, {

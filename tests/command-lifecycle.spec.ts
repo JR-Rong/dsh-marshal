@@ -123,6 +123,22 @@ afterEach(() => {
 })
 
 describe('node command lifecycle', () => {
+  it.each(['ownership-unverified', 'revision-conflict', 'widen-rejected', 'auth-required'] as const)(
+    '同键重试和状态查询保留 %s 原始拒绝码', async code => {
+      const { journal } = setup()
+      const h = harness()
+      const adapter = { ...h.adapter, async execute() { throw new PreCallRejection(code) } }
+      const cmd = command({ key: 'rejected-replay' })
+      runCommand(h.link, adapter, h.follower, cmd, 'mac', journal)
+      await flush()
+      runCommand(h.link, adapter, h.follower, { ...cmd, commandId: 'retry' }, 'mac', journal)
+      runCommand(h.link, adapter, h.follower, statusQuery(cmd.idempotencyKey), 'mac', journal)
+      await flush()
+      expect(h.acks()).toHaveLength(2)
+      for (const ack of h.acks()) expect(ack).toMatchObject({ status: 'rejected', code })
+      expect(h.statusResults()[0]).toMatchObject({ status: 'rejected', code })
+    },
+  )
   it('同键并发只调用一次，其余返回 pending-confirmation', async () => {
     const { journal } = setup()
     const h = harness()
@@ -264,7 +280,7 @@ describe('node command lifecycle', () => {
     const { journal } = setup()
     const h = harness()
     runCommand(h.link, h.adapter, h.follower, command({
-      key: 'history', op: 'observe', args: { kind: 'history' },
+      key: 'history', op: 'observe', args: { kind: 'history', limit: 50 },
     }), 'mac', journal)
     await flush()
     expect(journal.size).toBe(0)

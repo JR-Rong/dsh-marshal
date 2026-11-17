@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import {
   encodeFrame, type AckFrame, type CommandFrame, type CommandOp,
   type CommandStatusFrame, type CommandStatusResultFrame, type EventFrame,
-  type InputsSnapshotFrame, type InputsSnapshotResultFrame,
+  type InputsSnapshotFrame, type InputsSnapshotResultFrame, type HistoryResultFrame,
 } from '../wire/frames.ts'
 import { COMMAND_TTL_MS } from '../wire/limits.ts'
 import { commandPayloadDigest } from '../wire/commands.ts'
@@ -33,6 +33,8 @@ export type CommandOutcome =
     ok: true
     status: 'accepted' | 'confirmed'
     result: unknown
+    /** Only settleHistory may populate this; ordinary ACKs cannot impersonate it. */
+    history?: Pick<HistoryResultFrame, 'items' | 'completeness' | 'nextCursor'>
     /** 成功仍可能带通知性 code（如 result-too-large）；它不是失败，必须原样可见。 */
     code?: string
   }
@@ -63,17 +65,19 @@ export interface SessionRow {
   readonly running: boolean
   readonly updatedAt: number
   readonly blank?: boolean
+  readonly title?: string
   readonly ownership?: string
   readonly counts?: Readonly<Record<string, number>>
 }
 
-/** 完整同步提交的会话行；hub 只接受这些字段，不存 cwd/标题/正文。 */
+/** 完整同步会话行；标题经过节点授权与脱敏，不存 cwd 或消息正文。 */
 export interface CommitRow {
   readonly agent: string
   readonly sessionId: string
   readonly running: boolean
   readonly updatedAt: number
   readonly blank?: boolean
+  readonly title?: string
   readonly ownership?: string
   readonly counts?: Readonly<Record<string, number>>
 }
@@ -128,7 +132,7 @@ const CAPABILITY_OPERATIONS: ReadonlySet<string> = new Set([
   'prompt', 'interrupt', 'answer', 'cancel', 'configure', 'create', 'fork', 'acquire',
 ])
 const CAPABILITY_OWNERSHIP: ReadonlySet<string> = new Set([
-  'ours', 'foreign-unknown', 'foreign-running', 'unverified',
+  'ours', 'attached', 'foreign-unknown', 'foreign-running', 'unverified',
 ])
 const CAPABILITY_TOOL_DETAIL: ReadonlySet<string> = new Set(['args+output', 'args', 'none'])
 const CAPABILITY_PROMPT_FIDELITY: ReadonlySet<string> = new Set(['native', 'relay', 'dom', 'none'])
@@ -283,6 +287,7 @@ function sameSessionRow(previous: SessionRow | undefined, next: SessionRow): boo
   if (previous === undefined) return false
   return previous.running === next.running
     && previous.updatedAt === next.updatedAt
+    && previous.title === next.title
     && (previous.blank ?? false) === (next.blank ?? false)
     && previous.ownership === next.ownership
     && JSON.stringify(previous.counts ?? {}) === JSON.stringify(next.counts ?? {})
@@ -301,6 +306,7 @@ function withoutBody(outcome: CommandOutcome): CommandOutcome {
 }
 
 interface Pending {
+  input: CommandInput
   resolve: (outcome: CommandOutcome) => void
   timer: NodeJS.Timeout
   readonly deviceId: string
@@ -371,9 +377,13 @@ export class HubRelay {
     timeoutMs?: number
     operatorId?: string
     hubEpoch?: string
+    historyTtlMs?: number
   }) {
     this.historyEpochValue = options.hubEpoch ?? randomUUID()
-    this.buffer = createEventBuffer({ hubEpoch: this.historyEpochValue, now: options.now })
+    this.buffer = createEventBuffer({
+      hubEpoch: this.historyEpochValue, now: options.now,
+      ...(options.historyTtlMs === undefined ? {} : { ttlMs: options.historyTtlMs }),
+    })
   }
 
   /** hub 装配同步协调器后注入：未完成原子提交的设备不得收到写命令。 */
@@ -422,7 +432,7 @@ export class HubRelay {
   }
 
   async command(input: CommandInput): Promise<CommandOutcome> {
-    if (this.disposed) return disposedOutcome()
+    if (this.disposed) return { ok: false, status: 'rejected', code: 'disposed' }
 
     // 先算载荷摘要：同域不同载荷必须 conflict，不能因为 key 相同就复用结果。
     const digest = commandPayloadDigest(input.op, input.target, input.args ?? {})
@@ -458,7 +468,7 @@ export class HubRelay {
       if (outcome.ok || outcome.code !== 'disposed') {
         // accepted/confirmed/rejected 是终态；pending/unknown 只阻止重发，不算成功缓存。
         const resolved = outcome.ok || outcome.status === 'rejected'
-        this.idempotency.complete(key, digest, outcome, resolved)
+        this.idempotency.complete(key, digest, input.op === 'observe' ? withoutBody(outcome) : outcome, resolved)
       }
       return outcome
     } finally {
@@ -494,6 +504,7 @@ export class HubRelay {
         resolve({ ok: false, status: 'outcome-unknown', code: 'outcome-unknown' })
       }, timeoutMs)
       this.pending.set(commandId, {
+        input,
         resolve, timer, deviceId: input.target.deviceId, connectionId, nodeEpoch,
       })
       let text: string
@@ -522,6 +533,23 @@ export class HubRelay {
    * 只有 commandId、绑定连接身份与当前注册槽位全部匹配的 ACK 才能结算；
    * 旧连接/旧代次的 ACK 一律忽略并计入有界拒绝计数（契约 §4.6）。
    */
+  settleHistory(frame: HistoryResultFrame, origin: FrameIdentity): void {
+    const entry = this.pending.get(frame.commandId)
+    if (!entry || entry.input.op !== 'observe' || asRecord(entry.input.args)?.kind !== 'history'
+      || !this.currentBinding(entry, origin) || frame.connectionId !== entry.connectionId
+      || frame.nodeEpoch !== entry.nodeEpoch || frame.target.deviceId !== entry.input.target.deviceId
+      || frame.target.agent !== entry.input.target.agent || frame.target.sessionId !== entry.input.target.sessionId
+      || frame.items.some(item => item.deviceId !== frame.target.deviceId || item.agent !== frame.target.agent
+        || item.sessionId !== frame.target.sessionId || item.nodeEpoch !== frame.nodeEpoch
+        || item.kind.startsWith('input.'))) { this.rejectAck(); return }
+    clearTimeout(entry.timer)
+    this.pending.delete(frame.commandId)
+    entry.resolve({ ok: true, status: 'confirmed', result: undefined, history: {
+      items: frame.items, completeness: frame.completeness,
+      ...(frame.nextCursor === undefined ? {} : { nextCursor: frame.nextCursor }),
+    } })
+  }
+
   settle(ack: AckFrame, origin: FrameIdentity): void {
     const entry = this.pending.get(ack.commandId)
     if (entry === undefined) {
@@ -762,6 +790,7 @@ export class HubRelay {
         running: row.running,
         updatedAt: row.updatedAt,
         ...(row.blank === undefined ? {} : { blank: row.blank }),
+        ...(row.title === undefined ? {} : { title: row.title }),
         ...(row.ownership === undefined ? {} : { ownership: row.ownership }),
         ...(row.counts === undefined ? {} : { counts: row.counts }),
       })
@@ -872,6 +901,7 @@ export class HubRelay {
         running: row.running,
         updatedAt: row.updatedAt,
         ...(row.blank === undefined ? {} : { blank: row.blank }),
+        ...(row.title === undefined ? {} : { title: row.title }),
         ...(row.ownership === undefined ? {} : { ownership: row.ownership }),
         ...(row.counts === undefined ? {} : { counts: row.counts }),
       },
@@ -887,7 +917,7 @@ export class HubRelay {
 
   /**
    * 记录会话索引并扇出；索引只存设备/agent/sessionId/运行态/所有权/计数，
-   * 不存 cwd/标题或正文。省略字段保留旧值；turn 事件只在已有行上改运行态。
+   * 标题仅来自已过滤的内容帧；不存 cwd 或正文。省略字段保留旧值；turn 事件只在已有行上改运行态。
    *
    * 先 append 再扇出：缓存是唯一可回放来源，只有缓存接纳的事件才带游标。
    * 交互帧（input.*）与非白名单载荷会被 buffer 拒收，因此没有 id 行。
@@ -911,6 +941,7 @@ export class HubRelay {
         ? payload.updatedAt
         : previous?.updatedAt ?? event.ts
       const blank = typeof payload.blank === 'boolean' ? payload.blank : previous?.blank
+      const title = typeof payload.title === 'string' ? payload.title.slice(0, 160) : previous?.title
       const ownership = typeof payload.ownership === 'string'
         ? payload.ownership.slice(0, 32)
         : previous?.ownership
@@ -919,6 +950,7 @@ export class HubRelay {
         deviceId: event.deviceId, agent: event.agent, sessionId: event.sessionId,
         running: running === true, updatedAt,
         ...(blank === undefined ? {} : { blank }),
+        ...(title === undefined ? {} : { title }),
         ...(ownership === undefined ? {} : { ownership }),
         ...(counts === undefined ? {} : { counts }),
       })
@@ -1006,6 +1038,13 @@ export class HubRelay {
   purgeHistory(deviceId: string): number {
     // 即使没有可删事件也要推进代次：暂存队列里可能还留着该设备的旧帧。
     this.purgeGenerations.set(deviceId, this.purgeGeneration(deviceId) + 1)
+    this.stripDeviceBodies(deviceId)
+    for (const [key, row] of this.index) {
+      if (row.deviceId === deviceId && row.title !== undefined) {
+        const { title: _title, ...metadata } = row
+        this.index.set(key, metadata)
+      }
+    }
     return this.buffer.purgeDevice(deviceId)
   }
 

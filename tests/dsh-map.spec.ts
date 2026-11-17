@@ -47,7 +47,7 @@ describe('toMarshalEvents', () => {
       },
     }
     const events = toMarshalEvents(frame, meta, () => 1)
-    expect(events[0]?.payload).toEqual({ callId: 'call-1', tool: 'ask', status: 'running', arguments: { note: 'ok' } })
+    expect(events[0]?.payload).toEqual({ callId: 'call-1', tool: 'ask', status: 'running' })
   })
 
   it('忽略不认识的帧', () => {

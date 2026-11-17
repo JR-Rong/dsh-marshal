@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { Agent as HttpsAgent } from 'node:https'
 import { WebSocket } from 'ws'
 import {
   CONTRACT_REVISION, CLOSE_CODES, decodeFrame, encodeFrame,
@@ -57,6 +58,8 @@ export interface HandshakeBinding {
 
 export interface NodeLinkOptions {
   readonly url: string
+  /** Explicit trust for a private Hub; hostname and certificate verification remain enabled. */
+  readonly ca?: Buffer
   readonly token: string
   readonly deviceId: string
   readonly deviceName: string
@@ -75,6 +78,7 @@ export interface NodeLinkOptions {
   readonly maxBackoffMs?: number
   /** 连接稳定多久后清零退避计数，默认 30s。 */
   readonly stableMs?: number
+  readonly features?: readonly string[]
   readonly onFrame?: (text: string) => void
   /** hello.ack 后触发：上层必须开始完整同步，不得在此前把事件视为在线。 */
   readonly onSyncNeeded?: () => void
@@ -121,7 +125,13 @@ export class NodeLink {
   private bestRtt = Number.POSITIVE_INFINITY
   private hasSkewSample = false
 
-  constructor(private readonly options: NodeLinkOptions) {}
+  private readonly tlsAgent: HttpsAgent | undefined
+
+  constructor(private readonly options: NodeLinkOptions) {
+    // Private Hub trust belongs to this direct connection, independently of
+    // the host's global agent and its proxy/trust configuration.
+    this.tlsAgent = options.ca === undefined ? undefined : new HttpsAgent({ ca: options.ca })
+  }
 
   get buffered(): number { return this.queue.length }
   get dropped(): number { return this.droppedCount }
@@ -208,6 +218,7 @@ export class NodeLink {
     const socket = this.socket
     this.socket = undefined
     socket?.close()
+    this.tlsAgent?.destroy()
   }
 
   /** close 的别名，便于直接当作 dispose 回调。 */
@@ -279,7 +290,10 @@ export class NodeLink {
     if (this.closed || !this.active) return
     // 任何时刻只允许一个 socket：定时器与手动 start 撞车也在这里拦住。
     if (this.socket !== undefined) return
-    const ws = new WebSocket(this.options.url, { headers: { authorization: `Bearer ${this.options.token}` } })
+    const ws = new WebSocket(this.options.url, {
+      headers: { authorization: `Bearer ${this.options.token}` },
+      ...(this.tlsAgent === undefined ? {} : { agent: this.tlsAgent }),
+    })
     this.socket = ws
     this.linkState = 'dialing'
     this.activeSyncId = undefined
@@ -296,7 +310,7 @@ export class NodeLink {
       const hello = encodeFrame({
         v: 2, type: 'hello', contractRevision: CONTRACT_REVISION,
         deviceId: this.options.deviceId, deviceName: this.options.deviceName,
-        nodeEpoch: this.options.nodeEpoch, agents: [...this.options.agents], features: [],
+        nodeEpoch: this.options.nodeEpoch, agents: [...this.options.agents], features: [...(this.options.features ?? [])],
         ...(this.options.privacy === undefined ? {} : { privacy: this.options.privacy }),
         ...(binding === undefined
           ? {}

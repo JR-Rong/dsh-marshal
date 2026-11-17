@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
 import type {
-  Query, SDKControlInterruptResponse, SDKMessage, SDKSystemMessage, SDKUserMessage,
+  AccountInfo, Query, SDKControlInitializeResponse, SDKControlInterruptResponse, SDKMessage, SDKSystemMessage, SDKUserMessage,
 } from '@anthropic-ai/claude-agent-sdk'
 import {
   CLAUDE_RUNTIME_MAX_QUEUED_INPUTS, ClaudeRuntimeError,
@@ -43,9 +43,15 @@ function stateMessage(state: 'idle' | 'running' | 'requires_action'): SDKMessage
 class FakeQuery {
   readonly params: ClaudeSdkQueryParams
   readonly pushed: SDKMessage[] = []
+  selectedModel?: string
+  flagSettings?: unknown
+  async supportedModels() { return [{ value: 'sonnet', displayName: 'Sonnet', description: '', supportedEffortLevels: ['low', 'high'] }] }
+  async setModel(value: string) { this.selectedModel = value }
+  async applyFlagSettings(value: unknown) { this.flagSettings = value }
   closeCalls = 0
   interruptCalls = 0
   interruptResult: SDKControlInterruptResponse | undefined
+  account: AccountInfo = { apiProvider: 'firstParty', tokenSource: 'oauth' }
   private failure: unknown
   private finished = false
   private waiter: (() => void) | undefined
@@ -79,6 +85,11 @@ class FakeQuery {
   async interrupt(): Promise<SDKControlInterruptResponse | undefined> {
     this.interruptCalls += 1
     return this.interruptResult
+  }
+
+  async initializationResult(): Promise<SDKControlInitializeResponse> {
+    await Promise.resolve()
+    return { commands: [], agents: [], output_style: 'default', available_output_styles: [], models: [], account: this.account }
   }
 
   async next(): Promise<IteratorResult<SDKMessage, void>> {
@@ -162,6 +173,77 @@ function signal(): AbortSignal {
 }
 
 describe('claude runtime', () => {
+  it('uses the authenticated SDK resume contract when init waits for the first prompt', async () => {
+    const h = harness({ resume: 'existing-session' })
+    await expect(h.runtime.ready()).resolves.toMatchObject({ session_id: 'existing-session', identitySource: 'resume-contract' })
+    expect(h.runtime.init()).toBeUndefined()
+    h.query().push(initMessage('existing-session'))
+    await new Promise(resolve => setImmediate(resolve))
+    expect(h.runtime.closed).toBe(false)
+    expect(h.runtime.init()?.session_id).toBe('existing-session')
+    h.runtime.close()
+  })
+
+  it('rejects native identity drift after a resume handshake', async () => {
+    const h = harness({ resume: 'existing-session' })
+    await h.runtime.ready()
+    h.query().push(initMessage('unexpected-fork'))
+    await new Promise(resolve => setImmediate(resolve))
+    expect(h.runtime.closed).toBe(true)
+    expect(h.errors).toHaveLength(1)
+  })
+
+  it('does not use the requested parent id as a fork result', async () => {
+    const h = harness({ resume: 'parent-session', forkSession: true, initTimeoutMs: 5 })
+    await expect(h.runtime.ready()).rejects.toMatchObject({ code: 'timeout' })
+    expect(h.runtime.sessionId()).toBeUndefined()
+  })
+
+  it('accepts a native SessionStart identity plus authentication without injecting a prompt', async () => {
+    const h = harness()
+    h.query().push({ type: 'system', subtype: 'hook_started', hook_id: 'start', hook_name: 'native-start',
+      hook_event: 'SessionStart', session_id: 'session-native', uuid: randomUUID() })
+    await expect(h.runtime.ready()).resolves.toMatchObject({ session_id: 'session-native' })
+    expect(h.runtime.sessionId()).toBe('session-native')
+    expect(h.runtime.init()).toBeUndefined()
+    // Later init must agree with the identity already used for routing.
+    h.query().push(initMessage('different-session'))
+    await new Promise(resolve => setImmediate(resolve))
+    expect(h.runtime.closed).toBe(true)
+    expect(h.errors).toHaveLength(1)
+  })
+
+  it('does not let early native identity bypass missing credentials', async () => {
+    const h = harness()
+    h.query().account = { apiProvider: 'firstParty', tokenSource: 'none' }
+    h.query().push({ type: 'system', subtype: 'hook_started', hook_id: 'start', hook_name: 'native-start',
+      hook_event: 'SessionStart', session_id: 'session-native', uuid: randomUUID() })
+    await expect(h.runtime.ready()).rejects.toMatchObject({ code: 'auth-required' })
+    expect(h.runtime.sessionId()).toBeUndefined()
+  })
+
+  it('rejects explicit missing first-party credentials without waiting for system/init', async () => {
+    const h = harness({ resume: 'existing-session' })
+    h.query().account = { apiProvider: 'firstParty', tokenSource: 'none' }
+    await expect(h.runtime.ready()).rejects.toMatchObject({ code: 'auth-required' })
+    await expect(h.runtime.ready()).rejects.toMatchObject({ code: 'auth-required' })
+    expect(h.runtime.closed).toBe(true)
+    expect(h.runtime.sessionId()).toBeUndefined()
+    expect(h.query().closeCalls).toBe(1)
+    expect(h.exits).toEqual(['error'])
+  })
+
+  it.each([
+    { apiProvider: 'bedrock', tokenSource: 'none' },
+    { apiProvider: 'firstParty', tokenSource: 'none', apiKeySource: 'user' },
+  ] as const)('does not misclassify an external credential source: %j', async account => {
+    const h = harness()
+    h.query().account = account
+    h.query().push(initMessage('session-1'))
+    await expect(h.runtime.ready()).resolves.toMatchObject({ session_id: 'session-1' })
+    h.runtime.close()
+  })
+
   it('waits for system/init before exposing the native session id', async () => {
     const h = harness()
     expect(h.runtime.sessionId()).toBeUndefined()
@@ -292,4 +374,12 @@ describe('claude runtime', () => {
     expect(h.runtime.state).toBe('idle')
     h.runtime.close()
   })
+})
+
+it('uses the query catalog and session-only setters for model and effort', async () => {
+  const h = harness(); h.query().push(initMessage('session-1')); await h.runtime.ready()
+  expect(await h.runtime.controls()).toEqual({ models: [{ id: 'sonnet', label: 'Sonnet', efforts: ['low', 'high'] }] })
+  await h.runtime.applyOptions({ model: 'sonnet', reasoning: 'high' })
+  expect(h.query().selectedModel).toBe('sonnet'); expect(h.query().flagSettings).toEqual({ effortLevel: 'high' })
+  h.runtime.close()
 })

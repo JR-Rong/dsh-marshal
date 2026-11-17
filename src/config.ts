@@ -8,6 +8,7 @@ export type Relay = 'off' | 'notify' | 'remote'
 export interface MarshalConfig {
   readonly role: Role
   readonly hubUrl?: string
+  readonly hubCaFile?: string
   readonly token?: string
   readonly deviceId?: string
   readonly deviceName: string
@@ -25,13 +26,15 @@ export interface MarshalConfig {
   readonly redaction: readonly string[]
   readonly allowDiscussion: boolean
   readonly devicesFile: string
+  readonly accountLogin: boolean
+  readonly dshAccountHash?: string
 }
 
 const KNOWN_KEYS = new Set([
-  'role', 'hubUrl', 'token', 'deviceId', 'deviceName', 'dashboardToken', 'publicOrigin',
+  'role', 'hubUrl', 'hubCaFile', 'token', 'deviceId', 'deviceName', 'dashboardToken', 'publicOrigin',
   'privacy', 'questionRelay', 'approvalRelay', 'answerTimeoutMs', 'approvalTimeoutMs',
   'agents', 'codexExecutable', 'claudeExecutable', 'ringBufferMinutes', 'redaction',
-  'allowDiscussion', 'devicesFile',
+  'allowDiscussion', 'devicesFile', 'accountLogin', 'dshAccountHash',
 ])
 
 const WEAK_DASHBOARD_TOKENS = new Set([
@@ -229,6 +232,10 @@ export function parseConfig(raw: unknown, hostname: string): MarshalConfig {
   const approvalRelay = parseRelay(input.approvalRelay, 'approvalRelay')
   const answerTimeoutMs = parseInteger(input.answerTimeoutMs, 'answerTimeoutMs', 300_000, 15_000, 300_000)
   const approvalTimeoutMs = parseInteger(input.approvalTimeoutMs, 'approvalTimeoutMs', 60_000, 15_000, 300_000)
+  const hubCaFile = parseOptionalExecutable(input.hubCaFile, 'hubCaFile')
+  if (hubCaFile !== undefined && !isAbsolute(hubCaFile)) {
+    throw new Error('marshal: config.hubCaFile must be an absolute path')
+  }
   const agents = parseAgents(input.agents)
   const codexExecutable = parseOptionalExecutable(input.codexExecutable, 'codexExecutable')
   const claudeExecutable = parseOptionalExecutable(input.claudeExecutable, 'claudeExecutable')
@@ -237,10 +244,17 @@ export function parseConfig(raw: unknown, hostname: string): MarshalConfig {
   const redaction = parseRedaction(input.redaction)
   const allowDiscussion = parseBoolean(input.allowDiscussion, 'allowDiscussion', false)
   const devicesFile = parseDevicesFile(input.devicesFile)
+  const accountLogin = parseBoolean(input.accountLogin, 'accountLogin', false)
+  const dshAccountHash = input.dshAccountHash
+  if (dshAccountHash !== undefined && (role !== 'hub' || typeof dshAccountHash !== 'string' || !/^[a-f0-9]{64}$/.test(dshAccountHash))) {
+    throw new Error('marshal: config.dshAccountHash must be a SHA-256 owner identity on the Hub')
+  }
+  if (role === 'hub' && accountLogin && dshAccountHash === undefined) throw new Error('marshal: account login requires a bound DSH owner')
 
   return Object.freeze({
     role,
     ...(hubUrl === undefined ? {} : { hubUrl }),
+    ...(hubCaFile === undefined ? {} : { hubCaFile }),
     ...(token === undefined ? {} : { token }),
     ...(deviceId === undefined ? {} : { deviceId }),
     ...(dashboardToken === undefined ? {} : { dashboardToken }),
@@ -258,5 +272,7 @@ export function parseConfig(raw: unknown, hostname: string): MarshalConfig {
     redaction,
     allowDiscussion,
     devicesFile,
+    accountLogin,
+    ...(dshAccountHash === undefined ? {} : { dshAccountHash: dshAccountHash as string }),
   })
 }

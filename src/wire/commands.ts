@@ -1,3 +1,6 @@
+import { PromptOptionsSchema } from '../agents/controls.ts'
+import { UploadSchema } from '../node/uploads.ts'
+import { DiscussionTurnSchema, DiscussionStopSchema, type DiscussionTurn, type DiscussionStop } from '../discussions/types.ts'
 import { createHash } from 'node:crypto'
 import { z } from 'zod'
 import { FrameError, type CommandFrame, type CommandOp } from './frames.ts'
@@ -23,6 +26,8 @@ const ObserveArgsSchema = z.discriminatedUnion('kind', [ObserveHistorySchema, Ob
 const PromptArgsSchema = z.object({
   // 拒绝原生 mode 等透传字段：普通 prompt 的受理语义由 node 端保证。
   text: z.string().min(1).max(200_000),
+  options: PromptOptionsSchema.optional(),
+  attachments: z.array(z.string().uuid()).max(8).optional(),
 }).strict()
 
 const InterruptArgsSchema = z.object({
@@ -76,6 +81,7 @@ export type AcquireArgs = z.infer<typeof AcquireArgsSchema>
 export type CreateArgs = z.infer<typeof CreateArgsSchema>
 export type ForkArgs = z.infer<typeof ForkArgsSchema>
 export type CommandArgs =
+  | z.infer<typeof UploadSchema>
   | ObserveArgs
   | PromptArgs
   | InterruptArgs
@@ -85,8 +91,14 @@ export type CommandArgs =
   | AcquireArgs
   | CreateArgs
   | ForkArgs
+  | DiscussionTurn
+  | DiscussionStop
 
 const ARG_SCHEMAS = {
+  controls: z.object({}).strict(),
+  upload: UploadSchema,
+  'discussion.turn': DiscussionTurnSchema,
+  'discussion.stop': DiscussionStopSchema,
   observe: ObserveArgsSchema,
   prompt: PromptArgsSchema,
   interrupt: InterruptArgsSchema,

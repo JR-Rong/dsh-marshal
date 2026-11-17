@@ -1,10 +1,12 @@
+import type { PromptExtras } from '../../agents/controls.ts'
 import {
   PreCallRejection, type Capability, type AnswerSink, type Operation, type SnapshotCompleteness,
   type SyncSnapshot,
 } from '../types.ts'
 import type { EventFrame } from '../../wire/frames.ts'
-import { createEventDeduper, toMarshalEvents } from './map.ts'
+import { createEventDeduper, toMarshalEvents, dshHistoryEvents } from './map.ts'
 import type { DshSurface } from './surface.ts'
+import { dshStatistics } from './statistics.ts'
 
 /** 能力快照的版本；字段含义变化时递增，页面据此丢弃旧解读。 */
 const CAPABILITY_REVISION = 1
@@ -12,22 +14,19 @@ const CAPABILITY_REVISION = 1
 const TURN_BINDING_MISSING = 'interrupt requires an atomic turn binding'
 
 /**
- * DSH v0 的能力。`observe.history=false` 来自已验证的原生 surface：
- * `list`/`follow` 之外没有可用的只读历史入口，不是“没实现所以猜 false”。
+ * DSH 能力来自当前宿主 surface；只在只读分页接口可用时开放历史。
  *
- * ownership 保持 `unverified`：`prompt` 之所以仍出现在 operations，是
- * 因为进程内原生 `prompt` 的“受理”本身就是控制边界；它只证明本适配器
- * 没有绕过原生受理，不证明外部写者不会并发写同一会话。
+ * attached 表示已连接同一 DSH 原生宿主。prompt 由该宿主恢复并受理，
+ * 不需要另起运行时；这不是跨窗口排他声明。
  */
 function buildCapability(surface: DshSurface): Capability {
   const operations = new Set<Operation>(['prompt', 'answer', 'cancel'])
   const unavailable: Record<string, string> = {
-    'observe.history': 'history-unavailable',
     create: 'not-exposed-in-v0',
     fork: 'not-exposed-in-v0',
     configure: 'read-only-in-v0',
-    ownership: 'unverified-in-v0',
   }
+  if (!surface.history) unavailable['observe.history'] = 'history-unavailable'
   // interrupt 只在原生控制器给出 atomic turn binding 时开放；否则关闭并说明原因。
   if (surface.activeTurn !== undefined && surface.cancelTurn !== undefined) {
     operations.add('interrupt')
@@ -35,9 +34,9 @@ function buildCapability(surface: DshSurface): Capability {
     unavailable.interrupt = 'no-atomic-turn-binding'
   }
   return {
-    observe: { history: false, follow: 'stream' },
+    observe: { history: surface.history !== undefined, follow: 'stream' },
     operations,
-    ownership: 'unverified',
+    ownership: 'attached',
     reasoning: true,
     toolDetail: 'args+output',
     promptFidelity: 'native',
@@ -113,12 +112,14 @@ export function createDshAdapter(surface: DshSurface, options: DshAdapterOptions
   const syncSnapshot = async (signal: AbortSignal): Promise<SyncSnapshot> => {
     const listed = await list(signal)
     return {
-      rows: listed.items.map(session => ({
+      rows: listed.items.map(session => { const counts = dshStatistics(session.projections?.values); return ({
         sessionId: session.sessionId,
+        title: (session.projections?.values?.title || session.publicAlias || "新会话").slice(0, 160),
         running: session.running,
         updatedAt: session.updatedAt,
         blank: session.blank,
-      })),
+        ...(counts ? { counts } : {}),
+      }) }),
       capabilities: [{ agent: 'dsh', capability: capabilityPayload() }],
       completeness: listed.completeness,
     }
@@ -126,10 +127,19 @@ export function createDshAdapter(surface: DshSurface, options: DshAdapterOptions
 
   return {
     agent: 'dsh',
+    ...(surface.controls ? { controls: surface.controls } : {}),
     capabilities(_sessionId: string): Capability { return capability },
     get snapshotCompleteness(): SnapshotCompleteness { return completeness },
     frame,
     nextSeq,
+    ...(surface.history === undefined ? {} : { async history(request: { sessionId: string; cursor?: string; limit?: number }, signal: AbortSignal) {
+      const page = await surface.history!(request, signal)
+      let seq = 0
+      return { items: dshHistoryEvents(page.events, { deviceId: options.deviceId, agent: 'dsh',
+        sessionId: request.sessionId, nodeEpoch: options.nodeEpoch }, () => seq++),
+        completeness: 'complete' as const,
+        ...(page.nextCursor === undefined ? {} : { nextCursor: page.nextCursor }) }
+    } }),
 
     async syncSnapshot(signal: AbortSignal): Promise<SyncSnapshot> {
       return await syncSnapshot(signal)
@@ -140,11 +150,13 @@ export function createDshAdapter(surface: DshSurface, options: DshAdapterOptions
       const events: EventFrame[] = []
       const capability = listed.capabilities.find(item => item.agent === 'dsh')
       for (const session of listed.rows) {
-        // 只发可公开状态：cwd/标题/正文一律不出适配器。
+        // 标题交给节点隐私层授权与脱敏；cwd 和正文不进入索引。
         events.push(frame(session.sessionId, 'session.updated', {
           running: session.running,
           updatedAt: session.updatedAt,
           blank: session.blank,
+          title: session.title,
+          counts: session.counts,
         }))
         if (capability !== undefined) {
           events.push(frame(session.sessionId, 'capability.changed', capability.capability))
@@ -172,7 +184,7 @@ export function createDshAdapter(surface: DshSurface, options: DshAdapterOptions
           // 跟随由 runner 的订阅表处理；适配器没有只读历史入口。
           throw new PreCallRejection('unsupported', 'history-unavailable')
         case 'prompt': {
-          const args = (command.args ?? {}) as { text?: string; requestId?: string }
+          const args = (command.args ?? {}) as { text?: string; requestId?: string } & PromptExtras
           if (typeof args.text !== 'string' || args.text.trim() === '') {
             throw new PreCallRejection('invalid-args', 'text is required')
           }
@@ -187,7 +199,7 @@ export function createDshAdapter(surface: DshSurface, options: DshAdapterOptions
           // 受理原子性完全依赖原生 prompt；调用之后的异常原样上抛，
           // 由 runner 记为 outcome-unknown（不伪造 writer-busy，也不重试）。
           const requestId = args.requestId ?? crypto.randomUUID()
-          return await surface.prompt({ sessionId, text: args.text, requestId })
+          return await surface.prompt({ sessionId, text: args.text, requestId, ...(args.options ? { options: args.options } : {}), ...(args.files ? { files: args.files } : {}) })
         }
         case 'interrupt': {
           if (surface.activeTurn === undefined || surface.cancelTurn === undefined) {

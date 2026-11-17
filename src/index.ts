@@ -1,14 +1,15 @@
+import { createDiscussionPort } from './discussions/ports.ts'
+import { createNodeDiscussions } from './discussions/node.ts'
+import { DISCUSSION_FEATURE } from './discussions/types.ts'
+import { hasWriteControl } from './adapters/types.ts'
+import { mountHub } from './hub/runtime.ts'
 import { randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import { mountSidebarConnection } from './sidebar.ts'
 import { parseConfig, type MarshalConfig } from './config.ts'
 import type { Frame } from './wire/frames.ts'
 import { decodeFrame, type EventFrame } from './wire/frames.ts'
 import type { MarshalContext } from './dsh-types.ts'
-import { mountHubSocket, webServerPort } from './hub/server.ts'
-import { registerMarshalRoutes } from './hub/api.ts'
-import { DeviceRegistry } from './hub/registry.ts'
-import { HubRelay } from './hub/relay.ts'
-import { createHubSync } from './hub/sync.ts'
-import { ensureInstall } from './hub/identity.ts'
 import { createDshSurface } from './adapters/dsh/surface.ts'
 import { createDshAdapter } from './adapters/dsh/adapter.ts'
 import type { Adapter } from './adapters/types.ts'
@@ -24,56 +25,29 @@ import { createQuestionRelay, type QuestionRelay } from './node/questions.ts'
 import { createInteractionRelay } from './node/interactions.ts'
 import { createAuditLog } from './node/audit.ts'
 import { createPrivacyProjector, type PrivacyProjector } from './node/privacy.ts'
+import { mountSetup } from './setup.ts'
 
 export const name = 'marshal'
 
 export function apply(ctx: MarshalContext, raw: unknown): void {
+  mountSetup(ctx, raw, applyConfigured)
+}
+
+function applyConfigured(ctx: MarshalContext, raw: unknown): void {
   const config = parseConfig(raw, process.env.HOSTNAME ?? 'unknown')
-  if (config.role === 'hub') { applyHub(ctx, config); return }
-  applyNode(ctx, config)
+  mountSidebarConnection(ctx, config)
+  if (config.role === 'hub') {
+    ctx.inject(['webServer'], scoped => applyHub(scoped, config))
+  } else if (config.agents.includes('dsh')) {
+    ctx.inject(config.allowDiscussion ? ['sessionController', 'llm'] : ['sessionController'], scoped => applyNode(scoped, config))
+  } else {
+    applyNode(ctx, config)
+  }
 }
 
 function applyHub(ctx: MarshalContext, config: MarshalConfig): void {
-  const webServer = ctx.webServer
-  if (webServer === undefined) throw new Error('marshal: hub role requires the webServer service')
-  const registry = new DeviceRegistry()
-  const install = ensureInstall(config.devicesFile)
-  if (install.initialized) ctx.logger.warn('marshal: empty device table')
-  // 同一个 epoch 同时作为历史游标前缀与 hello.ack 的 hubEpoch，重连才能对齐。
-  const hubEpoch = randomUUID()
-  const relay = new HubRelay({ registry, now: Date.now, operatorId: install.operatorId, hubEpoch })
-  const sync = createHubSync({ relay, now: Date.now, logger: ctx.logger })
-  // 只能在匹配的 sync.ack 原子提交后写入；同步期间一律 sync-required。
-  relay.setSyncGate((deviceId, connectionId, nodeEpoch) =>
-    sync.isSynced({ deviceId, connectionId, nodeEpoch }))
-  const socket = mountHubSocket({
-    port: webServerPort(webServer),
-    registry,
-    store: install.store,
-    operatorId: install.operatorId,
-    hubEpoch,
-    now: Date.now,
-    logger: ctx.logger,
-    sync,
-    onDetach: deviceId => relay.deviceOffline(deviceId),
-    // 内容授权收紧后不再保留该设备的可回放正文。
-    onContentRevoked: deviceId => { relay.purgeHistory(deviceId) },
-    onFrame: (identity, frame) => {
-      // 事件进索引并扇出；ACK 必须同时匹配 commandId 与连接身份才结算。
-      if (frame.type === 'event') relay.publish(frame)
-      else if (frame.type === 'ack') relay.settle(frame, identity)
-      // 只读状态查询走独立完成逻辑，不能混进 ACK 或 event。
-      else if (frame.type === 'command.status.result') relay.settleStatus(frame, identity)
-      // 待答快照结果只按请求时刻的设备/连接/代次结算。
-      else if (frame.type === 'inputs.snapshot.result') relay.settleInputs(frame, identity)
-    },
-  })
-  ctx.effect(() => { socket.dispose(); sync.dispose(); relay.dispose() }, 'marshal: uplink socket')
-  ctx.effect(registerMarshalRoutes({
-    webServer, registry, relay, sync, requireToken: config.dashboardToken!,
-    publicOrigin: config.publicOrigin!, operatorId: install.operatorId,
-  }).dispose, 'marshal: dashboard routes')
-  ctx.logger.info(`marshal: hub ready at ${webServer.getOrigin()}/marshal`)
+  if (ctx.webServer === undefined) throw new Error('marshal: hub role requires the webServer service')
+  ctx.effect(() => mountHub(ctx.webServer!, config, ctx.logger), 'marshal: hub runtime')
 }
 
 /** 各 agent 独立投影器；agent 名嵌在指纹里，绝不能共用一个实例。 */
@@ -117,6 +91,7 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
 
   // journal 在发起任何调用前打开并持有进程间锁；损坏/缺失时直接启动失败，
   // 不能带着空去重表继续接受写命令。
+  const hubCa = config.hubCaFile === undefined ? undefined : readFileSync(config.hubCaFile)
   const journal = openJournal()
   // nodeEpoch 只随插件实例生成；普通重连沿用同一个值。
   const nodeEpoch = randomUUID()
@@ -172,6 +147,7 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
     auditFields: fields => currentProjector(agent).auditFields(fields),
   })
 
+  let discussions: ReturnType<typeof createNodeDiscussions> | undefined
   let nodeSync: NodeSync | undefined
   /** 逐事件兜底：单帧超限或投影失败只丢这一帧，不能终止跟随循环。 */
   const emitProjected = (agent: string, event: EventFrame): void => {
@@ -225,7 +201,8 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
       inputs,
     })
     // 命令/状态/待答快照都按 target.agent 走各自的投影器与审计。
-    routes.set(agent, { adapter, follower, runtime: { projector: () => currentProjector(agent), audit, inputs } })
+    routes.set(agent, { adapter, follower, runtime: { projector: () => currentProjector(agent), audit, inputs,
+      ...(config.allowDiscussion ? { discussion: (frame: import('./wire/frames.ts').CommandFrame, args: unknown) => discussions!.execute(frame, args) } : {}) } })
   }
 
   if (config.agents.includes('dsh')) {
@@ -291,7 +268,7 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
       frame: (sessionId, kind, payload) => adapter().frame(sessionId, kind, payload),
       authorization: () => handshakeAuthorization(agent),
       available: () => link.online,
-      stillOwned: sessionId => adapter().ownershipPort?.ownership(sessionId) === 'ours',
+      stillOwned: sessionId => hasWriteControl(adapter().ownershipPort?.ownership(sessionId) ?? 'unverified'),
       deviceId: config.deviceId!,
       agent,
       now: Date.now,
@@ -356,10 +333,12 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
   }
 
   const link = new NodeLink({
+    ...(hubCa === undefined ? {} : { ca: hubCa }),
     url: config.hubUrl!, token: config.token!, deviceId: config.deviceId!,
     deviceName: config.deviceName,
     agents: config.agents,
     nodeEpoch,
+    features: config.allowDiscussion ? [DISCUSSION_FEATURE] : [],
     privacy: config.privacy,
     onFrame: text => {
       let frame: Frame
@@ -370,6 +349,8 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
       runRoutedCommand(link, routes, frame, config.deviceId!, journal, Date.now)
     },
     onHandshake: (binding, previous) => {
+      discussions?.invalidate()
+      void discussions?.announce().catch(() => {})
       const tightened = (previous?.policies.allowContent === true && binding.policies.allowContent !== true)
         || (previous?.policies.allowInteractions === true && binding.policies.allowInteractions !== true)
       // 每个 relay 都先按新协商复核旧卡：授权变化（含仅 revision 变化）立即结算，
@@ -387,9 +368,18 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
     // 订阅绑定当前连接：断线即清空每个 agent 的跟随引用。
     onOffline: () => {
       nodeSync?.abort()
+      discussions?.invalidate()
       for (const item of bindings.values()) item.follower.stopAll()
     },
     onError: error => ctx.logger.warn(`marshal: link error: ${errorName(error)}`),
+  })
+
+  if (config.allowDiscussion) discussions = createNodeDiscussions({
+    enabled: true, journal, link: () => link,
+    port: createDiscussionPort({ agents: config.agents, ...(ctx.llm === undefined ? {} : { llm: ctx.llm }),
+      ...(config.codexExecutable === undefined ? {} : { codexExecutable: config.codexExecutable }),
+      ...(config.claudeExecutable === undefined ? {} : { claudeExecutable: config.claudeExecutable }),
+    }),
   })
 
   nodeSync = createNodeSync({
@@ -397,6 +387,10 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
     sources: [...bindings.values()].map(item => ({
       agent: item.agent,
       syncSnapshot: (signal: AbortSignal) => item.adapter.syncSnapshot(signal),
+      sessionCapability: (sessionId: string) => {
+        const capability = item.adapter.capabilities(sessionId)
+        return { ...capability, operations: [...capability.operations] }
+      },
     })),
     agents: config.agents,
     projector: agent => currentProjector(agent),
@@ -410,7 +404,8 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
     logger: ctx.logger,
   })
 
-  ctx.effect(() => {
+  ctx.effect(() => () => {
+    discussions?.dispose()
     nodeSync?.dispose()
     for (const item of bindings.values()) {
       item.follower.stopAll()

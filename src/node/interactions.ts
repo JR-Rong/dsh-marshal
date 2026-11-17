@@ -431,9 +431,8 @@ export function createInteractionRelay(options: InteractionRelayOptions): Native
         rememberBlocked(entry.requestId, kind, entry.sessionId, entry.expiresAt, entry.authorization)
         entry.finish(undefined, 'invalidated')
       }
-      for (const [requestId, card] of [...blocked]) {
-        if (!stillAuthorized(card.authorization, currentAuth(card.kind))) blocked.delete(requestId)
-      }
+      // 失效卡只保留有界身份墓碑，直到原期限；授权改变不能马上删掉刚登记的拒绝证据。
+      pruneBlocked()
     },
 
     invalidate() {

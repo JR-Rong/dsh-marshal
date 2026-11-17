@@ -118,11 +118,14 @@ class FakeCodexServer {
   turnId = 'turn-1'
   turnStarts = 0
   interrupts = 0
+  resumedThreadId: string | undefined
   resumes = 0
+  readStatus: NonNullable<CodexThread['status']> = { type: 'idle' }
   forks = 0
   goal: { objective: string } | null = null
   /** 为 pending 测试挂起 goal/set 响应，直到 releaseGoalSet 显式放行。 */
   holdGoalSet = false
+  holdInitialize = false
   private pendingGoalSet: { readonly id: number; readonly params: Record<string, unknown> } | undefined
   private buffer = ''
 
@@ -176,8 +179,11 @@ class FakeCodexServer {
     this.requests.push({ id, method, params })
     switch (method) {
       case 'initialize':
+        if (this.holdInitialize) return
         this.respond(id, { userAgent: `codex/${this.version} (linux; x86_64)` })
         return
+      case 'model/list':
+        this.respond(id, { data: [{ model: 'test-model', displayName: 'Test model', supportedReasoningEfforts: [{ reasoningEffort: 'high' }] }] }); return
       case 'thread/list': {
         const limit = typeof params.limit === 'number' ? params.limit : this.threads.length
         this.respond(id, { data: this.threads.slice(0, Math.max(0, limit)) })
@@ -192,14 +198,30 @@ class FakeCodexServer {
         return
       case 'thread/resume':
         this.resumes += 1
-        this.respond(id, { thread: { id: typeof params.threadId === 'string' ? params.threadId : '' } })
+        // 新线程尚无持久历史，既有线程允许原 ID 恢复。
+        if (params.threadId === this.createdThreadId) this.fail(id, -32600)
+        else this.respond(id, { thread: { id: this.resumedThreadId ?? params.threadId, status: { type: 'idle' } } })
         return
-      case 'thread/turns/list':
-        this.respond(id, { data: [...this.historyTurns] })
+      case 'thread/read':
+        this.respond(id, { thread: { id: params.threadId, status: this.readStatus, model: 'test-model', reasoningEffort: 'high' } })
         return
+      case 'thread/turns/list': {
+        const offset = Number(params.cursor ?? 0), limit = Number(params.limit ?? 100)
+        const all = this.historyTurns.slice(offset, offset + limit)
+        this.respond(id, { data: all.map(turn => params.itemsView === 'notLoaded' ? { ...turn, items: [] } : turn),
+          nextCursor: offset + limit < this.historyTurns.length ? String(offset + limit) : null })
+        return
+      }
+      case 'thread/items/list': {
+        const all = this.historyTurns.find(turn => turn.id === params.turnId)?.items ?? []
+        const offset = Number(params.cursor ?? 0), limit = Number(params.limit ?? 20)
+        this.respond(id, { data: all.slice(offset, offset + limit).map(item => ({ turnId: params.turnId, item })),
+          nextCursor: offset + limit < all.length ? String(offset + limit) : null })
+        return
+      }
       case 'turn/start':
         this.turnStarts += 1
-        this.respond(id, { turn: { id: this.turnId, status: 'inProgress' } })
+        this.respond(id, { turn: { id: this.turnId, status: 'inProgress', items: [], startedAt: null, completedAt: null } })
         return
       case 'turn/interrupt':
         this.interrupts += 1
@@ -284,8 +306,9 @@ interface Harness {
 
 function harness(overrides: Partial<CodexAdapterOptions> = {}): Harness {
   const servers: FakeCodexServer[] = []
+  const first = new FakeCodexServer()
   const spawn: SpawnFn = () => {
-    const server = new FakeCodexServer()
+    const server = servers.length === 0 ? first : new FakeCodexServer()
     servers.push(server)
     return server.child
   }
@@ -308,14 +331,27 @@ function harness(overrides: Partial<CodexAdapterOptions> = {}): Harness {
     ...overrides,
   })
   const server = (): FakeCodexServer => {
-    const first = servers[0]
-    if (first === undefined) throw new Error('codex server was not spawned')
     return first
   }
   return { adapter, servers, server }
 }
 
 describe('codex adapter', () => {
+  it('concurrent control waits for the initialization handshake', async () => {
+    const h = harness()
+    h.server().holdInitialize = true
+    const started = h.adapter.start(signal())
+    const created = h.adapter.createSession!({ requestId: 'create-concurrent' }, signal())
+    try {
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(h.server().requests.map(request => request.method)).toEqual(['initialize'])
+    } finally {
+      const initialize = h.server().requests.find(request => request.method === 'initialize')!
+      h.server().send({ id: initialize.id, result: { userAgent: 'codex/0.166.0 (linux; x86_64)' } })
+      await Promise.allSettled([started, created])
+      await h.adapter.stop()
+    }
+  })
   it('probes the pinned version and reports foreign-unknown ownership', async () => {
     const h = harness()
     const result = await h.adapter.probe(signal())
@@ -323,7 +359,7 @@ describe('codex adapter', () => {
     expect(result.version).toBe('0.166.0')
     expect(result.capability?.ownership).toBe('foreign-unknown')
     expect(result.capability?.observe).toEqual({ history: true, follow: 'stream' })
-    expect([...(result.capability?.operations ?? [])]).toEqual(['create', 'fork'])
+    expect([...(result.capability?.operations ?? [])]).toEqual(['create', 'fork', 'acquire'])
     expect(h.adapter.health().state).toBe('ready')
     expect(h.server().notifications.map(item => item.method)).toContain('initialized')
     await h.adapter.stop()
@@ -339,7 +375,7 @@ describe('codex adapter', () => {
     await h.adapter.stop()
   })
 
-  it('lists every thread page as rows without preview or title', async () => {
+  it('lists every thread page with titles for the content projector', async () => {
     const h = harness()
     h.server().threads = [
       { id: 's1', status: { type: 'active', activeFlags: [] }, updatedAt: 1_700_000_000, preview: 'x' },
@@ -348,8 +384,8 @@ describe('codex adapter', () => {
     const listed = await h.adapter.list(signal())
     expect(listed.completeness).toBe('complete')
     expect(listed.rows).toEqual([
-      { sessionId: 's1', running: true, updatedAt: 1_700_000_000_000, blank: false },
-      { sessionId: 's2', running: false, updatedAt: 0, blank: true },
+      { sessionId: 's1', running: true, updatedAt: 1_700_000_000_000, blank: false, title: 'x' },
+      { sessionId: 's2', running: false, updatedAt: 0, blank: true, title: '新会话' },
     ])
     const snapshot = await h.adapter.syncSnapshot(signal())
     expect(snapshot.capabilities).toHaveLength(1)
@@ -358,16 +394,54 @@ describe('codex adapter', () => {
     await h.adapter.stop()
   })
 
-  it('never acquires an external session by resuming it', async () => {
+  it('explicitly resumes an existing thread with the same ID and scoped control', async () => {
     const h = harness()
     await h.adapter.start(signal())
-    const port = h.adapter.ownershipPort
-    if (port === undefined) throw new Error('ownership port missing')
-    const error = await port.acquire('external-1', signal()).catch(reason => reason)
-    expect(error).toBeInstanceOf(OwnershipError)
-    expect(error).toMatchObject({ code: 'ownership-unverified' })
+    h.server().readStatus = { type: 'notLoaded' }
+    const port = h.adapter.ownershipPort!
+    expect(h.adapter.capabilities('external-1').operations.has('prompt')).toBe(false)
+    const acquired = await port.acquire('external-1', signal())
+    expect(acquired).toMatchObject({ wire: 'attached', evidence: { scope: 'native-runtime', mechanism: 'native-thread-resume' } })
+    expect(h.server().resumes).toBe(1)
+    expect(h.server().requests.find(r => r.method === 'thread/resume')?.params).toEqual({ threadId: 'external-1', excludeTurns: true })
+    expect(h.adapter.capabilities('external-1').operations.has('prompt')).toBe(true)
+    await h.adapter.prompt({ sessionId: 'external-1', text: 'continue', requestId: 'req', runtimeEpoch: 'epoch-1' }, signal())
+    expect(h.server().requests.find(r => r.method === 'turn/start')?.params.threadId).toBe('external-1')
+    expect(h.server().turnStarts).toBe(1)
+    await h.adapter.stop()
+  })
+
+  it('does not resume a known active external thread', async () => {
+    const h = harness()
+    await h.adapter.start(signal())
+    h.server().readStatus = { type: 'active', activeFlags: [] }
+    await expect(h.adapter.ownershipPort!.acquire('external-1', signal())).rejects.toMatchObject({ code: 'writer-busy' })
     expect(h.server().resumes).toBe(0)
+    expect(h.adapter.capabilities('external-1').operations.has('prompt')).toBe(false)
+    await h.adapter.stop()
+  })
+
+  it('does not adopt a different identity returned by resume', async () => {
+    const h = harness()
+    await h.adapter.start(signal())
+    h.server().resumedThreadId = 'wrong-id'
+    await expect(h.adapter.ownershipPort!.acquire('external-1', signal())).rejects.toMatchObject({ code: 'ownership-unverified' })
+    expect(h.adapter.capabilities('external-1').operations.has('prompt')).toBe(false)
+    expect(h.adapter.capabilities('wrong-id').operations.has('prompt')).toBe(false)
+    await h.adapter.stop()
+  })
+
+  it('serializes explicit acquire and preserves attached scope after release', async () => {
+    const h = harness()
+    await h.adapter.start(signal())
+    const port = h.adapter.ownershipPort!
+    const results = await Promise.allSettled([port.acquire('external-1', signal()), port.acquire('external-1', signal())])
+    expect(results.map(r => r.status).sort()).toEqual(['fulfilled', 'rejected'])
+    expect(h.server().resumes).toBe(1)
+    await port.release('external-1')
     expect(port.ownership('external-1')).toBe('foreign-unknown')
+    expect((await port.acquire('external-1', signal())).wire).toBe('attached')
+    expect(h.server().resumes).toBe(1)
     await h.adapter.stop()
   })
 
@@ -383,7 +457,10 @@ describe('codex adapter', () => {
     const acquired = await port.acquire('new-1', signal())
     expect(acquired).toMatchObject({ state: 'ours-idle', wire: 'ours' })
     expect(acquired.evidence?.mechanism).toBe('managed-thread')
-    expect(h.server().resumes).toBe(1)
+    expect(h.server().resumes).toBe(0)
+    expect(h.server().requests).toContainEqual(expect.objectContaining({
+      method: 'thread/read', params: { threadId: 'new-1', includeTurns: false },
+    }))
 
     const before = h.adapter.capabilities('new-1')
     expect(before.ownership).toBe('ours')
@@ -416,6 +493,17 @@ describe('codex adapter', () => {
     }, signal())
     expect(interrupted).toEqual({ accepted: true, runtimeEpoch: 'epoch-1', turnId: 'turn-1' })
     expect(h.server().interrupts).toBe(1)
+    await h.adapter.stop()
+  })
+
+  it.each(['notLoaded', 'active'] as const)('cannot acquire a managed thread whose current status is %s', async type => {
+    const h = harness()
+    const created = await h.adapter.createSession!({ requestId: 'req-create' }, signal())
+    h.server().readStatus = type === 'active' ? { type, activeFlags: [] } : { type }
+    await expect(h.adapter.ownershipPort!.acquire(created.sessionId, signal()))
+      .rejects.toMatchObject({ code: type === 'active' ? 'writer-busy' : 'ownership-unverified' })
+    expect(h.adapter.ownershipPort!.ownership(created.sessionId)).not.toBe('ours')
+    expect(h.server().resumes).toBe(0)
     await h.adapter.stop()
   })
 
@@ -469,6 +557,50 @@ describe('codex adapter', () => {
     await h.adapter.stop()
   })
 
+  it('paginates large turns by item without duplicate turn boundaries', async () => {
+    const h = harness()
+    h.server().historyTurns = [
+      { id: 'a', status: 'completed', items: Array.from({ length: 45 }, (_, i) => ({ id: String(i), type: 'agentMessage', text: 'x'.repeat(200_000) })) },
+      { id: 'b', status: 'completed', items: [{ id: 'last', type: 'agentMessage', text: 'done' }] },
+    ]
+    const events = []; let cursor: string | undefined
+    do {
+      const page = await h.adapter.history({ sessionId: 's1', limit: 100, ...(cursor ? { cursor } : {}) }, signal())
+      events.push(...page.items); cursor = page.nextCursor
+    } while (cursor)
+    expect(events.filter(e => e.kind === 'turn.started')).toHaveLength(2)
+    expect(events.filter(e => e.kind === 'turn.completed')).toHaveLength(2)
+    expect(events.filter(e => e.kind === 'message.completed')).toHaveLength(46)
+    expect(h.server().requests.filter(r => r.method === 'thread/turns/list').every(r => r.params.itemsView === 'notLoaded')).toBe(true)
+    expect((await h.adapter.controls!('s1', signal())).current).toEqual({ model: 'test-model', reasoning: 'high' })
+    await h.adapter.stop()
+  })
+
+  it('rejects history cursors for another session before reading its items', async () => {
+    const h = harness()
+    h.server().historyTurns = [{ id: 'a', status: 'completed', items: [
+      { id: '1', type: 'agentMessage', text: 'one' }, { id: '2', type: 'agentMessage', text: 'two' },
+    ] }]
+    const first = await h.adapter.history({ sessionId: 's1', limit: 1 }, signal())
+    const before = h.server().requests.length
+    await expect(h.adapter.history({ sessionId: 's2', cursor: first.nextCursor! }, signal())).rejects.toMatchObject({ code: 'invalid-args' })
+    await expect(h.adapter.history({ sessionId: 's1', cursor: 'items-v1:bad' }, signal())).rejects.toMatchObject({ code: 'invalid-args' })
+    expect(h.server().requests).toHaveLength(before)
+    await h.adapter.stop()
+  })
+
+  it('restarts a poisoned native channel without replaying writes', async () => {
+    const h = harness()
+    await h.adapter.start(signal())
+    h.server().child.output.emitData('x'.repeat(8 * 1024 * 1024 + 1) + '\n')
+    await new Promise(resolve => setTimeout(resolve, 1100))
+    const models = await h.adapter.controls!('s1', signal())
+    expect(models.models).toHaveLength(1)
+    expect(h.servers).toHaveLength(2)
+    expect(h.servers.every(s => s.turnStarts === 0 && s.resumes === 0)).toBe(true)
+    await h.adapter.stop()
+  })
+
   it('streams mapped notifications to followers', async () => {
     const h = harness()
     const controller = new AbortController()
@@ -478,6 +610,7 @@ describe('codex adapter', () => {
     const created = await create({ requestId: 'req-create' }, controller.signal)
 
     const iterator = h.adapter.follow(created.sessionId, controller.signal)[Symbol.asyncIterator]()
+    expect((await iterator.next()).value?.kind).toBe('capability.changed')
     const pending = iterator.next()
     // 让生成器先注册监听；peer 已就绪，剩下的只是微任务。
     await new Promise(resolve => setTimeout(resolve, 0))
@@ -582,7 +715,7 @@ describe('codex adapter', () => {
     expect(capability.operations.has('answer')).toBe(false)
     expect(capability.unavailable?.answer).toBe('interaction-relay-unavailable')
     const probed = await relayed.adapter.probe(signal())
-    expect([...(probed.capability?.operations ?? [])].sort()).toEqual(['answer', 'cancel', 'create', 'fork'])
+    expect([...(probed.capability?.operations ?? [])].sort()).toEqual(['acquire', 'answer', 'cancel', 'create', 'fork'])
     expect(probed.capability?.unavailable?.answer).toBeUndefined()
     expect(probed.capability?.unavailable?.cancel).toBeUndefined()
     await relayed.adapter.stop()
@@ -661,12 +794,12 @@ describe('codex adapter', () => {
     await h.adapter.stop()
   })
 
-  it('keeps acquire/configure off for an unmanaged session', () => {
+  it('offers explicit acquire but not configure for an unowned session', () => {
     const h = harness()
     const capability = h.adapter.capabilities('external-1')
-    expect(capability.operations.has('acquire')).toBe(false)
+    expect(capability.operations.has('acquire')).toBe(true)
     expect(capability.operations.has('configure')).toBe(false)
-    expect(capability.unavailable?.acquire).toBe('ownership-unverified')
+    expect(capability.unavailable?.acquire).toBeUndefined()
     expect(capability.unavailable?.configure).toBe('ownership-unverified')
     expect(capability.settingsRevision).toBe(0)
     expect(capability.runtimeEpoch).toBe('epoch-1')
@@ -754,4 +887,15 @@ describe('codex adapter', () => {
     await iterator.return?.()
     await h.adapter.stop()
   })
+})
+
+it('forwards validated next-turn model, effort and native image paths without changing permissions', async () => {
+  const h = harness()
+  await h.adapter.start(signal())
+  await h.adapter.ownershipPort!.acquire('external-1', signal())
+  await expect(h.adapter.prompt({ sessionId: 'external-1', text: 'inspect', requestId: 'bad', runtimeEpoch: 'epoch-1', options: { model: 'invented' } }, signal())).rejects.toMatchObject({ code: 'invalid-args' })
+  expect(h.server().turnStarts).toBe(0)
+  await h.adapter.prompt({ sessionId: 'external-1', text: 'inspect', requestId: 'r', runtimeEpoch: 'epoch-1', options: { model: 'test-model', reasoning: 'high' }, files: [{ path: '/tmp/test.png', name: 'test.png', mime: 'image/png' }] }, signal())
+  expect(h.server().requests.find(item => item.method === 'turn/start')?.params).toEqual({ threadId: 'external-1', model: 'test-model', effort: 'high', input: [{ type: 'text', text: 'inspect' }, { type: 'localImage', path: '/tmp/test.png' }] })
+  await h.adapter.stop()
 })

@@ -1,0 +1,7 @@
+# 首次安装直接启用，在“调度官”页面选择中心服务器或边缘主机。
+# 空配置进入设置页；已有显式 hub/node 配置保持兼容。
+- insert:
+    - id: dsh-marshal
+      name: dsh-marshal
+      disabled: false
+      config: {}

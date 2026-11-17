@@ -7,6 +7,7 @@ export interface SessionSummaryLike {
   readonly cwd?: string
   /** 只有源端显式标记为可公开的短别名才允许过线；原生标题不在此列。 */
   readonly publicAlias?: string
+  readonly projections?: { readonly values?: { readonly title?: string; readonly modelSelection?: { readonly next?: { provider: string; model: string; reasoningEffort?: string } }; readonly tokenUsage?: unknown; readonly sessionStats?: unknown; readonly contextPressure?: unknown } }
 }
 
 export interface ActiveTurnLike { readonly turnId: string }
@@ -17,7 +18,10 @@ export interface SessionControllerLike {
     signal: AbortSignal,
   ): Promise<{ items: readonly SessionSummaryLike[]; nextCursor?: string | undefined }>
   follow(request: unknown, signal: AbortSignal): AsyncIterable<unknown>
+  page?(request: unknown, signal: AbortSignal): Promise<unknown>
   prompt(request: unknown, signal: AbortSignal): Promise<unknown>
+  modelCatalog?(): Promise<any>
+  selectModel?(request: unknown): Promise<unknown>
   cancel(request: unknown): unknown
   /**
    * 可选的原生回合绑定。只有控制器的实际实现（不是类型声明）提供这两个
@@ -70,10 +74,18 @@ export interface AskUserQuestionAnswerLike {
 }
 
 export interface MarshalContext {
+  plugin?(plugin: { name: string; apply(ctx: MarshalContext, config: unknown): void }, config: unknown): PromiseLike<unknown> & { dispose(): void | Promise<void>; state?: number }
+  readonly deepseekAccount?: {
+    getPlatformSession(): Promise<{ origin: string; token: string; userId: string | null; requestHeaders?: Record<string, string> } | null>
+  }
+  readonly llm?: import('./discussions/ports.ts').DiscussionLlm
+
   readonly webServer?: WebServerLike
   readonly sessionController?: SessionControllerLike
   readonly logger: LoggerLike
-  effect(cleanup: () => void | Promise<void>, label?: string): void
+  inject(services: readonly string[], callback: (ctx: MarshalContext) => void): unknown
+  /** Cordis executes setup immediately and retains its returned disposer. */
+  effect(setup: () => (() => void | Promise<void>), label?: string): unknown
   on(
     event: 'user-questions/request',
     handler: (request: AskUserQuestionRequestLike, next: () => Promise<AskUserQuestionAnswerLike>) => Promise<AskUserQuestionAnswerLike>,

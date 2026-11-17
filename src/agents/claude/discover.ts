@@ -136,9 +136,8 @@ function updatedAtOf(info: SDKSessionInfo): number {
 }
 
 /**
- * 同步行只含可公开状态：`SDKSessionInfo` 的 summary/customTitle/firstPrompt/cwd
- * 一律不出适配器。`blank` 只在本机由「标题与首个提示都为空」算成一个布尔值；
- * 内容本身从不外传。
+ * 从原生名称或首条输入构造有界标题，再由节点隐私层决定是否同步并脱敏。
+ * cwd 不进入索引；blank 只携带空会话布尔状态。
  */
 export function claudeRow(info: SDKSessionInfo): SyncSessionRow {
   const summary = typeof info.summary === 'string' ? info.summary.trim() : ''
@@ -146,6 +145,7 @@ export function claudeRow(info: SDKSessionInfo): SyncSessionRow {
   const customTitle = typeof info.customTitle === 'string' ? info.customTitle.trim() : ''
   return {
     sessionId: info.sessionId,
+    title: (customTitle || summary || firstPrompt || "新会话").replace(/\s+/g, " ").slice(0, 160),
     // Claude 的 `SDKSessionInfo` 没有 running/status 字段（spike §2），
     // 外部会话没有任何存活证据，因此恒为 false；所有权另行标为 foreign-unknown。
     // 受管会话的运行态由适配器用本地 Query 状态覆盖。

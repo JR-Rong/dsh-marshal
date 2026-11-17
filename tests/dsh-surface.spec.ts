@@ -33,6 +33,18 @@ const surfaceOf = (raw: ReturnType<typeof controller>, options: DshSurfaceOption
   createDshSurface(raw as unknown as SessionControllerLike, options)
 
 describe('dsh surface: paged list', () => {
+  it('subscribes to opt-in assistant text instead of only durable completion events', async () => {
+    const raw = controller([])
+    const signal = new AbortController().signal
+    const follow = vi.fn(async function* (request: any) {
+      if (request.assistantStream) yield { type: 'assistant-stream', frame: { type: 'chunk', chunk: { type: 'text-delta', text: 'reply' } } }
+    })
+    const surface = createDshSurface({ ...raw, follow } as unknown as SessionControllerLike)
+    const events = []
+    for await (const frame of surface.follow('s1', signal)) events.push(frame)
+    expect(events).toHaveLength(1)
+    expect(follow).toHaveBeenCalledWith({ address: { kind: 'session', sessionId: 's1' }, assistantStream: true }, signal)
+  })
   it('按 cursor 遍历到终止页并保持顺序', async () => {
     const raw = controller([
       { items: [summary('s1'), summary('s2')], nextCursor: 'c1' },

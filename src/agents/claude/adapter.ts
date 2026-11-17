@@ -1,10 +1,11 @@
+import { attachmentText, validateOptions, type PromptExtras, type SessionControls } from '../controls.ts'
 import { randomUUID } from 'node:crypto'
 import { isAbsolute } from 'node:path'
 import type {
-  Options, PermissionResult, SDKMessage, SDKSystemMessage,
+  Options, PermissionResult, SDKMessage,
 } from '@anthropic-ai/claude-agent-sdk'
 import {
-  PreCallRejection,
+  PreCallRejection, hasWriteControl,
   type Capability, type Operation, type SnapshotCompleteness,
   type SyncSnapshot, type Tunable,
 } from '../../adapters/types.ts'
@@ -26,7 +27,7 @@ import {
 import { classifyClaudeTool, claudePermissionResult } from './permissions.ts'
 import {
   ClaudeRuntimeError, createClaudeRuntime, loadClaudeSdk,
-  type ClaudeRuntime, type ClaudeSdk,
+  type ClaudeRuntime, type ClaudeRuntimeReady, type ClaudeSdk,
 } from './runtime.ts'
 import { createClaudeSessionRegistry } from './session.ts'
 import { createClaudeSettingsPort } from './settings.ts'
@@ -37,9 +38,8 @@ import { createClaudeSettingsPort } from './settings.ts'
  * 安全边界：
  * - `list`/`history`/`probe` 只走 `listSessions`/`getSessionMessages`，不创建
  *   Query、不 spawn CLI（spike §2 的类型证据：两者只读 JSONL transcript）。
- * - 外部会话一律 `foreign-unknown`：`SDKSessionInfo` 没有 running/status，
- *   Claude 也没有原生排他/liveness 证据，因此绝不 resume 冒领。
- * - 只有本实例 create/fork 出来的会话进入 managed 集合，才可能 `acquire`。
+ * - 未恢复会话保持 foreign-unknown；显式 acquire 使用原 ID 和 cwd 恢复 Query。
+ * - 恢复后 attached 仅表示原生控制句柄，不把 SDK 缺失的跨进程排他/liveness 当成已验证。
  * - steer 无原生证据，保持关闭；interrupt 必须带当前 runtimeEpoch + 已绑定回合。
  * - 任何副作用只发一次；Query 失败不会被新 Query 静默重跑。
  */
@@ -270,7 +270,7 @@ export function createClaudeAdapter(options: ClaudeAdapterOptions): AgentAdapter
       if (relay === undefined) return DENIED_TOOL
       // 外部（非本实例受管）会话或失去写权时不建卡；只允许当前 runtime 结算的请求。
       if (!sessions.isManaged(entry.sessionId)
-        || coordinator.ownership(entry.sessionId) !== 'ours') return DENIED_TOOL
+        || !hasWriteControl(coordinator.ownership(entry.sessionId))) return DENIED_TOOL
       const classification = classifyClaudeTool(toolName, input)
       if (classification.kind === 'deny') {
         return claudePermissionResult(classification, { decision: 'decline' })
@@ -292,7 +292,7 @@ export function createClaudeAdapter(options: ClaudeAdapterOptions): AgentAdapter
   const openRuntime = async (
     sdk: ClaudeSdk,
     params: OpenRuntimeParams,
-  ): Promise<{ runtime: ClaudeRuntime; init: SDKSystemMessage; holder: RuntimeHolder }> => {
+  ): Promise<{ runtime: ClaudeRuntime; init: ClaudeRuntimeReady; holder: RuntimeHolder }> => {
     generation += 1
     const holder: RuntimeHolder = {}
 
@@ -331,25 +331,30 @@ export function createClaudeAdapter(options: ClaudeAdapterOptions): AgentAdapter
     })
 
     // init 超时/中止不伪造 ID：以非 PreCallRejection 的错误上抛，runner 记 outcome-unknown。
-    let init: SDKSystemMessage
+    let init: ClaudeRuntimeReady
     try {
       init = await runtime.ready()
     } catch (error) {
       runtime.close()
+      // Query 只收到了控制握手，尚未收到任何用户输入；缺少认证是确定的调用前拒绝。
+      if (error instanceof ClaudeRuntimeError && error.code === 'auth-required') {
+        throw new PreCallRejection('auth-required')
+      }
       throw error
     }
     if (init.session_id === '') {
       runtime.close()
       throw new Error('marshal: claude session id missing')
     }
+    lastVersion = init.claude_code_version ?? lastVersion
     return { runtime, init, holder }
   }
 
-  const adopt = (holder: RuntimeHolder, runtime: ClaudeRuntime, sessionId: string): void => {
+  const adopt = (holder: RuntimeHolder, runtime: ClaudeRuntime, sessionId: string, resumed = false): void => {
     const entry: RuntimeEntry = { generation: runtime.generation, sessionId, runtime }
     holder.entry = entry
     runtimes.set(sessionId, entry)
-    sessions.markManaged(sessionId)
+    sessions.markManaged(sessionId, resumed)
     failed.delete(sessionId)
     lastVersion = runtime.init()?.claude_code_version ?? lastVersion
     if (runtime.closed) {
@@ -366,11 +371,10 @@ export function createClaudeAdapter(options: ClaudeAdapterOptions): AgentAdapter
     && (options.questionRelay === 'remote' || options.approvalRelay === 'remote')
 
   const buildAgentCapability = (): Capability => {
-    const operations = new Set<Operation>(['create', 'fork'])
+    const operations = new Set<Operation>(['create', 'fork', 'acquire'])
     const unavailable: Record<string, string> = {
       prompt: 'ownership-unverified',
       interrupt: 'ownership-unverified',
-      acquire: 'ownership-unverified',
       configure: 'settings-readback-unavailable',
     }
     if (relayEnabled()) {
@@ -396,10 +400,10 @@ export function createClaudeAdapter(options: ClaudeAdapterOptions): AgentAdapter
 
   const buildSessionCapability = (sessionId: string): Capability => {
     const ownership = coordinator.ownership(sessionId)
-    const owns = ownership === 'ours'
+    const owns = hasWriteControl(ownership)
     const managed = sessions.isManaged(sessionId)
     const dead = failed.has(sessionId)
-    const operations = new Set<Operation>(['create', 'fork'])
+    const operations = new Set<Operation>(['create', 'fork', 'acquire'])
     const unavailable: Record<string, string> = {
       configure: 'settings-readback-unavailable',
     }
@@ -414,7 +418,6 @@ export function createClaudeAdapter(options: ClaudeAdapterOptions): AgentAdapter
     if (dead) {
       unavailable.prompt = 'terminal-failure'
       unavailable.interrupt = 'terminal-failure'
-      unavailable.acquire = 'terminal-failure'
       unavailable.follow = 'terminal-failure'
     } else if (owns) {
       operations.add('prompt')
@@ -429,12 +432,6 @@ export function createClaudeAdapter(options: ClaudeAdapterOptions): AgentAdapter
     } else {
       unavailable.prompt = 'ownership-unverified'
       unavailable.interrupt = 'ownership-unverified'
-      unavailable.acquire = 'ownership-unverified'
-    }
-    // 受管且未终止的会话才宣传 acquire；未受管/死亡保持上面的原因码。
-    if (managed && !dead) {
-      operations.add('acquire')
-      delete unavailable.acquire
     }
     return {
       // 外部会话没有可订阅的原生通道：只有受管会话才会在我们自己的 Query 上产生事件。
@@ -506,11 +503,12 @@ export function createClaudeAdapter(options: ClaudeAdapterOptions): AgentAdapter
    * 普通 prompt：只有受管 + ours-idle 才接受。没有隐式队列：重复提交由
    * `beginPrompt` 立即以 writer-busy 拒绝，去重交给 runner 的 journal。
    */
-  const promptSession = (
+  const promptSession = async (
     sessionId: string,
     text: string,
     signal: AbortSignal,
-  ): ControlResult => {
+    extras: PromptExtras = {},
+  ): Promise<ControlResult> => {
     if (signal.aborted) throw signal.reason
     if (!sessions.isManaged(sessionId)) throw new OwnershipError('ownership-unverified')
     if (failed.has(sessionId)) throw new PreCallRejection('agent-crashed')
@@ -526,7 +524,11 @@ export function createClaudeAdapter(options: ClaudeAdapterOptions): AgentAdapter
     const turnId = `claude-turn:${turnUuid}`
     try {
       // 同步入队：抛错只发生在 closed/busy，即确定没有写出。
-      entry.runtime.send(text, turnUuid)
+      if (extras.options) {
+        validateOptions(await entry.runtime.controls(), extras.options)
+        await entry.runtime.applyOptions(extras.options)
+      }
+      entry.runtime.send(text, turnUuid, extras)
     } catch (error) {
       coordinator.endTurn(sessionId)
       if (error instanceof ClaudeRuntimeError) {
@@ -572,20 +574,35 @@ export function createClaudeAdapter(options: ClaudeAdapterOptions): AgentAdapter
 
   const ownershipPort: OwnershipPort = {
     async acquire(sessionId, signal) {
-      if (!sessions.isManaged(sessionId)) {
-        // 外部会话没有排他证据：resume 成功也不等于取得写权。
-        throw new OwnershipError('ownership-unverified')
-      }
       return await coordinator.acquire(sessionId, async () => {
-        if (signal.aborted) throw signal.reason
-        const entry = runtimes.get(sessionId)
-        if (entry === undefined || entry.runtime.closed) return undefined
-        if (entry.runtime.sessionId() !== sessionId) return undefined
-        // 正在跑的会话不接受新写入者，也不冒充 idle。
-        if (entry.runtime.state !== 'idle') return undefined
+        signal.throwIfAborted()
+        let entry = runtimes.get(sessionId)
+        let resumed = sessions.isResumed(sessionId)
+        if (entry === undefined || entry.runtime.closed) {
+          const sdk = await ensureSdkForControl(signal)
+          const discovery = await listAllSessions(sdk, signal, {
+            ...(options.dir === undefined ? {} : { dir: options.dir }),
+          })
+          const info = discovery.sessions.find(item => item.sessionId === sessionId)
+          if (info === undefined) throw new PreCallRejection(discovery.complete ? 'session-unknown' : 'sync-required')
+          // 保留原工作目录；只做控制握手，不发送推理输入，不 fork。
+          const cwd = typeof info.cwd === 'string' && isAbsolute(info.cwd) ? info.cwd : undefined
+          const opened = await openRuntime(sdk, { resume: sessionId, ...(cwd === undefined ? {} : { cwd }) })
+          if (signal.aborted || stopping || opened.init.session_id !== sessionId || opened.runtime.closed) {
+            opened.runtime.close()
+            signal.throwIfAborted()
+            throw new OwnershipError('ownership-unverified')
+          }
+          adopt(opened.holder, opened.runtime, sessionId, true)
+          resumed = true
+          entry = runtimes.get(sessionId)
+        }
+        if (entry === undefined || entry.runtime.closed || entry.runtime.sessionId() !== sessionId) return undefined
+        if (entry.runtime.state !== 'idle') throw new OwnershipError('writer-busy')
         return {
           sessionId,
-          mechanism: 'managed-query',
+          ...(resumed ? { scope: 'native-runtime' as const } : {}),
+          mechanism: resumed ? 'native-query-resume' : 'managed-query',
           holder: coordinator.holder,
           runtimeEpoch,
           acquiredAt: now(),
@@ -740,8 +757,7 @@ export function createClaudeAdapter(options: ClaudeAdapterOptions): AgentAdapter
 
     follow(sessionId: string, signal: AbortSignal): AsyncIterable<EventFrame> {
       return (async function* (): AsyncIterable<EventFrame> {
-        // 只有受管会话有可订阅的原生通道；先给订阅者当前能力再转发事件。
-        if (!sessions.isManaged(sessionId)) return
+        // 未恢复时只等待本适配器事件，不创建 Query；显式接管后同一订阅即可续收。
         yield frame(sessionId, 'capability.changed', capabilityPayload(buildSessionCapability(sessionId)))
         yield* sessions.observe(sessionId, signal)
       })()
@@ -762,6 +778,7 @@ export function createClaudeAdapter(options: ClaudeAdapterOptions): AgentAdapter
           running: row.running,
           updatedAt: row.updatedAt,
           blank: row.blank,
+          title: row.title,
           ownership: coordinator.ownership(row.sessionId),
         }))
         // 会话级能力必须带该会话自己的所有权/观察通道，不能复用 agent 级文档。
@@ -774,11 +791,17 @@ export function createClaudeAdapter(options: ClaudeAdapterOptions): AgentAdapter
       return events
     },
 
+    async controls(sessionId) {
+      const entry = runtimes.get(sessionId)
+      if (!entry) throw new PreCallRejection('ownership-unverified')
+      return entry.runtime.controls()
+    },
+
     async prompt(promptRequest: PromptRequest, signal: AbortSignal): Promise<ControlResult> {
       if (promptRequest.runtimeEpoch !== runtimeEpoch) {
         throw new PreCallRejection('stale-connection')
       }
-      return promptSession(promptRequest.sessionId, promptRequest.text, signal)
+      return promptSession(promptRequest.sessionId, promptRequest.text, signal, promptRequest)
     },
 
     async steer(_steerRequest: SteerRequest, _signal: AbortSignal): Promise<ControlResult> {
@@ -799,7 +822,7 @@ export function createClaudeAdapter(options: ClaudeAdapterOptions): AgentAdapter
       const cwd = createRequest.cwd ?? options.cwd
       if (cwd !== undefined && !isAbsolute(cwd)) throw new PreCallRejection('invalid-args')
       const sdk = await ensureSdkForControl(signal)
-      // 流式输入不会注入用户回合：只等 system/init 拿到原生 session_id。
+      // 流式输入不会注入用户回合：等待原生会话身份与认证握手。
       const opened = await openRuntime(sdk, { ...(cwd === undefined ? {} : { cwd }) })
       adopt(opened.holder, opened.runtime, opened.init.session_id)
       return { sessionId: opened.init.session_id, runtimeEpoch }
@@ -843,7 +866,7 @@ export function createClaudeAdapter(options: ClaudeAdapterOptions): AgentAdapter
         case 'prompt': {
           const text = typeof args.text === 'string' ? args.text : ''
           if (text.trim() === '') throw new PreCallRejection('invalid-args', 'text is required')
-          return promptSession(sessionId, text, new AbortController().signal)
+          return promptSession(sessionId, text, new AbortController().signal, args as PromptExtras)
         }
         case 'interrupt': {
           const requestedEpoch = typeof args.runtimeEpoch === 'string' ? args.runtimeEpoch : ''

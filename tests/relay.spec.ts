@@ -39,6 +39,38 @@ function setup(ids: readonly string[] = ['mac']) {
 }
 
 describe('HubRelay', () => {
+  it('removes content titles from the index when content access is revoked', () => {
+    const { registry } = setup()
+    const relay = new HubRelay({ registry, now: () => 0, timeoutMs: 50 })
+    try {
+      relay.publish({ v: 2, type: 'event', deviceId: 'mac', agent: 'dsh', sessionId: 's1',
+        nodeEpoch: NODE_EPOCH, seq: 1, ts: 0, kind: 'session.updated',
+        payload: { running: false, updatedAt: 0, title: 'Private session summary' } })
+      expect(relay.sessions('mac')[0]?.title).toBe('Private session summary')
+      relay.purgeHistory('mac')
+      expect(relay.sessions('mac')[0]).not.toHaveProperty('title')
+      expect(relay.sessions('mac')[0]?.sessionId).toBe('s1')
+    } finally { relay.dispose() }
+  })
+
+  it('按配置的历史保留期清除正文并报告游标缺口', () => {
+    const { registry } = setup()
+    let now = 0
+    const relay = new HubRelay({ registry, now: () => now, historyTtlMs: 60_000 })
+    try {
+      const cursor = relay.historyCursor()
+      relay.publish({
+        v: 2, type: 'event', deviceId: 'mac', agent: 'dsh', sessionId: 's1',
+        nodeEpoch: NODE_EPOCH, seq: 1, ts: 0, kind: 'message.delta', payload: { text: 'body' },
+      })
+      now = 59_999
+      expect(relay.historyRead(cursor).events).toHaveLength(1)
+      now = 60_000
+      expect(relay.historyRead(cursor)).toMatchObject({ events: [], gap: true })
+    } finally {
+      relay.dispose()
+    }
+  })
   it('把指令投递给目标设备', async () => {
     const registry = new DeviceRegistry()
     const sent: string[] = []
@@ -304,7 +336,7 @@ describe('HubRelay', () => {
     // 迟到的 ack 与后续指令都不再改变状态。
     relay.settle(ack(JSON.parse(sent[0]!).commandId, { result: 1 }), origin())
     await expect(relay.command({ op: 'prompt', target: target(), args: {}, idempotencyKey: 'c' }))
-      .resolves.toEqual({ ok: false, status: 'outcome-unknown', code: 'disposed', message: 'relay: disposed' })
+      .resolves.toEqual({ ok: false, status: 'rejected', code: 'disposed' })
     expect(sent).toHaveLength(2)
     vi.useRealTimers()
   })

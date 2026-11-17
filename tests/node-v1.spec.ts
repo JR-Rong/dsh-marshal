@@ -153,6 +153,7 @@ function statusQuery(key: string, agent = 'dsh'): CommandStatusFrame {
 }
 
 function configureCommand(options: {
+  agent?: string
   key: string
   expectedRevision: string
   field?: string
@@ -160,6 +161,7 @@ function configureCommand(options: {
 }): CommandFrame {
   return command({
     key: options.key,
+    agent: options.agent ?? 'codex',
     op: 'configure',
     args: {
       expectedRevision: options.expectedRevision,
@@ -242,7 +244,7 @@ describe('configure through the settings port', () => {
     const dsh = fakeAdapter('dsh')
     runCommand(
       link.link, dsh.adapter, followerFor(dsh.adapter),
-      configureCommand({ key: 'no-port', expectedRevision: formatExpectedRevision('epoch-1', 3) }),
+      configureCommand({ agent: 'dsh', key: 'no-port', expectedRevision: formatExpectedRevision('epoch-1', 3) }),
       'mac', journal,
     )
     await flush()
@@ -362,5 +364,45 @@ describe('configure through the settings port', () => {
     )
     await flush()
     expect(meta.requests[0]?.contentAuthorized).toBe(false)
+  })
+})
+
+
+describe('history transport privacy and isolation', () => {
+  it('denies metadata history, redacts content, filters unrelated targets, and does not journal reads', async () => {
+    const { journal } = setup()
+    const link = linkHarness(), base = fakeAdapter('codex')
+    let reads = 0
+    const adapter: Adapter = { ...base.adapter, async history() {
+      reads++
+      const event = { v: 2 as const, type: 'event' as const, deviceId: 'mac', agent: 'codex', sessionId: 's1', nodeEpoch: 'epoch-1', seq: 1, ts: 1, kind: 'user.message' as const, payload: { itemId: 'u', text: 'password=secret hello' } }
+      return { items: [event, { ...event, sessionId: 'other' }, { ...event, kind: 'input.requested' as const }], completeness: 'complete' }
+    } }
+    const frame = command({ agent: 'codex', key: 'history-read', op: 'observe', args: { kind: 'history', limit: 20 } })
+    runCommand(link.link, adapter, followerFor(adapter), frame, 'mac', journal)
+    await flush()
+    expect(reads).toBe(0)
+    expect(link.acks().at(-1)).toMatchObject({ status: 'rejected', code: 'unsupported' })
+    const projector = createPrivacyProjector({ privacy: 'content', allowContent: true, questionRelay: 'off', approvalRelay: 'off', allowInteractions: false, redaction: [], deviceId: 'mac', agent: 'codex' })
+    runCommand(link.link, adapter, followerFor(adapter), frame, 'mac', journal, Date.now, { projector: () => projector })
+    await flush()
+    const page = link.sent.find(item => item.type === 'history.result')
+    expect(page).toMatchObject({ type: 'history.result', items: [{ sessionId: 's1', kind: 'user.message' }] })
+    expect(page?.type === 'history.result' && page.items.length).toBe(1)
+    expect(JSON.stringify(page)).not.toContain('secret')
+    expect(base.calls()).toBe(0)
+    expect(journal.lookup({ operatorId: 'operator-1', target: frame.target, idempotencyKey: frame.idempotencyKey })).toBeUndefined()
+  })
+
+  it('drops the body if content authorization changes while a read is pending', async () => {
+    const { journal } = setup(), link = linkHarness(), base = fakeAdapter('codex')
+    let finish!: (value: { items: []; completeness: 'complete' }) => void
+    const adapter: Adapter = { ...base.adapter, history: () => new Promise(resolve => { finish = resolve }) }
+    let content = true
+    const runtime: CommandRuntime = { projector: () => createPrivacyProjector({ privacy: 'content', allowContent: content, questionRelay: 'off', approvalRelay: 'off', allowInteractions: false, redaction: [], deviceId: 'mac', agent: 'codex' }) }
+    runCommand(link.link, adapter, followerFor(adapter), command({ agent: 'codex', key: 'revoked', op: 'observe', args: { kind: 'history', limit: 20 } }), 'mac', journal, Date.now, runtime)
+    content = false; finish({ items: [], completeness: 'complete' }); await flush()
+    expect(link.sent.some(item => item.type === 'history.result')).toBe(false)
+    expect(link.acks().at(-1)).toMatchObject({ status: 'rejected' })
   })
 })

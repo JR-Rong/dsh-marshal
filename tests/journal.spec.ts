@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto'
 import {
-  mkdtempSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync,
+  mkdtempSync, readFileSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -141,6 +141,20 @@ describe('journal', () => {
     first.close()
     const second = openJournal({ file, keyFile })
     second.close()
+  })
+
+  it('同进程持有超过陈旧阈值的 journal 锁仍不可重入', () => {
+    const { file, keyFile } = paths()
+    const first = openJournal({ file, keyFile })
+    try {
+      const old = new Date(Date.now() - 60_000)
+      utimesSync(`${file}.lock`, old, old)
+      fails(() => openJournal({ file, keyFile }).close(), 'lock-held')
+      first.admit({ domain: domain('still-owned'), op: 'prompt', args: {} })
+      expect(first.lookup(domain('still-owned'))?.status).toBe('admitted')
+    } finally {
+      first.close()
+    }
   })
 
   it('容量满拒绝新写，未决项永不驱逐', () => {

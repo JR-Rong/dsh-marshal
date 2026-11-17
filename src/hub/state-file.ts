@@ -135,7 +135,7 @@ function lockIsStale(lockPath: string, now: () => number): boolean {
   }
   if (now() - mtimeMs <= LOCK_STALE_MS) return false
   const pid = recordedPid(lockPath)
-  if (pid !== undefined && pid !== process.pid && pidAlive(pid)) return false
+  if (pid !== undefined && pidAlive(pid)) return false
   return true
 }
 

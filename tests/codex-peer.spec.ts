@@ -97,11 +97,12 @@ describe('codex peer', () => {
     expect(response).toHaveProperty('error.code', -32601)
   })
 
-  it('returns the registered handler result for server requests', () => {
+  it('returns the registered handler result for server requests', async () => {
     const { peer, lines } = harness({
       onServerRequest: () => ({ result: { decision: 'decline' } }),
     })
     peer.handle('{"jsonrpc":"2.0","id":8,"method":"item/commandExecution/requestApproval","params":{}}\n')
+    await new Promise(resolve => setTimeout(resolve, 0))
     const response = JSON.parse(lines[0] ?? '{}') as Record<string, unknown>
     expect(response).toMatchObject({ id: 8, result: { decision: 'decline' } })
   })

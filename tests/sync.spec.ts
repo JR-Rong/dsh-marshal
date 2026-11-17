@@ -5,7 +5,7 @@ import { createHubSync, type SyncHost } from '../src/hub/sync.ts'
 import { DeviceRegistry } from '../src/hub/registry.ts'
 import type { NodeLink, NodeLinkState } from '../src/node/link.ts'
 import { createPrivacyProjector } from '../src/node/privacy.ts'
-import { createNodeSync } from '../src/node/sync.ts'
+import { createNodeSync, type NodeSyncSource } from '../src/node/sync.ts'
 import type { EventFrame, Frame, SyncAckFrame } from '../src/wire/frames.ts'
 import { buildSyncChunks, syncChecksum } from '../src/wire/sync.ts'
 
@@ -114,16 +114,17 @@ interface NodeHarness {
 
 function nodeHarness(
   snapshots: SyncSnapshot[],
-  overrides: Partial<{ scanMs: number; scanTimeoutMs: number; ackTimeoutMs: number }> = {},
+  overrides: Partial<{ scanMs: number; scanTimeoutMs: number; ackTimeoutMs: number; sources: readonly NodeSyncSource[] }> = {},
 ): NodeHarness {
   const link = new FakeLink()
   const adapter = new FakeAdapter(snapshots)
   const emitted: EventFrame[] = []
   const project = projector()
+  const sources = overrides.sources ?? [{ agent: 'dsh', syncSnapshot: (signal: AbortSignal) => adapter.syncSnapshot(signal) }]
   const sync = createNodeSync({
     link: link as unknown as NodeLink,
-    sources: [{ agent: 'dsh', syncSnapshot: signal => adapter.syncSnapshot(signal) }],
-    agents: ['dsh'],
+    sources,
+    agents: sources.map(source => source.agent),
     projector: () => project,
     emit: event => emitted.push(event),
     frame: (agent, sessionId, kind, payload) => ({
@@ -149,6 +150,70 @@ function ackFrame(syncId: string, accepted: boolean, version = 1): SyncAckFrame 
 }
 
 describe('node sync', () => {
+  it('单源故障不阻断健康源扫描，恢复后发布各会话自己的能力', async () => {
+    let failed = false
+    let updated = false
+    const owned = { operations: ['prompt', 'configure'], ownership: 'ours', settingsRevision: 7 }
+    const foreign = { operations: ['create'], ownership: 'foreign-unknown' }
+    const harness = nodeHarness([], { sources: [
+      {
+        agent: 'dsh',
+        async syncSnapshot() {
+          return snapshot([sessionRow(updated ? 'dsh-new' : 'dsh-old', 1)], foreign)
+        },
+      },
+      {
+        agent: 'codex',
+        async syncSnapshot() {
+          if (failed) throw new Error('unavailable')
+          return {
+            rows: [sessionRow('ours', 1), sessionRow('external', 1)],
+            capabilities: [{ agent: 'codex', capability: foreign }], completeness: 'complete',
+          }
+        },
+        sessionCapability: sessionId => sessionId === 'ours' ? owned : foreign,
+      },
+    ] })
+    harness.sync.begin()
+    await waitFor(() => harness.link.frames().some(frame => frame.type === 'sync.end'), 'sync.end')
+    const begin = harness.link.frames()[0]
+    if (begin?.type !== 'sync.begin') throw new Error('expected sync.begin')
+    harness.sync.onFrame(ackFrame(begin.syncId, true))
+    await waitFor(() => harness.link.confirmed.length === 1, 'confirm')
+    failed = true
+    updated = true
+    await waitFor(() => harness.emitted.some(event => event.sessionId === 'dsh-new'), 'healthy discovery')
+    expect(harness.emitted.some(event => event.sessionId === 'dsh-old' && event.kind === 'session.removed')).toBe(true)
+    expect(harness.emitted.some(event => event.agent === 'codex' && event.kind === 'session.removed')).toBe(false)
+    expect(harness.emitted.filter(event => event.agent === 'dsh' && event.kind === 'capability.changed')).toEqual([])
+
+    failed = false
+    await waitFor(() => harness.emitted.some(event => event.agent === 'codex'
+      && event.sessionId === 'ours' && (event.payload as Record<string, unknown>).stale === false), 'recovered capability')
+    const recovered = harness.emitted.filter(event => event.agent === 'codex' && event.kind === 'capability.changed')
+    expect(recovered.findLast(event => event.sessionId === 'ours')?.payload).toMatchObject({ ...owned, stale: false })
+    expect(recovered.findLast(event => event.sessionId === 'external')?.payload).toMatchObject({ ...foreign, stale: false })
+  })
+  it('周期扫描不把会话能力当作 agent 默认值重新广播', async () => {
+    const harness = nodeHarness([
+      snapshot([sessionRow('s1', 1), sessionRow('s2', 1)], {
+        operations: ['create'], ownership: 'foreign-unknown',
+      }),
+    ])
+    harness.sync.begin()
+    await waitFor(() => harness.link.frames().some(frame => frame.type === 'sync.end'), 'sync.end')
+    const begin = harness.link.frames()[0]
+    if (begin?.type !== 'sync.begin') throw new Error('expected sync.begin')
+    harness.sync.onFrame(ackFrame(begin.syncId, true))
+    await waitFor(() => harness.link.confirmed.length === 1, 'confirm')
+    harness.sync.observe({
+      v: 2, type: 'event', deviceId: DEVICE_ID, agent: 'dsh', sessionId: 's1',
+      nodeEpoch: NODE_EPOCH, seq: 8, ts: 1, kind: 'capability.changed',
+      payload: { operations: ['prompt', 'configure'], ownership: 'ours', settingsRevision: 5 },
+    })
+    await settle(60)
+    expect(harness.emitted.filter(event => event.kind === 'capability.changed')).toEqual([])
+  })
   it('发送完整分片与校验和，只有匹配的 sync.ack 才进入 online', async () => {
     const harness = nodeHarness([
       snapshot([sessionRow('s1', 1), sessionRow('s2', 2, true)], { operations: ['prompt'], readAt: 1 }),
@@ -189,6 +254,54 @@ describe('node sync', () => {
     await waitFor(() => harness.link.confirmed.length === 1, 'confirm')
   })
 
+  it('重连快照恢复健康能力，但在匹配 ACK 前仍禁止进入 online', async () => {
+    const capability = { operations: ['prompt'], ownership: 'attached' }
+    const harness = nodeHarness([snapshot([sessionRow('s1', 1)], capability)])
+    harness.sync.begin()
+    await waitFor(() => harness.link.frames().some(frame => frame.type === 'sync.end'), 'first sync.end')
+    const first = harness.link.frames()[0]
+    if (first?.type !== 'sync.begin') throw new Error('expected sync.begin')
+    harness.sync.onFrame(ackFrame(first.syncId, true))
+    await waitFor(() => harness.link.confirmed.length === 1, 'first confirm')
+
+    harness.sync.abort()
+    harness.link.state = 'syncing'
+    harness.link.online = false
+    harness.link.controls.length = 0
+    expect(harness.sync.stale).toBe(true)
+    harness.sync.begin()
+    await waitFor(() => harness.link.frames().some(frame => frame.type === 'sync.end'), 'reconnect sync.end')
+    const frames = harness.link.frames()
+    const begin = frames[0]
+    if (begin?.type !== 'sync.begin') throw new Error('expected sync.begin')
+    const rows = frames.flatMap(frame => frame.type === 'sync.chunk' ? frame.rows : [])
+    expect(rows).toContainEqual({ agent: 'dsh', capability })
+    expect(harness.link.online).toBe(false)
+    expect(harness.link.confirmed).toHaveLength(1)
+    harness.sync.onFrame(ackFrame(first.syncId, true))
+    await settle(10)
+    expect(harness.link.online).toBe(false)
+    harness.sync.onFrame(ackFrame(begin.syncId, true, 2))
+    await waitFor(() => harness.link.confirmed.length === 2, 'reconnect confirm')
+    expect(harness.sync.stale).toBe(false)
+    await settle(60)
+    expect(harness.emitted.filter(event => event.kind === 'capability.changed')).toEqual([])
+  })
+
+  it('首次同步的故障源也明确标记 stale，健康源不受影响', async () => {
+    const harness = nodeHarness([], { sources: [
+      { agent: 'dsh', async syncSnapshot() { return snapshot([sessionRow('s1', 1)], { operations: ['prompt'] }) } },
+      { agent: 'codex', async syncSnapshot() { throw new Error('unavailable') } },
+    ] })
+    harness.sync.begin()
+    await waitFor(() => harness.link.frames().some(frame => frame.type === 'sync.end'), 'sync.end')
+    const rows = harness.link.frames().flatMap(frame => frame.type === 'sync.chunk' ? frame.rows : [])
+    expect(rows).toContainEqual({
+      agent: 'codex', capability: { unavailable: { adapter: 'capability-unavailable' }, stale: true },
+    })
+    expect(rows).toContainEqual({ agent: 'dsh', capability: { operations: ['prompt'] } })
+  })
+
   it('被拒绝或超时的 sync.ack 都不得 online，只能重连重试', async () => {
     const rejected = nodeHarness([snapshot([sessionRow('s1', 1)])])
     rejected.sync.begin()
@@ -206,6 +319,35 @@ describe('node sync', () => {
     await waitFor(() => timedOut.link.rejected.includes('sync-timeout'), 'ack timeout')
     expect(timedOut.link.confirmed).toEqual([])
     expect(timedOut.sync.syncing).toBe(false)
+  })
+
+  it('更新时间不变时仍修正已完成的运行态', async () => {
+    const harness = nodeHarness([snapshot([sessionRow('s1', 1, true)]), snapshot([sessionRow('s1', 1, false)])])
+    harness.sync.begin()
+    await waitFor(() => harness.link.frames().some(frame => frame.type === 'sync.end'), 'sync.end')
+    const begin = harness.link.frames()[0]
+    if (begin?.type !== 'sync.begin') throw new Error('expected sync.begin')
+    harness.sync.onFrame(ackFrame(begin.syncId, true))
+    await waitFor(() => harness.emitted.some(e => e.kind === 'session.updated'), 'idle update')
+    expect(harness.emitted.find(e => e.kind === 'session.updated')?.payload).toMatchObject({ running: false, updatedAt: 1 })
+  })
+
+  it('扫描期间的新运行事件优先于等时间旧清单', async () => {
+    let scans = 0
+    let complete!: (value: SyncSnapshot) => void
+    const harness = nodeHarness([], { sources: [{ agent: 'dsh', async syncSnapshot() {
+      if (++scans === 1) return snapshot([sessionRow('s1', 1, false)])
+      return await new Promise<SyncSnapshot>(resolve => { complete = resolve })
+    } }] })
+    harness.sync.begin()
+    await waitFor(() => harness.link.frames().some(frame => frame.type === 'sync.end'), 'sync.end')
+    const begin = harness.link.frames()[0]
+    if (begin?.type !== 'sync.begin') throw new Error('expected sync.begin')
+    harness.sync.onFrame(ackFrame(begin.syncId, true))
+    await waitFor(() => scans > 1, 'pending scan')
+    harness.sync.observe({ v: 2, type: 'event', deviceId: DEVICE_ID, agent: 'dsh', sessionId: 's1', nodeEpoch: NODE_EPOCH, seq: 1, ts: 100, kind: 'turn.started', payload: {} })
+    complete(snapshot([sessionRow('s1', 1, false)])); await settle(10)
+    expect(harness.emitted.filter(e => e.kind === 'session.updated')).toEqual([])
   })
 
   it('周期扫描只发布差异，静默变化在下一轮可见', async () => {

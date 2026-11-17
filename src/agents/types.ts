@@ -1,3 +1,4 @@
+import type { PromptExtras } from './controls.ts'
 import type {
   Adapter, Capability, ObserveCapability, Operation, Ownership, SettleResult, SnapshotCompleteness,
   SyncCapabilityDocument, SyncSessionRow, SyncSnapshot, Tunable,
@@ -110,7 +111,7 @@ export interface TurnBinding {
   readonly runtimeEpoch: RuntimeEpoch
 }
 
-export interface PromptRequest {
+export interface PromptRequest extends PromptExtras {
   readonly sessionId: string
   readonly text: string
   readonly requestId: string
@@ -145,10 +146,11 @@ export type OwnershipState =
   | 'ours-running'
 
 /**
- * 持续排他证据必须带机制、持有者与代次，不能只记 boolean。
+ * 控制证据必须带机制、持有者与代次；native-runtime 仅证明本地原生句柄，不是跨进程锁。
  * `invalidatesOn` 至少一项，说明哪些事件会让这份证据失效。
  */
 export interface OwnershipEvidence {
+  readonly scope?: 'native-runtime'
   readonly sessionId: string
   readonly mechanism: string
   readonly holder: string

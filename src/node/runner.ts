@@ -1,5 +1,8 @@
+import { UploadStore, UploadSchema } from './uploads.ts'
+import { ControlsSchema } from '../agents/controls.ts'
+const uploadStore = new UploadStore()
 import {
-  encodeFrame, type AckFrame, type CommandStatusResultFrame, type EventFrame, type Frame,
+  encodeFrame, FrameError, WIRE_ERROR_CODES, type AckFrame, type CommandStatusResultFrame, type EventFrame, type Frame,
   type WireErrorCode,
 } from '../wire/frames.ts'
 import { parseCommandArgs, type ConfigureArgs, type ObserveArgs } from '../wire/commands.ts'
@@ -15,6 +18,8 @@ import type { AuditSink } from './audit.ts'
 
 /** 命令出口的投影端口与审计：每次调用都现取，握手收紧后立即生效。 */
 export interface CommandRuntime {
+  discussion?(frame: Extract<Frame, { type: 'command' }>, args: unknown): Promise<unknown>
+
   projector(): PrivacyProjector
   audit?: AuditSink
   /** 当前待答快照；只读，不写 journal，也不进入命令分派。 */
@@ -119,13 +124,7 @@ export function createFollower(options: {
 }
 
 /** 只允许 spec 定义的 wire 错误码过线；其余（`marshal: …`、`Error: …`）一律归为 agent-crashed。 */
-const WIRE_CODES: ReadonlySet<string> = new Set([
-  'session-unknown', 'invalid-args', 'unsupported', 'device-mismatch', 'agent-crashed', 'result-too-large',
-  'unknown', 'invalid', 'session-mismatch', 'tighten-only', 'deadline-expired',
-  'stale-connection', 'clock-skew', 'writer-busy', 'conflict',
-  // configure 的真实回读结论必须原样过线，不能被归成 timeout。
-  'readback-timeout', 'readback-mismatch', 'settings-unsafe',
-])
+const WIRE_CODES: ReadonlySet<string> = new Set(WIRE_ERROR_CODES)
 
 /** 超过这个偏差就不接受带副作用的命令：期限判断已经不可信。 */
 const MAX_CLOCK_SKEW_MS = 60_000
@@ -420,6 +419,11 @@ export function runCommand(
     reply({ status: 'rejected', code: 'session-unknown' })
     return
   }
+  // 时钟失准时不能先用不可信的校正值把副作用命令误报为已过期。
+  if (frame.op !== 'observe' && Math.abs(binding.serverTimeOffset) > MAX_CLOCK_SKEW_MS) {
+    reply({ status: 'rejected', code: 'clock-skew' })
+    return
+  }
   // hub 已经超时并可能让用户重试过：迟到的指令再执行会跑两遍。
   if (frame.deadline < deadlineNow()) {
     reply({ status: 'rejected', code: 'deadline-expired' })
@@ -445,6 +449,23 @@ export function runCommand(
     reply({ status: 'rejected', code: 'invalid-args' })
     return
   }
+  const attachmentScope = JSON.stringify([frame.operatorId, frame.nodeEpoch, frame.target])
+  if (frame.op === 'controls' || frame.op === 'upload') {
+    if (!project().content || sessionId === null) { reply({ status: 'rejected', code: 'unsupported' }); return }
+    const control = async (): Promise<unknown> => {
+      if (frame.op === 'upload') return uploadStore.put(attachmentScope, UploadSchema.parse(args))
+      if (!adapter.controls) throw new PreCallRejection('unsupported')
+      return { controls: ControlsSchema.parse(await adapter.controls(sessionId, AbortSignal.timeout(20000))) }
+    }
+    void control().then(result => {
+      if (!bindingFor(link, frame) || !project().content) { reply({ status: 'rejected', code: 'stale-connection' }); return }
+      reply({ status: 'accepted', result })
+    }).catch(error => reply({ status: 'rejected', code: error instanceof PreCallRejection ? error.code : 'agent-crashed' }))
+    return
+  }
+  if (frame.op === 'prompt' && 'attachments' in args && args.attachments?.length && !project().content) {
+    reply({ status: 'rejected', code: 'unsupported' }); return
+  }
   if (frame.op === 'observe') {
     if (sessionId === null) {
       // 目标校验已经拦下；这里只帮助类型收窄，防御运行期构造。
@@ -453,8 +474,30 @@ export function runCommand(
     }
     const observe = args as ObserveArgs
     if (observe.kind === 'history') {
-      // 已验证的 DSH surface 没有只读历史入口；明确拒绝，不能让调用方自己猜。
-      reply({ status: 'rejected', code: 'unsupported', result: { reason: 'history-unavailable' } })
+      if (!adapter.history || !project().content) {
+        reply({ status: 'rejected', code: 'unsupported', result: { reason: 'history-unavailable' } })
+        return
+      }
+      const signal = AbortSignal.timeout(Math.max(1, frame.deadline - deadlineNow()))
+      void adapter.history({ sessionId, limit: observe.limit,
+        ...(observe.cursor === undefined ? {} : { cursor: observe.cursor }) }, signal).then(page => {
+        signal.throwIfAborted()
+        if (bindingFor(link, frame) === undefined || !project().content) {
+          reply({ status: 'rejected', code: 'stale-connection' }); return
+        }
+        // History has its own ordering. Never consume the live public sequence,
+        // journal its body, or forward interaction cards through this channel.
+        const items = page.items.filter(item => item.deviceId === deviceId && item.agent === adapter.agent
+          && item.sessionId === sessionId && !item.kind.startsWith('input.')
+          && !item.kind.startsWith('session.') && item.kind !== 'capability.changed')
+          .flatMap(item => project().event(item))
+        if (items.length > 4000) throw new RangeError('history page exceeds event limit')
+        link.sendRaw(encodeFrame({ v: 2, type: 'history.result', commandId: frame.commandId,
+          connectionId: frame.connectionId, nodeEpoch: frame.nodeEpoch, target: frame.target,
+          items, completeness: page.completeness,
+          ...(page.nextCursor === undefined ? {} : { nextCursor: page.nextCursor }) }))
+      }).catch(error => reply({ status: 'rejected',
+        code: error instanceof PreCallRejection ? error.code : error instanceof RangeError || error instanceof FrameError ? 'result-too-large' : 'agent-crashed' }))
       return
     }
     const observer = observerKey(frame)
@@ -478,14 +521,8 @@ export function runCommand(
     return
   }
 
-  // 副作用操作：validate → clock → deadline → journal → 调用 → settle。
+  // 副作用操作：身份/时钟/期限/参数检查 → journal → 调用 → settle。
   // journal 是硬依赖：没有持久登记就不能产生副作用（也不再有 journal-less 回退）。
-  if (Math.abs(binding.serverTimeOffset) > MAX_CLOCK_SKEW_MS) {
-    // 偏差过大时期限判断不可信；必须在任何 journal 写入与 agent 调用之前拒绝。
-    reply({ status: 'rejected', code: 'clock-skew' })
-    return
-  }
-
   const domain: JournalDomain = {
     operatorId: frame.operatorId,
     target: frame.target,
@@ -517,6 +554,9 @@ export function runCommand(
   }
   // create/fork 没有原生端口时必须在登记 journal 之前拒绝，避免留下无调用证据的 admitted。
   const ports = sessionFactoryPorts(adapter)
+  if (frame.op.startsWith('discussion.') && runtime?.discussion === undefined) {
+    reply({ status: 'rejected', code: 'unsupported' }); return
+  }
   if (frame.op === 'create' && typeof ports.createSession !== 'function') {
     reply({ status: 'rejected', code: 'unsupported', result: { reason: 'capability-unavailable' } })
     return
@@ -542,7 +582,9 @@ export function runCommand(
   }
 
   const signal = new AbortController().signal
-  const invoke = (): Promise<unknown> => {
+  const invoke = async (): Promise<unknown> => {
+    if (frame.op.startsWith('discussion.')) return runtime!.discussion!(frame, args)
+
     if (frame.op === 'create') {
       const create = ports.createSession
       if (typeof create !== 'function') return Promise.reject(new PreCallRejection('unsupported'))
@@ -579,7 +621,8 @@ export function runCommand(
         contentAuthorized: (runtime?.projector() ?? fallback).content,
       }, signal)
     }
-    return adapter.execute({ op: frame.op, target: { sessionId }, args })
+    const resolvedArgs = frame.op === 'prompt' && 'attachments' in args ? { ...args, files: uploadStore.resolve(attachmentScope, args.attachments ?? []) } : args
+    return adapter.execute({ op: frame.op, target: { sessionId }, args: resolvedArgs })
   }
 
   void invoke()

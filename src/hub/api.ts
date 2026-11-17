@@ -1,3 +1,8 @@
+import { ControlsSchema } from '../agents/controls.ts'
+import { AccountLoginError, type AccountLogin, type AccountIdentity } from './account.ts'
+import { DeviceStateError, type DeviceStore } from './devices.ts'
+import type { Discussions } from './discussions/coordinator.ts'
+import { DiscussionError } from '../discussions/types.ts'
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { WebServerLike } from '../dsh-types.ts'
@@ -8,10 +13,16 @@ import type { BufferReadResult } from './buffer.ts'
 import type { DeviceRegistry } from './registry.ts'
 import type { CommandOutcome, CommandStatusOutcome, HubRelay } from './relay.ts'
 import type { HubSync } from './sync.ts'
-import { PAGE_HTML } from './page.ts'
+import { PAGE_HTML, DESKTOP_PAGE_HTML } from './page.ts'
 
 export interface ApiOptions {
+  readonly accountLogin?: AccountLogin
+  readonly deviceStore?: DeviceStore
+  readonly discussions?: Discussions
+
   readonly webServer: WebServerLike
+  /** Dedicated, partitioned browser session for the DSH Desktop panel. */
+  readonly desktopEmbed?: boolean
   readonly registry: DeviceRegistry
   readonly relay: HubRelay
   readonly sync?: Pick<HubSync, 'status'>
@@ -38,6 +49,7 @@ interface CommandBody {
 }
 
 interface ServerSession {
+  readonly account?: AccountIdentity
   readonly id: string
   readonly csrf: string
   readonly operatorId: string
@@ -57,6 +69,8 @@ interface AuthOptions {
 
 export const SESSION_COOKIE = '__Host-marshal-session'
 export const CSRF_COOKIE = '__Host-marshal-csrf'
+export const DESKTOP_SESSION_COOKIE = '__Host-marshal-desktop-session'
+export const DESKTOP_CSRF_COOKIE = '__Host-marshal-desktop-csrf'
 const SESSION_ABSOLUTE_MS = 8 * 60 * 60 * 1000
 const SESSION_IDLE_MS = 30 * 60 * 1000
 const LOGIN_WINDOW_MS = 15 * 60 * 1000
@@ -227,7 +241,7 @@ function commandStatusHttpStatus(outcome: CommandStatusOutcome): number {
 
 /** 出口只给分类/结果白名单字段；内部 message 与原始异常绝不回显。 */
 const RESULT_KEYS = new Set([
-  'accepted', 'cancelled', 'following', 'subscriptionId', 'created',
+  'attachmentId', 'complete', 'accepted', 'cancelled', 'following', 'subscriptionId', 'created',
   'sessionId', 'status', 'state', 'count', 'bytes', 'chars',
 ])
 
@@ -235,6 +249,8 @@ const RESULT_KEYS = new Set([
 function publicResult(result: unknown): unknown {
   if (typeof result !== 'object' || result === null || Array.isArray(result)) return undefined
   const out: Record<string, unknown> = {}
+  const catalog = ControlsSchema.safeParse((result as Record<string, unknown>).controls)
+  if (catalog.success) out.controls = catalog.data
   for (const [key, value] of Object.entries(result as Record<string, unknown>)) {
     if (!RESULT_KEYS.has(key)) continue
     if (typeof value === 'boolean') { out[key] = value; continue }
@@ -257,10 +273,10 @@ function publicOutcome(outcome: CommandOutcome): Record<string, unknown> {
   return { ok: false, status: outcome.status, code: outcome.code }
 }
 
-/** 会话索引只暴露契约字段；cwd/标题等本机信息不经过 HTTP。 */
+/** 会话索引只暴露契约字段；标题已通过内容授权与脱敏，不暴露 cwd。 */
 function publicSession(row: {
   deviceId: string; agent: string; sessionId: string;
-  running: boolean; updatedAt: number; blank?: boolean;
+  running: boolean; updatedAt: number; blank?: boolean; title?: string;
   ownership?: string; counts?: Readonly<Record<string, number>>
 }, relay: Pick<HubRelay, 'sessionCapability'>): Record<string, unknown> {
   const capability = relay.sessionCapability(row.deviceId, row.agent, row.sessionId)
@@ -270,6 +286,7 @@ function publicSession(row: {
     sessionId: row.sessionId,
     running: row.running,
     updatedAt: row.updatedAt,
+    ...(row.title === undefined ? {} : { title: row.title }),
     ...(row.blank === undefined ? {} : { blank: row.blank }),
     ...(row.ownership === undefined ? {} : { ownership: row.ownership }),
     ...(row.counts === undefined ? {} : { counts: row.counts }),
@@ -397,9 +414,9 @@ function publicCards(cards: readonly unknown[]): Record<string, unknown>[] {
   })
 }
 
-function cookiePair(name: string, value: string, httpOnly: boolean, maxAge?: number): string {
+function cookiePair(name: string, value: string, httpOnly: boolean, maxAge?: number, partitioned = false): string {
   // __Host- 要求 Secure、Path=/、无 Domain；CSRF 需要页面可读，故只有它不带 HttpOnly。
-  return `${name}=${value}; Path=/; Secure; SameSite=Strict${httpOnly ? '; HttpOnly' : ''}`
+  return `${name}=${value}; Path=/; Secure; ${partitioned ? 'SameSite=None; Partitioned' : 'SameSite=Strict'}${httpOnly ? '; HttpOnly' : ''}`
     + (maxAge === undefined ? '' : `; Max-Age=${maxAge}`)
 }
 
@@ -409,6 +426,9 @@ function cookiePair(name: string, value: string, httpOnly: boolean, maxAge?: num
  */
 export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } {
   const { webServer, registry, relay, sync, requireToken } = options
+  const desktopEmbed = options.desktopEmbed === true
+  const sessionCookieName = desktopEmbed ? DESKTOP_SESSION_COOKIE : SESSION_COOKIE
+  const csrfCookieName = desktopEmbed ? DESKTOP_CSRF_COOKIE : CSRF_COOKIE
   const now = options.now ?? Date.now
   const publicOrigin = options.publicOrigin ?? ''
   const operatorId = options.operatorId ?? 'operator-unbound'
@@ -468,7 +488,7 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
    */
   const authenticate = (req: IncomingMessage, auth: AuthOptions): AuthContext | undefined => {
     const at = now()
-    const sessionCookie = readCookie(req, SESSION_COOKIE)
+    const sessionCookie = readCookie(req, sessionCookieName)
     const tokenHeader = headerValue(req, 'x-marshal-token')
     if (sessionCookie !== undefined) {
       // 非法/重复 cookie 不能再拿 header 兜底。
@@ -488,7 +508,7 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
   }
 
   const csrfMatches = (req: IncomingMessage, session: ServerSession): boolean => {
-    const cookie = readCookie(req, CSRF_COOKIE)
+    const cookie = readCookie(req, csrfCookieName)
     const header = headerValue(req, 'x-marshal-csrf')
     if (cookie === undefined || cookie === null || header === undefined || header === '') return false
     const expectedCsrf = Buffer.from(session.csrf, 'utf8')
@@ -545,7 +565,8 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
   }
 
   const register = (path: string, handler: Handler): void => {
-    disposers.push(webServer.register({ kind: 'exact', path, handler }))
+    const mountedPath = desktopEmbed ? path.replace('/marshal', '/marshal/desktop') : path
+    disposers.push(webServer.register({ kind: 'exact', path: mountedPath, handler }))
   }
 
   // 异步失败统一收口：未发头回 500，已发头只结束响应，避免客户端一直挂着。
@@ -574,9 +595,62 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
       'cache-control': 'no-store',
       'referrer-policy': 'no-referrer',
       'x-content-type-options': 'nosniff',
-      'x-frame-options': 'DENY',
+      ...(desktopEmbed
+        ? { 'content-security-policy': 'frame-ancestors dsh-app://app' }
+        : { 'x-frame-options': 'DENY' }),
     })
-    res.end(PAGE_HTML)
+    const html = desktopEmbed ? DESKTOP_PAGE_HTML : PAGE_HTML
+    res.end(options.accountLogin ? html.replace('var accountMode = false;', 'var accountMode = true;') : html)
+  }))
+
+  // Only a native Host sends the Platform grant. It never passes through the renderer,
+  // logs, node journal or persistent Hub state. The result is a short single-use ticket.
+  register('/marshal/account/exchange', guard(async (req, res) => {
+    if (req.method !== 'POST') { methodNotAllowed(res, 'POST'); return }
+    if (!options.accountLogin) { json(res, 404, { code: 'unsupported' }); return }
+    if (req.headers.origin !== undefined || urlHasToken(req)) { deny(res, 403, 'forbidden'); return }
+    const source = req.socket.remoteAddress ?? 'unknown'
+    if (limiter.blocked(source) > 0) { json(res, 429, { code: 'rate-limited' }); return }
+    const body = await readJsonBody(req, res, 16_384); if (!body.ok) return
+    const data = asRecord(body.value)
+    if (!data || Object.keys(data).length !== 1 || typeof data.grant !== 'string') { json(res, 400, { code: 'invalid-args' }); return }
+    try {
+      const result = await options.accountLogin.exchange(data.grant)
+      limiter.success(source); json(res, 200, { ok: true, ...result })
+    } catch (error) {
+      limiter.fail(source)
+      const code = error instanceof AccountLoginError ? error.code : 'account-unavailable'
+      json(res, code === 'rate-limited' ? 429 : code === 'account-unavailable' ? 503 : 403, { ok: false, code })
+    }
+  }))
+
+  register('/marshal/account/enroll', guard(async (req, res) => {
+    if (req.method !== 'POST') { methodNotAllowed(res, 'POST'); return }
+    if (!options.accountLogin || !options.deviceStore) { json(res, 404, { code: 'unsupported' }); return }
+    if (req.headers.origin !== undefined || urlHasToken(req)) { deny(res, 403, 'forbidden'); return }
+    const source = req.socket.remoteAddress ?? 'unknown'
+    if (limiter.blocked(source) > 0) { json(res, 429, { code: 'rate-limited' }); return }
+    const body = await readJsonBody(req, res, 16_384); if (!body.ok) return
+    const data = asRecord(body.value)
+    if (!data || Object.keys(data).some(key => !['grant', 'installationId', 'tokenDigest', 'name', 'shareContent'].includes(key))
+      || typeof data.grant !== 'string' || typeof data.installationId !== 'string' || !/^[a-f0-9-]{36}$/.test(data.installationId)
+      || typeof data.tokenDigest !== 'string' || !/^[a-f0-9]{64}$/.test(data.tokenDigest)
+      || typeof data.name !== 'string' || !data.name.trim() || data.name.length > 80 || /[\x00-\x1f\x7f]/.test(data.name)
+      || typeof data.shareContent !== 'boolean') { json(res, 400, { code: 'invalid-args' }); return }
+    try {
+      const verified = await options.accountLogin.exchange(data.grant)
+      const identity = options.accountLogin.consume(verified.ticket)
+      if (!identity) throw new AccountLoginError('account-unavailable')
+      const id = 'account-' + createHash('sha256').update(identity.accountHash + '|' + data.installationId).digest('hex').slice(0, 32)
+      const device = options.deviceStore.enroll(id, data.name, data.tokenDigest, data.shareContent)
+      limiter.success(source)
+      json(res, 200, { ok: true, deviceId: device.id, accountHash: identity.accountHash, operatorId,
+        allowContent: device.allowContent, allowDiscussion: device.allowDiscussion })
+    } catch (error) {
+      limiter.fail(source)
+      const code = error instanceof AccountLoginError || error instanceof DeviceStateError ? error.code : 'account-unavailable'
+      json(res, code === 'account-unavailable' ? 503 : code === 'rate-limited' ? 429 : 403, { ok: false, code })
+    }
   }))
 
   register('/marshal/login', guard(async (req, res) => {
@@ -592,10 +666,11 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
     const body = await readJsonBody(req, res, LOGIN_BODY_LIMIT)
     if (!body.ok) return
     const record = asRecord(body.value)
-    const provided = record?.token
+    const field = options.accountLogin ? 'ticket' : 'token'
+    const provided = record?.[field]
     const extraKeys = record === undefined
       ? 0
-      : Object.keys(record).filter(key => key !== 'token').length
+      : Object.keys(record).filter(key => key !== field).length
     const fail = (status: number, reason: string): void => {
       limiter.fail(source)
       // 统一失败延迟，长度/前缀差异不落在响应时序上。
@@ -606,9 +681,12 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
     // 登录必须精确匹配配置 Origin；缺失、null、不匹配都拒绝。
     if (!exactOrigin(req, publicOrigin)) { fail(403, 'forbidden'); return }
     if (typeof provided !== 'string' || provided === '' || extraKeys > 0) { fail(400, 'bad request'); return }
-    if (!tokenMatches(provided)) { fail(401, 'unauthorized'); return }
+    const account = options.accountLogin?.consume(provided)
+    if (options.accountLogin ? !account : !tokenMatches(provided)) { fail(401, 'unauthorized'); return }
 
     pruneSessions()
+    const previous = readCookie(req, sessionCookieName)
+    if (typeof previous === 'string') expireSession(previous)
     if (sessions.size >= MAX_SESSIONS) {
       json(res, 503, { ok: false, code: 'unavailable' })
       return
@@ -620,18 +698,20 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
       operatorId,
       createdAt: at,
       lastSeenAt: at,
+      ...(account === undefined ? {} : { account }),
     }
     sessions.set(session.id, session)
     limiter.success(source)
     res.setHeader('set-cookie', [
-      cookiePair(SESSION_COOKIE, session.id, true),
-      cookiePair(CSRF_COOKIE, session.csrf, false),
+      cookiePair(sessionCookieName, session.id, true, undefined, desktopEmbed),
+      cookiePair(csrfCookieName, session.csrf, false, undefined, desktopEmbed),
     ])
     json(res, 200, {
       ok: true,
       operatorId: session.operatorId,
       csrf: session.csrf,
       expiresAt: session.createdAt + absoluteMs,
+      ...(session.account === undefined ? {} : { account: session.account, workspaceName: '我的调度空间' }),
     })
   }))
 
@@ -642,8 +722,8 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
     if (auth === undefined || auth.kind !== 'session') return
     expireSession(auth.session.id)
     res.setHeader('set-cookie', [
-      cookiePair(SESSION_COOKIE, '', true, 0),
-      cookiePair(CSRF_COOKIE, '', false, 0),
+      cookiePair(sessionCookieName, '', true, 0, desktopEmbed),
+      cookiePair(csrfCookieName, '', false, 0, desktopEmbed),
     ])
     json(res, 200, { ok: true })
   }))
@@ -658,6 +738,7 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
       operatorId: auth.session.operatorId,
       csrf: auth.session.csrf,
       expiresAt: auth.session.createdAt + absoluteMs,
+      ...(auth.session.account === undefined ? {} : { account: auth.session.account, workspaceName: '我的调度空间' }),
     })
   }))
 
@@ -666,7 +747,25 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
   register('/marshal/api/devices', guard((req, res) => {
     if (req.method !== 'GET') { methodNotAllowed(res, 'GET'); return }
     if (authorize(req, res, readAccess) === undefined) return
-    json(res, 200, { devices: registry.list(now()).map(row => publicDevice(row, relay, sync)) })
+    json(res, 200, { devices: registry.list(now()).map(row => publicDevice({ ...row, name: options.deviceStore?.findById(row.id)?.name ?? row.name }, relay, sync)) })
+  }))
+
+  register('/marshal/api/device-name', guard(async (req, res) => {
+    if (req.method !== 'POST') { methodNotAllowed(res, 'POST'); return }
+    if (authorize(req, res, { allowToken: true, refresh: true, write: true }) === undefined) return
+    const read = await readJsonBody(req, res, SMALL_BODY_LIMIT)
+    if (!read.ok) return
+    const body = asRecord(read.value)
+    if (!body || typeof body.deviceId !== 'string' || typeof body.name !== 'string' || !options.deviceStore) {
+      json(res, 400, { ok: false, code: 'invalid-args' }); return
+    }
+    try {
+      const device = options.deviceStore.rename(body.deviceId, body.name)
+      json(res, 200, { ok: true, device: { id: device.id, name: device.name } })
+    } catch (error) {
+      json(res, error instanceof DeviceStateError && error.code === 'unknown-device' ? 404 : 400,
+        { ok: false, code: 'invalid-args' })
+    }
   }))
 
   register('/marshal/api/sessions', guard((req, res) => {
@@ -678,10 +777,61 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
     json(res, 200, { sessions: relay.sessions(device).map(row => publicSession(row, relay)) })
   }))
 
+  register('/marshal/api/discussions', guard(async (req, res) => {
+    if (req.method !== 'GET' && req.method !== 'POST') { methodNotAllowed(res, 'GET, POST'); return }
+    const auth = authorize(req, res, { allowToken: false, refresh: true, write: req.method === 'POST' })
+    if (auth?.kind !== 'session') return
+    const groups = options.discussions
+    if (!groups) { json(res, 503, { ok: false, code: 'unsupported' }); return }
+    try {
+      if (req.method === 'GET') {
+        const roomId = new URL(req.url ?? '/', 'http://localhost').searchParams.get('room')
+        json(res, 200, roomId ? { room: groups.read(roomId) } : { rooms: groups.list(), catalog: groups.catalog(), presets: groups.presets() }); return
+      }
+      const body = await readJsonBody(req, res, 32768); if (!body.ok) return
+      const data = asRecord(body.value)
+      if (!data || typeof data.action !== 'string') { json(res, 400, { code: 'invalid-args' }); return }
+      let value: unknown
+      if (data.action === 'preview') value = { preview: groups.preview(data.input) }
+      else if (data.action === 'preset') value = { presets: groups.savePreset(data.input) }
+      else if (data.action === 'create' && typeof data.digest === 'string' && typeof data.key === 'string') value = { room: groups.create(data.digest, data.key) }
+      else if (data.action === 'send' && typeof data.roomId === 'string' && typeof data.text === 'string'
+        && data.text.trim() && typeof data.recipient === 'string' && typeof data.key === 'string') value = { room: groups.send(data.roomId, data.text, data.recipient, data.key) }
+      else if (data.action === 'stop' && typeof data.roomId === 'string') value = { room: await groups.stop(data.roomId) }
+      else if (data.action === 'reconcile' && typeof data.roomId === 'string') value = { room: await groups.reconcile(data.roomId) }
+      else if (data.action === 'configure' && typeof data.roomId === 'string' && typeof data.revision === 'number' && Number.isSafeInteger(data.revision)) value = { room: groups.configure(data.roomId, data.revision, data.profiles) }
+      else { json(res, 400, { code: 'invalid-args' }); return }
+      json(res, 200, value)
+    } catch (error) { json(res, 409, { code: error instanceof DiscussionError ? error.code : 'invalid-args' }) }
+  }))
+
+  register('/marshal/api/discussions/stream', guard((req, res) => {
+    if (req.method !== 'GET') { methodNotAllowed(res, 'GET'); return }
+    const auth = authorize(req, res, { allowToken: false, refresh: false, write: false })
+    if (auth?.kind !== 'session') return
+    const groups = options.discussions
+    if (!groups) { json(res, 503, { code: 'unsupported' }); return }
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store', connection: 'keep-alive', 'x-accel-buffering': 'no' })
+    let closed = false
+    const send = (): void => { if (!closed && !res.write('data: {"changed":true}\n\n')) cleanup() }
+    const unsubscribe = groups.subscribe(send)
+    const timer = setInterval(() => {
+      if (!authenticate(req, { allowToken: false, refresh: false, write: false })) cleanup()
+      else if (!res.write(': keepalive\n\n')) cleanup()
+    }, 5000); timer.unref()
+    const cleanup = (): void => {
+      if (closed) return; closed = true; clearInterval(timer); unsubscribe(); streams.delete(cleanup)
+      sessionStreams.get(auth.session.id)?.delete(cleanup); res.end()
+    }
+    streams.add(cleanup)
+    let set = sessionStreams.get(auth.session.id); if (!set) { set = new Set(); sessionStreams.set(auth.session.id, set) }; set.add(cleanup)
+    res.on('close', cleanup); res.on('error', cleanup); send()
+  }))
+
   register('/marshal/api/command', guard(async (req, res) => {
     if (req.method !== 'POST') { methodNotAllowed(res, 'POST'); return }
     if (authorize(req, res, { allowToken: true, refresh: true, write: true }) === undefined) return
-    const read = await readJsonBody(req, res, SMALL_BODY_LIMIT)
+    const read = await readJsonBody(req, res, MAX_FRAME_BYTES - 4096)
     if (!read.ok) return
     const body = asRecord(read.value) as CommandBody | undefined
     if (body === undefined) { json(res, 400, { ok: false, code: 'invalid-args' }); return }
@@ -690,7 +840,7 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
       || idempotencyKey.length === 0 || idempotencyKey.length > 256) {
       json(res, 400, { ok: false, code: 'invalid-args' }); return
     }
-    if (!(COMMAND_OPS as readonly string[]).includes(op)) {
+    if (op.startsWith('discussion.') || !(COMMAND_OPS as readonly string[]).includes(op)) {
       json(res, 400, { ok: false, code: 'invalid-args' }); return
     }
     // 每次 subscribe 都由 hub 签发新的不透明 id；页面在 HTTP 结果里取回并按 tab
@@ -809,8 +959,13 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
     const outcome = await relay.command({
       op: 'observe', target, args: parsed, idempotencyKey: randomUUID(),
     })
-    // 结果只按 publicResult 白名单重建，任意历史 payload 不透传。
-    json(res, commandHttpStatus(outcome), publicOutcome(outcome))
+    // Only the separately correlated, source-projected history channel can carry
+    // transcript bodies. Ordinary ACK/status/command responses stay metadata-only.
+    const result = outcome.ok ? outcome.history : undefined
+    json(res, commandHttpStatus(outcome), result !== undefined && Array.isArray(result.items)
+      ? { ok: true, status: outcome.status, result: { items: result.items,
+          completeness: result.completeness, ...(typeof result.nextCursor === 'string' ? { nextCursor: result.nextCursor } : {}) } }
+      : publicOutcome(outcome))
   }))
 
   register('/marshal/api/stream', guard(async (req, res) => {
@@ -855,6 +1010,9 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
       writeRaw(`event: reset\ndata: ${JSON.stringify({
         required: true, hubEpoch, degradedDevices: [...reset.degraded], complete: reset.complete,
         cursor: reset.cursor,
+        continuity: Object.fromEntries(registry.list(now()).map(device => [device.id, {
+          nodeEpoch: relay.nodeEpoch(device.id) ?? null, purge: relay.purgeGeneration(device.id),
+        }])),
         ...(reset.capabilities === undefined ? {} : { capabilities: reset.capabilities }),
         ...(reset.replay === undefined ? {} : { replay: reset.replay }),
       })}\n\n`)

@@ -130,7 +130,7 @@ class ReadOnlyAgent implements AgentAdapter {
     yield this.frame(sessionId, 'message.completed', { text: 'observed' })
   }
 
-  prompt(request: PromptRequest, signal: AbortSignal): Promise<ControlResult> {
+  async prompt(request: PromptRequest, signal: AbortSignal): Promise<ControlResult> {
     this.calls.prompt += 1
     if (signal.aborted) return Promise.reject(signal.reason)
     // 写入口必须显式经过所有权协调器；只读观察不会留下 ours。

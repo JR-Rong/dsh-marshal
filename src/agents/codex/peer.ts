@@ -50,6 +50,7 @@ export interface CodexPeerStats {
 export interface CodexPeerOptions {
   /** 写出一整行（不含换行）；抛错会关闭连接并拒绝所有 pending。 */
   readonly write: (line: string) => void
+  readonly onFatal?: () => void
   readonly onNotification?: (method: string, params: unknown) => void
   readonly onServerRequest?: (request: CodexServerRequest) => CodexServerResponse | Promise<CodexServerResponse>
   /** 已知通知白名单；未列入的方法不路由，只做有界计数。 */
@@ -148,6 +149,7 @@ export function createCodexPeer(options: CodexPeerOptions): CodexPeer {
   const failProtocol = (): void => {
     protocolErrorCount += 1
     close()
+    options.onFatal?.()
   }
 
   const noteUnknownNotification = (method: string): void => {
@@ -269,6 +271,7 @@ export function createCodexPeer(options: CodexPeerOptions): CodexPeer {
       if (newline === -1) break
       // 容忍 CRLF，但只去掉一个行尾 \r。
       const end = newline > start && combined[newline - 1] === 0x0d ? newline - 1 : newline
+      if (end - start > maxLineBytes) { failProtocol(); return }
       processLine(combined.toString('utf8', start, end))
       start = newline + 1
       if (closed) return
@@ -337,6 +340,7 @@ export function createCodexPeer(options: CodexPeerOptions): CodexPeer {
         pending.delete(id)
         reject(error)
         close()
+        options.onFatal?.()
       }
     })
   }

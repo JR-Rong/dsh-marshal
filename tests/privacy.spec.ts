@@ -128,13 +128,14 @@ describe('privacy projector: content authorization', () => {
     expectNoSentinel(projected)
   })
 
-  it('安全显示别名独立于原生标题', () => {
+  it('内容授权允许原生标题，未授权仍不外传', () => {
     const p = projector({ privacy: 'content', allowContent: true })
     const visible = p.event(event('session.updated', {
       running: false, updatedAt: 1, title: 'Native title', publicAlias: true,
     }))
     expect(visible[0]?.payload).toMatchObject({ title: 'Native title' })
-    const hidden = p.event(event('session.updated', { running: false, updatedAt: 1, title: 'Native title' }))
+    expect(p.syncRow({ sessionId: 's1', title: 'Native title' })).toMatchObject({ title: 'Native title' })
+    const hidden = projector().event(event('session.updated', { running: false, updatedAt: 1, title: 'Native title' }))
     expect((hidden[0]?.payload as { title?: string }).title).toBeUndefined()
   })
 })

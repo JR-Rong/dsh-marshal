@@ -265,20 +265,27 @@ export function turnToEvents(
   meta: CodexEventMeta,
   nextSeq: () => number,
   context: CodexMapContext,
+  boundaries: { start: boolean; end: boolean } = { start: true, end: true },
 ): EventFrame[] {
   const events: EventFrame[] = []
   const emit = (kind: EventFrame['kind'], payload: unknown): void => {
     events.push({
       v: 2, type: 'event', deviceId: meta.deviceId, agent: meta.agent, sessionId: meta.sessionId,
-      nodeEpoch: meta.nodeEpoch, seq: nextSeq(), ts: Date.now(), kind, payload,
+      nodeEpoch: meta.nodeEpoch, seq: nextSeq(), ts: Math.trunc(((kind === 'turn.started' || kind === 'user.message' ? turn.startedAt : turn.completedAt) ?? turn.startedAt ?? Date.now() / 1000) * 1000), kind, payload,
     })
   }
-  emit('turn.started', {
+  if (boundaries.start) emit('turn.started', {
     turnId: turn.id,
     state: 'running',
     runtimeEpoch: context.runtimeEpoch,
   })
   for (const item of turn.items ?? []) {
+    if (item.type === 'userMessage') {
+      const content = Array.isArray(item.content) ? item.content : []
+      emit('user.message', { itemId: item.id, text: content.map(asRecord)
+        .filter(part => part?.type === 'text').map(part => part!.text).join('\n') })
+      continue
+    }
     if (item.type === 'agentMessage') {
       emit('message.completed', {
         itemId: item.id,
@@ -294,7 +301,7 @@ export function turnToEvents(
     const complete = itemComplete(item)
     if (complete !== undefined) emit(complete.kind, complete.payload)
   }
-  emit('turn.completed', {
+  if (boundaries.end) emit('turn.completed', {
     turnId: turn.id,
     state: turnState(turn.status),
     runtimeEpoch: context.runtimeEpoch,

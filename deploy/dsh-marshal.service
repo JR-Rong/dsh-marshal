@@ -1,0 +1,34 @@
+[Unit]
+Description=DSH Marshal cloud hub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dsh-marshal
+Group=dsh-marshal
+WorkingDirectory=/opt/dsh-marshal/current
+ExecStart=/opt/dsh-marshal/runtime/node-v24.22.2-linux-x64/bin/node /opt/dsh-marshal/current/lib/src/bin/hub.js /var/lib/dsh-marshal/hub.json /var/lib/dsh-marshal/server-cert.pem /var/lib/dsh-marshal/server-key.pem 48443 127.0.0.1
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+UMask=0077
+Environment=NODE_OPTIONS=--max-old-space-size=160
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/var/lib/dsh-marshal
+CapabilityBoundingSet=
+LimitNOFILE=4096
+TasksMax=64
+MemoryHigh=192M
+MemoryMax=256M
+CPUWeight=20
+
+[Install]
+WantedBy=multi-user.target
