@@ -22,9 +22,9 @@ describe('page v1 capability flow', () => {
     expect(PAGE_HTML).not.toContain('ours-idle')
   })
 
-  it('ownership-unverified 有明确原因，只有 ours 才 ready', () => {
+  it('未接管有明确入口，已连接原生会话可写', () => {
     expect(PAGE_HTML).toContain('写权未确认（ownership-unverified）')
-    expect(PAGE_HTML).toContain('写权未确认（ownership-unverified），需先取得写权')
+    expect(PAGE_HTML).toContain('首次发送将自动接管并继续原会话')
     expect(PAGE_HTML).toContain('外部写者运行中')
     expect(PAGE_HTML).toContain("caps.ownership !== 'ours'")
     expect(PAGE_HTML).toContain("operations.indexOf('prompt') < 0")
@@ -55,7 +55,7 @@ describe('page v1 capability flow', () => {
   it('能力面板呈现 ownership、代次、修订、pending 与不可编辑原因', () => {
     expect(PAGE_HTML).toContain('id="capability"')
     expect(PAGE_HTML).toContain('function renderCapability')
-    expect(PAGE_HTML).toContain('function renderTunable(capability, tunable)')
+    expect(PAGE_HTML).toContain('function renderTunable(capability, tunable, container)')
     expect(PAGE_HTML).toContain("'所有权：'")
     expect(PAGE_HTML).toContain("'实例代次：'")
     expect(PAGE_HTML).toContain("'设置修订：'")

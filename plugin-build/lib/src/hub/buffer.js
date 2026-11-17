@@ -1,0 +1,457 @@
+/**
+ * hub 侧有界历史 EventBuffer（V1-T08）。
+ *
+ * 只缓存允许回放的 kind；`input.requested`/`input.resolved` 与载荷里出现的
+ * 交互、审批、答案、密钥键一律拒收，避免结构化派生副本绕过 kind 白名单。
+ *
+ * 存储按 hub 接收顺序分配单调游标 `n`（1 起）：活跃项放在
+ * `Map<number, BufferedEntry>` 里按 `n` 直接索引，淘汰时从 Map 删除，不保留
+ * tombstone 或指向大对象的辅助索引。另维护一条只存游标号的全局 FIFO
+ * （`globalNs` + `head`，惰性压缩）用于按接收顺序做 TTL/全局字节淘汰，
+ * 每个会话另有一条同样格式的 FIFO。所有读取/计数/追加都先按接收时间清理
+ * 过期项，事件自身的 `ts` 不参与保留窗计算。
+ */
+import { MARSHAL_KINDS } from "../wire/frames.js";
+export const BUFFER_SESSION_EVENT_MAX = 2_000;
+export const BUFFER_SESSION_BYTES_MAX = 8 * 1024 * 1024;
+export const BUFFER_HUB_BYTES_MAX = 64 * 1024 * 1024;
+export const BUFFER_TTL_MS = 15 * 60 * 1000;
+/** 单次 read 的条数上限。 */
+export const BUFFER_REPLAY_MAX = 1_000;
+/** 单次 read 的字节上限。 */
+export const BUFFER_REPLAY_BYTES_MAX = 4 * 1024 * 1024;
+const NON_CACHEABLE_KINDS = new Set([
+    'input.requested',
+    'input.resolved',
+]);
+/** 允许进入历史的 kind 白名单；与 MARSHAL_KINDS 保持同步。 */
+export const CACHEABLE_KINDS = new Set(MARSHAL_KINDS.filter((kind) => !NON_CACHEABLE_KINDS.has(kind)));
+export function isCacheableKind(kind) {
+    return CACHEABLE_KINDS.has(kind);
+}
+const CURSOR_INDEX = /^(0|[1-9][0-9]*)$/;
+/**
+ * 解析 `${hubEpoch}:${n}`。epoch 不匹配、格式非法、负数、非整数或超出安全
+ * 整数范围都返回 undefined，调用方按未知游标（gap/reset）处理。
+ */
+export function parseBufferCursor(cursor, hubEpoch) {
+    const prefix = `${hubEpoch}:`;
+    if (!cursor.startsWith(prefix))
+        return undefined;
+    const text = cursor.slice(prefix.length);
+    if (!CURSOR_INDEX.test(text))
+        return undefined;
+    const n = Number(text);
+    if (!Number.isSafeInteger(n) || n < 0)
+        return undefined;
+    return n;
+}
+const FORBIDDEN_PAYLOAD_KEYS = new Set([
+    'secret',
+    'answer',
+    'answers',
+    'selectedOptionIds',
+    'decisions',
+    'questions',
+    'approval',
+]);
+const PAYLOAD_MAX_DEPTH = 4;
+const PAYLOAD_MAX_KEYS = 64;
+/** 会话 FIFO / 全局数组的惰性压缩阈值。 */
+const COMPACT_MIN = 1_024;
+function isPlainRecord(value) {
+    if (typeof value !== 'object' || value === null || Array.isArray(value))
+        return false;
+    const proto = Object.getPrototypeOf(value);
+    return proto === Object.prototype || proto === null;
+}
+function isNonEmptyString(value) {
+    return typeof value === 'string' && value.length > 0;
+}
+/**
+ * 扫描 payload 的键。深度超过上限、单层对象键数超过上限、或出现交互/答案/
+ * 密钥键即不安全；`text` 不在禁用列表内，`message.delta`/`tool.output` 正常。
+ */
+function isSafePayload(payload) {
+    if (payload === null || typeof payload !== 'object')
+        return true;
+    const stack = [
+        { value: payload, depth: 0 },
+    ];
+    while (stack.length > 0) {
+        const current = stack.pop();
+        if (current === undefined)
+            break;
+        const item = current.value;
+        if (item === null || typeof item !== 'object')
+            continue;
+        if (current.depth > PAYLOAD_MAX_DEPTH)
+            return false;
+        const keys = Object.keys(item);
+        if (!Array.isArray(item) && keys.length > PAYLOAD_MAX_KEYS)
+            return false;
+        for (const key of keys) {
+            if (FORBIDDEN_PAYLOAD_KEYS.has(key))
+                return false;
+            const child = item[key];
+            if (child !== null && typeof child === 'object') {
+                stack.push({ value: child, depth: current.depth + 1 });
+            }
+        }
+    }
+    return true;
+}
+function isCacheableEvent(value) {
+    if (!isPlainRecord(value))
+        return false;
+    if (value.v !== 2 || value.type !== 'event')
+        return false;
+    if (!isNonEmptyString(value.deviceId))
+        return false;
+    if (!isNonEmptyString(value.agent))
+        return false;
+    if (!isNonEmptyString(value.sessionId))
+        return false;
+    if (!isNonEmptyString(value.nodeEpoch))
+        return false;
+    if (typeof value.seq !== 'number' || !Number.isInteger(value.seq) || value.seq < 0)
+        return false;
+    if (typeof value.ts !== 'number' || !Number.isFinite(value.ts) || value.ts < 0)
+        return false;
+    if (typeof value.kind !== 'string' || !isCacheableKind(value.kind))
+        return false;
+    if (!Object.hasOwn(value, 'payload') || value.payload === undefined)
+        return false;
+    return isSafePayload(value.payload);
+}
+class HubEventBuffer {
+    hubEpoch;
+    clock;
+    sessionEventMax;
+    sessionBytesMax;
+    hubBytesMax;
+    ttlMs;
+    replayMax;
+    replayBytesMax;
+    /** 活跃项按游标号直接索引；淘汰即删除，不留 tombstone。 */
+    live = new Map();
+    /** 全局接收顺序的游标 FIFO；head 之前是已淘汰项，惰性压缩。 */
+    globalNs = [];
+    globalHead = 0;
+    /** 下一个可分配的游标号。clear/dispose 也不回退，避免旧游标复用。 */
+    nextN = 1;
+    /** 已淘汰的最高游标号；严格小于它的请求游标必定有缺口。 */
+    evictedMax = 0;
+    /** clear 明确的失效边界（不含）；严格小于它的旧游标必须 reset。 */
+    purgedThrough = -1;
+    droppedTotal = 0;
+    hubBytes = 0;
+    lastReceivedAt = Number.NEGATIVE_INFINITY;
+    sessions = new Map();
+    disposed = false;
+    constructor(options) {
+        this.hubEpoch = options.hubEpoch;
+        this.clock = options.now ?? (() => Date.now());
+        this.sessionEventMax = options.sessionEventMax ?? BUFFER_SESSION_EVENT_MAX;
+        this.sessionBytesMax = options.sessionBytesMax ?? BUFFER_SESSION_BYTES_MAX;
+        this.hubBytesMax = options.hubBytesMax ?? BUFFER_HUB_BYTES_MAX;
+        this.ttlMs = options.ttlMs ?? BUFFER_TTL_MS;
+        this.replayMax = options.replayMax ?? BUFFER_REPLAY_MAX;
+        this.replayBytesMax = options.replayBytesMax ?? BUFFER_REPLAY_BYTES_MAX;
+    }
+    append(event) {
+        if (this.disposed)
+            return { accepted: false, dropped: 0 };
+        const now = this.clock();
+        const startDropped = this.droppedTotal;
+        this.evictExpired(now);
+        const raw = event;
+        let valid = false;
+        try {
+            valid = isCacheableEvent(raw);
+        }
+        catch {
+            valid = false;
+        }
+        if (!valid)
+            return { accepted: false, dropped: this.droppedTotal - startDropped };
+        let bytes;
+        try {
+            // 每次 append 只序列化一次，仅用于计算字节数；缓存保留原对象引用。
+            const text = JSON.stringify(event);
+            if (typeof text !== 'string') {
+                return { accepted: false, dropped: this.droppedTotal - startDropped };
+            }
+            bytes = Buffer.byteLength(text, 'utf8');
+        }
+        catch {
+            return { accepted: false, dropped: this.droppedTotal - startDropped };
+        }
+        const n = this.nextN;
+        this.nextN += 1;
+        const cursor = `${this.hubEpoch}:${n}`;
+        const receivedAt = Math.max(now, this.lastReceivedAt);
+        this.lastReceivedAt = receivedAt;
+        const sessionKey = `${event.deviceId}\u0000${event.agent}\u0000${event.sessionId}`;
+        const entry = {
+            n, cursor, deviceId: event.deviceId, sessionKey, receivedAt, bytes, event,
+        };
+        this.live.set(n, entry);
+        this.globalNs.push(n);
+        let session = this.sessions.get(sessionKey);
+        if (session === undefined) {
+            session = { key: sessionKey, head: 0, ns: [], count: 0, bytes: 0 };
+            this.sessions.set(sessionKey, session);
+        }
+        session.ns.push(n);
+        session.count += 1;
+        session.bytes += bytes;
+        this.hubBytes += bytes;
+        while (session.count > this.sessionEventMax || session.bytes > this.sessionBytesMax) {
+            if (!this.evictSessionOldest(session))
+                break;
+        }
+        while (this.hubBytes > this.hubBytesMax) {
+            if (!this.evictGlobalOldest())
+                break;
+        }
+        this.compactGlobal();
+        return { accepted: true, cursor, dropped: this.droppedTotal - startDropped };
+    }
+    read(cursor) {
+        if (this.disposed) {
+            return {
+                events: [], cursor: `${this.hubEpoch}:0`, gap: true,
+                dropped: this.droppedTotal, truncated: false,
+            };
+        }
+        this.evictExpired(this.clock());
+        const lastAssigned = this.nextN - 1;
+        const current = this.displayCursor();
+        let requestN;
+        if (cursor === undefined) {
+            // 只做 live 对齐：不重放任何历史。
+            requestN = lastAssigned;
+        }
+        else {
+            const parsed = parseBufferCursor(cursor, this.hubEpoch);
+            if (parsed === undefined
+                || parsed < this.evictedMax
+                || parsed < this.purgedThrough
+                || parsed > lastAssigned) {
+                return {
+                    events: [], cursor: current, gap: true,
+                    dropped: this.droppedTotal, truncated: false,
+                };
+            }
+            requestN = parsed;
+        }
+        const events = [];
+        let bytes = 0;
+        let truncated = false;
+        for (let n = requestN + 1; n <= lastAssigned; n += 1) {
+            const entry = this.entryAt(n);
+            if (entry === undefined) {
+                // 有效游标之后出现空洞说明索引与游标失配；防御性转为 reset，避免静默丢内容。
+                return {
+                    events: [], cursor: current, gap: true,
+                    dropped: this.droppedTotal, truncated: false,
+                };
+            }
+            if (events.length >= this.replayMax || bytes + entry.bytes > this.replayBytesMax) {
+                truncated = true;
+                break;
+            }
+            const event = entry.event;
+            events.push({
+                cursor: entry.cursor, event, receivedAt: entry.receivedAt, bytes: entry.bytes,
+            });
+            bytes += entry.bytes;
+        }
+        const last = events[events.length - 1];
+        let resultCursor;
+        if (last !== undefined)
+            resultCursor = last.cursor;
+        else if (cursor !== undefined)
+            resultCursor = `${this.hubEpoch}:${requestN}`;
+        else
+            resultCursor = current;
+        return {
+            events, cursor: resultCursor, gap: false,
+            dropped: this.droppedTotal, truncated,
+        };
+    }
+    size() {
+        if (this.disposed)
+            return { events: 0, bytes: 0, sessions: 0 };
+        this.evictExpired(this.clock());
+        return { events: this.live.size, bytes: this.hubBytes, sessions: this.sessions.size };
+    }
+    cursor() {
+        if (this.disposed)
+            return `${this.hubEpoch}:0`;
+        this.evictExpired(this.clock());
+        return this.displayCursor();
+    }
+    purgeDevice(deviceId) {
+        if (this.disposed || deviceId.length === 0)
+            return 0;
+        this.evictExpired(this.clock());
+        let deleted = 0;
+        // 内容授权收紧是低频管理操作；这里允许一次顺序扫描，不暴露为读取 API。
+        for (const entry of this.live.values()) {
+            if (entry.deviceId !== deviceId)
+                continue;
+            this.evictEntry(entry);
+            deleted += 1;
+        }
+        this.compactGlobal();
+        return deleted;
+    }
+    clear() {
+        if (this.disposed)
+            return;
+        this.evictExpired(this.clock());
+        const lastAssigned = this.nextN - 1;
+        this.droppedTotal += this.live.size;
+        if (lastAssigned > this.evictedMax)
+            this.evictedMax = lastAssigned;
+        if (lastAssigned > 0 && lastAssigned > this.purgedThrough) {
+            this.purgedThrough = lastAssigned;
+        }
+        this.live.clear();
+        this.globalNs = [];
+        this.globalHead = 0;
+        this.sessions.clear();
+        this.hubBytes = 0;
+    }
+    dispose() {
+        if (this.disposed)
+            return;
+        this.disposed = true;
+        this.live.clear();
+        this.globalNs = [];
+        this.globalHead = 0;
+        this.sessions.clear();
+        this.hubBytes = 0;
+    }
+    /** 始终返回最后分配过的高水位；全新缓冲 nextN===1 时为 `:0`。 */
+    displayCursor() {
+        return `${this.hubEpoch}:${this.nextN - 1}`;
+    }
+    entryAt(n) {
+        return this.live.get(n);
+    }
+    /** 跳过 globalNs 头部已淘汰的游标号。 */
+    advanceGlobalHead() {
+        while (this.globalHead < this.globalNs.length) {
+            const n = this.globalNs[this.globalHead];
+            if (n !== undefined && this.live.has(n))
+                return;
+            this.globalHead += 1;
+        }
+    }
+    /** 按接收顺序从全局 FIFO 头部清理到期项；没有新 append 也会执行。 */
+    evictExpired(now) {
+        for (;;) {
+            this.advanceGlobalHead();
+            const n = this.globalNs[this.globalHead];
+            if (n === undefined)
+                break;
+            const entry = this.live.get(n);
+            if (entry === undefined) {
+                this.globalHead += 1;
+                continue;
+            }
+            if (now - entry.receivedAt < this.ttlMs)
+                break;
+            this.evictEntry(entry);
+        }
+        this.compactGlobal();
+    }
+    /** 淘汰会话最旧项；返回 false 表示队列已空。 */
+    evictSessionOldest(session) {
+        while (session.head < session.ns.length) {
+            const n = session.ns[session.head];
+            if (n === undefined) {
+                session.head += 1;
+                continue;
+            }
+            const entry = this.entryAt(n);
+            if (entry === undefined) {
+                session.head += 1;
+                continue;
+            }
+            this.evictEntry(entry);
+            return true;
+        }
+        return false;
+    }
+    /** 淘汰全局最旧存活项；返回 false 表示缓冲已空。 */
+    evictGlobalOldest() {
+        this.advanceGlobalHead();
+        const n = this.globalNs[this.globalHead];
+        if (n === undefined)
+            return false;
+        const entry = this.live.get(n);
+        if (entry === undefined)
+            return false;
+        this.evictEntry(entry);
+        return true;
+    }
+    /**
+     * 唯一淘汰入口：从活跃 Map 中删除并扣减全局/会话计数，再把游标号从会话
+     * FIFO 头部移除。调用方保证该事件是所属会话的最旧存活项。
+     */
+    evictEntry(entry) {
+        if (!this.live.delete(entry.n))
+            return;
+        this.hubBytes -= entry.bytes;
+        this.droppedTotal += 1;
+        if (entry.n > this.evictedMax)
+            this.evictedMax = entry.n;
+        const session = this.sessions.get(entry.sessionKey);
+        if (session === undefined)
+            return;
+        if (session.ns[session.head] === entry.n) {
+            session.head += 1;
+            session.count -= 1;
+            session.bytes -= entry.bytes;
+            if (session.count <= 0) {
+                this.sessions.delete(entry.sessionKey);
+            }
+            else if (session.head > COMPACT_MIN && session.head * 2 >= session.ns.length) {
+                session.ns = session.ns.slice(session.head);
+                session.head = 0;
+            }
+            return;
+        }
+        // 正常路径不会到达：会话 FIFO 与全局接收顺序一致，待淘汰项必在队首。
+        // 防御性移除，保证异常输入下索引也不会泄漏引用。
+        const index = session.ns.indexOf(entry.n, session.head);
+        if (index < 0)
+            return;
+        session.ns.splice(index, 1);
+        session.count -= 1;
+        session.bytes -= entry.bytes;
+        if (session.count <= 0)
+            this.sessions.delete(entry.sessionKey);
+    }
+    /** 丢弃 globalNs 头部已失效的游标号；只在超过阈值时复制，避免每条事件都 splice。 */
+    compactGlobal() {
+        if (this.globalHead >= this.globalNs.length) {
+            if (this.globalNs.length > 0) {
+                this.globalNs = [];
+                this.globalHead = 0;
+            }
+            return;
+        }
+        if (this.globalHead > COMPACT_MIN && this.globalHead * 2 >= this.globalNs.length) {
+            this.globalNs = this.globalNs.slice(this.globalHead);
+            this.globalHead = 0;
+        }
+    }
+}
+export function createEventBuffer(options) {
+    return new HubEventBuffer(options);
+}

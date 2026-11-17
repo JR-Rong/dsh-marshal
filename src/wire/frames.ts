@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { DiscussionModelSchema, DiscussionUsageSchema, DiscussionProgressSchema } from '../discussions/types.ts'
 import { MAX_FRAME_BYTES, MAX_JSON_DEPTH } from './limits.ts'
 
 export const CONTRACT_REVISION = 'p1-review-2'
@@ -11,7 +12,7 @@ export const WIRE_ERROR_CODES = [
   'approval-disabled', 'approval-expired', 'decision-invalid', 'widen-rejected', 'unsupported',
   'version-unsupported', 'size-limit', 'readback-timeout', 'readback-mismatch', 'agent-crashed',
   'recovery-required', 'record-unavailable', 'settings-unsafe', 'session-purpose-conflict',
-  'invalid-args',
+  'invalid-args', 'auth-required',
   // 传输层内部使用，不在契约 §12 的公开枚举里。
   'hello-required', 'timeout', 'disposed', 'invalid', 'unknown', 'result-too-large',
   'deadline-expired', 'tighten-only', 'session-mismatch',
@@ -50,7 +51,7 @@ export class FrameError extends Error {
 
 export const MARSHAL_KINDS = [
   'session.updated', 'session.removed', 'turn.started', 'turn.completed',
-  'reasoning.delta', 'message.delta', 'message.completed',
+  'reasoning.delta', 'message.delta', 'message.completed', 'user.message',
   'tool.started', 'tool.output', 'tool.completed',
   'input.requested', 'input.resolved', 'capability.changed', 'error',
 ] as const
@@ -60,7 +61,8 @@ export type MarshalKind = z.infer<typeof MarshalKind>
 
 /** v0 op set; create/fork/acquire arrive with v1 (decide remains T05). Append here and in wire/commands.ts. */
 export const COMMAND_OPS = [
-  'observe', 'prompt', 'interrupt', 'answer', 'cancel', 'configure', 'acquire', 'create', 'fork',
+  'controls', 'upload', 'observe', 'prompt', 'interrupt', 'answer', 'cancel', 'configure', 'acquire', 'create', 'fork',
+  'discussion.turn', 'discussion.stop',
 ] as const
 export const CommandOpSchema = z.enum(COMMAND_OPS)
 export type CommandOp = z.infer<typeof CommandOpSchema>
@@ -149,6 +151,16 @@ const EventSchema = z.object({
   seq: z.number().int().nonnegative(),
   ts: z.number().int().nonnegative(),
   kind: MarshalKind, payload: z.unknown(),
+}).strict()
+
+/** A requested history page is not an ACK result or a live event sequence. */
+const HistoryResultSchema = z.object({
+  v: z.literal(2), type: z.literal('history.result'),
+  commandId: z.string().min(1), connectionId: z.string().min(1), nodeEpoch: z.string().min(1),
+  target: TargetSchema,
+  items: z.array(EventSchema).max(4000),
+  completeness: z.enum(['complete', 'unconfirmed']),
+  nextCursor: z.string().min(1).max(4096).optional(),
 }).strict()
 
 const SyncScopeSchema = z.object({
@@ -253,20 +265,46 @@ const HeartbeatAckSchema = z.object({
   localDiscussionRevision: z.number().int().nonnegative().optional(),
 }).strict()
 
+const DiscussionCatalogSchema = z.object({
+  v: z.literal(2), type: z.literal('discussion.catalog'),
+  connectionId: z.string().min(1), nodeEpoch: z.string().min(1),
+  models: z.array(DiscussionModelSchema).max(32),
+}).strict()
+const DiscussionResultSchema = z.object({
+  v: z.literal(2), type: z.literal('discussion.result'),
+  connectionId: z.string().min(1), nodeEpoch: z.string().min(1),
+  roomId: z.string().min(1).max(128), memberId: z.string().min(1).max(128), turnId: z.string().min(1).max(128),
+  state: z.enum(['completed', 'failed', 'cancelled']),
+  usage: DiscussionUsageSchema.optional(),
+  text: z.string().max(16384).optional(), checksum: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  code: z.string().max(80).optional(),
+}).strict()
+const DiscussionProgressFrameSchema = DiscussionProgressSchema.extend({
+  v: z.literal(2), type: z.literal('discussion.progress'),
+  connectionId: z.string().min(1), nodeEpoch: z.string().min(1),
+  roomId: z.string().min(1).max(128), memberId: z.string().min(1).max(128), turnId: z.string().min(1).max(128),
+  seq: z.number().int().positive().max(100000),
+}).strict()
+
 export const FrameSchema = z.discriminatedUnion('type', [
-  HelloSchema, HelloAckSchema, CommandSchema, AckSchema, EventSchema,
+  HelloSchema, HelloAckSchema, CommandSchema, AckSchema, EventSchema, HistoryResultSchema,
+  DiscussionCatalogSchema, DiscussionResultSchema, DiscussionProgressFrameSchema,
   SyncBeginSchema, SyncChunkSchema, SyncEndSchema, SyncAckSchema,
   CommandStatusSchema, CommandStatusResultSchema,
   InputsSnapshotSchema, InputsSnapshotResultSchema,
   HeartbeatSchema, HeartbeatAckSchema,
 ])
 
+export type DiscussionCatalogFrame = z.infer<typeof DiscussionCatalogSchema>
+export type DiscussionResultFrame = z.infer<typeof DiscussionResultSchema>
+export type DiscussionProgressFrame = z.infer<typeof DiscussionProgressFrameSchema>
 export type Frame = z.infer<typeof FrameSchema>
 export type HelloFrame = z.infer<typeof HelloSchema>
 export type HelloAckFrame = z.infer<typeof HelloAckSchema>
 export type CommandFrame = z.infer<typeof CommandSchema>
 export type AckFrame = z.infer<typeof AckSchema>
 export type EventFrame = z.infer<typeof EventSchema>
+export type HistoryResultFrame = z.infer<typeof HistoryResultSchema>
 export type SyncBeginFrame = z.infer<typeof SyncBeginSchema>
 export type SyncChunkFrame = z.infer<typeof SyncChunkSchema>
 export type SyncEndFrame = z.infer<typeof SyncEndSchema>
@@ -281,8 +319,8 @@ export type HeartbeatAckFrame = z.infer<typeof HeartbeatAckSchema>
 export type FrameDirection = 'node-to-hub' | 'hub-to-node'
 
 const NODE_TO_HUB: ReadonlySet<Frame['type']> = new Set([
-  'hello', 'event', 'sync.begin', 'sync.chunk', 'sync.end',
-  'ack', 'command.status.result', 'inputs.snapshot.result',
+  'hello', 'event', 'history.result', 'sync.begin', 'sync.chunk', 'sync.end',
+  'ack', 'command.status.result', 'inputs.snapshot.result', 'discussion.catalog', 'discussion.result', 'discussion.progress',
 ])
 
 const HUB_TO_NODE: ReadonlySet<Frame['type']> = new Set([

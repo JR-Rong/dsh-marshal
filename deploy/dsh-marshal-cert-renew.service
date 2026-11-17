@@ -1,0 +1,9 @@
+[Unit]
+Description=Renew DSH Marshal public IP certificate
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/dsh-marshal/certbot/bin/certbot renew --non-interactive --cert-name dsh-marshal-ip --deploy-hook /opt/dsh-marshal/renew-ip-cert.sh
+TimeoutStartSec=600

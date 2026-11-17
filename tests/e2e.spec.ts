@@ -16,7 +16,8 @@ import { closeTestWeb, createTestWeb, type TestWeb } from './support/web.ts'
 const DASHBOARD_TOKEN = 'e2e-dashboard-token-0123456789abcdef'
 const POLL_INTERVAL_MS = 20
 const POLL_TIMEOUT_MS = 2_000
-const AUTH = { 'x-marshal-token': DASHBOARD_TOKEN }
+// 重启用例会在同一端口关闭并重建服务器；普通 HTTP 请求不复用旧 socket。
+const AUTH = { 'x-marshal-token': DASHBOARD_TOKEN, connection: 'close' }
 /** 合成哨兵：所有出站字节、journal 与审计都不允许出现。 */
 const PROMPT_SENTINEL = 'sk-e2e-sentinel-0123456789abcdef'
 const CWD_SENTINEL = '/home/example/secret-project'
@@ -94,7 +95,10 @@ describe('e2e', () => {
       const hubContext = {
         webServer: web.webServer,
         logger,
-        effect(cleanup: () => void | Promise<void>) { cleanups.push(cleanup) },
+        effect(setup: () => () => void | Promise<void>) { cleanups.push(setup()) },
+        inject(services: readonly string[], callback: (ctx: MarshalContext) => void) {
+          if (services.every(service => service in this)) callback(this as unknown as MarshalContext)
+        },
       }
       apply(hubContext as unknown as MarshalContext, {
         role: 'hub', dashboardToken: DASHBOARD_TOKEN,
@@ -106,7 +110,10 @@ describe('e2e', () => {
 
       const nodeContext = {
         logger,
-        effect(cleanup: () => void | Promise<void>) { cleanups.push(cleanup) },
+        effect(setup: () => () => void | Promise<void>) { cleanups.push(setup()) },
+        inject(services: readonly string[], callback: (ctx: MarshalContext) => void) {
+          if (services.every(service => service in this)) callback(this as unknown as MarshalContext)
+        },
         sessionController,
       }
       apply(nodeContext as unknown as MarshalContext, {
@@ -181,7 +188,7 @@ describe('e2e', () => {
       expect(observeResponse.status).toBe(200)
       // follow 由跟随循环异步取用，ack 先到；轮询等它落到记录里。
       await waitForCount(async () => follows, 1, 'follow')
-      expect(follows).toEqual([{ address: { kind: 'session', sessionId: 's1' } }])
+      expect(follows).toEqual([{ address: { kind: 'session', sessionId: 's1' }, assistantStream: true }])
     } finally {
       // 装配顺序是 hub → node，卸载按相反顺序。
       for (const cleanup of [...cleanups].reverse()) await cleanup()
@@ -314,6 +321,8 @@ async function startAssembly(options: AssemblyOptions = {}): Promise<Assembly> {
       cert: readFileSync(new URL('./fixtures/tls-cert.pem', import.meta.url), 'utf8'),
     },
   })
+  const previousTlsSetting = process.env.NODE_TLS_REJECT_UNAUTHORIZED
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'
   const prompts: NativePrompt[] = []
   const follows: unknown[] = []
   const hubCleanups: (() => void | Promise<void>)[] = []
@@ -329,7 +338,10 @@ async function startAssembly(options: AssemblyOptions = {}): Promise<Assembly> {
     const hubContext = {
       webServer: web.webServer,
       logger,
-      effect(cleanup: () => void | Promise<void>) { hubCleanups.push(cleanup) },
+      effect(setup: () => () => void | Promise<void>) { hubCleanups.push(setup()) },
+        inject(services: readonly string[], callback: (ctx: MarshalContext) => void) {
+          if (services.every(service => service in this)) callback(this as unknown as MarshalContext)
+        },
     }
     apply(hubContext as unknown as MarshalContext, {
       role: 'hub',
@@ -395,7 +407,10 @@ async function startAssembly(options: AssemblyOptions = {}): Promise<Assembly> {
       process.env.MARSHAL_AUDIT_FILE = auditFile
       const nodeContext = {
         logger,
-        effect(cleanup: () => void | Promise<void>) { nodeCleanups.push(cleanup) },
+        effect(setup: () => () => void | Promise<void>) { nodeCleanups.push(setup()) },
+        inject(services: readonly string[], callback: (ctx: MarshalContext) => void) {
+          if (services.every(service => service in this)) callback(this as unknown as MarshalContext)
+        },
         sessionController,
         on(_event: 'user-questions/request', fn: QuestionHandler) {
           handler = fn
@@ -434,6 +449,8 @@ async function startAssembly(options: AssemblyOptions = {}): Promise<Assembly> {
         if (env.audit === undefined) delete process.env.MARSHAL_AUDIT_FILE
         else process.env.MARSHAL_AUDIT_FILE = env.audit
       }
+      if (previousTlsSetting === undefined) delete process.env.NODE_TLS_REJECT_UNAUTHORIZED
+      else process.env.NODE_TLS_REJECT_UNAUTHORIZED = previousTlsSetting
       if (ownsDir) await rm(dir, { recursive: true, force: true })
     },
   }

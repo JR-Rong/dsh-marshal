@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs'
+import { attachmentText, type PromptExtras, type SessionControls } from '../controls.ts'
 import type { UUID } from 'node:crypto'
 import type {
   GetSessionMessagesOptions, ListSessionsOptions, Options, PermissionMode, Query,
@@ -19,12 +21,12 @@ import type {
  * - `close()` 幂等：取消输入队列、abort controller、结束 Query、清理监听。
  */
 
-/** 等 `system/init` 的上限；超过即视为本次原生调用结果未知。 */
+/** 等原生身份与认证握手的上限；超过即视为本次原生调用结果未知。 */
 export const CLAUDE_RUNTIME_DEFAULT_INIT_TIMEOUT_MS = 30_000
 /** 流式输入队列上限。适配器一次只允许一个受管回合，正常最多 1 条在队。 */
 export const CLAUDE_RUNTIME_MAX_QUEUED_INPUTS = 16
 
-export type ClaudeRuntimeErrorCode = 'closed' | 'busy' | 'timeout' | 'aborted' | 'sdk' | 'failed'
+export type ClaudeRuntimeErrorCode = 'closed' | 'busy' | 'timeout' | 'aborted' | 'sdk' | 'failed' | 'auth-required'
 
 /** 稳定分类；消息不含会话内容、路径或凭据。 */
 export class ClaudeRuntimeError extends Error {
@@ -39,6 +41,13 @@ export class ClaudeRuntimeError extends Error {
 
 export type ClaudeRuntimeState = 'idle' | 'running' | 'requires_action'
 export type ClaudeRuntimeExitReason = 'closed' | 'aborted' | 'error' | 'timeout'
+
+/** 控制握手后的路由身份；原生事件与 SDK 的原 ID 恢复契约分开标明。 */
+export interface ClaudeRuntimeReady {
+  readonly session_id: string
+  readonly identitySource: 'native-event' | 'resume-contract'
+  readonly claude_code_version?: string
+}
 
 /** 与 SDK 自己的 `query()` 参数形状一致；不另造协议。 */
 export interface ClaudeSdkQueryParams {
@@ -72,10 +81,10 @@ export async function loadClaudeSdk(): Promise<ClaudeSdk> {
 }
 
 /**
- * 本适配器驱动 `Query` 的成员子集：迭代消息、`interrupt()`、`close()`。
+ * 本适配器驱动 `Query` 的成员子集：迭代消息、初始化结果、`interrupt()`、`close()`。
  * 每个签名直接来自 SDK 的 `Query`，不是平行定义。
  */
-export type ClaudeQueryHandle = Pick<Query, 'interrupt' | 'close'> & AsyncIterable<SDKMessage>
+export type ClaudeQueryHandle = Pick<Query, 'interrupt' | 'close' | 'initializationResult'> & Partial<Pick<Query, 'supportedModels' | 'setModel' | 'applyFlagSettings'>> & AsyncIterable<SDKMessage>
 
 export interface ClaudeRuntimeOptions {
   readonly sdk: ClaudeSdk
@@ -83,7 +92,7 @@ export interface ClaudeRuntimeOptions {
   readonly generation: number
   readonly runtimeEpoch: string
   readonly cwd?: string
-  /** 只有本适配器自己的生命周期才允许 resume；外部会话永不走这条路径。 */
+  /** 显式 acquire/fork 可恢复指定 ID；只读发现/订阅不进入这条路径。 */
   readonly resume?: string
   readonly forkSession?: boolean
   readonly pathToClaudeCodeExecutable?: string
@@ -106,17 +115,19 @@ export interface ClaudeRuntime {
   readonly runtimeEpoch: string
   readonly closed: boolean
   readonly state: ClaudeRuntimeState
-  /** 原生 `session_id`；`system/init` 之前为 undefined。 */
+  /** 已握手的路由身份；恢复使用 SDK resume 契约，后续原生 init 必须匹配。 */
   sessionId(): string | undefined
   /** 首次 init 的原样快照（model/permissionMode/version 只留在本机）。 */
   init(): SDKSystemMessage | undefined
-  /** 等到 `system/init`；超时/关闭时以 ClaudeRuntimeError 拒绝。 */
-  ready(): Promise<SDKSystemMessage>
+  /** 等到路由身份与认证握手；恢复身份来源见 identitySource，超时/关闭时拒绝。 */
+  ready(): Promise<ClaudeRuntimeReady>
   /**
    * 推入一条用户消息。只有「确定没有写出」的情况才同步抛错（closed/busy），
    * 调用方可以安全转成调用前拒绝；成功返回表示已进入流式输入队列。
    */
-  send(text: string, uuid: UUID): void
+  send(text: string, uuid: UUID, extras?: PromptExtras): void
+  controls(): Promise<SessionControls>
+  applyOptions(options: PromptExtras["options"]): Promise<void>
   /** `Query.interrupt()`；调用前已关闭则抛 `closed`（确定未送达）。 */
   interrupt(signal: AbortSignal): Promise<SDKControlInterruptResponse | undefined>
   close(): void
@@ -154,12 +165,14 @@ export function createClaudeRuntime(options: ClaudeRuntimeOptions): ClaudeRuntim
   let state: ClaudeRuntimeState = 'idle'
   let closed = false
   let initMessage: SDKSystemMessage | undefined
-  let exitReason: ClaudeRuntimeExitReason | undefined
+  let nativeSessionId: string | undefined
+  let nativeVersion: string | undefined
+  let accountChecked = false
   let timer: ReturnType<typeof setTimeout> | undefined
 
-  let resolveReady: ((message: SDKSystemMessage) => void) | undefined
+  let resolveReady: ((message: ClaudeRuntimeReady) => void) | undefined
   let rejectReady: ((error: unknown) => void) | undefined
-  const readyPromise = new Promise<SDKSystemMessage>((resolve, reject) => {
+  const readyPromise = new Promise<ClaudeRuntimeReady>((resolve, reject) => {
     resolveReady = resolve
     rejectReady = reject
   })
@@ -191,12 +204,13 @@ export function createClaudeRuntime(options: ClaudeRuntimeOptions): ClaudeRuntim
   const finish = (reason: ClaudeRuntimeExitReason, error?: unknown): void => {
     if (closed) return
     closed = true
-    exitReason = reason
     inputClosed = true
     inputs.length = 0
     wakeInput()
     clearTimer()
-    rejectReady?.(new ClaudeRuntimeError(reason === 'timeout' ? 'timeout' : 'failed'))
+    rejectReady?.(error instanceof ClaudeRuntimeError
+      ? error
+      : new ClaudeRuntimeError(reason === 'timeout' ? 'timeout' : 'failed'))
     try {
       query.close()
     } catch {
@@ -218,18 +232,59 @@ export function createClaudeRuntime(options: ClaudeRuntimeOptions): ClaudeRuntim
   timer = setTimeout(() => { finish('timeout') }, initTimeoutMs)
   timer.unref()
 
+  // 恢复流在首条用户输入之前可以不发任何身份事件。SDK 的 resume 明确绑定
+  // 已存在的原会话（适配器先查只读清单），不把它标为原生事件已确认的身份。
+  const routingSessionId = (): string | undefined => nativeSessionId
+    ?? (options.forkSession !== true ? options.resume : undefined)
+
+  const resolveInitialized = (): void => {
+    const sessionId = routingSessionId()
+    if (closed || !accountChecked || !sessionId) return
+    clearTimer()
+    resolveReady?.({ session_id: sessionId, identitySource: nativeSessionId === undefined ? 'resume-contract' : 'native-event',
+      ...(nativeVersion === undefined ? {} : { claude_code_version: nativeVersion }) })
+    resolveReady = undefined
+    rejectReady = undefined
+  }
+
+  // 空输入的 CLI 可能一直不发 system/init，但控制初始化已经明确知道登录状态。
+  // 只拒绝 firstParty 显式报告的无凭据；第三方后端的认证由其自身负责。
+  void query.initializationResult().then(result => {
+    if (closed) return
+    const account = result.account
+    if (account.apiProvider === 'firstParty' && account.tokenSource === 'none'
+      && (account.apiKeySource === undefined || account.apiKeySource === 'none')) {
+      finish('error', new ClaudeRuntimeError('auth-required'))
+      return
+    }
+    accountChecked = true
+    nativeVersion = result.claude_code_version ?? nativeVersion
+    resolveInitialized()
+  }).catch(error => { finish('error', error) })
+
   const handleMessage = (message: SDKMessage): void => {
     if (message.type === 'system') {
+      // 空输入的 CLI 会先发 SessionStart 生命周期帧，再等首条输入才发 init。
+      // 帧身份与已绑定的恢复目标必须一致；不解析钩子 stdout。
+      const identifiesSession = message.subtype === 'init'
+        || ((message.subtype === 'hook_started' || message.subtype === 'hook_response')
+          && message.hook_event === 'SessionStart')
+      if (identifiesSession) {
+        const expectedId = routingSessionId()
+        if (!message.session_id || (expectedId !== undefined && expectedId !== message.session_id)) {
+          finish('error', new ClaudeRuntimeError('failed'))
+          return
+        }
+        nativeSessionId = message.session_id
+      }
       if (message.subtype === 'init') {
         initMessage = message
+        nativeVersion = message.claude_code_version
         state = 'idle'
-        clearTimer()
-        resolveReady?.(message)
-        resolveReady = undefined
-        rejectReady = undefined
       } else if (message.subtype === 'session_state_changed') {
         state = message.state
       }
+      if (identifiesSession) resolveInitialized()
     }
     options.onMessage(message)
   }
@@ -249,15 +304,19 @@ export function createClaudeRuntime(options: ClaudeRuntimeOptions): ClaudeRuntim
   })()
   pump.catch(() => undefined)
 
-  const send = (text: string, uuid: UUID): void => {
+  const send = (text: string, uuid: UUID, extras: PromptExtras = {}): void => {
     if (closed) throw new ClaudeRuntimeError('closed')
     if (inputs.length >= maxQueuedInputs) throw new ClaudeRuntimeError('busy')
+    const sessionId = routingSessionId()
     const message: SDKUserMessage = {
       type: 'user',
-      message: { role: 'user', content: text },
+      message: { role: 'user', content: extras.files?.length ? [
+        { type: 'text', text: attachmentText(text, extras.files) },
+        ...extras.files.filter(file => file.mime.startsWith('image/')).map(file => ({ type: 'image' as const, source: { type: 'base64' as const, media_type: file.mime as 'image/png', data: readFileSync(file.path).toString('base64') } })),
+      ] : text },
       parent_tool_use_id: null,
       uuid,
-      ...(initMessage === undefined ? {} : { session_id: initMessage.session_id }),
+      ...(sessionId === undefined ? {} : { session_id: sessionId }),
     }
     inputs.push(message)
     wakeInput()
@@ -291,14 +350,26 @@ export function createClaudeRuntime(options: ClaudeRuntimeOptions): ClaudeRuntim
     runtimeEpoch: options.runtimeEpoch,
     get closed(): boolean { return closed },
     get state(): ClaudeRuntimeState { return state },
-    sessionId(): string | undefined { return initMessage?.session_id },
+    sessionId(): string | undefined { return accountChecked ? routingSessionId() : undefined },
     init(): SDKSystemMessage | undefined { return initMessage },
-    ready(): Promise<SDKSystemMessage> {
-      if (initMessage !== undefined) return Promise.resolve(initMessage)
-      if (closed) {
-        return Promise.reject(new ClaudeRuntimeError(exitReason === 'timeout' ? 'timeout' : 'failed'))
-      }
+    ready(): Promise<ClaudeRuntimeReady> {
       return readyPromise
+    },
+    async controls() {
+      if (!query.supportedModels) throw new ClaudeRuntimeError('closed')
+      return { models: (await query.supportedModels()).slice(0, 100).map(model => ({
+        id: model.value, label: model.displayName, efforts: model.supportedEffortLevels ?? [],
+      })) }
+    },
+    async applyOptions(options) {
+      if (options?.model) {
+        if (!query.setModel) throw new ClaudeRuntimeError('closed')
+        await query.setModel(options.model)
+      }
+      if (options?.reasoning) {
+        if (!query.applyFlagSettings) throw new ClaudeRuntimeError('closed')
+        await query.applyFlagSettings({ effortLevel: options.reasoning as import('@anthropic-ai/claude-agent-sdk').EffortLevel })
+      }
     },
     send,
     interrupt,

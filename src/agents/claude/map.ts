@@ -343,6 +343,8 @@ export function historyToEvents(
         ? rawContent.trim() !== ''
         : blocks.some(block => asRecord(block)?.type !== 'tool_result')
       if (opensTurn) startTurn(`claude-turn:history:${uuid}`)
+      if (opensTurn) emit('user.message', { itemId: uuid, text: typeof rawContent === 'string' ? rawContent
+        : blocks.map(asRecord).filter(part => part?.type === 'text').map(part => part!.text).join('\n') })
       emitToolResults(blocks, emit)
       return
     }

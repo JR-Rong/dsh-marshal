@@ -1,3 +1,5 @@
+import { NATIVE_BRIDGE_CSS, NATIVE_BRIDGE_SCRIPT } from './native-bridge.ts'
+import { DISCUSSION_CSS, DISCUSSION_HTML, DISCUSSION_SCRIPT } from './discussions/page.ts'
 /**
  * 页面是静态模板：所有来自设备/会话/事件的数据都经 textContent 写入，
  * 不拼 HTML 字符串，也不在模板里插入任何服务端值。
@@ -5,76 +7,184 @@
 export const PAGE_HTML = `<!doctype html>
 <html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>marshal</title>
+<title>调度官 · 跨设备会话管理</title>
 <style>
-  :root { color-scheme: light dark; }
-  body { margin:0; font:14px/1.5 system-ui,sans-serif; height:100vh; }
+  :root { color-scheme:dark; --bg:#151719; --rail:#1b1e21; --surface:#22262a; --hover:#2b3035; --line:#30353b; --text:#edf0f3; --muted:#939da8; --accent:#83c7b0; --accent-ink:#112c22; --selected:#263b34; --warning:#e1ae68; --danger:#ee9693; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.55 -apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif; height:100vh; }
   [hidden] { display:none !important; }
-  #loginView { max-width:420px; margin:12vh auto; padding:24px; }
-  #loginView form { display:flex; gap:8px; padding:0; border:0; }
-  #loginView input { flex:1; padding:8px; }
-  #appView { display:flex; height:100vh; }
-  aside { width:320px; border-right:1px solid #8883; padding:12px; overflow:auto; }
-  main { flex:1; display:flex; flex-direction:column; min-width:0; }
-  #log { flex:1; overflow:auto; padding:12px; }
-  #cards { max-height:45vh; overflow:auto; padding:0 12px; }
-  .row { padding:6px 8px; border-radius:6px; cursor:pointer; }
-  .row:hover, .row.active { background:#8881; }
-  .group { font-weight:600; margin-top:12px; }
-  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#999; margin-right:6px; }
-  .dot.running { background:#2a2; }
-  .tool { border:1px solid #8883; border-radius:6px; padding:6px 8px; margin:6px 0; font-family:ui-monospace,monospace; font-size:12px; white-space:pre-wrap; }
-  .reason { color:#888; white-space:pre-wrap; }
-  .ask { border:2px solid #d80; border-radius:8px; padding:10px; margin:10px 0; }
-  .ask button { margin:4px 6px 0 0; padding:4px 10px; }
-  .ask button.picked { outline:2px solid #d80; }
-  .ask input[type=text] { width:100%; box-sizing:border-box; margin-top:4px; padding:6px; }
-  #send { display:flex; gap:8px; padding:12px; border-top:1px solid #8883; }
-  #send input { flex:1; padding:8px; }
-  #status { padding:0 12px 8px; color:#c33; min-height:1.2em; white-space:pre-wrap; }
-  #who { font-size:12px; color:#888; word-break:break-all; }
-  #pending div { font-size:12px; color:#888; padding:2px 0; white-space:pre-wrap; }
-  #capability { padding:0 12px; }
-  #capability .tunable { border-top:1px solid #8883; padding:6px 0; }
-  #capability .tunable label { display:block; font-family:ui-monospace,monospace; }
-  #capability select, #capability input[type=text] { display:block; max-width:100%; box-sizing:border-box; margin-top:4px; padding:5px 6px; }
-  #capability button { margin-top:6px; padding:4px 10px; }
-  @media (max-width:720px) {
-    body { height:auto; }
-    #appView { flex-direction:column; height:auto; min-height:100vh; }
-    aside { width:auto; border-right:0; border-bottom:1px solid #8883; max-height:45vh; }
-    main { min-height:55vh; }
-    #cards, #log { max-height:none; overflow:visible; }
-    #log { flex:none; }
-    .ask button, #send button, #capability button { min-height:40px; padding:8px 14px; }
-    #send input, #capability select, #capability input[type=text] { min-height:40px; }
+  h1,h2,h3,p { margin:0; }
+  button,input,select { font:inherit; }
+  button { border:1px solid var(--line); border-radius:8px; padding:8px 14px; background:var(--surface); color:var(--text); cursor:pointer; transition:background .15s,border-color .15s; }
+  button:hover:not(:disabled) { background:var(--hover); border-color:var(--muted); }
+  button:disabled { cursor:not-allowed; opacity:.45; }
+  button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+  input,select { border:1px solid var(--line); border-radius:8px; padding:10px 12px; background:var(--bg); color:var(--text); min-width:0; }
+  input::placeholder { color:var(--muted); }
+  .primary { background:var(--accent); border-color:var(--accent); color:var(--accent-ink); font-weight:600; }
+  .primary:hover:not(:disabled) { background:#9dd9c4; border-color:#9dd9c4; }
+  .muted,.reason { color:var(--muted); }
+  .reason { white-space:pre-wrap; overflow-wrap:anywhere; }
+  .brand { display:flex; align-items:center; gap:12px; }
+  .brand svg { color:var(--accent); flex-shrink:0; }
+  .brand h1 { font-size:20px; letter-spacing:-.03em; font-weight:650; }
+  .brand p { color:var(--muted); font-size:12px; }
+  #loginView { max-width:432px; margin:clamp(48px,12vh,140px) auto; padding:24px; }
+  #loginView .brand { margin-bottom:30px; }
+  #loginView .brand h1 { font-size:26px; }
+  .login-box { padding:26px; border:1px solid var(--line); border-radius:14px; background:var(--rail); }
+  .login-box h2 { font-size:18px; font-weight:600; margin-bottom:22px; }
+  #loginForm { display:flex; flex-direction:column; gap:10px; }
+  #loginForm label { color:var(--muted); font-size:13px; }
+  #loginForm input,#loginForm button { width:100%; min-height:44px; }
+  #loginForm button { margin-top:8px; }
+  .login-help { margin-top:16px; color:var(--muted); font-size:12px; }
+  #loginStatus { margin-top:12px; color:var(--danger); }
+  #appView { display:flex; flex-direction:column; height:100vh; height:100dvh; }
+  .app-header { min-height:64px; padding:12px 24px; display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid var(--line); background:var(--rail); gap:20px; }
+  .account { display:flex; align-items:center; gap:16px; }
+  #who { color:var(--muted); font-size:12px; }
+  .workspace { display:grid; grid-template-columns:208px 232px minmax(0,1fr); flex:1; min-height:0; }
+  .device-rail,.session-rail { min-width:0; border-right:1px solid var(--line); overflow:auto; }
+  .device-rail { background:var(--rail); padding:20px 12px; }
+  .rail-label { font-size:12px; color:var(--muted); font-weight:500; padding:0 10px 12px; }
+  .device-group + .device-group { border-top:1px solid var(--line); margin-top:18px; padding-top:18px; }
+  .device-heading { padding:0 10px 10px; display:flex; align-items:center; justify-content:space-between; gap:8px; }
+  .device-heading strong { font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .device-state { font-size:11px; color:var(--muted); flex-shrink:0; }
+  .device-state.online { color:var(--accent); }
+  .row { display:flex; align-items:center; width:100%; text-align:left; border:1px solid transparent; background:transparent; padding:10px 12px; border-radius:8px; gap:10px; }
+  .row:hover:not(:disabled) { background:var(--hover); border-color:transparent; }
+  .row.active { background:var(--selected); color:var(--accent); border-color:transparent; }
+  .row.active:hover:not(:disabled) { background:var(--selected); }
+  .agent-symbol { width:20px; font:600 12px/20px ui-monospace,monospace; color:var(--muted); text-align:center; }
+  .row.active .agent-symbol { color:var(--accent); }
+  .session-rail { padding:22px 12px; }
+  .session-heading { padding:0 10px 18px; }
+  .session-heading h2 { font-size:16px; font-weight:600; margin-bottom:5px; }
+  #sessionCount { margin-left:8px; padding:2px 7px; border-radius:5px; background:var(--surface); color:var(--muted); font-size:11px; vertical-align:middle; }
+  .session-heading p { font-size:12px; color:var(--muted); }
+  .session-row { align-items:flex-start; margin-bottom:3px; padding:12px 10px; }
+  .session-copy { min-width:0; flex:1; }
+  .session-name { display:block; font:500 13px/1.5 ui-monospace,monospace; color:var(--text); overflow:hidden; text-overflow:ellipsis; }
+  .session-time { display:block; color:var(--muted); font-size:11px; margin-top:4px; }
+  .session-state { color:var(--muted); font-size:11px; margin-left:auto; white-space:nowrap; }
+  .session-row .dot { margin-top:6px; }
+  .session-row.active .session-state { color:var(--accent); }
+  .empty-list { padding:10px; color:var(--muted); font-size:12px; line-height:1.8; }
+  #sessions:empty::before { content:'选择设备下的智能体，查看会话。'; display:block; padding:10px; color:var(--muted); font-size:12px; }
+  main { display:flex; flex-direction:column; min-width:0; min-height:0; padding:26px 28px 18px; }
+  .session-header { padding-bottom:22px; }
+  #sessionTitle { font-size:23px; font-weight:600; letter-spacing:-.035em; }
+  #sessionSubtitle { color:var(--muted); font-size:13px; margin-top:4px; }
+  #status { padding:10px 14px; margin-bottom:14px; border:1px solid var(--line); border-radius:8px; background:var(--surface); color:var(--muted); font-size:13px; white-space:pre-wrap; overflow-wrap:anywhere; }
+  #status:empty { display:none; }
+  #status.warning { color:var(--warning); }
+  #status.success { color:var(--accent); }
+  #capability { max-height:42vh; overflow:auto; flex-shrink:0; }
+  #capability:empty { display:none; }
+  details { border:1px solid var(--line); border-radius:9px; background:var(--surface); margin-bottom:10px; }
+  summary { padding:11px 14px; cursor:pointer; color:var(--text); font-size:13px; }
+  .detail-body { padding:0 14px 12px; font-size:12px; color:var(--muted); overflow-wrap:anywhere; }
+  #capability .tunable { display:grid; gap:6px; border-top:1px solid var(--line); padding:12px 0; }
+  #capability .tunable label { display:block; font-size:12px; color:var(--text); }
+  #capability select,#capability input[type=text] { display:block; width:100%; font-size:13px; }
+  #capability button { justify-self:start; font-size:12px; }
+  .ownership { color:var(--muted); font-size:12px; margin-bottom:12px; }
+  .ownership button { margin-left:12px; }
+  .timeline-label { font-size:12px; color:var(--muted); margin:16px 0 12px; }
+  #log { flex:1; min-height:96px; overflow:auto; padding:0 6px 20px 0; }
+  #log:empty::before { content:'选择一个会话，查看最新动态'; display:block; padding:48px 0; color:var(--muted); text-align:center; font-size:13px; }
+  #log.selected:empty::before { content:'正在等待新的会话动态'; }
+  .event { border-left:1px solid var(--line); margin-left:5px; padding:0 0 18px 20px; position:relative; font-size:13px; overflow-wrap:anywhere; }
+  .event::before { content:''; position:absolute; width:7px; height:7px; border-radius:50%; background:var(--accent); left:-4px; top:6px; }
+  .event time { display:block; font-size:11px; color:var(--muted); margin-bottom:3px; }
+  .event .reason { color:var(--text); }
+  .tool { padding:8px 10px; border:1px solid var(--line); border-radius:7px; font-family:ui-monospace,monospace; font-size:12px; white-space:pre-wrap; }
+  #cards { max-height:40vh; overflow:auto; flex-shrink:0; }
+  .ask { border:1px solid var(--warning); border-radius:10px; padding:14px; margin:8px 0; background:var(--surface); }
+  .ask button { margin:8px 6px 0 0; font-size:13px; }
+  .ask button.picked { border-color:var(--accent); background:var(--selected); }
+  .ask input[type=text] { width:100%; margin-top:10px; }
+  #send { display:flex; gap:10px; padding:10px; border:1px solid var(--line); border-radius:11px; background:var(--surface); flex-shrink:0; }
+  #send input { flex:1; border:0; background:transparent; padding:8px; }
+  #send button { min-width:72px; }
+  .privacy-note { margin:9px 0 0; font-size:11px; color:var(--muted); }
+  #pendingPanel { margin-top:24px; background:transparent; }
+  #pendingPanel summary { color:var(--warning); font-size:12px; }
+  #pending div { font-size:11px; color:var(--muted); padding:0 12px 12px; overflow-wrap:anywhere; }
+  .dot { display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--muted); flex-shrink:0; }
+  .dot.running { background:var(--accent); }
+  .desktop-embed .app-header { min-height:48px; padding:10px 22px; }
+  .desktop-embed .app-header .brand h1,.desktop-embed .app-header .brand svg { display:none; }
+  .desktop-embed .app-header .brand p { font-size:12px; }
+  @media (prefers-color-scheme:light) {
+    :root { color-scheme:light; --bg:#fff; --rail:#f7f8f9; --surface:#f1f3f4; --hover:#e8ecef; --line:#dde2e6; --text:#20262c; --muted:#67727d; --accent:#238361; --accent-ink:#fff; --selected:#e2f1eb; --warning:#936018; --danger:#b6413e; }
+    .primary:hover:not(:disabled) { background:#196b4d; border-color:#196b4d; }
   }
+  @media (max-width:1040px) { .workspace { grid-template-columns:180px 200px minmax(0,1fr); } main { padding:22px 20px 16px; } .account #who { display:none; } }
+  @media (max-width:720px) {
+    body,#appView { height:auto; min-height:100vh; }
+    .app-header { padding:14px 16px; }.app-header .brand p { display:none; }
+    .workspace { display:flex; flex-direction:column; min-height:0; }
+    .device-rail { padding:14px 12px; border-right:0; border-bottom:1px solid var(--line); }
+    #devices { display:flex; gap:16px; overflow:auto; }
+    .device-group { min-width:150px; flex:1; }
+    .device-group + .device-group { border:0; margin:0; padding:0; }
+    .row { padding:8px 10px; }
+    .session-rail { border-right:0; border-bottom:1px solid var(--line); padding:16px 12px; max-height:240px; }
+    .session-heading { padding-bottom:10px; }
+    main { min-height:60vh; padding:22px 18px 18px; }
+    #sessionTitle { font-size:21px; }
+    #log { min-height:140px; max-height:50vh; }
+    #capability { max-height:none; }
+    .ask button,#send button,#capability button { min-height:40px; }
+    #send input { width:0; }
+    #pendingPanel { margin-top:12px; }
+  }
+  @media (prefers-reduced-motion:reduce) { button { transition:none; } }
+${DISCUSSION_CSS}
+${NATIVE_BRIDGE_CSS}
 </style></head>
 <body>
 <div id="loginView" hidden>
-  <h1>marshal</h1>
-  <form id="loginForm">
-    <input id="loginToken" type="password" autocomplete="current-password" placeholder="dashboard token">
-    <button>登录</button>
-  </form>
-  <p class="reason" id="loginStatus"></p>
+  <div class="brand"><div><h1>调度官</h1><p>跨设备会话管理</p></div></div>
+  <section class="login-box" aria-labelledby="loginHeading">
+    <h2 id="loginHeading">连接调度中心</h2>
+    <form id="loginForm">
+      <label for="loginToken">管理令牌</label>
+      <input id="loginToken" type="password" autocomplete="current-password" placeholder="输入管理令牌" required>
+      <button class="primary">登录</button>
+    </form>
+    <p class="login-help" id="tokenHelp">令牌由管理服务生成，用于验证此设备的管理权限。</p>
+    <div id="accountLogin" hidden><p class="login-help">使用当前 DeepSeek Harness 账号，进入你的设备与工作群。</p><button id="accountEnter" type="button" class="primary">使用 DSH 账号进入</button></div>
+    <p class="reason" id="loginStatus" role="status" aria-live="polite"></p>
+  </section>
 </div>
 <div id="appView" hidden>
-  <aside>
-    <div id="who"></div>
-    <button id="logout" type="button">退出</button>
-    <div class="group">设备</div>
-    <div id="devices">loading…</div>
-    <div class="group">未决写入</div>
-    <div id="pending"></div>
-  </aside>
-  <main>
-    <div id="status"></div>
-    <div id="capability"></div>
-    <div id="cards"></div>
-    <div id="log"></div>
-    <form id="send"><input id="text" placeholder="给选中会话发一条消息"><button>发送</button></form>
-  </main>
+  <header class="app-header">
+    <div class="brand"><h1>调度官</h1><p>跨设备会话管理</p></div>
+    <div class="mode-switch" aria-label="工作模式"><button id="singleMode" type="button" aria-pressed="true">单会话</button><button id="groupMode" type="button" aria-pressed="false">Agent 群聊</button></div>
+    <div class="account"><div id="who"></div><button id="logout" type="button">退出登录</button></div>
+  </header>
+  <div class="workspace" id="singleWorkspace">
+    <nav class="device-rail" aria-label="设备与智能体">
+      <h2 class="rail-label">设备</h2><div id="devices">正在连接设备…</div>
+      <details id="pendingPanel" hidden><summary>未决写入</summary><div id="pending"></div></details>
+    </nav>
+    <section class="session-rail" aria-label="会话列表">
+      <div class="session-heading"><h2><span id="sessionListTitle">会话</span><span id="sessionCount" hidden></span></h2><p>最近更新的会话，按更新时间排序</p></div>
+      <div id="sessions"><p class="empty-list">选择设备下的智能体，查看会话。</p></div>
+    </section>
+    <main>
+      <header class="session-header"><h2 id="sessionTitle">尚未选择会话</h2><p id="sessionSubtitle">从左侧选择设备与会话，开始协作。</p></header>
+      <div id="status" role="status" aria-live="polite"></div><div id="capability"></div><div id="cards"></div>
+      <h3 class="timeline-label">会话消息</h3><div id="log" role="log" aria-label="会话事件" aria-live="polite"></div>
+      <form id="send"><input id="text" aria-label="给选中会话发一条消息" placeholder="给选中会话发一条消息"><button class="primary">发送</button></form>
+      <p class="privacy-note">状态与消息按设备授权同步。</p>
+    </main>
+  </div>
+  ${DISCUSSION_HTML}
 </div>
 <script>
 'use strict';
@@ -83,8 +193,11 @@ var EVENTS_KEY = 'marshal-events';
 var CSRF_COOKIE = '__Host-marshal-csrf';
 var origin = location.origin;
 var session = null;
+var accountMode = false;
+var accountGeneration = 0;
 var current = null;
 var currentRow = null;
+var selectedAgent = null;
 var stream = null;
 var lastAuthCheck = 0;
 var writeState = 'unknown';
@@ -94,10 +207,12 @@ var barrierBlocked = true;
 var rebuilding = false;
 var rebuildGeneration = 0;
 var queuedEvents = [];
+var streamContinuity = null;
 var MAX_QUEUED_EVENTS = 256;
 var lastSeq = new Map();
 var cardMap = new Map();
 var devicesData = null;
+var devicesRenderSignature = '';
 var currentCapability = null;
 var capabilityNotice = '';
 var acquirePending = false;
@@ -107,17 +222,24 @@ var selectionToken = 0;
 var db = null;
 var dbUnavailable = false;
 var loginStatus = document.getElementById('loginStatus');
-var status = document.getElementById('status');
+var statusRoot = document.getElementById('status');
 var log = document.getElementById('log');
 var cardsRoot = document.getElementById('cards');
 var capabilityRoot = document.getElementById('capability');
 var devicesRoot = document.getElementById('devices');
+var sessionsRoot = document.getElementById('sessions');
 var pendingRoot = document.getElementById('pending');
 var sendForm = document.getElementById('send');
 var textInput = document.getElementById('text');
 
-function setStatus(text) { status.textContent = text || ''; }
-function clearNode(node) { node.textContent = ''; }
+${NATIVE_BRIDGE_SCRIPT}
+
+function setStatus(text) {
+  statusRoot.textContent = text || '';
+  statusRoot.className = /失败|拒绝|未知|禁用|过期|断开/.test(text || '') ? 'warning' : 'success';
+  nativeState();
+}
+function clearNode(node) { node.textContent = ''; if (node === log && messageNodes) messageNodes.clear(); }
 
 function readCookie(name) {
   var parts = document.cookie ? document.cookie.split(';') : [];
@@ -156,8 +278,32 @@ function cardKey(target, runtimeEpoch, requestId) {
   return [target.deviceId, target.agent, target.sessionId, runtimeEpoch || 'unknown', requestId].join('\\u0000');
 }
 
-function appendLog(node) {
-  log.append(node);
+function appendLog(node, timestamp) {
+  var entry = textNode('div', '', 'event');
+  var date = typeof timestamp === 'number' ? new Date(timestamp) : null;
+  if (date !== null && Number.isFinite(date.getTime())) {
+    var time = textNode('time', date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }));
+    time.dateTime = date.toISOString();
+    entry.append(time);
+  }
+  entry.append(node);
+  log.append(entry);
+  log.scrollTop = log.scrollHeight;
+}
+
+// One bubble per streamed item; no body is written to browser storage.
+var messageNodes = new Map();
+var sendingPrompt = false;
+function appendMessage(text, role, itemId, timestamp) {
+  var key = sessionKey(current) + ':' + role + ':' + itemId;
+  var body = messageNodes.get(key);
+  if (!body) {
+    var card = textNode('article', '', 'group-message ' + role);
+    card.append(textNode('strong', role === 'user' ? '你' : role === 'reason' ? '思考' : current.agent));
+    body = textNode('p', ''); card.append(body); appendLog(card, timestamp);
+    messageNodes.set(key, body);
+  }
+  body.textContent += text;
   log.scrollTop = log.scrollHeight;
 }
 
@@ -257,12 +403,15 @@ var INTENT_LABELS = {
 
 function renderPending(records) {
   clearNode(pendingRoot);
+  var count = 0;
   for (var index = 0; index < records.length; index += 1) {
     var record = records[index];
     if (record.status === 'accepted' || record.status === 'rejected') continue;
+    count += 1;
     var label = INTENT_LABELS[record.status] || INTENT_LABELS.unknown;
     pendingRoot.append(textNode('div', record.op + ' · ' + record.target.sessionId + ' · ' + label));
   }
+  document.getElementById('pendingPanel').hidden = count === 0;
 }
 
 /** 恢复后只查状态，绝不自动重发；未知记录保持 pending 提示。 */
@@ -297,11 +446,16 @@ function reconcilePending() {
 /* ---------------- 登录与会话 ---------------- */
 
 function showLogin(message) {
+  nativePost({ type: 'clear' });
+  streamContinuity = null;
+  resetGroups();
   closeStream();
   session = null;
   current = null;
   currentRow = null;
+  selectedAgent = null;
   devicesData = null;
+  devicesRenderSignature = '';
   selectionToken += 1;
   loadToken += 1;
   writeState = 'unknown';
@@ -311,6 +465,10 @@ function showLogin(message) {
   queuedEvents.length = 0;
   clearNode(cardsRoot);
   clearNode(log);
+  clearNode(sessionsRoot);
+  document.getElementById('sessionListTitle').textContent = '会话';
+  document.getElementById('sessionCount').hidden = true;
+  updateSessionHeading(null, null);
   clearCapability();
   cardMap.clear();
   lastSeq.clear();
@@ -319,14 +477,45 @@ function showLogin(message) {
   loginStatus.textContent = message || '';
   var input = document.getElementById('loginToken');
   input.value = '';
-  input.focus();
+  document.getElementById('loginForm').hidden = accountMode;
+  document.getElementById('tokenHelp').hidden = accountMode;
+  document.getElementById('accountLogin').hidden = !accountMode;
+  if (!accountMode) input.focus();
 }
+
+function accountError(code) {
+  return ({ 'account-required': '请先在 DeepSeek Harness 中登录账号', 'account-mismatch': '当前 DSH 账号不属于这个调度空间', 'rate-limited': '尝试过多，请稍后重试' })[code] || '账号连接暂不可用，请重试';
+}
+async function loginWithAccount(args) {
+  if (!accountMode) return { ok: false };
+  var generation = ++accountGeneration;
+  if (typeof args?.ticket !== 'string') { showLogin(accountError(args?.code)); return { ok: false }; }
+  loginStatus.textContent = '正在进入我的调度空间…';
+  try {
+    var response = await request('/marshal/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ticket: args.ticket }) });
+    if (!response.ok) throw Error('login');
+    var data = await response.json();
+    if (generation !== accountGeneration) return { ok: false };
+    enterApp(data); nativeState(); return { ok: true };
+  } catch (error) { if (generation === accountGeneration) showLogin('登录未完成，请重试'); return { ok: false }; }
+}
+async function logoutAccount(message) {
+  accountGeneration++;
+  var headers = session ? writeHeaders() : null;
+  showLogin(message || '已退出');
+  if (headers) { try { await request('/marshal/logout', { method: 'POST', headers: headers, body: '{}' }); } catch (error) {} }
+}
+document.getElementById('accountEnter').onclick = function() {
+  if (!nativePort) { loginStatus.textContent = '请在 DeepSeek Harness 的调度官插件中进入'; return; }
+  loginStatus.textContent = '正在验证 DSH 账号…'; nativePost({ type: 'account-needed' });
+};
 
 function enterApp(data) {
   session = data;
   document.getElementById('loginView').hidden = true;
   document.getElementById('appView').hidden = false;
-  document.getElementById('who').textContent = 'operator ' + data.operatorId + ' · 到期 '
+  document.getElementById('who').textContent = data.account ? data.account.name + ' · ' + data.workspaceName : '已连接调度中心';
+  document.getElementById('who').title = '管理身份：' + data.operatorId + ' · 登录到期：'
     + new Date(data.expiresAt).toLocaleString();
   loginStatus.textContent = '';
   connectStream();
@@ -350,7 +539,7 @@ document.getElementById('loginForm').onsubmit = async function(event) {
   event.preventDefault();
   var token = document.getElementById('loginToken').value;
   loginStatus.textContent = '';
-  if (!token) { loginStatus.textContent = '请输入 dashboard token'; return; }
+  if (!token) { loginStatus.textContent = '请输入管理令牌'; return; }
   var response;
   try {
     response = await request('/marshal/login', {
@@ -373,16 +562,35 @@ document.getElementById('loginForm').onsubmit = async function(event) {
 };
 
 document.getElementById('logout').onclick = async function() {
-  try {
-    await request('/marshal/logout', { method: 'POST', headers: writeHeaders(), body: '{}' });
-  } catch (error) {}
-  showLogin('已退出');
+  await logoutAccount('已退出');
 };
 
 /* ---------------- 索引与选择 ---------------- */
 
 function dot(running) {
   return textNode('span', '', running ? 'dot running' : 'dot');
+}
+
+function agentLabel(agent) { return agent === 'dsh' ? 'DSH' : agent === 'codex' ? 'Codex' : agent === 'claude' ? 'Claude' : agent; }
+
+function sessionName(row) { return row.title || (row.blank ? '新会话' : '未命名会话'); }
+
+function shortSessionId(id) { return id.replace(/^session-/, '').slice(0, 8); }
+
+function updateSessionHeading(device, row) {
+  log.className = row ? 'selected' : '';
+  document.getElementById('sessionTitle').textContent = row ? sessionName(row) : '尚未选择会话';
+  document.getElementById('sessionSubtitle').textContent = row
+    ? (device ? device.name : row.deviceId) + ' · ' + agentLabel(row.agent)
+    : '从左侧选择设备与会话，开始协作。';
+}
+
+function selectRow(root, selected) {
+  for (var other of root.querySelectorAll('.row')) {
+    var active = other === selected;
+    other.classList.toggle('active', active);
+    other.setAttribute('aria-pressed', active ? 'true' : 'false');
+  }
 }
 
 function capabilitiesOf(device, agent) {
@@ -403,13 +611,13 @@ function evaluateWriteState(device, row, capability) {
   var caps = capability && typeof capability === 'object' ? capability : capabilitiesOf(device, row.agent);
   if (caps === null || caps === undefined) { writeReason = '能力未知'; return 'unknown'; }
   if (caps.stale === true) { writeReason = '能力已过期'; return 'stale'; }
-  // 契约 §7 的已验证写权是 ours；其它 ownership 一律不可写。
+  // 受管会话与已连接的原生运行时可写；未知状态仍关闭。
   if (caps.ownership === 'foreign-running') { writeReason = '外部写者运行中'; return 'busy'; }
   if (caps.ownership === 'unverified') { writeReason = '写权未确认（ownership-unverified）'; return 'unknown'; }
-  if (caps.ownership !== 'ours') {
+  if (caps.ownership !== 'ours' && caps.ownership !== 'attached') {
     var offered = Array.isArray(caps.operations) ? caps.operations : [];
     if (caps.ownership === 'foreign-unknown' && offered.indexOf('acquire') >= 0) {
-      writeReason = '写权未确认（ownership-unverified），需先取得写权';
+      writeReason = '首次发送将自动接管并继续原会话';
     } else if (caps.ownership === 'foreign-unknown') {
       writeReason = '所有权未确认（ownership-unverified）';
     } else {
@@ -425,12 +633,17 @@ function evaluateWriteState(device, row, capability) {
 }
 
 function applyWriteState() {
-  var disabled = writeState !== 'ready';
+  var canAcquire = acquireEligible();
+  var disabled = sendingPrompt || acquirePending || (writeState !== 'ready' && !canAcquire);
   sendForm.querySelector('button').disabled = disabled;
+  sendForm.querySelector('button').textContent = canAcquire ? '接管并发送' : '发送';
   textInput.disabled = disabled;
+  if (canAcquire && !disabled) { setStatus('首次发送将自动接管并继续原会话'); return; }
   if (disabled && writeReason) { setStatus('写入已禁用：' + writeReason); return; }
   // 只有之前那条“写入已禁用”提示可以清除；其它状态（错误/受理）不能被覆盖。
-  if (status.textContent && status.textContent.indexOf('写入已禁用：') === 0) setStatus('');
+  if (statusRoot.textContent && statusRoot.textContent.indexOf('写入已禁用：') === 0) setStatus('');
+  if (!statusRoot.textContent && !disabled) setStatus('可以发送消息');
+  nativeState();
 }
 
 function deviceForCurrent() {
@@ -447,9 +660,27 @@ function evaluateCurrentWriteState() {
   applyWriteState();
 }
 
+function updateCurrentRunning(running) {
+  if (current === null || currentRow === null) return;
+  currentRow.running = running;
+  var key = sessionKey(current);
+  for (var row of sessionsRoot.querySelectorAll('.row')) {
+    if (row.dataset.sessionKey !== key) continue;
+    var indicator = row.querySelector('.dot');
+    var label = row.querySelector('.session-state');
+    if (indicator) indicator.classList.toggle('running', running);
+    if (label) label.textContent = running ? '运行中' : '空闲';
+    break;
+  }
+  // 完成事件只更新运行状态，写权与同步屏障仍由原有能力检查决定。
+  evaluateCurrentWriteState();
+  nativeState();
+}
+
 var OWNERSHIP_LABELS = {
-  ours: '自有写权（ours）',
-  'foreign-unknown': '写权未取得（foreign-unknown）',
+  ours: '可继续会话',
+  attached: '已连接原生会话',
+  'foreign-unknown': '尚未接管',
   'foreign-running': '外部写者运行中（foreign-running）',
   unverified: '写权未验证（unverified）',
 };
@@ -481,7 +712,7 @@ function capabilityDigest(document) {
 
 /** 取得写权只对“能力声明 acquire 且 ownership 未取得”的当前会话开放。 */
 function acquireEligible() {
-  if (acquirePending || current === null || currentCapability === null
+  if (currentRow?.running === true || acquirePending || current === null || currentCapability === null
     || typeof currentCapability !== 'object') return false;
   if (barrierBlocked || unknownDevices[current.deviceId]) return false;
   var device = deviceForCurrent();
@@ -499,23 +730,20 @@ function clearCapability() {
 }
 
 function renderCapability() {
+  var settingsOpen = capabilityRoot.querySelector('[data-section="settings"]')?.open === true;
+  var diagnosticsOpen = capabilityRoot.querySelector('[data-section="diagnostics"]')?.open === true;
   clearNode(capabilityRoot);
   if (current === null) return;
-  capabilityRoot.append(textNode('div', '能力', 'group'));
   if (currentCapability === null || typeof currentCapability !== 'object') {
     capabilityRoot.append(textNode('div', '能力未知', 'reason'));
     return;
   }
   var capability = currentCapability;
+  var ownership = textNode('div', '', 'ownership');
   if (typeof capability.ownership === 'string') {
-    capabilityRoot.append(textNode('div', '所有权：' + (OWNERSHIP_LABELS[capability.ownership] || capability.ownership)));
+    ownership.append(textNode('span', '所有权：' + (OWNERSHIP_LABELS[capability.ownership] || capability.ownership)));
   }
-  if (typeof capability.runtimeEpoch === 'string' && capability.runtimeEpoch !== '') {
-    capabilityRoot.append(textNode('div', '实例代次：' + capability.runtimeEpoch));
-  }
-  if (Number.isInteger(capability.settingsRevision)) {
-    capabilityRoot.append(textNode('div', '设置修订：' + String(capability.settingsRevision)));
-  }
+  capabilityRoot.append(ownership);
   if (capability.pending && typeof capability.pending === 'object') {
     var pendingStatus = capability.pending.status;
     var label = pendingStatus === 'readback-timeout' ? '回读超时（未自动重试）'
@@ -529,23 +757,45 @@ function renderCapability() {
   if (acquireEligible()) {
     var acquire = document.createElement('button');
     acquire.type = 'button';
-    acquire.textContent = '取得写权';
+    acquire.textContent = '接管并继续';
     acquire.onclick = function() { acquireWrite(); };
-    capabilityRoot.append(acquire);
+    ownership.append(acquire);
+    capabilityRoot.append(textNode('div', '恢复原会话及上下文，不会停止其他窗口；请避免同时向同一会话发送消息。', 'reason'));
   }
   var tunables = Array.isArray(capability.tunables) ? capability.tunables : [];
+  var settings = document.createElement('details');
+  settings.dataset.section = 'settings';
+  settings.open = settingsOpen;
+  settings.append(textNode('summary', '会话设置'));
+  var settingsBody = textNode('div', '', 'detail-body');
+  settings.append(settingsBody);
   for (var index = 0; index < tunables.length; index += 1) {
     var tunable = tunables[index];
     if (!tunable || typeof tunable !== 'object' || typeof tunable.id !== 'string') continue;
-    renderTunable(capability, tunable);
+    renderTunable(capability, tunable, settingsBody);
   }
+  if (tunables.length > 0) capabilityRoot.append(settings);
+  var diagnostics = document.createElement('details');
+  diagnostics.dataset.section = 'diagnostics';
+  diagnostics.open = diagnosticsOpen;
+  diagnostics.append(textNode('summary', '诊断信息'));
+  var diagnosticBody = textNode('div', '', 'detail-body');
+  diagnosticBody.append(textNode('div', '会话 ID：' + current.sessionId));
+  if (typeof capability.runtimeEpoch === 'string' && capability.runtimeEpoch !== '') {
+    diagnosticBody.append(textNode('div', '实例代次：' + capability.runtimeEpoch));
+  }
+  if (Number.isInteger(capability.settingsRevision)) {
+    diagnosticBody.append(textNode('div', '设置修订：' + String(capability.settingsRevision)));
+  }
+  diagnostics.append(diagnosticBody);
+  capabilityRoot.append(diagnostics);
 }
 
 /**
  * 每个可编辑设置一个控件和“应用”；不回写 current，只把用户输入作为新值发送。
  * 值为枚举时用 select，goal 用文本框，其余没有可靠输入形态就不渲染控件。
  */
-function renderTunable(capability, tunable) {
+function renderTunable(capability, tunable, container) {
   var target = current;
   if (target === null) return;
   var row = document.createElement('div');
@@ -556,7 +806,7 @@ function renderTunable(capability, tunable) {
     if (typeof tunable.reason === 'string' && tunable.reason !== '') {
       row.append(textNode('div', '不可编辑：' + tunable.reason, 'reason'));
     }
-    capabilityRoot.append(row);
+    container.append(row);
     return;
   }
   var revisionReady = typeof capability.runtimeEpoch === 'string' && capability.runtimeEpoch !== ''
@@ -581,7 +831,7 @@ function renderTunable(capability, tunable) {
     row.append(control);
   }
   if (control === null) {
-    capabilityRoot.append(row);
+    container.append(row);
     return;
   }
   var apply = document.createElement('button');
@@ -598,7 +848,7 @@ function renderTunable(capability, tunable) {
     };
     row.append(apply);
   }
-  capabilityRoot.append(row);
+  container.append(row);
 }
 
 function configureLabel(body) {
@@ -674,7 +924,7 @@ async function acquireWrite() {
     return;
   }
   if (current === target) {
-    capabilityNotice = '取得写权：已发送，等待源端确认';
+    capabilityNotice = '正在恢复原会话，等待源端确认…';
     renderCapability();
   }
   var body = await command('acquire', {}, target, false, key);
@@ -684,9 +934,10 @@ async function acquireWrite() {
   var label = body === null ? '未确认（结果未知，先查状态，不自动重发）'
     : outcomeLabel(body.status === 'rejected' ? 200 : (body.ok ? 200 : 202), body);
   // 不乐观设置 ownership/writeState：只提示受理结果，等 capability.changed 或刷新。
-  capabilityNotice = '取得写权：' + label;
+  capabilityNotice = '接管会话：' + label;
   renderCapability();
-  refreshCurrentCapability();
+  await refreshCurrentCapability();
+  return current === target && writeState === 'ready';
 }
 
 /** 重新读取当前会话的能力文档；响应迟到时不覆盖更新的选择。 */
@@ -708,7 +959,7 @@ async function refreshCurrentCapability() {
     if (!rowData || sessionKey({
       deviceId: rowData.deviceId, agent: rowData.agent, sessionId: rowData.sessionId,
     }) !== key) continue;
-    var next = rowData.capability && typeof rowData.capability === 'object' ? rowData.capability : null;
+    var next = rowData.capability && typeof rowData.capability === 'object' ? rowData.capability : capabilitiesOf(deviceForCurrent(), target.agent);
     currentRow = rowData;
     var changed = capabilityDigest(next) !== capabilityDigest(currentCapability);
     currentCapability = next;
@@ -746,22 +997,64 @@ async function refreshDevices() {
   if (!data || !Array.isArray(data.devices)) return null;
   // 保留最近一次设备载荷：acquire 资格与 ownership 兜底都要看 syncing/stale。
   devicesData = data;
+  var signature = JSON.stringify(data.devices.map(function(device) {
+    return [device.id, device.name, device.agents, device.online, device.stale, device.syncing, !!unknownDevices[device.id]];
+  }));
+  // 常规状态刷新不重建未变化的导航，保留键盘焦点。
+  if (signature === devicesRenderSignature) {
+    if (current !== null) evaluateCurrentWriteState();
+    return data;
+  }
+  devicesRenderSignature = signature;
   clearNode(devicesRoot);
   for (var index = 0; index < data.devices.length; index += 1) {
     var device = data.devices[index];
     if (!device || typeof device.id !== 'string') continue;
     if (unknownDevices[device.id]) device.stale = true;
-    devicesRoot.append(textNode('div', device.name + ' (' + device.id + ')', 'group'));
+    var group = textNode('section', '', 'device-group');
+    var heading = textNode('div', '', 'device-heading');
+    var name = textNode('strong', device.name || device.id);
+    name.title = device.id;
+    var online = device.online !== false && device.stale !== true && device.syncing !== true;
+    heading.append(name, textNode('span', device.syncing === true ? '同步中' : online ? '在线' : '离线', online ? 'device-state online' : 'device-state'));
+    var rename = textNode('button', '✎');
+    rename.type = 'button'; rename.setAttribute('aria-label', '重命名设备 ' + (device.name || device.id));
+    rename.style.cssText = 'padding:2px 5px;font-size:12px;border:0';
+    rename.onclick = (function(item, section) { return function() {
+      if (section.querySelector('form')) return;
+      var form = document.createElement('form'); form.style.cssText = 'display:grid;gap:6px;padding:6px';
+      var input = document.createElement('input'); input.value = item.name; input.maxLength = 80;
+      input.setAttribute('aria-label', '新的设备名称'); input.style.minWidth = '0';
+      var save = textNode('button', '保存名称'); save.type = 'submit';
+      var cancel = textNode('button', '取消'); cancel.type = 'button'; cancel.onclick = function() { form.remove(); };
+      form.append(input, save, cancel); section.prepend(form); input.focus(); input.select();
+      form.onsubmit = async function(event) {
+        event.preventDefault(); save.disabled = true;
+        try {
+          var response = await request('/marshal/api/device-name', { method: 'POST', headers: writeHeaders(), body: JSON.stringify({ deviceId: item.id, name: input.value }) });
+          if (!response.ok) throw Error('名称需为 1–80 个字符');
+          form.remove(); devicesRenderSignature = ''; await refreshDevices(); nativeState();
+        } catch (error) { setStatus(error.message); save.disabled = false; }
+      };
+    }; })(device, group);
+    heading.append(rename);
+    group.append(heading);
+    devicesRoot.append(group);
     if (!Array.isArray(device.agents)) continue;
     for (var a = 0; a < device.agents.length; a += 1) {
       var agent = device.agents[a];
-      var row = textNode('div', '', 'row');
-      if (current !== null && current.deviceId === device.id && current.agent === agent) row.classList.add('active');
-      row.append(dot(false), document.createTextNode(agent));
+      var row = textNode('button', '', 'row');
+      row.type = 'button';
+      var active = selectedAgent !== null && selectedAgent.deviceId === device.id && selectedAgent.agent === agent;
+      if (active) row.classList.add('active');
+      row.setAttribute('aria-pressed', active ? 'true' : 'false');
+      row.setAttribute('aria-label', (device.name || device.id) + ' · ' + agentLabel(agent));
+      row.append(textNode('span', agent === 'codex' ? '</>' : agent === 'claude' ? 'AI' : '>_', 'agent-symbol'), document.createTextNode(agentLabel(agent)));
       row.onclick = selectAgent(device, agent, row);
-      devicesRoot.append(row);
+      group.append(row);
     }
   }
+  if (data.devices.length === 0) devicesRoot.append(textNode('p', '暂无设备连接', 'empty-list'));
   if (current !== null) evaluateCurrentWriteState();
   return data;
 }
@@ -776,8 +1069,7 @@ function findDevice(data, deviceId) {
 
 function selectAgent(device, agent, row) {
   return function() {
-    for (var other of devicesRoot.querySelectorAll('.row')) other.classList.remove('active');
-    row.classList.add('active');
+    selectRow(devicesRoot, row);
     loadSessions(device.id, agent, device);
   };
 }
@@ -785,14 +1077,22 @@ function selectAgent(device, agent, row) {
 async function loadSessions(deviceId, agent, device) {
   // 单调加载令牌：旧响应晚到不能覆盖后发起的列表。
   var token = ++loadToken;
+  selectedAgent = { deviceId: deviceId, agent: agent };
+  document.getElementById('sessionListTitle').textContent = agentLabel(agent) + ' 会话';
+  document.getElementById('sessionCount').hidden = true;
   // 换设备/agent 后旧选中不再属于当前列表，先作废并释放旧订阅。
   if (current !== null && (current.deviceId !== deviceId || current.agent !== agent)) {
     var previous = current;
     selectionToken += 1;
     current = null;
     currentRow = null;
+    writeState = 'unknown';
+    writeReason = '未选择会话';
+    applyWriteState();
     clearCapability();
     clearNode(cardsRoot);
+    clearNode(log);
+    updateSessionHeading(null, null);
     cardMap.clear();
     await releaseSubscription(previous);
     if (token !== loadToken) return;
@@ -807,14 +1107,29 @@ async function loadSessions(deviceId, agent, device) {
   try { data = await response.json(); } catch (error) { return; }
   if (token !== loadToken) return;
   if (!data || !Array.isArray(data.sessions)) { setStatus('加载会话失败'); return; }
-  clearNode(log);
-  for (var index = 0; index < data.sessions.length; index += 1) {
-    var rowData = data.sessions[index];
-    if (!rowData || typeof rowData.sessionId !== 'string' || rowData.agent !== agent) continue;
-    var row = textNode('div', '', 'row');
-    row.append(dot(rowData.running), document.createTextNode(rowData.sessionId.slice(0, 8)));
+  clearNode(sessionsRoot);
+  var visible = data.sessions.filter(function(row) { return row && typeof row.sessionId === 'string' && row.agent === agent; });
+  visible.sort(function(a, b) { return (b.updatedAt || 0) - (a.updatedAt || 0); });
+  document.getElementById('sessionCount').textContent = String(visible.length);
+  document.getElementById('sessionCount').hidden = false;
+  if (visible.length === 0) sessionsRoot.append(textNode('p', '这个智能体暂无会话。', 'empty-list'));
+  for (var index = 0; index < visible.length; index += 1) {
+    var rowData = visible[index];
+    var row = textNode('button', '', 'row session-row');
+    row.type = 'button';
+    row.title = sessionName(rowData) + ' · ' + rowData.sessionId;
+    row.dataset.sessionKey = sessionKey({ deviceId: deviceId, agent: agent, sessionId: rowData.sessionId });
+    var active = current !== null && current.sessionId === rowData.sessionId && current.agent === agent && current.deviceId === deviceId;
+    if (active) row.classList.add('active');
+    row.setAttribute('aria-pressed', active ? 'true' : 'false');
+    var copy = textNode('span', '', 'session-copy');
+    copy.append(textNode('span', sessionName(rowData), 'session-name'));
+    if (typeof rowData.updatedAt === 'number' && Number.isFinite(rowData.updatedAt) && rowData.updatedAt > 0) {
+      copy.append(textNode('span', new Date(rowData.updatedAt).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }), 'session-time'));
+    }
+    row.append(dot(rowData.running), copy, textNode('span', rowData.running ? '运行中' : '空闲', 'session-state'));
     row.onclick = selectSession(device, rowData, row);
-    log.append(row);
+    sessionsRoot.append(row);
   }
 }
 
@@ -833,21 +1148,24 @@ function selectSession(device, rowData, row) {
     // 先切目标再发 subscribe：跟随事件可能先于 HTTP 响应到达 SSE。
     current = target;
     currentRow = rowData;
+    updateSessionHeading(device, rowData);
+    clearNode(log);
     clearNode(cardsRoot);
     cardMap.clear();
     lastSeq.delete(sessionKey(target));
-    currentCapability = rowData.capability && typeof rowData.capability === 'object' ? rowData.capability : null;
+    currentCapability = rowData.capability && typeof rowData.capability === 'object' ? rowData.capability : capabilitiesOf(device, rowData.agent);
     capabilityNotice = '';
     renderCapability();
     evaluateCurrentWriteState();
-    for (var other of log.querySelectorAll('.row')) other.classList.remove('active');
-    row.classList.add('active');
+    selectRow(sessionsRoot, row);
+    nativeState();
     var body = await command('observe', { kind: 'follow', action: 'subscribe' }, target, true);
     if (token !== selectionToken) return;
     if (body === null) {
       if (current === target) {
         current = previous;
         currentRow = null;
+        updateSessionHeading(null, null);
         clearCapability();
         renderCapability();
         evaluateCurrentWriteState();
@@ -1251,6 +1569,14 @@ function connectStream() {
 }
 
 async function onReset(payload) {
+  var nextContinuity = { hubEpoch: payload.hubEpoch, devices: payload.continuity || {} };
+  var oldDevice = current && streamContinuity && streamContinuity.devices[current.deviceId];
+  var newDevice = current && nextContinuity.devices[current.deviceId];
+  var keepMessages = payload.complete === true && streamContinuity && typeof payload.hubEpoch === 'string'
+    && streamContinuity.hubEpoch === payload.hubEpoch && oldDevice && newDevice
+    && typeof newDevice.nodeEpoch === 'string' && Number.isInteger(newDevice.purge)
+    && oldDevice.nodeEpoch === newDevice.nodeEpoch && oldDevice.purge === newDevice.purge;
+  streamContinuity = nextContinuity;
   var generation = ++rebuildGeneration;
   rebuilding = true;
   queuedEvents.length = 0;
@@ -1258,11 +1584,13 @@ async function onReset(payload) {
   loadToken += 1;
   selectionToken += 1;
   barrierBlocked = payload.complete === false;
-  // reset-required：先丢弃本地时间线和卡片，再按索引/能力/待答快照重建。
+  // Rebuild authorization on every reset. Preserve already displayed messages
+  // only when the Hub proves node identity and content-purge generation match.
   clearNode(cardsRoot);
-  clearNode(log);
+  if (!keepMessages) { clearNode(log); nativePost({ type: 'clear' }); }
   cardMap.clear();
-  lastSeq.clear();
+  if (!keepMessages) lastSeq.clear();
+  if (keepMessages && payload.replay && payload.replay.gap) appendLog(textNode('div', '连接已恢复，中断期间可能有消息未同步。', 'reason'), Date.now());
   clearCapability();
   unknownDevices = {};
   if (Array.isArray(payload.degradedDevices)) {
@@ -1294,6 +1622,12 @@ async function onReset(payload) {
   }
 }
 
+function deltaText(payload, label) {
+  if (payload.redacted !== true && typeof payload.text === 'string' && payload.text.length > 0) return payload.text;
+  var count = Number.isInteger(payload.chars) && payload.chars >= 0 ? payload.chars + '字，' : '';
+  return label + '更新（' + count + '正文未同步）';
+}
+
 function onEvent(event) {
   if (!event) return;
   // 重建期间先有界暂存，避免被 loadSessions/loadInputs 的清空覆盖。
@@ -1316,11 +1650,14 @@ function onEvent(event) {
     return;
   }
   var key = sessionKey(current);
+  var turnEvent = event.kind === 'turn.started' || event.kind === 'turn.completed';
+  if (turnEvent && !Number.isInteger(event.seq)) return;
   if (typeof event.seq === 'number') {
     var previous = lastSeq.get(key) || 0;
     if (event.seq <= previous) return;
     lastSeq.set(key, event.seq);
   }
+  nativePost({ type: 'event', event: event });
   var payload = event.payload || {};
   if (event.kind === 'input.requested') {
     if (unknownDevices[event.deviceId]) { setStatus('状态未知、暂不可答'); return; }
@@ -1333,9 +1670,9 @@ function onEvent(event) {
   }
   var node;
   if (event.kind === 'reasoning.delta') {
-    node = textNode('div', payload.redacted ? '（思考 ' + payload.chars + ' 字，metadata 档）' : payload.text, 'reason');
+    appendMessage(deltaText(payload, '思考'), 'reason', payload.itemId || event.seq, event.ts); return;
   } else if (event.kind === 'message.delta') {
-    node = textNode('div', payload.redacted ? '（回复 ' + payload.chars + ' 字，metadata 档）' : payload.text);
+    appendMessage(deltaText(payload, '回复'), 'assistant', payload.itemId || event.seq, event.ts); return;
   } else if (event.kind === 'message.completed') {
     node = textNode('div', '消息完成', 'reason');
   } else if (event.kind === 'tool.started') {
@@ -1343,34 +1680,45 @@ function onEvent(event) {
   } else if (event.kind === 'tool.completed') {
     node = textNode('div', (payload.isError ? '✗ ' : '✓ ') + (payload.redacted ? payload.chars + ' 字' : String(payload.content || '').slice(0, 400)), 'tool');
   } else if (event.kind === 'turn.started') {
+    updateCurrentRunning(true);
     node = textNode('div', '回合开始', 'reason');
   } else if (event.kind === 'turn.completed') {
+    updateCurrentRunning(false);
     node = textNode('div', '回合完成（' + (payload.state || 'completed') + '）', 'reason');
   } else {
     return;
   }
-  appendLog(node);
+  appendLog(node, event.ts);
 }
 
 /* ---------------- 发送 ---------------- */
 
-sendForm.onsubmit = async function(event) {
-  event.preventDefault();
+async function submitPrompt(text, requestId, extras) {
   if (current === null) { setStatus('失败：请先选择会话'); return; }
-  if (writeState !== 'ready') { setStatus('写入已禁用：' + (writeReason || '状态未知')); return; }
-  var text = textInput.value.trim();
+  if (sendingPrompt || acquirePending) return;
+  if (writeState !== 'ready' && !acquireEligible()) { setStatus('写入已禁用：' + (writeReason || '状态未知')); return; }
+  text = text.trim();
   if (!text) return;
   var target = current;
-  var key = newKey();
+  sendingPrompt = true; applyWriteState();
+  try {
+  if (writeState !== 'ready') {
+    var acquired = await acquireWrite();
+    if (!acquired || current !== target) return;
+  }
+  // Selection, busy state or synchronization can change during acquisition.
+  evaluateCurrentWriteState();
+  if (current !== target || writeState !== 'ready') return;
+  var key = requestId || newKey();
   var intent = {
     id: intentId(key, target, 'prompt'), owner: origin + '|' + (session ? session.operatorId : ''),
     key: key, op: 'prompt', target: target, status: 'pending', at: Date.now(),
-  };
+  }
   // 先持久化再发送；存储不可用时拒绝新写。
   var stored = await persistIntent(intent);
   if (!stored) { setStatus('持久存储不可用，拒绝发送'); return; }
-  textInput.value = '';
-  var body = await command('prompt', { text: text }, target, false, key);
+  appendMessage(text, 'user', key, Date.now());
+  var body = await command('prompt', { text: text, ...(extras || {}) }, target, false, key);
   if (body === null) {
     await updateIntent(intent.id, { status: 'unknown' });
     return;
@@ -1379,10 +1727,20 @@ sendForm.onsubmit = async function(event) {
   setStatus(label);
   await updateIntent(intent.id, { status: intentStatus(body) });
   reconcilePending();
+  return body;
+  } finally { sendingPrompt = false; applyWriteState(); }
+}
+
+sendForm.onsubmit = async function(event) {
+  event.preventDefault();
+  var text = textInput.value;
+  var result = await submitPrompt(text);
+  if (result?.ok && textInput.value === text) textInput.value = '';
 };
 
+${DISCUSSION_SCRIPT}
 applyWriteState();
-restore();
+if (accountMode) showLogin('请从 DeepSeek Harness 插件进入你的调度空间'); else restore();
 setInterval(function() {
   if (session === null) return;
   refreshDevices().then(function() { return refreshCurrentCapability(); }).catch(function() {});
@@ -1392,3 +1750,10 @@ try {
   channel.onmessage = function() { if (session !== null) reconcilePending(); };
 } catch (error) {}
 </script></body></html>`
+
+
+/** Reuse the static UI with an isolated cookie/API namespace inside Desktop. */
+export const DESKTOP_PAGE_HTML = PAGE_HTML
+  .replaceAll('/marshal/', '/marshal/desktop/')
+  .replaceAll('__Host-marshal-csrf', '__Host-marshal-desktop-csrf')
+  .replace('<body>', '<body class="desktop-embed">')

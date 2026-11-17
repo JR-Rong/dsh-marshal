@@ -1,3 +1,4 @@
+import { ControlsSchema } from '../agents/controls.ts'
 import { MAX_FRAME_BYTES, MAX_INTERACTION_INPUT_BYTES } from '../wire/limits.ts'
 import {
   COMMAND_OPS, MARSHAL_KINDS, WIRE_ERROR_CODES,
@@ -32,7 +33,7 @@ const BUILTIN_PATTERNS: readonly string[] = [
 ]
 
 const RESULT_KEYS = new Set([
-  'accepted', 'cancelled', 'following', 'subscriptionId', 'created',
+  'attachmentId', 'complete', 'accepted', 'cancelled', 'following', 'subscriptionId', 'created',
   'sessionId', 'status', 'state', 'count', 'bytes', 'chars', 'reason', 'revision',
 ])
 
@@ -40,7 +41,7 @@ const CAPABILITY_OPERATIONS: ReadonlySet<string> = new Set([
   'prompt', 'interrupt', 'answer', 'cancel', 'configure', 'create', 'fork', 'acquire',
 ])
 const CAPABILITY_OWNERSHIP: ReadonlySet<string> = new Set([
-  'ours', 'foreign-unknown', 'foreign-running', 'unverified',
+  'ours', 'attached', 'foreign-unknown', 'foreign-running', 'unverified',
 ])
 const CAPABILITY_TOOL_DETAIL: ReadonlySet<string> = new Set(['args+output', 'args', 'none'])
 const CAPABILITY_PROMPT_FIDELITY: ReadonlySet<string> = new Set(['native', 'relay', 'dom', 'none'])
@@ -357,6 +358,7 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
         const out: Record<string, unknown> = {}
         if (typeof payload.running === 'boolean') out.running = payload.running
         if (typeof payload.blank === 'boolean') out.blank = payload.blank
+        if (content && typeof payload.title === 'string') out.title = scrub(payload.title.replace(/\s+/g, ' ').slice(0, 160)).text
         const updatedAt = safeInt(payload.updatedAt)
         if (updatedAt !== undefined) out.updatedAt = updatedAt
         const ownership = safeString(payload.ownership, 32)
@@ -387,6 +389,7 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
       case 'reasoning.delta':
       case 'message.delta':
         return { itemId: itemIdOf(payload, frame), chars: charCount(payload.text) }
+      case 'user.message':
       case 'message.completed':
         return { itemId: itemIdOf(payload, frame), chars: charCount(payload.text) }
       case 'tool.started': {
@@ -462,15 +465,11 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
       case 'session.updated': {
         const base = metadataPayload(kind, payload, frame)
         if (base === undefined) return undefined
-        // 只有源端显式标记为公开的别名才会带标题；原生标题默认丢弃。
-        if (payload.publicAlias === true) {
-          const title = safeText(payload.title, 200)
-          if (title !== undefined) base.title = title
-        }
         return [base]
       }
       case 'reasoning.delta':
       case 'message.delta':
+      case 'user.message':
       case 'message.completed': {
         const text = typeof payload.text === 'string' ? payload.text : undefined
         const itemId = itemIdOf(payload, frame)
@@ -642,6 +641,8 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
     const record = asRecord(raw)
     if (record === undefined) return undefined
     const out: Record<string, unknown> = {}
+    const catalog = ControlsSchema.safeParse(record.controls)
+    if (content && catalog.success) out.controls = { ...catalog.data, models: catalog.data.models.map(model => ({ ...model, label: scrub(model.label).text })) }
     for (const [key, value] of Object.entries(record)) {
       if (!RESULT_KEYS.has(key)) continue
       if (typeof value === 'boolean') { out[key] = value; continue }
@@ -1075,7 +1076,8 @@ export function createPrivacyProjector(options: PrivacyOptions): PrivacyProjecto
       if (ownership !== undefined) out.ownership = scrub(ownership).text
       const counts = countsOf(record.counts)
       if (counts !== undefined) out.counts = counts
-      // cwd、标题、任意未知字段都不进入同步快照。
+      if (content && typeof record.title === 'string') out.title = scrub(record.title.replace(/\s+/g, ' ').slice(0, 160)).text
+      // cwd 与其它未知字段不进入同步快照。
       return out
     },
 

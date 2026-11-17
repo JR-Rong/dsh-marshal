@@ -54,6 +54,13 @@ describe('parseConfig', () => {
     expect(Object.isFrozen(config)).toBe(true)
   })
 
+  it('私有 Hub 证书文件必须是绝对路径', () => {
+    expect(parseConfig({ ...base, hubCaFile: '/tmp/marshal-ca.pem' }, 'box').hubCaFile).toBe('/tmp/marshal-ca.pem')
+    for (const hubCaFile of ['cert.pem', '~/cert.pem', '', 42]) {
+      expect(() => parseConfig({ ...base, hubCaFile }, 'box')).toThrow(/hubCaFile/)
+    }
+  })
+
   it('hubUrl 必须是 wss://', () => {
     expect(parseConfig(base, 'box').hubUrl).toBe('wss://hub.example/marshal/uplink')
     expect(() => parseConfig({ ...base, hubUrl: 'http://hub/marshal' }, 'box')).toThrow(/wss:\/\/ URL/)

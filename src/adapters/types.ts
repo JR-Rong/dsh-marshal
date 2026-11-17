@@ -38,10 +38,14 @@ export interface ObserveCapability {
 export type Operation = 'prompt' | 'interrupt' | 'answer' | 'cancel' | 'configure' | 'create' | 'fork' | 'acquire'
 
 /**
- * v0 的 DSH 没有已验证的写权证据，能力里必须如实写 `unverified`；
- * 后三个值留给 v1 的 acquire/写权实现，不能在本版本冒充。
+ * attached 表示已连接原生会话，可通过该运行时继续；不承诺跨进程排他。
+ * ours 保留给本实例创建的受管会话；未知/运行中/未验证都不授予写入。
  */
-export type Ownership = 'ours' | 'foreign-unknown' | 'foreign-running' | 'unverified'
+export type Ownership = 'ours' | 'attached' | 'foreign-unknown' | 'foreign-running' | 'unverified'
+
+export function hasWriteControl(ownership: Ownership): boolean {
+  return ownership === 'ours' || ownership === 'attached'
+}
 
 /** 清单遍历是否被原生证据证明完整；`items.length` 不是证据。 */
 export type SnapshotCompleteness = 'complete' | 'unconfirmed'
@@ -83,12 +87,14 @@ export interface AnswerSink {
   cancel?(sessionId: string, requestId: string): SettleResult
 }
 
-/** 同步快照的会话行：只含可公开状态，不含 cwd/标题/正文。 */
+/** 同步会话状态；可选标题须经节点内容授权与脱敏，不携带 cwd 或正文。 */
 export interface SyncSessionRow {
   readonly sessionId: string
   readonly running: boolean
   readonly updatedAt: number
   readonly blank: boolean
+  readonly title?: string
+  readonly counts?: Readonly<Record<string, number>>
 }
 
 /** 每个 agent 一份完整能力文档；投影后仍不含本机路径或设置正文。 */
@@ -104,7 +110,12 @@ export interface SyncSnapshot {
 }
 
 export interface Adapter {
+  controls?(sessionId: string, signal: AbortSignal): Promise<import('../agents/controls.ts').SessionControls>
   readonly agent: string
+  /** Read-only native transcript; never creates or resumes a model run. */
+  history?(request: { sessionId: string; cursor?: string; limit?: number }, signal: AbortSignal): Promise<{
+    items: readonly EventFrame[]; completeness: SnapshotCompleteness; nextCursor?: string
+  }>
   capabilities(sessionId: string): Capability
   /**
    * 最近一次清单遍历的完整性。`unconfirmed` 时同步方（T06）只能发布

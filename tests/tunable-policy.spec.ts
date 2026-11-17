@@ -441,10 +441,10 @@ describe('model 组合检查', () => {
 })
 
 describe('plan 只允许收紧', () => {
-  const plan = (value: unknown, currentPlan: 'on' | 'off' | undefined = 'on') => decideConfigure(
+  const plan = (value: unknown, currentPlan: 'on' | 'off' | null = 'on') => decideConfigure(
     request({ field: 'plan', value }),
     context({
-      current: currentPlan === undefined ? confirmedWithout('plan') : { ...CONFIRMED, plan: currentPlan },
+      current: currentPlan === null ? confirmedWithout('plan') : { ...CONFIRMED, plan: currentPlan },
     }),
   )
 
@@ -460,7 +460,7 @@ describe('plan 只允许收紧', () => {
   it('相等 no-op，非法值与非确认当前值拒绝', () => {
     expect(plan('on')).toEqual({ outcome: 'no-op' })
     expect(plan('maybe')).toEqual({ outcome: 'reject', code: 'invalid-args', reason: 'plan-value-invalid' })
-    expect(plan('on', undefined))
+    expect(plan('on', null))
       .toEqual({ outcome: 'reject', code: 'unsupported', reason: 'current-unknown' })
   })
 })

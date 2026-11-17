@@ -30,13 +30,13 @@ export class OwnershipError extends PreCallRejection {
   }
 }
 
-export function toWireOwnership(state: OwnershipState): Ownership {
+export function toWireOwnership(state: OwnershipState, scope?: OwnershipEvidence['scope']): Ownership {
   switch (state) {
     case 'foreign-unknown': return 'foreign-unknown'
     case 'foreign-running': return 'foreign-running'
     case 'acquiring': return 'unverified'
     case 'ours-idle':
-    case 'ours-running': return 'ours'
+    case 'ours-running': return scope === 'native-runtime' ? 'attached' : 'ours'
   }
 }
 
@@ -129,6 +129,7 @@ export function createOwnershipCoordinator(options: OwnershipCoordinatorOptions)
     candidate: OwnershipEvidence | undefined,
   ): OwnershipEvidence | undefined => {
     if (candidate === undefined) return undefined
+    if (candidate.scope !== undefined && candidate.scope !== 'native-runtime') return undefined
     if (candidate.sessionId !== sessionId) return undefined
     if (typeof candidate.mechanism !== 'string' || candidate.mechanism === '') return undefined
     if (typeof candidate.holder !== 'string' || candidate.holder === '') return undefined
@@ -138,6 +139,7 @@ export function createOwnershipCoordinator(options: OwnershipCoordinatorOptions)
     if (!Array.isArray(candidate.invalidatesOn) || candidate.invalidatesOn.length === 0) return undefined
     if (candidate.invalidatesOn.some(entry => typeof entry !== 'string' || entry === '')) return undefined
     return {
+      ...(candidate.scope === undefined ? {} : { scope: candidate.scope }),
       sessionId: candidate.sessionId,
       mechanism: candidate.mechanism,
       holder: candidate.holder,
@@ -155,7 +157,7 @@ export function createOwnershipCoordinator(options: OwnershipCoordinatorOptions)
     state,
 
     ownership(sessionId: string): Ownership {
-      return toWireOwnership(state(sessionId))
+      return toWireOwnership(state(sessionId), owned.get(sessionId)?.evidence.scope)
     },
 
     evidence(sessionId: string): OwnershipEvidence | undefined {
@@ -199,7 +201,7 @@ export function createOwnershipCoordinator(options: OwnershipCoordinatorOptions)
       cancelIfStale()
       acquiring.delete(sessionId)
       if (signal.aborted) throw signal.reason
-      // resume 成功但没有排他证据时仍必须保持只读。
+      // 必须验证控制句柄及失效边界；原生恢复使用 attached，不能冒充排他。
       const evidence = validateEvidence(sessionId, candidate)
       if (evidence === undefined) throw new OwnershipError('ownership-unverified')
       owned.set(sessionId, { evidence, turnActive: false, configuring: false })
@@ -208,7 +210,7 @@ export function createOwnershipCoordinator(options: OwnershipCoordinatorOptions)
       return {
         sessionId,
         state: next,
-        wire: toWireOwnership(next),
+        wire: toWireOwnership(next, evidence.scope),
         evidence,
         ...(reason === undefined ? {} : { reason }),
       }

@@ -391,9 +391,8 @@ describe('ownership lease and cleanup', () => {
 
   it('release falls back to observation, revoke keeps it, clear drops everything', async () => {
     const target = coordinator()
-    target.noteObserved('s1', true)
     await target.acquire('s1', async () => evidence('s1'))
-    target.noteObserved('s2', true)
+    target.noteObserved('s1', true)
     await target.acquire('s2', async () => evidence('s2'))
     target.noteObserved('s2', true)
 

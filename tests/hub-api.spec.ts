@@ -342,7 +342,7 @@ describe('hub api endpoints', () => {
     })).statusCode).toBe(400)
     expect(sent).toEqual([])
     const huge = await target.request('/marshal/api/command', {
-      method: 'POST', headers: { ...AUTH, 'content-type': 'application/json' }, body: 'x'.repeat(9_000),
+      method: 'POST', headers: { ...AUTH, 'content-type': 'application/json' }, body: 'x'.repeat(1_048_576),
     })
     expect(huge.statusCode).toBe(413)
   })
@@ -488,4 +488,16 @@ describe('hub api endpoints', () => {
     expect(response.statusCode).toBe(503)
     expect(response.body).not.toContain('sk-testtesttesttest')
   })
+})
+
+it('relays bounded attachment chunks larger than the former 8 KB command limit', async () => {
+  const { web: target, relay, sent } = await start()
+  const waiting = target.request('/marshal/api/command', { method: 'POST', headers: { ...AUTH, 'content-type': 'application/json' }, body: JSON.stringify({
+    op: 'upload', target: { deviceId: 'mac', agent: 'dsh', sessionId: 's1' }, idempotencyKey: 'upload-1',
+    args: { id: '12345678-1234-4123-8123-123456789012', name: 'fixture.txt', mime: 'text/plain', offset: 0, size: 196608, sha256: '0'.repeat(64), data: Buffer.alloc(196608).toString('base64') },
+  }) })
+  const frame = await waitForFrame(sent, 'command')
+  relay.settle({ v: 2, type: 'ack', commandId: frame.commandId as string, connectionId: 'conn-1', nodeEpoch: 'epoch-1', status: 'accepted', result: { attachmentId: '12345678-1234-4123-8123-123456789012', complete: true, bytes: 196608 } }, ORIGIN_FRAME)
+  expect((await waiting).statusCode).toBe(200)
+  relay.dispose()
 })

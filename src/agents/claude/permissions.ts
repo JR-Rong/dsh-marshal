@@ -75,12 +75,14 @@ function classifyQuestion(input: unknown): ClaudeClassification {
 
   const questions: unknown[] = []
   const answerKeys = new Map<string, string>()
+  const seenTexts = new Set<string>()
   for (const [index, item] of raw.entries()) {
     const question = asRecord(item)
     if (question === undefined) return { kind: 'deny' }
     const text = question.question
     if (typeof text !== 'string' || text === '') return { kind: 'deny' }
-    if (answerKeys.has(text)) return { kind: 'deny' }
+    if (seenTexts.has(text)) return { kind: 'deny' }
+    seenTexts.add(text)
 
     const id = `q${index + 1}`
     const projected: Record<string, unknown> = { id, question: text }

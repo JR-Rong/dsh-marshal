@@ -13,6 +13,8 @@ import type { PrivacyProjector } from './privacy.ts'
 export interface NodeSyncSource {
   readonly agent: string
   syncSnapshot(signal: AbortSignal): Promise<SyncSnapshot>
+  /** 能力属于具体会话；agent 默认值不能覆盖其所有权或设置回读。 */
+  sessionCapability?(sessionId: string): Record<string, unknown>
 }
 
 export interface NodeSyncOptions {
@@ -101,6 +103,8 @@ function sameRow(previous: Row | undefined, next: Row): boolean {
   if (previous === undefined) return false
   return previous.running === next.running
     && previous.updatedAt === next.updatedAt
+    && previous.title === next.title
+    && JSON.stringify(previous.counts ?? {}) === JSON.stringify(next.counts ?? {})
     && (previous.blank ?? false) === (next.blank ?? false)
 }
 
@@ -128,6 +132,7 @@ export function createNodeSync(options: NodeSyncOptions): NodeSync {
   let version = 0
   let stale = false
   let stalePublished = false
+  const staleAgents = new Set<string>()
   /** 最近一次完整提交的会话行（按 agent+sessionId 键）与逐 agent 能力文档。 */
   let lastRows = new Map<string, Row>()
   const lastCapability = new Map<string, Record<string, unknown>>()
@@ -206,6 +211,11 @@ export function createNodeSync(options: NodeSyncOptions): NodeSync {
     try { options.emit(options.frame(agent, sessionId, 'capability.changed', payload)) } catch (error) { report(error) }
   }
 
+  const sessionCapability = (agent: string, sessionId: string, fallback: Record<string, unknown>): Record<string, unknown> => {
+    const source = options.sources.find(item => item.agent === agent)
+    try { return source?.sessionCapability?.(sessionId) ?? fallback } catch { return fallback }
+  }
+
   const sessionsOfAgent = (agent: string, rows: ReadonlyMap<string, Row>): string[] => {
     const sessions: string[] = []
     for (const row of rows.values()) {
@@ -218,8 +228,9 @@ export function createNodeSync(options: NodeSyncOptions): NodeSync {
   /** 逐 agent 广播 stale；绝不把某个 agent 的能力行发给另一个 agent 的会话。 */
   const publishCapability = (flag: boolean): void => {
     for (const [agent, capability] of lastCapability) {
-      const payload = { ...capability, stale: flag }
-      for (const sessionId of sessionsOfAgent(agent, lastRows)) emitCapability(agent, sessionId, payload)
+      for (const sessionId of sessionsOfAgent(agent, lastRows)) {
+        emitCapability(agent, sessionId, { ...sessionCapability(agent, sessionId, capability), stale: flag })
+      }
     }
     stalePublished = flag
   }
@@ -256,7 +267,7 @@ export function createNodeSync(options: NodeSyncOptions): NodeSync {
         capabilities.push(document)
         const projected = projector.syncRow({
           agent: document.agent,
-          capability: { ...document.capability, ...(stale ? { stale: true } : {}) },
+          capability: { ...document.capability, stale: true },
         })
         if (projected !== undefined) rows.push(projected)
         continue
@@ -272,7 +283,9 @@ export function createNodeSync(options: NodeSyncOptions): NodeSync {
         capabilities.push({ agent, capability: document.capability })
         const projected = projector.syncRow({
           agent,
-          capability: { ...document.capability, ...(stale ? { stale: true } : {}) },
+          // Fresh snapshots replace pre-disconnect capabilities. The sync ACK
+          // barrier, not the previous connection's stale flag, gates writes.
+          capability: { ...document.capability },
         })
         if (projected !== undefined) rows.push(projected)
       }
@@ -352,6 +365,7 @@ export function createNodeSync(options: NodeSyncOptions): NodeSync {
       }
       stale = false
       stalePublished = false
+      staleAgents.clear()
       clearAck()
       infight = undefined
       link.confirmSync(syncId)
@@ -387,14 +401,20 @@ export function createNodeSync(options: NodeSyncOptions): NodeSync {
     try {
       const gathered = await gather(scanTimeoutMs)
       if (disposed || !link.online) return
-      if (gathered.completeness !== 'complete') {
-        // 不完整清单不能产生删除/运行态差异；只标 stale，并把失败 agent 标为不可用。
-        stale = true
-        if (!stalePublished) publishCapability(true)
-        publishUnavailable(gathered)
-        return
+      const unavailable = new Set(gathered.sources.filter(item =>
+        item.snapshot === undefined || item.snapshot.completeness !== 'complete').map(item => item.agent))
+      for (const agent of unavailable) {
+        if (staleAgents.has(agent)) continue
+        const fallback = lastCapability.get(agent) ?? {}
+        for (const sessionId of sessionsOfAgent(agent, lastRows)) {
+          emitCapability(agent, sessionId, { ...sessionCapability(agent, sessionId, fallback), stale: true })
+        }
       }
-      const projected = projectGathered(gathered)
+      publishUnavailable(gathered)
+      // 不可用源保留自己的旧行；健康源仍正常发现、更新和删除会话。
+      const projected = projectGathered({
+        sources: gathered.sources.filter(item => !unavailable.has(item.agent)), completeness: 'complete',
+      })
       const next = new Map<string, Row>()
       for (const row of projected.rows) {
         if (!isSessionRow(row) || typeof row.sessionId !== 'string') continue
@@ -404,6 +424,9 @@ export function createNodeSync(options: NodeSyncOptions): NodeSync {
       }
       // 先把差异全部算完，再一次性发事件；扫描中断不会产生半套 diff。
       const merged = new Map<string, Row>()
+      for (const [key, row] of lastRows) {
+        if (unavailable.has(rowAgent(row) ?? '')) merged.set(key, row)
+      }
       const changed: Row[] = []
       for (const [key, row] of next) {
         const previous = lastRows.get(key)
@@ -418,8 +441,9 @@ export function createNodeSync(options: NodeSyncOptions): NodeSync {
         }
         const updatedAt = typeof row.updatedAt === 'number' ? row.updatedAt : 0
         const previousAt = typeof previous.updatedAt === 'number' ? previous.updatedAt : 0
-        // 只有快照确实更新时才覆盖；相同或更旧的清单让位给增量。
-        if (updatedAt > previousAt) {
+        // DSH updatedAt 是最近输入时间；完成回合未必改变它。等时快照仍可修正运行态，
+        // 但扫描开始之后的增量优先，避免迟到清单清掉刚开始的新回合。
+        if (updatedAt >= previousAt && (lastEventTs.get(key) ?? -1) < scanStartedAt) {
           merged.set(key, row)
           changed.push(row)
         } else {
@@ -428,6 +452,7 @@ export function createNodeSync(options: NodeSyncOptions): NodeSync {
       }
       const removed: Row[] = []
       for (const [key, previous] of lastRows) {
+        if (unavailable.has(rowAgent(previous) ?? '')) continue
         if (next.has(key)) continue
         // 扫描期间到达的增量已证明会话仍存在：旧清单不能覆盖它。
         if ((lastEventTs.get(key) ?? 0) > scanStartedAt) merged.set(key, previous)
@@ -448,6 +473,8 @@ export function createNodeSync(options: NodeSyncOptions): NodeSync {
             running: row.running,
             updatedAt: row.updatedAt,
             blank: row.blank,
+            title: row.title,
+            counts: row.counts,
           }))
         } catch (error) { report(error) }
       }
@@ -457,16 +484,17 @@ export function createNodeSync(options: NodeSyncOptions): NodeSync {
         const capabilityChanged = stableCapability(document.capability)
           !== stableCapability(lastCapability.get(document.agent))
         lastCapability.set(document.agent, document.capability)
-        if (!capabilityChanged) continue
-        const payload = { ...document.capability, ...(stale ? { stale: true } : {}) }
+        if (!capabilityChanged && !staleAgents.has(document.agent) && !stalePublished) continue
         for (const sessionId of sessionsOfAgent(document.agent, merged)) {
-          emitCapability(document.agent, sessionId, payload)
+          emitCapability(document.agent, sessionId, {
+            ...sessionCapability(document.agent, sessionId, document.capability), stale: false,
+          })
         }
       }
-      if (stale) {
-        stale = false
-        if (stalePublished) publishCapability(false)
-      }
+      stale = unavailable.size > 0
+      stalePublished = false
+      staleAgents.clear()
+      for (const agent of unavailable) staleAgents.add(agent)
     } catch (error) {
       stale = true
       if (!stalePublished) publishCapability(true)
@@ -515,6 +543,8 @@ export function createNodeSync(options: NodeSyncOptions): NodeSync {
         if (payload.running !== undefined) merged.running = payload.running
         if (payload.updatedAt !== undefined) merged.updatedAt = payload.updatedAt
         if (payload.blank !== undefined) merged.blank = payload.blank
+        if (payload.title !== undefined) merged.title = payload.title
+        if (payload.counts !== undefined) merged.counts = payload.counts
         lastRows.set(key, merged)
         lastEventTs.set(key, at)
         return
@@ -540,13 +570,7 @@ export function createNodeSync(options: NodeSyncOptions): NodeSync {
         lastEventTs.set(key, at)
         return
       }
-      if (event.kind === 'capability.changed' && isRecord(event.payload)) {
-        const capability = isRecord(event.payload.capability)
-          ? event.payload.capability
-          : event.payload
-        const { stale: _stale, ...rest } = capability
-        lastCapability.set(event.agent, rest)
-      }
+      // capability.changed 始终绑定会话；agent 清单的比较基线只由 syncSnapshot 更新。
     },
     get stale(): boolean { return stale },
     get syncing(): boolean { return infight !== undefined },

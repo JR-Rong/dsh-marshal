@@ -195,7 +195,7 @@ describe('dsh capability model', () => {
     expect(projected[0]?.payload).toMatchObject({
       observe: { history: false, follow: 'stream' },
       operations: ['prompt', 'answer', 'cancel'],
-      ownership: 'unverified',
+      ownership: 'attached',
       reasoning: true,
       unavailable: {
         'observe.history': 'history-unavailable',

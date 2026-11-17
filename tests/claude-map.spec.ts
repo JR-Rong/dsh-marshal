@@ -25,13 +25,13 @@ function counter(): () => number {
 }
 
 function context(
-  turnId: string | undefined = 'claude-turn:t1',
+  turnId: string | null = 'claude-turn:t1',
   stream?: ClaudeStreamTracker,
 ): ClaudeMapContext {
   return {
     runtimeEpoch: 'epoch-1',
     ownership: 'ours',
-    ...(turnId === undefined ? {} : { turnId }),
+    ...(turnId === null ? {} : { turnId }),
     ...(stream === undefined ? {} : { stream }),
   }
 }
@@ -209,7 +209,7 @@ describe('claude message mapping', () => {
     const failed = toClaudeEvents(resultMessage(true), meta, counter(), context())
     expect(failed[0]?.payload).toMatchObject({ state: 'failed' })
 
-    const unbound = toClaudeEvents(resultMessage(), meta, counter(), context(undefined))
+    const unbound = toClaudeEvents(resultMessage(), meta, counter(), context(null))
     expect(unbound).toEqual([])
 
     const subagent = assistant([{ type: 'text', text: 'child' }])
@@ -221,9 +221,9 @@ describe('claude message mapping', () => {
     const events = historyToEvents([
       historyMessage('user', 'plain prompt', 'uuid-s'),
       historyMessage('assistant', [{ type: 'text', text: 'reply' }]),
-    ], meta, counter(), context(undefined))
+    ], meta, counter(), context(null))
     expect(events.map(item => item.kind)).toEqual([
-      'turn.started', 'message.completed', 'turn.completed',
+      'turn.started', 'user.message', 'message.completed', 'turn.completed',
     ])
     expect(events[0]?.payload).toMatchObject({ turnId: 'claude-turn:history:uuid-s' })
   })
@@ -236,14 +236,14 @@ describe('claude message mapping', () => {
       historyMessage('user', [{ type: 'text', text: 'two' }], 'uuid-b'),
       historyMessage('assistant', [{ type: 'text', text: 'second' }]),
     ]
-    const events = historyToEvents(messages, meta, counter(), context(undefined))
+    const events = historyToEvents(messages, meta, counter(), context(null))
     expect(events.map(item => item.kind)).toEqual([
-      'turn.started', 'message.completed', 'tool.completed',
-      'turn.completed', 'turn.started', 'message.completed', 'turn.completed',
+      'turn.started', 'user.message', 'message.completed', 'tool.completed',
+      'turn.completed', 'turn.started', 'user.message', 'message.completed', 'turn.completed',
     ])
     expect(events[0]?.payload).toMatchObject({ turnId: 'claude-turn:history:uuid-a', state: 'running' })
-    expect(events[3]?.payload).toMatchObject({ turnId: 'claude-turn:history:uuid-a', state: 'completed' })
-    expect(events[4]?.payload).toMatchObject({ turnId: 'claude-turn:history:uuid-b', state: 'running' })
-    expect(events[6]?.payload).toMatchObject({ turnId: 'claude-turn:history:uuid-b', state: 'completed' })
+    expect(events[4]?.payload).toMatchObject({ turnId: 'claude-turn:history:uuid-a', state: 'completed' })
+    expect(events[5]?.payload).toMatchObject({ turnId: 'claude-turn:history:uuid-b', state: 'running' })
+    expect(events[8]?.payload).toMatchObject({ turnId: 'claude-turn:history:uuid-b', state: 'completed' })
   })
 })

@@ -1,6 +1,18 @@
 # dsh-marshal
 
-本文安装和协议说明对应 `feat/v0` 的现有实现（评审基线 `702ef24`）。P1 修订目标及迁移要求见[公共契约](docs/superpowers/specs/2026-10-29-marshal-contract.md)，尚未在代码中实施；不要把目标版配置直接用于当前版本。
+> `rjr/cx/v1-agents` 分支说明：代码已迁移到 wire v2，支持 DSH、Codex 和 Claude 的装配；下文保留的 v0 安装示例不适用于本分支。当前 hub 必填 `publicOrigin`（HTTPS origin），node 必填稳定的 `deviceId` 并使用 `wss://`；账号模式的新设备在插件中选择角色后自动注册；手工运维仍支持 `marshal-device add <deviceId>`。日常在插件内复用 DSH 登录态，不使用 URL token。配置与迁移规则见[公共契约](docs/superpowers/specs/2026-10-29-marshal-contract.md)。
+>
+> 原生会话：桌面单会话复用 DSH 的聊天视图、输入框和轮次导航；Codex/Claude 保持原始引擎与会话 ID。`/marshal/api/history` 已接通独立只读正文通道，DSH 在宿主提供分页接口时也支持历史；正文须同时通过节点与 Hub 的内容授权。SSE 的有界缓存回放可用，保留时间由 `ringBufferMinutes`（1–15，默认 15）控制。自动化测试使用原生协议替身，不能代替真实 agent 和两机验收。
+
+当前分支的 bundle 默认启用首次设置。安装后打开 DeepSeek Harness 侧边栏“调度官”，选择“边缘主机”或“中心服务器”。已有云端中心时 Mac 选择边缘主机，使用当前 DSH 账号自动加入；不需要复制 token 或手动注册。现有明确角色配置保留原设备身份。调度页面直接显示在插件面板内；侧边栏接口只返回公开地址。内嵌页面采用独立的分区会话 cookie，只允许 `dsh-app://app` 桌面来源嵌入，仍校验 Origin 与 CSRF；独立浏览器入口 `/marshal` 保持禁止嵌入。私有 HTTPS Hub 可在 node 配置绝对路径 `hubCaFile`，为该直连指定 PEM CA 证书；Electron 宿主应使用 CA 签发的站点证书，证书和主机名校验始终启用。
+
+已有会话的接管与继续、控制范围和并发边界见[会话控制说明](docs/session-control.md)。
+
+云端 Hub 可启用 [DSH 账号登录](docs/account-workspaces.md)：同账号的新 Mac 安装并完成角色选择后自动进入同一调度空间；不同账号被拒绝。默认 Hub 地址只是示例 `https://hub.example.com`，首次设置时请改成你自己的 Hub 地址；真实地址、证书和 token 不要提交到仓库。DSH 单会话显示原生轮数、步数、解码速度、token、缓存命中率和上下文占用；不提供的统计不会伪造。群聊可为主持和每位成员分别选择模型支持的思考强度。Agent 工作群的主持分工、双机执行与真实验收记录见[群聊说明](docs/agent-group-chat.md)。
+
+云端可使用独立入口 `marshal-hub` 运行中心服务，无须安装桌面宿主。部署、证书、systemd 与双机迁移步骤见[云端 Hub 文档](docs/cloud-hub.md)。
+
+以下保留的安装和协议说明对应旧 `feat/v0` 实现（评审基线 `702ef24`），不代表当前分支；当前配置与迁移规则以上面的分支说明和[公共契约](docs/superpowers/specs/2026-10-29-marshal-contract.md)为准。
 
 调度官：把 DSH 会话的观察、续跑与提问搬到任意浏览器，node 只做出站连接，不新开任何入站端口。
 
@@ -200,7 +212,7 @@ WebSocket 上的 JSON 帧统一带 `v: 1`，四种 `type`：
 
 - v0 已在分支 `feat/v0` 实现并提交：hub + node，DSH↔DSH 全链路，含双向提问。
 - v1（Codex / Claude Code 适配器、设置切换与回读）尚未开始。
-- D1 跨平台讨论组仅有设计与计划：显式选择成员、只讨论与汇总、用户决定后续行动；尚未实现，也未安装或验证参考插件。
+- [主持式 agent 群聊](docs/agent-group-chat.md)已实现：在插件内选择 2–4 位 DSH/Codex 成员和主持人，自动分工、回复、汇总，支持最多 3 轮、停止及状态核对。只讨论，不导入工作会话或执行任务；Claude 群聊尚未开放。早期 D1 的完整扩展协议仍是后续设计。
 - 两台真机上的联调与验收尚未记录；本文档中的部署步骤按代码实现编写，未附现场验收结果。
 - 当前已有 ACK 路由、hub 并发同键合并、node deadline 检查、事件设备/agent 校验及重连快照。ACK 来源绑定、node 持久去重、全通道隐私与原子同步等仍见 P1 增量计划；超时不能据此认定未执行，也不保证重启后不重复执行。
 

@@ -1,0 +1,18 @@
+# Import from the existing Caddyfile. For IP clients without SNI, its global
+# options block needs: default_sni hub.example.com
+https://hub.example.com {
+    tls /etc/caddy/dsh-marshal/public-cert.pem /etc/caddy/dsh-marshal/public-key.pem
+    @marshal path /marshal /marshal/*
+    handle @marshal {
+        reverse_proxy https://127.0.0.1:48443 {
+            transport http {
+                # Syntax supported by the server's existing Caddy 2.6.2.
+                tls_trusted_ca_certs /etc/caddy/dsh-marshal/hub-ca.pem
+                keepalive 2s
+            }
+        }
+    }
+    handle {
+        respond 404
+    }
+}

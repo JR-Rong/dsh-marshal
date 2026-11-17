@@ -178,7 +178,7 @@ export function toMarshalEvents(frame: unknown, meta: Meta, nextSeq: () => numbe
       const content = stripInteraction(message?.content)
       const isError = message?.isError === true || data.error !== undefined
       return emit('tool.completed', {
-        callId: message?.toolCallId,
+        callId: asRecord(message?.source)?.callId ?? message?.toolCallId,
         status: isError ? 'error' : 'ok',
         ...(content.removed || content.value === undefined ? {} : { content: content.value }),
       })
@@ -186,4 +186,30 @@ export function toMarshalEvents(frame: unknown, meta: Meta, nextSeq: () => numbe
     default:
       return []
   }
+}
+
+/** Durable history is read separately from transient assistant stream chunks. */
+export function dshHistoryEvents(events: readonly unknown[], meta: Meta, nextSeq: () => number): EventFrame[] {
+  return events.flatMap(raw => {
+    const event = asRecord(raw)
+    const data = asRecord(event?.data)
+    if (!event || !data) return []
+    const make = (kind: EventFrame['kind'], payload: unknown): EventFrame => ({
+      v: 2, type: 'event', ...meta, seq: nextSeq(),
+      ts: typeof event.time === 'number' ? event.time : Date.now(), kind, payload,
+    })
+    if (event.type === 'user/message' && event.surfaceOp === 'append') {
+      const source = asRecord(data.source)
+      if (source?.kind !== 'user') return []
+      const text = Array.isArray(data.content) ? data.content.map(asRecord).filter(part => part?.type === 'text').map(part => part!.text).join('\n') : ''
+      return [make('user.message', { itemId: String(data.id), text })]
+    }
+    if (event.type === 'assistant/message' && event.surfaceOp === 'append') {
+      const message = asRecord(data.message)
+      const blocks = Array.isArray(message?.content) ? message.content.map(asRecord) : []
+      return blocks.flatMap((part, index) => part?.type === 'text' || part?.type === 'reasoning'
+        ? [make(part.type === 'text' ? 'message.completed' : 'reasoning.delta', { itemId: `${String(message?.id)}:${index}`, text: part.text })] : [])
+    }
+    return toMarshalEvents({ type: 'event', event }, meta, nextSeq).map(item => ({ ...item, ts: typeof event.time === 'number' ? event.time : item.ts }))
+  })
 }

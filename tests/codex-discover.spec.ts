@@ -101,7 +101,7 @@ describe('codex discovery', () => {
     expect(page.nextCursor).toBeUndefined()
   })
 
-  it('projects rows without preview, title or cwd', () => {
+  it('projects a bounded title while leaving raw preview and cwd out', () => {
     const row = threadRow(thread('s1', {
       status: { type: 'active', activeFlags: [] },
       updatedAt: 1_700_000_000,
@@ -112,11 +112,12 @@ describe('codex discovery', () => {
       running: true,
       updatedAt: 1_700_000_000_000,
       blank: false,
+      title: 'secret preview',
     })
   })
 
   it('marks a thread with no preview and no turns as blank', () => {
     const row = threadRow(thread('s2'))
-    expect(row).toEqual({ sessionId: 's2', running: false, updatedAt: 0, blank: true })
+    expect(row).toEqual({ sessionId: 's2', running: false, updatedAt: 0, blank: true, title: '新会话' })
   })
 })

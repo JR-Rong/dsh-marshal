@@ -3,8 +3,7 @@ import type { EventFrame } from '../../wire/frames.ts'
 /**
  * Claude 受管会话集合 + 每会话观察者登记。
  *
- * - 只有本适配器 `createSession`/`forkSession` 成功建立的会话才进入 managed；
- *   外部会话永远不在集合里，`acquire` 因此只能拿 ownership-unverified。
+ * - 本适配器 create/fork 或显式原 ID 恢复后进入 managed，并保留恢复来源。
  * - 观察者各自持有有界队列，溢出即结束该观察者（调用方应从历史补齐），
  *   绝不无界缓存正文；正常关闭、异常退出、输入取消都走 `clear`/`closeSession`。
  * - 本文件不发起任何原生订阅：Claude 侧没有可比的多会话通知面，
@@ -13,7 +12,8 @@ import type { EventFrame } from '../../wire/frames.ts'
 export const CLAUDE_MAX_QUEUED_EVENTS = 2048
 
 export interface ClaudeSessionRegistry {
-  markManaged(sessionId: string): void
+  markManaged(sessionId: string, resumed?: boolean): void
+  isResumed(sessionId: string): boolean
   isManaged(sessionId: string): boolean
   managedIds(): readonly string[]
   publish(sessionId: string, event: EventFrame): void
@@ -51,7 +51,7 @@ export function createClaudeSessionRegistry(
   options: ClaudeSessionRegistryOptions = {},
 ): ClaudeSessionRegistry {
   const maxQueued = Math.max(1, options.maxQueuedEvents ?? CLAUDE_MAX_QUEUED_EVENTS)
-  const managed = new Set<string>()
+  const managed = new Map<string, boolean>()
   const listeners = new Map<string, Set<Listener>>()
 
   const closeSet = (set: Set<Listener> | undefined, dropQueued = false): void => {
@@ -111,9 +111,10 @@ export function createClaudeSessionRegistry(
   }
 
   return {
-    markManaged(sessionId: string): void { managed.add(sessionId) },
+    markManaged(sessionId: string, resumed = false): void { managed.set(sessionId, resumed) },
+    isResumed(sessionId: string): boolean { return managed.get(sessionId) === true },
     isManaged(sessionId: string): boolean { return managed.has(sessionId) },
-    managedIds(): readonly string[] { return [...managed] },
+    managedIds(): readonly string[] { return [...managed.keys()] },
     publish,
     observe,
     subscriberCount(sessionId: string): number {

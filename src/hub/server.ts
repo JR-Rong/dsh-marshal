@@ -1,3 +1,4 @@
+import { DISCUSSION_FEATURE } from '../discussions/types.ts'
 import { randomUUID } from 'node:crypto'
 import { watch, type FSWatcher } from 'node:fs'
 import type { IncomingMessage, Server } from 'node:http'
@@ -104,6 +105,7 @@ interface Connection {
   readonly deviceName: string
   readonly connectionId: string
   readonly nodeEpoch: string
+  readonly features: ReadonlySet<string>
   readonly agents: ReadonlySet<string>
   readonly sender: Sender
   readonly ws: WebSocket
@@ -458,6 +460,7 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
             connectionId,
             nodeEpoch: frame.nodeEpoch,
             agents: new Set(frame.agents),
+            features: new Set(frame.features),
             sender,
             ws,
           }
@@ -553,6 +556,19 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
           return
         }
 
+        if (frame.type === 'discussion.catalog' || frame.type === 'discussion.result' || frame.type === 'discussion.progress') {
+          if (!current.features.has(DISCUSSION_FEATURE)) { ws.close(CLOSE_CODES.FRAME_INVALID, 'frame-invalid'); return }
+        }
+        if (frame.type === 'history.result') {
+          if (frame.target.deviceId !== current.deviceId || !current.agents.has(frame.target.agent)) {
+            ws.close(CLOSE_CODES.DEVICE_MISMATCH, 'device-mismatch'); return
+          }
+          if (!contentDevices.has(current.deviceId)) {
+            options.onFrame?.(identityOf(current), { v: 2, type: 'ack', commandId: frame.commandId,
+              connectionId: current.connectionId, nodeEpoch: current.nodeEpoch, status: 'rejected', code: 'unsupported' })
+            return
+          }
+        }
         if (frame.type === 'event') {
           // 只信握手绑定的身份：帧里自报的 deviceId/agent 不能冒充别的设备或未声明的 agent。
           if (frame.deviceId !== current.deviceId) {

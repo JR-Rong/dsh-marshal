@@ -104,11 +104,12 @@ export async function listTurnsPage(
   }
 }
 
-/** 同步行只含可公开状态；preview/name/cwd 一律不出适配器。 */
+/** 原生名称或 preview 构造有界标题，交节点隐私层过滤；cwd 不进入索引。 */
 export function threadRow(thread: CodexThread): SyncSessionRow {
   const updatedAt = threadUpdatedAtMs(thread)
   return {
     sessionId: thread.id,
+    title: (thread.name?.trim() || thread.preview?.trim() || "新会话").replace(/\s+/g, " ").slice(0, 160),
     running: threadRunning(thread),
     updatedAt: updatedAt ?? 0,
     blank: threadBlank(thread),

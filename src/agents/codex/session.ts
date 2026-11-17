@@ -6,12 +6,13 @@ import type { EventFrame } from '../../wire/frames.ts'
  * - 通知来自同一条 app-server 连接，本文件不发起原生订阅；
  * - 观察者各自持有有界队列，溢出时终止该观察者（调用方应从历史重新同步），
  *   绝不无界缓存正文；
- * - 受管集合只在 create/fork 成功后登记，进程退出/重启即清空。
+ * - 受管集合在 create/fork 或显式原 ID 恢复后登记，进程退出/重启即清空。
  */
 export const CODEX_MAX_QUEUED_EVENTS = 2048
 
 export interface CodexSessionRegistry {
-  markManaged(sessionId: string): void
+  markManaged(sessionId: string, resumed?: boolean): void
+  isResumed(sessionId: string): boolean
   isManaged(sessionId: string): boolean
   managedIds(): readonly string[]
   publish(sessionId: string, event: EventFrame): void
@@ -46,7 +47,7 @@ export function createCodexSessionRegistry(
   options: CodexSessionRegistryOptions = {},
 ): CodexSessionRegistry {
   const maxQueued = Math.max(1, options.maxQueuedEvents ?? CODEX_MAX_QUEUED_EVENTS)
-  const managed = new Set<string>()
+  const managed = new Map<string, boolean>()
   const listeners = new Map<string, Set<Listener>>()
 
   const publish = (sessionId: string, event: EventFrame): void => {
@@ -97,9 +98,10 @@ export function createCodexSessionRegistry(
   }
 
   return {
-    markManaged(sessionId: string): void { managed.add(sessionId) },
+    markManaged(sessionId: string, resumed = false): void { managed.set(sessionId, resumed) },
+    isResumed(sessionId: string): boolean { return managed.get(sessionId) === true },
     isManaged(sessionId: string): boolean { return managed.has(sessionId) },
-    managedIds(): readonly string[] { return [...managed] },
+    managedIds(): readonly string[] { return [...managed.keys()] },
     publish,
     observe,
     subscriberCount(sessionId: string): number {

@@ -207,3 +207,13 @@ describe('DeviceStore', () => {
     expect(() => store.setPolicy('mac', {})).toThrow(/no policy change/)
   })
 })
+
+it('persists a rename without changing authorization or losing concurrent policy updates', () => {
+  const file = tempPath(); writeState(file, { version: 2, devices: [record()] })
+  const first = new DeviceStore(file), second = new DeviceStore(file)
+  second.setPolicy('mac', { allowContent: true })
+  first.rename('mac', '  工作电脑  ')
+  expect(new DeviceStore(file).findById('mac')).toMatchObject({ id: 'mac', name: '工作电脑', tokenDigest: sha256Hex(TOKEN), allowContent: true, policyRevision: 2 })
+  expect(() => first.rename('mac', '   ')).toThrow()
+  expect(() => first.rename('mac', 'x'.repeat(81))).toThrow()
+})

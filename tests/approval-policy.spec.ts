@@ -373,7 +373,7 @@ describe('snapshot and native expiry', () => {
     const h = harness()
     const pending = h.claim(questionClaim({
       nativeExpiry: {
-        kind: 'foreign-clock', atMs: 1_009_000, foreignNowMs: 1_000, uncertaintyMs: 500,
+        kind: 'foreign-clock', atMs: 9_000, foreignNowMs: 1_000, uncertaintyMs: 500,
       },
     }))
     pending.catch(() => {})

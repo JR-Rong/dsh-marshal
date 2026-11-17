@@ -1,7 +1,8 @@
+import { attachmentText, validateOptions, type PromptExtras, type SessionControls } from '../controls.ts'
 import { randomUUID } from 'node:crypto'
 import { isAbsolute } from 'node:path'
 import {
-  PreCallRejection,
+  PreCallRejection, hasWriteControl,
   type Capability, type Operation, type SnapshotCompleteness,
   type SyncSnapshot, type Tunable,
 } from '../../adapters/types.ts'
@@ -18,7 +19,7 @@ import { createOwnershipCoordinator, OwnershipError, type OwnershipCoordinator }
 import { createSupervisor, type SpawnFn, type Supervisor, type SupervisorExitReason } from '../supervisor.ts'
 import { classifyCodexServerRequest, codexResponseFor } from './approvals.ts'
 import { resolveCodexBinary, type CodexBinaryResolution } from './binary.ts'
-import { listAllThreads, listTurnsPage, threadRow, type CodexRequest } from './discover.ts'
+import { listAllThreads, threadRow, type CodexRequest } from './discover.ts'
 import {
   notificationThreadId, toCodexEvents, turnToEvents, type CodexEventMeta,
 } from './map.ts'
@@ -31,6 +32,8 @@ import {
   parseThreadStatus, parseTurn, parseTurnStartResponse, parseVersionFromUserAgent,
   supportsVersion, threadRunning,
 } from './protocol.ts'
+import { listHistoryPage } from './history.ts'
+import { createCodexStatistics } from './statistics.ts'
 import { createCodexSessionRegistry } from './session.ts'
 import { CODEX_SETTINGS_CATALOG, createCodexSettingsPort } from './settings.ts'
 import { buildTunables } from '../../tunables/catalog.ts'
@@ -39,8 +42,8 @@ import { buildTunables } from '../../tunables/catalog.ts'
  * Codex 基础适配器（app-server over stdio）。
  *
  * 安全边界：
- * - 外部会话只读；`acquire` 对未受管会话返回 ownership-unverified，绝不 resume 冒领。
- * - 只有本实例 create/fork 出来的会话才进入 managed 集合；取得写权后再 turn/start。
+ * - 观察不恢复会话；显式 acquire 才调用 thread/resume，保持原 ID。
+ * - 恢复后使用 attached（原生句柄，非跨进程排他）；有效句柄才能 turn/start。
  * - steer 未经验证，保持关闭；interrupt 必须带 runtimeEpoch + 已绑定 turnId。
  * - 所有副作用调用只发一次；超时/断连不做任何自动重发。
  */
@@ -178,6 +181,16 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
     nodeEpoch: options.nodeEpoch, seq: nextSeq(sessionId), ts: now(), kind, payload,
   })
 
+  const statistics = createCodexStatistics({
+    ...(options.env?.CODEX_HOME ? { codexHome: options.env.CODEX_HOME } : {}),
+    onChanged: (id, counts) => sessions.publish(id, frame(id, 'session.updated', { counts })),
+  })
+  let selectedStatistics: string | undefined
+  const refreshStatistics = async (sessionId: string, signal: AbortSignal): Promise<void> => {
+    const response = await request('thread/read', { threadId: sessionId, includeTurns: false }, signal, parseThreadRefResponse)
+    if (response.thread.id === sessionId) await statistics.refresh(sessionId, response.thread.path)
+  }
+
   const closePeer = (): void => {
     abortPendingApprovals()
     const entry = peerEntry
@@ -208,6 +221,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
       // 进程退出/重启即丢失受管身份与写权证据；重启不会恢复控制。
       sessions.clear()
       coordinator.clear()
+      statistics.resetActive()
       // peer 断开后旧回读不再可信；端口本身保持可用，等新连接重建。
       settings.reset()
       lastVersion = undefined
@@ -236,7 +250,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
   const settings = createCodexSettingsPort({
     request,
     runtimeEpoch,
-    writable: id => sessions.isManaged(id) && coordinator.ownership(id) === 'ours',
+    writable: id => sessions.isManaged(id) && hasWriteControl(coordinator.ownership(id)),
     idle: id => coordinator.state(id) === 'ours-idle',
     beginConfigure: id => coordinator.beginConfigure(id),
     endConfigure: id => coordinator.endConfigure(id),
@@ -251,7 +265,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
   const relayable = (sessionId: string): boolean => !stopping
     && options.inputRelay !== undefined
     && sessions.isManaged(sessionId)
-    && coordinator.ownership(sessionId) === 'ours'
+    && hasWriteControl(coordinator.ownership(sessionId))
 
   const handleServerRequest = async (request: {
     readonly method: string
@@ -303,6 +317,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
     const sessionId = notificationThreadId(method, params)
     if (sessionId === undefined) return
     const record = asRecord(params)
+    statistics.observe(sessionId, method, params)
 
     if (method === 'thread/started') {
       const thread = parseThread(record?.thread)
@@ -357,6 +372,9 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
       },
       knownNotifications: CODEX_KNOWN_NOTIFICATIONS,
       requestTimeoutMs,
+      onFatal: () => {
+        if (supervisor.isCurrent(generation)) supervisor.fail(new CodexPeerError('protocol'))
+      },
       onNotification: handleNotification,
       onServerRequest: handleServerRequest,
     })
@@ -419,11 +437,15 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
   async function ensurePeer(signal: AbortSignal): Promise<CodexPeer> {
     if (stopping) throw new AgentUnavailableError({ reason: 'stopped' })
     if (signal.aborted) throw signal.reason
+    // openPeer 在握手完成前就登记 transport；并发调用必须共享整段初始化屏障。
+    if (startup !== undefined) return await withSignal(startup, signal)
     const existing = peerEntry
     if (existing !== undefined && !existing.peer.closed && supervisor.isCurrent(existing.generation)) {
       return existing.peer
     }
-    if (startup !== undefined) return await withSignal(startup, signal)
+    if (existing?.peer.closed && supervisor.isCurrent(existing.generation)) {
+      supervisor.fail(new CodexPeerError('closed'))
+    }
     if (!binary.ok) {
       throw new AgentUnavailableError({ reason: binary.reason ?? 'not-installed' })
     }
@@ -453,11 +475,10 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
   }
 
   const buildAgentCapability = (): Capability => {
-    const operations = new Set<Operation>(['create', 'fork'])
+    const operations = new Set<Operation>(['create', 'fork', 'acquire'])
     const unavailable: Record<string, string> = {
       prompt: 'ownership-unverified',
       interrupt: 'ownership-unverified',
-      acquire: 'ownership-unverified',
       configure: 'settings-readback-unavailable',
     }
     if (relayEnabled()) {
@@ -483,10 +504,10 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
 
   const buildSessionCapability = (sessionId: string): Capability => {
     const ownership = coordinator.ownership(sessionId)
-    const owns = ownership === 'ours'
+    const owns = hasWriteControl(ownership)
     const managed = sessions.isManaged(sessionId)
     const snapshot = settings.snapshot(sessionId)
-    const operations = new Set<Operation>(['create', 'fork'])
+    const operations = new Set<Operation>(['create', 'fork', 'acquire'])
     const unavailable: Record<string, string> = {}
     // 外部/未管理的会话永远没有可答卡，能力里也不能暴露 answer/cancel。
     if (relayEnabled() && owns && managed) {
@@ -509,12 +530,6 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
     } else {
       unavailable.prompt = 'ownership-unverified'
       unavailable.interrupt = 'ownership-unverified'
-      unavailable.acquire = 'ownership-unverified'
-    }
-    // Codex 的 acquire 只对受管会话有效；未受管会话保持 ownership-unverified。
-    if (managed) {
-      operations.add('acquire')
-      delete unavailable.acquire
     }
     // 只有受管、写权属于本实例且回读未闩锁时才宣传 configure。
     if (managed && owns && snapshot?.unsafe !== true) {
@@ -576,7 +591,9 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
       coordinator.noteObserved(thread.id, threadRunning(thread))
     }
     completeness = discovery.complete ? 'complete' : 'unconfirmed'
-    return { rows: discovery.threads.map(threadRow), completeness }
+    if (selectedStatistics) await refreshStatistics(selectedStatistics, signal).catch(() => {})
+    return { rows: discovery.threads.map(thread => ({ ...threadRow(thread),
+      ...(statistics.get(thread.id) ? { counts: statistics.get(thread.id)! } : {}) })), completeness }
   }
 
   const syncSnapshot = async (signal: AbortSignal): Promise<SyncSnapshot> => {
@@ -588,11 +605,38 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
     }
   }
 
+  const controls = async (sessionId: string, signal: AbortSignal): Promise<SessionControls> => {
+    const models: SessionControls['models'] = []
+    let cursor: string | undefined
+    for (let page = 0; page < 10; page++) {
+      const response = await request('model/list', { limit: 100, ...(cursor ? { cursor } : {}) }, signal,
+        value => value && typeof value === 'object' && Array.isArray((value as any).data) ? value as { data: any[]; nextCursor?: string | null } : undefined)
+      for (const model of response.data) {
+        if (model.hidden || typeof model.model !== 'string') continue
+        models.push({ id: model.model, label: model.displayName || model.model,
+          efforts: (model.supportedReasoningEfforts ?? []).map((effort: any) => effort.reasoningEffort).filter((effort: unknown) => typeof effort === 'string') })
+      }
+      if (!response.nextCursor || response.nextCursor === cursor) break
+      cursor = response.nextCursor
+    }
+    const response = await request('thread/read', { threadId: sessionId, includeTurns: false }, signal, parseThreadRefResponse)
+    if (response.thread.id !== sessionId) throw new PreCallRejection('session-unknown')
+    selectedStatistics = sessionId
+    await statistics.refresh(sessionId, response.thread.path)
+    const model = models.find(model => model.id === response.thread.model)
+    return { models: models.slice(0, 100), ...(model ? { current: { model: model.id,
+      ...(response.thread.reasoningEffort && model.efforts.includes(response.thread.reasoningEffort)
+        ? { reasoning: response.thread.reasoningEffort } : {}) } } : {}) }
+  }
+
   const promptSession = async (
     sessionId: string,
     text: string,
     signal: AbortSignal,
+    extras: PromptExtras = {},
   ): Promise<ControlResult> => {
+    await refreshStatistics(sessionId, signal).catch(() => {})
+    if (extras.options) validateOptions(await controls(sessionId, signal), extras.options)
     // beginPrompt 在第一个 await 之前置 busy：并发第二次写入立即被拒。
     coordinator.beginPrompt(sessionId)
     let peer: CodexPeer
@@ -605,7 +649,9 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
     try {
       const response = await peer.request('turn/start', {
         threadId: sessionId,
-        input: [{ type: 'text', text }],
+        input: [{ type: 'text', text: attachmentText(text, extras.files) }, ...(extras.files ?? []).filter(file => file.mime.startsWith('image/')).map(file => ({ type: 'localImage', path: file.path }))],
+        ...(extras.options?.model ? { model: extras.options.model } : {}),
+        ...(extras.options?.reasoning ? { effort: extras.options.reasoning } : {}),
       }, signal, parseTurnStartResponse)
       const turnId = response.turn.id
       if (turnId === '') {
@@ -655,24 +701,40 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
 
   const ownershipPort: OwnershipPort = {
     async acquire(sessionId, signal) {
-      if (!sessions.isManaged(sessionId)) {
-        // 外部会话没有排他证据：resume 成功也不等于取得写权。
-        throw new OwnershipError('ownership-unverified')
-      }
       return await coordinator.acquire(sessionId, async context => {
-        const peer = await ensurePeer(context.signal)
-        const response = await peer.request('thread/resume', {
-          threadId: sessionId,
-          excludeTurns: true,
-        }, context.signal, parseThreadRefResponse)
-        if (response.thread.id !== sessionId) return undefined
-        return {
-          sessionId,
-          mechanism: 'managed-thread',
-          holder: coordinator.holder,
-          runtimeEpoch,
-          acquiredAt: now(),
-          invalidatesOn: ['process-exit', 'peer-close', 'plugin-reload', 'journal-recovery'],
+        const peer = await ensurePeerForControl(context.signal)
+        const resumed = !sessions.isManaged(sessionId) || sessions.isResumed(sessionId)
+        try {
+          const before = await peer.request('thread/read', {
+            threadId: sessionId, includeTurns: false,
+          }, context.signal, parseThreadRefResponse)
+          if (before.thread.id !== sessionId) return undefined
+          if (before.thread.status?.type === 'active') throw new OwnershipError('writer-busy')
+          let thread = before.thread
+          if (!sessions.isManaged(sessionId)) {
+            // 显式恢复原 ID，不覆盖模型、工作目录、权限或创建分支。
+            thread = (await peer.request('thread/resume', {
+              threadId: sessionId, excludeTurns: true,
+            }, context.signal, parseThreadRefResponse)).thread
+          }
+          if (thread.id !== sessionId) return undefined
+          if (thread.status?.type === 'active') throw new OwnershipError('writer-busy')
+          if (thread.status?.type !== 'idle') return undefined
+          context.signal.throwIfAborted()
+          if (stopping || peerEntry?.peer !== peer) throw new OwnershipError('stale-runtime')
+          sessions.markManaged(sessionId, resumed)
+          return {
+            sessionId,
+            ...(resumed ? { scope: 'native-runtime' as const } : {}),
+            mechanism: resumed ? 'native-thread-resume' : 'managed-thread',
+            holder: coordinator.holder,
+            runtimeEpoch,
+            acquiredAt: now(),
+            invalidatesOn: ['process-exit', 'peer-close', 'plugin-reload', 'journal-recovery'],
+          }
+        } catch (error) {
+          if (error instanceof CodexPeerError && error.code === 'rpc') throw rpcRejection(error)
+          throw error
         }
       }, { signal })
     },
@@ -795,11 +857,13 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
     list,
 
     async history(historyRequest: HistoryRequest, signal: AbortSignal): Promise<HistoryPage> {
-      const page = await listTurnsPage(request, {
+      selectedStatistics = historyRequest.sessionId
+      const page = await listHistoryPage(request, {
         threadId: historyRequest.sessionId,
         ...(historyRequest.cursor === undefined ? {} : { cursor: historyRequest.cursor }),
         ...(historyRequest.limit === undefined ? {} : { limit: historyRequest.limit }),
       }, signal)
+      if (!historyRequest.cursor) await refreshStatistics(historyRequest.sessionId, signal).catch(() => {})
       const meta: CodexEventMeta = {
         deviceId: options.deviceId,
         agent: 'codex',
@@ -807,15 +871,15 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
         sessionId: historyRequest.sessionId,
       }
       const items: EventFrame[] = []
-      for (const turn of page.turns) {
-        items.push(...turnToEvents(turn, meta, () => nextSeq(historyRequest.sessionId), {
+      if (page.turn) {
+        items.push(...turnToEvents(page.turn, meta, () => nextSeq(historyRequest.sessionId), {
           runtimeEpoch,
           ownership: coordinator.ownership(historyRequest.sessionId),
-        }))
+        }, page))
       }
       return {
         items,
-        completeness: page.complete ? 'complete' : 'unconfirmed',
+        completeness: page.nextCursor ? 'unconfirmed' : 'complete',
         ...(page.nextCursor === undefined ? {} : { nextCursor: page.nextCursor }),
       }
     },
@@ -847,6 +911,8 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
           running: row.running,
           updatedAt: row.updatedAt,
           blank: row.blank,
+          title: row.title,
+          ...(row.counts ? { counts: row.counts } : {}),
           ownership: coordinator.ownership(row.sessionId),
         }))
         // 会话级能力必须带该会话自己的所有权，不能复用 agent 级文档。
@@ -859,9 +925,11 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
       return events
     },
 
+    controls,
+
     async prompt(promptRequest: PromptRequest, signal: AbortSignal): Promise<ControlResult> {
       if (promptRequest.runtimeEpoch !== runtimeEpoch) throw new PreCallRejection('stale-connection')
-      return await promptSession(promptRequest.sessionId, promptRequest.text, signal)
+      return await promptSession(promptRequest.sessionId, promptRequest.text, signal, promptRequest)
     },
 
     async steer(_steerRequest: SteerRequest, _signal: AbortSignal): Promise<ControlResult> {
@@ -889,6 +957,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
         const sessionId = response.thread.id
         if (sessionId === '') throw new Error('marshal: codex thread id missing')
         sessions.markManaged(sessionId)
+        statistics.empty(sessionId)
         return { sessionId, runtimeEpoch }
       } catch (error) {
         if (error instanceof CodexPeerError && error.code === 'rpc') throw rpcRejection(error)
@@ -938,7 +1007,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): AgentAdapter {
         case 'prompt': {
           const text = typeof args.text === 'string' ? args.text : ''
           if (text.trim() === '') throw new PreCallRejection('invalid-args', 'text is required')
-          return await promptSession(sessionId, text, new AbortController().signal)
+          return await promptSession(sessionId, text, new AbortController().signal, args as PromptExtras)
         }
         case 'interrupt': {
           const requestedEpoch = typeof args.runtimeEpoch === 'string' ? args.runtimeEpoch : ''

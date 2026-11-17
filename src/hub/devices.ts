@@ -320,6 +320,27 @@ export class DeviceStore {
     })
   }
 
+  /** The native installation persists its random credential BEFORE enrollment.
+   * Retrying the same verified account/installation cannot rotate it or widen policy. */
+  enroll(id: string, name: string, tokenDigest: string, content: boolean): DeviceRecord {
+    if (!/^account-[a-f0-9]{32}$/.test(id) || !/^[a-f0-9]{64}$/.test(tokenDigest)
+      || !name.trim() || name.length > 80 || /[\x00-\x1f\x7f]/.test(name)) throw new DeviceStateError('invalid', 'invalid enrollment')
+    return this.mutate(state => {
+      const current = state.devices.find(device => device.id === id)
+      if (current?.revoked) throw new DeviceStateError('revoked', 'device enrollment revoked')
+      if (current) {
+        if (current.tokenDigest !== tokenDigest) throw new DeviceStateError('duplicate-id', 'installation credential mismatch')
+        return { state, result: current }
+      }
+      if (state.devices.length >= 256 || state.devices.some(device => device.tokenDigest === tokenDigest)) {
+        throw new DeviceStateError('invalid', 'enrollment limit or credential conflict')
+      }
+      const entry: DeviceRecord = { id, name: name.trim(), tokenDigest, revoked: false,
+        allowContent: content, allowDiscussion: content, allowInteractions: false, policyRevision: 1 }
+      return { state: { ...state, devices: [...state.devices, entry] }, result: entry }
+    })
+  }
+
   revoke(id: string): DeviceMutation {
     return this.mutate(state => {
       const index = state.devices.findIndex(device => device.id === id)
@@ -362,6 +383,19 @@ export class DeviceStore {
     })
   }
 
+  rename(id: string, rawName: string): DeviceRecord {
+    const name = rawName.trim()
+    if (!name || name.length > 80 || /[\x00-\x1f\x7f]/.test(name)) {
+      throw new DeviceStateError('invalid', 'name must contain 1–80 printable characters')
+    }
+    return this.mutate(state => {
+      const current = state.devices.find(item => item.id === id)
+      if (!current) throw new DeviceStateError('unknown-device', 'device not found')
+      const entry = { ...current, name }
+      return { state: { ...state, devices: state.devices.map(item => item.id === id ? entry : item) }, result: entry }
+    })
+  }
+
   private load(): DevicesState {
     const loaded = readDeviceState(this.path)
     if (loaded.kind === 'missing') throw new DeviceStateError('missing', `device table ${this.path} is missing`)
@@ -399,6 +433,7 @@ export class DeviceStore {
       const current = this.load()
       this.assertWritable()
       const next = fn(current)
+      if (next.state === current) { this.state = current; return next.result }
       // 写入前再确认目标行没有被锁外修改成修订异常。
       this.assertWritable()
       const committed = this.withWatermarks(next.state)

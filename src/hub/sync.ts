@@ -41,6 +41,7 @@ interface DeviceState {
   agents: ReadonlySet<string>
   attached: boolean
   online: boolean
+  syncing: boolean
   stale: boolean
 }
 
@@ -116,6 +117,7 @@ function parseCommit(rows: readonly unknown[], agents: ReadonlySet<string>, now:
     const counts = indexCounts(row.counts)
     out.push({
       agent, sessionId, running, updatedAt,
+      ...(typeof row.title === "string" ? { title: row.title.slice(0, 160) } : {}),
       ...(blank === undefined ? {} : { blank }),
       ...(ownership === undefined ? {} : { ownership }),
       ...(counts === undefined ? {} : { counts }),
@@ -169,7 +171,7 @@ export function createHubSync(options: {
 
   const markStale = (deviceId: string): void => {
     const state = states.get(deviceId)
-    if (state !== undefined) state.stale = true
+    if (state !== undefined) { state.stale = true; state.syncing = false }
   }
 
   const sendAck = (
@@ -233,6 +235,7 @@ export function createHubSync(options: {
     // 新的屏障开始即关闭写门：提交失败时旧索引只能 stale 只读，不能继续接命令。
     state.online = false
     state.stale = true
+    state.syncing = true
     const timer = setTimeout(() => { expire(identity.deviceId, frame.syncId) }, stagingTimeoutMs)
     timer.unref()
     staging.set(identity.deviceId, {
@@ -310,6 +313,7 @@ export function createHubSync(options: {
     versions.set(versionKey(identity), version)
     state.online = true
     state.stale = false
+    state.syncing = false
     sendAck(host, identity, frame.syncId, true, undefined, version)
   }
 
@@ -330,6 +334,7 @@ export function createHubSync(options: {
         identity: { ...identity },
         agents: new Set(agents),
         attached: true,
+        syncing: true,
         online: false,
         // 普通重连也必须重新完成同步；旧数据在提交前一直标记 stale。
         stale: true,
@@ -341,6 +346,7 @@ export function createHubSync(options: {
       if (!identityMatches(state, identity) || state === undefined) return
       abortStaging(identity.deviceId)
       state.attached = false
+      state.syncing = false
       state.online = false
       state.stale = true
     },
@@ -385,7 +391,7 @@ export function createHubSync(options: {
       const state = states.get(deviceId)
       if (state === undefined) return { syncing: false, stale: false }
       return {
-        syncing: staging.has(deviceId) || (state.attached && !state.online),
+        syncing: state.syncing,
         stale: state.stale,
       }
     },

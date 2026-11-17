@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
 import type {
-  GetSessionMessagesOptions, ListSessionsOptions, Query, SDKControlInterruptResponse, SDKMessage,
+  AccountInfo, GetSessionMessagesOptions, ListSessionsOptions, Query, SDKControlInitializeResponse, SDKControlInterruptResponse, SDKMessage,
   SDKSessionInfo, SDKSystemMessage, SDKUserMessage, SessionMessage,
 } from '@anthropic-ai/claude-agent-sdk'
 import type { EventFrame } from '../src/wire/frames.ts'
@@ -75,6 +75,7 @@ class FakeQuery {
   closeCalls = 0
   interruptCalls = 0
   interruptResult: SDKControlInterruptResponse | undefined
+  account: AccountInfo = { apiProvider: 'firstParty', tokenSource: 'oauth' }
   private failure: unknown
   private finished = false
   private waiter: (() => void) | undefined
@@ -104,6 +105,11 @@ class FakeQuery {
   async interrupt(): Promise<SDKControlInterruptResponse | undefined> {
     this.interruptCalls += 1
     return this.interruptResult
+  }
+
+  async initializationResult(): Promise<SDKControlInitializeResponse> {
+    await Promise.resolve()
+    return { commands: [], agents: [], output_style: 'default', available_output_styles: [], models: [], account: this.account }
   }
 
   async next(): Promise<IteratorResult<SDKMessage, void>> {
@@ -141,17 +147,20 @@ class FakeClaudeSdk implements ClaudeSdk {
   readonly queries: FakeQuery[] = []
   sessions: SDKSessionInfo[] = []
   readonly history = new Map<string, SessionMessage[]>()
+  resumeIdOverride: string | undefined
   createdSessionId = 'session-created'
   forkedSessionId = 'session-forked'
   autoInit = true
+  account: AccountInfo = { apiProvider: 'firstParty', tokenSource: 'oauth' }
   listCalls = 0
   historyCalls = 0
 
   query(params: ClaudeSdkQueryParams): Query {
     const sessionId = params.options?.forkSession === true
       ? this.forkedSessionId
-      : this.createdSessionId
+      : params.options?.resume ? this.resumeIdOverride ?? params.options.resume : this.createdSessionId
     const query = new FakeQuery(params)
+    query.account = this.account
     this.queries.push(query)
     if (this.autoInit) queueMicrotask(() => { query.push(initMessage(sessionId)) })
     return query as unknown as Query
@@ -242,12 +251,24 @@ async function collect(iterable: AsyncIterable<EventFrame>): Promise<EventFrame[
 }
 
 describe('claude adapter', () => {
+  it('rejects missing credentials before sending any user input or adopting a session', async () => {
+    const h = harness()
+    h.sdk.autoInit = false
+    h.sdk.account = { apiProvider: 'firstParty', tokenSource: 'none' }
+    await expect(h.adapter.createSession!({ requestId: 'auth-check' }, signal()))
+      .rejects.toMatchObject({ name: 'PreCallRejection', code: 'auth-required' })
+    expect(h.query().closeCalls).toBe(1)
+    expect(h.adapter.ownershipPort!.ownership(h.sdk.createdSessionId)).toBe('foreign-unknown')
+    expect(h.adapter.capabilities(h.sdk.createdSessionId).observe.follow).toBe('none')
+    await h.adapter.stop()
+  })
+
   it('probes with read-only listSessions and never creates a query', async () => {
     const h = harness()
     const result = await h.adapter.probe(signal())
     expect(result.ok).toBe(true)
     expect(result.capability?.ownership).toBe('foreign-unknown')
-    expect([...(result.capability?.operations ?? [])]).toEqual(['create', 'fork'])
+    expect([...(result.capability?.operations ?? [])]).toEqual(['create', 'fork', 'acquire'])
     expect(result.capability?.observe).toEqual({ history: true, follow: 'stream' })
     expect(h.sdk.queries).toHaveLength(0)
     expect(h.sdk.listCalls).toBe(1)
@@ -255,7 +276,7 @@ describe('claude adapter', () => {
     await h.adapter.stop()
   })
 
-  it('lists rows without summary, title, first prompt or cwd', async () => {
+  it('lists preferred titles without raw summary, first prompt or cwd', async () => {
     const h = harness()
     h.sdk.sessions = [
       { ...sessionInfo('s1', 'secret title', 1_700_000_000_123), firstPrompt: 'secret prompt', customTitle: 'secret custom', cwd: '/secret/path' },
@@ -264,11 +285,11 @@ describe('claude adapter', () => {
     const listed = await h.adapter.list(signal())
     expect(listed.completeness).toBe('complete')
     expect(listed.rows).toEqual([
-      { sessionId: 's1', running: false, updatedAt: 1_700_000_000_123, blank: false },
-      { sessionId: 's2', running: false, updatedAt: 1_700_000_000_000, blank: true },
+      { sessionId: 's1', running: false, updatedAt: 1_700_000_000_123, blank: false, title: 'secret custom' },
+      { sessionId: 's2', running: false, updatedAt: 1_700_000_000_000, blank: true, title: '新会话' },
     ])
     const serialized = JSON.stringify(listed.rows)
-    expect(serialized).not.toContain('secret')
+    expect(serialized).not.toContain('secret prompt')
     expect(serialized).not.toContain('/secret/path')
     expect(h.sdk.queries).toHaveLength(0)
     await h.adapter.stop()
@@ -291,23 +312,47 @@ describe('claude adapter', () => {
     await h.adapter.stop()
   })
 
-  it('never acquires an external session and keeps it read-only', async () => {
+  it('resumes an existing session in its cwd without creating a new identity or sending a prompt', async () => {
     const h = harness()
-    await h.adapter.start(signal())
-    const port = h.adapter.ownershipPort
-    if (port === undefined) throw new Error('ownership port missing')
+    h.sdk.sessions = [{ ...sessionInfo('external-1'), cwd: '/original/project' }]
+    const port = h.adapter.ownershipPort!
+    expect(h.adapter.capabilities('external-1').operations.has('prompt')).toBe(false)
+    const acquired = await port.acquire('external-1', signal())
+    expect(acquired).toMatchObject({ wire: 'attached', evidence: { scope: 'native-runtime', mechanism: 'native-query-resume' } })
+    expect(h.sdk.queries).toHaveLength(1)
+    expect(h.query().params.options).toMatchObject({ resume: 'external-1', cwd: '/original/project' })
+    expect(h.query().params.options?.forkSession).toBeUndefined()
+    expect(h.adapter.capabilities('external-1').operations.has('prompt')).toBe(true)
+    await port.release('external-1')
+    expect((await port.acquire('external-1', signal())).wire).toBe('attached')
+    expect(h.sdk.queries).toHaveLength(1)
+    await h.adapter.stop()
+  })
 
-    const error = await port.acquire('external-1', signal()).catch(reason => reason)
-    expect(error).toBeInstanceOf(OwnershipError)
-    expect(error).toMatchObject({ code: 'ownership-unverified' })
-    expect(port.ownership('external-1')).toBe('foreign-unknown')
+  it('rejects a missing session before starting a Query', async () => {
+    const h = harness()
+    await expect(h.adapter.ownershipPort!.acquire('missing', signal())).rejects.toMatchObject({ code: 'session-unknown' })
     expect(h.sdk.queries).toHaveLength(0)
+    await h.adapter.stop()
+  })
 
-    const capability = h.adapter.capabilities('external-1')
-    expect(capability.ownership).toBe('foreign-unknown')
-    expect(capability.operations.has('prompt')).toBe(false)
-    expect(capability.observe).toEqual({ history: true, follow: 'none' })
-    expect(capability.unavailable?.prompt).toBe('ownership-unverified')
+  it('closes an unexpected resumed identity without granting control', async () => {
+    const h = harness()
+    h.sdk.sessions = [sessionInfo('external-1')]
+    h.sdk.resumeIdOverride = 'wrong-id'
+    await expect(h.adapter.ownershipPort!.acquire('external-1', signal())).rejects.toMatchObject({ code: 'ownership-unverified' })
+    expect(h.adapter.capabilities('external-1').operations.has('prompt')).toBe(false)
+    expect(h.adapter.capabilities('wrong-id').operations.has('prompt')).toBe(false)
+    await h.adapter.stop()
+  })
+
+  it('reports missing authentication on explicit resume and keeps the session unowned', async () => {
+    const h = harness()
+    h.sdk.sessions = [sessionInfo('external-1')]
+    h.sdk.account = { apiProvider: 'firstParty', tokenSource: 'none' }
+    await expect(h.adapter.ownershipPort!.acquire('external-1', signal())).rejects.toMatchObject({ code: 'auth-required' })
+    expect(h.adapter.ownershipPort!.ownership('external-1')).toBe('foreign-unknown')
+    expect(h.adapter.capabilities('external-1').operations.has('prompt')).toBe(false)
     await h.adapter.stop()
   })
 
@@ -383,12 +428,12 @@ describe('claude adapter', () => {
     h.sdk.sessions = [sessionInfo('session-created')]
     const listed = await h.adapter.list(signal())
     expect(listed.rows).toEqual([
-      { sessionId: 'session-created', running: true, updatedAt: 1_700_000_000_000, blank: true },
+      { sessionId: 'session-created', running: true, updatedAt: 1_700_000_000_000, blank: true, title: '新会话' },
     ])
     await h.adapter.stop()
   })
 
-  it('advertises acquire only for managed sessions and carries epoch metadata', async () => {
+  it('advertises explicit acquire for existing sessions and carries epoch metadata', async () => {
     const h = harness()
     const create = h.adapter.createSession
     if (create === undefined) throw new Error('createSession missing')
@@ -401,8 +446,8 @@ describe('claude adapter', () => {
     expect(managed.runtimeEpoch).toBe('epoch-1')
 
     const foreign = h.adapter.capabilities('external-1')
-    expect(foreign.operations.has('acquire')).toBe(false)
-    expect(foreign.unavailable?.acquire).toBe('ownership-unverified')
+    expect(foreign.operations.has('acquire')).toBe(true)
+    expect(foreign.unavailable?.acquire).toBeUndefined()
     expect(foreign.settingsRevision).toBe(0)
     expect(foreign.runtimeEpoch).toBe('epoch-1')
     await h.adapter.stop()
@@ -429,9 +474,15 @@ describe('claude adapter', () => {
     controller.abort()
     await iterator.return?.()
 
-    // 外部会话没有可订阅通道：既不宣传能力，也不产生任何初始帧。
-    const foreign = await collect(h.adapter.follow('external-1', signal()))
-    expect(foreign).toEqual([])
+    // 未恢复会话的只读订阅不创建 Query，并保持等待，以便显式接管后收到新能力。
+    const foreignAbort = new AbortController()
+    const foreign = h.adapter.follow('external-1', foreignAbort.signal)[Symbol.asyncIterator]()
+    const initial = await foreign.next()
+    expect(initial.value?.payload).toMatchObject({ ownership: 'foreign-unknown', operations: expect.arrayContaining(['acquire']) })
+    const pending = foreign.next()
+    expect(h.sdk.queries).toHaveLength(1)
+    foreignAbort.abort()
+    expect((await pending).done).toBe(true)
     await h.adapter.stop()
   })
 
@@ -490,9 +541,10 @@ describe('claude adapter', () => {
     const page = await h.adapter.history({ sessionId: 'session-1', limit: 10 }, signal())
     expect(page.completeness).toBe('complete')
     expect(page.items.map(item => item.kind)).toEqual([
-      'turn.started', 'message.completed', 'turn.completed',
+      'turn.started', 'user.message', 'message.completed', 'turn.completed',
     ])
-    expect(page.items[1]?.payload).toMatchObject({ text: 'answer' })
+    expect(page.items[1]?.payload).toMatchObject({ text: 'question' })
+    expect(page.items[2]?.payload).toMatchObject({ text: 'answer' })
     expect(h.sdk.queries).toHaveLength(0)
 
     await expect(h.adapter.history({ sessionId: 'session-1', cursor: 'not-a-cursor' }, signal()))
@@ -510,6 +562,7 @@ describe('claude adapter', () => {
     await port.acquire(created.sessionId, controller.signal)
 
     const iterator = h.adapter.follow(created.sessionId, controller.signal)[Symbol.asyncIterator]()
+    expect((await iterator.next()).value?.kind).toBe('capability.changed')
     const pending = iterator.next()
     // 让生成器先注册监听。
     await new Promise(resolve => setTimeout(resolve, 0))
@@ -550,16 +603,16 @@ describe('claude adapter', () => {
     }]
     const snapshot = await h.adapter.syncSnapshot(signal())
     expect(snapshot.rows).toEqual([
-      { sessionId: 's1', running: false, updatedAt: 1_700_000_000_000, blank: false },
+      { sessionId: 's1', running: false, updatedAt: 1_700_000_000_000, blank: false, title: 'secret title' },
     ])
     expect(snapshot.capabilities).toHaveLength(1)
     const payload = snapshot.capabilities[0]?.capability
     expect(payload?.ownership).toBe('foreign-unknown')
-    expect(JSON.stringify(snapshot)).not.toContain('secret')
+    expect(JSON.stringify(snapshot)).not.toContain('/secret/path')
 
     const frames = await h.adapter.snapshot(signal())
     expect(frames.map(item => item.kind)).toEqual(['session.updated', 'capability.changed'])
-    expect(JSON.stringify(frames)).not.toContain('secret')
+    expect(JSON.stringify(frames)).not.toContain('secret prompt')
 
     await h.adapter.stop()
     expect(h.adapter.health().state).toBe('stopped')

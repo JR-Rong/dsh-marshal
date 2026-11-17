@@ -95,6 +95,7 @@ export interface CodexTurn {
   readonly items?: readonly CodexThreadItem[]
   readonly startedAt?: number
   readonly completedAt?: number
+  readonly durationMs?: number
 }
 
 export interface CodexThreadItem {
@@ -109,8 +110,12 @@ export interface CodexThread {
   readonly updatedAt?: number
   readonly createdAt?: number
   readonly preview?: string
+  readonly name?: string
   readonly turns?: readonly CodexTurn[]
   readonly forkedFromId?: string | null
+  readonly model?: string
+  readonly reasoningEffort?: string
+  readonly path?: string
 }
 
 export interface CodexThreadListResponse {
@@ -192,6 +197,10 @@ export function parseThread(value: unknown): CodexThread | undefined {
     ...(status === undefined ? {} : { status }),
     ...(updatedAt === undefined ? {} : { updatedAt }),
     ...(createdAt === undefined ? {} : { createdAt }),
+    ...(typeof record.model === 'string' ? { model: record.model } : {}),
+    ...(typeof record.reasoningEffort === 'string' ? { reasoningEffort: record.reasoningEffort } : {}),
+    ...(typeof record.path === 'string' ? { path: record.path } : {}),
+    ...(typeof record.name === 'string' ? { name: record.name } : {}),
     ...(typeof record.preview === 'string' ? { preview: record.preview } : {}),
     ...(turns === undefined ? {} : { turns }),
     ...(forkedFromId === undefined ? {} : { forkedFromId }),
@@ -215,16 +224,18 @@ export function parseTurn(value: unknown): CodexTurn | undefined {
   if (id === undefined || status === undefined) return undefined
   const items = record.items === undefined ? undefined : parseItems(record.items)
   if (record.items !== undefined && items === undefined) return undefined
-  const startedAt = record.startedAt === undefined ? undefined : finiteNumber(record.startedAt)
-  const completedAt = record.completedAt === undefined ? undefined : finiteNumber(record.completedAt)
-  if (record.startedAt !== undefined && startedAt === undefined) return undefined
-  if (record.completedAt !== undefined && completedAt === undefined) return undefined
+  // 原生 Turn 的两个时间戳均可为 null，尤其 turn/start 的首次响应。
+  const startedAt = record.startedAt == null ? undefined : finiteNumber(record.startedAt)
+  const completedAt = record.completedAt == null ? undefined : finiteNumber(record.completedAt)
+  if (record.startedAt != null && startedAt === undefined) return undefined
+  if (record.completedAt != null && completedAt === undefined) return undefined
   return {
     id,
     status,
     ...(items === undefined ? {} : { items }),
     ...(startedAt === undefined ? {} : { startedAt }),
     ...(completedAt === undefined ? {} : { completedAt }),
+    ...(typeof record.durationMs === 'number' && Number.isFinite(record.durationMs) && record.durationMs >= 0 ? { durationMs: record.durationMs } : {}),
   }
 }
 

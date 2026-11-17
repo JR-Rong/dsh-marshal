@@ -165,7 +165,7 @@ describe('dsh adapter', () => {
     const adapter = createDshAdapter(surface(), options)
     const capability = adapter.capabilities('s1')
     expect(capability.observe).toEqual({ history: false, follow: 'stream' })
-    expect(capability.ownership).toBe('unverified')
+    expect(capability.ownership).toBe('attached')
     expect(capability.unavailable).toMatchObject({
       'observe.history': 'history-unavailable',
       configure: 'read-only-in-v0',
@@ -189,7 +189,7 @@ describe('dsh adapter', () => {
     expect(JSON.stringify(events[0])).not.toContain('/w')
     expect(events[1]?.payload).toMatchObject({
       observe: { history: false, follow: 'stream' },
-      ownership: 'unverified',
+      ownership: 'attached',
       revision: 1,
     })
     expect(adapter.snapshotCompleteness).toBe('complete')
