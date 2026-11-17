@@ -447,7 +447,8 @@ window.__ModuleLoader__.load({
       return h('section', { 'aria-label': '调度官', style: { height: '100%', minHeight: 0, width: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden' } },
         h('header', { style: { padding: '12px 20px', minHeight: 54, display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderBottom: '1px solid #8883', flexShrink: 0 } },
           h('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } }, h(MarshalIcon), h('h1', { style: { fontSize: 16, fontWeight: 600, margin: 0 } }, '调度官'), h('span', { style: { fontSize: 12, opacity: .55 } }, state.account ? state.account.name + ' · ' + state.workspaceName : '原生会话')),
-          h('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+          h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' } },
+            h(MarshalNav, { active: tab, onTab: chooseTab, openPanel, compact: true }),
             health && (!health.capabilities?.agents || !health.capabilities?.taskBoard) && h('span', { style: { fontSize: 11, color: dswTheme.danger } },
               '缺少：' + [!health.capabilities?.agents ? '智能体后端' : '', !health.capabilities?.taskBoard ? '任务看板后端' : ''].filter(Boolean).join('、')),
             h('button', { type: 'button', style: buttonStyle, onClick: () => retry(value => value + 1) }, '重新连接'))),
@@ -656,6 +657,45 @@ window.__ModuleLoader__.load({
           fontSize: Math.max(11, Math.round(edge * 0.42)), fontWeight: 600, flexShrink: 0,
         },
       }, agentInitial(name));
+    }
+
+    function MarshalNav({ active, onTab, openPanel, compact = false }) {
+      const tabs = [['session', '会话'], ['groups', '群聊'], ['agents', '智能体'], ['cross', '跨设备']];
+      const button = (key, label) => h('button', {
+        key, type: 'button', 'aria-pressed': active === key,
+        style: {
+          border: 0, borderRadius: 999, cursor: 'pointer', whiteSpace: 'nowrap',
+          font: (compact ? '11px/1' : '12px/1') + ' inherit',
+          padding: compact ? '6px 9px' : '7px 11px',
+          background: active === key ? 'color-mix(in srgb, currentColor 16%, transparent)' : 'transparent',
+          color: 'inherit', fontWeight: active === key ? 600 : 400,
+          transition: 'background .15s ease',
+        },
+        onClick: () => onTab(key),
+      }, label);
+      return h('div', {
+        id: 'marshal-quick-nav',
+        'data-active': active,
+        role: 'navigation', 'aria-label': '调度官快速切换',
+        style: {
+          display: 'flex', alignItems: 'center', gap: 2, padding: 3,
+          borderRadius: 999, border: '1px solid color-mix(in srgb, currentColor 14%, transparent)',
+          background: 'color-mix(in srgb, currentColor 5%, transparent)',
+          flexShrink: 0, maxWidth: '100%', overflowX: 'auto',
+        },
+      },
+        ...tabs.map(([key, label]) => button(key, label)),
+        h('button', {
+          type: 'button', 'aria-pressed': active === 'tasks',
+          style: {
+            border: 0, borderRadius: 999, cursor: 'pointer', whiteSpace: 'nowrap',
+            font: (compact ? '11px/1' : '12px/1') + ' inherit',
+            padding: compact ? '6px 9px' : '7px 11px',
+            background: active === 'tasks' ? 'color-mix(in srgb, currentColor 16%, transparent)' : 'transparent',
+            color: 'inherit', fontWeight: active === 'tasks' ? 600 : 400,
+          },
+          onClick: () => { if (openPanel && openPanel('task-board')) return; onTab('tasks'); },
+        }, '任务看板'));
     }
 
     function Field({ label, children }) {
@@ -1490,7 +1530,7 @@ window.__ModuleLoader__.load({
           if (!document.getElementById('marshal-consolidated-rows')) {
             const style = document.createElement('style');
             style.id = 'marshal-consolidated-rows';
-            style.textContent = 'button:has([data-dsh-panel-entry="agents"]),[role="button"]:has([data-dsh-panel-entry="agents"]),li:has([data-dsh-panel-entry="agents"]),button:has([data-dsh-panel-entry="task-board"]),[role="button"]:has([data-dsh-panel-entry="task-board"]),li:has([data-dsh-panel-entry="task-board"]){display:none!important}[data-dsh-taskboard-view]{padding-top:44px!important;box-sizing:border-box!important;position:relative}[data-dsh-taskboard-view]::before{content:"";position:absolute;left:0;right:0;top:0;height:44px;background:var(--dsw-alias-bg-base);border-bottom:1px solid var(--dsw-alias-border-l1);pointer-events:none}';
+            style.textContent = 'button:has([data-dsh-panel-entry="agents"]),[role="button"]:has([data-dsh-panel-entry="agents"]),li:has([data-dsh-panel-entry="agents"]),button:has([data-dsh-panel-entry="task-board"]),[role="button"]:has([data-dsh-panel-entry="task-board"]),li:has([data-dsh-panel-entry="task-board"]){display:none!important}[data-dsh-taskboard-view]{padding-top:44px!important;box-sizing:border-box!important;position:relative}';
             document.head.appendChild(style);
           }
         } catch (error) { /* a DOM-less host keeps its own panel list */ }
@@ -1513,30 +1553,46 @@ window.__ModuleLoader__.load({
             try { window.dispatchEvent(new CustomEvent('marshal:tab', { detail: tab })); } catch (error) { /* host without window */ }
           }, 60);
         };
-        const quickTabs = [['session', '会话'], ['groups', '群聊'], ['agents', '智能体'], ['cross', '跨设备']];
-        const MarshalQuickNav = () => h('div', {
-          id: 'marshal-quick-nav',
-          role: 'navigation',
-          'aria-label': '调度官快速切换',
-          style: { display: 'flex', alignItems: 'center', gap: 2, padding: 3, borderRadius: 999, border: '1px solid color-mix(in srgb, currentColor 14%, transparent)', background: 'color-mix(in srgb, currentColor 5%, transparent)', flexShrink: 0, maxWidth: 'min(52vw, 520px)', overflowX: 'auto' },
-        },
-          quickTabs.map(([key, label]) => h('button', {
-            key, type: 'button',
-            style: { border: 0, background: 'transparent', color: 'inherit', font: '11px/1 inherit', padding: '6px 9px', borderRadius: 999, cursor: 'pointer', whiteSpace: 'nowrap' },
-            onClick: () => goTab(key),
-          }, label)),
-          h('button', {
-            type: 'button',
-            style: { border: 0, background: 'transparent', color: 'inherit', font: '11px/1 inherit', padding: '6px 9px', borderRadius: 999, cursor: 'pointer', whiteSpace: 'nowrap' },
-            onClick: () => { if (!openPanel('task-board')) goTab('tasks'); },
-          }, '任务看板'));
         try {
           ctx.slots.inject('conversation.session.header.actions', () => ctx.slots.register({
             name: 'conversation.session.header.actions',
             id: 'marshal-quick-nav',
             order: 40,
-          }, MarshalQuickNav));
+          }, () => h(MarshalNav, { active: 'session', onTab: goTab, openPanel, compact: true })));
         } catch (error) { /* older host without the conversation header action slot */ }
+        const ensureTaskboardHeader = () => {
+          const root = document.querySelector('[data-dsh-taskboard-view]');
+          if (root === null || root.querySelector('#marshal-taskboard-head') !== null) return;
+          const bar = document.createElement('div');
+          bar.id = 'marshal-taskboard-head';
+          bar.style.cssText = 'position:absolute;top:0;left:0;right:0;height:44px;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:0 16px;box-sizing:border-box;background:var(--dsw-alias-bg-base);border-bottom:1px solid var(--dsw-alias-border-l1);z-index:6;color:inherit;font-family:inherit';
+          const title = document.createElement('div');
+          title.textContent = '任务看板';
+          title.style.cssText = 'font-size:14px;font-weight:600;white-space:nowrap';
+          const nav = document.createElement('div');
+          nav.style.cssText = 'display:flex;align-items:center;gap:2px;padding:3px;border-radius:999px;border:1px solid color-mix(in srgb, currentColor 14%, transparent);background:color-mix(in srgb, currentColor 5%, transparent);overflow-x:auto;max-width:100%';
+          const add = (label, key) => {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.textContent = label;
+            button.setAttribute('aria-pressed', key === 'tasks' ? 'true' : 'false');
+            button.style.cssText = 'border:0;border-radius:999px;cursor:pointer;white-space:nowrap;font:11px/1 inherit;padding:6px 9px;color:inherit;background:' + (key === 'tasks' ? 'color-mix(in srgb, currentColor 16%, transparent)' : 'transparent') + ';font-weight:' + (key === 'tasks' ? '600' : '400');
+            button.onclick = () => {
+              if (key === 'tasks') return;
+              goTab(key);
+            };
+            nav.appendChild(button);
+          };
+          add('会话', 'session');
+          add('群聊', 'groups');
+          add('智能体', 'agents');
+          add('跨设备', 'cross');
+          add('任务看板', 'tasks');
+          bar.append(title, nav);
+          root.prepend(bar);
+        };
+        ensureTaskboardHeader();
+        setInterval(ensureTaskboardHeader, 1000);
         ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({ name: 'sidebar.panellist', id: PANEL, order: 25, label: () => '调度官' }, MarshalIcon));
         ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: PANEL,
           children: { 'marshal.native.body': { kind: 'single', scope: 'session' } },
