@@ -1547,9 +1547,9 @@ window.__ModuleLoader__.load({
                 return;
               }
               const rect = center.getBoundingClientRect();
-              const rightControl = document.querySelector('[aria-label="Open right sidebar"], [aria-label="Close right sidebar"], [aria-label*="right sidebar" i]');
-              const controlLeft = rightControl === null ? rect.right - 12 : rightControl.getBoundingClientRect().left - 8;
-              const limit = Math.min(rect.right - 12, controlLeft);
+              const rightControl = document.querySelector('[aria-label="Open right sidebar"], [aria-label="Close right sidebar"], [aria-label*="right sidebar" i], [aria-label*="右侧"], [aria-label*="右栏"], [aria-label*="侧边栏"]');
+              const controlLeft = rightControl === null ? rect.right - 56 : rightControl.getBoundingClientRect().left - 8;
+              const limit = Math.min(rect.right - 12, controlLeft, rect.right - 56);
               nav.style.right = 'auto';
               nav.style.left = Math.max(8, Math.round(limit - nav.offsetWidth)) + 'px';
             };
