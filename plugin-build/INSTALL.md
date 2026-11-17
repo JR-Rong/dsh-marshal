@@ -9,11 +9,29 @@
 - `plugin-build/dsh-marshal-0.2.0-agent-groups.2.tgz`（推荐，依赖会由 pnpm 安装）
 - 或 `plugin-build/` 目录（需要先在那里执行 `pnpm install --prod`）
 
-## 前置条件
+## 依赖（务必先看）
+
+marshal 本身是一个 DSH 插件，下面两个是**同 profile 的 DSH 插件依赖**，不是 marshal npm 包里的普通 dependency。请先安装它们，再启用 marshal：
+
+| 依赖包 | 是否必需 | 作用 |
+|---|---|---|
+| `@linxin666/dsh-agents` | **必需** | 提供 `/dsh-agents` 后端、智能体库、成员会话；缺它时「智能体」「群聊」「跨设备」都会提示后端未挂载 |
+| `@linxin666/dsh-client-ui-task-board` | **可选** | 提供完整原生任务看板；缺它时 marshal 使用内置轻量看板（基础建卡/运行/删除） |
+
+安装命令（有 `dsh` 的 CLI 环境）：
+
+```bash
+dsh plugin --profile desktop add @linxin666/dsh-agents
+dsh plugin --profile desktop add @linxin666/dsh-client-ui-task-board
+```
+
+Desktop 没有 `dsh` 命令时：打开 **Plugins → Add plugin**，搜索并安装这两个插件，然后重启 DSH。
+
+> 这两个包是 DSH 插件，不是 npm 上的普通库；只装 marshal tarball 不会自动带入它们。
+
+## 其他前置条件
 
 - DeepSeek Harness 0.2.2 或更新版本；
-- 智能体功能需要 `@linxin666/dsh-agents` 插件；
-- 原生任务看板需要 task-board 插件；没有它时 marshal 会使用内置的轻量看板（只支持基础建卡/运行/删除）；
 - Desktop 自带 Node 24，不要用 PATH 里的 Node 22 去构建或运行插件。
 
 ## Desktop 安装（没有 dsh 命令）
