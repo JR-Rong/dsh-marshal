@@ -1547,8 +1547,11 @@ window.__ModuleLoader__.load({
                 return;
               }
               const rect = center.getBoundingClientRect();
+              const rightControl = document.querySelector('[aria-label="Open right sidebar"], [aria-label="Close right sidebar"], [aria-label*="right sidebar" i]');
+              const controlLeft = rightControl === null ? rect.right - 12 : rightControl.getBoundingClientRect().left - 8;
+              const limit = Math.min(rect.right - 12, controlLeft);
               nav.style.right = 'auto';
-              nav.style.left = Math.max(8, Math.round(rect.right - nav.offsetWidth - 12)) + 'px';
+              nav.style.left = Math.max(8, Math.round(limit - nav.offsetWidth)) + 'px';
             };
             let attachAttempts = 0;
             const attachCenter = () => {
