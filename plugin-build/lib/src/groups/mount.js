@@ -9,6 +9,9 @@ import { createCrossClient } from './cross-client.js';
 import { createLocalBoard } from './local-board.js';
 import { createAgentsHttpClient, agentToolDefinitions } from './agent-tools.js';
 import { createDshSurface } from '../adapters/dsh/surface.js';
+import { createMemoryRoutes } from '../memory/http.js';
+import { createMemoryHttpAuth, resolveDesktopOwner } from '../memory/http-auth.js';
+import { dshAccountHash, DSH_ACCOUNT_ORIGIN } from '../hub/account.js';
 
 const BODY_LIMIT = 64 * 1024;
 
@@ -121,6 +124,24 @@ function exact(method, path, handler, open = false) {
     };
 }
 
+export function buildHealthBody(req, info) {
+    return {
+        ok: true,
+        name: 'dsh-marshal',
+        version: '0.2.0-agent-groups.2',
+        deviceId: info.deviceId,
+        capabilities: {
+            groups: true,
+            agents: info.agents,
+            agentsCode: info.agentsCode ?? null,
+            taskBoard: true,
+            taskBoardSource: info.taskBoardSource,
+            crossGroups: info.crossGroups,
+            ...(isLoopback(req) ? { agentMemory: info.agentMemory } : {}),
+        },
+    };
+}
+
 function taskView(task) {
     const executions = Array.isArray(task.executions) ? task.executions : [];
     const latest = executions.length > 0 ? executions[executions.length - 1] : undefined;
@@ -139,25 +160,20 @@ function taskView(task) {
     };
 }
 
-function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource = () => 'local') {
+function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource = () => 'local', memory, auth, allowedOrigins) {
     return [
         exact('GET', '/marshal/health', async (req, res) => {
             const ledger = readAgentsLedger();
-            write(res, 200, {
-                ok: true,
-                name: 'dsh-marshal',
-                version: '0.2.0-agent-groups.2',
+            write(res, 200, buildHealthBody(req, {
                 deviceId: initiator.replace(/^marshal:/, ''),
-                capabilities: {
-                    groups: true,
-                    agents: ledger.available,
-                    agentsCode: ledger.code ?? null,
-                    taskBoard: true,
-                    taskBoardSource: boardSource(),
-                    crossGroups: cross !== undefined,
-                },
-            });
+                agents: ledger.available,
+                agentsCode: ledger.code ?? null,
+                taskBoardSource: boardSource(),
+                crossGroups: cross !== undefined,
+                agentMemory: memory !== undefined,
+            }));
         }, true),
+        ...createMemoryRoutes({ memory, auth, allowedOrigins }).map(route => exact(route.method, route.path, route.handler, true)),
         exact('GET', '/marshal/tasks/state', async (req, res) => {
             const board = getBoard();
             if (board === undefined) {
@@ -431,6 +447,28 @@ export function mountGroups(ctx, config, options = {}) {
     const drafter = createAgentDrafter({ llm, defaultModel: readDefaultModel });
     const promptAbort = new AbortController();
     if (typeof ctx.effect === 'function') ctx.effect(() => () => promptAbort.abort(), 'marshal: groups prompt lifetime');
+    const platformHash = async () => {
+        try {
+            const account = typeof ctx.get === 'function' ? ctx.get('deepseekAccount') : undefined;
+            const session = await account?.getPlatformSession?.();
+            if (session?.userId && session.origin === DSH_ACCOUNT_ORIGIN) return dshAccountHash(session.userId);
+        }
+        catch { /* no signed-in platform account */ }
+        return undefined;
+    };
+    const ownerFile = join(config.memoryRoot ?? join(homedir(), '.dsh-marshal', 'memory'), 'owner.json');
+    const desktopOwner = async () => resolveDesktopOwner({ config, platformHash: await platformHash(), ownerFile });
+    const memoryAuth = createMemoryHttpAuth({
+        resolveOwner: async () => {
+            const owner = await desktopOwner();
+            if (typeof owner.caller === 'string' && owner.caller !== '') return owner.caller;
+            if (typeof config.deviceId === 'string' && config.deviceId !== '') return 'device:' + config.deviceId;
+            return '';
+        },
+        // Unknown install owner stays non-owner. After the first signed-in owner is
+        // persisted, a later logged-out local session can present that same hash.
+        installOwner: async () => (await desktopOwner()).install,
+    });
     const service = createGroupService({
         root,
         deviceId: config.deviceId,
@@ -471,7 +509,15 @@ export function mountGroups(ctx, config, options = {}) {
     ctx.inject(['webServer'], (scoped) => {
         scoped.effect(() => {
             webServer = scoped.webServer;
-            const disposers = makeRoutes(service, drafter, getBoard, `marshal:${config.deviceId}`, crossClient, () => taskBoard === undefined ? 'local' : 'host').map((route) => scoped.webServer.register(route));
+            const disposers = makeRoutes(service, drafter, getBoard, `marshal:${config.deviceId}`, crossClient, () => taskBoard === undefined ? 'local' : 'host', options.memory, memoryAuth, () => {
+                const origins = ['dsh-app://app'];
+                try {
+                    const origin = scoped.webServer.getOrigin?.();
+                    if (typeof origin === 'string' && origin !== '') origins.push(origin);
+                }
+                catch { /* desktop origin is enough when the host has no public origin */ }
+                return origins;
+            }).map((route) => scoped.webServer.register(route));
             return () => {
                 for (const dispose of disposers) dispose();
             };

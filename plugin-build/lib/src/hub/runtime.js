@@ -10,6 +10,7 @@ import { HubRelay } from "./relay.js";
 import { mountHubSocket, webServerPort } from "./server.js";
 import { createHubSync } from "./sync.js";
 import { createAccountLogin } from "./account.js";
+import { createHubMemorySync } from "./memory-sync.js";
 /** Shared Hub composition for the desktop host and the standalone cloud service. */
 export function mountHub(webServer, config, logger) {
     if (config.role !== 'hub')
@@ -21,6 +22,7 @@ export function mountHub(webServer, config, logger) {
         const registry = new DeviceRegistry();
         const inventories = new Map();
         const install = ensureInstall(config.devicesFile);
+        const memorySync = createHubMemorySync({ file: join(dirname(config.devicesFile), 'memory-sync.json') });
         if (install.initialized)
             logger.warn('marshal: empty device table');
         const hubEpoch = randomUUID();
@@ -83,7 +85,7 @@ export function mountHub(webServer, config, logger) {
         disposers.push(() => socket.dispose());
         for (const desktopEmbed of [false, true]) {
             disposers.push(registerMarshalRoutes({
-                webServer, registry, relay, sync, deviceStore: install.store, inventories, ...(discussions === undefined ? {} : { discussions }), crossGroups, desktopEmbed, requireToken: config.dashboardToken,
+                webServer, registry, relay, sync, deviceStore: install.store, inventories, ...(discussions === undefined ? {} : { discussions }), crossGroups, memorySync, desktopEmbed, requireToken: config.dashboardToken,
                 publicOrigin: config.publicOrigin, operatorId: install.operatorId,
                 ...(accountLogin === undefined ? {} : { accountLogin }),
             }).dispose);

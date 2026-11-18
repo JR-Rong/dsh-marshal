@@ -154,7 +154,7 @@ export class MemoryStore {
     }
 
     /** 追加写入（notes / global profile）。写回判据：≤10 行、≤2 KB、只记结论。 */
-    write({ scope = 'workspace', file = 'notes', cwd, content, by = null } = {}) {
+    write({ scope = 'workspace', file = 'notes', cwd, content, by = null, approved = false } = {}) {
         this.ensure();
         if (typeof content !== 'string' || content.trim() === '')
             throw new MemoryError('invalid-args', 'content is required');
@@ -164,11 +164,14 @@ export class MemoryStore {
         if (bytes(body) > MAX_WRITE_BYTES)
             throw new MemoryError('too-long', `keep one write to ${MAX_WRITE_BYTES} bytes`);
         if (scope === 'global') {
-            if (file !== 'profile')
-                throw new MemoryError('invalid-args', 'global writes go to profile (use promote for cross-workspace conclusions)');
-            const path = join(this.globalDir, 'profile.md');
+            if (approved !== true)
+                throw new MemoryError('approval-required', 'global file memory is only written after owner approval');
+            if (file !== 'profile' && file !== 'rules')
+                throw new MemoryError('invalid-args', 'global writes go to profile or rules');
+            const path = join(this.globalDir, file + '.md');
             const record = nowIso(this.now);
-            atomicWriteFile(path, `${readText(path) ?? SEED_PROFILE}\n- [${record}]${by === null ? '' : ` (${by})`} ${body}\n`);
+            const seed = file === 'rules' ? SEED_RULES : SEED_PROFILE;
+            atomicWriteFile(path, `${readText(path) ?? seed}\n- [${record}]${by === null ? '' : ` (${by})`} ${body}\n`);
             return { scope, file, path, bytes: bytes(body) };
         }
         if (file !== 'notes')
@@ -259,6 +262,26 @@ export class MemoryStore {
         if (bytes(rules) > MAX_GLOBAL_BYTES)
             issues.push(`global rules ${bytes(rules)} B > ${MAX_GLOBAL_BYTES} B，铁律必须短`);
         return { ok: issues.length === 0, issues, workspace: { slug: workspace.slug, path: workspace.record.path } };
+    }
+
+    /**
+     * Short operational block injected beside SQLite memory.
+     * Rules and the current workspace handoff only; notes stay on the tool.
+     * Does not create files.
+     */
+    promptText(cwd) {
+        const parts = [];
+        const rules = (readText(join(this.globalDir, 'rules.md')) ?? '').trim();
+        if (rules !== '') parts.push('【文件记忆·全局铁律】\n' + rules.slice(0, 1500));
+        if (typeof cwd === 'string' && cwd.startsWith('/')) {
+            try {
+                const handoff = (readText(join(this.workspacesDir, this.slugFor(cwd), 'handoff.md')) ?? '').trim();
+                if (handoff !== '') parts.push('【文件记忆·工作区交接】\n' + handoff.slice(0, 1500));
+            }
+            catch { /* cwd that cannot be a workspace slug contributes no handoff */ }
+        }
+        if (parts.length === 0) return '';
+        return '<file-memory>\n' + parts.join('\n') + '\n</file-memory>\n';
     }
 
     /** 一线视图：全局摘要 + 工作区摘要 + 体检。 */

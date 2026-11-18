@@ -2,6 +2,7 @@ import { ControlsSchema } from "../agents/controls.js";
 import { AccountLoginError } from "./account.js";
 import { DeviceStateError } from "./devices.js";
 import { DiscussionError } from "../discussions/types.js";
+import { handleMemorySyncMigrate, handleMemorySyncPull, handleMemorySyncPush } from "./memory-sync.js";
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { COMMAND_OPS } from "../wire/frames.js";
 import { parseCommandArgs } from "../wire/commands.js";
@@ -376,7 +377,7 @@ function cookiePair(name, value, httpOnly, maxAge, partitioned = false) {
  * 只登记 exact 路径：`/marshal` 与 `/marshal/api/*`，其余请求仍归 DSH。
  */
 export function registerMarshalRoutes(options) {
-    const { webServer, registry, relay, sync, requireToken } = options;
+    const { webServer, registry, relay, sync, requireToken, memorySync } = options;
     const desktopEmbed = options.desktopEmbed === true;
     const sessionCookieName = desktopEmbed ? DESKTOP_SESSION_COOKIE : SESSION_COOKIE;
     const csrfCookieName = desktopEmbed ? DESKTOP_CSRF_COOKIE : CSRF_COOKIE;
@@ -652,7 +653,7 @@ export function registerMarshalRoutes(options) {
             if (!identity)
                 throw new AccountLoginError('account-unavailable');
             const id = 'account-' + createHash('sha256').update(identity.accountHash + '|' + data.installationId).digest('hex').slice(0, 32);
-            const device = options.deviceStore.enroll(id, data.name, data.tokenDigest, data.shareContent);
+            const device = options.deviceStore.enroll(id, data.name, data.tokenDigest, data.shareContent, identity.accountHash);
             limiter.success(source);
             json(res, 200, { ok: true, deviceId: device.id, accountHash: identity.accountHash, operatorId,
                 allowContent: device.allowContent, allowDiscussion: device.allowDiscussion });
@@ -841,6 +842,15 @@ export function registerMarshalRoutes(options) {
         catch (error) {
             json(res, 400, { ok: false, code: error instanceof Error ? error.message : 'send-failed' });
         }
+    }));
+    register('/marshal/api/memory-sync/push', guard(async (req, res) => {
+        await handleMemorySyncPush(req, res, { memorySync, deviceFromRequest: deviceFromBearer, operatorId });
+    }));
+    register('/marshal/api/memory-sync/pull', guard((req, res) => {
+        handleMemorySyncPull(req, res, { memorySync, deviceFromRequest: deviceFromBearer, operatorId });
+    }));
+    register('/marshal/api/memory-sync/migrate', guard(async (req, res) => {
+        await handleMemorySyncMigrate(req, res, { memorySync, deviceFromRequest: deviceFromBearer });
     }));
     register('/marshal/api/device-name', guard(async (req, res) => {
         if (req.method !== 'POST') {

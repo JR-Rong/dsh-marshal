@@ -43,7 +43,7 @@ function assertUnique(records, context) {
 function validateRecord(value, index) {
     if (!isObject(value))
         throw new DeviceStateError('invalid', `devices[${index}] is not an object`);
-    const { id, name, tokenDigest, revoked, allowContent, allowInteractions, allowDiscussion, policyRevision, revokedAt } = value;
+    const { id, name, tokenDigest, revoked, allowContent, allowInteractions, allowDiscussion, policyRevision, revokedAt, ownerId } = value;
     if (!nonEmptyString(id))
         throw new DeviceStateError('invalid', `devices[${index}].id must be a non-empty string`);
     if (!nonEmptyString(name))
@@ -65,6 +65,9 @@ function validateRecord(value, index) {
     if (revokedAt !== undefined && (typeof revokedAt !== 'number' || !Number.isInteger(revokedAt) || revokedAt < 0)) {
         throw new DeviceStateError('invalid', `devices[${index}].revokedAt must be an integer >= 0`);
     }
+    if (ownerId !== undefined && (typeof ownerId !== 'string' || ownerId === '' || ownerId.length > 128 || /[\x00-\x1f\x7f]/.test(ownerId))) {
+        throw new DeviceStateError('invalid', `devices[${index}].ownerId must be 1–128 visible characters`);
+    }
     return {
         record: {
             id, name, tokenDigest, revoked,
@@ -74,6 +77,7 @@ function validateRecord(value, index) {
             // 占位值只用于内存；任何写盘都会因 unconfirmed 而被拒绝，不会把 0 持久化。
             policyRevision: revisionUnconfirmed ? 0 : policyRevision,
             ...(revokedAt === undefined ? {} : { revokedAt }),
+            ...(ownerId === undefined ? {} : { ownerId }),
         },
         revisionUnconfirmed,
     };
@@ -249,9 +253,10 @@ export class DeviceStore {
     }
     /** The native installation persists its random credential BEFORE enrollment.
      * Retrying the same verified account/installation cannot rotate it or widen policy. */
-    enroll(id, name, tokenDigest, content) {
+    enroll(id, name, tokenDigest, content, ownerId) {
         if (!/^account-[a-f0-9]{32}$/.test(id) || !/^[a-f0-9]{64}$/.test(tokenDigest)
-            || !name.trim() || name.length > 80 || /[\x00-\x1f\x7f]/.test(name))
+            || !name.trim() || name.length > 80 || /[\x00-\x1f\x7f]/.test(name)
+            || (ownerId !== undefined && (typeof ownerId !== 'string' || ownerId === '' || ownerId.length > 128 || /[\x00-\x1f\x7f]/.test(ownerId))))
             throw new DeviceStateError('invalid', 'invalid enrollment');
         return this.mutate(state => {
             const current = state.devices.find(device => device.id === id);
@@ -260,13 +265,20 @@ export class DeviceStore {
             if (current) {
                 if (current.tokenDigest !== tokenDigest)
                     throw new DeviceStateError('duplicate-id', 'installation credential mismatch');
+                if (typeof ownerId === 'string' && current.ownerId !== undefined && current.ownerId !== ownerId)
+                    throw new DeviceStateError('invalid', 'device owner mismatch');
+                if (typeof ownerId === 'string' && current.ownerId === undefined) {
+                    const entry = { ...current, ownerId };
+                    return { state: { ...state, devices: state.devices.map(device => device.id === id ? entry : device) }, result: entry };
+                }
                 return { state, result: current };
             }
             if (state.devices.length >= 256 || state.devices.some(device => device.tokenDigest === tokenDigest)) {
                 throw new DeviceStateError('invalid', 'enrollment limit or credential conflict');
             }
             const entry = { id, name: name.trim(), tokenDigest, revoked: false,
-                allowContent: content, allowDiscussion: content, allowInteractions: false, policyRevision: 1 };
+                allowContent: content, allowDiscussion: content, allowInteractions: false, policyRevision: 1,
+                ...(typeof ownerId === 'string' ? { ownerId } : {}) };
             return { state: { ...state, devices: [...state.devices, entry] }, result: entry };
         });
     }
