@@ -159,6 +159,15 @@ test('dispatch: the per-minute limiter refuses a flood', async () => {
     assert.equal(second.body.code, 'rate-limited');
 });
 
+test('dispatch: an already executed card is never prepared again', async () => {
+    const executed = taskFixture({ executions: [{ id: 'old-run', startedAt: 1, endedAt: 2, result: 'failed' }] });
+    const { bridge, board } = setup({ settings: { defaultAgent: '工部尚书' }, tasks: [executed] });
+    const answer = await bridge.humanCreate({ taskId: 'task-1', source: 'board-ui' });
+    assert.equal(answer.status, 200);
+    assert.equal(answer.body.code, 'already-executed');
+    assert.equal(board.actions.length, 0, 'an executed card is not rewritten or re-run');
+});
+
 test('dispatch: an unknown tag falls back to the default; a bad task id is refused', async () => {
     const { bridge } = setup({ settings: { defaultAgent: '工部尚书' }, tasks: [taskFixture({ tags: [{ name: '@不存在' }] })] });
     const answer = await bridge.humanCreate({ taskId: 'task-1', source: 'board-ui' });
@@ -168,5 +177,5 @@ test('dispatch: an unknown tag falls back to the default; a bad task id is refus
     assert.equal(bad.status, 400);
     assert.equal(bad.body.code, 'invalid-task-id');
     const wrongSource = await bridge.humanCreate({ taskId: 'task-1', source: 'agent' });
-    assert.equal(wrongSource.status, 403);
+    assert.equal(wrongSource.status, 400);
 });

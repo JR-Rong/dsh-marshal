@@ -54,7 +54,8 @@ export function createDispatcher(options) {
 
     const recentHumanDispatchCount = () => {
         const since = now() - 60_000;
-        return stateStore.list().filter(record => record.source === 'ui' && (record.createdAt ?? 0) >= since && record.status !== 'skipped').length;
+        const counted = new Set(['dispatched', 'running', 'settled', 'memory-pending']);
+        return stateStore.list().filter(record => record.source === 'ui' && (record.createdAt ?? 0) >= since && counted.has(record.status)).length;
     };
 
     const status = () => {
@@ -84,7 +85,11 @@ export function createDispatcher(options) {
                 agentName: record.agentName,
                 outcome: record.outcome,
                 error: record.error,
+                memoryError: record.memoryError ?? null,
                 memoryWritten: record.memoryWritten === true,
+                notes: record.notes ?? null,
+                executionId: record.executionId ?? null,
+                sessionId: record.sessionId ?? null,
                 updatedAt: record.updatedAt,
             })),
         };
@@ -263,6 +268,8 @@ export function createDispatcher(options) {
         const taskId = typeof event?.taskId === 'string' ? event.taskId : '';
         const record = stateStore.get(taskId);
         if (record === undefined || typeof record.agentId !== 'string' || record.agentId === '') return { ok: false, code: 'not-dispatched' };
+        if (settingsStore.get().enabled !== true) return { ok: false, code: 'disabled' };
+        if (record.status === 'failed' || record.status === 'skipped') return { ok: false, code: 'not-active' };
         if (record.memoryWritten === true) return { ok: true, code: 'already-settled' };
         if (typeof event.executionId === 'string' && typeof record.executionId === 'string' && record.executionId !== event.executionId) {
             // A later manual rerun is not this dispatch's execution.
@@ -303,8 +310,9 @@ export function createDispatcher(options) {
             tags: [taskId, 'superagent', record.agentName].filter(tag => typeof tag === 'string' && tag !== ''),
         });
         stateStore.put(taskId, {
+            status: memoryResult.ok === true ? 'settled' : 'memory-pending',
             memoryWritten: memoryResult.ok === true,
-            ...(memoryResult.ok === true ? {} : { memoryError: memoryResult.error ?? 'memory-write-failed' }),
+            ...(memoryResult.ok === true ? { memoryError: undefined } : { memoryError: memoryResult.error ?? 'memory-write-failed' }),
         });
         if (memoryResult.ok !== true) noteError('settle ' + taskId + ' memory write failed: ' + (memoryResult.error ?? 'unknown'));
         try {

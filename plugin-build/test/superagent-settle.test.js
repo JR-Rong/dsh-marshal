@@ -80,7 +80,7 @@ test('settle: memory unavailable or throwing is recorded, never fatal', async ()
     board.fireSettled({ taskId: 'task-1', executionId: 'exec-1', outcome: 'failed', error: 'tests failed' });
     await wait();
     const record = bridge.stateStore.get('task-1');
-    assert.equal(record.status, 'settled');
+    assert.equal(record.status, 'memory-pending');
     assert.equal(record.memoryWritten, false);
     assert.match(record.memoryError, /disk full/);
     assert.equal(board.integrations[0].payload.memoryWritten, false);
@@ -120,6 +120,68 @@ test('settle: a late duplicate notification cannot erase the settled record', as
     assert.equal(bridge.stateStore.get('task-1').status, 'settled');
     assert.equal(bridge.stateStore.get('task-1').memoryWritten, true);
     assert.equal(memory.writes.length, 1);
+});
+
+test('settle: disabling the bridge defers memory until it is re-enabled', async () => {
+    const { bridge, board, memory } = setup();
+    await bridge.humanCreate({ taskId: 'task-1', source: 'board-ui' });
+    bridge.configure({ enabled: false });
+    board.settleExecution('task-1', 'succeeded', { summary: 'disabled settle' });
+    board.fireSettled({ taskId: 'task-1', executionId: 'exec-1', outcome: 'succeeded' });
+    await wait();
+    assert.equal(memory.writes.length, 0, 'disabled bridge must not write memory');
+    assert.equal(bridge.stateStore.get('task-1').status, 'running');
+    bridge.configure({ enabled: true });
+    const result = await bridge.reconcile('test');
+    assert.equal(result.settled, 1);
+    assert.equal(memory.writes.length, 1);
+    assert.equal(bridge.stateStore.get('task-1').status, 'settled');
+});
+
+test('settle: a failed dispatch record is never written by a later manual run', async () => {
+    const { bridge, board, memory } = setup();
+    board.setFailRun('permission-confirmation-required');
+    const refused = await bridge.humanCreate({ taskId: 'task-1', source: 'board-ui' });
+    assert.equal(refused.status, 409);
+    assert.equal(bridge.stateStore.get('task-1').status, 'failed');
+    board.setFailRun(undefined);
+    await board.apply('manual-run', { kind: 'run', taskId: 'task-1' }, 'human-session');
+    board.settleExecution('task-1', 'succeeded', { summary: 'manual work' });
+    board.fireSettled({ taskId: 'task-1', executionId: 'exec-1', outcome: 'succeeded' });
+    await wait();
+    assert.equal(memory.writes.length, 0);
+    assert.equal(bridge.stateStore.get('task-1').status, 'failed');
+});
+
+test('settle: a transient memory failure is retried by reconcile', async () => {
+    const writes = [];
+    let fail = true;
+    const memory = {
+        listFor: () => [],
+        rememberFor(input) {
+            if (fail) {
+                fail = false;
+                throw new Error('transient disk error');
+            }
+            writes.push(input);
+            return { id: 'memory-retried' };
+        },
+    };
+    const { bridge, board } = setup({ memory });
+    await bridge.humanCreate({ taskId: 'task-1', source: 'board-ui' });
+    board.settleExecution('task-1', 'succeeded', { summary: 'retry me' });
+    board.fireSettled({ taskId: 'task-1', executionId: 'exec-1', outcome: 'succeeded' });
+    await wait();
+    const pending = bridge.stateStore.get('task-1');
+    assert.equal(pending.status, 'memory-pending');
+    assert.match(pending.memoryError, /transient/);
+    assert.match(bridge.status().recent[0].memoryError, /transient/);
+    const result = await bridge.reconcile('test');
+    assert.equal(result.settled, 1);
+    assert.equal(writes.length, 1);
+    const settled = bridge.stateStore.get('task-1');
+    assert.equal(settled.status, 'settled');
+    assert.equal(settled.memoryWritten, true);
 });
 
 test('restart: a new bridge with the same root does not re-dispatch a running card', async () => {

@@ -111,9 +111,16 @@ export function planCardPatch({ task, member, snapshot, prompt }) {
         if (finalModel !== '' && (text(task.model) === '' || finalModel === text(member.model))) patch.reasoningEffort = text(member.reasoningEffort);
     }
     if (text(task.permission) === '' && text(member.permission) !== '') {
-        const defaultRank = permissionRank(snapshot?.sessionDefaultPermission) || permissionRank('workspace-write');
-        if (permissionRank(member.permission) <= defaultRank) patch.permission = text(member.permission);
-        else notes.push('permission-not-raised: member "' + member.name + '" pins ' + member.permission + ' above the board default; card left at the default and the run gate decides');
+        const defaultRank = permissionRank(snapshot?.sessionDefaultPermission);
+        if (defaultRank === 0) {
+            notes.push('permission-default-unknown: the board snapshot carries no sessionDefaultPermission; the card is left at the deployment default');
+        }
+        else if (permissionRank(member.permission) <= defaultRank) {
+            patch.permission = text(member.permission);
+        }
+        else {
+            notes.push('permission-not-raised: member "' + member.name + '" pins ' + member.permission + ' above the board default; card left at the default and the run gate decides');
+        }
     }
     const tags = mergeTags(task, member);
     if (tags.length > 0) patch.tags = tags;

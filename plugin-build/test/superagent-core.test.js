@@ -51,6 +51,7 @@ test('settings: normalization refuses invalid values without throwing', () => {
     assert.deepEqual(normalized.aliases, { '工部': '工部尚书' });
     assert.equal(normalized.memoryLimit, defaults.memoryLimit);
     assert.equal(normalized.maxDispatchesPerMinute, defaults.maxDispatchesPerMinute);
+    assert.equal(normalizeSettings({ memoryLimit: 12 }).memoryLimit, 6, 'A8 hard cap is six');
 });
 
 test('agents: ledger read, tag override, alias and default', () => {
@@ -120,6 +121,9 @@ test('patch: member fills blanks, never raises permission above the board defaul
     assert.match(planned.notes.join(' '), /permission-not-raised/);
     const allowed = planCardPatch({ task: taskFixture(), member: { ...member, permission: 'workspace-write' }, snapshot, prompt: 'p' });
     assert.equal(allowed.patch.permission, 'workspace-write');
+    const unknownDefault = planCardPatch({ task: taskFixture(), member, snapshot: {}, prompt: 'p' });
+    assert.equal(unknownDefault.patch.permission, undefined, 'unknown session default fails closed');
+    assert.match(unknownDefault.notes.join(' '), /permission-default-unknown/);
     const pinned = planCardPatch({
         task: taskFixture({ permission: 'read-only', model: 'kilo/x', reasoningEffort: 'high' }),
         member,

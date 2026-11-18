@@ -13,10 +13,15 @@ import { createBoardExtension, SUPERAGENT_EXTENSION_ID } from './extension.js';
 import { createMemoryBridge } from './memory.js';
 import { createSettingsStore, resolveRoot } from './settings.js';
 import { createStateStore } from './state.js';
+import { controlPageHtml } from './control-page.js';
 import { specToJsonSchema } from '../tools/schema.js';
 
 const BODY_LIMIT = 64 * 1024;
+const CONTROL_PATH = '/marshal-superagent';
 const HUMAN_CREATE_PATH = '/marshal-superagent/api/human-create';
+const CONFIG_PATH = '/marshal-superagent/api/config';
+const DISPATCH_PATH = '/marshal-superagent/api/dispatch';
+const AGENTS_PATH = '/marshal-superagent/api/agents';
 const STATUS_PATH = '/marshal-superagent/api/status';
 const HEALTH_PATH = '/marshal-superagent/health';
 
@@ -36,21 +41,47 @@ function isLoopback(req) {
     return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
 }
 
-function sameOrigin(req) {
-    const origin = req.headers?.origin;
-    if (typeof origin !== 'string' || origin === '') return true;
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]', '::1']);
+
+function hostIsLoopback(value) {
+    if (typeof value !== 'string' || value === '') return false;
     try {
-        return new URL(origin).host === req.headers.host;
+        return LOOPBACK_HOSTS.has(new URL('http://' + value).hostname);
     }
     catch {
         return false;
     }
 }
 
-function trusted(req) {
-    if (req.headers?.['sec-fetch-site'] === 'cross-site') return false;
+/**
+ * A human browser request, as far as a loopback HTTP server can tell: same
+ * origin, same-origin fetch metadata, and a loopback Host. A local process that
+ * deliberately forges every header can still impersonate a browser; that is
+ * outside this bridge's trust boundary (the operator's own machine), but the
+ * casual agent-shell curl and every non-browser caller fail closed.
+ */
+function browserProof(req) {
     if (!isLoopback(req)) return false;
-    return sameOrigin(req);
+    if (String(req.headers?.['sec-fetch-site'] ?? '') !== 'same-origin') return false;
+    if (!hostIsLoopback(req.headers?.host)) return false;
+    const origin = req.headers?.origin;
+    if (typeof origin !== 'string' || origin === '') return false;
+    let url;
+    try { url = new URL(origin); }
+    catch { return false; }
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
+    if (url.username !== '' || url.password !== '') return false;
+    if (url.pathname !== '/' && url.pathname !== '') return false;
+    if (url.search !== '' || url.hash !== '') return false;
+    if (url.host !== req.headers?.host) return false;
+    if (!hostIsLoopback(url.host)) return false;
+    return true;
+}
+
+/** Read-only routes: loopback and not a cross-site browser request. */
+function readTrusted(req) {
+    if (req.headers?.['sec-fetch-site'] === 'cross-site') return false;
+    return isLoopback(req);
 }
 
 function write(res, status, value) {
@@ -75,7 +106,13 @@ async function readBody(req) {
     return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
 
-function exact(method, path, handler, open = false) {
+function writeHtml(res, html) {
+    if (typeof res.writeHead !== 'function') return;
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+    res.end(html);
+}
+
+function exact(method, path, handler, guard = readTrusted) {
     return {
         kind: 'exact',
         path,
@@ -87,7 +124,7 @@ function exact(method, path, handler, open = false) {
                 }
                 return;
             }
-            if (!open && !trusted(req)) {
+            if (!guard(req)) {
                 write(res, 403, { ok: false, code: 'forbidden' });
                 return;
             }
@@ -227,8 +264,8 @@ export function createSuperagentBridge(options = {}) {
         const taskId = typeof body?.taskId === 'string' ? body.taskId.trim() : '';
         if (taskId === '') return { status: 400, body: { ok: false, code: 'invalid-task-id' } };
         if (taskId.length > 128) return { status: 400, body: { ok: false, code: 'invalid-task-id' } };
-        if (body?.source !== undefined && body.source !== 'board-ui') {
-            return { status: 403, body: { ok: false, code: 'bad-source' } };
+        if (body?.source !== 'board-ui') {
+            return { status: 400, body: { ok: false, code: 'bad-source' } };
         }
         const result = await dispatcher.dispatch({ taskId, source: 'ui', requestId: body?.requestId });
         if (result.ok === true) return { status: 202, body: { ok: true, code: result.code, taskId, via: result.via } };
@@ -236,17 +273,75 @@ export function createSuperagentBridge(options = {}) {
         return { status: benign.has(result.code) ? 200 : 409, body: { ok: false, code: result.code, taskId, error: result.error } };
     };
 
+    const controlConfig = async body => {
+        const patch = {};
+        for (const key of ['enabled', 'rootOnly', 'injectMemory']) {
+            if (typeof body?.[key] === 'boolean') patch[key] = body[key];
+        }
+        for (const key of ['defaultAgent', 'tagPrefix']) {
+            if (typeof body?.[key] === 'string') patch[key] = body[key];
+        }
+        if (body?.memoryLimit !== undefined) patch.memoryLimit = body.memoryLimit;
+        if (body?.aliases !== null && typeof body?.aliases === 'object' && !Array.isArray(body.aliases)) patch.aliases = body.aliases;
+        try {
+            configure(patch);
+            return { status: 200, body: { ok: true, status: status() } };
+        }
+        catch (cause) {
+            return { status: 400, body: { ok: false, code: 'config-refused', error: messageOf(cause) } };
+        }
+    };
+
+    const controlDispatch = async body => {
+        const taskId = typeof body?.taskId === 'string' ? body.taskId.trim() : '';
+        if (taskId === '' || taskId.length > 128) {
+            return { status: 400, body: { ok: false, code: 'invalid-task-id' } };
+        }
+        const result = await dispatcher.dispatch({ taskId, source: 'manual', force: true });
+        const benign = new Set(['disabled', 'duplicate-dispatch', 'subtask-suppressed', 'already-running', 'already-executed', 'task-archived', 'in-flight']);
+        return {
+            status: result.ok === true ? 202 : benign.has(result.code) ? 200 : 409,
+            body: result,
+        };
+    };
+
+    const readJson = async req => {
+        const contentType = String(req.headers?.['content-type'] ?? '');
+        if (!contentType.toLowerCase().startsWith('application/json')) return { error: 'json-required' };
+        try { return { body: await readBody(req) }; }
+        catch (cause) { return { error: cause?.code === 'body-too-large' ? 'body-too-large' : 'invalid-json' }; }
+    };
+
     const routes = () => [
+        exact('GET', CONTROL_PATH, (req, res) => { writeHtml(res, controlPageHtml()); }),
         exact('POST', HUMAN_CREATE_PATH, async (req, res) => {
-            const body = await readBody(req);
-            const contentType = String(req.headers?.['content-type'] ?? '');
-            if (!contentType.toLowerCase().startsWith('application/json')) {
-                write(res, 415, { ok: false, code: 'json-required' });
+            const parsed = await readJson(req);
+            if (parsed.error !== undefined) {
+                write(res, parsed.error === 'body-too-large' ? 413 : 415, { ok: false, code: parsed.error });
                 return;
             }
-            const answer = await humanCreate(body);
+            const answer = await humanCreate(parsed.body);
             write(res, answer.status, answer.body);
-        }),
+        }, browserProof),
+        exact('POST', CONFIG_PATH, async (req, res) => {
+            const parsed = await readJson(req);
+            if (parsed.error !== undefined) {
+                write(res, parsed.error === 'body-too-large' ? 413 : 415, { ok: false, code: parsed.error });
+                return;
+            }
+            const answer = await controlConfig(parsed.body);
+            write(res, answer.status, answer.body);
+        }, browserProof),
+        exact('POST', DISPATCH_PATH, async (req, res) => {
+            const parsed = await readJson(req);
+            if (parsed.error !== undefined) {
+                write(res, parsed.error === 'body-too-large' ? 413 : 415, { ok: false, code: parsed.error });
+                return;
+            }
+            const answer = await controlDispatch(parsed.body);
+            write(res, answer.status, answer.body);
+        }, browserProof),
+        exact('GET', AGENTS_PATH, (req, res) => { write(res, 200, { ok: true, ...dispatcher.listAgentSummaries() }); }),
         exact('GET', STATUS_PATH, (req, res) => { write(res, 200, status()); }),
         exact('GET', HEALTH_PATH, (req, res) => {
             const value = status();
@@ -257,6 +352,7 @@ export function createSuperagentBridge(options = {}) {
                 board: value.board,
                 memory: value.memory,
                 extension: value.extension,
+                controlPage: CONTROL_PATH,
             });
         }),
     ];
@@ -264,41 +360,15 @@ export function createSuperagentBridge(options = {}) {
     const toolDefinition = () => {
         const definition = {
             name: 'marshal_superagent',
-            description: '任务看板 × Super-agent 人工派发桥：查看状态、配置默认智能体与标签别名、人工补派工单、对账。只有皇上在 GUI 新建的工单会自动派发；agent 自建卡不触发。',
+            description: '任务看板 × Super-agent 人工派发桥的只读面：status 查看状态、agents 列出智能体、reconcile 对账。配置与人工补派只能由皇上在本机浏览器打开 /marshal-superagent 控制页操作；agent 的模型工具不能改路由或补派。只有皇上在 GUI 新建的工单会自动派发。',
             parameters: {
-                action: { type: 'string', required: true, enum: ['status', 'config', 'agents', 'dispatch', 'reconcile'] },
-                taskId: { type: 'string', description: 'dispatch / reconcile 的工单 id；reconcile 留空则对账全部活跃派发。' },
-                enabled: { type: 'boolean', description: 'config：总开关。' },
-                defaultAgent: { type: 'string', description: 'config：默认智能体名称或成员 id；留空清空。' },
-                rootOnly: { type: 'boolean', description: 'config：是否只派发根卡（默认 true）。' },
-                tagPrefix: { type: 'string', description: 'config：卡片标签前缀，默认 @。' },
-                injectMemory: { type: 'boolean', description: 'config：派发时是否注入该智能体的相关长期记忆。' },
-                memoryLimit: { type: 'integer', description: 'config：注入记忆条数上限 0–12。' },
-                aliases: {
-                    type: 'object',
-                    additionalProperties: true,
-                    description: 'config：标签别名表，如 {"工部":"工部尚书"}。',
-                },
+                action: { type: 'string', required: true, enum: ['status', 'agents', 'reconcile'] },
             },
             output: { schema: textOutput(), render },
             async execute(args) {
                 const action = typeof args?.action === 'string' ? args.action : '';
                 if (action === 'status') return JSON.stringify(status(), null, 2);
                 if (action === 'agents') return JSON.stringify(dispatcher.listAgentSummaries(), null, 2);
-                if (action === 'config') {
-                    const patch = {};
-                    for (const key of ['enabled', 'rootOnly', 'injectMemory']) if (args[key] !== undefined) patch[key] = args[key];
-                    for (const key of ['defaultAgent', 'tagPrefix']) if (args[key] !== undefined) patch[key] = args[key];
-                    if (args.memoryLimit !== undefined) patch.memoryLimit = args.memoryLimit;
-                    if (args.aliases !== undefined) patch.aliases = args.aliases;
-                    configure(patch);
-                    return JSON.stringify(status(), null, 2);
-                }
-                if (action === 'dispatch') {
-                    if (typeof args.taskId !== 'string' || args.taskId.trim() === '') throw new Error('taskId is required');
-                    const result = await dispatcher.dispatch({ taskId: args.taskId.trim(), source: 'manual', force: true });
-                    return JSON.stringify(result, null, 2);
-                }
                 if (action === 'reconcile') {
                     const result = await reconcile('tool');
                     return JSON.stringify(result ?? { ok: true }, null, 2);
@@ -391,4 +461,12 @@ export function mountSuperagent(ctx, config, options = {}) {
     return bridge;
 }
 
-export const SUPERAGENT_PATHS = Object.freeze({ humanCreate: HUMAN_CREATE_PATH, status: STATUS_PATH, health: HEALTH_PATH });
+export const SUPERAGENT_PATHS = Object.freeze({
+    control: CONTROL_PATH,
+    humanCreate: HUMAN_CREATE_PATH,
+    config: CONFIG_PATH,
+    dispatch: DISPATCH_PATH,
+    agents: AGENTS_PATH,
+    status: STATUS_PATH,
+    health: HEALTH_PATH,
+});

@@ -66,8 +66,13 @@ export function createMemoryBridge(service, options = {}) {
 
     const recall = ({ agentId, workspaceId, text, limit = 6 }) => {
         if (!available || limit <= 0) return { text: '', count: 0, error: undefined };
-        const agentItems = itemsOf(service, { scope: 'agent', agentId, limit, text }) ?? [];
-        const workspaceItems = itemsOf(service, { scope: 'workspace', workspaceId, limit: Math.max(1, Math.min(3, limit - 1)), text }) ?? [];
+        const agentResult = itemsOf(service, { scope: 'agent', agentId, limit, text });
+        const workspaceResult = itemsOf(service, { scope: 'workspace', workspaceId, limit: Math.max(1, Math.min(3, limit - 1)), text });
+        if (agentResult === undefined && workspaceResult === undefined) {
+            return { text: '', count: 0, error: 'memory-recall-failed' };
+        }
+        const agentItems = agentResult ?? [];
+        const workspaceItems = workspaceResult ?? [];
         const seen = new Set();
         const lines = [];
         for (const [scope, items] of [['agent', agentItems], ['workspace', workspaceItems]]) {
@@ -122,7 +127,9 @@ export function createMemoryBridge(service, options = {}) {
         if (summary !== '') lines.push('工作摘要：' + clip(summary, 2600));
         else lines.push('工作摘要：（执行会话未留下可读的助手结论）');
         if (typeof execution?.sessionId === 'string' && execution.sessionId !== '') lines.push('执行会话：' + execution.sessionId);
-        if (typeof task?.description === 'string' && task.description.trim() !== '') lines.push('工单说明：' + clip(task.description, 400));
+        // The card description is operator/agent-authored text; the episode keeps
+        // the execution's own conclusion so a forged card cannot smuggle arbitrary
+        // text into the member's long-term memory through this field.
         return clip(lines.join('\n'), MAX_EPISODE_CHARS);
     };
 

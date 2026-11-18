@@ -13,7 +13,7 @@ import { dirname, join } from 'node:path';
 
 export const STATE_VERSION = 1;
 export const MAX_DISPATCHES = 500;
-const ACTIVE = new Set(['preparing', 'dispatched', 'running']);
+const ACTIVE = new Set(['preparing', 'dispatched', 'running', 'memory-pending']);
 const TERMINAL = new Set(['settled', 'failed', 'skipped']);
 
 export function defaultState(now = Date.now()) {

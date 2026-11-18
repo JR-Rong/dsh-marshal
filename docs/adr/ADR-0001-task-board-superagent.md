@@ -29,8 +29,9 @@
 - 触发：浏览器端只观察 POST /api/task-board/action 中 action.kind === 'create' 的请求；响应成功后再通知本机主机。agent 用工具建卡不经过浏览器，因此天然不触发。
 - 执行：走看板原生 run（taskBoard.apply({kind:'run'})），而不是 dsh-agents 成员会话。这样卡片工作区、会话、执行记录、状态、结算都由看板托管，卡上能直接看到 agent 在工作；agent 身份通过执行提示注入。
 - 记忆：不依赖看板会话的身份自动解析。派发时从 createAgentMemoryService 的 agent scope 读取该成员记忆并注入提示；结算时显式 rememberFor({agentId, scope:'agent'}) 写回。
-- 指定：设置里的默认 agent + 卡片标签 @某官（可配别名）覆盖；按名字或成员 id 解析。
+- 指定：设置里的默认 agent + 卡片标签 @某官（可配别名）覆盖；按名字或成员 id 解析。默认已设为丞相。
 - 范围：默认只对根卡触发；子卡需显式 rootOnly=false。不自动确认权限；高于会话默认的权限只记录。
+- 人机边界：模型工具只读（status / agents / reconcile）；配置与人工补派只在本机同源浏览器控制页 /marshal-superagent。human-create / config / dispatch 路由要求 Origin + Sec-Fetch-Site: same-origin + 回环 Host；本机进程蓄意伪造全部请求头不在本桥信任边界内。
 
 ## 代价
 

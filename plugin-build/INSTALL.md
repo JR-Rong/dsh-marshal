@@ -94,20 +94,20 @@ GET /marshal/health
 
 ## Super-agent 人工派发桥（0.2.1+）
 
-装好后先配置默认智能体（名字取自「智能体」页；也可用成员 id）：
+默认已设为 **丞相**。配置、开关与人工补派都在本机控制页：
 
 ```text
-marshal_superagent action=config defaultAgent=工部尚书
+http://127.0.0.1:63125/marshal-superagent
 ```
 
-然后在任务看板 GUI 新建一张根卡：marshal 会自动调用看板原生 run，把卡片交给该智能体。卡片标签写 `@丞相` 可临时改派。
+控制页只接受本机同源浏览器请求；agent 的模型工具只有 status / agents / reconcile，不能改路由或补派。卡片标签写 `@工部尚书` 可临时改派。
 
 - 只认 GUI 新建；agent 用工具建卡不会触发。
-- 默认只派发根卡；要派发子卡，配置 `rootOnly=false`。
+- 默认只派发根卡；控制页可关 `rootOnly`。
 - 结算后写回该智能体记忆；派发时注入最多 6 条相关记忆。
 - 状态：`GET /marshal-superagent/health`，或 `marshal_superagent action=status`。
-- 关闭：`marshal_superagent action=config enabled=false`。
-- 手机/远端建卡不会自动触发；用 `marshal_superagent action=dispatch taskId=<卡 id>` 补派。
+- 关闭：控制页取消「启用」，或改 `~/.dsh-marshal/superagent/settings.json`。
+- 手机/远端建卡不会自动触发；在控制页填卡片 id 补派。
 
 ## 常见问题
 

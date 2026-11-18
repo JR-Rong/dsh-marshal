@@ -17,6 +17,7 @@ scope:
   - plugin-build/lib/src/index.js
   - plugin-build/client/superagent-hook.js
   - plugin-build/client/index.js
+  - scripts/append-superagent-hook.mjs
   - plugin-build/test/superagent-*.test.js
   - plugin-build/package.json
   - plugin-build/README.md

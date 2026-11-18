@@ -5,7 +5,7 @@
 | 块 | 范围 | 类别 | 行数 | 风险 | 证据 | 建议 |
 |---|---|---|---|---|---|---|
 | 1 | plugin-build/lib/src/superagent/dispatch.js、prompt.js、extension.js | 核心 | 583 | 高 | superagent-dispatch / superagent-settle 共 18 条 | 深审 |
-| 2 | plugin-build/lib/src/superagent/mount.js | 核心 | 394 | 高 | superagent-mount 5 条 + 路由守卫测试 | 深审 |
+| 2 | plugin-build/lib/src/superagent/mount.js + control-page.js | 核心 | 600 | 高 | superagent-mount 6 条 + 路由守卫/控制页测试 | 深审 |
 | 3 | plugin-build/lib/src/superagent/agents.js、settings.js、state.js、memory.js | 支撑 | 546 | 中 | superagent-core 7 条 + 记忆读写测试 | 抽读 |
 | 4 | plugin-build/lib/src/index.js（import + mountSuperagent） | 接线 | 7 | 中 | 入口 import 实跑 | 抽读 |
 | 5 | plugin-build/client/superagent-hook.js + client/index.js 追加段 | 核心 | 190 | 高 | superagent-hook 5 条；bundle 一致性断言 | 深审 |
@@ -28,7 +28,7 @@
 | A10 | 1、2 | run refusal recorded; memory failure recorded; health/status |
 | A11 | 1、2、5 | disabled route test; hook test skips failed/disabled responses |
 | A12 | 2、5 | route loopback/origin guard; dispatch refuses source != board-ui |
-| A13 | 6 | node --test test/*.test.js 61/61 |
+| A13 | 6 | node --test test/*.test.js 66/66 |
 | A14 | 7 | tarball contents + README/INSTALL |
 
 ## 人类预算

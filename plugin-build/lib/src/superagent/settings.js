@@ -78,7 +78,7 @@ export function normalizeSettings(raw, now = Date.now()) {
         tagPrefix: text(value.tagPrefix, 8) ?? base.tagPrefix,
         aliases,
         injectMemory: boolean(value.injectMemory, base.injectMemory),
-        memoryLimit: integer(value.memoryLimit, base.memoryLimit, 0, 12),
+        memoryLimit: integer(value.memoryLimit, base.memoryLimit, 0, 6),
         maxDispatchesPerMinute: integer(value.maxDispatchesPerMinute, base.maxDispatchesPerMinute, 1, 60),
         updatedAt: Number.isFinite(value.updatedAt) ? value.updatedAt : now,
     };
