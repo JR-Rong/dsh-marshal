@@ -10,7 +10,7 @@ import { createLocalBoard } from './local-board.js';
 import { createAgentsHttpClient, agentToolDefinitions } from './agent-tools.js';
 import { createDshSurface } from '../adapters/dsh/surface.js';
 import { createMemoryRoutes } from '../memory/http.js';
-import { createMemoryHttpAuth } from '../memory/http-auth.js';
+import { createMemoryHttpAuth, installOwnerFor } from '../memory/http-auth.js';
 import { dshAccountHash, DSH_ACCOUNT_ORIGIN } from '../hub/account.js';
 
 const BODY_LIMIT = 64 * 1024;
@@ -447,17 +447,24 @@ export function mountGroups(ctx, config, options = {}) {
     const drafter = createAgentDrafter({ llm, defaultModel: readDefaultModel });
     const promptAbort = new AbortController();
     if (typeof ctx.effect === 'function') ctx.effect(() => () => promptAbort.abort(), 'marshal: groups prompt lifetime');
+    const platformHash = async () => {
+        try {
+            const account = typeof ctx.get === 'function' ? ctx.get('deepseekAccount') : undefined;
+            const session = await account?.getPlatformSession?.();
+            if (session?.userId && session.origin === DSH_ACCOUNT_ORIGIN) return dshAccountHash(session.userId);
+        }
+        catch { /* no signed-in platform account */ }
+        return undefined;
+    };
     const memoryAuth = createMemoryHttpAuth({
         resolveOwner: async () => {
-            try {
-                const account = typeof ctx.get === 'function' ? ctx.get('deepseekAccount') : undefined;
-                const session = await account?.getPlatformSession?.();
-                if (session?.userId && session.origin === DSH_ACCOUNT_ORIGIN) return dshAccountHash(session.userId);
-            }
-            catch { /* the desktop owner falls back to this device */ }
-            const device = typeof config.deviceId === 'string' && config.deviceId !== '' ? config.deviceId : 'local';
-            return 'device:' + device;
+            const hash = await platformHash();
+            if (hash !== undefined) return hash;
+            if (typeof config.deviceId === 'string' && config.deviceId !== '') return 'device:' + config.deviceId;
+            return '';
         },
+        // Unknown install owner stays non-owner. A device id alone does not grant approval.
+        installOwner: async () => installOwnerFor(config, await platformHash()),
     });
     const service = createGroupService({
         root,

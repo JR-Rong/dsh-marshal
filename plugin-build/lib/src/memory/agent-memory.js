@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { atomicWriteFile, withFileLock } from '../hub/state-file.js';
 import { homedir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import { MemoryStore } from './sqlite-store.js';
@@ -38,8 +39,40 @@ function readTokenUsage(root, at) {
     catch { return { day, tokens: 0 }; }
 }
 
-function writeTokenUsage(root, usage) {
-    writeFileSync(join(root, 'summary-usage.json'), JSON.stringify(usage) + '\n');
+function usageFile(root) {
+    return join(root, 'summary-usage.json');
+}
+
+function mutateTokenUsage(root, at, change) {
+    const file = usageFile(root);
+    return withFileLock(file, () => {
+        const current = readTokenUsage(root, at);
+        const next = change(current);
+        const tokens = Math.max(0, Math.floor(Number(next.tokens) || 0));
+        atomicWriteFile(file, JSON.stringify({ day: next.day ?? current.day, tokens }) + '\n');
+        return { ...next, day: next.day ?? current.day, tokens };
+    });
+}
+
+/** Hold input+output budget before the model call so one request cannot pass the cap. */
+export function reserveSummaryBudget(root, at, cap, estimateIn) {
+    const input = Math.max(1, Math.floor(estimateIn) || 1);
+    return mutateTokenUsage(root, at, (usage) => {
+        const remaining = cap - usage.tokens;
+        if (!(cap > 0) || remaining <= input) return { ...usage, ok: false, maxTokens: 0, hold: 0 };
+        const maxTokens = Math.max(1, Math.min(1024, remaining - input));
+        const hold = input + maxTokens;
+        return { day: usage.day, tokens: Math.min(cap, usage.tokens + hold), ok: true, maxTokens, hold };
+    });
+}
+
+export function settleSummaryBudget(root, at, hold, actual, cap) {
+    const reserved = Math.max(0, Math.floor(hold) || 0);
+    const spent = Math.max(0, Math.min(reserved, Math.floor(actual) || 0));
+    return mutateTokenUsage(root, at, (usage) => ({
+        day: usage.day,
+        tokens: Math.max(0, Math.min(cap, usage.tokens - reserved + spent)),
+    }));
 }
 
 function tokensOf(usage, prompt, output) {
@@ -53,18 +86,21 @@ function tokensOf(usage, prompt, output) {
     return Math.max(1, Math.ceil((String(prompt).length + String(output).length) / 4));
 }
 
-function groupSessionIds(file) {
+function readGroupRoster(file) {
+    if (typeof file !== 'string' || file === '') return { ids: new Set(), status: 'unknown' };
     try {
+        if (!existsSync(file)) return { ids: new Set(), status: 'missing' };
         const parsed = JSON.parse(readFileSync(file, 'utf8'));
+        if (parsed === null || typeof parsed !== 'object' || !Array.isArray(parsed.groups)) return { ids: new Set(), status: 'unknown' };
         const ids = new Set();
-        for (const group of Array.isArray(parsed?.groups) ? parsed.groups : []) {
+        for (const group of parsed.groups) {
             for (const member of Array.isArray(group?.members) ? group.members : []) {
                 if (typeof member?.sessionId === 'string' && member.sessionId !== '') ids.add(member.sessionId);
             }
         }
-        return ids;
+        return { ids, status: 'ok' };
     }
-    catch { return new Set(); }
+    catch { return { ids: new Set(), status: 'unknown' }; }
 }
 
 function ledgerPath() {
@@ -195,7 +231,7 @@ function memoryBlock(service, identity) {
     }
     const lastUser = recentDialog(identity.session).filter(message => message.role === 'user').at(-1);
     const query = lastUser?.text ?? '';
-    const cacheKey = identity.sessionId ?? 'global';
+    const cacheKey = (identity.sessionId ?? 'global') + (group ? ':group' : ':direct');
     const cached = service.blockCache.get(cacheKey);
     if (cached !== undefined && cached.version === service.cacheVersion && topicSimilarity(cached.query, query) >= 0.65 && Date.now() - cached.at < 10 * 60_000) return cached.text;
     const entries = [];
@@ -236,9 +272,9 @@ function memoryBlock(service, identity) {
     return text;
 }
 
-async function streamModelText(llm, provider, model, prompt) {
+async function streamModelText(llm, provider, model, prompt, maxTokens) {
     if (typeof llm?.prepareCall !== 'function') throw new Error('no-summary-wrapper');
-    const prepared = await llm.prepareCall({ provider, model, maxTokens: 1024 });
+    const prepared = await llm.prepareCall({ provider, model, maxTokens: Math.max(1, Math.min(1024, maxTokens)) });
     const chunks = [];
     let usage;
     for await (const chunk of prepared.stream({
@@ -271,19 +307,23 @@ async function refineSession(service, session) {
     const text = dialog.map(message => (message.role === 'user' ? '用户：' : '助手：') + message.text.slice(0, 1600)).join('\n');
     const cap = Number(service.settings.dailyTokenCap);
     const at = typeof service.now === 'function' ? service.now() : Date.now();
-    const usage = readTokenUsage(service.store.root, at);
-    const underCap = Number.isFinite(cap) && cap > 0 && usage.tokens < cap;
-    if (underCap && service.llm !== undefined && service.settings.summaryProvider !== '' && service.settings.summaryModel !== '') {
+    if (Number.isFinite(cap) && cap > 0 && service.llm !== undefined && service.settings.summaryProvider !== '' && service.settings.summaryModel !== '') {
         const prompt = '你是记忆提炼器。把下面的对话提炼为最多 5 条值得长期记住的原子记忆。'
             + '只记录事实、偏好、决定、承诺、验收结论、踩坑经验；不要复述对话，不要编造。'
             + '没有值得记的就输出 []。格式：JSON 数组，元素包含 kind(fact|preference|promise|decision|event|feeling)、title、content、importance(0-100)、tags(array)。\n\n' + text;
-        try {
-            const result = await streamModelText(service.llm, service.settings.summaryProvider, service.settings.summaryModel, prompt);
-            writeTokenUsage(service.store.root, { day: usage.day, tokens: usage.tokens + result.tokens });
-            const parsed = parseMemoryArray(result.text);
-            if (parsed !== undefined) return parsed;
+        const estimateIn = Math.max(1, Math.ceil(prompt.length / 4));
+        const reserved = reserveSummaryBudget(service.store.root, at, cap, estimateIn);
+        if (reserved.ok) {
+            try {
+                const result = await streamModelText(service.llm, service.settings.summaryProvider, service.settings.summaryModel, prompt, reserved.maxTokens);
+                settleSummaryBudget(service.store.root, at, reserved.hold, result.tokens, cap);
+                const parsed = parseMemoryArray(result.text);
+                if (parsed !== undefined) return parsed;
+            }
+            catch {
+                settleSummaryBudget(service.store.root, at, reserved.hold, 0, cap);
+            }
         }
-        catch { /* fall through to local heuristic */ }
     }
     const summary = heuristicSummary(session);
     return summary === undefined ? [] : [{ kind: 'event', title: summary.title, content: summary.content, importance: 45, tags: summary.tags }];
@@ -394,16 +434,16 @@ export function agentMemoryTool(service) {
     };
 }
 
-export function createAgentMemoryService({ root, logger, deviceId, hubUrl, token, passphrase, now = Date.now, ledger, groupsFile, groupsRoot, fileText, fileMemory } = {}) {
+export function createAgentMemoryService({ root, logger, deviceId, hubUrl, token, passphrase, now = Date.now, ledger, groupsFile, groupsRoot, fileText, fileMemory, fetchImpl } = {}) {
     const store = new MemoryStore({ root, logger, now });
-    const sync = createMemorySyncClient({ hubUrl, token, passphrase, deviceId });
+    const sync = createMemorySyncClient({ hubUrl, token, passphrase, deviceId, fetchImpl });
     const resolvedGroupsFile = groupsFile ?? join(groupsRoot ?? join(homedir(), '.dsh-marshal', 'groups'), 'groups.json');
     const service = {
         store, deviceId, now, sync, ledger, groupsFile: resolvedGroupsFile,
         settings: readSettings(store.root), blockCache: new Map(), lastDecay: new Map(), cacheVersion: 1, llm: undefined,
     };
-    service.groupIds = () => groupSessionIds(service.groupsFile);
-    service.isGroup = identity => sessionIsGroup(identity, service.groupIds());
+    service.groupRoster = () => readGroupRoster(service.groupsFile);
+    service.isGroup = identity => sessionIsGroup(identity, service.groupRoster());
     service.fileText = identity => {
         if (typeof fileText === 'function') return fileText(identity) ?? '';
         const cwd = identity?.workspacePath;
@@ -463,7 +503,10 @@ export function createAgentMemoryService({ root, logger, deviceId, hubUrl, token
     service.listProposals = () => store.listProposals('pending');
     service.approveProposal = (id, edits) => {
         const result = store.approveProposal(id, edits);
-        if (result !== undefined) service.cacheVersion++;
+        if (result !== undefined) {
+            service.cacheVersion++;
+            if (typeof service.onApproved === 'function') service.onApproved(result.proposal, result.memory);
+        }
         return result;
     };
     service.rejectProposal = id => store.rejectProposal(id);
@@ -482,6 +525,8 @@ export function createAgentMemoryService({ root, logger, deviceId, hubUrl, token
         const scopes = [];
         if (agentId) scopes.push({ scope: 'agent', ownerId: agentId });
         if (workspaceId) scopes.push({ scope: 'workspace', ownerId: workspaceId });
+        // Approved global rows and their tombstones sync. Proposals stay on this machine.
+        scopes.push({ scope: 'global', ownerId: 'global' });
         return sync.sync(store, scopes);
     };
     service.forgetFor = ({ agentId, workspaceId, id }) => {

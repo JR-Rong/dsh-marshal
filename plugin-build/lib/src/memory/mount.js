@@ -40,10 +40,12 @@ export function createMemoryService({ root, logger, now = Date.now } = {}) {
                 };
             }
             case 'write': {
+                if ((args.scope ?? 'workspace') === 'global')
+                    return submitGlobalProposal(api, args.content, by, args.file ?? 'profile', action);
                 const result = store.write({
                     scope: args.scope ?? 'workspace',
                     file: args.file ?? 'notes',
-                    cwd: (args.scope ?? 'workspace') === 'global' ? undefined : needCwd(cwd),
+                    cwd: needCwd(cwd),
                     content: args.content,
                     by,
                 });
@@ -74,15 +76,51 @@ export function createMemoryService({ root, logger, now = Date.now } = {}) {
             case 'promote': {
                 if (typeof args.content !== 'string' || args.content.trim() === '')
                     throw new Error('marshal-memory: invalid-args: promote needs content');
-                const result = store.promote({ cwd, content: args.content, by });
-                return { ok: true, action, memory: result, text: `已沉淀到全局 profile` };
+                return submitGlobalProposal(api, args.content, by, 'profile', action);
             }
             default:
                 throw new Error(`marshal-memory: invalid-args: unknown action ${action}`);
         }
     };
 
-    return { store, handle, dir, injectionText: cwd => store.promptText(cwd) };
+    const api = {
+        store, dir, proposeGlobal: undefined,
+        injectionText: cwd => store.promptText(cwd),
+        handle,
+    };
+    return api;
+}
+
+function submitGlobalProposal(service, content, by, file, action) {
+    if (typeof content !== 'string' || content.trim() === '')
+        throw new Error('marshal-memory: invalid-args: content is required');
+    if (typeof service.proposeGlobal !== 'function')
+        throw new Error('marshal-memory: approval-required: global writes need the proposal queue');
+    const body = content.trim();
+    const proposal = service.proposeGlobal({
+        title: body.slice(0, 80),
+        content: body,
+        kind: 'profile',
+        tags: file === 'rules' ? ['file-profile', 'file-rules'] : ['file-profile'],
+        visibility: 'no-group',
+    }, { agentId: typeof by === 'string' && by !== '' ? by : 'file-memory' });
+    return {
+        ok: true, action,
+        text: '已提交全局记忆审批，机主同意前不会写入',
+        proposal,
+        memory: { proposed: true, id: proposal.id },
+    };
+}
+
+/** File-layer global writes become the same proposals. Approval persists profile.md. */
+export function attachFileProposals(fileService, agentService) {
+    if (fileService === undefined || agentService === undefined) return;
+    fileService.proposeGlobal = (entry, context) => agentService.store.propose(entry, context);
+    agentService.onApproved = (proposal, memory) => {
+        if (!Array.isArray(proposal?.tags) || !proposal.tags.includes('file-profile')) return;
+        const file = proposal.tags.includes('file-rules') ? 'rules' : 'profile';
+        fileService.store.write({ scope: 'global', file, content: memory.content, approved: true, by: 'owner' });
+    };
 }
 
 function formatStatus(status) {
@@ -100,9 +138,9 @@ const MEMORY_ACTIONS = ['status', 'read', 'write', 'handoff', 'check', 'list', '
 function memoryTool(service) {
     return {
         name: 'marshal_memory',
-        description: '两级文件记忆：global（跨工作区：rules 铁律 / profile 画像，保持短）+ workspace（每个工作区一份 handoff 交接 / notes 结论）。'
+        description: '两级文件记忆：workspace 交接和笔记可以直接写。global rules/profile 与 promote 只提交审批，机主同意前不会落盘。'
             + '收工或换会话前用 handoff 写 §〇（≤4 KB，五小节）；只记结论不记过程，单次写入 ≤10 行；'
-            + 'status 看当前工作区与全局摘要，check 做体检，promote 把跨工作区结论沉淀到全局。',
+            + 'status 看当前工作区与全局摘要，check 做体检。',
         parameters: {
             action: { type: 'string', required: true, enum: MEMORY_ACTIONS },
             scope: { type: 'string', enum: ['global', 'workspace'], description: '读写范围，默认 workspace。' },

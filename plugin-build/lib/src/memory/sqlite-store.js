@@ -7,7 +7,7 @@ import {
     hashEmbed, memorySearchText, vectorToBuffer,
 } from './hash-vector.js';
 import { neutralizeMemory, queryTerms } from './lifecycle.js';
-import { normalizeGlobalVisibility } from './policy.js';
+import { normalizeFact, normalizeGlobalVisibility } from './policy.js';
 
 const SCHEMA_VERSION = 1;
 const MAX_CONTENT = 20_000;
@@ -154,6 +154,7 @@ export class MemoryStore {
             CREATE TABLE IF NOT EXISTS memory_tombstones (
                 id TEXT PRIMARY KEY,
                 content_hash TEXT,
+                norm_hash TEXT,
                 updated_at INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS memory_proposals (
@@ -183,6 +184,8 @@ export class MemoryStore {
         }
         const current = db.prepare("SELECT value FROM memory_meta WHERE key='schema_version'").get();
         if (current === undefined) db.prepare("INSERT INTO memory_meta(key,value) VALUES('schema_version',?)").run(String(SCHEMA_VERSION));
+        const tombColumns = new Set(db.prepare('PRAGMA table_info(memory_tombstones)').all().map(row => row.name));
+        if (!tombColumns.has('norm_hash')) db.exec('ALTER TABLE memory_tombstones ADD COLUMN norm_hash TEXT');
         if (scope === 'global') {
             db.prepare("UPDATE memories SET visibility='no-group' WHERE visibility NOT IN ('all','no-group')").run();
             db.prepare("UPDATE memory_archive SET visibility='no-group' WHERE visibility NOT IN ('all','no-group')").run();
@@ -213,6 +216,7 @@ export class MemoryStore {
         const pinned = entry.pinned === true || kind === 'handoff' ? 1 : 0;
         const hash = contentHash(title, content);
         const db = this.db(scope, ownerId);
+        if (this.hashTombstoned(scope, ownerId, title, content)) return undefined;
         const existing = db.prepare('SELECT * FROM memories WHERE content_hash=?').get(hash);
         if (existing !== undefined) {
             const updated = nowMs(this.now);
@@ -274,8 +278,8 @@ export class MemoryStore {
             db.prepare('DELETE FROM memories_fts WHERE memory_id=?').run(String(id));
             db.prepare('DELETE FROM memory_vectors WHERE memory_id=?').run(String(id));
             db.prepare('DELETE FROM memories WHERE id=?').run(String(id));
-            db.prepare('INSERT OR REPLACE INTO memory_tombstones(id, content_hash, updated_at) VALUES(?,?,?)')
-                .run(String(id), row.content_hash, nowMs(this.now));
+            db.prepare('INSERT OR REPLACE INTO memory_tombstones(id, content_hash, norm_hash, updated_at) VALUES(?,?,?,?)')
+                .run(String(id), row.content_hash, contentHash(normalizeFact(row.title), normalizeFact(row.content)), nowMs(this.now));
             db.exec('COMMIT');
             return true;
         }
@@ -420,9 +424,21 @@ export class MemoryStore {
         return row !== undefined;
     }
 
+    hashTombstoned(scope, ownerId, title, content) {
+        const raw = contentHash(title, content);
+        const norm = contentHash(normalizeFact(title), normalizeFact(content));
+        const row = this.db(scope, ownerId).prepare(
+            'SELECT id FROM memory_tombstones WHERE content_hash=? OR norm_hash=? OR content_hash=? OR norm_hash=? LIMIT 1',
+        ).get(raw, raw, norm, norm);
+        return row !== undefined;
+    }
+
     exportTombstones(scope, ownerId) {
-        return this.db(scope, ownerId).prepare('SELECT id, content_hash AS contentHash, updated_at AS updatedAt FROM memory_tombstones ORDER BY updated_at ASC').all()
-            .map(row => ({ id: row.id, contentHash: row.contentHash ?? undefined, updatedAt: Number(row.updatedAt), tombstone: true, revision: Number(row.updatedAt) }));
+        return this.db(scope, ownerId).prepare('SELECT id, content_hash AS contentHash, norm_hash AS normHash, updated_at AS updatedAt FROM memory_tombstones ORDER BY updated_at ASC').all()
+            .map(row => ({
+                id: row.id, contentHash: row.contentHash ?? undefined, normHash: row.normHash ?? undefined,
+                updatedAt: Number(row.updatedAt), tombstone: true, revision: Number(row.updatedAt),
+            }));
     }
 
     applyTombstone(scope, ownerId, record) {
@@ -430,8 +446,11 @@ export class MemoryStore {
         if (id === '') return false;
         if (this.get(scope, ownerId, id) !== undefined) this.forget(scope, ownerId, id);
         const at = Number(record?.updatedAt ?? nowMs(this.now));
-        this.db(scope, ownerId).prepare('INSERT OR REPLACE INTO memory_tombstones(id, content_hash, updated_at) VALUES(?,?,?)')
-            .run(id, typeof record?.contentHash === 'string' ? record.contentHash : null, at);
+        const contentHashValue = typeof record?.contentHash === 'string' ? record.contentHash : null;
+        const normHash = typeof record?.normHash === 'string' ? record.normHash : null;
+        const existing = this.db(scope, ownerId).prepare('SELECT content_hash, norm_hash FROM memory_tombstones WHERE id=?').get(id);
+        this.db(scope, ownerId).prepare('INSERT OR REPLACE INTO memory_tombstones(id, content_hash, norm_hash, updated_at) VALUES(?,?,?,?)')
+            .run(id, contentHashValue ?? existing?.content_hash ?? null, normHash ?? existing?.norm_hash ?? null, at);
         return true;
     }
 

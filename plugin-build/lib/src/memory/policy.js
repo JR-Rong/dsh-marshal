@@ -13,15 +13,43 @@ export function globalMemoryVisible(item, group) {
     return group !== true;
 }
 
+const DIRECT_TYPES = new Set(['direct', 'solo', 'single', '1:1', '1on1']);
+const GROUP_TYPES = new Set(['group', 'discussion']);
+
+function headerOf(identity) {
+    const header = identity?.session?.header;
+    return header !== null && typeof header === 'object' ? header : undefined;
+}
+
+/**
+ * Fail closed. A session is not a group only when we positively know it is a
+ * 1:1: an explicit direct marker, or a readable group roster that does not
+ * contain its session id. Missing identity, an unreadable roster, or no
+ * session id without an explicit direct marker is treated as a group.
+ */
 export function sessionIsGroup(identity, groupSessionIds) {
-    if (identity === null || typeof identity !== 'object') return false;
-    if (identity.group === true || identity.sessionType === 'group') return true;
-    const header = identity.session?.header;
-    if (header !== null && typeof header === 'object') {
-        if (header.group === true || header.kind === 'group' || header.chat === 'group') return true;
-    }
-    const sessionId = identity.sessionId;
-    return typeof sessionId === 'string' && sessionId !== '' && groupSessionIds?.has(sessionId) === true;
+    const roster = groupSessionIds instanceof Set
+        ? { ids: groupSessionIds, status: 'ok' }
+        : (groupSessionIds !== null && typeof groupSessionIds === 'object' ? groupSessionIds : { ids: new Set(), status: 'unknown' });
+    const ids = roster.ids instanceof Set ? roster.ids : new Set();
+    const status = roster.status === 'ok' || roster.status === 'missing' ? roster.status : 'unknown';
+    if (identity === null || typeof identity !== 'object') return true;
+    const header = headerOf(identity);
+    const sessionType = typeof identity.sessionType === 'string' ? identity.sessionType : '';
+    const headerKind = typeof header?.kind === 'string' ? header.kind : '';
+    const headerChat = typeof header?.chat === 'string' ? header.chat : '';
+    if (identity.group === true || GROUP_TYPES.has(sessionType) || GROUP_TYPES.has(headerKind) || GROUP_TYPES.has(headerChat)
+        || header?.group === true || typeof identity.groupId === 'string' || typeof identity.session?.groupId === 'string'
+        || typeof identity.discussionId === 'string') return true;
+    const sessionId = typeof identity.sessionId === 'string' && identity.sessionId !== ''
+        ? identity.sessionId
+        : (typeof identity.session?.id === 'string' ? identity.session.id : '');
+    if (sessionId !== '' && ids.has(sessionId)) return true;
+    if (status === 'unknown') return true;
+    const explicitDirect = identity.group === false || header?.group === false
+        || DIRECT_TYPES.has(sessionType) || DIRECT_TYPES.has(headerKind) || DIRECT_TYPES.has(headerChat);
+    if (sessionId === '') return !explicitDirect;
+    return false;
 }
 
 export function normalizeFact(text) {

@@ -154,7 +154,7 @@ export class MemoryStore {
     }
 
     /** 追加写入（notes / global profile）。写回判据：≤10 行、≤2 KB、只记结论。 */
-    write({ scope = 'workspace', file = 'notes', cwd, content, by = null } = {}) {
+    write({ scope = 'workspace', file = 'notes', cwd, content, by = null, approved = false } = {}) {
         this.ensure();
         if (typeof content !== 'string' || content.trim() === '')
             throw new MemoryError('invalid-args', 'content is required');
@@ -164,11 +164,14 @@ export class MemoryStore {
         if (bytes(body) > MAX_WRITE_BYTES)
             throw new MemoryError('too-long', `keep one write to ${MAX_WRITE_BYTES} bytes`);
         if (scope === 'global') {
-            if (file !== 'profile')
-                throw new MemoryError('invalid-args', 'global writes go to profile (use promote for cross-workspace conclusions)');
-            const path = join(this.globalDir, 'profile.md');
+            if (approved !== true)
+                throw new MemoryError('approval-required', 'global file memory is only written after owner approval');
+            if (file !== 'profile' && file !== 'rules')
+                throw new MemoryError('invalid-args', 'global writes go to profile or rules');
+            const path = join(this.globalDir, file + '.md');
             const record = nowIso(this.now);
-            atomicWriteFile(path, `${readText(path) ?? SEED_PROFILE}\n- [${record}]${by === null ? '' : ` (${by})`} ${body}\n`);
+            const seed = file === 'rules' ? SEED_RULES : SEED_PROFILE;
+            atomicWriteFile(path, `${readText(path) ?? seed}\n- [${record}]${by === null ? '' : ` (${by})`} ${body}\n`);
             return { scope, file, path, bytes: bytes(body) };
         }
         if (file !== 'notes')

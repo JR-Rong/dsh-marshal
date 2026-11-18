@@ -46,7 +46,7 @@ export function createMemoryRoutes({ memory, auth, allowedOrigins } = {}) {
     const origins = () => typeof allowedOrigins === 'function' ? allowedOrigins() : allowedOrigins;
     const guard = (writeNeeded, handler, { owner = false, target = false } = {}) => async (req, res) => {
         if (memory === undefined || auth === undefined) { unavailable(res); return; }
-        const authn = auth.authenticate(req, { write: writeNeeded });
+        const authn = auth.authenticate(req, { write: writeNeeded, origins: origins() });
         if (!authn.ok) { write(res, authn.status, { ok: false, code: authn.code }); return; }
         if (owner && authn.session.owner !== true) { write(res, 403, { ok: false, code: 'owner-only' }); return; }
         let body;

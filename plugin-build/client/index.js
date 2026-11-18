@@ -900,7 +900,7 @@ window.__ModuleLoader__.load({
       return area + '失败：' + message;
     }
 
-    const MEMORY_CSRF_COOKIE = '__Host-marshal-memory-csrf';
+    const MEMORY_CSRF_COOKIE = 'marshal-memory-csrf';
     let memorySessionPromise;
     function readBrowserCookie(name) {
       const parts = String(document.cookie || '').split(';');

@@ -2,9 +2,27 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { agentsLedgerPath } from '../groups/inventory.js';
 
-export const MEMORY_SESSION_COOKIE = '__Host-marshal-memory-session';
-export const MEMORY_CSRF_COOKIE = '__Host-marshal-memory-csrf';
+/**
+ * Loopback memory cookies.
+ * `__Host-` + `Secure` was not verified to stick in the desktop WebView on
+ * http://127.0.0.1 (a headless Chrome probe of that origin did not complete, and
+ * Electron WebViews have dropped Secure cookies on plain HTTP). These names omit
+ * the `__Host-` prefix and the Secure flag so the WebView can store them.
+ * They are still SameSite=Strict, Path=/, and only issued to loopback.
+ */
+export const MEMORY_SESSION_COOKIE = 'marshal-memory-session';
+export const MEMORY_CSRF_COOKIE = 'marshal-memory-csrf';
+export const MEMORY_SESSION_ABSOLUTE_MS = 8 * 60 * 60 * 1000;
+export const MEMORY_SESSION_IDLE_MS = 30 * 60 * 1000;
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{16,128}$/;
+
+/** The install owner is the configured account hash, or the signed-in platform account. A device id is not an owner. */
+export function installOwnerFor(config, platformHash) {
+    const configured = config?.dshAccountHash;
+    if (typeof configured === 'string' && /^[a-f0-9]{64}$/.test(configured)) return configured;
+    if (typeof platformHash === 'string' && /^[a-f0-9]{64}$/.test(platformHash)) return platformHash;
+    return undefined;
+}
 
 export function isLoopbackAddress(address) {
     return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
@@ -34,7 +52,7 @@ export function readCookie(req, name) {
 }
 
 function cookiePair(name, value, httpOnly, maxAge) {
-    return `${name}=${value}; Path=/; Secure; SameSite=Strict${httpOnly ? '; HttpOnly' : ''}`
+    return `${name}=${value}; Path=/; SameSite=Strict${httpOnly ? '; HttpOnly' : ''}`
         + (maxAge === undefined ? '' : `; Max-Age=${maxAge}`);
 }
 
@@ -80,9 +98,18 @@ export function memoryTargetAllowed(session, target, ledger) {
     return true;
 }
 
-export function createMemoryHttpAuth({ now = Date.now, resolveOwner = async () => 'device:local', installOwner, loadLedger = readRawLedger, allowedOrigins = ['dsh-app://app'] } = {}) {
+export function createMemoryHttpAuth({ now = Date.now, resolveOwner = async () => '', installOwner, loadLedger = readRawLedger, allowedOrigins = ['dsh-app://app'], absoluteMs = MEMORY_SESSION_ABSOLUTE_MS, idleMs = MEMORY_SESSION_IDLE_MS } = {}) {
     const sessions = new Map();
     const token = () => randomBytes(32).toString('base64url');
+    const expectedOwner = async () => {
+        const value = typeof installOwner === 'function' ? await installOwner() : installOwner;
+        return typeof value === 'string' && value !== '' ? value : undefined;
+    };
+    const originAllowed = (req, origins) => {
+        const origin = headerValue(req, 'origin');
+        const list = Array.isArray(origins) ? origins : allowedOrigins;
+        return typeof origin === 'string' && origin !== '' && list.includes(origin);
+    };
     const csrfMatches = (req, session) => {
         const cookie = readCookie(req, MEMORY_CSRF_COOKIE);
         const header = headerValue(req, 'x-marshal-csrf');
@@ -102,14 +129,15 @@ export function createMemoryHttpAuth({ now = Date.now, resolveOwner = async () =
             if (!isLoopbackAddress(req.socket?.remoteAddress ?? '')) return { ok: false, status: 403, code: 'forbidden' };
             if (req.headers?.['sec-fetch-site'] === 'cross-site') return { ok: false, status: 403, code: 'forbidden' };
             if (headerValue(req, 'x-marshal-memory') !== '1') return { ok: false, status: 403, code: 'forbidden' };
-            const origin = headerValue(req, 'origin');
-            if (origin !== undefined && !origins.includes(origin)) return { ok: false, status: 403, code: 'forbidden' };
+            if (!originAllowed(req, origins)) return { ok: false, status: 403, code: 'forbidden' };
             const ownerId = await resolveOwner();
             if (typeof ownerId !== 'string' || ownerId === '') return { ok: false, status: 403, code: 'forbidden' };
+            const expected = await expectedOwner();
+            const at = now();
             const session = {
                 id: token(), csrf: token(), ownerId,
-                owner: installOwner === undefined || ownerId === installOwner,
-                createdAt: now(),
+                owner: expected !== undefined && ownerId === expected,
+                createdAt: at, lastSeenAt: at,
             };
             sessions.set(session.id, session);
             return {
@@ -120,13 +148,20 @@ export function createMemoryHttpAuth({ now = Date.now, resolveOwner = async () =
                 ],
             };
         },
-        authenticate(req, { write = false } = {}) {
+        authenticate(req, { write = false, origins = allowedOrigins } = {}) {
             if (!isLoopbackAddress(req.socket?.remoteAddress ?? '')) return { ok: false, status: 403, code: 'forbidden' };
             if (req.headers?.['sec-fetch-site'] === 'cross-site') return { ok: false, status: 403, code: 'forbidden' };
+            if (write && !originAllowed(req, origins)) return { ok: false, status: 403, code: 'forbidden' };
             const id = readCookie(req, MEMORY_SESSION_COOKIE);
             if (id === undefined || id === null) return { ok: false, status: 401, code: 'unauthorized' };
             const session = sessions.get(id);
             if (session === undefined) return { ok: false, status: 401, code: 'unauthorized' };
+            const at = now();
+            if (at - session.createdAt >= absoluteMs || at - session.lastSeenAt >= idleMs) {
+                sessions.delete(id);
+                return { ok: false, status: 401, code: 'unauthorized' };
+            }
+            session.lastSeenAt = at;
             if (write && !csrfMatches(req, session)) return { ok: false, status: 403, code: 'forbidden' };
             return { ok: true, session };
         },

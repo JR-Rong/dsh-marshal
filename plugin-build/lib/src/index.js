@@ -24,7 +24,7 @@ import { createAuditLog } from "./node/audit.js";
 import { createPrivacyProjector } from "./node/privacy.js";
 import { mountSetup } from "./setup.js";
 import { mountDispatch } from "./dispatch/mount.js";
-import { mountMemory } from "./memory/mount.js";
+import { attachFileProposals, mountMemory } from "./memory/mount.js";
 import { mountAgentMemory } from "./memory/agent-memory.js";
 import { mountGroups } from "./groups/mount.js";
 import { mountWorkspaceIdentity } from "./groups/workspace-identity.js";
@@ -417,6 +417,7 @@ function applyNode(ctx, config) {
         }
         try {
             agentMemoryService = mountAgentMemory(ctx, config, { logger: ctx.logger, fileMemory: memoryService });
+            attachFileProposals(memoryService, agentMemoryService);
         }
         catch (error) {
             ctx.logger.warn(`marshal: agent memory unavailable: ${errorName(error)}`);

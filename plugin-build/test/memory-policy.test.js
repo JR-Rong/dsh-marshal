@@ -177,12 +177,13 @@ test('summary uses prepareCall until the daily token cap, then the heuristic', a
         service.llm = llm;
         service.settings.summaryProvider = 'other';
         service.settings.summaryModel = 'memo';
-        service.settings.dailyTokenCap = 40;
+        service.settings.dailyTokenCap = 20000;
         const wrote = await service.summarizeSession(session());
         assert.equal(calls, 1);
         assert.equal(wrote, 1);
         const usage = JSON.parse(readFileSync(join(root, 'summary-usage.json'), 'utf8'));
         assert.equal(usage.tokens, 50);
+        service.settings.dailyTokenCap = usage.tokens;
         const second = await service.summarizeSession(session());
         assert.equal(calls, 1);
         assert.equal(second >= 1, true);
@@ -223,9 +224,14 @@ test('hub sync checks the device owner, keeps tombstones, and caps the file', as
         };
         const pull = (path, token) => call((req, res) => handleMemorySyncPull(req, res, deps), { path, headers: token === undefined ? {} : { authorization: 'Bearer ' + token }, remoteAddress: '203.0.113.8' });
         const legacy = await pull('/marshal/api/memory-sync/pull?scope=agent&ownerId=agent-1', 'token-op');
-        assert.equal(legacy.status, 200);
-        assert.equal(legacy.json.records.length, 1);
-        const stolen = await pull('/marshal/api/memory-sync/pull?scope=agent&ownerId=agent-1', 'token-a');
+        assert.equal(legacy.status, 401);
+        const before = await pull('/marshal/api/memory-sync/pull?scope=agent&ownerId=agent-1', 'token-a');
+        assert.equal(before.status, 200);
+        assert.equal(before.json.records.length, 0);
+        assert.equal(hub.migrateLegacy('acct-a').migrated, 1);
+        const claimed = await pull('/marshal/api/memory-sync/pull?scope=agent&ownerId=agent-1', 'token-a');
+        assert.equal(claimed.json.records.length, 1);
+        const stolen = await pull('/marshal/api/memory-sync/pull?scope=agent&ownerId=agent-1', 'token-b');
         assert.equal(stolen.status, 403);
         assert.equal(stolen.json.code, 'owner-mismatch');
         const anonymous = await pull('/marshal/api/memory-sync/pull?scope=agent&ownerId=agent-1');
@@ -315,7 +321,7 @@ test('memory HTTP binds the caller and requires owner CSRF for global approval',
         let who = 'owner-a';
         const auth = createMemoryHttpAuth({ resolveOwner: async () => who, installOwner: 'owner-a', loadLedger: () => book });
         const routes = new Map(createMemoryRoutes({ memory, auth }).map(route => [route.method + ' ' + route.path, route.handler]));
-        const opened = await call(routes.get('POST /marshal/memory/session'), { method: 'POST', headers: { 'x-marshal-memory': '1' } });
+        const opened = await call(routes.get('POST /marshal/memory/session'), { method: 'POST', headers: { 'x-marshal-memory': '1', origin: 'dsh-app://app' } });
         assert.equal(opened.status, 200);
         const cookies = cookieHeader(opened.headers['set-cookie']);
         const csrf = cookieValue(opened.headers['set-cookie'], MEMORY_CSRF_COOKIE);
@@ -329,24 +335,24 @@ test('memory HTTP binds the caller and requires owner CSRF for global approval',
         assert.equal(own.status, 200);
         const proposal = memory.store.propose({ title: '待审', content: '等待机主同意的全局事实', visibility: 'all' }, { agentId: 'agent-a' });
         const noCsrf = await call(routes.get('POST /marshal/memory/proposals/approve'), {
-            method: 'POST', headers: { cookie: cookies, 'content-type': 'application/json' }, body: JSON.stringify({ id: proposal.id }),
+            method: 'POST', headers: { cookie: cookies, 'content-type': 'application/json', origin: 'dsh-app://app' }, body: JSON.stringify({ id: proposal.id }),
         });
         assert.equal(noCsrf.status, 403);
         const approved = await call(routes.get('POST /marshal/memory/proposals/approve'), {
             method: 'POST',
-            headers: { cookie: cookies, 'content-type': 'application/json', 'x-marshal-csrf': csrf },
+            headers: { cookie: cookies, 'content-type': 'application/json', 'x-marshal-csrf': csrf, origin: 'dsh-app://app' },
             body: JSON.stringify({ id: proposal.id, text: '机主批准的全局事实', visibility: 'no-group' }),
         });
         assert.equal(approved.status, 200);
         assert.equal(approved.json.memory.visibility, 'no-group');
         who = 'owner-b';
-        const other = await call(routes.get('POST /marshal/memory/session'), { method: 'POST', headers: { 'x-marshal-memory': '1' } });
+        const other = await call(routes.get('POST /marshal/memory/session'), { method: 'POST', headers: { 'x-marshal-memory': '1', origin: 'dsh-app://app' } });
         const otherCookies = cookieHeader(other.headers['set-cookie']);
         const otherCsrf = cookieValue(other.headers['set-cookie'], MEMORY_CSRF_COOKIE);
         const next = memory.store.propose({ title: '另一条', content: '另一个账号不能审批', visibility: 'all' }, { agentId: 'agent-b' });
         const blocked = await call(routes.get('POST /marshal/memory/proposals/approve'), {
             method: 'POST',
-            headers: { cookie: otherCookies, 'content-type': 'application/json', 'x-marshal-csrf': otherCsrf },
+            headers: { cookie: otherCookies, 'content-type': 'application/json', 'x-marshal-csrf': otherCsrf, origin: 'dsh-app://app' },
             body: JSON.stringify({ id: next.id }),
         });
         assert.equal(blocked.status, 403);

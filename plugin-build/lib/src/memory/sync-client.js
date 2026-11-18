@@ -4,16 +4,29 @@ function weakClient() {
     return { async sync() { const error = new Error('weak-passphrase'); error.code = 'weak-passphrase'; throw error; } };
 }
 
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
+
+/** wss and https stay encrypted. Plain http is only allowed for loopback. */
+export function syncHttpBase(hubUrl) {
+    let url;
+    try { url = new URL(hubUrl); }
+    catch { return undefined; }
+    if (url.protocol === 'wss:') url.protocol = 'https:';
+    else if (url.protocol === 'https:') { /* already encrypted */ }
+    else if (url.protocol === 'http:') {
+        if (!LOOPBACK_HOSTS.has(url.hostname)) return undefined;
+    }
+    else return undefined;
+    if (url.host === '') return undefined;
+    return url.protocol + '//' + url.host;
+}
+
 export function createMemorySyncClient({ hubUrl, token, passphrase = process.env.DSH_MARSHAL_MEMORY_SYNC_KEY, deviceId, fetchImpl = fetch } = {}) {
     if (typeof passphrase !== 'string' || passphrase.trim() === '') return undefined;
     if (!passphraseAcceptable(passphrase)) return weakClient();
     if (typeof hubUrl !== 'string' || hubUrl === '' || typeof token !== 'string' || token === '') return undefined;
-    let base;
-    try {
-        const url = new URL(hubUrl);
-        base = (url.protocol === 'wss:' ? 'https:' : 'http:') + '//' + url.host;
-    }
-    catch { return undefined; }
+    const base = syncHttpBase(hubUrl);
+    if (base === undefined) return undefined;
     const legacyKey = syncKey(passphrase, LEGACY_SALT);
     const request = async (path, body) => {
         const response = await fetchImpl(base + path, {
@@ -73,6 +86,8 @@ export function createMemorySyncClient({ hubUrl, token, passphrase = process.env
                     ...store.exportRecords(scope, ownerId).map(record => encryptRecord(key, record, 'scrypt')),
                     ...store.exportTombstones(scope, ownerId).map(tomb => ({
                         id: tomb.id, updatedAt: tomb.updatedAt, revision: tomb.updatedAt, tombstone: true,
+                        ...(tomb.contentHash === undefined ? {} : { contentHash: tomb.contentHash }),
+                        ...(tomb.normHash === undefined ? {} : { normHash: tomb.normHash }),
                     })),
                 ];
                 if (records.length === 0 && salt === undefined) continue;
@@ -84,10 +99,12 @@ export function createMemorySyncClient({ hubUrl, token, passphrase = process.env
                     if (error.code !== 'salt-mismatch' || typeof error.payload?.salt !== 'string') throw error;
                     salt = error.payload.salt;
                     const retryKey = syncKey(passphrase, salt);
-                    const retried = [
+                        const retried = [
                         ...store.exportRecords(scope, ownerId).map(record => encryptRecord(retryKey, record, 'scrypt')),
                         ...store.exportTombstones(scope, ownerId).map(tomb => ({
                             id: tomb.id, updatedAt: tomb.updatedAt, revision: tomb.updatedAt, tombstone: true,
+                            ...(tomb.contentHash === undefined ? {} : { contentHash: tomb.contentHash }),
+                            ...(tomb.normHash === undefined ? {} : { normHash: tomb.normHash }),
                         })),
                     ];
                     result = await request('/marshal/api/memory-sync/push', { scope, ownerId, deviceId, records: retried, salt });

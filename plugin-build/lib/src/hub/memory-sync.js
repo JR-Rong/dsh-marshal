@@ -10,15 +10,19 @@ function emptyState() {
     return { version: 2, accounts: {} };
 }
 
-function accountOf(device, operatorId) {
+function accountOf(device) {
     if (device === undefined || device === null || device.revoked === true) return undefined;
     if (typeof device.ownerId === 'string' && device.ownerId !== '') return device.ownerId;
-    if (typeof operatorId !== 'string' || operatorId === '') return undefined;
-    return 'operator:' + operatorId;
+    return undefined;
 }
 
-export function accountOwnerForDevice(device, operatorId) {
-    return accountOf(device, operatorId);
+/** Unbound devices, including DeviceStore.add() rows with no ownerId, are isolated. */
+export function accountOwnerForDevice(device) {
+    return accountOf(device);
+}
+
+function knownScope(scope) {
+    return scope === 'agent' || scope === 'workspace' || scope === 'global';
 }
 
 function bindingKey(scope, memoryOwnerId) {
@@ -42,18 +46,27 @@ function ensureAccount(state, accountOwner) {
 }
 
 function claimLegacy(state, accountOwner) {
-    if (!accountOwner.startsWith('operator:') || state.legacyRecords === undefined || state.legacyClaimedBy !== undefined) return;
+    if (typeof accountOwner !== 'string' || accountOwner === '' || accountOwner.startsWith('operator:')) {
+        const error = new Error('owner-mismatch'); error.code = 'owner-mismatch'; throw error;
+    }
+    if (state.legacyRecords === undefined) return 0;
+    if (state.legacyClaimedBy !== undefined && state.legacyClaimedBy !== accountOwner) {
+        const error = new Error('owner-mismatch'); error.code = 'owner-mismatch'; throw error;
+    }
     const bucket = ensureAccount(state, accountOwner);
+    let migrated = 0;
     for (const record of Object.values(state.legacyRecords)) {
         if (record === null || typeof record !== 'object' || typeof record.id !== 'string') continue;
-        if (record.scope !== 'agent' && record.scope !== 'workspace') continue;
+        if (!knownScope(record.scope)) continue;
         if (typeof record.ownerId !== 'string' || record.ownerId === '') continue;
         const key = recordKey(record.scope, record.ownerId, record.id);
         bucket.records[key] = { ...record, kdf: record.kdf === 'scrypt' ? 'scrypt' : 'legacy' };
         bucket.bindings[bindingKey(record.scope, record.ownerId)] = true;
+        migrated++;
     }
     state.legacyClaimedBy = accountOwner;
     delete state.legacyRecords;
+    return migrated;
 }
 
 function boundAccount(state, scope, memoryOwnerId) {
@@ -111,14 +124,13 @@ export function createHubMemorySync({ file, now = Date.now, maxBytes = MEMORY_SY
         if (typeof accountOwner !== 'string' || accountOwner === '') {
             const error = new Error('owner-mismatch'); error.code = 'owner-mismatch'; throw error;
         }
-        if (scope !== 'agent' && scope !== 'workspace') {
+        if (!knownScope(scope)) {
             const error = new Error('invalid-args'); error.code = 'invalid-args'; throw error;
         }
         if (typeof memoryOwnerId !== 'string' || memoryOwnerId === '') {
             const error = new Error('invalid-args'); error.code = 'invalid-args'; throw error;
         }
         return mutate(state => {
-            claimLegacy(state, accountOwner);
             const bound = boundAccount(state, scope, memoryOwnerId);
             if (bound !== undefined && bound !== accountOwner) {
                 const error = new Error('owner-mismatch'); error.code = 'owner-mismatch'; throw error;
@@ -159,6 +171,8 @@ export function createHubMemorySync({ file, now = Date.now, maxBytes = MEMORY_SY
                         revision: Number(record.revision ?? record.updatedAt ?? now()),
                         updatedAt: Number(record.updatedAt ?? now()),
                         tombstone: true, kdf: 'tombstone', nonce: '', tag: '', ciphertext: '',
+                        contentHash: typeof record.contentHash === 'string' ? record.contentHash : '',
+                        normHash: typeof record.normHash === 'string' ? record.normHash : '',
                     };
                     accepted++;
                     continue;
@@ -185,12 +199,10 @@ export function createHubMemorySync({ file, now = Date.now, maxBytes = MEMORY_SY
         if (typeof accountOwner !== 'string' || accountOwner === '') {
             const error = new Error('owner-mismatch'); error.code = 'owner-mismatch'; throw error;
         }
-        if (scope !== 'agent' && scope !== 'workspace') {
+        if (!knownScope(scope)) {
             const error = new Error('invalid-args'); error.code = 'invalid-args'; throw error;
         }
         return mutate(state => {
-            const before = state.legacyClaimedBy;
-            claimLegacy(state, accountOwner);
             const bound = boundAccount(state, scope, memoryOwnerId);
             if (bound !== undefined && bound !== accountOwner) {
                 const error = new Error('owner-mismatch'); error.code = 'owner-mismatch'; throw error;
@@ -200,10 +212,15 @@ export function createHubMemorySync({ file, now = Date.now, maxBytes = MEMORY_SY
                 .filter(record => record.scope === scope && record.ownerId === memoryOwnerId && Number(record.updatedAt) > Number(since))
                 .sort((a, b) => a.updatedAt - b.updatedAt)
                 .slice(0, MAX_PUSH);
-            return { write: state.legacyClaimedBy !== before, value: { records, salt: bucket?.salt ?? null } };
+            return { write: false, value: { records, salt: bucket?.salt ?? null } };
         });
     };
-    return { push, pull, read, file, maxBytes };
+    /** Explicit migration. Push and pull never claim leftover v1 records. */
+    const migrateLegacy = (accountOwner) => mutate(state => {
+        const migrated = claimLegacy(state, accountOwner);
+        return { write: migrated > 0, value: { migrated } };
+    });
+    return { push, pull, migrateLegacy, read, file, maxBytes };
 }
 
 function readBody(req, limit) {
@@ -246,12 +263,12 @@ export async function handleMemorySyncPush(req, res, { memorySync, deviceFromReq
     if (memorySync === undefined) { send(res, 503, { ok: false, code: 'memory-sync-unavailable' }); return; }
     if (req.method !== 'POST') { res.writeHead(405, { allow: 'POST', 'cache-control': 'no-store' }).end(); return; }
     const device = deviceFromRequest(req);
-    const accountOwner = accountOwnerForDevice(device, operatorId);
+    const accountOwner = accountOwnerForDevice(device);
     if (device === undefined || accountOwner === undefined) { send(res, 401, { ok: false, code: 'unauthorized' }); return; }
     let body;
     try { body = await readBody(req, 512 * 1024); }
     catch (error) { fail(res, error?.code === 'size-limit' ? error : Object.assign(new Error('invalid-args'), { code: 'invalid-args' })); return; }
-    const scope = body?.scope === 'workspace' ? 'workspace' : body?.scope === 'agent' ? 'agent' : undefined;
+    const scope = body?.scope === 'workspace' ? 'workspace' : body?.scope === 'agent' ? 'agent' : body?.scope === 'global' ? 'global' : undefined;
     const memoryOwnerId = typeof body?.ownerId === 'string' ? body.ownerId : '';
     if (scope === undefined || memoryOwnerId === '') { send(res, 400, { ok: false, code: 'invalid-args' }); return; }
     try {
@@ -268,12 +285,13 @@ export function handleMemorySyncPull(req, res, { memorySync, deviceFromRequest, 
     if (memorySync === undefined) { send(res, 503, { ok: false, code: 'memory-sync-unavailable' }); return; }
     if (req.method !== 'GET') { res.writeHead(405, { allow: 'GET', 'cache-control': 'no-store' }).end(); return; }
     const device = deviceFromRequest(req);
-    const accountOwner = accountOwnerForDevice(device, operatorId);
+    const accountOwner = accountOwnerForDevice(device);
     if (device === undefined || accountOwner === undefined) { send(res, 401, { ok: false, code: 'unauthorized' }); return; }
     let url;
     try { url = new URL(req.url ?? '/', 'http://localhost'); }
     catch { send(res, 400, { ok: false, code: 'invalid-args' }); return; }
-    const scope = url.searchParams.get('scope') === 'workspace' ? 'workspace' : url.searchParams.get('scope') === 'agent' ? 'agent' : undefined;
+    const requested = url.searchParams.get('scope');
+    const scope = requested === 'workspace' ? 'workspace' : requested === 'agent' ? 'agent' : requested === 'global' ? 'global' : undefined;
     const memoryOwnerId = url.searchParams.get('ownerId') ?? '';
     if (scope === undefined || memoryOwnerId === '') { send(res, 400, { ok: false, code: 'invalid-args' }); return; }
     const since = Number(url.searchParams.get('since')) || 0;
