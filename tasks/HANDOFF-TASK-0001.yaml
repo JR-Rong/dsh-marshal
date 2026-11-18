@@ -1,7 +1,7 @@
 ticket: T-000001
 task: TASK-0001
 baseline: 96018a922823507122f7bf128606a1ae03211a38
-updated_at: 2026-11-18T01:56:00-08:00
+updated_at: 2026-11-18T02:05:00-08:00
 
 done:
   - superagent 主机模块：settings / state / agents / memory / prompt / dispatch / extension / mount
@@ -22,13 +22,14 @@ unverified:
   - 高于看板会话默认权限的成员：权限闸门真实提示与人工确认流程
   - 手机/远端建卡：当前不自动触发，仅控制页人工补派
   - 两轮盲审在 84dd00b 上判 fail；第三轮在 bdcad3a 上复核：仅 B1 未闭环（本机进程伪造请求头），B2/B3/A8/A10/A5 均 fixed
-  - B1 已开待批 EXC-0001（本机进程信任边界）；未获皇上批准前不判 A12 覆盖，不宣称盲审通过
+  - B1 已获皇上批准 EXC-0001（2026-11-18）：本机进程伪造全部请求头不在信任边界内；第三轮唯一阻塞按例外结案，其余 fixed
   - GUI 按钮点击未自动化：真机走的是与 hook 等价的 HTTP 请求；hook 本身有单测
-  - 第三轮盲审的 B1：需皇上批准 EXC-0001，或改浏览器 WebCrypto 密钥签名
+  - GUI 点击验收：皇上已选“亲点一张根卡”，候皇上操作后臣验 Running/会话/记忆
 
 decisions:
   - ADR-0001：轻量桥 + 看板原生 run + 显式记忆读写；不 fork 第三方看板
-  - 默认 agent 设为丞相，卡片标签 @某官 覆盖
+  - 默认 agent 只在本机配置为丞相（代码默认空，不写死个人名），卡片标签 @某官 覆盖
+  - PR #4 保持 OPEN，由皇上自己审，不自动合并；本机保留 0.1.0 backport
   - live 0.1.0 只回填同一模块，不整体升级到 0.2.1，避免改动皇上现有 UI
   - 盲审 B1/B2/A11/A8/A10 已修：human/config/dispatch 路由要求 Origin + Sec-Fetch-Site + 回环 Host；模型工具只读；配置/补派走 /marshal-superagent 控制页；settle 尊重 enabled；memoryLimit 硬上限 6；memory-pending 可重试
 
@@ -47,6 +48,6 @@ traps:
   - live 备份后缀 .bak-20261118-superagent
 
 blocked_on:
-  need: B1 信任边界（批 EXC-0001 或改浏览器密钥签名）+ GUI 点击体验验收
+  need: 皇上亲手点一张根卡的 GUI 验收
   owner: 皇上
   due: 2026-11-18
