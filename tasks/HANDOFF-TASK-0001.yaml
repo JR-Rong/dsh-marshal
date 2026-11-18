@@ -1,7 +1,7 @@
 ticket: T-000001
 task: TASK-0001
 baseline: 96018a922823507122f7bf128606a1ae03211a38
-updated_at: 2026-11-18T01:17:00-08:00
+updated_at: 2026-11-18T01:40:00-08:00
 
 done:
   - superagent 主机模块：settings / state / agents / memory / prompt / dispatch / extension / mount
@@ -10,16 +10,18 @@ done:
   - 本机路由：/marshal-superagent 控制页、/api/human-create、/api/config、/api/dispatch、/api/agents、/api/status、/health
   - 代码提交 bdcad3a（基线 96018a9）；66 条测试全绿
   - evidence RUN-20261118-011602（superagent-unit）、RUN-20261118-011603（regression），HEAD bdcad3a PASS
+  - 真机验收：卡片 20469794-3c17-4c6d-a229-5296971084cb → 执行 7e47e297 → session-f3c7d3f7 → succeeded；记忆 memoryWritten:true；记录见 docs/specs/E2E-2026-11-18-superagent-bridge.md
+  - 最终代码在 56120 复验：控制页 200、缺 Origin/cross-site 403、工具 config 被拒、默认丞相
   - tarball plugin-build/dsh-marshal-0.2.1-superagent.1.tgz
   - 本机 live 0.1.0 已备份并回填同一模块；settings 默认丞相
 
 unverified:
-  - DSH 重启/禁用启用后的真机链路：GUI 新建根卡 → Running → 卡片会话 → 记忆新增
+  - GUI 按钮点击的最终体验验收（本次真机走的是与 hook 等价的两次 HTTP 请求；hook 本身有单测）
   - 0.2.1 tarball 在干净 profile 的安装（当前 profile 仍是 0.1.0 link）
   - 高于看板会话默认权限的成员：权限闸门真实提示与人工确认流程
   - 手机/远端建卡：当前不自动触发，仅控制页人工补派
-  - 两轮独立盲审均判 fail：B1 路由可被本机伪造、B2/A11 关桥仍写记忆、工具面可强制派发；B1/B2 与工具面已修，仍需二次盲审复核；A1/A6/A7 真机证据仍缺
-  - 真机端到端仍未执行：需重启/禁用启用后由皇上建卡验收
+  - 两轮独立盲审在 84dd00b 上判 fail：B1 路由可被本机伪造、B2/A11 关桥仍写记忆、工具面可强制派发；B1/B2 与工具面已修到 bdcad3a，第三轮复核进行中，尚无 pass
+  - GUI 按钮点击未自动化：真机走的是与 hook 等价的 HTTP 请求；hook 本身有单测
 
 decisions:
   - ADR-0001：轻量桥 + 看板原生 run + 显式记忆读写；不 fork 第三方看板
@@ -28,10 +30,9 @@ decisions:
   - 盲审 B1/B2/A11/A8/A10 已修：human/config/dispatch 路由要求 Origin + Sec-Fetch-Site + 回环 Host；模型工具只读；配置/补派走 /marshal-superagent 控制页；settle 尊重 enabled；memoryLimit 硬上限 6；memory-pending 可重试
 
 next:
-  - 在 Plugins 里 disable → enable dsh-marshal（或重启 DSH），刷新页面
-  - 新建一张根卡，确认 Running 与卡片会话；结算后查 agent 记忆
+  - 最终代码已在 56120 重新加载；皇上可手点一张根卡做 GUI 体验验收
   - 再建一张带 @工部尚书 的卡，确认覆盖
-  - 控制页 http://127.0.0.1:63125/marshal-superagent 可改默认/开关/补派
+  - 控制页 http://127.0.0.1:56120/marshal-superagent 可改默认/开关/补派
   - 证据补入库：git add evidence && git commit；提交后 HEAD 会越过被验证的 bdcad3a，验证需按 manifest 的 commit 读
   - PR：https://github.com/JR-Rong/dsh-marshal/pull/4
 
@@ -43,6 +44,6 @@ traps:
   - live 备份后缀 .bak-20261118-superagent
 
 blocked_on:
-  need: 本机重启/禁用启用后的真机验收
-  owner: 皇上
+  need: 第三轮独立盲审结论 + GUI 点击体验验收
+  owner: 皇上 / 门下省
   due: 2026-11-18
