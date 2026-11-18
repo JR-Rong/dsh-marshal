@@ -6,7 +6,7 @@
 
 当前可安装产物只有：
 
-- `plugin-build/dsh-marshal-0.2.0-agent-groups.2.tgz`（推荐，依赖会由 pnpm 安装）
+- `plugin-build/dsh-marshal-0.2.1-superagent.1.tgz`（推荐，依赖会由 pnpm 安装）
 - 或 `plugin-build/` 目录（需要先在那里执行 `pnpm install --prod`）
 
 ## 依赖（务必先看）
@@ -38,7 +38,7 @@ Desktop 没有 `dsh` 命令时：打开 **Plugins → Add plugin**，搜索并�
 
 1. 打开 DeepSeek Harness；
 2. 左侧 **Plugins** → **Add plugin / 添加插件**；
-3. 选择本仓库的 `plugin-build/dsh-marshal-0.2.0-agent-groups.2.tgz`；
+3. 选择本仓库的 `plugin-build/dsh-marshal-0.2.1-superagent.1.tgz`；
 4. 启用后重启 DSH；打开侧边栏 **调度官**。
 
 Desktop 的插件管理器会做安装和链接；不需要也不保证有全局 `dsh` 命令。
@@ -48,7 +48,7 @@ Desktop 的插件管理器会做安装和链接；不需要也不保证有全局
 如果当前环境有 `dsh`：
 
 ```bash
-dsh plugin --profile desktop add "$(pwd)/plugin-build/dsh-marshal-0.2.0-agent-groups.2.tgz"
+dsh plugin --profile desktop add "$(pwd)/plugin-build/dsh-marshal-0.2.1-superagent.1.tgz"
 ```
 
 tarball 会由 pnpm 正常安装依赖（zod / ws / marked / entities）。不要用 `link:` 指到工作区目录：工作区一移动插件就坏，而且链接安装不会自动安装依赖。
@@ -77,7 +77,7 @@ GET /marshal/health
 {
   "ok": true,
   "name": "dsh-marshal",
-  "version": "0.2.0-agent-groups.2",
+  "version": "0.2.1-superagent.1",
   "capabilities": {
     "groups": true,
     "agents": true,
@@ -91,6 +91,23 @@ GET /marshal/health
 - `agents: false`：缺少 `@linxin666/dsh-agents`，或它没有挂载 `/dsh-agents` API；
 - `taskBoardSource: "local"`：没有宿主 task-board，正在用内置轻量看板；
 - `crossGroups: false`：当前 node 没有配置 hubUrl/token。
+
+## Super-agent 人工派发桥（0.2.1+）
+
+装好后先配置默认智能体（名字取自「智能体」页；也可用成员 id）：
+
+```text
+marshal_superagent action=config defaultAgent=工部尚书
+```
+
+然后在任务看板 GUI 新建一张根卡：marshal 会自动调用看板原生 run，把卡片交给该智能体。卡片标签写 `@丞相` 可临时改派。
+
+- 只认 GUI 新建；agent 用工具建卡不会触发。
+- 默认只派发根卡；要派发子卡，配置 `rootOnly=false`。
+- 结算后写回该智能体记忆；派发时注入最多 6 条相关记忆。
+- 状态：`GET /marshal-superagent/health`，或 `marshal_superagent action=status`。
+- 关闭：`marshal_superagent action=config enabled=false`。
+- 手机/远端建卡不会自动触发；用 `marshal_superagent action=dispatch taskId=<卡 id>` 补派。
 
 ## 常见问题
 

@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "tier_default": "P2",
+  "escalate_paths": {
+    "P2": ["plugin-build/lib/src/superagent/", "plugin-build/client/superagent-hook.js", "plugin-build/client/index.js"],
+    "P0": ["plugin-build/lib/src/superagent/permissions.js"]
+  },
+  "suites": {
+    "superagent-unit": [
+      "plugin-build/test/superagent-*.test.js",
+      "plugin-build/lib/src/superagent/**/*.js",
+      "plugin-build/client/superagent-hook.js"
+    ],
+    "regression": ["plugin-build/test/*.test.js"]
+  },
+  "checks": [
+    { "id": "superagent-unit", "cmd": "node --test plugin-build/test/superagent-*.test.js", "suite": "superagent-unit", "tier": "P2" },
+    { "id": "regression", "cmd": "node --test plugin-build/test/*.test.js", "suite": "regression", "tier": "P2" }
+  ],
+  "ready_check": "node --test plugin-build/test/superagent-*.test.js --test-name-pattern=settings",
+  "evidence": {
+    "store": ".evidence-store",
+    "max_age_days": { "P3": 14, "P2": 7, "P1": 3, "P0": 1 },
+    "retention_days": 90
+  },
+  "human_budget_minutes": { "P3": 3, "P2": 30 }
+}

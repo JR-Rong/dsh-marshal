@@ -1,0 +1,71 @@
+task_id: TASK-0001
+ticket: T-000001
+card: CARD-0001
+spec: SPC-0001
+spec_inline: false
+owner: dsh
+worker: dsh
+model_route: backend-default
+role: executor
+tier: P2
+baseline: 96018a922823507122f7bf128606a1ae03211a38
+
+goal: 在 dsh-marshal 插件内交付「任务看板人工新建工单 → 按默认/标签唤醒指定智能体 → 看板原生执行会话开发 → 工作摘要写回该智能体长期记忆」的派发桥，附测试与 tarball。
+
+scope:
+  - plugin-build/lib/src/superagent/**
+  - plugin-build/lib/src/index.js
+  - plugin-build/client/superagent-hook.js
+  - plugin-build/client/index.js
+  - plugin-build/test/superagent-*.test.js
+  - plugin-build/package.json
+  - plugin-build/README.md
+  - plugin-build/INSTALL.md
+  - docs/specs/SPC-0001-task-board-superagent.md
+  - docs/adr/ADR-0001-task-board-superagent.md
+  - tasks/TASK-0001.yaml
+  - project.json
+  - evidence/TASK-0001/**
+
+core_paths:
+  - plugin-build/lib/src/superagent/
+  - plugin-build/client/superagent-hook.js
+  - plugin-build/lib/src/index.js
+
+non_goals:
+  - 不改第三方看板/智能体源码
+  - 不做 LLM Router 自动决策
+  - 不做远端/手机自动触发
+  - 不自动确认权限
+  - 不替换现有 dispatch/groups/memory
+
+dependencies:
+  - 看板扩展契约 v1
+  - dsh-agents 账本只读
+  - dsh-marshal 记忆服务 rememberFor/listFor
+
+acceptance:
+  - 见 SPC-0001 §4 A1–A14
+
+verification:
+  - node --test plugin-build/test/superagent-*.test.js
+  - node --test plugin-build/test/*.test.js
+
+deliverables:
+  - superagent 主机模块与浏览器 hook
+  - 单测与回归结果
+  - manifest 与 digest
+  - dsh-marshal-0.2.1-superagent.1.tgz
+  - 交接包
+
+limits:
+  timebox_hours: 8
+  budget_tokens: 400000
+  retry_max: 2
+
+escalation:
+  - 需要改第三方看板/智能体源码
+  - 需要绕过权限闸门
+  - 连续两次验证失败
+
+lessons: []
