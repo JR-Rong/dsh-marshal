@@ -1,0 +1,7 @@
+# TASK-0001 / EVD-TASK-0001-20261118021706
+commit e0149b6258aa clean
+cmd '/Users/rongjianrui/.dsh/dsh-runtimes/dsh-primary-runtime/dependencies/node/bin/node' --te exit=0
+stdout sha256 2725700c1f4fda07 5338B
+suite regression files=9 sha abe34747cdc7029c
+env darwin-arm64 python 3.12.14
+runner evd 2026-11-18T02:17:06.806996-08:00

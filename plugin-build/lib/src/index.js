@@ -28,6 +28,7 @@ import { attachFileProposals, mountMemory } from "./memory/mount.js";
 import { mountAgentMemory } from "./memory/agent-memory.js";
 import { mountGroups } from "./groups/mount.js";
 import { mountWorkspaceIdentity } from "./groups/workspace-identity.js";
+import { mountSuperagent } from "./superagent/mount.js";
 export const name = 'marshal';
 export function apply(ctx, raw) {
     mountSetup(ctx, raw, applyConfigured);
@@ -444,6 +445,12 @@ function applyNode(ctx, config) {
         catch (error) {
             ctx.logger.warn(`marshal: workspace identity unavailable: ${errorName(error)}`);
         }
+    }
+    try {
+        mountSuperagent(ctx, config, { logger: ctx.logger, memory: agentMemoryService });
+    }
+    catch (error) {
+        ctx.logger.warn(`marshal: superagent unavailable: ${errorName(error)}`);
     }
     ctx.effect(() => () => {
         discussions?.dispose();

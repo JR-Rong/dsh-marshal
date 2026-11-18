@@ -1,0 +1,40 @@
+{
+  "evidence_id": "EVD-TASK-0001-20261118051240",
+  "task": "TASK-0001",
+  "ticket": null,
+  "spec": "SPC-0001",
+  "tier": "P2",
+  "commit": "8ca45d623d8e6ae7b687882a3bba218122243a5c",
+  "dirty": false,
+  "env": {
+    "os": "darwin-arm64",
+    "python": "3.12.14",
+    "locks": {
+      "pnpm-lock.yaml": "398d37ac0c6abef07472d7339367af3c110d3402722dab8d6206d407700b2705"
+    }
+  },
+  "suites": [
+    {
+      "name": "superagent-unit",
+      "files": 16,
+      "sha256": "7ec040ad273de578ca5022fdcaadcb798911349956476bd89536be8c723f89c0"
+    }
+  ],
+  "commands": [
+    {
+      "cmd": "'/Users/rongjianrui/.dsh/dsh-runtimes/dsh-primary-runtime/dependencies/node/bin/node' --test plugin-build/test/superagent-*.test.js",
+      "exit": 0,
+      "stdout": ".evidence-store/TASK-0001/RUN-20261118-051240-bd434d/stdout.log",
+      "stdout_sha256": "80e626356f2bcfc64cdd42366f4ec2207458627804e0c163caf85ffbaf136d5c",
+      "stdout_bytes": 3943,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "produced_by": {
+    "runner": "evd/0.1",
+    "user": "rongjianrui",
+    "worker": "dsh",
+    "model": "deepseek-account/deepseek-flash"
+  },
+  "issued_at": "2026-11-18T05:12:40.993623-08:00"
+}

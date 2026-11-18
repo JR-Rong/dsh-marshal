@@ -1,7 +1,7 @@
 {
   "name": "dsh-marshal",
-  "version": "0.2.0-agent-groups.2",
-  "description": "Cross-device agent groups with resident DSH sessions, task board and memory.",
+  "version": "0.2.1-superagent.1",
+  "description": "Cross-device agent groups with resident DSH sessions, task board, memory and a human-created-card superagent bridge.",
   "icon": "icon.svg",
   "type": "module",
   "engines": { "node": ">=24" },

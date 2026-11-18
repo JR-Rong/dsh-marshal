@@ -1,0 +1,55 @@
+ticket: T-000001
+task: TASK-0001
+baseline: 96018a922823507122f7bf128606a1ae03211a38
+updated_at: 2026-11-18T05:15:00-08:00
+
+done:
+  - superagent 主机模块：settings / state / agents / memory / prompt / dispatch / extension / mount
+  - 浏览器 human-create observer（独立源 + 已追加到 client bundle）
+  - marshal_superagent 工具：status / agents / reconcile（只读）
+  - 本机路由：/marshal-superagent 控制页、/api/human-create、/api/config、/api/dispatch、/api/agents、/api/status、/health
+  - 第二次复审修复：DSH connection 签名 cookie admission + Host 回环；status/agents Host 门禁；bundle 由构建脚本刷新并测实际 bundle；改派重算当前身份/清理旧标签；72 条测试全绿
+  - 代码 commit 8ca45d6；evidence RUN-20261118-051240（unit）、RUN-20261118-051241（regression）在 8ca45d6 PASS
+  - 真机验收：卡片 20469794-3c17-4c6d-a229-5296971084cb → 执行 7e47e297 → session-f3c7d3f7 → succeeded；记忆 memoryWritten:true；记录见 docs/specs/E2E-2026-11-18-superagent-bridge.md
+  - 最终代码在 56120 复验：控制页 200、缺 Origin/cross-site 403、工具 config 被拒、默认丞相
+  - 真机 A3：agent 用 task_board_create 建卡 9f2958f1-2b68-4af7-aa58-f1d3cac14381，2.5s 后仍 todo/0 execution，桥 records 未增；已删除测试卡
+  - GUI 真机验收通过：皇上在 62150 点「创建」建卡 d7103e7e「测试gui」；桥自动派发，execution 33c73544 / session-30f5ccc8，结果 succeeded，memoryWritten=true；记忆 episode「工单「测试gui」完成」已写入
+  - tarball plugin-build/dsh-marshal-0.2.1-superagent.1.tgz
+  - 本机 live 0.1.0 已备份并回填同一模块；settings 默认丞相
+
+unverified:
+  - 0.2.1 tarball 在干净 profile 的安装（当前 profile 仍是 0.1.0 link）
+  - 高于看板会话默认权限的成员：权限闸门真实提示与人工确认流程
+  - 手机/远端建卡：当前不自动触发，仅控制页人工补派
+  - 本机 live 已同步新守卫，但 DSH 运行进程尚未重启；重启后需实测无 cookie 的 /api 通知 403、Host: evil 的 /status 403
+  - 两轮盲审在 84dd00b 上判 fail；第三轮在 bdcad3a 上复核：仅 B1 未闭环（本机进程伪造请求头），B2/B3/A8/A10/A5 均 fixed
+  - B1 已获皇上批准 EXC-0001（2026-11-18）：本机进程伪造全部请求头不在信任边界内；第三轮唯一阻塞按例外结案，其余 fixed
+  - GUI 第一次「创建并执行」与第二次旧 hook 未触发属历史，已由 62150 完整重启后的 d7103e7e 成功验收覆盖
+
+decisions:
+  - ADR-0001：轻量桥 + 看板原生 run + 显式记忆读写；不 fork 第三方看板
+  - 默认 agent 只在本机配置为丞相（代码默认空，不写死个人名），卡片标签 @某官 覆盖
+  - PR #4 保持 OPEN，由皇上自己审，不自动合并；本机保留 0.1.0 backport
+  - live 0.1.0 只回填同一模块，不整体升级到 0.2.1，避免改动皇上现有 UI
+  - 盲审 B1/B2/A11/A8/A10 已修；2026-11-18 二次复审把 B1 从“仅 Origin/Host”升级为 DSH connection 签名 cookie admission + 回环 Host，并补 status/agents Host 门禁、bundle 行为测试、改派身份修复；模型工具只读；配置/补派走 /marshal-superagent 控制页；settle 尊重 enabled；memoryLimit 硬上限 6；memory-pending 可重试
+
+next:
+  - 最终代码已同步到 62150 插件目录；DSH 进程需完整重启才装载新宿主守卫；重启后实测无 cookie 的 /api 通知与 Host: evil 的 /status 均 403
+  - GUI 验收已过
+  - 再建一张带 @工部尚书 的卡，确认标签覆盖（可选）
+  - 控制页 http://127.0.0.1:62150/marshal-superagent 可改默认/开关/补派
+  - 证据补入库：git add evidence && git commit；提交后 HEAD 会越过被验证的 f58a1ff，验证需按 manifest 的 commit 读
+  - PR：https://github.com/JR-Rong/dsh-marshal/pull/4（由皇上自审，不自动合并）
+
+traps:
+  - client bundle 是生成产物；scripts/append-superagent-hook.mjs 现在会替换旧 observer，测试从实际 bundle 提取并运行；改源后必须重新运行构建并重新打包
+  - human 路由依赖 DSH connection.admit/requestRejection；没有 connection 服务时 fail closed，需重启 DSH 装载新宿主模块
+  - 触发依赖看板 POST api/task-board/action 的 create；端点变化时 fail-soft（不误触发）
+  - 只认本机浏览器；agent 用 task_board_create 建卡不触发
+  - state/settings 在 ~/.dsh-marshal/superagent/；删除即清空派发记录
+  - live 备份后缀 .bak-20261118-superagent
+
+blocked_on:
+  need: 无；PR #4 由皇上自审/合并
+  owner: 皇上
+  due: 2026-11-18
