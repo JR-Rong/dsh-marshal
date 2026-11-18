@@ -1,15 +1,15 @@
 ticket: T-000001
 task: TASK-0001
 baseline: 96018a922823507122f7bf128606a1ae03211a38
-updated_at: 2026-11-18T01:40:00-08:00
+updated_at: 2026-11-18T01:56:00-08:00
 
 done:
   - superagent 主机模块：settings / state / agents / memory / prompt / dispatch / extension / mount
   - 浏览器 human-create observer（独立源 + 已追加到 client bundle）
   - marshal_superagent 工具：status / agents / reconcile（只读）
   - 本机路由：/marshal-superagent 控制页、/api/human-create、/api/config、/api/dispatch、/api/agents、/api/status、/health
-  - 代码提交 bdcad3a（基线 96018a9）；66 条测试全绿
-  - evidence RUN-20261118-011602（superagent-unit）、RUN-20261118-011603（regression），HEAD bdcad3a PASS
+  - 代码提交 9a7dac5（基线 96018a9）；66 条测试全绿
+  - evidence RUN-20261118-015441（unit+regression）在 9a7dac5 PASS
   - 真机验收：卡片 20469794-3c17-4c6d-a229-5296971084cb → 执行 7e47e297 → session-f3c7d3f7 → succeeded；记忆 memoryWritten:true；记录见 docs/specs/E2E-2026-11-18-superagent-bridge.md
   - 最终代码在 56120 复验：控制页 200、缺 Origin/cross-site 403、工具 config 被拒、默认丞相
   - 真机 A3：agent 用 task_board_create 建卡 9f2958f1-2b68-4af7-aa58-f1d3cac14381，2.5s 后仍 todo/0 execution，桥 records 未增；已删除测试卡
@@ -21,8 +21,10 @@ unverified:
   - 0.2.1 tarball 在干净 profile 的安装（当前 profile 仍是 0.1.0 link）
   - 高于看板会话默认权限的成员：权限闸门真实提示与人工确认流程
   - 手机/远端建卡：当前不自动触发，仅控制页人工补派
-  - 两轮独立盲审在 84dd00b 上判 fail：B1 路由可被本机伪造、B2/A11 关桥仍写记忆、工具面可强制派发；B1/B2 与工具面已修到 bdcad3a，第三轮复核进行中，尚无 pass
+  - 两轮盲审在 84dd00b 上判 fail；第三轮在 bdcad3a 上复核：仅 B1 未闭环（本机进程伪造请求头），B2/B3/A8/A10/A5 均 fixed
+  - B1 已开待批 EXC-0001（本机进程信任边界）；未获皇上批准前不判 A12 覆盖，不宣称盲审通过
   - GUI 按钮点击未自动化：真机走的是与 hook 等价的 HTTP 请求；hook 本身有单测
+  - 第三轮盲审的 B1：需皇上批准 EXC-0001，或改浏览器 WebCrypto 密钥签名
 
 decisions:
   - ADR-0001：轻量桥 + 看板原生 run + 显式记忆读写；不 fork 第三方看板
@@ -45,6 +47,6 @@ traps:
   - live 备份后缀 .bak-20261118-superagent
 
 blocked_on:
-  need: 第三轮独立盲审结论 + GUI 点击体验验收
-  owner: 皇上 / 门下省
+  need: B1 信任边界（批 EXC-0001 或改浏览器密钥签名）+ GUI 点击体验验收
+  owner: 皇上
   due: 2026-11-18
