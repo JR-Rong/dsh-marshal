@@ -44,6 +44,7 @@ test('integration: the browser observer reaches the real HTTP route and dispatch
         readAgents: () => agentsFixture([memberFixture()]),
         logger: loggerFixture(),
         reconcileDelayMs: -1,
+        trustedRequest: () => true,
     });
     bridge.setBoard(board);
     bridge.configure({ defaultAgent: '工部尚书' });

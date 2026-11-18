@@ -58,16 +58,17 @@ function hostIsLoopback(value) {
 }
 
 /**
- * A human browser request, as far as a loopback HTTP server can tell: same
- * origin, same-origin fetch metadata, and a loopback Host. A local process that
- * deliberately forges every header can still impersonate a browser; that is
- * outside this bridge's trust boundary (the operator's own machine), but the
- * casual agent-shell curl and every non-browser caller fail closed.
+ * Browser-shaped markers for the legacy route: same origin, same-origin fetch
+ * metadata, and a loopback Host. These markers are only a tripwire; the signed
+ * DSH connection admission is the authority and is checked separately.
  */
+function hostProof(req) {
+    return isLoopback(req) && hostIsLoopback(req.headers?.host);
+}
+
 function browserProof(req) {
-    if (!isLoopback(req)) return false;
+    if (!hostProof(req)) return false;
     if (String(req.headers?.['sec-fetch-site'] ?? '') !== 'same-origin') return false;
-    if (!hostIsLoopback(req.headers?.host)) return false;
     const origin = req.headers?.origin;
     if (typeof origin !== 'string' || origin === '') return false;
     let url;
@@ -82,10 +83,10 @@ function browserProof(req) {
     return true;
 }
 
-/** Read-only routes: loopback and not a cross-site browser request. */
+/** Read-only routes: loopback + loopback Host, and not a cross-site browser request. */
 function readTrusted(req) {
     if (req.headers?.['sec-fetch-site'] === 'cross-site') return false;
-    return isLoopback(req);
+    return hostProof(req);
 }
 
 function write(res, status, value) {
@@ -154,6 +155,7 @@ function exact(method, path, handler, guard = readTrusted) {
  */
 export function createSuperagentBridge(options = {}) {
     const logger = options.logger ?? { warn: () => {}, info: () => {} };
+    const trustedRequest = options.trustedRequest ?? (() => false);
     const now = options.now ?? Date.now;
     const uuid = options.uuid ?? (() => randomUUID());
     const root = options.root ?? resolveRoot();
@@ -253,7 +255,7 @@ export function createSuperagentBridge(options = {}) {
         return {
             ...base,
             extension: { id: SUPERAGENT_EXTENSION_ID, active: extension.summary().ready, settled: extension.summary().settledCount },
-            hook: { path: HUMAN_CREATE_PATH, mode: 'browser-observer', version: 1 },
+            hook: { path: HUMAN_CREATE_API_PATH, legacyPath: HUMAN_CREATE_PATH, mode: 'browser-observer', version: 1 },
             reconcileError: reconcileError ?? null,
         };
     };
@@ -268,6 +270,14 @@ export function createSuperagentBridge(options = {}) {
         }
         return dispatcher.configure(clean);
     };
+
+    const admitted = req => {
+        if (!hostProof(req)) return false;
+        try { return trustedRequest(req) === true; }
+        catch { return false; }
+    };
+    const humanProof = req => browserProof(req) && admitted(req);
+    const desktopHumanProof = req => hostProof(req) && admitted(req);
 
     const humanCreate = async body => {
         const taskId = typeof body?.taskId === 'string' ? body.taskId.trim() : '';
@@ -333,12 +343,12 @@ export function createSuperagentBridge(options = {}) {
 
     const routes = () => [
         exact('GET', CONTROL_PATH, (req, res) => { writeHtml(res, controlPageHtml()); }),
-        exact('POST', HUMAN_CREATE_PATH, humanCreateHandler, browserProof),
-        // /api/* is gated by the DSH web auth layer; the desktop shell forwards
-        // the page request marker-less but attaches the browser-auth cookie, so
-        // this alias trusts the authenticated loopback request instead of the
-        // browser markers the shell deletes.
-        exact('POST', HUMAN_CREATE_API_PATH, humanCreateHandler, readTrusted),
+        exact('POST', HUMAN_CREATE_PATH, humanCreateHandler, humanProof),
+        // The desktop shell forwards the page request marker-less but attaches
+        // the Host's signed dsh-auth-* browser cookie. The /api alias therefore
+        // requires both a loopback Host and the Host connection's own admission
+        // (signature + expiry + authority), not merely a loopback socket.
+        exact('POST', HUMAN_CREATE_API_PATH, humanCreateHandler, desktopHumanProof),
         exact('POST', CONFIG_PATH, async (req, res) => {
             const parsed = await readJson(req);
             if (parsed.error !== undefined) {
@@ -347,7 +357,7 @@ export function createSuperagentBridge(options = {}) {
             }
             const answer = await controlConfig(parsed.body);
             write(res, answer.status, answer.body);
-        }, browserProof),
+        }, humanProof),
         exact('POST', DISPATCH_PATH, async (req, res) => {
             const parsed = await readJson(req);
             if (parsed.error !== undefined) {
@@ -356,7 +366,7 @@ export function createSuperagentBridge(options = {}) {
             }
             const answer = await controlDispatch(parsed.body);
             write(res, answer.status, answer.body);
-        }, browserProof),
+        }, humanProof),
         exact('GET', AGENTS_PATH, (req, res) => { write(res, 200, { ok: true, ...dispatcher.listAgentSummaries() }); }),
         exact('GET', STATUS_PATH, (req, res) => { write(res, 200, status()); }),
         exact('GET', HEALTH_PATH, (req, res) => {
@@ -430,6 +440,30 @@ export function createSuperagentBridge(options = {}) {
 export function mountSuperagent(ctx, config, options = {}) {
     if (!Array.isArray(config?.agents) || !config.agents.includes('dsh')) return undefined;
     const logger = options.logger ?? ctx.logger;
+    // The Host connection service is the only authority that can verify the
+    // signed dsh-auth-* cookie. Until it is injected, human routes fail closed.
+    let trustedRequest = () => false;
+    const adoptConnection = connection => {
+        if (connection === undefined || connection === null) {
+            trustedRequest = () => false;
+            return;
+        }
+        trustedRequest = req => {
+            try {
+                if (typeof connection.requestRejection === 'function') {
+                    return connection.requestRejection({ headers: req.headers }) === undefined;
+                }
+                if (typeof connection.admit === 'function') {
+                    const admission = connection.admit({ headers: req.headers });
+                    return admission !== undefined && admission.rejection === undefined && admission.peer !== undefined;
+                }
+                return false;
+            }
+            catch {
+                return false;
+            }
+        };
+    };
     const bridge = createSuperagentBridge({
         root: options.root ?? resolveRoot(),
         memory: options.memory,
@@ -438,7 +472,19 @@ export function mountSuperagent(ctx, config, options = {}) {
         uuid: options.uuid,
         readAgents: options.readAgents,
         reconcileDelayMs: options.reconcileDelayMs,
+        trustedRequest: req => trustedRequest(req),
     });
+    try {
+        ctx.inject(['connection', 'connection.authentication'], scoped => {
+            scoped.effect(() => {
+                adoptConnection(typeof scoped.get === 'function' ? scoped.get('connection') : scoped.connection);
+                return () => adoptConnection(undefined);
+            }, 'marshal: superagent connection trust');
+        });
+    }
+    catch (cause) {
+        logger.warn?.('marshal-superagent: connection trust unavailable; human routes fail closed: ' + messageOf(cause));
+    }
     try {
         ctx.inject(['taskBoard'], scoped => {
             scoped.effect(() => {

@@ -2102,7 +2102,6 @@ window.__ModuleLoader__.load({
 });
 
 })();
-
 /* --- dsh-marshal superagent human-create observer --- */
 /* Human-create observer for the dsh-marshal superagent bridge.
  *
@@ -2134,7 +2133,7 @@ window.__ModuleLoader__.load({
       return new URL('api/marshal-superagent/human-create', base === undefined ? '/' : base).href;
     }
     catch {
-      return '/api/marshal-superagent/human-create';
+      return '/marshal-superagent/api/human-create';
     }
   };
   const notify = (taskId, requestId) => {

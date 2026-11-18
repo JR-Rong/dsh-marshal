@@ -15,10 +15,17 @@ const hookPath = join(root, 'plugin-build', 'client', 'superagent-hook.js');
 const marker = 'dsh-marshal superagent human-create observer';
 
 const bundle = readFileSync(bundlePath, 'utf8');
-if (bundle.includes(marker)) {
-    console.log('superagent hook already present in ' + bundlePath);
+const hook = readFileSync(hookPath, 'utf8');
+const markerComment = '/* --- ' + marker + ' --- */';
+const at = bundle.indexOf(markerComment);
+// Replace the previously appended block: an idempotent append is not enough,
+// because a source fix after the first build would otherwise keep shipping the
+// old observer while the tests exercise the new source file.
+const base = (at === -1 ? bundle : bundle.slice(0, at)).replace(/\s+$/, '');
+const next = base + '\n' + markerComment + '\n' + hook;
+if (next === bundle) {
+    console.log('superagent hook already current in ' + bundlePath);
     process.exit(0);
 }
-const hook = readFileSync(hookPath, 'utf8');
-writeFileSync(bundlePath, bundle + '\n/* --- ' + marker + ' --- */\n' + hook);
-console.log('superagent hook appended to ' + bundlePath);
+writeFileSync(bundlePath, next);
+console.log((at === -1 ? 'superagent hook appended to ' : 'superagent hook refreshed in ') + bundlePath);

@@ -27,9 +27,12 @@
 | A9 | 1、3 | duplicate notifications / restart test / settle-in-flight |
 | A10 | 1、2 | run refusal recorded; memory failure recorded; health/status |
 | A11 | 1、2、5 | disabled route test; hook test skips failed/disabled responses |
-| A12 | 2、5 | route loopback/origin guard; dispatch refuses source != board-ui |
-| A13 | 6 | node --test test/*.test.js 67/67（含 hook→HTTP→dispatch 集成） |
+| A12 | 2、5 | DSH connection admission (signed cookie) + loopback Host; curl without cookie 403; dispatch refuses source != board-ui |
+| A13 | 6 | node --test test/*.test.js 72/72（含 hook→HTTP→dispatch 集成、bundle 行为、curl 冒充拒绝） |
 | A14 | 7 | tarball contents + README/INSTALL |
+| A15 | 5 | shipped client/index.js 中提取的 observer 与实际运行行为；与源文件逐字一致 |
+| A16 | 1 | 改派卡重算当前身份的 prompt/标签，旧身份不残留 |
+| A17 | 2 | status/agents 对非回环 Host 返回 403 |
 
 ## 人类预算
 
@@ -37,6 +40,6 @@
 
 ## 未覆盖与已知缺口
 
-- 真机 DSH 重启后的端到端（GUI 新建 → Running → 记忆条目）尚未在本机执行；需皇上重启后验收。单测用替身覆盖了相同调用序列。
+- GUI 真机链路已在 2026-11-18 62150 完整重启后由 d7103e7e 验收通过；本表中的单元/集成测试仍用于回归。
 - 看板客户端的 action 端点是第三方实现细节；hook 失效时不会误触发，但也不会派发。已列入复审条件。
 - 远端/手机建卡不触发；用 marshal_superagent dispatch 补派。

@@ -28,5 +28,9 @@ SPC-0001 原 A12 写“agent 无法伪造触发”。本机任意进程（含 ag
 - 批准人：皇上
 - 批准时间：2026-11-18（America/Los_Angeles）
 - 批准方式：在 DSH 会话中钦选“批 EXC-0001：本机进程不在边界内”
-- 生效后：A12 按本条边界判覆盖；第三轮盲审的唯一阻塞 B1 按例外结案；其余 fixed 项不变。
+## 2026-11-18 第二次复审后的收窄
+
+- 新增 DSH Host connection admission：human-create / config / dispatch 现在校验签名 `dsh-auth-*` cookie（Host/Origin/有效期），并再次检查回环 Host；只伪造 Origin/Sec-Fetch-Site 的本机 curl 已 403，不再落入本例外。
+- 只读 status/agents 增加 Host 回环门禁。
+- 本例外仅保留“本机进程已窃取一份有效浏览器 cookie”的残余边界；A12 按收窄后的边界判覆盖。原第三轮 B1 的“仅伪造请求头”已被代码修复，不再依赖例外。
 - 若未来要求挡住本机 agent bash：改浏览器 WebCrypto 密钥签名，另开增量与复审。

@@ -111,6 +111,25 @@ test('prompt: identity, brief, memory and task all travel', () => {
     assert.match(prompt, /ask_user_question/);
 });
 
+test('prompt: reassignment rebuilds the current identity and removes the previous agent tag', () => {
+    const a = memberFixture({ id: 'member-a', name: '甲大臣', brief: '甲大臣的旧职责' });
+    const b = memberFixture({ id: 'member-b', name: '乙大臣', brief: '乙大臣的新职责' });
+    const first = composePrompt({ member: a, task: taskFixture() });
+    const task = taskFixture({
+        prompt: first,
+        tags: [{ name: '智能体:甲大臣' }, { name: '保留标签' }],
+    });
+    const second = composePrompt({ member: b, task, memory: '- 乙大臣的记忆', memoryCount: 1 });
+    assert.match(second, /乙大臣/);
+    assert.match(second, /乙大臣的新职责/);
+    assert.match(second, /乙大臣的记忆/);
+    assert.doesNotMatch(second, /甲大臣的旧职责/);
+    assert.match(second, /实现登录页并跑测试/);
+    assert.equal((second.match(/【超级智能体派发】/g) ?? []).length, 1);
+    const planned = planCardPatch({ task, member: b, snapshot: {}, prompt: second });
+    assert.deepEqual(planned.patch.tags.map(tag => tag.name), ['智能体:乙大臣', '保留标签']);
+});
+
 test('patch: member fills blanks, never raises permission above the board default', () => {
     const member = memberFixture();
     const snapshot = { sessionDefaultPermission: 'workspace-write' };

@@ -8,7 +8,7 @@ const clientDir = join(import.meta.dirname, '..', 'client');
 const hookSource = readFileSync(join(clientDir, 'superagent-hook.js'), 'utf8');
 const bundleSource = readFileSync(join(clientDir, 'index.js'), 'utf8');
 
-function loadHook(responses = []) {
+function loadHook(responses = [], source = hookSource) {
     const calls = [];
     const fetch = function fakeFetch(input, init) {
         const url = typeof input === 'string' ? input : input?.url;
@@ -22,7 +22,7 @@ function loadHook(responses = []) {
         location: { href: 'http://127.0.0.1:63125/' },
     };
     const context = { window, URL, JSON, String, Set, Promise, console };
-    vm.runInNewContext(hookSource, context, { filename: 'superagent-hook.js' });
+    vm.runInNewContext(source, context, { filename: 'superagent-hook.js' });
     return { window, calls };
 }
 
@@ -79,10 +79,18 @@ test('hook: duplicate create ids do not double-notify and the patch is idempoten
     assert.equal(window.fetch, before, 'a second load leaves the installed hook alone');
 });
 
-test('hook: the generated bundle carries the observer', () => {
-    assert.match(bundleSource, /dsh-marshal superagent human-create observer/);
-    assert.match(bundleSource, /__marshalSuperagentHook/);
-    assert.match(bundleSource, /api\/marshal-superagent\/human-create/);
+test('hook: the shipped bundle carries and runs the current observer', async () => {
+    const markerComment = '/* --- dsh-marshal superagent human-create observer --- */';
+    const at = bundleSource.lastIndexOf(markerComment);
+    assert.notEqual(at, -1, 'the generated bundle contains no observer marker');
+    const shipped = bundleSource.slice(at + markerComment.length);
+    assert.equal(shipped.trim(), hookSource.trim(), 'run npm run build:superagent-hook after editing the source');
+    const { window, calls } = loadHook([], shipped);
+    await window.fetch('api/task-board/action', { method: 'POST', body: createEnvelope('bundle-task') });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(calls.length, 2);
+    assert.match(calls[1].url, /api\/marshal-superagent\/human-create/);
+    assert.equal(JSON.parse(calls[1].init.body).taskId, 'bundle-task');
 });
 
 test('hook: a window without fetch is left alone', () => {

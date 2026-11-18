@@ -8,7 +8,7 @@ function makeRequest({ method = 'GET', headers = {}, body, remoteAddress = '127.
     const req = Readable.from(body === undefined ? [] : [Buffer.from(body)]);
     req.method = method;
     req.url = '/';
-    req.headers = headers;
+    req.headers = { host: '127.0.0.1:63125', ...headers };
     req.socket = { remoteAddress };
     const res = {
         status: 0,
@@ -25,12 +25,24 @@ const PROOF = {
     host: '127.0.0.1:63125',
     origin: 'http://127.0.0.1:63125',
     'sec-fetch-site': 'same-origin',
+    cookie: 'dsh-auth-test=1',
 };
 
 function setup() {
     const board = createFakeBoard({ tasks: [taskFixture()] });
     const memory = createFakeMemory();
-    const context = createFakeContext({ taskBoard: board, memory, logger: loggerFixture() });
+    const connection = {
+        requestRejection(req) {
+            return String(req.headers.cookie ?? '').includes('dsh-auth-test=') ? undefined : 401;
+        },
+    };
+    const context = createFakeContext({
+        taskBoard: board,
+        memory,
+        logger: loggerFixture(),
+        connection,
+        'connection.authentication': {},
+    });
     const bridge = mountSuperagent(context, { agents: ['dsh'] }, {
         root: tempRoot(),
         memory,
@@ -152,10 +164,57 @@ test('mount: the /api alias accepts the desktop shell marker-less request', asyn
     try {
         bridge.configure({ defaultAgent: '工部尚书' });
         const alias = route(context, '/api/marshal-superagent/human-create');
-        const shell = makeRequest({ method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ taskId: 'task-1', source: 'board-ui' }) });
+        const shell = makeRequest({ method: 'POST', headers: { 'content-type': 'application/json', cookie: 'dsh-auth-test=1' }, body: JSON.stringify({ taskId: 'task-1', source: 'board-ui' }) });
         await alias.handler(shell.req, shell.res);
         assert.equal(shell.res.status, 202);
         assert.deepEqual(board.actions.map(entry => entry.action.kind), ['update', 'run']);
+    }
+    finally {
+        context.close();
+    }
+});
+
+test('mount: a loopback curl without the signed browser cookie cannot impersonate the operator', async () => {
+    const { board, context } = setup();
+    try {
+        const alias = route(context, '/api/marshal-superagent/human-create');
+        const curl = makeRequest({ method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ taskId: 'task-1', source: 'board-ui' }) });
+        await alias.handler(curl.req, curl.res);
+        assert.equal(curl.res.status, 403);
+        assert.deepEqual(board.actions, []);
+
+        const legacy = route(context, '/marshal-superagent/api/human-create');
+        const forged = makeRequest({
+            method: 'POST',
+            headers: {
+                'content-type': 'application/json',
+                host: '127.0.0.1:63125',
+                origin: 'http://127.0.0.1:63125',
+                'sec-fetch-site': 'same-origin',
+            },
+            body: JSON.stringify({ taskId: 'task-1', source: 'board-ui' }),
+        });
+        await legacy.handler(forged.req, forged.res);
+        assert.equal(forged.res.status, 403);
+        assert.deepEqual(board.actions, []);
+    }
+    finally {
+        context.close();
+    }
+});
+
+test('mount: read-only status and agents reject a non-loopback Host', async () => {
+    const { context } = setup();
+    try {
+        for (const path of ['/marshal-superagent/api/status', '/marshal-superagent/api/agents']) {
+            const routeItem = route(context, path);
+            const evil = makeRequest({ headers: { host: 'evil.example' } });
+            await routeItem.handler(evil.req, evil.res);
+            assert.equal(evil.res.status, 403, path + ' must reject a rebound Host');
+            const missing = makeRequest({ headers: { host: undefined } });
+            await routeItem.handler(missing.req, missing.res);
+            assert.equal(missing.res.status, 403, path + ' must reject a missing Host');
+        }
     }
     finally {
         context.close();

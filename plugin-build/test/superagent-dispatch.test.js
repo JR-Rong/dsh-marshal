@@ -20,6 +20,7 @@ function setup(options = {}) {
         readAgents: () => agentsFixture(members),
         logger: loggerFixture(),
         reconcileDelayMs: 0,
+        trustedRequest: () => true,
         now: options.now,
         uuid: (() => { let n = 0; return () => 'req-' + (++n); })(),
     });
@@ -76,7 +77,7 @@ test('dispatch: disabled, no-board and no-agent answer without touching the card
     assert.equal(off.body.code, 'disabled');
     assert.equal(disabled.board.actions.length, 0);
 
-    const noBoard = createSuperagentBridge({ root: tempRoot(), memory: createFakeMemory(), readAgents: () => agentsFixture(), logger: loggerFixture(), reconcileDelayMs: 0 });
+    const noBoard = createSuperagentBridge({ root: tempRoot(), memory: createFakeMemory(), readAgents: () => agentsFixture(), logger: loggerFixture(), reconcileDelayMs: 0, trustedRequest: () => true });
     const missing = await noBoard.humanCreate({ taskId: 'task-1', source: 'board-ui' });
     assert.equal(missing.status, 409);
     assert.equal(missing.body.code, 'no-task-board');
@@ -133,6 +134,27 @@ test('dispatch: a retry after a run refusal does not stack identity blocks', asy
     const prompt = board.actions.filter(entry => entry.action.kind === 'update').at(-1).action.patch.prompt;
     assert.equal((prompt.match(/【超级智能体派发】/g) ?? []).length, 1);
     assert.equal(board.snapshot().tasks[0].status, 'running');
+});
+
+test('dispatch: a failed card reassigned to another agent gets the new identity and memory', async () => {
+    const a = memberFixture({ id: 'member-a', name: '甲大臣', brief: '甲大臣的旧职责' });
+    const b = memberFixture({ id: 'member-b', name: '乙大臣', brief: '乙大臣的新职责' });
+    const { bridge, board, memory } = setup({
+        settings: { defaultAgent: '甲大臣' },
+        members: [a, b],
+        failRun: 'permission-confirmation-required',
+    });
+    const first = await bridge.humanCreate({ taskId: 'task-1', source: 'board-ui' });
+    assert.equal(first.status, 409);
+    board.setFailRun(undefined);
+    await board.apply('tag-change', { kind: 'update', taskId: 'task-1', patch: { tags: [{ name: '智能体:乙大臣' }] } }, 'test');
+    const retry = await bridge.humanCreate({ taskId: 'task-1', source: 'board-ui' });
+    assert.equal(retry.status, 202);
+    const prompt = board.actions.filter(entry => entry.action.kind === 'update').at(-1).action.patch.prompt;
+    assert.match(prompt, /乙大臣的新职责/);
+    assert.doesNotMatch(prompt, /甲大臣的旧职责/);
+    assert.equal(bridge.stateStore.get('task-1').agentName, '乙大臣');
+    assert.equal(memory.recalls.some(query => query.agentId === 'member-b'), true);
 });
 
 test('dispatch: memory recall feeds the prompt and can be switched off', async () => {

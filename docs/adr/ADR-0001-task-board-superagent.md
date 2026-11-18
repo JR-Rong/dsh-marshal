@@ -31,7 +31,7 @@
 - 记忆：不依赖看板会话的身份自动解析。派发时从 createAgentMemoryService 的 agent scope 读取该成员记忆并注入提示；结算时显式 rememberFor({agentId, scope:'agent'}) 写回。
 - 指定：设置里的默认 agent + 卡片标签 @某官（可配别名）覆盖；按名字或成员 id 解析。默认已设为丞相。
 - 范围：默认只对根卡触发；子卡需显式 rootOnly=false。不自动确认权限；高于会话默认的权限只记录。
-- 人机边界：模型工具不能改路由/派发（status / agents / reconcile）；reconcile 可为已派发卡补写记忆，但不改变路由或开新派发。配置与人工补派只在本机同源浏览器控制页 /marshal-superagent。human-create / config / dispatch 路由要求 Origin + Sec-Fetch-Site: same-origin + 回环 Host；本机进程蓄意伪造全部请求头不在本桥信任边界内；该边界见已批 EXC-0001（2026-11-18），A12 按该边界判覆盖。
+- 人机边界：模型工具不能改路由/派发（status / agents / reconcile）；reconcile 可为已派发卡补写记忆，但不改变路由或开新派发。配置与人工补派只在本机同源浏览器控制页 /marshal-superagent。human-create / config / dispatch 路由要求 DSH Host connection 的 admission（签名 `dsh-auth-*` cookie + Host/Origin + 有效期）并再次检查回环 Host；只伪造请求头不再能冒充皇上。只读 status/agents 也做 Host 回环门禁。EXC-0001 仅保留“本机进程已窃取有效浏览器 cookie”的残余边界，A12 按此判覆盖。
 
 ## 代价
 

@@ -64,6 +64,14 @@
 
 执行 prompt 含丞相 brief、1 条相关长期记忆、工单要求与执行约定。结算后该工单 episode「工单「测试gui」完成」已出现在丞相的会话记忆块。A1/A6/A7 的 GUI 自动派发链路由此闭环。
 
+## 3.3 二次复审安全加固（2026-11-18）
+
+- 原先本机 curl 可直达 `/api/marshal-superagent/human-create`（无 cookie 仍 409 进入 dispatcher）；legacy 路由也可只凭伪造 Origin 到达。现在 human-create/config/dispatch 都必须通过 DSH Host connection 的 admission：签名 `dsh-auth-*` cookie、Host/Origin、有效期；并再次检查回环 Host。CI 覆盖“本机无 cookie curl 403”“legacy 伪造头 403”。
+- `/status`、`/agents` 原先带 `Host: evil.example` 仍 200；现在 Host 非回环/缺失一律 403。
+- 客户端 bundle 由 `scripts/append-superagent-hook.mjs` 刷新（替换旧 observer），测试从实际 `client/index.js` 提取并运行 observer，不再只测源文件。
+- 改派卡：`composePrompt` 从旧派发块提取操作者原始要求，按当前成员重建；`mergeTags` 清除旧 `智能体:` 标签；改派后 prompt/标签/memory recall 均指向 B。
+- 本机 live 已同步新宿主模块；需完整重启 DSH 后才能在生产路由复验 403。
+
 ## 4. agent 自建卡不触发（真机）
 
 - 用 agent 工具 task_board_create 建卡 9f2958f1-2b68-4af7-aa58-f1d3cac14381。

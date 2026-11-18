@@ -33,6 +33,15 @@ export function agentTagName(name) {
     return clip('智能体:' + value, MAX_TAG_CHARS);
 }
 
+function extractRequirement(prompt) {
+    const marker = '【任务要求】';
+    const at = prompt.indexOf(marker);
+    if (at === -1) return '';
+    const rest = prompt.slice(at + marker.length).replace(/^\n+/, '');
+    const end = rest.indexOf('\n\n【执行约定】');
+    return (end === -1 ? rest : rest.slice(0, end)).trim();
+}
+
 function mergeTags(task, member) {
     const existing = (Array.isArray(task.tags) ? task.tags : [])
         .filter(tag => tag !== null && typeof tag === 'object' && typeof tag.name === 'string' && tag.name.trim() !== '')
@@ -41,11 +50,15 @@ function mergeTags(task, member) {
             ...(typeof tag.promptPrefix === 'string' && tag.promptPrefix.trim() !== '' ? { promptPrefix: tag.promptPrefix.trim() } : {}),
         }));
     const agentTag = agentTagName(member.name);
-    const hasAgentTag = existing.some(tag => tag.name === agentTag);
+    // Only one bridge-assigned executor belongs on a card. Removing every
+    // 智能体: tag is what makes a reassignment move the identity instead of
+    // leaving the previous agent's tag first in the list. Replacing an old
+    // agent tag never grows the tag list, so it is allowed at the cap.
+    const without = existing.filter(tag => !tag.name.startsWith('智能体:'));
+    const hadAgentTag = existing.some(tag => tag.name.startsWith('智能体:'));
     // A ninth tag would evict one the operator chose; show the agent in the
     // prompt and the dispatch ledger instead of silently rewriting the card.
-    if (!hasAgentTag && existing.length >= MAX_TAGS) return existing;
-    const without = existing.filter(tag => tag.name !== agentTag);
+    if (!hadAgentTag && existing.length >= MAX_TAGS) return existing;
     const seen = new Set();
     const result = [];
     for (const tag of [{ name: agentTag }, ...without]) {
@@ -67,10 +80,13 @@ export function composePrompt({ member, task, memory = '', memoryCount = 0 }) {
     const title = text(task?.title) || '(未命名工单)';
     const description = text(task?.description);
     const existing = text(task?.prompt);
-    // A failed run can leave the prepared prompt on the card. Re-running must
-    // not stack a second identity block on top of the first.
-    if (existing.startsWith('【超级智能体派发】')) return existing;
-    const requirement = existing || description || title;
+    // A failed run or a reassignment can leave the prepared prompt on the card.
+    // Recover the operator's requirement from it and rebuild the block for the
+    // CURRENT member; returning the old block would hand B A's identity and
+    // memory while settlement writes the result into B's memory.
+    const requirement = existing.startsWith('【超级智能体派发】')
+        ? extractRequirement(existing) || description || title
+        : existing || description || title;
     const lines = [];
     lines.push('【超级智能体派发】');
     lines.push('智能体：' + name);

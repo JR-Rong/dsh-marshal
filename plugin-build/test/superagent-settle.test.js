@@ -16,6 +16,7 @@ function setup(options = {}) {
         readAgents: () => agentsFixture(options.members ?? [memberFixture()]),
         logger: loggerFixture(),
         reconcileDelayMs: -1,
+        trustedRequest: () => true,
     });
     bridge.setBoard(board);
     if (options.defaultAgent !== false) bridge.configure({ defaultAgent: '工部尚书' });
@@ -198,6 +199,7 @@ test('restart: a new bridge with the same root does not re-dispatch a running ca
         readAgents: () => agentsFixture(),
         logger: loggerFixture(),
         reconcileDelayMs: 0,
+        trustedRequest: () => true,
     });
     resumed.setBoard(board);
     resumed.configure({ defaultAgent: '工部尚书' });
