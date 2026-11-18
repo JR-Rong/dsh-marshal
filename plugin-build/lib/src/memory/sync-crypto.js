@@ -1,13 +1,32 @@
 import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from 'node:crypto';
 
-const SALT = 'dsh-marshal-memory-sync-v1';
+/** Old deployments derived one key from this fixed salt. New sync uses a per-owner salt. */
+export const LEGACY_SALT = 'dsh-marshal-memory-sync-v1';
+export const MIN_PASSPHRASE_LENGTH = 12;
 
-export function syncKey(passphrase) {
-    if (typeof passphrase !== 'string' || passphrase.trim() === '') return undefined;
-    return scryptSync(passphrase, SALT, 32);
+export function passphraseAcceptable(passphrase) {
+    if (typeof passphrase !== 'string') return false;
+    const value = passphrase.normalize('NFKC');
+    if (value.length < MIN_PASSPHRASE_LENGTH || value.length > 512) return false;
+    if (/^(.)\1+$/u.test(value)) return false;
+    const classes = [/[a-z]/, /[A-Z]/, /[0-9]/, /[^A-Za-z0-9\s]/].filter(pattern => pattern.test(value)).length;
+    if (value.length >= 20) return classes >= 2;
+    return classes >= 3;
 }
 
-export function encryptRecord(key, record) {
+export function freshSalt() {
+    return randomBytes(16).toString('base64url');
+}
+
+/** Empty or weak passphrases do not produce a key. */
+export function syncKey(passphrase, salt = LEGACY_SALT) {
+    if (!passphraseAcceptable(passphrase)) return undefined;
+    const material = typeof salt === 'string' && salt.length >= 8 ? salt : undefined;
+    if (material === undefined) return undefined;
+    return scryptSync(passphrase.normalize('NFKC'), material, 32);
+}
+
+export function encryptRecord(key, record, kdf = 'scrypt') {
     const iv = randomBytes(12);
     const cipher = createCipheriv('aes-256-gcm', key, iv);
     const plaintext = Buffer.from(JSON.stringify(record));
@@ -19,6 +38,7 @@ export function encryptRecord(key, record) {
         nonce: iv.toString('base64'),
         tag: cipher.getAuthTag().toString('base64'),
         ciphertext: ciphertext.toString('base64'),
+        kdf,
     };
 }
 

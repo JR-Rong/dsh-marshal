@@ -9,6 +9,9 @@ import { createCrossClient } from './cross-client.js';
 import { createLocalBoard } from './local-board.js';
 import { createAgentsHttpClient, agentToolDefinitions } from './agent-tools.js';
 import { createDshSurface } from '../adapters/dsh/surface.js';
+import { createMemoryRoutes } from '../memory/http.js';
+import { createMemoryHttpAuth } from '../memory/http-auth.js';
+import { dshAccountHash, DSH_ACCOUNT_ORIGIN } from '../hub/account.js';
 
 const BODY_LIMIT = 64 * 1024;
 
@@ -121,6 +124,24 @@ function exact(method, path, handler, open = false) {
     };
 }
 
+export function buildHealthBody(req, info) {
+    return {
+        ok: true,
+        name: 'dsh-marshal',
+        version: '0.2.0-agent-groups.2',
+        deviceId: info.deviceId,
+        capabilities: {
+            groups: true,
+            agents: info.agents,
+            agentsCode: info.agentsCode ?? null,
+            taskBoard: true,
+            taskBoardSource: info.taskBoardSource,
+            crossGroups: info.crossGroups,
+            ...(isLoopback(req) ? { agentMemory: info.agentMemory } : {}),
+        },
+    };
+}
+
 function taskView(task) {
     const executions = Array.isArray(task.executions) ? task.executions : [];
     const latest = executions.length > 0 ? executions[executions.length - 1] : undefined;
@@ -139,132 +160,20 @@ function taskView(task) {
     };
 }
 
-function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource = () => 'local', memory) {
+function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource = () => 'local', memory, auth, allowedOrigins) {
     return [
         exact('GET', '/marshal/health', async (req, res) => {
             const ledger = readAgentsLedger();
-            write(res, 200, {
-                ok: true,
-                name: 'dsh-marshal',
-                version: '0.2.0-agent-groups.2',
+            write(res, 200, buildHealthBody(req, {
                 deviceId: initiator.replace(/^marshal:/, ''),
-                capabilities: {
-                    groups: true,
-                    agents: ledger.available,
-                    agentsCode: ledger.code ?? null,
-                    taskBoard: true,
-                    taskBoardSource: boardSource(),
-                    crossGroups: cross !== undefined,
-                    agentMemory: memory !== undefined,
-                },
-            });
+                agents: ledger.available,
+                agentsCode: ledger.code ?? null,
+                taskBoardSource: boardSource(),
+                crossGroups: cross !== undefined,
+                agentMemory: memory !== undefined,
+            }));
         }, true),
-        exact('GET', '/marshal/memory/settings/get', async (req, res) => {
-            if (memory === undefined) { write(res, 503, { ok: false, code: 'no-agent-memory' }); return; }
-            write(res, 200, { ok: true, settings: memory.settings });
-        }),
-        exact('GET', '/marshal/memory/health', async (req, res) => {
-            if (memory === undefined) { write(res, 503, { ok: false, code: 'no-agent-memory' }); return; }
-            const url = new URL(req.url ?? '/', 'http://marshal.local');
-            const agentId = url.searchParams.get('agentId') ?? undefined;
-            const workspaceId = url.searchParams.get('workspaceId') ?? undefined;
-            const scopes = [];
-            if (agentId !== undefined) scopes.push({ scope: 'agent', ownerId: agentId });
-            if (workspaceId !== undefined) scopes.push({ scope: 'workspace', ownerId: workspaceId });
-            scopes.push({ scope: 'global', ownerId: 'global' });
-            write(res, 200, { ok: true, health: memory.store.health(scopes), stats: memory.settings });
-        }),
-        exact('POST', '/marshal/memory/settings', async (req, res) => {
-            if (memory === undefined) { write(res, 503, { ok: false, code: 'no-agent-memory' }); return; }
-            const body = await readBody(req);
-            write(res, 200, { ok: true, settings: memory.saveSettings(body) });
-        }),
-        exact('POST', '/marshal/memory/sync', async (req, res) => {
-            if (memory === undefined) { write(res, 503, { ok: false, code: 'no-agent-memory' }); return; }
-            const body = await readBody(req);
-            try {
-                const result = await memory.syncFor({
-                    agentId: typeof body.agentId === 'string' ? body.agentId : undefined,
-                    workspaceId: typeof body.workspaceId === 'string' ? body.workspaceId : undefined,
-                });
-                write(res, 200, { ok: true, ...result });
-            }
-            catch (error) {
-                write(res, 503, { ok: false, code: 'memory-sync-unavailable', message: error instanceof Error ? error.message : String(error) });
-            }
-        }),
-        exact('GET', '/marshal/memory/graph', async (req, res) => {
-            if (memory === undefined) { write(res, 503, { ok: false, code: 'no-agent-memory' }); return; }
-            const url = new URL(req.url ?? '/', 'http://marshal.local');
-            const graph = memory.graphFor({
-                agentId: url.searchParams.get('agentId') ?? undefined,
-                workspaceId: url.searchParams.get('workspaceId') ?? undefined,
-                limit: Math.max(1, Math.min(600, Number(url.searchParams.get('limit')) || 400)),
-            });
-            write(res, 200, { ok: true, graph });
-        }),
-        exact('GET', '/marshal/memory/list', async (req, res) => {
-            if (memory === undefined) { write(res, 503, { ok: false, code: 'no-agent-memory' }); return; }
-            const url = new URL(req.url ?? '/', 'http://marshal.local');
-            const items = memory.listFor({
-                agentId: url.searchParams.get('agentId') ?? undefined,
-                workspaceId: url.searchParams.get('workspaceId') ?? undefined,
-                scope: url.searchParams.get('scope') ?? 'all',
-                query: url.searchParams.get('query') ?? undefined,
-                limit: Math.max(1, Math.min(300, Number(url.searchParams.get('limit')) || 100)),
-            });
-            write(res, 200, { ok: true, items });
-        }),
-        exact('GET', '/marshal/memory/get', async (req, res) => {
-            if (memory === undefined) { write(res, 503, { ok: false, code: 'no-agent-memory' }); return; }
-            const url = new URL(req.url ?? '/', 'http://marshal.local');
-            const id = url.searchParams.get('id') ?? '';
-            const agentId = url.searchParams.get('agentId') ?? undefined;
-            const workspaceId = url.searchParams.get('workspaceId') ?? undefined;
-            const scope = url.searchParams.get('scope') ?? 'agent';
-            const ownerId = scope === 'workspace' ? workspaceId : scope === 'global' ? 'global' : agentId;
-            if (ownerId === undefined) { write(res, 400, { ok: false, code: 'invalid-owner' }); return; }
-            const item = memory.store.get(scope, ownerId, id);
-            if (item === undefined) { write(res, 404, { ok: false, code: 'not-found' }); return; }
-            write(res, 200, { ok: true, item });
-        }),
-        exact('POST', '/marshal/memory/remember', async (req, res) => {
-            if (memory === undefined) { write(res, 503, { ok: false, code: 'no-agent-memory' }); return; }
-            const body = await readBody(req);
-            const item = memory.rememberFor({
-                agentId: typeof body.agentId === 'string' ? body.agentId : undefined,
-                workspaceId: typeof body.workspaceId === 'string' ? body.workspaceId : undefined,
-                scope: body.scope === 'workspace' ? 'workspace' : 'agent',
-                title: typeof body.title === 'string' ? body.title : undefined,
-                text: typeof body.text === 'string' ? body.text : '',
-                kind: typeof body.kind === 'string' ? body.kind : 'fact',
-                importance: Number(body.importance) || 0.5,
-                tags: Array.isArray(body.tags) ? body.tags : [],
-                visibility: body.visibility,
-            });
-            write(res, 200, { ok: true, item });
-        }),
-        exact('POST', '/marshal/memory/forget', async (req, res) => {
-            if (memory === undefined) { write(res, 503, { ok: false, code: 'no-agent-memory' }); return; }
-            const body = await readBody(req);
-            const removed = memory.forgetFor({
-                agentId: typeof body.agentId === 'string' ? body.agentId : undefined,
-                workspaceId: typeof body.workspaceId === 'string' ? body.workspaceId : undefined,
-                id: typeof body.id === 'string' ? body.id : '',
-            });
-            write(res, 200, { ok: true, removed });
-        }),
-        exact('GET', '/marshal/memory/status', async (req, res) => {
-            if (memory === undefined) { write(res, 503, { ok: false, code: 'no-agent-memory' }); return; }
-            const url = new URL(req.url ?? '/', 'http://marshal.local');
-            const agentId = url.searchParams.get('agentId') ?? undefined;
-            const workspaceId = url.searchParams.get('workspaceId') ?? undefined;
-            const scopes = [];
-            if (agentId !== undefined) scopes.push({ scope: 'agent', ownerId: agentId });
-            if (workspaceId !== undefined) scopes.push({ scope: 'workspace', ownerId: workspaceId });
-            scopes.push({ scope: 'global', ownerId: 'global' });
-            write(res, 200, { ok: true, stats: memory.store.stats(scopes) });
-        }),
+        ...createMemoryRoutes({ memory, auth, allowedOrigins }).map(route => exact(route.method, route.path, route.handler, true)),
         exact('GET', '/marshal/tasks/state', async (req, res) => {
             const board = getBoard();
             if (board === undefined) {
@@ -538,6 +447,18 @@ export function mountGroups(ctx, config, options = {}) {
     const drafter = createAgentDrafter({ llm, defaultModel: readDefaultModel });
     const promptAbort = new AbortController();
     if (typeof ctx.effect === 'function') ctx.effect(() => () => promptAbort.abort(), 'marshal: groups prompt lifetime');
+    const memoryAuth = createMemoryHttpAuth({
+        resolveOwner: async () => {
+            try {
+                const account = typeof ctx.get === 'function' ? ctx.get('deepseekAccount') : undefined;
+                const session = await account?.getPlatformSession?.();
+                if (session?.userId && session.origin === DSH_ACCOUNT_ORIGIN) return dshAccountHash(session.userId);
+            }
+            catch { /* the desktop owner falls back to this device */ }
+            const device = typeof config.deviceId === 'string' && config.deviceId !== '' ? config.deviceId : 'local';
+            return 'device:' + device;
+        },
+    });
     const service = createGroupService({
         root,
         deviceId: config.deviceId,
@@ -578,7 +499,15 @@ export function mountGroups(ctx, config, options = {}) {
     ctx.inject(['webServer'], (scoped) => {
         scoped.effect(() => {
             webServer = scoped.webServer;
-            const disposers = makeRoutes(service, drafter, getBoard, `marshal:${config.deviceId}`, crossClient, () => taskBoard === undefined ? 'local' : 'host', options.memory).map((route) => scoped.webServer.register(route));
+            const disposers = makeRoutes(service, drafter, getBoard, `marshal:${config.deviceId}`, crossClient, () => taskBoard === undefined ? 'local' : 'host', options.memory, memoryAuth, () => {
+                const origins = ['dsh-app://app'];
+                try {
+                    const origin = scoped.webServer.getOrigin?.();
+                    if (typeof origin === 'string' && origin !== '') origins.push(origin);
+                }
+                catch { /* desktop origin is enough when the host has no public origin */ }
+                return origins;
+            }).map((route) => scoped.webServer.register(route));
             return () => {
                 for (const dispose of disposers) dispose();
             };

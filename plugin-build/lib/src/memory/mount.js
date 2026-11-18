@@ -82,7 +82,7 @@ export function createMemoryService({ root, logger, now = Date.now } = {}) {
         }
     };
 
-    return { store, handle, dir };
+    return { store, handle, dir, injectionText: cwd => store.promptText(cwd) };
 }
 
 function formatStatus(status) {
@@ -151,7 +151,22 @@ function memoryTool(service) {
 }
 
 export function mountMemory(ctx, config, options = {}) {
-    const service = createMemoryService({ root: options.root, logger: options.logger ?? ctx.logger });
+    const service = createMemoryService({ root: options.root ?? config?.memoryRoot, logger: options.logger ?? ctx.logger });
+    try {
+        ctx.inject(['systemPrompt'], scoped => {
+            scoped.effect(() => scoped.systemPrompt.section({
+                name: 'marshal:file-memory',
+                order: 4,
+                text: context => {
+                    const cwd = context?.agent?.session?.header?.cwd;
+                    return service.injectionText(typeof cwd === 'string' ? cwd : undefined);
+                },
+            }), 'marshal: file memory prompt');
+        });
+    }
+    catch (error) {
+        (options.logger ?? ctx.logger)?.warn?.('marshal memory: file prompt unavailable: ' + (error?.message ?? error));
+    }
     ctx.inject(['tools'], scoped => {
         scoped.effect(() => {
             const definition = memoryTool(service);

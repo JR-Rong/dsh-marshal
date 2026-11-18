@@ -420,6 +420,11 @@ window.__ModuleLoader__.load({
       const [settings, setSettings] = React.useState(null);
       const [health, setHealth] = React.useState(null);
       const [settingsOpen, setSettingsOpen] = React.useState(false);
+      const [proposals, setProposals] = React.useState([]);
+      const [drafts, setDrafts] = React.useState({});
+      const [globalVisibility, setGlobalVisibility] = React.useState('no-group');
+      const [editText, setEditText] = React.useState('');
+      const [editVisibility, setEditVisibility] = React.useState('no-group');
       const agents = library?.agents ?? [];
       const agent = agents.find(item => item.id === agentId);
       const workspaceId = agent?.workspaceId;
@@ -442,7 +447,22 @@ window.__ModuleLoader__.load({
         }
         catch (e) { setError(friendlyError(e, '记忆')); }
       };
-      React.useEffect(() => { void load(); void fetchJson('marshal/memory/settings/get').then(setSettings).catch(() => {}); }, []);
+      const loadProposals = async () => {
+        try {
+          const data = await fetchJson('marshal/memory/proposals');
+          const items = data.proposals || [];
+          setProposals(items);
+          setDrafts(current => {
+            const next = { ...current };
+            for (const item of items) {
+              if (next[item.id] === undefined) next[item.id] = { title: item.title, text: item.content, visibility: item.visibility === 'all' ? 'all' : 'no-group' };
+            }
+            return next;
+          });
+        }
+        catch { setProposals([]); }
+      };
+      React.useEffect(() => { void load(); void fetchJson('marshal/memory/settings/get').then(setSettings).catch(() => {}); void loadProposals(); }, []);
       React.useEffect(() => { void loadGraph(); }, [agentId, workspaceId]);
       const search = async () => {
         if (query.trim() === '') { setResults(null); return; }
@@ -456,7 +476,8 @@ window.__ModuleLoader__.load({
         if (title.trim() === '' || text.trim() === '') return;
         setBusy(true);
         try {
-          await fetchJson('marshal/memory/remember', { agentId, workspaceId, scope, title: title.trim(), text: text.trim(), kind: scope === 'workspace' ? 'fact' : 'fact', importance: 0.6, tags: [] });
+          if (scope === 'global') await fetchJson('marshal/memory/global', { title: title.trim(), text: text.trim(), kind: 'fact', importance: 0.6, tags: [], visibility: globalVisibility });
+          else await fetchJson('marshal/memory/remember', { agentId, workspaceId, scope, title: title.trim(), text: text.trim(), kind: 'fact', importance: 0.6, tags: [] });
           setTitle(''); setText(''); setFormOpen(false); await loadGraph();
         }
         catch (e) { setError(friendlyError(e, '写入记忆')); }
@@ -465,10 +486,30 @@ window.__ModuleLoader__.load({
       const forget = async item => {
         if (!item || !window.confirm('删除这条记忆？')) return;
         try {
-          await fetchJson('marshal/memory/forget', { agentId, workspaceId, id: item.id });
+          if (item.scope === 'global') await fetchJson('marshal/memory/global/forget', { id: item.id });
+          else await fetchJson('marshal/memory/forget', { agentId, workspaceId, id: item.id });
           setSelected(null); setResults(null); await loadGraph();
         }
         catch (e) { setError(friendlyError(e, '删除记忆')); }
+      };
+      const decideProposal = async (item, action) => {
+        const draft = drafts[item.id] || { title: item.title, text: item.content, visibility: item.visibility === 'all' ? 'all' : 'no-group' };
+        try {
+          if (action === 'reject') await fetchJson('marshal/memory/proposals/reject', { id: item.id });
+          else await fetchJson('marshal/memory/proposals/approve', { id: item.id, title: draft.title, text: draft.text, visibility: draft.visibility });
+          await loadProposals();
+          await loadGraph();
+        }
+        catch (e) { setError(friendlyError(e, '全局记忆审批')); }
+      };
+      const saveGlobal = async () => {
+        if (!selected || selected.scope !== 'global') return;
+        try {
+          const saved = await fetchJson('marshal/memory/global/update', { id: selected.id, title: selected.title, text: editText, visibility: editVisibility });
+          setSelected(saved.item);
+          await loadGraph();
+        }
+        catch (e) { setError(friendlyError(e, '编辑全局记忆')); }
       };
       return h('div', { style: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' } },
         h('div', { style: { padding: '14px 18px', display: 'flex', alignItems: 'center', gap: 10, borderBottom: '1px solid #8883', flexWrap: 'wrap' } },
@@ -491,20 +532,52 @@ window.__ModuleLoader__.load({
           h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } }, '摘要 provider', h('input', { defaultValue: settings.summaryProvider ?? '', placeholder: 'empty = 本地', onBlur: async event => { const value = event.target.value.trim(); try { const saved = await fetchJson('marshal/memory/settings', { summaryProvider: value }); setSettings(saved.settings); } catch { /* keep local */ } }, style: { ...uiInput, width: 150 } })),
           h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } }, '摘要模型', h('input', { defaultValue: settings.summaryModel ?? '', placeholder: 'empty = 本地', onBlur: async event => { const value = event.target.value.trim(); try { const saved = await fetchJson('marshal/memory/settings', { summaryModel: value }); setSettings(saved.settings); } catch { /* keep local */ } }, style: { ...uiInput, width: 180 } }))),
         error !== '' && h('div', { style: { padding: '8px 18px', color: dswTheme.danger, fontSize: 12 } }, error),
+        h('section', { style: { padding: '10px 18px', borderBottom: '1px solid #8883', display: 'grid', gap: 8 } },
+          h('div', { style: { fontSize: 13, fontWeight: 600 } }, '全局记忆审批'),
+          proposals.length === 0
+            ? h('div', { style: { fontSize: 12, color: dswTheme.dim } }, '没有待审批的全局记忆。智能体提交的全局记忆会停在这里，同意后才会生效。')
+            : proposals.map(item => {
+              const draft = drafts[item.id] || { title: item.title, text: item.content, visibility: item.visibility === 'all' ? 'all' : 'no-group' };
+              const patch = next => setDrafts(current => ({ ...current, [item.id]: { ...draft, ...next } }));
+              return h('div', { key: item.id, style: { display: 'grid', gap: 6, padding: 8, border: '1px solid #8883', borderRadius: 10 } },
+                h('div', { style: { fontSize: 11, color: dswTheme.dim } }, (item.agentId || '未知智能体') + ' · ' + new Date(item.createdAt || Date.now()).toLocaleString()),
+                h('input', { value: draft.title, onChange: event => patch({ title: event.target.value }), style: uiInput }),
+                h('textarea', { value: draft.text, rows: 3, onChange: event => patch({ text: event.target.value }), style: { ...uiInput, resize: 'vertical' } }),
+                h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
+                  h('select', { value: draft.visibility, onChange: event => patch({ visibility: event.target.value }), style: { ...uiInput, width: 140 } }, h('option', { value: 'all' }, '所有会话'), h('option', { value: 'no-group' }, '仅单聊')),
+                  h('button', { type: 'button', style: uiButton(true), onClick: () => { void decideProposal(item, 'approve'); } }, '同意'),
+                  h('button', { type: 'button', style: uiButton(false), onClick: () => { void decideProposal(item, 'reject'); } }, '拒绝')));
+            })),
         formOpen && h('div', { style: { padding: '12px 18px', display: 'grid', gap: 8, borderBottom: '1px solid #8883' } },
           h('div', { style: { display: 'flex', gap: 8 } },
             h('input', { value: title, onChange: event => setTitle(event.target.value), placeholder: '标题', style: { ...uiInput, flex: 1 } }),
-            h('select', { value: scope, onChange: event => setScope(event.target.value), style: { ...uiInput, width: 130 } }, h('option', { value: 'agent' }, 'Agent 私有'), h('option', { value: 'workspace' }, '工作区共享'))),
+            h('select', { value: scope, onChange: event => setScope(event.target.value), style: { ...uiInput, width: 130 } }, h('option', { value: 'agent' }, 'Agent 私有'), h('option', { value: 'workspace' }, '工作区共享'), h('option', { value: 'global' }, '全局')),
+            scope === 'global' && h('select', { value: globalVisibility, onChange: event => setGlobalVisibility(event.target.value), style: { ...uiInput, width: 140 } }, h('option', { value: 'all' }, '所有会话'), h('option', { value: 'no-group' }, '仅单聊'))),
           h('textarea', { value: text, onChange: event => setText(event.target.value), rows: 3, placeholder: '记忆内容…', style: { ...uiInput, resize: 'vertical' } }),
           h('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8 } }, h('button', { type: 'button', style: uiButton(false), onClick: () => setFormOpen(false) }, '取消'), h('button', { type: 'button', disabled: busy, style: uiButton(true), onClick: () => { void create(); } }, busy ? '保存中…' : '保存'))),
         results !== null && h('div', { style: { maxHeight: 180, overflow: 'auto', borderBottom: '1px solid #8883', padding: '8px 18px', display: 'grid', gap: 4 } },
-          results.length === 0 ? h('div', { style: { fontSize: 12, color: dswTheme.dim } }, '没有匹配的记忆') : results.map(item => h('button', { key: item.id, type: 'button', onClick: () => setSelected(item), style: { textAlign: 'left', border: 0, background: 'transparent', color: 'inherit', cursor: 'pointer', padding: '5px 0' } }, '[' + item.scope + '] ' + item.title))),
+          results.length === 0 ? h('div', { style: { fontSize: 12, color: dswTheme.dim } }, '没有匹配的记忆') : results.map(item => h('button', { key: item.id, type: 'button', onClick: () => { setSelected(item); if (item.scope === 'global') { setEditText(item.content || ''); setEditVisibility(item.visibility === 'all' ? 'all' : 'no-group'); } }, style: { textAlign: 'left', border: 0, background: 'transparent', color: 'inherit', cursor: 'pointer', padding: '5px 0' } }, '[' + item.scope + '] ' + item.title))),
         h('div', { style: { flex: 1, minHeight: 0, display: 'flex', padding: 14, gap: 14 } },
-          h('div', { style: { flex: 1, minWidth: 0, minHeight: 0, borderRadius: 14, overflow: 'hidden', border: '1px solid #8883' } }, h(MemoryGalaxy, { graph, selectedId: selected?.id, onSelect: setSelected })),
+          h('div', { style: { flex: 1, minWidth: 0, minHeight: 0, borderRadius: 14, overflow: 'hidden', border: '1px solid #8883' } }, h(MemoryGalaxy, { graph, selectedId: selected?.id, onSelect: item => {
+            setSelected(item);
+            if (item?.scope !== 'global') return;
+            setEditVisibility(item.visibility === 'all' ? 'all' : 'no-group');
+            if (typeof item.content === 'string' && item.content !== '') { setEditText(item.content); return; }
+            void fetchJson('marshal/memory/get?id=' + encodeURIComponent(item.id) + '&scope=global').then(data => {
+              setSelected(data.item);
+              setEditText(data.item?.content || '');
+              setEditVisibility(data.item?.visibility === 'all' ? 'all' : 'no-group');
+            }).catch(e => setError(friendlyError(e, '读取全局记忆')));
+          } })),
           selected && h('aside', { style: { width: 300, flexShrink: 0, overflow: 'auto', padding: 16, border: '1px solid #8883', borderRadius: 14, background: 'color-mix(in srgb, currentColor 3%, transparent)' } },
-            h('div', { style: { fontSize: 11, color: dswTheme.dim, textTransform: 'uppercase', letterSpacing: '.06em' } }, selected.scope + ' · ' + selected.kind),
+            h('div', { style: { fontSize: 11, color: dswTheme.dim, textTransform: 'uppercase', letterSpacing: '.06em' } }, selected.scope + ' · ' + selected.kind + (selected.scope === 'global' ? ' · ' + (selected.visibility === 'all' ? '所有会话' : '仅单聊') : '')),
             h('h3', { style: { margin: '6px 0 10px', fontSize: 16 } }, selected.title),
-            h('p', { style: { whiteSpace: 'pre-wrap', fontSize: 13, lineHeight: 1.65 } }, selected.content),
+            selected.scope === 'global'
+              ? h('div', { style: { display: 'grid', gap: 8 } },
+                h('textarea', { value: editText || selected.content || '', onChange: event => setEditText(event.target.value), rows: 6, style: { ...uiInput, resize: 'vertical' } }),
+                h('select', { value: editVisibility, onChange: event => setEditVisibility(event.target.value), style: uiInput }, h('option', { value: 'all' }, '所有会话'), h('option', { value: 'no-group' }, '仅单聊')),
+                h('button', { type: 'button', style: uiButton(true), onClick: () => { void saveGlobal(); } }, '保存全局记忆'))
+              : h('p', { style: { whiteSpace: 'pre-wrap', fontSize: 13, lineHeight: 1.65 } }, selected.content),
             h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 12 } }, (selected.tags || []).map(tag => h('span', { key: tag, style: { fontSize: 11, padding: '3px 7px', borderRadius: 999, background: 'color-mix(in srgb, currentColor 8%, transparent)' } }, tag))),
             h('div', { style: { marginTop: 14, fontSize: 11, color: dswTheme.dim } }, '清晰度 ' + ({ vivid: '清晰', clear: '清楚', fuzzy: '模糊', trace: '只剩印象' }[selected.clarity] || selected.clarity || '清晰') + ' · 重要性 ' + Math.round((selected.importance || 0) * 100) + '% · 访问 ' + (selected.accessCount || 0) + ' 次' + (selected.pinned ? ' · 已固定' : '')),
             h('div', { style: { display: 'flex', gap: 8, marginTop: 16 } },
@@ -827,10 +900,44 @@ window.__ModuleLoader__.load({
       return area + '失败：' + message;
     }
 
-    async function fetchJson(path, body) {
-      const init = body === undefined ? {} : {
+    const MEMORY_CSRF_COOKIE = '__Host-marshal-memory-csrf';
+    let memorySessionPromise;
+    function readBrowserCookie(name) {
+      const parts = String(document.cookie || '').split(';');
+      for (const part of parts) {
+        const trimmed = part.trim();
+        if (trimmed.startsWith(name + '=')) return trimmed.slice(name.length + 1);
+      }
+      return '';
+    }
+    async function ensureMemorySession() {
+      if (readBrowserCookie(MEMORY_CSRF_COOKIE) !== '') return;
+      memorySessionPromise ??= fetch(new URL('marshal/memory/session', document.baseURI), {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        credentials: 'same-origin',
+        headers: { 'x-marshal-memory': '1' },
+      }).then(async response => {
+        if (!response.ok) {
+          memorySessionPromise = undefined;
+          throw new Error('memory-auth');
+        }
+        return response.json();
+      }).catch(error => { memorySessionPromise = undefined; throw error; });
+      await memorySessionPromise;
+    }
+    async function fetchJson(path, body) {
+      const memory = String(path).startsWith('marshal/memory') && !String(path).startsWith('marshal/memory/session');
+      if (memory) await ensureMemorySession();
+      const headers = {};
+      if (body !== undefined) headers['content-type'] = 'application/json';
+      if (memory) {
+        const csrf = readBrowserCookie(MEMORY_CSRF_COOKIE);
+        if (csrf !== '') headers['x-marshal-csrf'] = csrf;
+      }
+      const init = body === undefined ? { credentials: 'same-origin', headers } : {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers,
         body: JSON.stringify(body),
       };
       const response = await fetch(new URL(path, document.baseURI), init);

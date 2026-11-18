@@ -7,6 +7,7 @@ import {
     hashEmbed, memorySearchText, vectorToBuffer,
 } from './hash-vector.js';
 import { neutralizeMemory, queryTerms } from './lifecycle.js';
+import { normalizeGlobalVisibility } from './policy.js';
 
 const SCHEMA_VERSION = 1;
 const MAX_CONTENT = 20_000;
@@ -81,12 +82,12 @@ export class MemoryStore {
         db.exec('PRAGMA journal_mode=WAL');
         db.exec('PRAGMA busy_timeout=5000');
         db.exec('PRAGMA foreign_keys=ON');
-        this.ensure(db);
+        this.ensure(db, scope);
         this.dbs.set(path, db);
         return db;
     }
 
-    ensure(db) {
+    ensure(db, scope) {
         db.exec(`
             CREATE TABLE IF NOT EXISTS memory_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS memories (
@@ -150,6 +151,24 @@ export class MemoryStore {
                 status TEXT NOT NULL DEFAULT 'pending',
                 created_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS memory_tombstones (
+                id TEXT PRIMARY KEY,
+                content_hash TEXT,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS memory_proposals (
+                id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                importance REAL NOT NULL DEFAULT 0.5,
+                tags TEXT NOT NULL DEFAULT '[]',
+                visibility TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                resolved_at INTEGER
+            );
         `);
         const columns = new Set(db.prepare('PRAGMA table_info(memories)').all().map(row => row.name));
         const additions = [
@@ -164,6 +183,15 @@ export class MemoryStore {
         }
         const current = db.prepare("SELECT value FROM memory_meta WHERE key='schema_version'").get();
         if (current === undefined) db.prepare("INSERT INTO memory_meta(key,value) VALUES('schema_version',?)").run(String(SCHEMA_VERSION));
+        if (scope === 'global') {
+            db.prepare("UPDATE memories SET visibility='no-group' WHERE visibility NOT IN ('all','no-group')").run();
+            db.prepare("UPDATE memory_archive SET visibility='no-group' WHERE visibility NOT IN ('all','no-group')").run();
+        }
+    }
+
+    visibilityFor(scope, value) {
+        if (scope === 'global') return normalizeGlobalVisibility(value);
+        return ['private', 'group-safe', 'never-group'].includes(value) ? value : 'private';
     }
 
     insertFts(db, memory) {
@@ -179,7 +207,7 @@ export class MemoryStore {
         if (content.length > MAX_CONTENT) throw new Error('memory content is too long');
         const kind = String(entry.kind ?? 'fact');
         if (!['profile', 'fact', 'decision', 'episode', 'handoff', 'scene'].includes(kind)) throw new Error('invalid memory kind');
-        const visibility = ['private', 'group-safe', 'never-group'].includes(entry.visibility) ? entry.visibility : 'private';
+        const visibility = this.visibilityFor(scope, entry.visibility);
         const tags = Array.isArray(entry.tags) ? entry.tags.filter(tag => typeof tag === 'string').slice(0, 24) : [];
         const importance = Math.max(0, Math.min(1, Number(entry.importance ?? 0.5)));
         const pinned = entry.pinned === true || kind === 'handoff' ? 1 : 0;
@@ -193,8 +221,10 @@ export class MemoryStore {
             return mapMemory(db.prepare('SELECT * FROM memories WHERE id=?').get(existing.id));
         }
         const at = nowMs(this.now);
+        const id = typeof context.id === 'string' && context.id !== '' ? context.id : randomUUID();
+        if (this.hasTombstone(scope, ownerId, id)) return undefined;
         const memory = {
-            id: randomUUID(), scope, ownerId, kind, title, content, importance, pinned, visibility,
+            id, scope, ownerId, kind, title, content, importance, pinned, visibility,
             tags, sourceSession: context.sessionId ?? null, sourceDevice: context.deviceId ?? null,
             createdAt: at, updatedAt: at,
         };
@@ -244,6 +274,8 @@ export class MemoryStore {
             db.prepare('DELETE FROM memories_fts WHERE memory_id=?').run(String(id));
             db.prepare('DELETE FROM memory_vectors WHERE memory_id=?').run(String(id));
             db.prepare('DELETE FROM memories WHERE id=?').run(String(id));
+            db.prepare('INSERT OR REPLACE INTO memory_tombstones(id, content_hash, updated_at) VALUES(?,?,?)')
+                .run(String(id), row.content_hash, nowMs(this.now));
             db.exec('COMMIT');
             return true;
         }
@@ -371,6 +403,7 @@ export class MemoryStore {
         }
         return { nodes: nodes.map(node => ({
             id: node.id, title: node.title, kind: node.kind, scope: node.scope,
+            visibility: node.visibility,
             importance: node.importance, pinned: node.pinned, tags: node.tags,
             accessCount: node.accessCount, clarity: node.clarity, retention: node.retention,
             createdAt: node.createdAt, updatedAt: node.updatedAt,
@@ -381,21 +414,145 @@ export class MemoryStore {
         return this.db(scope, ownerId).prepare('SELECT * FROM memories ORDER BY updated_at ASC').all().map(mapMemory);
     }
 
+    hasTombstone(scope, ownerId, id) {
+        if (typeof id !== 'string' || id === '') return false;
+        const row = this.db(scope, ownerId).prepare('SELECT id FROM memory_tombstones WHERE id=?').get(id);
+        return row !== undefined;
+    }
+
+    exportTombstones(scope, ownerId) {
+        return this.db(scope, ownerId).prepare('SELECT id, content_hash AS contentHash, updated_at AS updatedAt FROM memory_tombstones ORDER BY updated_at ASC').all()
+            .map(row => ({ id: row.id, contentHash: row.contentHash ?? undefined, updatedAt: Number(row.updatedAt), tombstone: true, revision: Number(row.updatedAt) }));
+    }
+
+    applyTombstone(scope, ownerId, record) {
+        const id = String(record?.id ?? '');
+        if (id === '') return false;
+        if (this.get(scope, ownerId, id) !== undefined) this.forget(scope, ownerId, id);
+        const at = Number(record?.updatedAt ?? nowMs(this.now));
+        this.db(scope, ownerId).prepare('INSERT OR REPLACE INTO memory_tombstones(id, content_hash, updated_at) VALUES(?,?,?)')
+            .run(id, typeof record?.contentHash === 'string' ? record.contentHash : null, at);
+        return true;
+    }
+
+    update(scope, ownerId, id, patch = {}) {
+        const db = this.db(scope, ownerId);
+        const row = db.prepare('SELECT * FROM memories WHERE id=?').get(String(id));
+        if (row === undefined) return undefined;
+        const current = mapMemory(row);
+        const title = patch.title !== undefined ? neutralizeMemory(patch.title).trim().slice(0, 160) : current.title;
+        const content = patch.content !== undefined ? neutralizeMemory(patch.content).trim() : current.content;
+        if (title === '' || content === '') throw new Error('memory title and content are required');
+        if (content.length > MAX_CONTENT) throw new Error('memory content is too long');
+        const kind = patch.kind !== undefined && ['profile', 'fact', 'decision', 'episode', 'handoff', 'scene'].includes(patch.kind) ? patch.kind : current.kind;
+        const visibility = patch.visibility === undefined && scope !== 'global'
+            ? current.visibility
+            : this.visibilityFor(scope, patch.visibility === undefined ? current.visibility : patch.visibility);
+        const tags = Array.isArray(patch.tags) ? patch.tags.filter(tag => typeof tag === 'string').slice(0, 24) : current.tags;
+        const importance = patch.importance === undefined ? current.importance : Math.max(0, Math.min(1, Number(patch.importance)));
+        const hash = contentHash(title, content);
+        const clash = db.prepare('SELECT id FROM memories WHERE content_hash=? AND id<>?').get(hash, String(id));
+        if (clash !== undefined) throw new Error('memory already exists');
+        const at = nowMs(this.now);
+        db.exec('BEGIN IMMEDIATE');
+        try {
+            db.prepare('UPDATE memories SET kind=?, title=?, content=?, importance=?, visibility=?, tags=?, updated_at=?, content_hash=? WHERE id=?')
+                .run(kind, title, content, importance, visibility, JSON.stringify(tags), at, hash, String(id));
+            const memory = mapMemory(db.prepare('SELECT * FROM memories WHERE id=?').get(String(id)));
+            this.insertFts(db, memory);
+            const vector = hashEmbed(title + '\n' + content, HASH_DIM);
+            db.prepare(`INSERT INTO memory_vectors(memory_id,provider,model,dim,vector) VALUES(?,?,?,?,?)
+                ON CONFLICT(memory_id) DO UPDATE SET provider=excluded.provider, model=excluded.model, dim=excluded.dim, vector=excluded.vector`)
+                .run(String(id), HASH_PROVIDER, 'hash-384', HASH_DIM, vectorToBuffer(vector));
+            db.exec('COMMIT');
+            return memory;
+        }
+        catch (error) {
+            try { db.exec('ROLLBACK'); } catch { /* closed */ }
+            throw error;
+        }
+    }
+
+    mapProposal(row) {
+        if (row === undefined) return undefined;
+        return {
+            id: row.id, status: row.status, agentId: row.agent_id, kind: row.kind, title: row.title,
+            content: row.content, importance: Number(row.importance), tags: parseTags(row.tags),
+            visibility: row.visibility, createdAt: Number(row.created_at),
+            resolvedAt: row.resolved_at === null || row.resolved_at === undefined ? undefined : Number(row.resolved_at),
+        };
+    }
+
+    propose(entry, context = {}) {
+        const title = neutralizeMemory(entry.title ?? '').trim().slice(0, 160);
+        const content = neutralizeMemory(entry.content ?? '').trim();
+        if (title === '' || content === '') throw new Error('memory title and content are required');
+        const kind = ['profile', 'fact', 'decision', 'episode', 'handoff', 'scene'].includes(entry.kind) ? entry.kind : 'fact';
+        const visibility = normalizeGlobalVisibility(entry.visibility);
+        const tags = Array.isArray(entry.tags) ? entry.tags.filter(tag => typeof tag === 'string').slice(0, 24) : [];
+        const importance = Math.max(0, Math.min(1, Number(entry.importance ?? 0.5)));
+        const at = nowMs(this.now);
+        const id = randomUUID();
+        const agentId = typeof context.agentId === 'string' && context.agentId !== '' ? context.agentId : 'unknown';
+        this.db('global', 'global').prepare(`INSERT INTO memory_proposals
+            (id,status,agent_id,kind,title,content,importance,tags,visibility,created_at,resolved_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,NULL)`)
+            .run(id, 'pending', agentId, kind, title, content, importance, JSON.stringify(tags), visibility, at);
+        return this.mapProposal(this.db('global', 'global').prepare('SELECT * FROM memory_proposals WHERE id=?').get(id));
+    }
+
+    listProposals(status = 'pending') {
+        const rows = this.db('global', 'global').prepare('SELECT * FROM memory_proposals WHERE status=? ORDER BY created_at ASC').all(status);
+        return rows.map(row => this.mapProposal(row));
+    }
+
+    getProposal(id) {
+        return this.mapProposal(this.db('global', 'global').prepare('SELECT * FROM memory_proposals WHERE id=?').get(String(id)));
+    }
+
+    approveProposal(id, edits = {}) {
+        const proposal = this.getProposal(id);
+        if (proposal === undefined || proposal.status !== 'pending') return undefined;
+        const title = edits.title !== undefined ? edits.title : proposal.title;
+        const content = edits.content !== undefined ? edits.content : (edits.text !== undefined ? edits.text : proposal.content);
+        const visibility = edits.visibility === undefined ? proposal.visibility : edits.visibility;
+        const memory = this.remember('global', 'global', {
+            kind: proposal.kind, title, content, importance: proposal.importance, tags: proposal.tags, visibility,
+        });
+        if (memory === undefined) return undefined;
+        this.db('global', 'global').prepare("UPDATE memory_proposals SET status='approved', resolved_at=? WHERE id=?")
+            .run(nowMs(this.now), proposal.id);
+        return { proposal: this.getProposal(proposal.id), memory };
+    }
+
+    rejectProposal(id) {
+        const proposal = this.getProposal(id);
+        if (proposal === undefined || proposal.status !== 'pending') return undefined;
+        this.db('global', 'global').prepare("UPDATE memory_proposals SET status='rejected', resolved_at=? WHERE id=?")
+            .run(nowMs(this.now), proposal.id);
+        return this.getProposal(proposal.id);
+    }
+
     applyRemote(scope, ownerId, record) {
-        if (record === null || typeof record !== 'object' || typeof record.title !== 'string' || typeof record.content !== 'string') return undefined;
+        if (record === null || typeof record !== 'object') return undefined;
+        if (record.tombstone === true || this.hasTombstone(scope, ownerId, record.id)) {
+            this.applyTombstone(scope, ownerId, record);
+            return undefined;
+        }
+        if (typeof record.title !== 'string' || typeof record.content !== 'string') return undefined;
         const existing = this.db(scope, ownerId).prepare('SELECT * FROM memories WHERE content_hash=?').get(contentHash(record.title, record.content));
         if (existing !== undefined) {
             if (Number(existing.updated_at) >= Number(record.updatedAt ?? 0)) return mapMemory(existing);
             const db = this.db(scope, ownerId);
             db.prepare('UPDATE memories SET importance=?, pinned=?, visibility=?, tags=?, updated_at=? WHERE id=?')
-                .run(Math.max(0, Math.min(1, Number(record.importance ?? 0.5))), record.pinned ? 1 : 0, record.visibility ?? 'private', JSON.stringify(Array.isArray(record.tags) ? record.tags : []), Number(record.updatedAt ?? nowMs(this.now)), existing.id);
+                .run(Math.max(0, Math.min(1, Number(record.importance ?? 0.5))), record.pinned ? 1 : 0, this.visibilityFor(scope, record.visibility), JSON.stringify(Array.isArray(record.tags) ? record.tags : []), Number(record.updatedAt ?? nowMs(this.now)), existing.id);
             return mapMemory(db.prepare('SELECT * FROM memories WHERE id=?').get(existing.id));
         }
         return this.remember(scope, ownerId, {
             kind: record.kind, title: record.title, content: record.content,
             importance: record.importance, pinned: record.pinned,
             visibility: record.visibility, tags: record.tags,
-        }, { sessionId: record.sourceSession, deviceId: record.sourceDevice });
+        }, { sessionId: record.sourceSession, deviceId: record.sourceDevice, id: record.id });
     }
 
     decay(scope, ownerId) {

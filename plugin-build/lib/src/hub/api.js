@@ -2,6 +2,7 @@ import { ControlsSchema } from "../agents/controls.js";
 import { AccountLoginError } from "./account.js";
 import { DeviceStateError } from "./devices.js";
 import { DiscussionError } from "../discussions/types.js";
+import { handleMemorySyncPull, handleMemorySyncPush } from "./memory-sync.js";
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { COMMAND_OPS } from "../wire/frames.js";
 import { parseCommandArgs } from "../wire/commands.js";
@@ -652,7 +653,7 @@ export function registerMarshalRoutes(options) {
             if (!identity)
                 throw new AccountLoginError('account-unavailable');
             const id = 'account-' + createHash('sha256').update(identity.accountHash + '|' + data.installationId).digest('hex').slice(0, 32);
-            const device = options.deviceStore.enroll(id, data.name, data.tokenDigest, data.shareContent);
+            const device = options.deviceStore.enroll(id, data.name, data.tokenDigest, data.shareContent, identity.accountHash);
             limiter.success(source);
             json(res, 200, { ok: true, deviceId: device.id, accountHash: identity.accountHash, operatorId,
                 allowContent: device.allowContent, allowDiscussion: device.allowDiscussion });
@@ -843,28 +844,10 @@ export function registerMarshalRoutes(options) {
         }
     }));
     register('/marshal/api/memory-sync/push', guard(async (req, res) => {
-        if (memorySync === undefined) { json(res, 503, { ok: false, code: 'memory-sync-unavailable' }); return; }
-        if (req.method !== 'POST') { methodNotAllowed(res, 'POST'); return; }
-        const auth = authorize(req, res, { allowToken: true, write: true });
-        if (auth === undefined) return;
-        const body = await readJsonBody(req, res, 512 * 1024);
-        if (!body.ok) return;
-        const scope = body.value?.scope === 'workspace' ? 'workspace' : body.value?.scope === 'agent' ? 'agent' : undefined;
-        const ownerId = typeof body.value?.ownerId === 'string' ? body.value.ownerId : '';
-        if (scope === undefined || ownerId === '') { json(res, 400, { ok: false, code: 'invalid-args' }); return; }
-        const accepted = memorySync.push(scope, ownerId, body.value?.deviceId, body.value?.records);
-        json(res, 200, { ok: true, accepted });
+        await handleMemorySyncPush(req, res, { memorySync, deviceFromRequest: deviceFromBearer, operatorId });
     }));
     register('/marshal/api/memory-sync/pull', guard((req, res) => {
-        if (memorySync === undefined) { json(res, 503, { ok: false, code: 'memory-sync-unavailable' }); return; }
-        if (req.method !== 'GET') { methodNotAllowed(res, 'GET'); return; }
-        if (authorize(req, res, { allowToken: true, write: false }) === undefined) return;
-        const url = new URL(req.url ?? '/', 'http://localhost');
-        const scope = url.searchParams.get('scope') === 'workspace' ? 'workspace' : 'agent';
-        const ownerId = url.searchParams.get('ownerId') ?? '';
-        if (ownerId === '') { json(res, 400, { ok: false, code: 'invalid-args' }); return; }
-        const since = Number(url.searchParams.get('since')) || 0;
-        json(res, 200, { ok: true, records: memorySync.pull(scope, ownerId, since) });
+        handleMemorySyncPull(req, res, { memorySync, deviceFromRequest: deviceFromBearer, operatorId });
     }));
     register('/marshal/api/device-name', guard(async (req, res) => {
         if (req.method !== 'POST') {

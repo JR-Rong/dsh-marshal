@@ -261,6 +261,26 @@ export class MemoryStore {
         return { ok: issues.length === 0, issues, workspace: { slug: workspace.slug, path: workspace.record.path } };
     }
 
+    /**
+     * Short operational block injected beside SQLite memory.
+     * Rules and the current workspace handoff only; notes stay on the tool.
+     * Does not create files.
+     */
+    promptText(cwd) {
+        const parts = [];
+        const rules = (readText(join(this.globalDir, 'rules.md')) ?? '').trim();
+        if (rules !== '') parts.push('【文件记忆·全局铁律】\n' + rules.slice(0, 1500));
+        if (typeof cwd === 'string' && cwd.startsWith('/')) {
+            try {
+                const handoff = (readText(join(this.workspacesDir, this.slugFor(cwd), 'handoff.md')) ?? '').trim();
+                if (handoff !== '') parts.push('【文件记忆·工作区交接】\n' + handoff.slice(0, 1500));
+            }
+            catch { /* cwd that cannot be a workspace slug contributes no handoff */ }
+        }
+        if (parts.length === 0) return '';
+        return '<file-memory>\n' + parts.join('\n') + '\n</file-memory>\n';
+    }
+
     /** 一线视图：全局摘要 + 工作区摘要 + 体检。 */
     status({ cwd } = {}) {
         this.ensure();

@@ -416,7 +416,7 @@ function applyNode(ctx, config) {
             ctx.logger.warn(`marshal: memory unavailable: ${errorName(error)}`);
         }
         try {
-            agentMemoryService = mountAgentMemory(ctx, config, { logger: ctx.logger });
+            agentMemoryService = mountAgentMemory(ctx, config, { logger: ctx.logger, fileMemory: memoryService });
         }
         catch (error) {
             ctx.logger.warn(`marshal: agent memory unavailable: ${errorName(error)}`);
