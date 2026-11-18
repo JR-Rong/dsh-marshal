@@ -1,85 +1,70 @@
 # 调度官手机端 · dsh-marshal-mobile
 
-把 dsh-marshal（调度官）搬到 Android 与 iOS 上的**客户端**应用：在手机上查看云端 Hub 的设备与会话、进入完整调度台续跑会话、审批提问、参与讨论群聊、调控制项、看历史与上传。
+手机端**直连** dsh-marshal Hub：界面由 App 自己绘制，不再加载网页控制台。看设备、挑会话、读历史、收实时事件、发消息、答审批、看控制项，全部在原生界面里完成。
 
 - 应用身份：`com.rongjunrui.marshal.mobile`
-- 技术栈：Capacitor 8（原生壳）+ TypeScript/Vite（壳内 UI）
-- 两端同源同码：Android 与 iOS 共用 `src/`，只有各自的 `android/`、`ios/` 工程不同
+- 技术栈：Capacitor 8（原生壳）+ TypeScript/Vite（自绘界面）+ 本地插件 `plugins/marshal-stream`（原生 SSE）
+- 两端同码：Android 与 iOS 共用 `src/`，各自只承载壳工程
 
 ---
 
 ## 一、硬约束：只能当客户端
 
-这是本工程的**第一原则**，也是验收项：
-
 | 约束 | 落地方式 |
 |---|---|
-| 不承载 Hub | 工程里没有任何 HTTP/WS 服务端代码，不监听端口；`android/`、`ios/` 只是 WebView 壳 |
-| 不承载 node | 不含 marshal node 角色装配、不含设备令牌握手逻辑 |
-| 不伪装成调度中心 | 所有数据都来自用户配置的 Hub；Hub 不可达时如实报错，不做本地冒充 |
-| 不绕过鉴权 | 仪表盘用 `x-marshal-token` 直连 Hub 的只读接口；控制台走 Hub 自己的登录与 Cookie |
+| 不承载 Hub | 无任何 HTTP/WS 服务端代码，不监听端口 |
+| 不承载 node | 不含 node 角色装配与设备令牌握手 |
+| 直连而非嵌入 | 不再内嵌 Hub 网页；所有请求走 `/marshal/api/*`，事件流走原生插件 |
+| 不绕过鉴权 | 统一用 `x-marshal-token`；Hub 拒绝就如实报错 |
 
-对照检查：`grep -rn "createServer\|listen(" src/` 应为空；`npx tsc --noEmit` 通过即说明没有引入服务端依赖。
+对照：`grep -rn "createServer\|listen(" src/` 为空即无服务端代码。
 
 ---
 
-## 二、两层结构
+## 二、结构
 
 ```
-┌──────────────────────── 手机 App ────────────────────────┐
-│ 原生壳（Capacitor）                                        │
-│  · 安全存储（iOS Keychain / Android EncryptedSharedPreferences）│
-│  · 状态栏 / 启动图 / 网络监听 / 返回键 / 深链               │
-│                                                            │
-│ 壳内 UI（本仓库 src/）                                     │
-│  · 首次配置向导、连接测试                                  │
-│  · 原生仪表盘：设备 / 会话 / 运行状态（`/marshal/api/*`）    │
-│  · 应用锁（6 位 PIN，PBKDF2-SHA256）                       │
-│                                                            │
-│ 控制台（进入调度官）                                       │
-│  · 在应用内加载 `<hub>/marshal` —— 与浏览器版同一份页面     │
-│  · 因此**功能不缺项**：会话续跑、提问审批、讨论群聊、        │
-│    控制项（模型/思考强度）、历史分页、上传等全部可用        │
-└────────────────────────────────────────────────────────────┘
-             │ HTTPS + SSE（同源，Cookie 认证）
-             ▼
-      dsh-marshal Hub（已有的那台，不改一行代码）
+┌──────────────────── 手机 App ────────────────────┐
+│ Capacitor 原生壳                                  │
+│  · Keychain / EncryptedSharedPreferences 安全存储 │
+│  · 状态栏 / 启动图 / 网络监听 / 返回键 / 深链      │
+│                                                   │
+│ 自绘界面（src/）                                  │
+│  · 配置向导、设备列表、会话列表、会话详情          │
+│  · 实时消息流、审批卡、控制项、历史分页            │
+│  · 应用锁（6 位 PIN，PBKDF2-SHA256）              │
+│                                                   │
+│ 传输层                                            │
+│  · HTTP：CapacitorHttp（原生栈，无跨域限制）       │
+│  · SSE：本地插件 marshal-stream                   │
+│    iOS URLSession / Android HttpURLConnection     │
+└───────────────────────┬───────────────────────────┘
+                        │ HTTPS + x-marshal-token
+                        ▼
+             dsh-marshal Hub（不改一行）
 ```
 
-**为什么控制台不重写而是加载 Hub 页面**：Hub 的实时流（SSE）、会话能力协商、控制项回读、离线幂等队列都在页面里；重写一遍必然缺项，且 Hub 未开 CORS 时手机直连拿不到流。加载同源页面能让手机端拿到与浏览器**完全一致**的功能面，同时把原生能力（安全存储、锁、通知、深链）补在外壳上。
+**为什么需要原生 SSE 插件**：WebView 里的事件源受同源策略限制，Hub 又未开 CORS；
+插件按 SSE 规范在原生侧读流再回传 JS，App 仍是纯客户端，不开端口。
 
 ---
 
 ## 三、功能清单
 
-### 壳内原生能力
+| 功能 | 状态 | 说明 |
+|---|---|---|
+| 配置与连接测试 | 可用 | Hub 地址规范化、令牌校验、实测 `/marshal/api/devices` |
+| 设备列表 | 可用 | 在线/离线、agent 标签、点击进会话 |
+| 会话列表 | 可用 | 按 agent 分组、运行状态、时间 |
+| 会话详情 | 可用 | 历史分页 + 实时事件（`message.delta` / `turn.*` / `tool.*`） |
+| 发消息 | 可用 | `op=prompt`，带幂等键 |
+| 审批与提问 | 可用 | `input.requested` 卡片；审批只呈现安全的「这一次」选项 |
+| 中断 | 可用 | 需能力文档含 `interrupt` 且带 `runtimeEpoch` |
+| 控制项 | 只读呈现 | Hub 当前把模型/思考强度标为 `v0-field-only`，App 如实显示不造假开关 |
+| 群聊 | 受阻（本 Hub） | 群聊接口不接受令牌；本 Hub 又是账号登录模式，登录用令牌返回 400 |
+| 应用锁 | 可用 | 6 位 PIN，启动/切回解锁 |
 
-| 能力 | 说明 |
-|---|---|
-| 首次配置 | Hub 地址 + 管理令牌，带「先测试连接」（`/marshal/health` + `/marshal/api/devices` 实测） |
-| 地址规范化 | 缺协议补 `https://`；粘贴带 `/marshal` 的整条地址自动裁到 origin；公网强制 https |
-| 原生仪表盘 | 在线设备、各设备 agent 与会话、运行中数量、上次同步时间、下拉刷新、20s 自动刷新 |
-| 应用锁 | 6 位 PIN，PBKDF2-SHA256（21 万次迭代）只存盐与摘要；启动/切回需解锁 |
-| 安全存储 | 令牌不落 `localStorage`：原生端走 Keychain / EncryptedSharedPreferences |
-| 断网处理 | 网络监听 + 顶部提示；Hub 不可达时给明确失败原因（401/429/超时/不可达） |
-| 深链 | `marshal://open?hub=<urlencode>` 直接把 Hub 地址填进配置页 |
-| 返回键 | 控制台内 Android 返回键走 WebView 历史回首页；首页返回退出应用 |
-| iOS 手势 | `allowsBackForwardNavigationGestures` 打开，边缘侧滑从控制台回首页 |
-
-### 控制台（Hub 页面，功能保真）
-
-| 功能 | 入口 |
-|---|---|
-| 设备 / 会话索引 | 进入调度官后左侧栏 |
-| 会话续跑（prompt） | 会话底部输入框 |
-| 实时事件流 | SSE `/marshal/api/stream` |
-| 提问与审批回答 | `/marshal/api/inputs` 卡片 |
-| 中断 / 取消 | 会话头部操作 |
-| 控制项（模型、思考强度等） | 能力面板 `/marshal/api/sessions` → capability |
-| 历史分页 | `/marshal/api/history` |
-| 讨论群聊 | `/marshal/api/discussions` + `/discussions/stream` |
-| 上传 | `/marshal/api/command` op=upload |
-| 断线重连与幂等 | 页面内置 intent 队列 |
+> 群聊已按接口写好接入位；Hub 若开放令牌登录（`accountLogin: false`）即可用同一套代码打开。
 
 ---
 
@@ -88,74 +73,54 @@
 ### 环境
 
 - Node.js ≥ 22、npm
-- Android：JDK 17+、Android SDK（platform **36**、build-tools 35+）
-- iOS：Xcode 16+，且**必须同意许可**：`sudo xcodebuild -license`
+- Android：JDK 21+、Android SDK（platform 36）
+- iOS：Xcode 16+，先同意许可 `sudo xcodebuild -license accept`
 
-### 常用命令
+### 命令
 
 ```bash
 npm install
-npm run dev              # 浏览器里调壳内 UI（http://127.0.0.1:5178）
-npm test                 # Node 单元测试（22 项）
-npm run typecheck        # tsc --noEmit
-npm run build            # 产出 dist/
+npm run dev            # 浏览器预览（接口需 mock）
+npm test               # 31 项单元测试
+npm run typecheck
+npm run build
 
-npm run cap:sync         # 构建 + 同步到 android/ios
 bash scripts/build-android.sh   # 出调试 APK
-bash scripts/build-ios.sh       # 出模拟器 .app（需 Xcode 许可）
-bash scripts/verify.sh          # 类型 + 单测 + 构建 + 同步 + UI 冒烟
+bash scripts/build-ios.sh       # 出模拟器 .app
+bash scripts/verify.sh          # 类型 + 单测 + 构建 + 双端同步 + UI 冒烟
 ```
 
-### 产物位置
+产物：`android/app/build/outputs/apk/debug/app-debug.apk`、`ios/build/Build/Products/Debug-iphonesimulator/App.app`
 
-- Android：`android/app/build/outputs/apk/debug/app-debug.apk`
-- iOS：`ios/build/Build/Products/Debug-iphonesimulator/App.app`（模拟器，免签名）
-
-### 归档与 PR
-
-本工程已进入 `JR-Rong/dsh-marshal` 仓库的 `mobile/`，分支 `feat/mobile-client`，
-PR：<https://github.com/JR-Rong/dsh-marshal/pull/5>。
-
-### 图标与启动图
-
-`scripts/make-assets.py` 用 Pillow 本地绘制，不依赖外部设计稿：
-
-```bash
-python3 scripts/make-assets.py
-```
-
-会重写 `android/app/src/main/res/mipmap-*`、`drawable*/splash.png` 与 `ios/App/App/Assets.xcassets`。
+> iOS 构建会把 SwiftPM 缓存写到 `~/Library/Caches/org.swift.swiftpm`；在被沙箱限制的环境里需在普通终端执行，或对该目录放行。
 
 ---
 
 ## 五、首次使用
 
-1. 打开 App，填 Hub 地址（形如 `https://hub.example.com`）。
-2. 填管理令牌（电脑端 marshal 配置里的 `dashboardToken`，至少 16 位）。
-3. 点「先测试连接」，看到「连接成功：N 台设备」。
-4. 「保存并进入」→ 首页出现设备与会话。
-5. 点「进入调度官」→ 在应用内打开 Hub 控制台；首次需要在控制台里用同一令牌登录一次，之后 Cookie 由 WebView 保持。
-6.（可选）设置里开启应用锁；或从电脑发深链 `marshal://open?hub=https%3A%2F%2Fhub.example.com` 预填地址。
+1. 填 Hub 地址与 `dashboardToken`（≥16 位），点「保存并进入」。
+2. 首页列出在线设备 → 点设备 → 选会话。
+3. 会话页：上方是审批/提问卡，中间是历史与实时消息，底部是输入框。
+4. 「控制」查看能力与可调项；运行态可「中断」。
 
 ---
 
-## 六、安全说明
+## 六、安全
 
-- 令牌只存本机安全存储；日志、崩溃信息、界面都不打印令牌明文。
-- 公网 Hub 强制 https，避免令牌在链路明文暴露。
-- 应用锁用 PBKDF2-SHA256 派生，摘要比对采用常数时间比较。
-- 控制台沿用 Hub 自己的会话 Cookie 与 CSRF，不另开旁路。
-- 「清除本地数据」会同时清掉安全存储与回退的 localStorage。
+- 令牌只存安全存储；界面与日志不打印明文。
+- 公网 Hub 强制 https；跨域请求走原生栈，不降低 TLS 校验。
+- 审批卡过滤「总是/记住/会话内」类选项，只允许「这一次」的决定。
+- 应用锁 PBKDF2-SHA256 21 万次迭代，常数时间比对。
 
 ---
 
 ## 七、已知限制
 
-1. **iOS 已能编译，但本机模拟器跑不起来**：`BUILD SUCCEEDED` 已达成；启动模拟器受限于本机 CoreSimulator 版本低于 Xcode 27.2 要求，补齐运行时后即可 `xcrun simctl install booted`。
-2. **应用锁是应用级锁定**，不是系统级生物识别（后续可接 Face ID / 指纹插件）。
-3. **无推送**：Hub 侧没有 push 通道，审批/提问到达时不会主动弹通知；前台靠刷新与页面内提示。
-4. **深链需手动配置**：`marshal://` 只用于预填 Hub 地址，不做控制台深链跳转。
-5. **Android 发布包需自签名**：当前只产出 debug APK；release 需要自备 keystore。
+1. **群聊在本 Hub 不可用**：`/marshal/api/discussions` 要求 cookie 会话，而本 Hub 的登录是账号 ticket 模式，令牌登录返回 400。
+2. **控制项只读**：Hub 侧把 tunables 标为不可编辑。
+3. **模拟器跑不起**：本机 CoreSimulator 1051.55.0 低于 Xcode 27.2 要求，只能编译不能启动。
+4. **未在真机安装验证**：本机无 AVD、无 adb 设备。
+5. **无推送**：Hub 无 push 通道。
 
 ---
 
@@ -163,21 +128,18 @@ python3 scripts/make-assets.py
 
 ```
 dsh-marshal-mobile/
-├─ index.html            壳入口
 ├─ src/
 │  ├─ main.ts            启动
-│  ├─ app.ts             页面与状态机（配置/首页/设置/锁）
-│  ├─ styles.css         手机优先样式（含安全区）
+│  ├─ app.ts             视图与状态机（设备/会话/聊天/控制/群聊/设置/锁）
 │  └─ lib/
-│     ├─ config.ts       配置模型 + Hub 地址规范化（纯函数）
-│     ├─ hub.ts          Hub 只读客户端 + 响应解析（纯函数）
-│     ├─ storage.ts      安全存储（Keychain / EncryptedSharedPreferences）
-│     ├─ lock.ts         应用锁 PBKDF2
-│     ├─ native.ts       状态栏/网络/返回键/深链/退出
-│     └─ version.ts      版本与「仅客户端」声明
-├─ android/              Capacitor Android 工程（深链、图标、启动图已配置）
-├─ ios/                  Capacitor iOS 工程（SPM、深链、侧滑返回已配置）
-├─ scripts/              构建、校验、UI 冒烟、图标生成
-├─ tests/                Node 单元测试
-└─ docs/                 验收记录与截图
+│     ├─ marshal.ts      Hub 接口客户端 + 纯解析函数
+│     ├─ sse.ts          SSE 传输（原生插件 / EventSource 兜底）
+│     ├─ config.ts       配置与地址规范化
+│     ├─ storage.ts      安全存储
+│     ├─ lock.ts         应用锁
+│     └─ native.ts       状态栏/网络/返回键/深链
+├─ plugins/marshal-stream/   本地 Capacitor 插件（iOS + Android 原生 SSE）
+├─ android/ · ios/           Capacitor 壳工程
+├─ scripts/ · tests/ · docs/
+└─ artifacts/                本地构建产物（不入库）
 ```

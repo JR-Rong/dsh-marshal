@@ -1,9 +1,8 @@
 #!/usr/bin/env node
 /**
- * 手机端 UI 冒烟：用无头 Chrome 以 iPhone 尺寸跑一遍首页流程，产物截图落 docs/screenshots。
- *
- * 不需要真机与 Hub：健康检查、设备、会话接口都用路由拦截伪造，
- * 目的是验证外壳的布局、错误分支与交互链路，不替代真机验收。
+ * 手机端 UI 冒烟（原生控制台）：无头 Chrome + iPhone 尺寸，
+ * 用路由拦截伪造 Hub 接口、注入假 EventSource，验证
+ * 配置 → 设备 → 会话 → 消息流 → 审批 → 控制项 整条链路。
  */
 import { createServer } from 'node:http'
 import { readFile, mkdir, writeFile } from 'node:fs/promises'
@@ -13,8 +12,7 @@ import { extname, join, resolve } from 'node:path'
 const ROOT = resolve(import.meta.dirname, '..')
 const DIST = join(ROOT, 'dist')
 const SHOTS = join(ROOT, 'docs', 'screenshots')
-const PORT = 5188
-const HUB = 'https://hub.smoke.test'
+const PORT = 5189
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -27,16 +25,52 @@ const MIME = {
 
 const devices = {
   devices: [
-    { id: 'rjr-mac-local', name: '本机 Mac（rjr）', agents: ['dsh', 'codex'], connectedAt: 1, lastSeen: Date.now(), syncing: false, stale: false },
-    { id: 'account-cloud', name: '云端主机', agents: ['dsh'], connectedAt: 2, lastSeen: Date.now() - 60_000, syncing: false, stale: false },
+    { id: 'mac-local', name: '本机 Mac', agents: ['dsh', 'codex'], connectedAt: 1, lastSeen: Date.now(), syncing: false, stale: false },
+    { id: 'cloud-box', name: '云端主机', agents: ['dsh'], connectedAt: 2, lastSeen: Date.now() - 60_000, syncing: false, stale: false },
   ],
 }
 
 const sessions = {
   sessions: [
-    { deviceId: 'rjr-mac-local', agent: 'dsh', sessionId: 'session-a1b2c3d4-0000', running: true, updatedAt: Date.now() - 30_000, title: 'dsh-marshal手机端' },
-    { deviceId: 'rjr-mac-local', agent: 'codex', sessionId: 'session-e5f6a7b8-1111', running: false, updatedAt: Date.now() - 3_600_000, title: 'CAD 零件簇批量出图' },
-    { deviceId: 'account-cloud', agent: 'dsh', sessionId: 'session-c9d0e1f2-2222', running: false, updatedAt: Date.now() - 7_200_000, blank: true },
+    {
+      deviceId: 'mac-local', agent: 'dsh', sessionId: 'session-aaa', running: true,
+      updatedAt: Date.now() - 60_000, title: 'dsh-marshal手机端',
+      capability: {
+        operations: ['prompt', 'answer', 'cancel'], ownership: 'attached', revision: 1, runtimeEpoch: 'epoch-1',
+        tunables: [
+          { id: 'model', scope: 'next-turn', effect: 'immediate', editable: false, reason: 'v0-field-only' },
+          { id: 'reasoning', scope: 'next-turn', effect: 'immediate', direction: 'tighten-only', editable: false, reason: 'v0-field-only' },
+          { id: 'permission', scope: 'next-session', effect: 'next-session', editable: false, reason: 'v0-tighten-only' },
+        ],
+      },
+    },
+    { deviceId: 'mac-local', agent: 'dsh', sessionId: 'session-bbb', running: false, updatedAt: Date.now() - 7_200_000, title: 'CAD 零件簇出图' },
+  ],
+}
+
+const history = {
+  ok: true,
+  status: 'confirmed',
+  result: {
+    completeness: 'complete',
+    items: [
+      { deviceId: 'mac-local', agent: 'dsh', sessionId: 'session-aaa', seq: 1, ts: Date.now() - 600_000, kind: 'user.message', payload: { text: '把手机端改成直连' } },
+      { deviceId: 'mac-local', agent: 'dsh', sessionId: 'session-aaa', seq: 2, ts: Date.now() - 540_000, kind: 'message.completed', payload: { text: '已改为原生界面直连 Hub，不再加载网页。' } },
+    ],
+  },
+}
+
+const inputs = {
+  ok: true,
+  runtimeEpoch: 'epoch-1',
+  highWatermark: 2,
+  cards: [
+    {
+      requestId: 'req-1',
+      runtimeEpoch: 'epoch-1',
+      title: '需要确认',
+      questions: [{ id: 'q1', prompt: '是否继续执行构建？', options: [{ id: 'yes', label: '继续' }, { id: 'no', label: '停止' }] }],
+    },
   ],
 }
 
@@ -45,10 +79,7 @@ function startServer() {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1')
     const path = url.pathname === '/' ? '/index.html' : url.pathname
     const file = join(DIST, path)
-    if (!file.startsWith(DIST) || !existsSync(file)) {
-      res.writeHead(404).end('not found')
-      return
-    }
+    if (!file.startsWith(DIST) || !existsSync(file)) { res.writeHead(404).end('not found'); return }
     const body = await readFile(file)
     res.writeHead(200, { 'content-type': MIME[extname(file)] ?? 'application/octet-stream', 'cache-control': 'no-store' })
     res.end(body)
@@ -56,34 +87,26 @@ function startServer() {
   return new Promise((resolveServer) => server.listen(PORT, '127.0.0.1', () => resolveServer(server)))
 }
 
-async function loadPlaywright() {
-  try {
-    return await import('playwright-core')
-  } catch {
-    return null
-  }
-}
-
 async function main() {
-  const playwright = await loadPlaywright()
-  if (!playwright) {
+  let playwright
+  try {
+    playwright = await import('playwright-core')
+  } catch {
     console.log('未安装 playwright-core，跳过 UI 冒烟')
     return
   }
   await mkdir(SHOTS, { recursive: true })
   const server = await startServer()
-  // 用持久化上下文：普通 launch 在本机会卡在临时 profile 目录上。
-  const context = await playwright.chromium.launchPersistentContext('/tmp/marshal-ui-profile', {
-    channel: 'chrome',
-    headless: true,
-    args: ['--no-sandbox', '--disable-gpu'],
-    viewport: { width: 390, height: 844 },
-    deviceScaleFactor: 3,
-    isMobile: true,
-    hasTouch: true,
-    locale: 'zh-CN',
-    colorScheme: 'dark',
+  const context = await playwright.chromium.launchPersistentContext('/tmp/marshal-ui-profile2', {
+    channel: 'chrome', headless: true, args: ['--no-sandbox', '--disable-gpu'],
+    viewport: { width: 390, height: 844 }, deviceScaleFactor: 3, isMobile: true, hasTouch: true,
+    locale: 'zh-CN', colorScheme: 'dark',
   })
+  context.setDefaultTimeout(8000)
+  const step = (name) => console.log('  ·', name)
+  const page = await context.newPage()
+  const errors = []
+  page.on('pageerror', (error) => errors.push(String(error)))
 
   const cors = {
     'access-control-allow-origin': '*',
@@ -93,107 +116,115 @@ async function main() {
   }
   const json = (body) => ({ status: 200, headers: cors, contentType: 'application/json; charset=utf-8', body: JSON.stringify(body) })
 
-  // 设置了 MARSHAL_LIVE_HUB / MARSHAL_LIVE_TOKEN 时，用 Node 侧代理真实 Hub（绕过浏览器 CORS），
-  // 这样截图里是真实设备与会话，而不是假数据。
-  const liveHub = (process.env.MARSHAL_LIVE_HUB ?? '').replace(/\/+$/, '')
-  const liveToken = process.env.MARSHAL_LIVE_TOKEN ?? ''
-  const live = Boolean(liveHub && liveToken)
-  if (live) console.log('  · 真实 Hub 模式：' + liveHub)
-
-  let liveStatus = 'mock'
-  const proxy = async (route) => {
-    const url = new URL(route.request().url())
-    const target = liveHub + url.pathname + (url.search || '')
-    try {
-      const response = await fetch(target, { headers: { 'x-marshal-token': liveToken, accept: 'application/json' } })
-      const body = await response.text()
-      liveStatus = 'live ' + response.status
-      await route.fulfill({ status: response.status, headers: cors, contentType: 'application/json; charset=utf-8', body })
-    } catch (error) {
-      await route.fulfill({ status: 502, headers: cors, contentType: 'application/json; charset=utf-8', body: JSON.stringify({ error: String(error) }) })
-    }
-  }
-
-  await context.route('**/marshal/health', (route) => live ? proxy(route) : route.fulfill(json({ ok: true })))
-  await context.route('**/marshal/api/devices', (route) => live ? proxy(route) : route.fulfill(json(devices)))
+  await context.route('**/marshal/api/devices', (route) => route.fulfill(json(devices)))
   await context.route('**/marshal/api/sessions**', (route) => {
-    if (live) return proxy(route)
     const deviceId = new URL(route.request().url()).searchParams.get('device')
     return route.fulfill(json({ sessions: sessions.sessions.filter((row) => row.deviceId === deviceId) }))
   })
-
-  context.setDefaultTimeout(8000)
-  const step = (name) => console.log('  ·', name)
-  const page = await context.newPage()
-  const errors = []
-  page.on('pageerror', (error) => errors.push(String(error)))
-  await page.goto('http://127.0.0.1:' + PORT + '/', { waitUntil: 'networkidle' })
-
-  const webStorage = await page.evaluate(() => {
-    localStorage.removeItem('dsh-marshal-mobile.config')
-    return true
+  await context.route('**/marshal/api/history', (route) => route.fulfill(json(history)))
+  await context.route('**/marshal/api/inputs', (route) => route.fulfill(json(inputs)))
+  await context.route('**/marshal/api/command', async (route) => {
+    const body = JSON.parse(route.request().postData() ?? '{}')
+    console.log('    command →', body.op)
+    return route.fulfill(json({ ok: true, status: 'accepted' }))
   })
-  if (!webStorage) throw new Error('无法清理本地配置')
+
+  // 假 EventSource：连上后推一段流式回复，再推一个审批请求。
+  await page.addInitScript(() => {
+    class FakeEventSource {
+      constructor() {
+        this.onmessage = null
+        this.onerror = null
+        this.readyState = 1
+        const frames = [
+          { deviceId: 'mac-local', agent: 'dsh', sessionId: 'session-aaa', seq: 10, kind: 'turn.started', payload: {} },
+          { deviceId: 'mac-local', agent: 'dsh', sessionId: 'session-aaa', seq: 11, kind: 'message.delta', payload: { itemId: 'm1', text: '正在' } },
+          { deviceId: 'mac-local', agent: 'dsh', sessionId: 'session-aaa', seq: 12, kind: 'message.delta', payload: { itemId: 'm1', text: '处理你的请求…' } },
+          { deviceId: 'mac-local', agent: 'dsh', sessionId: 'session-aaa', seq: 13, kind: 'turn.completed', payload: { state: 'completed' } },
+        ]
+        let index = 0
+        this.timer = setInterval(() => {
+          if (index >= frames.length) { clearInterval(this.timer); return }
+          const frame = frames[index++]
+          this.onmessage?.({ data: JSON.stringify(frame) })
+        }, 120)
+      }
+      addEventListener() {}
+      close() { clearInterval(this.timer) }
+    }
+    window.EventSource = FakeEventSource
+  })
+
+  await page.goto('http://127.0.0.1:' + PORT + '/', { waitUntil: 'networkidle' })
+  await page.evaluate(() => localStorage.removeItem('dsh-marshal-mobile.config'))
   await page.reload({ waitUntil: 'networkidle' })
 
-  await page.getByText('连接调度中心').waitFor({ timeout: 5000 })
-  step('首次配置页')
+  await page.getByText('连接调度中心').waitFor()
+  step('配置页')
   await page.screenshot({ path: join(SHOTS, '01-setup.png') })
 
-  await page.locator('input[type="url"]').first().fill(live ? liveHub : HUB)
-  await page.locator('input[type="password"]').first().fill(live ? liveToken : '0123456789abcdef0123456789abcdef')
-  await page.getByRole('button', { name: '先测试连接' }).click()
-  await page.getByText(/连接成功/).waitFor({ timeout: 5000 })
+  await page.locator('input[type="url"]').first().fill('https://hub.smoke.test')
+  await page.locator('input[type="password"]').first().fill('0123456789abcdef0123456789abcdef')
   await page.getByRole('button', { name: '保存并进入' }).click()
 
-  await page.getByText('已连接调度中心').waitFor({ timeout: 8000 })
-  step('首页仪表盘')
-  await page.screenshot({ path: join(SHOTS, live ? '07-live-home.png' : '02-home.png') })
+  await page.getByText('本机 Mac').first().waitFor()
+  step('设备列表')
+  await page.screenshot({ path: join(SHOTS, '02-home.png') })
 
-  // 展开设备，看会话列表
-  await page.locator('.device .device-head').first().click()
-  step('展开设备会话')
-  await page.screenshot({ path: join(SHOTS, live ? '08-live-expanded.png' : '03-home-expanded.png') })
+  await page.locator('.device-head').first().click()
+  await page.getByText('dsh-marshal手机端').first().waitFor()
+  step('会话列表')
+  await page.screenshot({ path: join(SHOTS, '03-sessions.png') })
 
-  // 设置页
+  await page.locator('.session').first().click()
+  await page.getByText('把手机端改成直连').waitFor()
+  await page.getByText('是否继续执行构建？').waitFor()
+  step('会话详情（历史 + 审批卡 + 流式）')
+  await page.screenshot({ path: join(SHOTS, '04-session.png') })
+
+  await page.locator('.ask .choice').first().click()
+  await page.getByRole('button', { name: '提交' }).click()
+  step('提交审批')
+
+  await page.locator('.composer input').fill('继续')
+  await page.getByRole('button', { name: '发送' }).click()
+  step('发送消息')
+  await page.screenshot({ path: join(SHOTS, '05-chat.png') })
+
+  await page.getByRole('button', { name: '控制' }).click()
+  await page.getByText(/可调项（/).waitFor()
+  step('控制项')
+  await page.screenshot({ path: join(SHOTS, '06-controls.png') })
+
+  // 控制项 → 会话 → 会话列表 → 首页
+  await page.getByRole('button', { name: '返回' }).first().click()
+  await page.getByRole('button', { name: '返回' }).first().click()
+  await page.getByRole('button', { name: '返回' }).first().click()
   await page.getByRole('button', { name: '设置' }).click()
-  await page.locator('.topbar .title strong').filter({ hasText: '设置' }).waitFor({ timeout: 8000 })
-  step('设置页')
-  await page.screenshot({ path: join(SHOTS, '04-settings.png') })
+  await page.getByText('安全').waitFor()
+  step('设置')
+  await page.screenshot({ path: join(SHOTS, '07-settings.png') })
 
-  // 应用锁：开启 → 连续两次输入 6 位 PIN（111111）
-  await page.getByRole('button', { name: '开启', exact: true }).click()
-  await page.getByText('设置 6 位 PIN').waitFor({ timeout: 8000 })
-  step('应用锁：设置 PIN')
+  await page.getByRole('button', { name: '开启' }).click()
+  await page.getByText('设置 6 位 PIN').waitFor()
   for (let i = 0; i < 6; i += 1) await page.getByRole('button', { name: '1', exact: true }).click()
-  await page.getByText('再输入一次确认').waitFor({ timeout: 5000 })
-  await page.screenshot({ path: join(SHOTS, '05-lock-set.png') })
+  await page.getByText('再输入一次确认').waitFor()
   for (let i = 0; i < 6; i += 1) await page.getByRole('button', { name: '1', exact: true }).click()
-  await page.getByText('已开启，启动时需 6 位 PIN').waitFor({ timeout: 5000 })
-  await page.screenshot({ path: join(SHOTS, '06-lock-enabled.png') })
+  await page.getByText('已开启，启动需 6 位 PIN').waitFor()
+  step('应用锁')
+  await page.screenshot({ path: join(SHOTS, '08-lock-enabled.png') })
 
   await context.close()
   server.close()
 
-  const report = {
-    mode: live ? `live (${liveStatus})` : 'mock',
-    hub: live ? liveHub : HUB,
-    viewport: '390x844@3x',
-    screens: ['01-setup.png', '02-home.png', '03-home-expanded.png', '04-settings.png', '05-lock-set.png', '06-lock-enabled.png'],
-    pageErrors: errors,
-  }
+  const report = { viewport: '390x844@3x', screens: 8, pageErrors: errors }
   await writeFile(join(SHOTS, 'smoke-report.json'), JSON.stringify(report, null, 2) + '\n')
-  if (errors.length > 0) {
-    console.error('页面报错：', errors)
-    process.exitCode = 1
-    return
-  }
+  if (errors.length > 0) { console.error('页面报错：', errors); process.exitCode = 1; return }
   console.log('UI 冒烟通过，截图见 docs/screenshots/')
 }
 
 main().catch((error) => {
   console.error(error)
   process.exitCode = 1
-  // 兜底释放：否则静态服务会把进程挂住，CI 里表现为「卡死」。
   setTimeout(() => process.exit(1), 500)
 })
