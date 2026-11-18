@@ -100,8 +100,11 @@ test('mount: the control page is served at /marshal-superagent', async () => {
         await page.handler(ok.req, ok.res);
         assert.equal(ok.res.status, 200);
         assert.match(ok.res.headers['content-type'], /text\/html/);
+        assert.equal(ok.res.headers['x-frame-options'], 'DENY');
+        assert.match(ok.res.headers['content-security-policy'], /frame-ancestors/);
         assert.match(ok.res.body, /Super-agent 派发桥/);
         assert.match(ok.res.body, /api\/config/);
+        assert.match(ok.res.body, /id="aliases"/);
     }
     finally {
         context.close();

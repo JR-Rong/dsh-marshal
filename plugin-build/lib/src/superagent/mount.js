@@ -108,7 +108,12 @@ async function readBody(req) {
 
 function writeHtml(res, html) {
     if (typeof res.writeHead !== 'function') return;
-    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+    res.writeHead(200, {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'no-store',
+        'x-frame-options': 'DENY',
+        'content-security-policy': "frame-ancestors 'none'",
+    });
     res.end(html);
 }
 

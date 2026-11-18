@@ -124,6 +124,9 @@ test('patch: member fills blanks, never raises permission above the board defaul
     const unknownDefault = planCardPatch({ task: taskFixture(), member, snapshot: {}, prompt: 'p' });
     assert.equal(unknownDefault.patch.permission, undefined, 'unknown session default fails closed');
     assert.match(unknownDefault.notes.join(' '), /permission-default-unknown/);
+    const unknownMember = planCardPatch({ task: taskFixture(), member: { ...member, permission: 'root' }, snapshot, prompt: 'p' });
+    assert.equal(unknownMember.patch.permission, undefined, 'unknown member permission is never written');
+    assert.match(unknownMember.notes.join(' '), /permission-unknown/);
     const pinned = planCardPatch({
         task: taskFixture({ permission: 'read-only', model: 'kilo/x', reasoningEffort: 'high' }),
         member,

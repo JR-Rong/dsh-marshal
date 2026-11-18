@@ -112,10 +112,14 @@ export function planCardPatch({ task, member, snapshot, prompt }) {
     }
     if (text(task.permission) === '' && text(member.permission) !== '') {
         const defaultRank = permissionRank(snapshot?.sessionDefaultPermission);
-        if (defaultRank === 0) {
+        const memberRank = permissionRank(member.permission);
+        if (memberRank === 0) {
+            notes.push('permission-unknown: member "' + member.name + '" pins an unknown permission; the card is left at the deployment default');
+        }
+        else if (defaultRank === 0) {
             notes.push('permission-default-unknown: the board snapshot carries no sessionDefaultPermission; the card is left at the deployment default');
         }
-        else if (permissionRank(member.permission) <= defaultRank) {
+        else if (memberRank <= defaultRank) {
             patch.permission = text(member.permission);
         }
         else {

@@ -97,7 +97,7 @@ GET /marshal/health
 默认已设为 **丞相**。配置、开关与人工补派都在本机控制页：
 
 ```text
-http://127.0.0.1:63125/marshal-superagent
+http://127.0.0.1:56120/marshal-superagent
 ```
 
 控制页只接受本机同源浏览器请求；agent 的模型工具只有 status / agents / reconcile，不能改路由或补派。卡片标签写 `@工部尚书` 可临时改派。

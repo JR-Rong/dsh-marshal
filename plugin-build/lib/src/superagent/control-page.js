@@ -54,6 +54,7 @@ export function controlPageHtml() {
       <label>记忆条数 <input type="number" id="memoryLimit" min="0" max="6" step="1" value="6" style="width:70px"></label>
       <label>标签前缀 <input type="text" id="tagPrefix" value="@" size="4" style="width:60px"></label>
     </div>
+    <div class="row"><label>标签别名 JSON <input type="text" id="aliases" placeholder='{"工部":"工部尚书"}' size="40"></label></div>
     <button type="submit">保存配置</button>
   </form>
 </section>
@@ -113,6 +114,7 @@ export function controlPageHtml() {
     document.getElementById('injectMemory').checked = value.injectMemory !== false;
     document.getElementById('memoryLimit').value = String(value.memoryLimit === undefined ? 6 : value.memoryLimit);
     document.getElementById('tagPrefix').value = value.tagPrefix || '@';
+    document.getElementById('aliases').value = JSON.stringify(value.aliases || {});
     recentEl.textContent = pretty(value.recent || []);
   }
   async function refresh() {
@@ -128,13 +130,17 @@ export function controlPageHtml() {
   document.getElementById('config').onsubmit = async function (event) {
     event.preventDefault();
     try {
+      var aliases = {};
+      var aliasesText = document.getElementById('aliases').value.trim();
+      if (aliasesText !== '') aliases = JSON.parse(aliasesText);
       var patch = {
         defaultAgent: document.getElementById('defaultAgent').value.trim() || null,
         enabled: document.getElementById('enabled').checked,
         rootOnly: document.getElementById('rootOnly').checked,
         injectMemory: document.getElementById('injectMemory').checked,
         memoryLimit: Number(document.getElementById('memoryLimit').value),
-        tagPrefix: document.getElementById('tagPrefix').value.trim() || '@'
+        tagPrefix: document.getElementById('tagPrefix').value.trim() || '@',
+        aliases: aliases
       };
       fill((await call('/marshal-superagent/api/config', patch)).status);
       say('配置已保存。', true);

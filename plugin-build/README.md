@@ -27,7 +27,7 @@ Do not install from the repository root. See INSTALL.md.
 - **执行**：marshal 把成员 brief、相关长期记忆、工单要求合成提示，补齐成员的模型/思考档位/预设；权限高于看板会话默认时不自动提升。随后调用看板原生 `run`，卡片进入 Running，执行会话可从卡片打开。
 - **记忆**：结算后写入该成员 `agent` 作用域的 `episode`（含 taskId、标题、结果、摘要、会话 id）；派发时读取最多 6 条相关记忆注入提示。可在记忆页删除。
 - **人类控制页**：`GET /marshal-superagent`（本机浏览器打开）可改默认 agent、开关、根卡策略、记忆条数、标签前缀，并可人工补派手机/远端建的卡。配置与补派只接受本机同源浏览器请求；agent 的模型工具是只读的。
-- **只读工具**：`marshal_superagent action=status | agents | reconcile`。`config`/`dispatch` 不再暴露给模型调用。
+- **模型工具**：`marshal_superagent action=status | agents | reconcile`。`config`/`dispatch` 不再暴露给模型调用；`reconcile` 只对账并补写已派发卡的记忆，不能改路由或开新派发。
 - **状态与设置**：`~/.dsh-marshal/superagent/settings.json` 与 `state.json`。
 
 - **健康检查**（本机）：`GET /marshal-superagent/health`，状态 `GET /marshal-superagent/api/status`。

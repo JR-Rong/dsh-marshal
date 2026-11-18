@@ -131,6 +131,10 @@ test('settle: disabling the bridge defers memory until it is re-enabled', async 
     await wait();
     assert.equal(memory.writes.length, 0, 'disabled bridge must not write memory');
     assert.equal(bridge.stateStore.get('task-1').status, 'running');
+    const blocked = await bridge.reconcile('test');
+    assert.equal(blocked.code, 'disabled');
+    assert.equal(blocked.checked, 0);
+    assert.equal(memory.writes.length, 0);
     bridge.configure({ enabled: true });
     const result = await bridge.reconcile('test');
     assert.equal(result.settled, 1);

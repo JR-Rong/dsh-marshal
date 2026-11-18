@@ -340,6 +340,7 @@ export function createDispatcher(options) {
      * board changes (throttled by the mount), and on demand from the tool.
      */
     const reconcile = async (filter = {}, host) => {
+        if (settingsStore.get().enabled !== true) return { ok: false, code: 'disabled', checked: 0 };
         const board = boardFor();
         if (board === undefined) return { ok: false, code: 'no-task-board', checked: 0 };
         const snapshot = snapshotOf(board);
