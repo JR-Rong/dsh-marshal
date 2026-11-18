@@ -16,8 +16,10 @@
 | APK 清单 | 正确 | `apkanalyzer manifest print`：包名 `com.rongjunrui.marshal.mobile`、minSdk 24、targetSdk 36、INTERNET + ACCESS_NETWORK_STATE |
 | 壳内 UI 冒烟 | 通过（mock） | `docs/screenshots/01~06`，页面无 JS 报错 |
 | 壳内 UI 冒烟 | 通过（真实 Hub） | `docs/screenshots/07~08`，实连 `https://hub.example.com`：2 台设备、328 个会话、2 个运行中 |
-| iOS 工程 | 结构完整，**编译被 Xcode 许可阻塞** | plist 校验 OK、URL scheme 与侧滑返回已配置、SPM 依赖齐全 |
-| 真机/模拟器安装 | **未做** | 本机无 AVD、无 adb 设备；iOS 编译需先同意 Xcode 许可 |
+| iOS 工程 | 结构完整 | plist 校验 OK、URL scheme 与侧滑返回已配置、SPM 8 个包齐全 |
+| iOS 编译 | **BUILD SUCCEEDED** | `ios/build/Build/Products/Debug-iphonesimulator/App.app`（6.5 MB，bundle id 正确，7 个插件已链入 dylib） |
+| 模拟器运行 | **未做** | 本机 CoreSimulator 1051.55.0 低于 Xcode 27.2 要求（1174.21.0），无法启动模拟器 |
+| 真机/模拟器安装 APK | **未做** | 本机无 AVD、无 adb 设备 |
 | 交付包 | `artifacts/dsh-marshal-mobile-0.1.0-debug.apk` | 4.0 MB，sha256 `83ca5d59…c25dfc` |
 
 ---
@@ -90,23 +92,40 @@ cd android && ./gradlew assembleDebug
 
 ---
 
-## 五、iOS 现状
+## 五、iOS 证据
 
-已完成（静态可查）：
+**编译结果（2026-11-18 05:40，Xcode 许可同意后）：**
+
+```
+** BUILD SUCCEEDED **
+App.app  6.5 MB
+CFBundleIdentifier      com.rongjunrui.marshal.mobile
+CFBundleDisplayName     调度官
+MinimumOSVersion        15.0
+Mach-O universal binary (x86_64 + arm64)
+App.debug.dylib 1.6 MB：securestorage / network / statusbar 符号均在
+```
+
+已完成的静态校验：
 
 - `ios/App/App/Info.plist`：`plutil -lint` OK；`CFBundleURLSchemes = marshal`
 - `ios/App/App/SceneDelegate.swift`：`allowsBackForwardNavigationGestures = true`（边缘侧滑返回）
 - `ios/App/CapApp-SPM/Package.swift`：Capacitor 8.6.2 + 7 个插件（secure-storage / app / keyboard / network / preferences / splash-screen / status-bar）
 - `Assets.xcassets`：1024 图标 + 2732 启动图已生成
 
-阻塞（本机）：
+启动模拟器仍受限：本机 CoreSimulator 为 1051.55.0，低于 Xcode 27.2 要求的 1174.21.0，
+`xcrun simctl` 无法加载设备。补齐方式：安装与 Xcode 匹配的模拟器运行时（或升级 macOS / 重装 Xcode 组件）。
+真机安装还需在 Xcode 里选 Team 签名。
 
-```
-$ xcodebuild -project ios/App/App.xcodeproj -list
-You have not agreed to the Xcode license agreements. Please run 'sudo xcodebuild -license' ...
+构建命令（本机实测）：
+
+```bash
+xcodebuild -project ios/App/App.xcodeproj -scheme App -configuration Debug \
+  -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+  -derivedDataPath ios/build CODE_SIGNING_ALLOWED=NO build
 ```
 
-同意许可后即可执行 `bash scripts/build-ios.sh` 出模拟器包（免签名）。真机安装还需在 Xcode 里选 Team。
+> 注意：SPM 需要写 `~/Library/Caches/org.swift.swiftpm`，在受限沙箱里会因权限失败，需在普通终端执行。
 
 ---
 
@@ -128,16 +147,12 @@ You have not agreed to the Xcode license agreements. Please run 'sudo xcodebuild
 | 可直接安装的 APK | `artifacts/dsh-marshal-mobile-0.1.0-debug.apk` |
 | 验收截图 | `docs/screenshots/01~08` |
 
-建议归档到插件仓库（需一次写权限批准）：
+已归档进仓库并开 PR：
 
-```bash
-rsync -a --delete \
-  --exclude node_modules --exclude dist --exclude .cache \
-  --exclude 'android/build' --exclude 'android/app/build' --exclude 'android/.gradle' \
-  --exclude 'ios/build' --exclude '*.log' --exclude local.properties \
-  "$PWD/dsh-marshal-mobile/" \
-  ~/Documents/deepseek-harness/default-workspace/dsh-marshal-clone/mobile/
-```
+- 仓库：`JR-Rong/dsh-marshal`
+- 分支：`feat/mobile-client`（自 `main` 切出，只新增 `mobile/`）
+- PR：<https://github.com/JR-Rong/dsh-marshal/pull/5>
+- 首个提交：`0439a82 feat(mobile): 新增调度官手机端（Android / iOS，仅客户端）`
 
 安装到手机：`adb install -r artifacts/dsh-marshal-mobile-0.1.0-debug.apk`，或把 APK 传到手机点开安装（需允许「未知来源」）。
 

@@ -111,6 +111,11 @@ bash scripts/verify.sh          # 类型 + 单测 + 构建 + 同步 + UI 冒烟
 - Android：`android/app/build/outputs/apk/debug/app-debug.apk`
 - iOS：`ios/build/Build/Products/Debug-iphonesimulator/App.app`（模拟器，免签名）
 
+### 归档与 PR
+
+本工程已进入 `JR-Rong/dsh-marshal` 仓库的 `mobile/`，分支 `feat/mobile-client`，
+PR：<https://github.com/JR-Rong/dsh-marshal/pull/5>。
+
 ### 图标与启动图
 
 `scripts/make-assets.py` 用 Pillow 本地绘制，不依赖外部设计稿：
@@ -146,7 +151,7 @@ python3 scripts/make-assets.py
 
 ## 七、已知限制
 
-1. **iOS 编译待许可**：本机 Xcode 许可未同意，`xcodebuild` 无法运行；工程与脚本已就绪，同意许可后 `bash scripts/build-ios.sh` 即可出包。
+1. **iOS 已能编译，但本机模拟器跑不起来**：`BUILD SUCCEEDED` 已达成；启动模拟器受限于本机 CoreSimulator 版本低于 Xcode 27.2 要求，补齐运行时后即可 `xcrun simctl install booted`。
 2. **应用锁是应用级锁定**，不是系统级生物识别（后续可接 Face ID / 指纹插件）。
 3. **无推送**：Hub 侧没有 push 通道，审批/提问到达时不会主动弹通知；前台靠刷新与页面内提示。
 4. **深链需手动配置**：`marshal://` 只用于预填 Hub 地址，不做控制台深链跳转。
