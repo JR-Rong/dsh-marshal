@@ -12,6 +12,7 @@ done:
   - evidence RUN-20261118-011602（superagent-unit）、RUN-20261118-011603（regression），HEAD bdcad3a PASS
   - 真机验收：卡片 20469794-3c17-4c6d-a229-5296971084cb → 执行 7e47e297 → session-f3c7d3f7 → succeeded；记忆 memoryWritten:true；记录见 docs/specs/E2E-2026-11-18-superagent-bridge.md
   - 最终代码在 56120 复验：控制页 200、缺 Origin/cross-site 403、工具 config 被拒、默认丞相
+  - 真机 A3：agent 用 task_board_create 建卡 9f2958f1-2b68-4af7-aa58-f1d3cac14381，2.5s 后仍 todo/0 execution，桥 records 未增；已删除测试卡
   - tarball plugin-build/dsh-marshal-0.2.1-superagent.1.tgz
   - 本机 live 0.1.0 已备份并回填同一模块；settings 默认丞相
 

@@ -41,7 +41,13 @@
 | 同源 POST config（defaultAgent=丞相, memoryLimit=6） | 200；状态回读一致 |
 | 模型工具 config 动作 | 拒绝：unknown marshal_superagent action: config |
 
-## 4. 结论与残项
+## 4. agent 自建卡不触发（真机）
+
+- 用 agent 工具 task_board_create 建卡 9f2958f1-2b68-4af7-aa58-f1d3cac14381。
+- 等待 2.5s 后：卡片 status=todo、executionCount=0；桥 `state.records` 仍为 1，recent 只有真机验收卡。
+- 证明 agent 工具建卡不会触发 human-create 派发；测试卡已删除。
+
+## 5. 结论与残项
 
 - A1/A6/A7 的真机核心链路（建卡 → 派发 → 原生 run → Running/会话 → 结算 → 记忆）已有本条记录作为证据；最终代码的控制页/守卫/只读工具在 56120 复验。
 - 残项：GUI 按钮点击的最终体验验收；0.2.1 tarball 在干净 profile 安装；高于会话默认权限的真实权限闸门；第三轮独立盲审。
