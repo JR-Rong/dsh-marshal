@@ -1,0 +1,14 @@
+{
+  "mode": "live (live 200)",
+  "hub": "https://123.57.223.115",
+  "viewport": "390x844@3x",
+  "screens": [
+    "01-setup.png",
+    "02-home.png",
+    "03-home-expanded.png",
+    "04-settings.png",
+    "05-lock-set.png",
+    "06-lock-enabled.png"
+  ],
+  "pageErrors": []
+}

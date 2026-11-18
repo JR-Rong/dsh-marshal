@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.cache/
+android/build/
+android/app/build/
+android/.gradle/
+ios/build/
+ios/App/Pods/
+ios/App/DerivedData/
+*.log
+.DS_Store
+local.properties
+artifacts/
