@@ -50,8 +50,9 @@ function route(context, path) {
 test('mount: registers the page, human routes, read routes, the tool and the board extension', () => {
     const { bridge, context } = setup();
     try {
-        assert.equal(context.routes.length, 7);
+        assert.equal(context.routes.length, 8);
         assert.deepEqual(context.routes.map(item => item.path).sort(), [
+            '/api/marshal-superagent/human-create',
             '/marshal-superagent',
             '/marshal-superagent/api/agents',
             '/marshal-superagent/api/config',
@@ -115,7 +116,7 @@ test('mount: human-create requires browser proof, source=board-ui and a JSON bod
     const { bridge, board, context } = setup();
     try {
         bridge.configure({ defaultAgent: '工部尚书' });
-        const human = route(context, '/marshal-superagent/api/human-create');
+        const human = route(context, '/api/marshal-superagent/human-create');
         const ok = makeRequest({ method: 'POST', headers: PROOF, body: JSON.stringify({ taskId: 'task-1', source: 'board-ui', requestId: 'ui-1' }) });
         await human.handler(ok.req, ok.res);
         assert.equal(ok.res.status, 202);

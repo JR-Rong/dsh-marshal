@@ -41,6 +41,12 @@
 | 同源 POST config（defaultAgent=丞相, memoryLimit=6） | 200；状态回读一致 |
 | 模型工具 config 动作 | 拒绝：unknown marshal_superagent action: config |
 
+## 3.1 第一次 GUI 点击未触发的原因与修复
+
+- 皇上第一次点「创建并执行」生成卡片 2793e898-12aa-4f24-83a9-e75ba38ce70d：卡片无「智能体」标签、prompt 未被桥改写、execution 的 initiatedBy 是普通 session，桥 records 仍为 1。
+- 诊断：DSH 桌面 Web GUI 的页面 origin 是 dsh-app://app/，旧 hook 把通知发到 dsh-app://app/marshal-superagent/...，没有落到主机的 /marshal-superagent 路由；且「创建并执行」会在桥之前手动 run。
+- 修复：hook 通知改走 /api/marshal-superagent/human-create（DSH 桌面把 /api/* 映射到主机 HTTP 并在宿主鉴权下转发），主机新增该别名；客户端已重载。请皇上再点「创建」（不要点「创建并执行」）验证。
+
 ## 4. agent 自建卡不触发（真机）
 
 - 用 agent 工具 task_board_create 建卡 9f2958f1-2b68-4af7-aa58-f1d3cac14381。

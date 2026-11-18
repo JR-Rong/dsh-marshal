@@ -19,6 +19,10 @@ import { specToJsonSchema } from '../tools/schema.js';
 const BODY_LIMIT = 64 * 1024;
 const CONTROL_PATH = '/marshal-superagent';
 const HUMAN_CREATE_PATH = '/marshal-superagent/api/human-create';
+// The DSH desktop app serves the Web GUI from dsh-app://app/ and maps /api/* to
+// the host HTTP server; the browser hook uses this alias so it also reaches the
+// bridge from inside the desktop app.
+const HUMAN_CREATE_API_PATH = '/api/marshal-superagent/human-create';
 const CONFIG_PATH = '/marshal-superagent/api/config';
 const DISPATCH_PATH = '/marshal-superagent/api/dispatch';
 const AGENTS_PATH = '/marshal-superagent/api/agents';
@@ -317,17 +321,20 @@ export function createSuperagentBridge(options = {}) {
         catch (cause) { return { error: cause?.code === 'body-too-large' ? 'body-too-large' : 'invalid-json' }; }
     };
 
+    const humanCreateHandler = async (req, res) => {
+        const parsed = await readJson(req);
+        if (parsed.error !== undefined) {
+            write(res, parsed.error === 'body-too-large' ? 413 : 415, { ok: false, code: parsed.error });
+            return;
+        }
+        const answer = await humanCreate(parsed.body);
+        write(res, answer.status, answer.body);
+    };
+
     const routes = () => [
         exact('GET', CONTROL_PATH, (req, res) => { writeHtml(res, controlPageHtml()); }),
-        exact('POST', HUMAN_CREATE_PATH, async (req, res) => {
-            const parsed = await readJson(req);
-            if (parsed.error !== undefined) {
-                write(res, parsed.error === 'body-too-large' ? 413 : 415, { ok: false, code: parsed.error });
-                return;
-            }
-            const answer = await humanCreate(parsed.body);
-            write(res, answer.status, answer.body);
-        }, browserProof),
+        exact('POST', HUMAN_CREATE_PATH, humanCreateHandler, browserProof),
+        exact('POST', HUMAN_CREATE_API_PATH, humanCreateHandler, browserProof),
         exact('POST', CONFIG_PATH, async (req, res) => {
             const parsed = await readJson(req);
             if (parsed.error !== undefined) {
@@ -469,6 +476,7 @@ export function mountSuperagent(ctx, config, options = {}) {
 export const SUPERAGENT_PATHS = Object.freeze({
     control: CONTROL_PATH,
     humanCreate: HUMAN_CREATE_PATH,
+    humanCreateApi: HUMAN_CREATE_API_PATH,
     config: CONFIG_PATH,
     dispatch: DISPATCH_PATH,
     agents: AGENTS_PATH,

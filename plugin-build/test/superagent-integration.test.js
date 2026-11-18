@@ -84,7 +84,7 @@ test('integration: the browser observer reaches the real HTTP route and dispatch
         assert.equal(dispatched, true, 'the bridge opened one run');
         assert.deepEqual(board.actions.map(entry => entry.action.kind), ['update', 'run']);
         assert.equal(bridge.stateStore.get('task-1').agentName, '工部尚书');
-        assert.equal(calls.some(url => url.includes('marshal-superagent/api/human-create')), true);
+        assert.equal(calls.some(url => url.includes('api/marshal-superagent/human-create')), true);
     }
     finally {
         server.close();

@@ -2131,10 +2131,10 @@ window.__ModuleLoader__.load({
       const base = win.document && typeof win.document.baseURI === 'string'
         ? win.document.baseURI
         : (win.location && typeof win.location.href === 'string' ? win.location.href : undefined);
-      return new URL('marshal-superagent/api/human-create', base === undefined ? '/' : base).href;
+      return new URL('api/marshal-superagent/human-create', base === undefined ? '/' : base).href;
     }
     catch {
-      return '/marshal-superagent/api/human-create';
+      return '/api/marshal-superagent/human-create';
     }
   };
   const notify = (taskId, requestId) => {

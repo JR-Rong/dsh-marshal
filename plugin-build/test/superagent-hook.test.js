@@ -39,7 +39,7 @@ test('hook: a successful GUI create notifies the host once', async () => {
     assert.equal(result.status, response.status);
     assert.equal(calls.length, 2, 'board request + host notification');
     assert.match(calls[0].url, /api\/task-board\/action/);
-    assert.match(calls[1].url, /marshal-superagent\/api\/human-create/);
+    assert.match(calls[1].url, /api\/marshal-superagent\/human-create/);
     const body = JSON.parse(calls[1].init.body);
     assert.equal(body.taskId, 'task-9');
     assert.equal(body.source, 'board-ui');
@@ -82,7 +82,7 @@ test('hook: duplicate create ids do not double-notify and the patch is idempoten
 test('hook: the generated bundle carries the observer', () => {
     assert.match(bundleSource, /dsh-marshal superagent human-create observer/);
     assert.match(bundleSource, /__marshalSuperagentHook/);
-    assert.match(bundleSource, /marshal-superagent\/api\/human-create/);
+    assert.match(bundleSource, /api\/marshal-superagent\/human-create/);
 });
 
 test('hook: a window without fetch is left alone', () => {

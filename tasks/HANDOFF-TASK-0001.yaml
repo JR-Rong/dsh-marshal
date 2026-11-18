@@ -23,7 +23,7 @@ unverified:
   - 手机/远端建卡：当前不自动触发，仅控制页人工补派
   - 两轮盲审在 84dd00b 上判 fail；第三轮在 bdcad3a 上复核：仅 B1 未闭环（本机进程伪造请求头），B2/B3/A8/A10/A5 均 fixed
   - B1 已获皇上批准 EXC-0001（2026-11-18）：本机进程伪造全部请求头不在信任边界内；第三轮唯一阻塞按例外结案，其余 fixed
-  - GUI 按钮点击未自动化：真机走的是与 hook 等价的 HTTP 请求；hook 本身有单测
+  - GUI 第一次点击「创建并执行」未触发桥（卡片 2793e898...，initiatedBy 是普通 session）；已诊断 dsh-app:// 页面 origin，hook 改走 /api/marshal-superagent/human-create 别名并重载；待皇上再点「创建」复验
   - GUI 点击验收：皇上已选“亲点一张根卡”，候皇上操作后臣验 Running/会话/记忆
 
 decisions:
