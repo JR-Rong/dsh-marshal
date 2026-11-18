@@ -9,7 +9,7 @@ done:
   - marshal_superagent 工具：status / agents / reconcile（只读）
   - 本机路由：/marshal-superagent 控制页、/api/human-create、/api/config、/api/dispatch、/api/agents、/api/status、/health
   - 第二次复审修复：DSH connection 签名 cookie admission + Host 回环；status/agents Host 门禁；bundle 由构建脚本刷新并测实际 bundle；改派重算当前身份/清理旧标签；72 条测试全绿
-  - 代码在 f58a1ff 之后继续修复，最新 evidence 以 manifest commit 为准
+  - 代码 commit 8ca45d6；evidence RUN-20261118-051240（unit）、RUN-20261118-051241（regression）在 8ca45d6 PASS
   - 真机验收：卡片 20469794-3c17-4c6d-a229-5296971084cb → 执行 7e47e297 → session-f3c7d3f7 → succeeded；记忆 memoryWritten:true；记录见 docs/specs/E2E-2026-11-18-superagent-bridge.md
   - 最终代码在 56120 复验：控制页 200、缺 Origin/cross-site 403、工具 config 被拒、默认丞相
   - 真机 A3：agent 用 task_board_create 建卡 9f2958f1-2b68-4af7-aa58-f1d3cac14381，2.5s 后仍 todo/0 execution，桥 records 未增；已删除测试卡
@@ -34,7 +34,8 @@ decisions:
   - 盲审 B1/B2/A11/A8/A10 已修；2026-11-18 二次复审把 B1 从“仅 Origin/Host”升级为 DSH connection 签名 cookie admission + 回环 Host，并补 status/agents Host 门禁、bundle 行为测试、改派身份修复；模型工具只读；配置/补派走 /marshal-superagent 控制页；settle 尊重 enabled；memoryLimit 硬上限 6；memory-pending 可重试
 
 next:
-  - 最终代码已在 62150 运行；GUI 验收已过
+  - 最终代码已同步到 62150 插件目录；DSH 进程需完整重启才装载新宿主守卫；重启后实测无 cookie 的 /api 通知与 Host: evil 的 /status 均 403
+  - GUI 验收已过
   - 再建一张带 @工部尚书 的卡，确认标签覆盖（可选）
   - 控制页 http://127.0.0.1:62150/marshal-superagent 可改默认/开关/补派
   - 证据补入库：git add evidence && git commit；提交后 HEAD 会越过被验证的 f58a1ff，验证需按 manifest 的 commit 读

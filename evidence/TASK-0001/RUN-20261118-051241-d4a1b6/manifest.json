@@ -1,0 +1,40 @@
+{
+  "evidence_id": "EVD-TASK-0001-20261118051241",
+  "task": "TASK-0001",
+  "ticket": null,
+  "spec": "SPC-0001",
+  "tier": "P2",
+  "commit": "8ca45d623d8e6ae7b687882a3bba218122243a5c",
+  "dirty": false,
+  "env": {
+    "os": "darwin-arm64",
+    "python": "3.12.14",
+    "locks": {
+      "pnpm-lock.yaml": "398d37ac0c6abef07472d7339367af3c110d3402722dab8d6206d407700b2705"
+    }
+  },
+  "suites": [
+    {
+      "name": "regression",
+      "files": 9,
+      "sha256": "88ceff13658ef16e96628e892ae184a6961f02250f0557a53d57eeef1353a94d"
+    }
+  ],
+  "commands": [
+    {
+      "cmd": "'/Users/rongjianrui/.dsh/dsh-runtimes/dsh-primary-runtime/dependencies/node/bin/node' --test plugin-build/test/*.test.js",
+      "exit": 0,
+      "stdout": ".evidence-store/TASK-0001/RUN-20261118-051241-d4a1b6/stdout.log",
+      "stdout_sha256": "f3193aa0ffce0f0bab056d6a99341b3fe72f21ee79c352582bb2615121f807b9",
+      "stdout_bytes": 5818,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "produced_by": {
+    "runner": "evd/0.1",
+    "user": "rongjianrui",
+    "worker": "dsh",
+    "model": "deepseek-account/deepseek-flash"
+  },
+  "issued_at": "2026-11-18T05:12:41.348540-08:00"
+}
