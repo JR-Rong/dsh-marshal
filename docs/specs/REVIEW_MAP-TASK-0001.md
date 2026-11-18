@@ -28,7 +28,7 @@
 | A10 | 1、2 | run refusal recorded; memory failure recorded; health/status |
 | A11 | 1、2、5 | disabled route test; hook test skips failed/disabled responses |
 | A12 | 2、5 | route loopback/origin guard; dispatch refuses source != board-ui |
-| A13 | 6 | node --test test/*.test.js 66/66 |
+| A13 | 6 | node --test test/*.test.js 67/67（含 hook→HTTP→dispatch 集成） |
 | A14 | 7 | tarball contents + README/INSTALL |
 
 ## 人类预算
