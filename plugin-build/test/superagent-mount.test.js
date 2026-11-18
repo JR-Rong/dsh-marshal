@@ -116,7 +116,7 @@ test('mount: human-create requires browser proof, source=board-ui and a JSON bod
     const { bridge, board, context } = setup();
     try {
         bridge.configure({ defaultAgent: '工部尚书' });
-        const human = route(context, '/api/marshal-superagent/human-create');
+        const human = route(context, '/marshal-superagent/api/human-create');
         const ok = makeRequest({ method: 'POST', headers: PROOF, body: JSON.stringify({ taskId: 'task-1', source: 'board-ui', requestId: 'ui-1' }) });
         await human.handler(ok.req, ok.res);
         assert.equal(ok.res.status, 202);
@@ -141,6 +141,21 @@ test('mount: human-create requires browser proof, source=board-ui and a JSON bod
         const noJson = makeRequest({ method: 'POST', headers: { ...PROOF, 'content-type': 'text/plain' }, body: '{}' });
         await human.handler(noJson.req, noJson.res);
         assert.equal(noJson.res.status, 415);
+    }
+    finally {
+        context.close();
+    }
+});
+
+test('mount: the /api alias accepts the desktop shell marker-less request', async () => {
+    const { bridge, board, context } = setup();
+    try {
+        bridge.configure({ defaultAgent: '工部尚书' });
+        const alias = route(context, '/api/marshal-superagent/human-create');
+        const shell = makeRequest({ method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ taskId: 'task-1', source: 'board-ui' }) });
+        await alias.handler(shell.req, shell.res);
+        assert.equal(shell.res.status, 202);
+        assert.deepEqual(board.actions.map(entry => entry.action.kind), ['update', 'run']);
     }
     finally {
         context.close();

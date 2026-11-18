@@ -334,7 +334,11 @@ export function createSuperagentBridge(options = {}) {
     const routes = () => [
         exact('GET', CONTROL_PATH, (req, res) => { writeHtml(res, controlPageHtml()); }),
         exact('POST', HUMAN_CREATE_PATH, humanCreateHandler, browserProof),
-        exact('POST', HUMAN_CREATE_API_PATH, humanCreateHandler, browserProof),
+        // /api/* is gated by the DSH web auth layer; the desktop shell forwards
+        // the page request marker-less but attaches the browser-auth cookie, so
+        // this alias trusts the authenticated loopback request instead of the
+        // browser markers the shell deletes.
+        exact('POST', HUMAN_CREATE_API_PATH, humanCreateHandler, readTrusted),
         exact('POST', CONFIG_PATH, async (req, res) => {
             const parsed = await readJson(req);
             if (parsed.error !== undefined) {
