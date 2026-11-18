@@ -1,15 +1,15 @@
 ticket: T-000001
 task: TASK-0001
 baseline: 96018a922823507122f7bf128606a1ae03211a38
-updated_at: 2026-11-18T01:09:00-08:00
+updated_at: 2026-11-18T01:17:00-08:00
 
 done:
   - superagent 主机模块：settings / state / agents / memory / prompt / dispatch / extension / mount
   - 浏览器 human-create observer（独立源 + 已追加到 client bundle）
-  - marshal_superagent 工具：status / config / agents / dispatch / reconcile
-  - 本机路由：/marshal-superagent/api/human-create、/api/status、/health
-  - 代码提交 c188b56（基线 96018a9）；61 条测试全绿
-  - evidence RUN-20261118-010814（superagent-unit）、RUN-20261118-010841（regression），HEAD c188b56 PASS
+  - marshal_superagent 工具：status / agents / reconcile（只读）
+  - 本机路由：/marshal-superagent 控制页、/api/human-create、/api/config、/api/dispatch、/api/agents、/api/status、/health
+  - 代码提交 bdcad3a（基线 96018a9）；66 条测试全绿
+  - evidence RUN-20261118-011602（superagent-unit）、RUN-20261118-011603（regression），HEAD bdcad3a PASS
   - tarball plugin-build/dsh-marshal-0.2.1-superagent.1.tgz
   - 本机 live 0.1.0 已备份并回填同一模块；settings 默认丞相
 
@@ -17,7 +17,7 @@ unverified:
   - DSH 重启/禁用启用后的真机链路：GUI 新建根卡 → Running → 卡片会话 → 记忆新增
   - 0.2.1 tarball 在干净 profile 的安装（当前 profile 仍是 0.1.0 link）
   - 高于看板会话默认权限的成员：权限闸门真实提示与人工确认流程
-  - 手机/远端建卡：当前不自动触发，仅 marshal_superagent dispatch 补派
+  - 手机/远端建卡：当前不自动触发，仅控制页人工补派
   - 两轮独立盲审均判 fail：B1 路由可被本机伪造、B2/A11 关桥仍写记忆、工具面可强制派发；B1/B2 与工具面已修，仍需二次盲审复核；A1/A6/A7 真机证据仍缺
   - 真机端到端仍未执行：需重启/禁用启用后由皇上建卡验收
 
@@ -32,8 +32,8 @@ next:
   - 新建一张根卡，确认 Running 与卡片会话；结算后查 agent 记忆
   - 再建一张带 @工部尚书 的卡，确认覆盖
   - 控制页 http://127.0.0.1:63125/marshal-superagent 可改默认/开关/补派
-  - 证据补入库：git add evidence && git commit；提交后 HEAD 会越过被验证的 commit，验证需按 manifest 的 commit 读
-  - PR：feat/task-board-superagent → main
+  - 证据补入库：git add evidence && git commit；提交后 HEAD 会越过被验证的 bdcad3a，验证需按 manifest 的 commit 读
+  - PR：https://github.com/JR-Rong/dsh-marshal/pull/4
 
 traps:
   - client bundle 是生成产物；重建会丢 observer，测试会检查 bundle 是否含 hook
