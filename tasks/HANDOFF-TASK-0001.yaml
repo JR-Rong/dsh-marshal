@@ -1,30 +1,29 @@
 ticket: T-000001
 task: TASK-0001
 baseline: 96018a922823507122f7bf128606a1ae03211a38
-updated_at: 2026-11-18T02:05:00-08:00
+updated_at: 2026-11-18T02:30:00-08:00
 
 done:
   - superagent 主机模块：settings / state / agents / memory / prompt / dispatch / extension / mount
   - 浏览器 human-create observer（独立源 + 已追加到 client bundle）
   - marshal_superagent 工具：status / agents / reconcile（只读）
   - 本机路由：/marshal-superagent 控制页、/api/human-create、/api/config、/api/dispatch、/api/agents、/api/status、/health
-  - 代码提交 9a7dac5（基线 96018a9）；66 条测试全绿
-  - evidence RUN-20261118-015441（unit+regression）在 9a7dac5 PASS
+  - 代码提交 f58a1ff（基线 96018a9）；68 条测试全绿
+  - evidence RUN-20261118-021753（unit）、RUN-20261118-021754（regression）在 f58a1ff PASS
   - 真机验收：卡片 20469794-3c17-4c6d-a229-5296971084cb → 执行 7e47e297 → session-f3c7d3f7 → succeeded；记忆 memoryWritten:true；记录见 docs/specs/E2E-2026-11-18-superagent-bridge.md
   - 最终代码在 56120 复验：控制页 200、缺 Origin/cross-site 403、工具 config 被拒、默认丞相
   - 真机 A3：agent 用 task_board_create 建卡 9f2958f1-2b68-4af7-aa58-f1d3cac14381，2.5s 后仍 todo/0 execution，桥 records 未增；已删除测试卡
+  - GUI 真机验收通过：皇上在 62150 点「创建」建卡 d7103e7e「测试gui」；桥自动派发，execution 33c73544 / session-30f5ccc8，结果 succeeded，memoryWritten=true；记忆 episode「工单「测试gui」完成」已写入
   - tarball plugin-build/dsh-marshal-0.2.1-superagent.1.tgz
   - 本机 live 0.1.0 已备份并回填同一模块；settings 默认丞相
 
 unverified:
-  - GUI 按钮点击的最终体验验收（本次真机走的是与 hook 等价的两次 HTTP 请求；hook 本身有单测）
   - 0.2.1 tarball 在干净 profile 的安装（当前 profile 仍是 0.1.0 link）
   - 高于看板会话默认权限的成员：权限闸门真实提示与人工确认流程
   - 手机/远端建卡：当前不自动触发，仅控制页人工补派
   - 两轮盲审在 84dd00b 上判 fail；第三轮在 bdcad3a 上复核：仅 B1 未闭环（本机进程伪造请求头），B2/B3/A8/A10/A5 均 fixed
   - B1 已获皇上批准 EXC-0001（2026-11-18）：本机进程伪造全部请求头不在信任边界内；第三轮唯一阻塞按例外结案，其余 fixed
-  - GUI 第一次点击「创建并执行」未触发桥（卡片 2793e898...，initiatedBy 是普通 session）；已诊断 dsh-app:// 页面 origin，hook 改走 /api/marshal-superagent/human-create 别名并重载；待皇上再点「创建」复验
-  - GUI 点击验收：皇上已选“亲点一张根卡”，候皇上操作后臣验 Running/会话/记忆
+  - GUI 第一次「创建并执行」与第二次旧 hook 未触发属历史，已由 62150 完整重启后的 d7103e7e 成功验收覆盖
 
 decisions:
   - ADR-0001：轻量桥 + 看板原生 run + 显式记忆读写；不 fork 第三方看板
@@ -34,11 +33,11 @@ decisions:
   - 盲审 B1/B2/A11/A8/A10 已修：human/config/dispatch 路由要求 Origin + Sec-Fetch-Site + 回环 Host；模型工具只读；配置/补派走 /marshal-superagent 控制页；settle 尊重 enabled；memoryLimit 硬上限 6；memory-pending 可重试
 
 next:
-  - 最终代码已在 56120 重新加载；皇上可手点一张根卡做 GUI 体验验收
-  - 再建一张带 @工部尚书 的卡，确认覆盖
-  - 控制页 http://127.0.0.1:56120/marshal-superagent 可改默认/开关/补派
-  - 证据补入库：git add evidence && git commit；提交后 HEAD 会越过被验证的 bdcad3a，验证需按 manifest 的 commit 读
-  - PR：https://github.com/JR-Rong/dsh-marshal/pull/4
+  - 最终代码已在 62150 运行；GUI 验收已过
+  - 再建一张带 @工部尚书 的卡，确认标签覆盖（可选）
+  - 控制页 http://127.0.0.1:62150/marshal-superagent 可改默认/开关/补派
+  - 证据补入库：git add evidence && git commit；提交后 HEAD 会越过被验证的 f58a1ff，验证需按 manifest 的 commit 读
+  - PR：https://github.com/JR-Rong/dsh-marshal/pull/4（由皇上自审，不自动合并）
 
 traps:
   - client bundle 是生成产物；重建会丢 observer，测试会检查 bundle 是否含 hook
@@ -48,6 +47,6 @@ traps:
   - live 备份后缀 .bak-20261118-superagent
 
 blocked_on:
-  need: 皇上亲手点一张根卡的 GUI 验收
+  need: 无；PR #4 由皇上自审/合并
   owner: 皇上
   due: 2026-11-18

@@ -1,0 +1,7 @@
+# TASK-0001 / EVD-TASK-0001-20261118021706
+commit e0149b6258aa clean
+cmd '/Users/rongjianrui/.dsh/dsh-runtimes/dsh-primary-runtime/dependencies/node/bin/node' --te exit=0
+stdout sha256 cf23f1346b029e2f 3468B
+suite superagent-unit files=16 sha 8c4036edfa3b7ec2
+env darwin-arm64 python 3.12.14
+runner evd 2026-11-18T02:17:06.443834-08:00

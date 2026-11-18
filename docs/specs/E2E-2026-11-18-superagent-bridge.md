@@ -1,8 +1,8 @@
 # E2E-2026-11-18 · Super-agent 人工派发桥真机验收
 
 - 日期：2026-11-18（America/Los_Angeles）
-- 代码：分支 feat/task-board-superagent；功能 commit bdcad3a；HEAD e4171a8（仅 evidence/handoff）
-- 环境：本机 DSH 桌面宿主；最终代码运行于 http://127.0.0.1:56120；首轮真机跑在 http://127.0.0.1:63125
+- 代码：分支 feat/task-board-superagent；最终代码 commit f58a1ff；PR #4
+- 环境：本机 DSH 桌面宿主；最终 GUI 验收跑在 http://127.0.0.1:62150；早期真机跑在 63125 / 56120
 - 任务包：TASK-0001 / SPC-0001
 
 ## 1. 真机链路
@@ -47,6 +47,23 @@
 - 诊断：DSH 桌面 Web GUI 的页面 origin 是 dsh-app://app/，旧 hook 把通知发到 dsh-app://app/marshal-superagent/...，没有落到主机的 /marshal-superagent 路由；且「创建并执行」会在桥之前手动 run。
 - 修复：hook 通知改走 /api/marshal-superagent/human-create（DSH 桌面把 /api/* 映射到主机 HTTP 并在宿主鉴权下转发），主机新增该别名；客户端已重载。请皇上再点「创建」（不要点「创建并执行」）验证。
 
+## 3.2 GUI 成功验收（2026-11-18 02:27，62150）
+
+在完整重启 DSH 后，皇上在任务看板点「创建」建卡；桥自动派发，未点「创建并执行」。
+
+| 项 | 值 |
+|---|---|
+| 工单 id | d7103e7e-60d0-4c10-85e8-4aa1eb9e8bea |
+| 标题 | 测试gui |
+| 标签 | 智能体:丞相 |
+| 执行 id | 33c73544-6018-4c5f-9e9e-324dd727ae6e |
+| 执行会话 | session-30f5ccc8-c511-4eea-818f-5e71caa5c277 |
+| initiatedBy | marshal-superagent |
+| 结果 | succeeded；卡片 done |
+| 桥记录 | status=settled，outcome=succeeded，memoryWritten=true |
+
+执行 prompt 含丞相 brief、1 条相关长期记忆、工单要求与执行约定。结算后该工单 episode「工单「测试gui」完成」已出现在丞相的会话记忆块。A1/A6/A7 的 GUI 自动派发链路由此闭环。
+
 ## 4. agent 自建卡不触发（真机）
 
 - 用 agent 工具 task_board_create 建卡 9f2958f1-2b68-4af7-aa58-f1d3cac14381。
@@ -55,5 +72,6 @@
 
 ## 5. 结论与残项
 
-- A1/A6/A7 的真机核心链路（建卡 → 派发 → 原生 run → Running/会话 → 结算 → 记忆）已有本条记录作为证据；最终代码的控制页/守卫/只读工具在 56120 复验。
-- 残项：GUI 按钮点击的最终体验验收；0.2.1 tarball 在干净 profile 安装；高于会话默认权限的真实权限闸门；第三轮独立盲审。
+- A1/A6/A7 的 GUI 真机链路（皇上点「创建」→ hook → 桥自动 update/run → Running/会话 → 结算 → memoryWritten=true → 记忆 episode）已由 3.2 闭环。
+- agent 自建卡不触发（A3）、缺 Origin/cross-site 拒绝、控制页、默认丞相、工具只读均已复验。
+- 残项：0.2.1 tarball 在干净 profile 安装；高于会话默认权限的真实权限闸门；PR #4 由皇上自审（不自动合并）。第三轮盲审唯一 B1 已由皇上批准的 EXC-0001 结案，reviewer 原判仍 fail，不宣称 pass。
