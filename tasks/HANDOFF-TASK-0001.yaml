@@ -1,0 +1,42 @@
+ticket: T-000001
+task: TASK-0001
+baseline: 96018a922823507122f7bf128606a1ae03211a38
+updated_at: 2026-11-18T01:05:00-08:00
+
+done:
+  - superagent 主机模块：settings / state / agents / memory / prompt / dispatch / extension / mount
+  - 浏览器 human-create observer（独立源 + 已追加到 client bundle）
+  - marshal_superagent 工具：status / config / agents / dispatch / reconcile
+  - 本机路由：/marshal-superagent/api/human-create、/api/status、/health
+  - 单测 33 条 + 回归 59 条全绿；evidence RUN-20261118-010229、RUN-20261118-010231
+  - tarball plugin-build/dsh-marshal-0.2.1-superagent.1.tgz
+  - 本机 live 0.1.0 已备份并回填同一模块；settings 默认工部尚书
+
+unverified:
+  - DSH 重启/禁用启用后的真机链路：GUI 新建根卡 → Running → 卡片会话 → 记忆新增
+  - 0.2.1 tarball 在干净 profile 的安装（当前 profile 仍是 0.1.0 link）
+  - 高于看板会话默认权限的成员：权限闸门真实提示与人工确认流程
+  - 手机/远端建卡：当前不自动触发，仅 marshal_superagent dispatch 补派
+
+decisions:
+  - ADR-0001：轻量桥 + 看板原生 run + 显式记忆读写；不 fork 第三方看板
+  - 默认 agent 设为工部尚书，卡片标签 @某官 覆盖
+  - live 0.1.0 只回填同一模块，不整体升级到 0.2.1，避免改动皇上现有 UI
+
+next:
+  - 在 Plugins 里 disable → enable dsh-marshal（或重启 DSH），刷新页面
+  - 新建一张根卡，确认 Running 与卡片会话；结算后查 agent 记忆
+  - 再建一张带 @丞相 的卡，确认覆盖
+  - 若默认 agent 要换：marshal_superagent action=config defaultAgent=丞相
+
+traps:
+  - client bundle 是生成产物；重建会丢 observer，测试会检查 bundle 是否含 hook
+  - 触发依赖看板 POST api/task-board/action 的 create；端点变化时 fail-soft（不误触发）
+  - 只认本机浏览器；agent 用 task_board_create 建卡不触发
+  - state/settings 在 ~/.dsh-marshal/superagent/；删除即清空派发记录
+  - live 备份后缀 .bak-20261118-superagent
+
+blocked_on:
+  need: 本机重启/禁用启用后的真机验收
+  owner: 皇上
+  due: 2026-11-18

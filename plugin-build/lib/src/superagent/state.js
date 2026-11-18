@@ -3,8 +3,9 @@
  *
  * One record per card the bridge itself dispatched. Records are keyed by task
  * id, so a duplicated browser notification can never open two runs. The file is
- * local, atomically replaced, bounded, and never contains card text: a status
- * read can report what happened without copying the work around.
+ * local, atomically replaced, bounded, and keeps only dispatch metadata plus a
+ * short card title for status reads — never the full prompt, memory block or
+ * session transcript.
  */
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';

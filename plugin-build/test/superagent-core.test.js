@@ -24,6 +24,15 @@ test('settings: defaults are safe and a malformed file falls back', () => {
     assert.equal(reloaded.get().memoryLimit, 3);
 });
 
+test('settings: a corrupt file falls back and is reported, not overwritten', () => {
+    const root = tempRoot();
+    writeFileSync(join(root, 'settings.json'), '{not-json');
+    const store = createSettingsStore(root, { logger: { warn: () => {} } });
+    assert.equal(store.get().enabled, true);
+    assert.equal(store.get().defaultAgent, null);
+    assert.match(store.error(), /settings-unreadable/);
+});
+
 test('settings: normalization refuses invalid values without throwing', () => {
     const normalized = normalizeSettings({
         enabled: 'yes',

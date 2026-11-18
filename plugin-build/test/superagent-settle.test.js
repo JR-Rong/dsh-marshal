@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
+import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import test from 'node:test';
 import { createSuperagentBridge } from '../lib/src/superagent/mount.js';
+import { createStateStore } from '../lib/src/superagent/state.js';
 import { agentsFixture, createFakeBoard, createFakeMemory, loggerFixture, memberFixture, taskFixture, tempRoot } from './superagent-support.js';
 
 function setup(options = {}) {
@@ -94,6 +97,14 @@ test('reconcile: a missed settle event is caught on the next board read', async 
     assert.equal(result.settled, 1);
     assert.equal(memory.writes.length, 1);
     assert.equal(bridge.stateStore.get('task-1').memoryWritten, true);
+});
+
+test('state: a corrupt dispatch file falls back to an empty ledger', () => {
+    const root = tempRoot();
+    writeFileSync(join(root, 'state.json'), '{broken');
+    const store = createStateStore(root, { logger: { warn: () => {} } });
+    assert.equal(store.list().length, 0);
+    assert.match(store.error(), /state-unreadable/);
 });
 
 test('settle: a late duplicate notification cannot erase the settled record', async () => {
