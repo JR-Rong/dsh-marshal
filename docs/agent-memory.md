@@ -25,9 +25,9 @@
 | Workspace | 一个工作区 | 在该工作区工作的 Agent |
 | Global | 机主 | `all`：所有会话都注入。`no-group`：只注入 1:1，群聊会话不注入 |
 
-全局没有 `private`。旧数据里未知或 `private` 的可见性会在打开库时改成 `no-group`。群聊和单聊的差别在注入时按会话类型判断（群成员会话、`group: true`，或会话头里的 group），不靠提示词自觉。
+全局没有 `private`。旧数据里未知或 `private` 的可见性会在打开库时改成 `no-group`。群聊和单聊的差别在注入时按会话类型判断（群成员会话、`group: true`，或会话头里的 group），不靠提示词自觉。注入上下文如果没有 session id，也没有明确的单聊标记，就按群聊处理，`no-group` 不会注入。这是故意的失败关闭：没有可靠的会话身份时，不把仅单聊的事实送进可能是群的上下文。
 
-Agent 不能直接写全局。`agent_memory` 的 `scope=global`，以及文件记忆的全局 `write` / `promote`，都只产生同一条提案队列里的 `pending` 记录：提案的 agentId、正文、建议可见性和时间。提案不进入任何提示词，也不上传到 Hub。记忆页的「全局记忆审批」可以同意、改完再同意，或拒绝。只有同意才会变成一条生效的全局记忆；带 `file-profile` 的提案同意后才会追加到 `profile.md` 或 `rules.md`。机主可以在同一页直接新建、修改和删除全局记忆。
+Agent 不能直接写全局。`agent_memory` 的 `scope=global`，以及文件记忆的全局 `write` / `promote`，都只产生同一条提案队列里的 `pending` 记录：提案的 agentId、正文、建议可见性和时间。提案不进入任何提示词，也不上传到 Hub。记忆页的「全局记忆审批」可以同意、改完再同意，或拒绝。只有同意才会变成一条生效的全局记忆。`rules.md` 会注入到每个会话，所以目标是 rules 的提案可见性固定为 `all`，同意后才写入 `rules.md`。如果同意时改成 `no-group`，它只留在 SQLite，不进 `rules.md`。`profile.md` 不进提示词，`no-group` 的 profile 提案同意后仍追加到文件。机主可以在同一页直接新建、修改和删除全局记忆。还没确定机主时，审批区显示「请先登录机主账号后再审批全局记忆」，而不是只有一个 403。第一次看到已登录的机主账号后，账号哈希写在 `owner.json`；之后本机会话凭回环、CSRF 和 Origin 仍可审批，换一个账号则不行。
 
 Agent 进入一个工作区时，同时读取该工作区的共享记忆；换工作区时 Agent 私有记忆不变。
 群聊会注入 Agent 私有记忆，默认禁止原文引用；可在记忆设置里打开“群聊允许引用”。全局的 `no-group` 不靠这句提示，群聊会话里根本不会注入。
@@ -79,7 +79,7 @@ Agent 进入一个工作区时，同时读取该工作区的共享记忆；换�
 3. 从 /marshal/api/memory-sync/pull 拉取并解密；
 4. hub 只保存密文、id、revision、时间和墓碑标记，没有正文、标签或向量。
 
-Hub 用设备 bearer 认出设备。只有设备记录上显式的 `ownerId` 能读写密文；`DeviceStore.add()` 和没有 `ownerId` 的旧设备互不相通，也不会自动领走 v1 记录。v1 记录要调用 `migrateLegacy(accountOwner)` 才会绑到一个账号。客户端传来的 ownerId 只是记忆归属（agent、workspace 或 global），不能借它读取另一个账号的密文。已批准的全局记忆会和 agent、workspace 一起同步；提案留在本机。删除会记下 id 和归一化正文哈希，同一段文字换一个 id 也不能写回来。某个 id 一旦留下墓碑，后到的活记录不能把它救回来。
+Hub 用设备 bearer 认出设备。只有设备记录上显式的 `ownerId` 能读写密文；`DeviceStore.add()` 和没有 `ownerId` 的旧设备互不相通，也不会自动领走 v1 记录。v1 记录不会在 push/pull 时自动认领。记忆页的「迁移旧同步」调用机主会话上的 `POST /marshal/memory/migrate-legacy`，节点再请求 Hub 的 `POST /marshal/api/memory-sync/migrate`。Hub 只认带 `ownerId` 的设备，把遗留密文绑到该设备的账号。重复调用是空操作；没有 owner 的设备，或已经绑给别的账号之后再来的设备，都会被拒绝。客户端传来的 ownerId 只是记忆归属（agent、workspace 或 global），不能借它读取另一个账号的密文。已批准的全局记忆会和 agent、workspace 一起同步；提案留在本机。删除会记下 id 和归一化正文哈希，同一段文字换一个 id 也不能写回来。某个 id 一旦留下墓碑，后到的活记录不能把它救回来。
 
 节点地址：`wss:` 变成 `https:`，`https:` 保持 `https:`。明文 `http:` 只允许 loopback。
 

@@ -356,7 +356,7 @@ test('memory HTTP binds the caller and requires owner CSRF for global approval',
             body: JSON.stringify({ id: next.id }),
         });
         assert.equal(blocked.status, 403);
-        assert.equal(blocked.json.code, 'owner-only');
+        assert.equal(blocked.json.code, 'sign-in-to-approve');
         const remote = buildHealthBody({ socket: { remoteAddress: '203.0.113.4' } }, { deviceId: 'dev', agents: true, taskBoardSource: 'local', crossGroups: false, agentMemory: true });
         const local = buildHealthBody({ socket: { remoteAddress: '127.0.0.1' } }, { deviceId: 'dev', agents: true, taskBoardSource: 'local', crossGroups: false, agentMemory: true });
         assert.equal(remote.capabilities.agentMemory, undefined);

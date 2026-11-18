@@ -97,12 +97,15 @@ function submitGlobalProposal(service, content, by, file, action) {
     if (typeof service.proposeGlobal !== 'function')
         throw new Error('marshal-memory: approval-required: global writes need the proposal queue');
     const body = content.trim();
+    const rules = file === 'rules';
     const proposal = service.proposeGlobal({
         title: body.slice(0, 80),
         content: body,
         kind: 'profile',
-        tags: file === 'rules' ? ['file-profile', 'file-rules'] : ['file-profile'],
-        visibility: 'no-group',
+        // rules.md is injected into every session, so that target is visibility all.
+        // no-group file proposals stay SQLite-only and never enter rules.md.
+        tags: rules ? ['file-profile', 'file-rules'] : ['file-profile'],
+        visibility: rules ? 'all' : 'no-group',
     }, { agentId: typeof by === 'string' && by !== '' ? by : 'file-memory' });
     return {
         ok: true, action,
@@ -118,7 +121,9 @@ export function attachFileProposals(fileService, agentService) {
     fileService.proposeGlobal = (entry, context) => agentService.store.propose(entry, context);
     agentService.onApproved = (proposal, memory) => {
         if (!Array.isArray(proposal?.tags) || !proposal.tags.includes('file-profile')) return;
-        const file = proposal.tags.includes('file-rules') ? 'rules' : 'profile';
+        const rules = proposal.tags.includes('file-rules');
+        if (rules && memory?.visibility !== 'all') return;
+        const file = rules ? 'rules' : 'profile';
         fileService.store.write({ scope: 'global', file, content: memory.content, approved: true, by: 'owner' });
     };
 }

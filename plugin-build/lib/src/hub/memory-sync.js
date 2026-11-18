@@ -49,10 +49,10 @@ function claimLegacy(state, accountOwner) {
     if (typeof accountOwner !== 'string' || accountOwner === '' || accountOwner.startsWith('operator:')) {
         const error = new Error('owner-mismatch'); error.code = 'owner-mismatch'; throw error;
     }
-    if (state.legacyRecords === undefined) return 0;
     if (state.legacyClaimedBy !== undefined && state.legacyClaimedBy !== accountOwner) {
         const error = new Error('owner-mismatch'); error.code = 'owner-mismatch'; throw error;
     }
+    if (state.legacyRecords === undefined) return 0;
     const bucket = ensureAccount(state, accountOwner);
     let migrated = 0;
     for (const record of Object.values(state.legacyRecords)) {
@@ -298,6 +298,29 @@ export function handleMemorySyncPull(req, res, { memorySync, deviceFromRequest, 
     try {
         const result = memorySync.pull({ accountOwner, scope, memoryOwnerId, since });
         send(res, 200, { ok: true, records: result.records, salt: result.salt });
+    }
+    catch (error) { fail(res, error); }
+}
+
+/**
+ * One-time, idempotent claim of v1 ciphertext. The account is the authenticated
+ * device's ownerId. Unbound devices and a second account are refused. A body
+ * cannot choose a different account.
+ */
+export async function handleMemorySyncMigrate(req, res, { memorySync, deviceFromRequest }) {
+    if (memorySync === undefined || typeof memorySync.migrateLegacy !== 'function') {
+        send(res, 503, { ok: false, code: 'memory-sync-unavailable' });
+        return;
+    }
+    if (req.method !== 'POST') { res.writeHead(405, { allow: 'POST', 'cache-control': 'no-store' }).end(); return; }
+    const device = deviceFromRequest(req);
+    const accountOwner = accountOwnerForDevice(device);
+    if (device === undefined || accountOwner === undefined) { send(res, 401, { ok: false, code: 'unauthorized' }); return; }
+    try { await readBody(req, 4096); }
+    catch { /* the account comes from the device, never the body */ }
+    try {
+        const result = memorySync.migrateLegacy(accountOwner);
+        send(res, 200, { ok: true, migrated: result.migrated, accountOwner });
     }
     catch (error) { fail(res, error); }
 }

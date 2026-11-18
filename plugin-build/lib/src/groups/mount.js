@@ -10,7 +10,7 @@ import { createLocalBoard } from './local-board.js';
 import { createAgentsHttpClient, agentToolDefinitions } from './agent-tools.js';
 import { createDshSurface } from '../adapters/dsh/surface.js';
 import { createMemoryRoutes } from '../memory/http.js';
-import { createMemoryHttpAuth, installOwnerFor } from '../memory/http-auth.js';
+import { createMemoryHttpAuth, resolveDesktopOwner } from '../memory/http-auth.js';
 import { dshAccountHash, DSH_ACCOUNT_ORIGIN } from '../hub/account.js';
 
 const BODY_LIMIT = 64 * 1024;
@@ -456,15 +456,18 @@ export function mountGroups(ctx, config, options = {}) {
         catch { /* no signed-in platform account */ }
         return undefined;
     };
+    const ownerFile = join(config.memoryRoot ?? join(homedir(), '.dsh-marshal', 'memory'), 'owner.json');
+    const desktopOwner = async () => resolveDesktopOwner({ config, platformHash: await platformHash(), ownerFile });
     const memoryAuth = createMemoryHttpAuth({
         resolveOwner: async () => {
-            const hash = await platformHash();
-            if (hash !== undefined) return hash;
+            const owner = await desktopOwner();
+            if (typeof owner.caller === 'string' && owner.caller !== '') return owner.caller;
             if (typeof config.deviceId === 'string' && config.deviceId !== '') return 'device:' + config.deviceId;
             return '';
         },
-        // Unknown install owner stays non-owner. A device id alone does not grant approval.
-        installOwner: async () => installOwnerFor(config, await platformHash()),
+        // Unknown install owner stays non-owner. After the first signed-in owner is
+        // persisted, a later logged-out local session can present that same hash.
+        installOwner: async () => (await desktopOwner()).install,
     });
     const service = createGroupService({
         root,

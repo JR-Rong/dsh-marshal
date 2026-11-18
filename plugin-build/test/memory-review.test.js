@@ -60,7 +60,8 @@ test('unknown install owner is not an owner', async () => {
         body: JSON.stringify({ id: 'proposal' }),
     });
     assert.equal(denied.status, 403);
-    assert.equal(denied.json.code, 'owner-only');
+    assert.equal(denied.json.code, 'sign-in-to-approve');
+    assert.match(denied.json.message, /请先登录机主账号后再审批全局记忆/);
 });
 
 test('file global write and promote become proposals', () => {

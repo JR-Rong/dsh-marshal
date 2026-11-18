@@ -529,6 +529,14 @@ export function createAgentMemoryService({ root, logger, deviceId, hubUrl, token
         scopes.push({ scope: 'global', ownerId: 'global' });
         return sync.sync(store, scopes);
     };
+    service.migrateLegacy = async () => {
+        if (sync === undefined || typeof sync.migrate !== 'function') {
+            const error = new Error('memory sync is not configured');
+            error.code = 'memory-sync-unavailable';
+            throw error;
+        }
+        return sync.migrate();
+    };
     service.forgetFor = ({ agentId, workspaceId, id }) => {
         const scopes = [];
         if (agentId) scopes.push({ scope: 'agent', ownerId: agentId });

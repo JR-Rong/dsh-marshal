@@ -1,6 +1,7 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { agentsLedgerPath } from '../groups/inventory.js';
+import { atomicWriteFile, withFileLock } from '../hub/state-file.js';
 
 /**
  * Loopback memory cookies.
@@ -16,12 +17,55 @@ export const MEMORY_SESSION_ABSOLUTE_MS = 8 * 60 * 60 * 1000;
 export const MEMORY_SESSION_IDLE_MS = 30 * 60 * 1000;
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{16,128}$/;
 
-/** The install owner is the configured account hash, or the signed-in platform account. A device id is not an owner. */
-export function installOwnerFor(config, platformHash) {
-    const configured = config?.dshAccountHash;
-    if (typeof configured === 'string' && /^[a-f0-9]{64}$/.test(configured)) return configured;
-    if (typeof platformHash === 'string' && /^[a-f0-9]{64}$/.test(platformHash)) return platformHash;
-    return undefined;
+const OWNER_HASH = /^[a-f0-9]{64}$/;
+
+function hashOrUndefined(value) {
+    return typeof value === 'string' && OWNER_HASH.test(value) ? value : undefined;
+}
+
+/** The install owner is the configured account hash, the signed-in platform account, or a hash persisted from an earlier signed-in owner. A device id is not an owner. */
+export function installOwnerFor(config, platformHash, persistedHash) {
+    const configured = hashOrUndefined(config?.dshAccountHash);
+    if (configured !== undefined) return configured;
+    const persisted = hashOrUndefined(persistedHash);
+    if (persisted !== undefined) return persisted;
+    return hashOrUndefined(platformHash);
+}
+
+export function readPersistedOwner(file) {
+    try {
+        const parsed = JSON.parse(readFileSync(file, 'utf8'));
+        return hashOrUndefined(parsed?.accountHash);
+    }
+    catch { return undefined; }
+}
+
+/** Remember the first signed-in owner. A later different account does not replace it. */
+export function persistOwner(file, hash) {
+    const next = hashOrUndefined(hash);
+    if (next === undefined || typeof file !== 'string' || file === '') return undefined;
+    return withFileLock(file, () => {
+        const existing = readPersistedOwner(file);
+        if (existing !== undefined) return existing;
+        atomicWriteFile(file, JSON.stringify({ accountHash: next }) + '\n');
+        return next;
+    });
+}
+
+/**
+ * Desktop owner resolution. The first matching signed-in account is written to
+ * ownerFile. After that, a logged-out local session can present that same hash.
+ * Until a hash exists, install is undefined and approval stays closed.
+ */
+export function resolveDesktopOwner({ config, platformHash, ownerFile }) {
+    const platform = hashOrUndefined(platformHash);
+    const configured = hashOrUndefined(config?.dshAccountHash);
+    if (platform !== undefined && (configured === undefined || platform === configured)) persistOwner(ownerFile, platform);
+    const persisted = typeof ownerFile === 'string' && ownerFile !== '' ? readPersistedOwner(ownerFile) : undefined;
+    return {
+        caller: platform ?? persisted,
+        install: installOwnerFor(config, platform, persisted),
+    };
 }
 
 export function isLoopbackAddress(address) {

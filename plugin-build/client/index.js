@@ -421,6 +421,7 @@ window.__ModuleLoader__.load({
       const [health, setHealth] = React.useState(null);
       const [settingsOpen, setSettingsOpen] = React.useState(false);
       const [proposals, setProposals] = React.useState([]);
+      const [approvalNotice, setApprovalNotice] = React.useState('');
       const [drafts, setDrafts] = React.useState({});
       const [globalVisibility, setGlobalVisibility] = React.useState('no-group');
       const [editText, setEditText] = React.useState('');
@@ -460,7 +461,11 @@ window.__ModuleLoader__.load({
             return next;
           });
         }
-        catch { setProposals([]); }
+        catch (error) {
+          setProposals([]);
+          if (error && (error.code === 'sign-in-to-approve' || String(error.message || '').includes('sign-in-to-approve')))
+            setApprovalNotice('请先登录机主账号后再审批全局记忆');
+        }
       };
       React.useEffect(() => { void load(); void fetchJson('marshal/memory/settings/get').then(setSettings).catch(() => {}); void loadProposals(); }, []);
       React.useEffect(() => { void loadGraph(); }, [agentId, workspaceId]);
@@ -500,7 +505,11 @@ window.__ModuleLoader__.load({
           await loadProposals();
           await loadGraph();
         }
-        catch (e) { setError(friendlyError(e, '全局记忆审批')); }
+        catch (e) {
+          if (e && (e.code === 'sign-in-to-approve' || String(e.message || '').includes('sign-in-to-approve')))
+            setApprovalNotice('请先登录机主账号后再审批全局记忆');
+          else setError(friendlyError(e, '全局记忆审批'));
+        }
       };
       const saveGlobal = async () => {
         if (!selected || selected.scope !== 'global') return;
@@ -522,6 +531,7 @@ window.__ModuleLoader__.load({
           h('button', { type: 'button', style: uiButton(false), onClick: () => setSettingsOpen(value => !value) }, '设置'),
           h('span', { style: { marginLeft: 'auto', fontSize: 11, color: dswTheme.dim } }, graph.nodes.length + ' 个节点 · ' + graph.edges.length + ' 条关联' + (health?.health?.length ? ' · 模糊 ' + health.health.reduce((sum, item) => sum + (item.fuzzy || 0), 0) + ' · 档案 ' + health.health.reduce((sum, item) => sum + (item.archived || 0), 0) : '')),
           h('button', { type: 'button', style: uiButton(false), onClick: async () => { setSyncNotice('同步中…'); try { const result = await fetchJson('marshal/memory/sync', { agentId, workspaceId }); setSyncNotice('推送 ' + (result.pushed ?? 0) + ' · 拉取 ' + (result.pulled ?? 0)); await loadGraph(); } catch (e) { setSyncNotice(String(e.message || e)); } } }, '同步'),
+          h('button', { type: 'button', style: uiButton(false), onClick: async () => { setSyncNotice('迁移旧同步…'); try { const result = await fetchJson('marshal/memory/migrate-legacy', {}); setSyncNotice(result.migrated ? '已绑定 ' + result.migrated + ' 条旧记录' : '没有待迁移的旧记录'); } catch (e) { if (e && (e.code === 'sign-in-to-approve' || String(e.message || '').includes('sign-in-to-approve'))) setApprovalNotice('请先登录机主账号后再审批全局记忆'); setSyncNotice(String(e.message || e)); } } }, '迁移旧同步'),
           h('button', { type: 'button', style: uiButton(false), onClick: () => { void loadGraph(); } }, '刷新')),
         syncNotice !== '' && h('div', { style: { padding: '6px 18px', fontSize: 11, color: dswTheme.dim } }, syncNotice),
         settingsOpen && settings && h('div', { style: { padding: '10px 18px', display: 'flex', gap: 16, flexWrap: 'wrap', fontSize: 12, borderBottom: '1px solid #8883' } },
@@ -534,6 +544,7 @@ window.__ModuleLoader__.load({
         error !== '' && h('div', { style: { padding: '8px 18px', color: dswTheme.danger, fontSize: 12 } }, error),
         h('section', { style: { padding: '10px 18px', borderBottom: '1px solid #8883', display: 'grid', gap: 8 } },
           h('div', { style: { fontSize: 13, fontWeight: 600 } }, '全局记忆审批'),
+          approvalNotice !== '' && h('div', { style: { fontSize: 12, color: dswTheme.danger } }, approvalNotice),
           proposals.length === 0
             ? h('div', { style: { fontSize: 12, color: dswTheme.dim } }, '没有待审批的全局记忆。智能体提交的全局记忆会停在这里，同意后才会生效。')
             : proposals.map(item => {

@@ -119,5 +119,8 @@ export function createMemorySyncClient({ hubUrl, token, passphrase = process.env
             }
             return { pushed, pulled };
         },
+        migrate() {
+            return request('/marshal/api/memory-sync/migrate', {});
+        },
     };
 }

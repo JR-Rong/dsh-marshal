@@ -2,7 +2,7 @@ import { ControlsSchema } from "../agents/controls.js";
 import { AccountLoginError } from "./account.js";
 import { DeviceStateError } from "./devices.js";
 import { DiscussionError } from "../discussions/types.js";
-import { handleMemorySyncPull, handleMemorySyncPush } from "./memory-sync.js";
+import { handleMemorySyncMigrate, handleMemorySyncPull, handleMemorySyncPush } from "./memory-sync.js";
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { COMMAND_OPS } from "../wire/frames.js";
 import { parseCommandArgs } from "../wire/commands.js";
@@ -848,6 +848,9 @@ export function registerMarshalRoutes(options) {
     }));
     register('/marshal/api/memory-sync/pull', guard((req, res) => {
         handleMemorySyncPull(req, res, { memorySync, deviceFromRequest: deviceFromBearer, operatorId });
+    }));
+    register('/marshal/api/memory-sync/migrate', guard(async (req, res) => {
+        await handleMemorySyncMigrate(req, res, { memorySync, deviceFromRequest: deviceFromBearer });
     }));
     register('/marshal/api/device-name', guard(async (req, res) => {
         if (req.method !== 'POST') {

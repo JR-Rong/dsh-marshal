@@ -48,7 +48,10 @@ export function createMemoryRoutes({ memory, auth, allowedOrigins } = {}) {
         if (memory === undefined || auth === undefined) { unavailable(res); return; }
         const authn = auth.authenticate(req, { write: writeNeeded, origins: origins() });
         if (!authn.ok) { write(res, authn.status, { ok: false, code: authn.code }); return; }
-        if (owner && authn.session.owner !== true) { write(res, 403, { ok: false, code: 'owner-only' }); return; }
+        if (owner && authn.session.owner !== true) {
+            write(res, 403, { ok: false, code: 'sign-in-to-approve', message: '请先登录机主账号后再审批全局记忆' });
+            return;
+        }
         let body;
         if (writeNeeded) {
             try { body = await readBody(req); }
@@ -160,6 +163,21 @@ export function createMemoryRoutes({ memory, auth, allowedOrigins } = {}) {
                 if (session.owner === true && requested.scope !== 'agent' && requested.scope !== 'workspace') scopes.push({ scope: 'global', ownerId: 'global' });
                 write(res, 200, { ok: true, health: memory.store.health(scopes) });
             }, { target: true }),
+        },
+        {
+            method: 'POST', path: '/marshal/memory/migrate-legacy',
+            handler: guard(true, async (_req, res) => {
+                try {
+                    const result = await memory.migrateLegacy();
+                    write(res, 200, { ok: true, migrated: Number(result?.migrated ?? 0) });
+                }
+                catch (error) {
+                    const code = error?.code === 'owner-mismatch' ? 'owner-mismatch'
+                        : error?.code === 'unauthorized' ? 'unauthorized'
+                            : 'memory-sync-unavailable';
+                    write(res, code === 'owner-mismatch' || code === 'unauthorized' ? 403 : 503, { ok: false, code, message: error instanceof Error ? error.message : String(error) });
+                }
+            }, { owner: true }),
         },
         {
             method: 'POST', path: '/marshal/memory/sync',
