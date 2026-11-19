@@ -91,16 +91,6 @@ export async function watchBackButton(onConsume: () => boolean): Promise<() => v
   }
 }
 
-/**
- * 进入调度官控制台。
- *
- * 与浏览器版加载同一个 Hub 页面：会话续跑、提问、审批、讨论群聊、控制项、
- * 历史与上传全部由 Hub 页面提供，手机端不做任何服务端逻辑。
- */
-export function enterConsole(url: string): void {
-  window.location.assign(url)
-}
-
 /** 退出应用（Android 返回键在首页时使用）。 */
 export async function exitApp(): Promise<void> {
   if (!inNativeShell()) return
@@ -112,10 +102,34 @@ export async function exitApp(): Promise<void> {
   }
 }
 
-/** 打开系统浏览器（用于「在浏览器中打开」，例如排障）。 */
+/** 打开系统浏览器。壳内不导航到外部页面。 */
 export async function openExternal(url: string): Promise<void> {
-  // 原生壳里直接交给系统浏览器；Capacitor 的 App 插件没有 openUrl。
+  if (inNativeShell()) {
+    try {
+      const { Browser } = await import('@capacitor/browser')
+      await Browser.open({ url })
+      return
+    } catch {
+      /* 插件缺失时退回系统打开 */
+    }
+  }
   window.open(url, '_blank', 'noopener')
+}
+
+/** 前后台切换。浏览器预览用页面可见性近似。 */
+export async function watchAppState(onChange: (active: boolean) => void): Promise<() => void> {
+  if (!inNativeShell()) {
+    const handler = (): void => { onChange(document.visibilityState !== 'hidden') }
+    document.addEventListener('visibilitychange', handler)
+    return () => document.removeEventListener('visibilitychange', handler)
+  }
+  try {
+    const { App } = await import('@capacitor/app')
+    const handle = await App.addListener('appStateChange', (next) => { onChange(next.isActive) })
+    return () => { void handle.remove() }
+  } catch {
+    return () => undefined
+  }
 }
 
 /** 震动反馈（可选，浏览器里静默跳过）。 */

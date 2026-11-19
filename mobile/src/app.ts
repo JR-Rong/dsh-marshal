@@ -6,29 +6,31 @@ import {
   type MarshalConfig,
 } from './lib/config.ts'
 import {
-  MarshalApi, agentLabel, sessionTitle, sameTarget, can,
-  type Capability, type DeviceRow, type InputCard, type SessionRow, type Target,
+  MarshalApi, agentLabel, sessionTitle, can, approvalChoices,
+  type Capability, type DeviceRow, type InputCard, type MemoryEntry, type RosterAgent,
+  type SessionRow, type Target, type TaskCard,
 } from './lib/marshal.ts'
 import { openEventStream, type StreamHandle, type StreamFrame } from './lib/sse.ts'
 import { readConfig, writeConfig, removeConfig } from './lib/storage.ts'
-import { createLock, verifyPin, isValidPin, type LockRecord } from './lib/lock.ts'
+import {
+  createLock, verifyPin, isValidPin, applyPinFailure, clearPinGuard, pinWaitMs, type LockRecord, type PinGuard,
+} from './lib/lock.ts'
 import {
   setupChrome, inNativeShell, openExternal, vibrate, exitApp,
-  watchNetwork, watchDeepLinks, watchBackButton,
+  watchNetwork, watchDeepLinks, watchBackButton, watchAppState,
 } from './lib/native.ts'
+import { decideDeepLink, parsePairingLink } from './lib/deeplink.ts'
+import { resolveSettingsToken, SETTINGS_TOKEN_PLACEHOLDER } from './lib/settings-token.ts'
+import { reduceActivity, type LockPhase } from './lib/activity.ts'
+import { SESSION_PAGE_SIZE, sliceSessions } from './lib/sessions.ts'
+import { createSingleFlight } from './lib/single-flight.ts'
+import { acceptEventSeq, historyToMessage, type TranscriptMessage } from './lib/transcript.ts'
 import { APP_TITLE, APP_VERSION, CLIENT_ONLY_NOTE } from './lib/version.ts'
 
-type View = 'booting' | 'setup' | 'lock' | 'home' | 'sessions' | 'session' | 'controls' | 'groups' | 'settings'
+type View = 'booting' | 'setup' | 'lock' | 'home' | 'sessions' | 'session' | 'controls' | 'groups' | 'settings' | 'tasks' | 'memory'
 
-type Role = 'user' | 'assistant' | 'reason' | 'tool' | 'system'
-
-interface Message {
-  id: string
-  role: Role
-  text: string
-  open: boolean
-  at: number
-}
+type Role = TranscriptMessage['role']
+type Message = TranscriptMessage
 
 interface UiState {
   view: View
@@ -51,6 +53,10 @@ interface UiState {
   lockPurpose: 'unlock' | 'set-new' | 'set-confirm' | 'disable'
   pinDraft: string
   pinError: string
+  tasks: TaskCard[]
+  memories: MemoryEntry[]
+  roster: RosterAgent[]
+  groupRoom: Record<string, unknown> | null
 }
 
 const state: UiState = {
@@ -74,6 +80,10 @@ const state: UiState = {
   lockPurpose: 'unlock',
   pinDraft: '',
   pinError: '',
+  tasks: [],
+  memories: [],
+  roster: [],
+  groupRoom: null,
 }
 
 let stream: StreamHandle | null = null
@@ -81,6 +91,15 @@ let subscriptionId: string | null = null
 let lastSeq = 0
 let disposeBack: (() => void) | null = null
 let draft = ''
+let sessionUnlocked = false
+let pendingHubUrl: string | null = null
+let sessionQuery = ''
+const sessionLimits = new Map<string, number>()
+let pinGuard: PinGuard = clearPinGuard()
+let lockPhase: LockPhase = 'unlocked'
+let seenInactive = false
+const answerGate = createSingleFlight()
+let advancedLogin = false
 
 const rootNode = (): HTMLElement => {
   const node = document.getElementById('app')
@@ -106,6 +125,8 @@ function screenChildren(): Child[] {
     case 'controls': return controlsView()
     case 'groups': return groupsView()
     case 'settings': return settingsView()
+    case 'tasks': return tasksView()
+    case 'memory': return memoryView()
   }
 }
 
@@ -142,33 +163,123 @@ export async function start(): Promise<void> {
   const config = await readConfig()
   state.config = config
   if (!config) {
+    sessionUnlocked = true
+    lockPhase = 'unlocked'
     state.view = 'setup'
     render()
   } else if (config.lock) {
+    sessionUnlocked = false
+    lockPhase = 'locked'
     state.view = 'lock'
+    state.lockPurpose = 'unlock'
     render()
   } else {
+    sessionUnlocked = true
+    lockPhase = 'unlocked'
     await enterApp()
   }
   await watchNetwork((online) => {
     state.online = online
     if (state.view === 'home' || state.view === 'sessions') render()
   })
-  await watchDeepLinks((url) => {
-    try {
-      const hub = new URL(url).searchParams.get('hub')
-      if (!hub) return
-      const normalized = normalizeHubUrl(hub)
-      if (!normalized.ok) { toast(normalized.error, 'error'); return }
-      state.config = state.config ?? makeConfig({ hubUrl: normalized.value })
-      state.config.hubUrl = normalized.value
-      state.view = 'setup'
-      render()
-      toast('已从链接填入 Hub 地址')
-    } catch { /* 非法深链忽略 */ }
+  await watchDeepLinks((url) => { void onDeepLink(url) })
+  await watchAppState((active) => {
+    const next = reduceActivity(lockPhase, Boolean(state.config?.lock), active, seenInactive)
+    lockPhase = next.phase
+    seenInactive = next.seenInactive
+    if (lockPhase === 'locked' && state.view !== 'lock') showLock()
   })
   await registerBackButton()
   window.addEventListener('pageshow', (event) => { if (event.persisted) void registerBackButton() })
+}
+
+function appIsLocked(): boolean {
+  return Boolean(state.config?.lock) && !sessionUnlocked
+}
+
+function showLock(): void {
+  sessionUnlocked = false
+  lockPhase = 'locked'
+  pinBuffer = ''
+  state.lockPurpose = 'unlock'
+  state.pinError = ''
+  state.view = 'lock'
+  render()
+}
+
+async function onDeepLink(url: string): Promise<void> {
+  if (appIsLocked()) return
+  const pairing = parsePairingLink(url)
+  if (pairing) {
+    if (pairing.hubUrl && state.config?.hubUrl && state.config.hubUrl !== pairing.hubUrl) {
+      pendingHubUrl = pairing.hubUrl
+      render()
+      return
+    }
+    if (pairing.hubUrl && !state.config) {
+      state.config = makeConfig({ hubUrl: pairing.hubUrl })
+    }
+    await redeemPairing(pairing.code)
+    return
+  }
+  const decision = decideDeepLink({
+    url,
+    locked: appIsLocked(),
+    configuredHub: state.config?.hubUrl ?? null,
+  })
+  if (decision.action === 'ignore' || decision.action === 'same') {
+    if (decision.action === 'same') toast('已是当前 Hub')
+    return
+  }
+  if (decision.action === 'invalid') { toast(decision.error, 'error'); return }
+  if (decision.action === 'prefill') {
+    state.config = makeConfig({ hubUrl: decision.hubUrl })
+    state.view = 'setup'
+    render()
+    toast('已从链接填入 Hub 地址')
+    return
+  }
+  pendingHubUrl = decision.hubUrl
+  render()
+}
+
+async function confirmPendingHub(): Promise<void> {
+  const hubUrl = pendingHubUrl
+  const config = state.config
+  pendingHubUrl = null
+  if (!hubUrl || !config) { render(); return }
+  const next: MarshalConfig = { ...config, hubUrl, token: '', updatedAt: Date.now() }
+  try { await writeConfig(next) } catch (error) {
+    toast(error instanceof Error ? error.message : '保存失败', 'error')
+    return
+  }
+  stream?.close()
+  stream = null
+  state.config = next
+  state.api = null
+  state.view = 'setup'
+  advancedLogin = true
+  render()
+  toast('Hub 已更换，请重新填写令牌')
+}
+
+async function redeemPairing(code: string): Promise<void> {
+  const hubUrl = state.config?.hubUrl
+  if (!hubUrl) { toast('先填写 Hub 地址', 'error'); state.view = 'setup'; render(); return }
+  const api = new MarshalApi({ hubUrl, token: '' })
+  const result = await api.redeemPairing(code, '手机')
+  if (!result.ok) { toast(result.message, 'error'); return }
+  const next: MarshalConfig = {
+    ...(state.config ?? makeConfig({ hubUrl })),
+    version: CONFIG_VERSION,
+    hubUrl,
+    token: result.data.credential,
+    updatedAt: Date.now(),
+  }
+  await writeConfig(next)
+  state.config = next
+  if (next.lock && !sessionUnlocked) { showLock(); return }
+  await enterApp()
 }
 
 async function registerBackButton(): Promise<void> {
@@ -176,6 +287,7 @@ async function registerBackButton(): Promise<void> {
   disposeBack = await watchBackButton(() => {
     const parent: Partial<Record<View, View>> = {
       settings: 'home', sessions: 'home', session: 'sessions', controls: 'session', groups: 'home',
+      tasks: 'home', memory: 'home',
     }
     const to = parent[state.view]
     if (to) { state.view = to; render(); return true }
@@ -194,6 +306,20 @@ async function enterApp(): Promise<void> {
   render()
   await refreshDevices()
   await openStream()
+  void registerPhonePush()
+}
+
+async function registerPhonePush(): Promise<void> {
+  const api = state.api
+  if (!api || !inNativeShell()) return
+  try {
+    const plugin = await import('marshal-push')
+    const token = await plugin.MarshalPush.token()
+    if (!token?.token || !token.provider) return
+    await api.registerPush({ provider: token.provider, token: token.token, ...(token.liveToken ? { liveToken: token.liveToken } : {}) })
+  } catch {
+    /* 没有推送插件或 Hub 未配置时保持安静 */
+  }
 }
 
 async function openStream(): Promise<void> {
@@ -238,6 +364,7 @@ async function openDevice(device: DeviceRow): Promise<void> {
   if (!result.ok) { state.statusText = result.message; render(); return }
   state.sessions = result.data
   state.statusText = ''
+  void loadRoster()
   render()
 }
 
@@ -295,23 +422,6 @@ function targetOf(row: SessionRow): Target {
   return { deviceId: row.deviceId, agent: row.agent, sessionId: row.sessionId }
 }
 
-export function historyToMessage(item: { kind: string; payload?: Record<string, unknown>; seq?: number; ts?: number }): Message | null {
-  const payload = item.payload ?? {}
-  const at = typeof item.ts === 'number' ? item.ts : Date.now()
-  const id = (typeof payload.itemId === 'string' ? payload.itemId : 'seq-' + String(item.seq ?? Math.random()))
-  const text = typeof payload.text === 'string' ? payload.text : ''
-  switch (item.kind) {
-    case 'user.message': return { id, role: 'user', text, open: false, at }
-    case 'message.delta':
-    case 'message.completed': return text ? { id, role: 'assistant', text, open: false, at } : null
-    case 'reasoning.delta': return text ? { id, role: 'reason', text, open: false, at } : null
-    case 'tool.started': return { id, role: 'tool', text: '▶ ' + String(payload.name ?? payload.tool ?? 'tool'), open: false, at }
-    case 'tool.completed': return { id, role: 'tool', text: (payload.isError === true ? '✗ ' : '✓ ') + String(payload.content ?? '').slice(0, 400), open: false, at }
-    case 'turn.completed': return { id, role: 'system', text: '回合完成（' + String(payload.state ?? 'completed') + '）', open: false, at }
-    default: return null
-  }
-}
-
 async function onFrame(frame: StreamFrame): Promise<void> {
   if (frame.event === 'reset') {
     await refreshDevices()
@@ -337,13 +447,13 @@ async function onFrame(frame: StreamFrame): Promise<void> {
   }
   if (!target) return
   if (event.deviceId !== target.deviceId || event.agent !== target.agent || event.sessionId !== target.sessionId) return
-  if (typeof event.seq === 'number') {
-    if (event.seq <= lastSeq) return
-    lastSeq = event.seq
-  }
+  const seq = acceptEventSeq(lastSeq, event.seq)
+  if (!seq.accept) return
+  lastSeq = seq.lastSeq
   switch (kind) {
     case 'capability.changed':
       state.capability = payload as unknown as Capability
+      if (state.view === 'session' || state.view === 'controls') render()
       return
     case 'input.requested': {
       const card = payload as unknown as InputCard
@@ -366,20 +476,30 @@ async function onFrame(frame: StreamFrame): Promise<void> {
       appendDelta(String(payload.itemId ?? event.seq ?? 'd'), kind === 'reasoning.delta' ? 'reason' : 'assistant', text)
       return
     }
-    case 'message.completed': closeOpenMessages(); return
-    case 'turn.started': state.running = true; render(); return
-    case 'turn.completed': state.running = false; closeOpenMessages(); render(); return
-    case 'tool.started':
+    case 'message.completed': {
+      const before = state.messages.map((message) => ({ ...message }))
+      closeOpenMessages()
+      patchTranscript(before)
+      return
+    }
+    case 'turn.started': state.running = true; renderKeepingComposer(); return
+    case 'turn.completed': state.running = false; closeOpenMessages(); renderKeepingComposer(); return
+    case 'tool.started': {
+      const before = state.messages.map((message) => ({ ...message }))
       state.messages.push({ id: String(event.seq), role: 'tool', text: '▶ ' + String(payload.name ?? payload.tool ?? 'tool'), open: false, at: Date.now() })
-      render(); return
-    case 'tool.completed':
+      patchTranscript(before); return
+    }
+    case 'tool.completed': {
+      const before = state.messages.map((message) => ({ ...message }))
       state.messages.push({ id: String(event.seq), role: 'tool', text: String(payload.content ?? '').slice(0, 400), open: false, at: Date.now() })
-      render(); return
+      patchTranscript(before); return
+    }
     case 'user.message': {
       const text = typeof payload.text === 'string' ? payload.text : ''
       if (text && !state.messages.some((m) => m.role === 'user' && m.text === text)) {
+        const before = state.messages.map((message) => ({ ...message }))
         state.messages.push({ id: String(event.seq), role: 'user', text, open: false, at: Date.now() })
-        render()
+        patchTranscript(before)
       }
       return
     }
@@ -388,6 +508,7 @@ async function onFrame(frame: StreamFrame): Promise<void> {
 }
 
 function appendDelta(id: string, role: Role, text: string): void {
+  const before = state.messages.map((message) => ({ ...message }))
   const existing = state.messages.find((m) => m.id === id && m.role === role)
   if (existing) {
     existing.text += text
@@ -395,7 +516,53 @@ function appendDelta(id: string, role: Role, text: string): void {
   } else {
     state.messages.push({ id, role, text, open: true, at: Date.now() })
   }
-  if (state.view === 'session') render()
+  if (state.view !== 'session') return
+  patchTranscript(before)
+}
+
+function patchTranscript(before: Message[]): void {
+  const root = document.getElementById('transcript')
+  if (!root) { render(); return }
+  const nodes = [...root.querySelectorAll<HTMLElement>('[data-key]')]
+  if (nodes.length !== before.length) { renderKeepingComposer(); return }
+  for (let index = 0; index < state.messages.length; index += 1) {
+    const message = state.messages[index]
+    if (!message) continue
+    const node = nodes[index]
+    if (!node || index >= before.length) {
+      const created = messageNode(message)
+      created.dataset.key = message.role + ':' + message.id
+      root.append(created)
+      continue
+    }
+    const previous = before[index]
+    if (!previous || previous.id !== message.id || previous.role !== message.role) {
+      renderKeepingComposer()
+      return
+    }
+    if (previous.text !== message.text || previous.open !== message.open) {
+      const body = node.querySelector('.msg-body')
+      if (body) body.textContent = message.text
+      node.classList.toggle('streaming', message.open)
+    }
+  }
+  root.querySelector('.empty')?.remove()
+}
+
+function renderKeepingComposer(): void {
+  const input = document.getElementById('composer')
+  const focused = document.activeElement === input
+  const selection = input instanceof HTMLInputElement
+    ? { start: input.selectionStart, end: input.selectionEnd }
+    : null
+  render()
+  const next = document.getElementById('composer')
+  if (focused && next instanceof HTMLInputElement) {
+    next.focus()
+    if (selection?.start !== null && selection?.end !== null && selection) {
+      next.setSelectionRange(selection.start, selection.end)
+    }
+  }
 }
 
 function closeOpenMessages(): void {
@@ -444,11 +611,17 @@ async function answerCard(card: InputCard, answers: Array<{ id: string; selected
   const api = state.api
   const session = state.session
   if (!api || !session) return
-  const result = await api.command('answer', targetOf(session), { requestId: card.requestId, answers })
-  if (!result.ok) { toast(result.message, 'error'); return }
-  state.cards = state.cards.filter((entry) => entry.requestId !== card.requestId)
-  toast('已提交')
-  render()
+  await answerGate.run(card.requestId, async () => {
+    const result = await api.command('answer', targetOf(session), { requestId: card.requestId, answers })
+    if (!result.ok) {
+      toast(result.error === 'unknown' ? '结果未知，未当作成功' : result.message, 'error')
+      render()
+      return
+    }
+    state.cards = state.cards.filter((entry) => entry.requestId !== card.requestId)
+    toast('已提交')
+    render()
+  })
 }
 
 async function interrupt(): Promise<void> {
@@ -466,34 +639,74 @@ async function interrupt(): Promise<void> {
 
 /* ------------------------------ 视图 ------------------------------ */
 
+function asNodes(children: Child[]): Node[] {
+  const nodes: Node[] = []
+  for (const child of children) {
+    if (child === null || child === undefined || child === false) continue
+    nodes.push(typeof child === 'string' || typeof child === 'number' ? document.createTextNode(String(child)) : child)
+  }
+  return nodes
+}
+
+function pendingHubCard(): HTMLElement | null {
+  if (!pendingHubUrl) return null
+  return el('div', { class: 'card' },
+    el('h2', { text: '更改 Hub？' }),
+    el('p', { class: 'empty', text: '链接要求连接到 ' + pendingHubUrl + '。确认后会清除已保存的令牌。' }),
+    el('div', { class: 'choices' },
+      button('确认更改', () => { void confirmPendingHub() }, { class: 'primary' }),
+      button('取消', () => { pendingHubUrl = null; render() }),
+    ),
+  )
+}
+
 function setupView(): Child[] {
   const hubInput = el('input', {
     type: 'url', inputmode: 'url', autocomplete: 'url',
     placeholder: DEFAULT_HUB || 'https://hub.example.com',
     value: state.config?.hubUrl ?? DEFAULT_HUB,
   }) as HTMLInputElement
-  const tokenInput = el('input', {
-    type: 'password', autocomplete: 'off', placeholder: '管理令牌（dashboardToken）',
-    value: state.config?.token ?? '',
+  const codeInput = el('input', {
+    type: 'text', autocomplete: 'off', placeholder: '粘贴配对码或 marshal://pair 链接',
   }) as HTMLInputElement
-  const result = el('p', { class: 'empty', text: '令牌只保存在本机安全存储，用于直连调度中心。' })
-
-  const test = button('先测试连接', () => { void testSetup(hubInput, tokenInput, result) }, { class: 'block' })
-  const save = button('保存并进入', () => { void saveSetup(hubInput, tokenInput, result) }, { class: 'primary block' })
+  const pairResult = el('p', { class: 'empty', text: '在已登录的电脑上打开「手机配对」，用系统相机扫描二维码。' })
+  const tokenInput = el('input', {
+    type: 'password', autocomplete: 'off', placeholder: '管理令牌（高级）', value: '',
+  }) as HTMLInputElement
+  const result = el('p', { class: 'empty', text: '' })
 
   return [
     brand(),
+    pendingHubCard(),
     el('div', { class: 'card' },
-      el('h2', { text: '连接调度中心' }),
+      el('h2', { text: '扫码配对' }),
       el('div', { class: 'form' },
         el('div', { class: 'field' }, el('label', { text: 'Hub 地址' }), hubInput),
+        el('div', { class: 'field' }, el('label', { text: '配对码' }), codeInput),
+        button('配对并进入', () => {
+          const hub = normalizeHubUrl(hubInput.value)
+          if (!hub.ok) { pairResult.textContent = hub.error; return }
+          state.config = { ...(state.config ?? makeConfig({ hubUrl: hub.value })), hubUrl: hub.value }
+          const link = parsePairingLink(codeInput.value.trim())
+          const code = link?.code ?? codeInput.value.trim()
+          if (!code) { pairResult.textContent = '请粘贴配对码'; return }
+          void redeemPairing(code)
+        }, { class: 'primary block' }),
+        pairResult,
+      ),
+    ),
+    el('div', { class: 'card' },
+      button(advancedLogin ? '收起管理令牌' : '高级：使用管理令牌', () => { advancedLogin = !advancedLogin; render() }, { class: 'block ghost' }),
+      ...(advancedLogin ? [el('div', { class: 'form' },
         el('div', { class: 'field' },
           el('label', { text: '管理令牌' }),
           tokenInput,
-          el('small', { text: '手机端直连 Hub 的 /marshal/api，不再加载网页控制台。' }),
+          el('small', { text: '只在无法扫码时使用。已保存的令牌不会回填到这里。' }),
         ),
-        test, save, result,
-      ),
+        button('先测试连接', () => { void testSetup(hubInput, tokenInput, result) }, { class: 'block' }),
+        button('保存并进入', () => { void saveSetup(hubInput, tokenInput, result) }, { class: 'primary block' }),
+        result,
+      )] : []),
     ),
     el('p', { class: 'notice', text: CLIENT_ONLY_NOTE }),
   ]
@@ -505,6 +718,7 @@ function readSetup(hubInput: HTMLInputElement, tokenInput: HTMLInputElement):
   if (!hub.ok) return { ok: false, error: hub.error }
   const token = normalizeToken(tokenInput.value)
   if (!token.ok) return { ok: false, error: token.error }
+  if (!token.value) return { ok: false, error: '请填写管理令牌' }
   return { ok: true, hubUrl: hub.value, token: token.value }
 }
 
@@ -535,6 +749,7 @@ async function saveSetup(hubInput: HTMLInputElement, tokenInput: HTMLInputElemen
     return
   }
   state.config = config
+  if (config.lock && !sessionUnlocked) { showLock(); return }
   await enterApp()
 }
 
@@ -542,6 +757,8 @@ function homeView(): Child[] {
   const config = state.config
   if (!config) { state.view = 'setup'; return setupView() }
   const header = topbar('调度官', hubLabel(config.hubUrl), [
+    button('任务', () => { state.view = 'tasks'; void loadTasks() }, { class: 'icon-button' }),
+    button('记忆', () => { state.view = 'memory'; void loadMemory() }, { class: 'icon-button' }),
     button('群聊', () => { state.view = 'groups'; void loadRooms() }, { class: 'icon-button' }),
     button('设置', () => { state.view = 'settings'; render() }, { class: 'icon-button' }),
   ])
@@ -560,6 +777,7 @@ function homeView(): Child[] {
 
   return [
     header,
+    pendingHubCard(),
     ...banners,
     el('div', { class: 'card' },
       el('h2', { text: '设备' }),
@@ -569,14 +787,44 @@ function homeView(): Child[] {
   ]
 }
 
+function agentCapability(device: DeviceRow | undefined, agent: string): Capability | undefined {
+  return device?.capabilities?.[agent]
+}
+
 function sessionsView(): Child[] {
   const device = state.devices.find((entry) => entry.id === state.deviceId)
   const header = topbar(device?.name ?? '会话', '选择会话', [backButton('home')])
+  const search = el('input', {
+    id: 'session-search',
+    type: 'search',
+    placeholder: '搜索会话',
+    value: sessionQuery,
+    onInput: (event: Event) => {
+      sessionQuery = (event.target as HTMLInputElement).value
+      const list = document.getElementById('session-list')
+      if (!list) { render(); return }
+      list.replaceChildren(...asNodes(sessionSections(device)))
+    },
+  }) as HTMLInputElement
+  return [
+    header,
+    el('div', { class: 'card' },
+      search,
+      el('div', { id: 'session-list' }, ...sessionSections(device)),
+    ),
+  ]
+}
+
+function sessionSections(device: DeviceRow | undefined): Child[] {
   const groups = new Map<string, SessionRow[]>()
   for (const row of state.sessions) {
     const list = groups.get(row.agent) ?? []
     list.push(row)
     groups.set(row.agent, list)
+  }
+  const named = state.roster.filter((agent) => !device || agent.deviceId === device.id)
+  for (const agent of named) {
+    if (!groups.has(agent.agent)) groups.set(agent.agent, [])
   }
   const sections: Child[] = []
   if (groups.size === 0) {
@@ -584,32 +832,76 @@ function sessionsView(): Child[] {
   }
   for (const [agent, rows] of groups) {
     rows.sort((a, b) => b.updatedAt - a.updatedAt)
+    const limit = sessionLimits.get(agent) ?? SESSION_PAGE_SIZE
+    const page = sliceSessions(rows, sessionQuery, limit)
+    const rosterName = named.find((item) => item.agent === agent)?.name
+    const title = (rosterName && rosterName !== agent ? rosterName + ' · ' : '') + agentLabel(agent)
+    const canCreate = !agentCapability(device, agent)?.operations || can(agentCapability(device, agent), 'create')
     sections.push(el('div', { class: 'agent-group' },
-      el('h3', { class: 'agent-title', text: agentLabel(agent) + ' · ' + rows.length + ' 个会话' }),
-      ...rows.slice(0, 40).map((row) => el('button', {
-        class: 'session',
-        onClick: () => { vibrate(); void openSession(state.deviceId ?? row.deviceId, row) },
-      },
-      el('span', { class: 'dot' + (row.running ? ' online' : '') }),
-      el('span', { class: 'copy' },
-        el('strong', { text: sessionTitle(row) }),
-        el('span', { text: formatTime(row.updatedAt) }),
+      el('div', { class: 'row-between' },
+        el('h3', { class: 'agent-title', text: title + ' · ' + page.total + ' 个会话' }),
+        canCreate ? button('新会话', () => { void createSession(device?.id ?? state.deviceId ?? '', agent) }, { class: 'icon-button' }) : null,
       ),
-      el('span', { class: 'state' + (row.running ? ' running' : ''), text: row.running ? '运行中' : '空闲' }),
+      ...page.shown.map((row) => el('div', { class: 'session-row' },
+        el('button', {
+          class: 'session',
+          onClick: () => { vibrate(); void openSession(state.deviceId ?? row.deviceId, row) },
+        },
+        el('span', { class: 'dot' + (row.running ? ' online' : '') }),
+        el('span', { class: 'copy' },
+          el('strong', { text: sessionTitle(row) }),
+          el('span', { text: formatTime(row.updatedAt) }),
+        ),
+        el('span', { class: 'state' + (row.running ? ' running' : ''), text: row.running ? '运行中' : '空闲' }),
+        ),
+        (!row.capability?.operations || can(row.capability, 'fork'))
+          ? button('分叉', () => { void forkSession(row) }, { class: 'icon-button' })
+          : null,
       )),
+      page.hasMore ? button('加载更多', () => {
+        sessionLimits.set(agent, limit + SESSION_PAGE_SIZE)
+        const list = document.getElementById('session-list')
+        if (list) list.replaceChildren(...asNodes(sessionSections(device)))
+      }, { class: 'block ghost' }) : null,
     ))
   }
-  return [header, el('div', { class: 'card' }, ...sections)]
+  return sections
+}
+
+async function createSession(deviceId: string, agent: string): Promise<void> {
+  const api = state.api
+  if (!api || !deviceId || state.busy) return
+  state.busy = true
+  const result = await api.command('create', { deviceId, agent, sessionId: null }, {})
+  state.busy = false
+  if (!result.ok) { toast(result.message, 'error'); return }
+  toast('已创建会话')
+  const device = state.devices.find((entry) => entry.id === deviceId)
+  if (device) await openDevice(device)
+}
+
+async function forkSession(row: SessionRow): Promise<void> {
+  const api = state.api
+  if (!api || state.busy) return
+  state.busy = true
+  const result = await api.command('fork', { deviceId: row.deviceId, agent: row.agent, sessionId: row.sessionId }, {})
+  state.busy = false
+  if (!result.ok) { toast(result.message, 'error'); return }
+  toast('已分叉会话')
+  const device = state.devices.find((entry) => entry.id === row.deviceId)
+  if (device) await openDevice(device)
 }
 
 function messageNode(message: Message): HTMLElement {
   const cls = 'msg msg-' + message.role
-  return el('div', { class: cls + (message.open ? ' streaming' : '') },
+  const node = el('div', { class: cls + (message.open ? ' streaming' : '') },
     el('div', { class: 'msg-role', text: ({
       user: '我', assistant: '智能体', reason: '思考', tool: '工具', system: '系统',
     } as const)[message.role] }),
     el('div', { class: 'msg-body', text: message.text }),
   )
+  node.dataset.key = message.role + ':' + message.id
+  return node
 }
 
 function cardNode(card: InputCard): HTMLElement {
@@ -618,10 +910,16 @@ function cardNode(card: InputCard): HTMLElement {
       el('h2', { text: '审批：' + card.approval.action }),
       ...(card.approval.detail ? [el('p', { class: 'tool', text: card.approval.detail })] : []),
       el('div', { class: 'choices' },
-        ...card.approval.decisions.map((decision) => button(decision.label, () => {
-          void answerCard(card, [{ id: decision.id, selectedOptionIds: [] }])
-        })),
-        button('拒绝', () => { void answerCard(card, [{ id: 'decline', selectedOptionIds: [] }]) }, { class: 'danger' }),
+        ...approvalChoices(card.approval.decisions).map((decision) => {
+          const node = button(decision.label, () => {
+            node.disabled = true
+            void answerCard(card, [{ id: decision.id, selectedOptionIds: [] }])
+          })
+          return node
+        }),
+        ...(approvalChoices(card.approval.decisions).length === 0
+          ? [el('p', { class: 'empty', text: '没有可安全表达的本机决定' })]
+          : []),
       ),
     )
   }
@@ -671,6 +969,7 @@ function sessionView(): Child[] {
   ])
 
   const input = el('input', {
+    id: 'composer',
     type: 'text', placeholder: '发消息给 ' + agentLabel(session.agent) + '…', value: draft,
     onInput: (event: Event) => { draft = (event.target as HTMLInputElement).value },
   }) as HTMLInputElement
@@ -681,7 +980,7 @@ function sessionView(): Child[] {
   return [
     header,
     state.cards.length > 0 ? el('div', {}, ...state.cards.map(cardNode)) : null,
-    el('div', { class: 'transcript' },
+    el('div', { id: 'transcript', class: 'transcript' },
       state.historyCursor ? button('加载更早消息', () => { void loadOlder() }, { class: 'block ghost' }) : null,
       ...state.messages.map(messageNode),
       ...(state.messages.length === 0 ? [el('p', { class: 'empty', text: '暂无消息。' })] : []),
@@ -734,8 +1033,32 @@ async function loadRooms(): Promise<void> {
   if (state.view === 'groups') render()
 }
 
+async function openRoom(roomId: string): Promise<void> {
+  const api = state.api
+  if (!api) return
+  const result = await api.discussion(roomId)
+  if (!result.ok) { toast(result.message, 'error'); return }
+  state.groupRoom = result.data
+  if (state.view === 'groups') render()
+}
+
 function groupsView(): Child[] {
   const header = topbar('群聊', 'Agent 工作群', [backButton('home')])
+  if (state.groupRoom) {
+    const room = state.groupRoom
+    const messages = Array.isArray(room.messages) ? room.messages as Array<{ text?: string; author?: string }> : []
+    const roomId = String(room.id ?? '')
+    return [
+      header,
+      el('div', { class: 'card' },
+        button('全部房间', () => { state.groupRoom = null; render() }, { class: 'ghost block' }),
+        el('h2', { text: String(room.title ?? '群聊') }),
+        ...(messages.length === 0 ? [el('p', { class: 'empty', text: '暂无消息。' })] : []),
+        ...messages.map((message) => el('p', { text: (message.author ? message.author + '：' : '') + String(message.text ?? '') })),
+      ),
+      roomId ? groupComposer(roomId) : null,
+    ]
+  }
   if (state.roomsError) {
     return [header, el('div', { class: 'card' }, el('p', { class: 'empty', text: state.roomsError }))]
   }
@@ -743,12 +1066,17 @@ function groupsView(): Child[] {
     return [header, el('div', { class: 'card' }, el('p', { class: 'empty', text: '暂无群聊房间。' }))]
   }
   return [header, el('div', { class: 'card' },
-    ...state.rooms.map((room) => el('div', { class: 'row-between' },
-      el('div', { class: 'label' },
-        el('strong', { text: String(room.title ?? room.name ?? room.roomId ?? room.id ?? '未命名房间') }),
-        el('span', { text: String(room.topic ?? room.status ?? '') }),
-      ),
-    )),
+    ...state.rooms.map((room) => {
+      const id = String(room.id ?? room.roomId ?? '')
+      return el('button', {
+        class: 'session',
+        onClick: () => { if (id) void openRoom(id) },
+      },
+      el('span', { class: 'copy' },
+        el('strong', { text: String((room.title ?? room.name ?? id) || '未命名房间') }),
+        el('span', { text: String(room.state ?? room.status ?? '') }),
+      ))
+    }),
   )]
 }
 
@@ -756,7 +1084,7 @@ function settingsView(): Child[] {
   const config = state.config
   if (!config) { state.view = 'setup'; return setupView() }
   const hubInput = el('input', { type: 'url', inputmode: 'url', autocomplete: 'url', value: config.hubUrl }) as HTMLInputElement
-  const tokenInput = el('input', { type: 'password', autocomplete: 'off', value: config.token, placeholder: '管理令牌' }) as HTMLInputElement
+  const tokenInput = el('input', { type: 'password', autocomplete: 'off', value: '', placeholder: SETTINGS_TOKEN_PLACEHOLDER }) as HTMLInputElement
   const result = el('p', { class: 'empty', text: '' })
 
   const lockRow = config.lock
@@ -794,19 +1122,25 @@ function settingsView(): Child[] {
 }
 
 async function testSettings(hubInput: HTMLInputElement, tokenInput: HTMLInputElement, result: HTMLElement): Promise<void> {
-  const parsed = readSetup(hubInput, tokenInput)
-  if (!parsed.ok) { result.textContent = parsed.error; return }
+  const config = state.config
+  if (!config) return
+  const hub = normalizeHubUrl(hubInput.value)
+  if (!hub.ok) { result.textContent = hub.error; return }
+  const token = resolveSettingsToken({ typed: tokenInput.value, saved: config.token, previousHub: config.hubUrl, nextHub: hub.value })
+  if (!token.ok) { result.textContent = token.error; return }
   result.textContent = '正在连接…'
-  const devices = await new MarshalApi({ hubUrl: parsed.hubUrl, token: parsed.token }).devices()
+  const devices = await new MarshalApi({ hubUrl: hub.value, token: token.token }).devices()
   result.textContent = devices.ok ? '连接成功：' + devices.data.length + ' 台设备。' : devices.message
 }
 
 async function saveSettings(hubInput: HTMLInputElement, tokenInput: HTMLInputElement, result: HTMLElement): Promise<void> {
   const config = state.config
   if (!config) return
-  const parsed = readSetup(hubInput, tokenInput)
-  if (!parsed.ok) { result.textContent = parsed.error; return }
-  const next: MarshalConfig = { ...config, hubUrl: parsed.hubUrl, token: parsed.token, updatedAt: Date.now() }
+  const hub = normalizeHubUrl(hubInput.value)
+  if (!hub.ok) { result.textContent = hub.error; return }
+  const token = resolveSettingsToken({ typed: tokenInput.value, saved: config.token, previousHub: config.hubUrl, nextHub: hub.value })
+  if (!token.ok) { result.textContent = token.error; return }
+  const next: MarshalConfig = { ...config, hubUrl: hub.value, token: token.token, updatedAt: Date.now() }
   try {
     await writeConfig(next)
   } catch (error) {
@@ -815,6 +1149,7 @@ async function saveSettings(hubInput: HTMLInputElement, tokenInput: HTMLInputEle
   }
   state.config = next
   toast('已保存')
+  if (next.lock && !sessionUnlocked) { showLock(); return }
   await enterApp()
 }
 
@@ -907,20 +1242,42 @@ function lockView(): Child[] {
       return
     }
     if (!config.lock) { state.view = 'home'; render(); return }
+    const wait = pinWaitMs(pinGuard, Date.now())
+    if (wait > 0) {
+      state.pinError = '尝试过多，请等待 ' + Math.ceil(wait / 1000) + ' 秒'
+      render()
+      return
+    }
     const ok = await verifyPin(pin, config.lock)
-    if (!ok) { state.pinError = 'PIN 不正确'; render(); return }
+    if (!ok) {
+      pinGuard = applyPinFailure(pinGuard, Date.now())
+      state.pinError = 'PIN 不正确，请等待 ' + Math.ceil(pinWaitMs(pinGuard, Date.now()) / 1000) + ' 秒'
+      render()
+      return
+    }
+    pinGuard = clearPinGuard()
     if (purpose === 'disable') {
       await persistLock(null)
+      sessionUnlocked = true
+      lockPhase = 'unlocked'
       state.view = 'settings'
       render()
       toast('应用锁已关闭')
       return
     }
     state.pinError = ''
+    sessionUnlocked = true
+    lockPhase = 'unlocked'
+    seenInactive = false
     await enterApp()
   }
 
   const press = (digit: string): void => {
+    if (pinWaitMs(pinGuard, Date.now()) > 0) {
+      state.pinError = '尝试过多，请等待 ' + Math.ceil(pinWaitMs(pinGuard, Date.now()) / 1000) + ' 秒'
+      render()
+      return
+    }
     if (pinBuffer.length >= 6) return
     pinBuffer += digit
     refreshDots()
@@ -942,5 +1299,102 @@ function lockView(): Child[] {
   )]
 }
 
-export { sameTarget }
-export type { SessionRow }
+async function loadTasks(): Promise<void> {
+  const api = state.api
+  if (!api) return
+  const result = await api.tasks()
+  state.tasks = result.ok ? result.data : []
+  state.statusText = result.ok ? '' : result.message
+  if (state.view === 'tasks') render()
+}
+
+async function loadMemory(): Promise<void> {
+  const api = state.api
+  if (!api) return
+  const result = await api.memory()
+  state.memories = result.ok ? result.data : []
+  state.statusText = result.ok ? '' : result.message
+  if (state.view === 'memory') render()
+}
+
+function tasksView(): Child[] {
+  const title = el('input', { type: 'text', placeholder: '新任务标题' }) as HTMLInputElement
+  return [
+    topbar('任务', '可编辑', [backButton('home')]),
+    el('div', { class: 'card' },
+      el('div', { class: 'form' },
+        title,
+        button('添加', () => {
+          const text = title.value.trim()
+          if (!text || !state.api) return
+          void state.api.taskWrite({ action: 'create', title: text }).then((result) => {
+            if (!result.ok) { toast(result.message, 'error'); return }
+            state.tasks = result.data
+            render()
+          })
+        }, { class: 'primary block' }),
+      ),
+      ...(state.tasks.length === 0 ? [el('p', { class: 'empty', text: state.statusText || '暂无任务。' })] : []),
+      ...state.tasks.map((task) => el('div', { class: 'row-between' },
+        el('div', { class: 'label' },
+          el('strong', { text: task.title }),
+          el('span', { text: task.status === 'todo' ? '待办' : task.status === 'doing' ? '进行中' : '完成' }),
+        ),
+        el('div', { class: 'choices' },
+          button(task.status === 'todo' ? '开始' : task.status === 'doing' ? '完成' : '待办', () => {
+            const status = task.status === 'todo' ? 'doing' : task.status === 'doing' ? 'done' : 'todo'
+            void state.api?.taskWrite({ action: 'move', id: task.id, status }).then((result) => {
+              if (!result || !result.ok) { toast(result && !result.ok ? result.message : '失败', 'error'); return }
+              state.tasks = result.data
+              render()
+            })
+          }, { class: 'icon-button' }),
+        ),
+      )),
+    ),
+  ]
+}
+
+function memoryView(): Child[] {
+  return [
+    topbar('记忆', '只读', [backButton('home')]),
+    el('div', { class: 'card' },
+      ...(state.memories.length === 0 ? [el('p', { class: 'empty', text: state.statusText || '暂无记忆。' })] : []),
+      ...state.memories.map((entry) => el('div', { class: 'row-between' },
+        el('div', { class: 'label' },
+          el('strong', { text: entry.agent || '记忆' }),
+          el('span', { text: entry.text }),
+        ),
+      )),
+    ),
+  ]
+}
+
+async function loadRoster(): Promise<void> {
+  const api = state.api
+  if (!api) return
+  const result = await api.roster()
+  if (result.ok) state.roster = result.data
+}
+
+function groupComposer(roomId: string): HTMLElement {
+  const input = el('input', { type: 'text', placeholder: '发到群里…' }) as HTMLInputElement
+  return el('div', { class: 'composer' },
+    input,
+    button('发送', () => {
+      const text = input.value.trim()
+      const room = state.groupRoom
+      const members = Array.isArray(room?.members) ? room.members as Array<{ id?: string }> : []
+      const recipient = typeof members[0]?.id === 'string' ? members[0].id : 'moderator'
+      if (!text || !state.api) return
+      void state.api.discussionAction({
+        action: 'send', roomId, text, recipient, key: 'm-' + Date.now().toString(36),
+      }).then((result) => {
+        if (!result.ok) { toast(result.message, 'error'); return }
+        state.groupRoom = result.data.room as Record<string, unknown> ?? result.data
+        input.value = ''
+        render()
+      })
+    }, { class: 'primary' }),
+  )
+}

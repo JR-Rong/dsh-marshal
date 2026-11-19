@@ -68,3 +68,29 @@ export async function verifyPin(pin: string, record: LockRecord): Promise<boolea
 export function isValidPin(pin: string): boolean {
   return /^\d{4,8}$/.test(pin)
 }
+
+export const PIN_MAX_ATTEMPTS = 5
+export const PIN_BACKOFF_BASE_MS = 1_000
+export const PIN_BACKOFF_MAX_MS = 60_000
+export const PIN_LOCKOUT_MS = 60_000
+
+export interface PinGuard {
+  failures: number
+  blockedUntil: number
+}
+
+export function clearPinGuard(): PinGuard {
+  return { failures: 0, blockedUntil: 0 }
+}
+
+/** 第 1 次错等 1 秒，之后翻倍；达到次数上限后至少锁 60 秒。 */
+export function applyPinFailure(guard: PinGuard, now: number): PinGuard {
+  const failures = guard.failures + 1
+  const exponential = Math.min(PIN_BACKOFF_MAX_MS, PIN_BACKOFF_BASE_MS * 2 ** Math.min(failures - 1, 16))
+  const delay = failures >= PIN_MAX_ATTEMPTS ? Math.max(exponential, PIN_LOCKOUT_MS) : exponential
+  return { failures, blockedUntil: now + delay }
+}
+
+export function pinWaitMs(guard: PinGuard, now: number): number {
+  return Math.max(0, guard.blockedUntil - now)
+}

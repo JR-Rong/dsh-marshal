@@ -11,6 +11,7 @@ import { HubRelay } from './relay.ts'
 import { mountHubSocket, webServerPort } from './server.ts'
 import { createHubSync } from './sync.ts'
 import { createAccountLogin } from './account.ts'
+import { createPhoneHub } from './phone.ts'
 
 /** Shared Hub composition for the desktop host and the standalone cloud service. */
 export function mountHub(webServer: WebServerLike, config: MarshalConfig, logger: LoggerLike): () => void {
@@ -61,10 +62,16 @@ export function mountHub(webServer: WebServerLike, config: MarshalConfig, logger
       },
     })
     disposers.push(() => socket.dispose())
+    const phone = createPhoneHub({
+      ...(config.dshAccountHash === undefined ? {} : { ownerHash: config.dshAccountHash }),
+      ...(config.publicOrigin === undefined ? {} : { publicOrigin: config.publicOrigin }),
+      ...(config.push === undefined ? {} : { push: config.push }),
+      findNode: (tokenDigest) => install.store.findByTokenDigest(tokenDigest),
+    })
     for (const desktopEmbed of [false, true]) {
       disposers.push(registerMarshalRoutes({
         webServer, registry, relay, sync, deviceStore: install.store, ...(discussions === undefined ? {} : { discussions }), desktopEmbed, requireToken: config.dashboardToken!,
-        publicOrigin: config.publicOrigin!, operatorId: install.operatorId,
+        publicOrigin: config.publicOrigin!, operatorId: install.operatorId, phone,
         ...(accountLogin === undefined ? {} : { accountLogin }),
       }).dispose)
     }

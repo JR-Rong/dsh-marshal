@@ -28,13 +28,19 @@ export interface MarshalConfig {
   readonly devicesFile: string
   readonly accountLogin: boolean
   readonly dshAccountHash?: string
+  /** 推送密钥只从文件路径读取。空字符串和 PLACEHOLDER 表示还没填写。 */
+  readonly push?: {
+    readonly apns?: { readonly keyId?: string; readonly teamId?: string; readonly bundleId?: string; readonly keyPath?: string }
+    readonly fcm?: { readonly projectId?: string; readonly clientEmail?: string; readonly privateKeyPath?: string }
+    readonly huawei?: { readonly appId?: string; readonly clientId?: string; readonly clientSecretPath?: string }
+  }
 }
 
 const KNOWN_KEYS = new Set([
   'role', 'hubUrl', 'hubCaFile', 'token', 'deviceId', 'deviceName', 'dashboardToken', 'publicOrigin',
   'privacy', 'questionRelay', 'approvalRelay', 'answerTimeoutMs', 'approvalTimeoutMs',
   'agents', 'codexExecutable', 'claudeExecutable', 'ringBufferMinutes', 'redaction',
-  'allowDiscussion', 'devicesFile', 'accountLogin', 'dshAccountHash',
+  'allowDiscussion', 'devicesFile', 'accountLogin', 'dshAccountHash', 'push',
 ])
 
 const WEAK_DASHBOARD_TOKENS = new Set([
@@ -250,6 +256,7 @@ export function parseConfig(raw: unknown, hostname: string): MarshalConfig {
     throw new Error('marshal: config.dshAccountHash must be a SHA-256 owner identity on the Hub')
   }
   if (role === 'hub' && accountLogin && dshAccountHash === undefined) throw new Error('marshal: account login requires a bound DSH owner')
+  const push = parsePush(input.push)
 
   return Object.freeze({
     role,
@@ -274,5 +281,31 @@ export function parseConfig(raw: unknown, hostname: string): MarshalConfig {
     devicesFile,
     accountLogin,
     ...(dshAccountHash === undefined ? {} : { dshAccountHash: dshAccountHash as string }),
+    ...(push === undefined ? {} : { push }),
   })
+}
+
+function parsePush(raw: unknown): MarshalConfig['push'] {
+  if (raw === undefined) return undefined
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) throw new Error('marshal: config.push must be an object')
+  const input = raw as Record<string, unknown>
+  const read = (key: 'apns' | 'fcm' | 'huawei', fields: readonly string[]): Record<string, string> | undefined => {
+    const value = input[key]
+    if (value === undefined) return undefined
+    if (typeof value !== 'object' || value === null) throw new Error(`marshal: config.push.${key} must be an object`)
+    const record = value as Record<string, unknown>
+    const out: Record<string, string> = {}
+    for (const field of fields) {
+      const item = record[field]
+      if (item === undefined) continue
+      if (typeof item !== 'string') throw new Error(`marshal: config.push.${key}.${field} must be a string`)
+      out[field] = item
+    }
+    return out
+  }
+  return {
+    ...(read('apns', ['keyId', 'teamId', 'bundleId', 'keyPath']) ? { apns: read('apns', ['keyId', 'teamId', 'bundleId', 'keyPath']) } : {}),
+    ...(read('fcm', ['projectId', 'clientEmail', 'privateKeyPath']) ? { fcm: read('fcm', ['projectId', 'clientEmail', 'privateKeyPath']) } : {}),
+    ...(read('huawei', ['appId', 'clientId', 'clientSecretPath']) ? { huawei: read('huawei', ['appId', 'clientId', 'clientSecretPath']) } : {}),
+  } as MarshalConfig['push']
 }

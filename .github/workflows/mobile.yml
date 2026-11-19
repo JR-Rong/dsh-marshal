@@ -1,0 +1,46 @@
+name: mobile
+
+on:
+  push:
+    paths:
+      - 'mobile/**'
+      - '.github/workflows/mobile.yml'
+  pull_request:
+    paths:
+      - 'mobile/**'
+      - '.github/workflows/mobile.yml'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: npm ci
+        run: npm ci
+      - name: test
+        run: npm test
+      - name: typecheck
+        run: npm run typecheck
+      - name: vite build
+        run: npx vite build
+      - uses: android-actions/setup-android@v3
+      - name: Android platform
+        run: yes | sdkmanager --licenses >/dev/null || true; sdkmanager --install "platforms;android-36" "build-tools;35.0.0"
+      - name: cap sync
+        run: npx cap sync android
+      - name: assembleDebug
+        working-directory: mobile/android
+        run: chmod +x ./gradlew && ./gradlew assembleDebug --console=plain
