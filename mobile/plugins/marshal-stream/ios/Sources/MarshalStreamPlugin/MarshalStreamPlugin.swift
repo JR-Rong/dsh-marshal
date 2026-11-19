@@ -13,7 +13,8 @@ public class MarshalStreamPlugin: CAPPlugin, CAPBridgedPlugin {
     public let jsName = "MarshalStream"
     public let pluginMethods: [CAPPluginMethod] = [
         CAPPluginMethod(name: "open", returnType: CAPPluginReturnPromise),
-        CAPPluginMethod(name: "close", returnType: CAPPluginReturnPromise)
+        CAPPluginMethod(name: "close", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "pushToken", returnType: CAPPluginReturnPromise)
     ]
 
     private let lock = NSLock()
@@ -36,6 +37,20 @@ public class MarshalStreamPlugin: CAPPlugin, CAPBridgedPlugin {
         lock.unlock()
         box.start(url: url, token: call.getString("token"), lastEventId: call.getString("lastEventId"))
         call.resolve()
+    }
+
+    @objc func pushToken(_ call: CAPPluginCall) {
+        let defaults = UserDefaults.standard
+        let token = defaults.string(forKey: "marshal.push.token") ?? ""
+        if token.isEmpty {
+            call.resolve(["ok": false, "reason": defaults.string(forKey: "marshal.push.error") ?? "unconfigured"])
+            return
+        }
+        var result: [String: Any] = ["ok": true, "provider": "apns", "token": token]
+        if let live = defaults.string(forKey: "marshal.push.live"), !live.isEmpty {
+            result["liveToken"] = live
+        }
+        call.resolve(result)
     }
 
     @objc func close(_ call: CAPPluginCall) {

@@ -39,6 +39,12 @@
 	<string>用于扫描电脑「跨设备」页的配对二维码。</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>仅在你打开局域网工作台时，用来连接同一网络里的电脑。</string>
+	<key>NSSupportsLiveActivities</key>
+	<true/>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>remote-notification</string>
+	</array>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

@@ -1,5 +1,6 @@
 import UIKit
 import Capacitor
+import UserNotifications
 
 @UIApplicationMain
 class AppDelegate: UIResponder, UIApplicationDelegate {
@@ -7,8 +8,31 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     var window: UIWindow?
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
-        // Override point for customization after application launch.
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { granted, error in
+            if let error {
+                UserDefaults.standard.set(error.localizedDescription, forKey: "marshal.push.error")
+                return
+            }
+            if granted {
+                DispatchQueue.main.async { application.registerForRemoteNotifications() }
+            } else {
+                UserDefaults.standard.set("denied", forKey: "marshal.push.error")
+            }
+        }
+        if #available(iOS 16.1, *) {
+            MarshalLiveActivity.registerPushToken()
+        }
         return true
+    }
+
+    func application(_ application: UIApplication, didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
+        let token = deviceToken.map { String(format: "%02x", $0) }.joined()
+        UserDefaults.standard.set(token, forKey: "marshal.push.token")
+        UserDefaults.standard.removeObject(forKey: "marshal.push.error")
+    }
+
+    func application(_ application: UIApplication, didFailToRegisterForRemoteNotificationsWithError error: Error) {
+        UserDefaults.standard.set(error.localizedDescription, forKey: "marshal.push.error")
     }
 
     func applicationWillResignActive(_ application: UIApplication) {

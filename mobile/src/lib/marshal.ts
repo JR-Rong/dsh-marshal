@@ -160,6 +160,12 @@ function statusFailure(status: number): ApiFailure | null {
   return null
 }
 
+/** 202、等待确认、结果未知都不是成功。调用方应继续查 command-status，或显示失败并沿用同一个幂等键重试。 */
+export function commandNeedsPoll(body: Record<string, unknown> | null | undefined): boolean {
+  const status = body?.status
+  return status === 'pending-confirmation' || status === 'outcome-unknown' || status === 'queued'
+}
+
 export function newIdempotencyKey(): string {
   const api = globalThis.crypto
   if (api && typeof api.randomUUID === 'function') return api.randomUUID()
@@ -361,17 +367,111 @@ export class MarshalApi {
     return this.command('cancel', target, { requestId })
   }
 
-  async command(op: string, target: Target, args: unknown = {}): Promise<ApiResult<Record<string, unknown>>> {
+  async command(op: string, target: Target, args: unknown = {}, idempotencyKey = newIdempotencyKey()): Promise<ApiResult<Record<string, unknown>>> {
     const result = await this.request<Record<string, unknown>>('/marshal/api/command', {
-      body: { op, target, args, idempotencyKey: newIdempotencyKey() },
+      body: { op, target, args, idempotencyKey },
     })
     if (!result.ok) return result
     const body = result.data ?? {}
-    if (body.status === 'rejected') {
+    if (body.ok === false || body.status === 'rejected') {
       const code = typeof body.code === 'string' ? body.code : 'invalid'
       return { ok: false, error: 'rejected', message: describeFailure('rejected', code), code }
     }
-    return { ok: true, data: body }
+    if (!commandNeedsPoll(body)) return { ok: true, data: body }
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 250))
+      const polled = await this.commandStatus(target, op, idempotencyKey)
+      if (!polled.ok) return polled
+      const next = polled.data ?? {}
+      if (next.ok === false || next.status === 'rejected') {
+        const code = typeof next.code === 'string' ? next.code : 'invalid'
+        return { ok: false, error: 'rejected', message: describeFailure('rejected', code), code }
+      }
+      if (!commandNeedsPoll(next)) return { ok: true, data: next }
+    }
+    return { ok: false, error: 'timeout', message: 'Hub 还没有确认这次操作，可以重试' }
+  }
+
+  async commandStatus(target: Target, op: string, key: string): Promise<ApiResult<Record<string, unknown>>> {
+    const query = new URLSearchParams({ deviceId: target.deviceId, agent: target.agent, op, key })
+    if (target.sessionId) query.set('sessionId', target.sessionId)
+    return this.request<Record<string, unknown>>('/marshal/api/command-status?' + query.toString())
+  }
+
+  async roster(): Promise<ApiResult<Array<{ deviceId: string; agent: string; name: string }>>> {
+    const result = await this.request<{ agents?: unknown }>('/marshal/api/roster')
+    if (!result.ok) return result
+    const agents = Array.isArray(result.data?.agents) ? result.data.agents.flatMap((row) => {
+      if (typeof row !== 'object' || row === null) return []
+      const item = row as Record<string, unknown>
+      if (typeof item.name !== 'string' || !item.name) return []
+      return [{
+        deviceId: typeof item.deviceId === 'string' ? item.deviceId : '',
+        agent: typeof item.agent === 'string' ? item.agent : 'dsh',
+        name: item.name,
+      }]
+    }) : []
+    return { ok: true, data: agents }
+  }
+
+  async board(): Promise<ApiResult<Array<{ id: string; deviceId: string; title: string; detail: string; status: string; revision: number }>>> {
+    const result = await this.request<{ tasks?: unknown }>('/marshal/api/board')
+    if (!result.ok) return result
+    const tasks = Array.isArray(result.data?.tasks) ? result.data.tasks.flatMap((row) => {
+      if (typeof row !== 'object' || row === null) return []
+      const item = row as Record<string, unknown>
+      if (typeof item.id !== 'string' || typeof item.title !== 'string') return []
+      return [{
+        id: item.id,
+        deviceId: typeof item.deviceId === 'string' ? item.deviceId : '',
+        title: item.title,
+        detail: typeof item.detail === 'string' ? item.detail : '',
+        status: item.status === 'doing' || item.status === 'done' ? item.status : 'todo',
+        revision: typeof item.revision === 'number' ? item.revision : 0,
+      }]
+    }) : []
+    return { ok: true, data: tasks }
+  }
+
+  async boardWrite(body: Record<string, unknown>): Promise<ApiResult<Record<string, unknown>>> {
+    const result = await this.request<Record<string, unknown>>('/marshal/api/board', { body })
+    if (!result.ok) return result
+    const payload = result.data ?? {}
+    if (payload.ok === false || payload.code === 'conflict') {
+      return { ok: false, error: 'conflict', message: '看板已被别的修改抢先，请刷新后再改', code: 'conflict' }
+    }
+    if (payload.code === 'queued' || payload.code === 'unsupported') {
+      return { ok: true, data: payload }
+    }
+    return { ok: true, data: payload }
+  }
+
+  async memory(): Promise<ApiResult<Array<{ id: string; deviceId: string; layer: string; agent: string; text: string }>>> {
+    const result = await this.request<{ entries?: unknown }>('/marshal/api/memory')
+    if (!result.ok) return result
+    const entries = Array.isArray(result.data?.entries) ? result.data.entries.flatMap((row) => {
+      if (typeof row !== 'object' || row === null) return []
+      const item = row as Record<string, unknown>
+      if (typeof item.text !== 'string') return []
+      return [{
+        id: typeof item.id === 'string' ? item.id : '',
+        deviceId: typeof item.deviceId === 'string' ? item.deviceId : '',
+        layer: item.layer === 'workspace' ? 'workspace' : 'private',
+        agent: typeof item.agent === 'string' ? item.agent : '',
+        text: item.text,
+      }]
+    }) : []
+    return { ok: true, data: entries }
+  }
+
+  async registerPush(provider: 'apns' | 'fcm' | 'huawei', token: string, liveToken?: string): Promise<ApiResult<Record<string, unknown>>> {
+    return this.request('/marshal/api/push-token', { body: { provider, token, ...(liveToken ? { liveToken } : {}) } })
+  }
+
+  async watchSession(target: Target): Promise<ApiResult<Record<string, unknown>>> {
+    return this.request('/marshal/api/watch', {
+      body: { deviceId: target.deviceId, agent: target.agent, sessionId: target.sessionId },
+    })
   }
 
   async inputs(target: Target): Promise<ApiResult<InputCard[]>> {

@@ -18,7 +18,7 @@ Hub 从设备表旁边的 `push.json` 读钥匙，文件权限应是 0600。缺�
 }
 ```
 
-把 `PLACEHOLDER` 换成真实值，并把钥匙放到 `keyPath` 指的文件。不要把钥匙提交进仓库。
+把 `PLACEHOLDER` 换成真实值，并把钥匙放到 `keyPath` 指的文件。不要把钥匙提交进仓库。FCM 走 HTTP v1：`https://oauth2.googleapis.com/token` 换访问令牌，再 `POST https://fcm.googleapis.com/v1/projects/{projectId}/messages:send`。华为走 `https://oauth-login.cloud.huawei.com/oauth2/v3/token` 和 `https://push-api.cloud.huawei.com/v1/{appId}/messages:send`。手机上的 Live View 先调 `com.huawei.hms.liveview.LiveView`，类不在时改用常驻通知。
 
 桌面「手机连接」向 `/marshal/api/pairing` 领取二维码。到期前 5 秒用上一张码作为 `replace` 再领一张，Hub 会作废同一账号还没使用的旧码。二维码正文只有 `marshal://pair?code=…&hub=…`。
 

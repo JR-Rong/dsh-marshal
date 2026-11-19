@@ -72,6 +72,11 @@ export function isValidPin(pin: string): boolean {
 export const PIN_MAX_ATTEMPTS = 5
 
 /** 第 1 次错等 1 秒，之后翻倍，第 5 次起至少 60 秒。 */
+export function nextPinGuard(failures: number, now: number): { failures: number; until: number } {
+  const count = Math.max(0, failures) + 1
+  return { failures: count, until: now + pinDelay(count) }
+}
+
 export function pinDelay(failures: number): number {
   if (failures <= 0) return 0
   const stepped = Math.min(60_000, 1_000 * 2 ** (failures - 1))

@@ -83,16 +83,92 @@ export async function deliverPush(input: {
       ? { delivered: true, reason: 'sent' }
       : { delivered: false, reason: 'provider-' + status }
   }
-  const secretPath = input.target.provider === 'fcm' ? input.config?.fcm?.privateKeyPath : input.config?.huawei?.clientSecretPath
-  if (!readKey(secretPath)) return { delivered: false, reason: 'key-unreadable' }
   const fetcher = input.fetchImpl ?? fetch
+  if (input.target.provider === 'fcm') return deliverFcm(input.config?.fcm, input.target, input.notice, now, fetcher)
+  return deliverHuawei(input.config?.huawei, input.target, input.notice, fetcher)
+}
+
+async function deliverFcm(
+  config: PushConfig['fcm'],
+  target: PushTarget,
+  notice: PushNotice,
+  now: number,
+  fetcher: typeof fetch,
+): Promise<PushDelivery> {
+  const key = readKey(config?.privateKeyPath)
+  const email = config?.clientEmail
+  const project = config?.projectId
+  if (!key || !email || !project || email.includes('PLACEHOLDER') || project.includes('PLACEHOLDER')) {
+    return { delivered: false, reason: 'key-unreadable' }
+  }
+  const header = b64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }))
+  const claims = b64url(JSON.stringify({
+    iss: email,
+    scope: 'https://www.googleapis.com/auth/firebase.messaging',
+    aud: 'https://oauth2.googleapis.com/token',
+    iat: Math.floor(now / 1000),
+    exp: Math.floor(now / 1000) + 3600,
+  }))
+  const signer = createSign('RSA-SHA256')
+  signer.update(header + '.' + claims)
+  let assertion = header + '.' + claims + '.'
+  try { assertion += signer.sign(key).toString('base64url') } catch { return { delivered: false, reason: 'key-unreadable' } }
   try {
-    const response = await fetcher('https://push.invalid/' + input.target.provider, {
+    const tokenResponse = await fetcher('https://oauth2.googleapis.com/token', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ token: input.target.token, notice: input.notice }),
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: 'grant_type=' + encodeURIComponent('urn:ietf:params:oauth:grant-type:jwt-bearer') + '&assertion=' + encodeURIComponent(assertion),
     })
-    return response.ok ? { delivered: true, reason: 'sent' } : { delivered: false, reason: 'provider-' + response.status }
+    if (!tokenResponse.ok) return { delivered: false, reason: 'provider-' + tokenResponse.status }
+    const tokenBody = await tokenResponse.json() as { access_token?: string }
+    if (!tokenBody.access_token) return { delivered: false, reason: 'provider-rejected' }
+    const send = await fetcher('https://fcm.googleapis.com/v1/projects/' + encodeURIComponent(project) + '/messages:send', {
+      method: 'POST',
+      headers: { authorization: 'Bearer ' + tokenBody.access_token, 'content-type': 'application/json' },
+      body: JSON.stringify({ message: { token: target.token, notification: { title: notice.title, body: notice.body } } }),
+    })
+    return send.ok ? { delivered: true, reason: 'sent' } : { delivered: false, reason: 'provider-' + send.status }
+  } catch {
+    return { delivered: false, reason: 'network' }
+  }
+}
+
+async function deliverHuawei(
+  config: PushConfig['huawei'],
+  target: PushTarget,
+  notice: PushNotice,
+  fetcher: typeof fetch,
+): Promise<PushDelivery> {
+  const secret = readKey(config?.clientSecretPath)
+  const clientId = config?.clientId
+  const appId = config?.appId
+  if (!secret || !clientId || !appId || clientId.includes('PLACEHOLDER') || appId.includes('PLACEHOLDER')) {
+    return { delivered: false, reason: 'key-unreadable' }
+  }
+  try {
+    const tokenResponse = await fetcher('https://oauth-login.cloud.huawei.com/oauth2/v3/token', {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: 'grant_type=client_credentials&client_id=' + encodeURIComponent(clientId) + '&client_secret=' + encodeURIComponent(secret),
+    })
+    if (!tokenResponse.ok) return { delivered: false, reason: 'provider-' + tokenResponse.status }
+    const tokenBody = await tokenResponse.json() as { access_token?: string }
+    if (!tokenBody.access_token) return { delivered: false, reason: 'provider-rejected' }
+    const send = await fetcher('https://push-api.cloud.huawei.com/v1/' + encodeURIComponent(appId) + '/messages:send', {
+      method: 'POST',
+      headers: { authorization: 'Bearer ' + tokenBody.access_token, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        validate_only: false,
+        message: {
+          token: [target.token],
+          notification: { title: notice.title, body: notice.body },
+          android: target.liveToken
+            ? { notification: { foreground_show: true, importance: 'NORMAL' }, category: 'CATEGORY_PROGRESS' }
+            : { notification: { foreground_show: true } },
+        },
+      }),
+    })
+    return send.ok ? { delivered: true, reason: 'sent' } : { delivered: false, reason: 'provider-' + send.status }
   } catch {
     return { delivered: false, reason: 'network' }
   }

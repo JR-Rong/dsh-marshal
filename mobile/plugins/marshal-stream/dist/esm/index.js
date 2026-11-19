@@ -7,6 +7,10 @@ export class MarshalStreamWeb {
 
   async close() {}
 
+  async pushToken() {
+    return { ok: false, reason: 'web' }
+  }
+
   async addListener() {
     return { remove: async () => {} }
   }

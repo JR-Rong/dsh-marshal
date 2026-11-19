@@ -8,6 +8,10 @@ export class MarshalStreamWeb implements MarshalStreamPlugin {
 
   async close(): Promise<void> {}
 
+  async pushToken() {
+    return { ok: false, reason: 'web' }
+  }
+
   async addListener(): Promise<{ remove: () => Promise<void> }> {
     return { remove: async () => {} }
   }

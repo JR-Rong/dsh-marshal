@@ -46,6 +46,24 @@ public class MarshalStreamPlugin extends Plugin {
     }
 
     @PluginMethod
+    public void pushToken(PluginCall call) {
+        JSObject result = new JSObject();
+        String token = PushTokens.token;
+        String provider = PushTokens.provider;
+        if (token == null || token.isEmpty() || provider == null) {
+            result.put("ok", false);
+            result.put("reason", PushTokens.reason == null ? "unconfigured" : PushTokens.reason);
+            call.resolve(result);
+            return;
+        }
+        result.put("ok", true);
+        result.put("provider", provider);
+        result.put("token", token);
+        if (PushTokens.liveToken != null) result.put("liveToken", PushTokens.liveToken);
+        call.resolve(result);
+    }
+
+    @PluginMethod
     public void close(PluginCall call) {
         String id = call.getString("id");
         if (id == null || id.isEmpty()) closeAll();

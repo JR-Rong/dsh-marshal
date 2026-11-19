@@ -6,15 +6,17 @@ import {
   type MarshalConfig,
 } from './lib/config.ts'
 import {
-  MarshalApi, agentLabel, sessionTitle, sameTarget, can, formatTokens, buildPromptArgs, randomUuid,
+  MarshalApi, agentLabel, sessionTitle, sameTarget, can, formatTokens, buildPromptArgs, newIdempotencyKey, decisionIsSafe,
   type Capability, type DeviceRow, type InputCard, type SessionRow, type Target, type SessionControls,
 } from './lib/marshal.ts'
 import {
-  AccountApi, buildPreviewInput, buildSendPayload, extractTicket, loginWithTicket, parseOnboardLink, parseRoom,
+  AccountApi, buildPreviewInput, buildSendPayload, extractTicket, loginWithTicket, parseOnboardLink, parsePreview, parseRoom, parseRoomList,
   type DiscussionCatalogItem, type DiscussionRoom, type GroupPreview, type RoomSummary,
 } from './lib/account.ts'
 import type { AccountSession } from './lib/config.ts'
 import { openEventStream, type StreamHandle, type StreamFrame } from './lib/sse.ts'
+import { sliceSessions, SESSION_PAGE_SIZE } from './lib/sessions.ts'
+import { acceptEventSeq } from './lib/transcript.ts'
 import { hasStoredBridge, loadBridgeDevice, openBridgeWorkbench, saveBridgeDevice } from './bridge/workbench.ts'
 import { classifyPairing, pairBridge, parsePairPayload, parseUnifiedPairing } from './lib/bridge.ts'
 import { openQrScanner } from './lib/scanner.ts'
@@ -29,7 +31,7 @@ import {
 import { APP_TITLE, APP_VERSION, CLIENT_ONLY_NOTE } from './lib/version.ts'
 import { initTheme, readTheme, setTheme, THEMES } from './lib/theme.ts'
 
-type View = 'booting' | 'setup' | 'lock' | 'home' | 'sessions' | 'session' | 'controls' | 'groups' | 'groupRoom' | 'groupNew' | 'settings'
+type View = 'booting' | 'setup' | 'lock' | 'home' | 'sessions' | 'session' | 'controls' | 'groups' | 'groupRoom' | 'groupNew' | 'settings' | 'board' | 'memory'
 
 type Role = 'user' | 'assistant' | 'reason' | 'tool' | 'system'
 
@@ -39,6 +41,8 @@ interface Message {
   text: string
   open: boolean
   at: number
+  failed?: boolean
+  retryKey?: string
 }
 
 interface PendingAttachment {
@@ -170,6 +174,8 @@ function screenChildren(): Child[] {
     case 'groupRoom': return groupRoomView()
     case 'groupNew': return groupNewView()
     case 'settings': return settingsView()
+    case 'board': return boardView()
+    case 'memory': return memoryView()
   }
 }
 
@@ -270,6 +276,18 @@ async function enterApp(): Promise<void> {
   render()
   await refreshDevices()
   await openStream()
+  void registerDevicePush()
+}
+
+async function registerDevicePush(): Promise<void> {
+  const api = phoneApi()
+  if (!api) return
+  try {
+    const plugin = await import('marshal-stream')
+    const token = await plugin.MarshalStream.pushToken?.()
+    if (!token || token.ok !== true || !token.token || (token.provider !== 'apns' && token.provider !== 'fcm' && token.provider !== 'huawei')) return
+    await api.registerPush(token.provider, token.token, token.liveToken)
+  } catch { /* 浏览器预览没有推送插件 */ }
 }
 
 async function openStream(): Promise<void> {
@@ -298,6 +316,8 @@ async function refreshDevices(): Promise<void> {
     return
   }
   state.devices = result.data
+  const named = await api.roster()
+  roster = named.ok ? named.data : roster
   state.statusText = result.data.length === 0 ? '暂无设备在线' : '已连接调度中心'
   if (state.view === 'home') render()
 }
@@ -343,6 +363,7 @@ async function openSession(deviceId: string, row: SessionRow): Promise<void> {
   render()
 
   const target = targetOf(state.session)
+  void api.watchSession(target)
   const subscribed = await api.subscribe(target)
   subscriptionId = subscribed.ok ? subscribed.data : null
 
@@ -423,10 +444,9 @@ async function onFrame(frame: StreamFrame): Promise<void> {
   }
   if (!target) return
   if (event.deviceId !== target.deviceId || event.agent !== target.agent || event.sessionId !== target.sessionId) return
-  if (typeof event.seq === 'number') {
-    if (event.seq <= lastSeq) return
-    lastSeq = event.seq
-  }
+  const seq = acceptEventSeq(lastSeq, event.seq)
+  if (!seq.accept) return
+  lastSeq = seq.lastSeq
   switch (kind) {
     case 'capability.changed':
       state.capability = payload as unknown as Capability
@@ -481,7 +501,16 @@ function appendDelta(id: string, role: Role, text: string): void {
   } else {
     state.messages.push({ id, role, text, open: true, at: Date.now() })
   }
+  const body = document.querySelector('[data-msg="' + cssEscape(id) + '"] .msg-body')
+  if (body && existing) {
+    body.textContent = existing.text
+    return
+  }
   if (state.view === 'session') render()
+}
+
+function cssEscape(value: string): string {
+  return typeof CSS !== 'undefined' && typeof CSS.escape === 'function' ? CSS.escape(value) : value.replace(/"/g, '')
 }
 
 function closeOpenMessages(): void {
@@ -510,7 +539,7 @@ async function loadOlder(): Promise<void> {
   render()
 }
 
-async function sendPrompt(): Promise<void> {
+async function sendPrompt(reuseKey?: string): Promise<void> {
   const api = state.api
   const session = state.session
   if (!api || !session || state.busy) return
@@ -528,20 +557,25 @@ async function sendPrompt(): Promise<void> {
     ...(state.effortChoice ? { reasoning: state.effortChoice } : {}),
   }
   const args = buildPromptArgs(text, options, attachmentIds)
-  const pending: Message = { id: 'local-' + Date.now(), role: 'user', text, open: false, at: Date.now() }
+  const pending: Message = {
+    id: 'local-' + Date.now(), role: 'user', text, open: false, at: Date.now(),
+    retryKey: reuseKey || newIdempotencyKey(),
+  }
   draft = ''
   state.busy = true
   state.messages.push(pending)
   render()
-  const result = await api.command('prompt', targetOf(session), args)
+  const result = await api.command('prompt', targetOf(session), args, pending.retryKey)
   state.busy = false
   if (!result.ok) {
-    state.messages = state.messages.filter((message) => message.id !== pending.id)
+    pending.failed = true
     if (!draft) draft = text
     toast(result.message, 'error')
     render()
     return
   }
+  pending.failed = false
+  pending.retryKey = undefined
   state.attachments = []
   state.uploading = false
   render()
@@ -654,11 +688,14 @@ async function cancelCard(card: InputCard): Promise<void> {
   render()
 }
 
+let answering = false
 async function answerCard(card: InputCard, answers: Array<{ id: string; selectedOptionIds: string[]; text?: string }>): Promise<void> {
   const api = state.api
   const session = state.session
-  if (!api || !session) return
+  if (!api || !session || answering) return
+  answering = true
   const result = await api.command('answer', targetOf(session), { requestId: card.requestId, answers })
+  answering = false
   if (!result.ok) { toast(result.message, 'error'); return }
   state.cards = state.cards.filter((entry) => entry.requestId !== card.requestId)
   toast('已提交')
@@ -840,6 +877,8 @@ function homeView(): Child[] {
   if (!config) { state.view = 'setup'; return setupView() }
   const header = topbar('调度官', hubLabel(config.hubUrl), [
     button('扫码', scanPairing, { class: 'icon-button' }),
+    button('看板', () => { state.view = 'board'; void loadBoard() }, { class: 'icon-button' }),
+    button('记忆', () => { state.view = 'memory'; void loadMemory() }, { class: 'icon-button' }),
     button('群聊', () => { state.view = 'groups'; void loadRooms() }, { class: 'icon-button' }),
     button('设置', () => { state.view = 'settings'; render() }, { class: 'icon-button' }),
   ])
@@ -860,10 +899,16 @@ function homeView(): Child[] {
     header,
     ...banners,
     el('div', { class: 'card' },
-      el('h2', { text: 'DSH 工作台' }),
-      el('p', { class: 'empty', text: '按智能体查看会话、任务看板；配对 DSH 远程桥后可用。' }),
-      button('进入 DSH 工作台', openDshWorkbench, { class: 'primary block' }),
+      el('h2', { text: '智能体' }),
+      ...(rosterRows().length > 0 ? rosterRows() : [el('p', { class: 'empty', text: '电脑上报花名册后，这里会显示智能体名字。' })]),
     ),
+    state.config?.lanBridge
+      ? el('div', { class: 'card' },
+        el('h2', { text: '局域网工作台' }),
+        el('p', { class: 'empty', text: '默认关闭。只在和电脑同一网络、并且你打开了这个开关时使用。' }),
+        button('进入局域网工作台', openDshWorkbench, { class: 'block' }),
+      )
+      : null,
     el('div', { class: 'card' },
       el('h2', { text: '设备' }),
       ...(rows.length > 0 ? rows : [el('p', { class: 'empty', text: '暂无设备在线。' })]),
@@ -872,24 +917,64 @@ function homeView(): Child[] {
   ]
 }
 
+let sessionQuery = ''
+let sessionLimit = SESSION_PAGE_SIZE
+let roster: Array<{ deviceId: string; agent: string; name: string }> = []
+let boardTasks: Array<{ id: string; deviceId: string; title: string; detail: string; status: string; revision: number }> = []
+let memoryEntries: Array<{ id: string; deviceId: string; layer: string; agent: string; text: string }> = []
+let groupKey = ''
+
+function namedAgent(agent: string, deviceId?: string): string {
+  const found = roster.find((item) => item.agent === agent && (!deviceId || item.deviceId === deviceId))
+    ?? roster.find((item) => item.name === agent)
+  return found?.name || agentLabel(agent)
+}
+
+function rosterRows(): Child[] {
+  return roster.map((item) => button(item.name, () => {
+    const device = state.devices.find((entry) => entry.id === item.deviceId) ?? state.devices[0]
+    if (!device) { toast('还没有在线的电脑', 'error'); return }
+    state.deviceId = device.id
+    void startNamedSession(device.id, item.agent, item.name)
+  }, { class: 'block' }))
+}
+
+async function startNamedSession(deviceId: string, agent: string, name: string): Promise<void> {
+  const api = state.api
+  if (!api) return
+  const result = await api.command('create', { deviceId, agent, sessionId: null }, {})
+  if (!result.ok) { toast(name + '：' + result.message, 'error'); return }
+  await openDevice(state.devices.find((entry) => entry.id === deviceId) ?? { id: deviceId, name, agents: [agent], connectedAt: 0, lastSeen: 0, syncing: false, stale: false })
+}
+
 function sessionsView(): Child[] {
   const device = state.devices.find((entry) => entry.id === state.deviceId)
-  const header = topbar(device?.name ?? '会话', '选择会话', [backButton('home')])
+  const header = topbar(device?.name ?? '会话', '选择会话', [
+    backButton('home'),
+    ...(device?.agents ?? []).map((agent) => button('新会话 · ' + namedAgent(agent, device?.id), () => {
+      void startNamedSession(device?.id ?? '', agent, namedAgent(agent, device?.id))
+    }, { class: 'icon-button' })),
+  ])
+  const search = el('input', {
+    type: 'search', placeholder: '搜索会话', value: sessionQuery,
+    onInput: (event: Event) => { sessionQuery = (event.target as HTMLInputElement).value; sessionLimit = SESSION_PAGE_SIZE; render() },
+  }) as HTMLInputElement
+  const page = sliceSessions(state.sessions, sessionQuery, sessionLimit)
   const groups = new Map<string, SessionRow[]>()
-  for (const row of state.sessions) {
+  for (const row of page.shown) {
     const list = groups.get(row.agent) ?? []
     list.push(row)
     groups.set(row.agent, list)
   }
-  const sections: Child[] = []
+  const sections: Child[] = [search]
   if (groups.size === 0) {
     sections.push(el('p', { class: 'empty', text: state.statusText || '这台设备暂无会话。' }))
   }
   for (const [agent, rows] of groups) {
     rows.sort((a, b) => b.updatedAt - a.updatedAt)
     sections.push(el('div', { class: 'agent-group' },
-      el('h3', { class: 'agent-title', text: agentLabel(agent) + ' · ' + rows.length + ' 个会话' }),
-      ...rows.slice(0, 40).map((row) => el('button', {
+      el('h3', { class: 'agent-title', text: namedAgent(agent, device?.id) + ' · ' + rows.length + ' 个会话' }),
+      ...rows.map((row) => el('button', {
         class: 'session',
         onClick: () => { vibrate(); void openSession(state.deviceId ?? row.deviceId, row) },
       },
@@ -902,16 +987,25 @@ function sessionsView(): Child[] {
       )),
     ))
   }
+  if (page.hasMore) sections.push(button('加载更多', () => { sessionLimit += SESSION_PAGE_SIZE; render() }, { class: 'block' }))
   return [header, el('div', { class: 'card' }, ...sections)]
 }
 
 function messageNode(message: Message): HTMLElement {
-  const cls = 'msg msg-' + message.role
-  return el('div', { class: cls + (message.open ? ' streaming' : '') },
+  const cls = 'msg msg-' + message.role + (message.failed ? ' failed' : '')
+  return el('div', { class: cls + (message.open ? ' streaming' : ''), 'data-msg': message.id },
     el('div', { class: 'msg-role', text: ({
       user: '我', assistant: '智能体', reason: '思考', tool: '工具', system: '系统',
     } as const)[message.role] }),
     el('div', { class: 'msg-body', text: message.text }),
+    message.failed
+      ?         button('重试', () => {
+          const key = message.retryKey
+          draft = message.text
+          state.messages = state.messages.filter((entry) => entry.id !== message.id)
+          void sendPrompt(key)
+        }, { class: 'danger' })
+      : null,
   )
 }
 
@@ -921,10 +1015,9 @@ function cardNode(card: InputCard): HTMLElement {
       el('h2', { text: '审批：' + card.approval.action }),
       ...(card.approval.detail ? [el('p', { class: 'tool', text: card.approval.detail })] : []),
       el('div', { class: 'choices' },
-        ...card.approval.decisions.map((decision) => button(decision.label, () => {
+        ...card.approval.decisions.filter(decisionIsSafe).map((decision) => button(decision.label, () => {
           void answerCard(card, [{ id: decision.id, selectedOptionIds: [] }])
         })),
-        button('拒绝', () => { void answerCard(card, [{ id: 'decline', selectedOptionIds: [] }]) }, { class: 'danger' }),
         can(state.capability, 'cancel')
           ? button('忽略此请求', () => { void cancelCard(card) }, { class: 'ghost' })
           : null,
@@ -952,15 +1045,20 @@ function cardNode(card: InputCard): HTMLElement {
       el('div', { class: 'choices' }, ...optionButtons),
     )
   })
+  const freeText = el('textarea', { rows: 2, placeholder: '也可以直接输入回答' }) as HTMLTextAreaElement
   return el('div', { class: 'card ask' },
     el('h2', { text: card.title ?? '需要你回答' }),
     ...questionNodes,
+    freeText,
     el('div', { class: 'choices' },
       button('提交', () => {
+        const text = freeText.value.trim()
         const answers = (card.questions ?? []).map((question) => ({
           id: question.id,
           selectedOptionIds: Array.from(selections.get(question.id) ?? []),
+          ...(text ? { text } : {}),
         }))
+        if (answers.length === 0 && text) answers.push({ id: card.requestId, selectedOptionIds: [], text })
         void answerCard(card, answers)
       }, { class: 'primary' }),
       can(state.capability, 'cancel')
@@ -1172,11 +1270,23 @@ function controlsView(): Child[] {
 let groupPoll: ReturnType<typeof setInterval> | null = null
 
 function stopGroupPoll(): void {
+  groupStream?.close()
+  groupStream = null
   if (groupPoll) { clearInterval(groupPoll); groupPoll = null }
 }
 
+let groupStream: StreamHandle | null = null
 function startGroupPoll(): void {
   stopGroupPoll()
+  const api = phoneApi()
+  if (api) {
+    void openEventStream({
+      url: api.discussionStreamUrl(),
+      token: api.token,
+      id: 'groups',
+      onFrame: () => { void refreshRoom(true) },
+    }).then((handle) => { groupStream = handle })
+  }
   groupPoll = setInterval(() => {
     if (state.view === 'groupRoom') void refreshRoom(true)
   }, 4_000)
@@ -1344,106 +1454,179 @@ async function logoutAccount(): Promise<void> {
   toast('已退出群聊账号')
 }
 
+function phoneApi(): MarshalApi | null {
+  const api = state.api
+  return api && api.token.startsWith('mph1.') ? api : null
+}
+
+async function loadBoard(): Promise<void> {
+  const api = phoneApi()
+  if (!api) { toast('看板需要手机配对凭证', 'error'); return }
+  const result = await api.board()
+  boardTasks = result.ok ? result.data : []
+  if (!result.ok) toast(result.message, 'error')
+  if (state.view === 'board') render()
+}
+
+async function writeBoard(body: Record<string, unknown>): Promise<void> {
+  const api = phoneApi()
+  if (!api) return
+  const result = await api.boardWrite(body)
+  if (!result.ok) { toast(result.message, 'error'); return }
+  toast(result.data.code === 'queued' ? '已交给这台电脑，修订不一致时会拒绝' : '看板已更新')
+  await loadBoard()
+}
+
+function boardView(): Child[] {
+  const title = el('input', { type: 'text', placeholder: '新任务标题' }) as HTMLInputElement
+  const deviceId = boardTasks[0]?.deviceId || state.devices[0]?.id || ''
+  const head = boardTasks.reduce((max, task) => Math.max(max, task.revision), 0)
+  return [
+    topbar('任务看板', '只改你选中的那台电脑', [backButton('home'), button('刷新', () => { void loadBoard() }, { class: 'icon-button' })]),
+    el('div', { class: 'card' },
+      title,
+      button('新建', () => { void writeBoard({ deviceId, action: 'create', title: title.value, baseRevision: head }) }, { class: 'primary' }),
+    ),
+    ...boardTasks.map((task) => el('div', { class: 'card' },
+      el('h2', { text: task.title }),
+      el('p', { class: 'empty', text: task.status + ' · 修订 ' + task.revision }),
+      el('div', { class: 'choices' },
+        button('待办', () => { void writeBoard({ deviceId: task.deviceId, action: 'move', taskId: task.id, status: 'todo', baseRevision: head }) }),
+        button('进行中', () => { void writeBoard({ deviceId: task.deviceId, action: 'move', taskId: task.id, status: 'doing', baseRevision: head }) }),
+        button('完成', () => { void writeBoard({ deviceId: task.deviceId, action: 'move', taskId: task.id, status: 'done', baseRevision: head }) }),
+        button('改标题', () => {
+          const next = window.prompt('新标题', task.title)
+          if (next && next.trim()) void writeBoard({ deviceId: task.deviceId, action: 'edit', taskId: task.id, title: next.trim(), baseRevision: head })
+        }),
+        button('删除', () => { void writeBoard({ deviceId: task.deviceId, action: 'delete', taskId: task.id, baseRevision: head }) }, { class: 'danger' }),
+      ),
+    )),
+    boardTasks.length === 0 ? el('p', { class: 'empty', text: '电脑还没有上报看板。空列表不会当成“已经清空”。' }) : null,
+  ]
+}
+
+async function loadMemory(): Promise<void> {
+  const api = phoneApi()
+  if (!api) { toast('记忆需要手机配对凭证', 'error'); return }
+  const result = await api.memory()
+  memoryEntries = result.ok ? result.data : []
+  if (!result.ok) toast(result.message, 'error')
+  if (state.view === 'memory') render()
+}
+
+function memoryView(): Child[] {
+  return [
+    topbar('记忆', '只读', [backButton('home'), button('刷新', () => { void loadMemory() }, { class: 'icon-button' })]),
+    ...memoryEntries.map((entry) => el('div', { class: 'card' },
+      el('h2', { text: (entry.agent || '全局') + ' · ' + entry.layer }),
+      el('p', { text: entry.text }),
+    )),
+    memoryEntries.length === 0 ? el('p', { class: 'empty', text: '还没有可读的记忆。内容共享关闭时电脑不会外发正文。' }) : null,
+  ]
+}
+
 async function loadRooms(notify = false): Promise<void> {
   const config = state.config
+  const api = phoneApi()
   if (!config) { state.view = 'setup'; render(); return }
-  if (!accountUsable()) {
-    state.groupError = state.account ? '账号会话已过期，请重新生成 ticket。' : '群聊需要先用账号 ticket 登录。'
+  if (!api) {
+    state.groupError = '群聊使用手机配对凭证。请先扫电脑上的配对码。'
     state.roomList = []
     state.catalog = []
     if (state.view === 'groups') render()
     return
   }
-  const account = state.account as AccountSession
   state.groupBusy = true
   state.groupError = ''
   if (state.view === 'groups') render()
-  const result = await new AccountApi(config.hubUrl, account).list()
+  const result = await api.discussions()
   state.groupBusy = false
   if (!result.ok) {
     state.groupError = result.message
-    if (result.error === 'unauthorized' || result.error === 'expired') {
+    if (result.error === 'unauthorized') {
       await clearAccount('账号会话已失效，请重新生成 ticket')
       return
     }
     if (state.view === 'groups') render()
     return
   }
-  state.roomList = result.data.rooms
-  state.catalog = result.data.catalog
+  const listed = parseRoomList(result.data)
+  state.roomList = listed.rooms
+  state.catalog = listed.catalog
   if (notify) toast('群聊已刷新')
   if (state.view === 'groups') render()
 }
 
 async function openRoom(roomId: string): Promise<void> {
-  const config = state.config
-  const account = state.account
-  if (!config || !account) return
+  const api = phoneApi()
+  if (!api) return
   stopGroupPoll()
   state.room = null
   state.groupError = ''
   state.groupDraft = ''
+  groupKey = ''
   state.view = 'groupRoom'
   state.groupBusy = true
   render()
-  const result = await new AccountApi(config.hubUrl, account).room(roomId)
+  const result = await api.discussion(roomId)
   state.groupBusy = false
   if (!result.ok) {
     state.groupError = result.message
-    if (result.error === 'unauthorized' || result.error === 'expired') {
+    if (result.error === 'unauthorized') {
       await clearAccount('账号会话已失效，请重新生成 ticket')
       return
     }
     render()
     return
   }
-  state.room = result.data
+  state.room = parseRoom(result.data)
   render()
   startGroupPoll()
 }
 
 async function refreshRoom(silent = false): Promise<void> {
-  const config = state.config
-  const account = state.account
+  const api = phoneApi()
   const room = state.room
-  if (!config || !account || !room || state.groupBusy) return
+  if (!api || !room || state.groupBusy) return
   if (!silent) { state.groupBusy = true; render() }
-  const result = await new AccountApi(config.hubUrl, account).room(room.id)
+  const result = await api.discussion(room.id)
   if (!silent) state.groupBusy = false
   if (!result.ok) {
-    if (result.error === 'unauthorized' || result.error === 'expired') {
+    if (result.error === 'unauthorized') {
       await clearAccount('账号会话已失效，请重新生成 ticket')
       return
     }
     if (!silent) { toast(result.message, 'error'); render() }
     return
   }
-  if (state.room?.id === result.data.id) {
-    state.room = result.data
+  const updated = parseRoom(result.data)
+  if (updated && state.room?.id === updated.id) {
+    state.room = updated
     if (state.view === 'groupRoom') render()
   }
 }
 
 async function sendGroupMessage(): Promise<void> {
-  const config = state.config
-  const account = state.account
+  const api = phoneApi()
   const room = state.room
-  if (!config || !account || !room || state.groupBusy) return
+  if (!api || !room || state.groupBusy) return
   const text = state.groupDraft.trim()
   if (!text) return
   if (room.state !== 'idle' || room.cleared || room.rounds >= 3) {
     toast('此群当前不可发送', 'error')
     return
   }
+  if (!groupKey) groupKey = newIdempotencyKey()
   state.groupBusy = true
   render()
-  const result = await new AccountApi(config.hubUrl, account).action(buildSendPayload(room.id, text, randomUuid()))
+  const result = await api.discussionAction(buildSendPayload(room.id, text, groupKey, room.moderatorId))
   state.groupBusy = false
   if (!result.ok) {
-    toast(result.message, 'error')
+    toast(result.message + '。这次发送会沿用同一个幂等键。', 'error')
     render()
     return
   }
+  groupKey = ''
   state.groupDraft = ''
   const updated = result.data.room ? parseRoom(result.data.room) : null
   if (updated) state.room = updated
@@ -1452,13 +1635,12 @@ async function sendGroupMessage(): Promise<void> {
 }
 
 async function stopRoom(): Promise<void> {
-  const config = state.config
-  const account = state.account
+  const api = phoneApi()
   const room = state.room
-  if (!config || !account || !room) return
+  if (!api || !room) return
   state.groupBusy = true
   render()
-  const result = await new AccountApi(config.hubUrl, account).action({ action: 'stop', roomId: room.id })
+  const result = await api.discussionAction({ action: 'stop', roomId: room.id })
   state.groupBusy = false
   if (!result.ok) { toast(result.message, 'error'); render(); return }
   const updated = result.data.room ? parseRoom(result.data.room) : null
@@ -1472,10 +1654,10 @@ function groupsView(): Child[] {
   const config = state.config
   if (!config) { state.view = 'setup'; return setupView() }
   const account = state.account
-  const header = topbar('群聊', account?.name || '账号 ticket 会话', [
+  const header = topbar('群聊', phoneApi() ? '手机凭证' : (account?.name || '未配对'), [
     backButton('home'),
     button('刷新', () => { void loadRooms(true) }, { class: 'icon-button' }),
-    accountUsable() ? button('新建', () => { openGroupNew() }, { class: 'icon-button' }) : null,
+    phoneApi() ? button('新建', () => { openGroupNew() }, { class: 'icon-button' }) : null,
   ])
   if (!account || account.expiresAt <= Date.now()) {
     return [
@@ -1607,9 +1789,8 @@ function chosenCatalog(): DiscussionCatalogItem[] {
 }
 
 async function previewGroup(): Promise<void> {
-  const config = state.config
-  const account = state.account
-  if (!config || !account || state.groupBusy) return
+  const api = phoneApi()
+  if (!api || state.groupBusy) return
   const chosen = chosenCatalog()
   if (chosen.length < 2) { toast('至少选 2 个成员', 'error'); return }
   const title = state.groupTitle.trim()
@@ -1623,40 +1804,41 @@ async function previewGroup(): Promise<void> {
     text,
     members: chosen.map((item) => ({ deviceId: item.deviceId, modelId: item.id })),
   })
-  const result = await new AccountApi(config.hubUrl, account).preview(input)
+  const result = await api.discussionAction({ action: 'preview', input })
   state.groupBusy = false
   if (!result.ok) {
     toast(result.message, 'error')
-    if (result.error === 'unauthorized' || result.error === 'expired') {
+    if (result.error === 'unauthorized') {
       await clearAccount('账号会话已失效，请重新生成 ticket')
       return
     }
     render()
     return
   }
-  state.groupPreview = result.data
+  const preview = parsePreview(result.data.preview)
+  if (!preview) { toast('预览结果无法识别', 'error'); render(); return }
+  state.groupPreview = preview
   render()
 }
 
 async function createGroup(): Promise<void> {
-  const config = state.config
-  const account = state.account
+  const api = phoneApi()
   const preview = state.groupPreview
-  if (!config || !account || !preview || state.groupBusy) return
+  if (!api || !preview || state.groupBusy) return
   state.groupBusy = true
   render()
-  const result = await new AccountApi(config.hubUrl, account).create(preview.digest)
+  const result = await api.discussionAction({ action: 'create', digest: preview.digest, key: newIdempotencyKey() })
   state.groupBusy = false
   if (!result.ok) {
     toast(result.message, 'error')
-    if (result.error === 'unauthorized' || result.error === 'expired') {
+    if (result.error === 'unauthorized') {
       await clearAccount('账号会话已失效，请重新生成 ticket')
       return
     }
     render()
     return
   }
-  state.room = result.data
+  state.room = parseRoom(result.data.room)
   state.groupPreview = null
   state.view = 'groupRoom'
   state.groupDraft = ''
@@ -1667,13 +1849,11 @@ async function createGroup(): Promise<void> {
 }
 
 function groupNewView(): Child[] {
-  const config = state.config
-  const account = state.account
-  if (!config || !account || account.expiresAt <= Date.now()) {
+  if (!phoneApi()) {
     state.view = 'groups'
     return groupsView()
   }
-  const header = topbar('新建群聊', '账号 ticket 会话 · 讨论模式', [
+  const header = topbar('新建群聊', '手机凭证 · 讨论模式', [
     button('返回', () => { state.view = 'groups'; render() }, { class: 'icon-button' }),
   ])
   const titleInput = el('input', {
