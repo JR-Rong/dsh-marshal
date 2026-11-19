@@ -97,9 +97,15 @@ function validateMessage(value) {
     if (!Array.isArray(mentions) || mentions.length > 12 || mentions.some((name) => !clean(name))) {
         throw new GroupStoreError('invalid-message', 'message.mentions must be at most 12 non-empty names');
     }
+    const source = value.source;
+    if (source !== undefined && (author !== 'member' || !clean(source?.sessionId)
+        || !Number.isSafeInteger(source?.seq) || source.seq < 0)) {
+        throw new GroupStoreError('invalid-source', 'member reply source needs a session id and event sequence');
+    }
     return {
         author,
         text: value.text,
+        ...(source === undefined ? {} : { source: { sessionId: source.sessionId, seq: source.seq } }),
         mentions: mentions.map((name) => name.trim().slice(0, GROUP_NAME_MAX)),
         ...(value.authorDeviceId === undefined ? {} : { authorDeviceId: String(value.authorDeviceId) }),
         ...(value.authorMemberId === undefined ? {} : { authorMemberId: String(value.authorMemberId) }),
@@ -299,18 +305,22 @@ export function createGroupStore({ root, now = Date.now, idFactory = randomUUID 
         },
         appendMessage(id, value) {
             const group = requireGroup(id);
-            const message = {
-                id: String(idFactory()),
-                ts: now(),
-                ...validateMessage(value),
-                deliveries: [],
-            };
-            group.messages.push(message);
-            if (group.messages.length > GROUP_MESSAGES_KEEP) {
-                group.messages = group.messages.slice(group.messages.length - GROUP_MESSAGES_KEEP);
+            const input = validateMessage(value);
+            if (input.source !== undefined) {
+                const existing = group.messages.find(candidate => candidate.authorDeviceId === input.authorDeviceId
+                    && candidate.source?.sessionId === input.source.sessionId && candidate.source.seq === input.source.seq);
+                if (existing !== undefined) return clone(existing);
             }
+            const message = { id: String(idFactory()), ts: now(), ...input, deliveries: [] };
+            const { messages, updatedAt } = group;
+            group.messages = [...messages, message].slice(-GROUP_MESSAGES_KEEP);
             group.updatedAt = message.ts;
-            persist();
+            try { persist(); }
+            catch (error) {
+                group.messages = messages;
+                group.updatedAt = updatedAt;
+                throw error;
+            }
             return clone(message);
         },
         markDelivery(id, messageId, key, delivery) {

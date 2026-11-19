@@ -437,6 +437,7 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
     ? createPhoneHub({
         now,
         store: options.deviceStore,
+        nodeConnection: id => registry.get(id)?.connectionId,
         findNode: (tokenDigest) => {
           const row = options.deviceStore?.findByTokenDigest(tokenDigest)
           return row !== undefined && row.role !== 'phone' ? row : undefined
@@ -866,7 +867,7 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
     if (req.method === 'GET') {
       const auth = parsed.kind === 'phone' ? phone.authenticate(parsed.token) : { ok: false as const, code: 'unauthorized' as const }
       if (!auth.ok) { deny(res, 401, 'unauthorized'); return }
-      json(res, 200, { ok: true, tasks: phone.tasksFor(), revisions: phone.revisions() }); return
+      json(res, 200, { ok: true, tasks: phone.tasksFor(), revisions: phone.revisions(), receipts: phone.receiptsFor(auth) }); return
     }
     if (req.method !== 'POST') { methodNotAllowed(res, 'GET, POST'); return }
     const read = await readJsonBody(req, res, 65_536)
@@ -882,7 +883,10 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
     if (!auth.ok) { deny(res, 401, 'unauthorized'); return }
     try {
       const result = phone.writeTasks(auth, body)
-      json(res, result.conflict ? 409 : 202, { ok: !result.conflict, code: result.conflict ? 'conflict' : 'queued', tasks: result.tasks, revisions: phone.revisions() })
+      json(res, result.conflict ? 409 : 202, {
+        ok: !result.conflict, code: result.conflict ? 'conflict' : 'queued',
+        tasks: result.tasks, revisions: phone.revisions(), commandId: result.commandId,
+      })
     } catch (error) {
       const code = typeof error === 'object' && error !== null && (error as { code?: unknown }).code
       json(res, code === 'size-limit' ? 429 : 400, { ok: false, code: code === 'size-limit' ? 'size-limit' : 'invalid-args' })
@@ -894,15 +898,17 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
     const parsed = parseBearer(headerValue(req, 'authorization'))
     if (parsed === undefined) { deny(res, 401, 'unauthorized'); return }
     if (req.method === 'GET') {
-      if (parsed.kind !== 'phone' || !phone.authenticate(parsed.token).ok) { deny(res, 401, 'unauthorized'); return }
-      json(res, 200, { ok: true, entries: phone.readMemory() }); return
+      const auth = parsed.kind === 'phone' ? phone.authenticate(parsed.token) : undefined
+      if (!auth?.ok) { deny(res, 401, 'unauthorized'); return }
+      json(res, 200, { ok: true, entries: phone.readMemory(auth) }); return
     }
     if (req.method !== 'POST' || parsed.kind !== 'node') { deny(res, 403, 'forbidden'); return }
     const auth = phone.authenticateNode(parsed.token)
     if (!auth.ok) { deny(res, 401, 'unauthorized'); return }
     const read = await readJsonBody(req, res, 65_536)
     if (!read.ok) return
-    json(res, 200, { ok: true, entries: phone.writeMemory(auth, asRecord(read.value)?.entries) })
+    phone.writeMemory(auth, asRecord(read.value) ?? {})
+    json(res, 200, { ok: true })
   }))
 
   register('/marshal/api/roster', guard(async (req, res) => {

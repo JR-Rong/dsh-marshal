@@ -28,6 +28,7 @@ import { mountDispatch } from "./dispatch/mount.js";
 import { attachFileProposals, mountMemory } from "./memory/mount.js";
 import { mountAgentMemory } from "./memory/agent-memory.js";
 import { mountGroups } from "./groups/mount.js";
+import { readAgentsLedger } from "./groups/inventory.js";
 import { mountWorkspaceIdentity } from "./groups/workspace-identity.js";
 export const name = 'marshal';
 export function apply(ctx, raw) {
@@ -448,8 +449,16 @@ function applyNode(ctx, config) {
     }
     const phoneHost = () => {
         const board = lookupService(ctx, 'taskBoard');
-        const memory = lookupService(ctx, 'memory');
-        const roster = lookupService(ctx, 'roster');
+        const hostMemory = lookupService(ctx, 'memory');
+        const memory = typeof hostMemory?.readPhone === 'function' ? hostMemory : agentMemoryService;
+        const hostRoster = lookupService(ctx, 'roster');
+        const roster = typeof hostRoster?.list === 'function' ? hostRoster : config.groups ? { list() {
+            const ledger = readAgentsLedger();
+            if (!ledger.available) return { code: 'unavailable' };
+            return { agents: ledger.teams.flatMap(team => team.members.map(member => ({
+                id: team.id + '/' + member.id, name: member.name,
+            }))) };
+        } } : undefined;
         return {
             ...(board === undefined ? {} : { board }),
             ...(memory === undefined ? {} : { memory }),
@@ -459,7 +468,13 @@ function applyNode(ctx, config) {
     const stopRelay = config.hubUrl !== undefined && config.token !== undefined && config.deviceId !== undefined
         ? startPhoneRelay({
             host: phoneHost,
-            allowContent: config.privacy === 'content',
+            contentGrant: () => {
+                const handshake = link.handshake;
+                const binding = link.binding;
+                if (!link.online || !handshake || binding?.policies.allowContent !== true)
+                    return undefined;
+                return { connectionId: handshake.connectionId, policyRevision: binding.policyRevision };
+            },
             origin: hubHttpOrigin(config.hubUrl),
             token: config.token,
             deviceId: config.deviceId,

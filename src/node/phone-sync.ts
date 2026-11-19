@@ -108,10 +108,12 @@ export interface BoardCapabilities {
   readonly apply: readonly BoardKind[]
 }
 
+type AdvertisedBoardCapabilities = { revision?: boolean; apply?: readonly string[] }
+
 export interface PhoneHost {
   readonly board?: {
     snapshot?: () => unknown
-    capabilities?: () => { revision?: boolean; apply?: readonly string[] }
+    capabilities?: () => AdvertisedBoardCapabilities
     apply?: (requestId: string, action: Record<string, unknown>) => unknown
   }
   readonly memory?: {
@@ -125,16 +127,19 @@ export interface PhoneHost {
 /** 没有 capabilities() 就不调用 apply。现有实现会把不认识的 kind 静默忽略，不能拿来假装写成功。 */
 export function boardCapabilities(board: PhoneHost['board']): BoardCapabilities {
   const read = typeof board?.snapshot === 'function'
-  const advertised = typeof board?.capabilities === 'function' ? board.capabilities() : undefined
+  let advertised: AdvertisedBoardCapabilities | undefined
+  try { advertised = board?.capabilities?.() } catch { /* The Host cannot confirm write support. */ }
   const apply = Array.isArray(advertised?.apply)
     ? advertised.apply.filter((kind): kind is BoardKind => (BOARD_KINDS as readonly string[]).includes(kind))
     : []
   return { read, revision: advertised?.revision === true, apply }
 }
 
+type MemorySnapshot = { entries: unknown[] } | { code: 'withheld' | 'unavailable' }
+
 export interface PhoneFaces {
   readonly tasks: unknown[] | null
-  readonly memory: unknown[] | null
+  readonly memory: MemorySnapshot
   readonly roster: unknown[] | null
   readonly revision: number | null
 }
@@ -143,28 +148,29 @@ function asTasks(value: unknown): { tasks: unknown[]; revision: number | null } 
   if (typeof value !== 'object' || value === null) return null
   const record = value as { tasks?: unknown; revision?: unknown }
   if (!Array.isArray(record.tasks)) return null
-  return { tasks: record.tasks, revision: typeof record.revision === 'number' ? record.revision : null }
+  const revision = record.revision
+  return { tasks: record.tasks, revision: typeof revision === 'number' && Number.isSafeInteger(revision) && revision >= 0 ? revision : null }
 }
 
-/** 只上报主机真的返回的面。读失败或方法不存在时该面是 null，不能补成空数组。 */
+async function readBoard(board: PhoneHost['board']) {
+  try { return asTasks(await board?.snapshot?.()) } catch { return null }
+}
+
+async function readPhoneMemory(memory: PhoneHost['memory'], allowContent: boolean): Promise<MemorySnapshot> {
+  if (!allowContent) return { code: 'withheld' }
+  try {
+    const result = await memory?.readPhone?.({ allowContent, capBytes: 24_000 })
+    if (typeof result === 'object' && result !== null) {
+      const { entries, code } = result as { entries?: unknown; code?: unknown }
+      if (code === 'withheld') return { code }
+      if (code === undefined && Array.isArray(entries)) return { entries }
+    }
+  } catch { /* A failed read carries no snapshot. */ }
+  return { code: 'unavailable' }
+}
+
 export async function readPhoneFaces(host: PhoneHost | undefined, allowContent: boolean): Promise<PhoneFaces> {
-  let tasks: unknown[] | null = null
-  let revision: number | null = null
-  if (typeof host?.board?.snapshot === 'function') {
-    try {
-      const snap = asTasks(await host.board.snapshot())
-      if (snap) { tasks = snap.tasks; revision = snap.revision }
-    } catch { tasks = null }
-  }
-  let memory: unknown[] | null = null
-  if (typeof host?.memory?.readPhone === 'function') {
-    try {
-      const result = await host.memory.readPhone({ allowContent, capBytes: 24_000 })
-      if (typeof result === 'object' && result !== null && Array.isArray((result as { entries?: unknown }).entries)) {
-        memory = (result as { entries: unknown[] }).entries
-      }
-    } catch { memory = null }
-  }
+  const [board, memory] = await Promise.all([readBoard(host?.board), readPhoneMemory(host?.memory, allowContent)])
   let roster: unknown[] | null = null
   if (typeof host?.roster?.list === 'function') {
     try {
@@ -174,7 +180,7 @@ export async function readPhoneFaces(host: PhoneHost | undefined, allowContent: 
       }
     } catch { roster = null }
   }
-  return { tasks, memory, roster, revision }
+  return { tasks: board?.tasks ?? null, revision: board?.revision ?? null, memory, roster }
 }
 
 export async function applyBoardCommand(host: PhoneHost | undefined, command: {
@@ -184,9 +190,9 @@ export async function applyBoardCommand(host: PhoneHost | undefined, command: {
   taskId?: string
   title?: string
   status?: string
-}): Promise<{ ok: true; revision: number | null } | { ok: false; code: 'unsupported' | 'conflict' | 'unavailable' }> {
+}): Promise<{ ok: true; revision: number } | { ok: false; code: 'unsupported' | 'conflict' | 'unavailable' }> {
   const caps = boardCapabilities(host?.board)
-  if (!caps.apply.includes(command.action as BoardKind) || typeof host?.board?.apply !== 'function') {
+  if (!caps.revision || !caps.apply.includes(command.action as BoardKind) || typeof host?.board?.apply !== 'function') {
     return { ok: false, code: 'unsupported' }
   }
   try {
@@ -197,8 +203,8 @@ export async function applyBoardCommand(host: PhoneHost | undefined, command: {
       ...(command.title === undefined ? {} : { input: { title: command.title } }),
       ...(command.status === undefined ? {} : { status: command.status }),
     }))
-    if (!snap) return { ok: false, code: 'unavailable' }
-    if (caps.revision && snap.revision !== null && snap.revision === command.baseRevision) {
+    if (snap?.revision == null || snap.revision < command.baseRevision) return { ok: false, code: 'unavailable' }
+    if (snap.revision === command.baseRevision) {
       return { ok: false, code: 'conflict' }
     }
     return { ok: true, revision: snap.revision }
@@ -211,7 +217,7 @@ export async function applyBoardCommand(host: PhoneHost | undefined, command: {
 
 export function startPhoneRelay(input: {
   host: () => PhoneHost | undefined
-  allowContent: boolean
+  contentGrant: () => { connectionId: string; policyRevision: number } | undefined
   origin: string
   token: string
   deviceId: string
@@ -219,42 +225,43 @@ export function startPhoneRelay(input: {
   intervalMs?: number
 }): () => void {
   let stopped = false
-  const postBoard = (body: unknown) => postNodeJsonRead({
+  let running = false
+  const post = (path: string, body: unknown) => postNodeJsonRead({
     origin: input.origin,
-    path: '/marshal/api/board',
+    path: '/marshal/api/' + path,
     token: input.token,
     body,
     ...(input.ca === undefined ? {} : { ca: input.ca }),
   })
+  const postBoard = (board: { tasks: unknown[] | null; revision: number | null }, outcomes?: {
+    applied: string[]; rejected: Array<{ id: string; code: string }>
+  }) => post('board', {
+    ...forwardBody({ tasks: board.tasks, memory: null, roster: null }),
+    deviceId: input.deviceId,
+    ...(board.revision === null ? {} : { revision: board.revision }),
+    ...outcomes,
+  })
   const tick = async (): Promise<void> => {
+    const grant = input.contentGrant()
+    const faces = await readPhoneFaces(input.host(), grant !== undefined)
     if (stopped) return
-    const faces = await readPhoneFaces(input.host(), input.allowContent)
-    const memory = input.allowContent ? faces.memory : null
-    if (memory !== null) {
-      await postNodeJsonRead({
-        origin: input.origin, path: '/marshal/api/memory', token: input.token,
-        body: { entries: memory },
-        ...(input.ca === undefined ? {} : { ca: input.ca }),
-      })
-    }
-    if (faces.roster !== null) {
-      await postNodeJsonRead({
-        origin: input.origin, path: '/marshal/api/roster', token: input.token,
-        body: { agents: faces.roster },
-        ...(input.ca === undefined ? {} : { ca: input.ca }),
-      })
-    }
-    const first = await postBoard({
-      ...forwardBody({ tasks: faces.tasks, memory: null, roster: null }),
-      deviceId: input.deviceId,
-      ...(faces.revision === null ? {} : { revision: faces.revision }),
-    })
+    const current = input.contentGrant()
+    const memory = grant && grant.connectionId === current?.connectionId && grant.policyRevision === current.policyRevision
+      ? { ...faces.memory, ...grant }
+      : { code: 'withheld' }
+    const [first] = await Promise.all([
+      postBoard(faces),
+      post('memory', memory),
+      faces.roster === null ? undefined : post('roster', { agents: faces.roster }),
+    ])
+    if (stopped || first.status !== 200) return
     const commands = Array.isArray((first.body as { commands?: unknown })?.commands)
       ? (first.body as { commands: Array<Record<string, unknown>> }).commands
       : []
     const applied: string[] = []
     const rejected: Array<{ id: string; code: string }> = []
     for (const command of commands) {
+      if (stopped) return
       if (typeof command.id !== 'string' || typeof command.action !== 'string' || typeof command.baseRevision !== 'number') continue
       const result = await applyBoardCommand(input.host(), {
         id: command.id,
@@ -268,18 +275,17 @@ export function startPhoneRelay(input: {
       else rejected.push({ id: command.id, code: result.code })
     }
     if (applied.length === 0 && rejected.length === 0) return
-    const after = await readPhoneFaces(input.host(), input.allowContent)
-    await postBoard({
-      ...forwardBody({ tasks: after.tasks, memory: null, roster: null }),
-      deviceId: input.deviceId,
-      ...(after.revision === null ? {} : { revision: after.revision }),
-      applied,
-      rejected,
-    })
+    const after = await readBoard(input.host()?.board)
+    if (!stopped) await postBoard(after ?? { tasks: null, revision: null }, { applied, rejected })
   }
-  const timer = setInterval(() => { void tick() }, input.intervalMs ?? 15_000)
+  const run = () => {
+    if (stopped || running) return
+    running = true
+    void tick().catch(() => { /* Transient relay failure is retried on the next tick. */ }).finally(() => { running = false })
+  }
+  const timer = setInterval(run, input.intervalMs ?? 15_000)
   timer.unref?.()
-  void tick()
+  run()
   return () => { stopped = true; clearInterval(timer) }
 }
 
@@ -305,12 +311,14 @@ function postNodeJsonRead(input: {
     }, (res) => {
       const chunks: Buffer[] = []
       res.on('data', (chunk) => chunks.push(chunk as Buffer))
+      res.on('error', () => resolve({ status: 0, body: { ok: false, code: 'network' } }))
       res.on('end', () => {
         let body: unknown = {}
         try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')) } catch { body = {} }
         resolve({ status: res.statusCode ?? 0, body })
       })
     })
+    req.setTimeout(8_000, () => req.destroy())
     req.on('error', () => resolve({ status: 0, body: { ok: false, code: 'network' } }))
     req.end(payload)
   })

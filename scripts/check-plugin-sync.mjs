@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 
@@ -30,23 +30,31 @@ if (!srcPhone.includes('phoneTokenDigest') || !srcPhone.includes('onceDecisionId
   throw new Error('src/hub/phone.ts is missing the review fixes')
 }
 
-function filesUnder(dir) {
+function filesUnder(dir, root = dir) {
   const out = []
   for (const name of readdirSync(dir)) {
     const path = join(dir, name)
-    if (statSync(path).isDirectory()) out.push(...filesUnder(path))
-    else out.push(relative(dir, path))
+    if (statSync(path).isDirectory()) out.push(...filesUnder(path, root))
+    else out.push(relative(root, path))
   }
   return out.sort()
 }
 const extracted = mkdtempSync(join(tmpdir(), 'marshal-tgz-'))
-execFileSync('tar', ['-xzf', join(plugin, packedName), '-C', extracted])
-const packedLib = join(extracted, 'package', 'lib')
-const live = filesUnder(join(plugin, 'lib'))
-const packed = filesUnder(packedLib)
-if (live.join('\n') !== packed.join('\n')) {
-  throw new Error('tgz lib tree does not match plugin-build/lib')
+try {
+  execFileSync('tar', ['-xzf', join(plugin, packedName), '-C', extracted])
+  const packedLib = join(extracted, 'package', 'lib')
+  const live = filesUnder(join(plugin, 'lib'))
+  const packed = filesUnder(packedLib)
+  if (live.join('\n') !== packed.join('\n')) {
+    throw new Error('tgz lib tree does not match plugin-build/lib')
+  }
+  for (const path of live) {
+    const installed = readFileSync(join(plugin, 'lib', path))
+    if (!installed.equals(readFileSync(join(packedLib, path)))) throw new Error('tgz lib differs at ' + path)
+  }
+  const packedPkg = JSON.parse(readFileSync(join(extracted, 'package/package.json'), 'utf8'))
+  if (!packedPkg.dependencies?.uqr) throw new Error('tgz is missing the uqr dependency')
+  console.log('plugin tgz matches plugin-build/lib (' + packed.length + ' files)')
+} finally {
+  rmSync(extracted, { recursive: true, force: true })
 }
-const packedPkg = JSON.parse(readFileSync(join(extracted, 'package/package.json'), 'utf8'))
-if (!packedPkg.dependencies?.uqr) throw new Error('tgz is missing the uqr dependency')
-console.log('plugin tgz matches plugin-build/lib (' + packed.length + ' files)')

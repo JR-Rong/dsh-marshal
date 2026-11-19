@@ -7,7 +7,7 @@ import {
 } from './lib/config.ts'
 import {
   MarshalApi, agentLabel, sessionTitle, sameTarget, can, formatTokens, buildPromptArgs, newIdempotencyKey, decisionIsSafe,
-  type Capability, type DeviceRow, type InputCard, type SessionRow, type Target, type SessionControls,
+  type BoardReceipt, type Capability, type DeviceRow, type InputCard, type RosterEntry, type SessionRow, type Target, type SessionControls,
 } from './lib/marshal.ts'
 import {
   AccountApi, buildPreviewInput, buildSendPayload, extractTicket, loginWithTicket, parseOnboardLink, parsePreview, parseRoom, parseRoomList,
@@ -273,6 +273,11 @@ async function enterApp(): Promise<void> {
   const config = state.config
   if (!config) { state.view = 'setup'; render(); return }
   state.api = new MarshalApi(config)
+  roster = []
+  boardTasks = []
+  boardRevisions = {}
+  boardReceipts = []
+  memoryEntries = []
   state.view = 'home'
   state.statusText = '正在连接…'
   render()
@@ -327,6 +332,7 @@ async function refreshDevices(): Promise<void> {
   const api = state.api
   if (!api) return
   const result = await api.devices()
+  if (state.api !== api) return
   if (!result.ok) {
     state.statusText = result.message
     if (result.error === 'unauthorized') { state.view = 'setup'; render(); return }
@@ -335,6 +341,7 @@ async function refreshDevices(): Promise<void> {
   }
   state.devices = result.data
   const named = await api.roster()
+  if (state.api !== api) return
   roster = named.ok ? named.data : roster
   state.statusText = result.data.length === 0 ? '暂无设备在线' : '已连接调度中心'
   if (state.view === 'home') render()
@@ -901,8 +908,13 @@ function homeView(): Child[] {
   if (!config) { state.view = 'setup'; return setupView() }
   const header = topbar('调度官', hubLabel(config.hubUrl), [
     button('扫码', scanPairing, { class: 'icon-button' }),
-    button('看板', () => { state.view = 'board'; void loadBoard() }, { class: 'icon-button' }),
-    button('记忆', () => { state.view = 'memory'; void loadMemory() }, { class: 'icon-button' }),
+    button('看板', () => { state.view = 'board'; render(); void loadBoard() }, { class: 'icon-button' }),
+    button('记忆', () => {
+      memoryEntries = []
+      state.view = 'memory'
+      render()
+      void loadMemory()
+    }, { class: 'icon-button' }),
     button('群聊', () => { state.view = 'groups'; void loadRooms() }, { class: 'icon-button' }),
     button('设置', () => { state.view = 'settings'; render() }, { class: 'icon-button' }),
   ])
@@ -919,12 +931,16 @@ function homeView(): Child[] {
   el('span', { class: 'chip', text: device.agents.map(agentLabel).join(' / ') || '无 agent' }),
   ))
 
+  const members = roster.map((item) => {
+    const device = state.devices.find(entry => entry.id === item.deviceId)
+    return el('p', { text: item.name + ' · ' + (device?.name ?? item.deviceId) + (device && !device.stale ? '' : '（离线）') })
+  })
   return [
     header,
     ...banners,
     el('div', { class: 'card' },
-      el('h2', { text: '智能体' }),
-      ...(rosterRows().length > 0 ? rosterRows() : [el('p', { class: 'empty', text: '电脑上报花名册后，这里会显示智能体名字。' })]),
+      el('h2', { text: '智能体花名册' }),
+      ...(members.length > 0 ? members : [el('p', { class: 'empty', text: '等待电脑上报智能体花名册。' })]),
     ),
     state.config?.lanBridge
       ? el('div', { class: 'card' },
@@ -943,41 +959,34 @@ function homeView(): Child[] {
 
 let sessionQuery = ''
 let sessionLimit = SESSION_PAGE_SIZE
-let roster: Array<{ deviceId: string; agent: string; name: string }> = []
+let roster: RosterEntry[] = []
 let boardTasks: Array<{ id: string; deviceId: string; title: string; detail: string; status: string; revision: number }> = []
 let boardRevisions: Record<string, number> = {}
+let boardReceipts: BoardReceipt[] = []
+let boardPoll: ReturnType<typeof setTimeout> | undefined
+let boardLoad = 0
+let memoryPoll: ReturnType<typeof setTimeout> | undefined
+let memoryLoad = 0
 let memoryEntries: Array<{ id: string; deviceId: string; layer: string; agent: string; text: string }> = []
 let groupKey = ''
 
-function namedAgent(agent: string, deviceId?: string): string {
-  const found = roster.find((item) => item.agent === agent && (!deviceId || item.deviceId === deviceId))
-    ?? roster.find((item) => item.name === agent)
-  return found?.name || agentLabel(agent)
-}
-
-function rosterRows(): Child[] {
-  return roster.map((item) => button(item.name, () => {
-    const device = state.devices.find((entry) => entry.id === item.deviceId) ?? state.devices[0]
-    if (!device) { toast('还没有在线的电脑', 'error'); return }
-    state.deviceId = device.id
-    void startNamedSession(device.id, item.agent, item.name)
-  }, { class: 'block' }))
-}
-
-async function startNamedSession(deviceId: string, agent: string, name: string): Promise<void> {
+async function startDeviceSession(deviceId: string, agent: string): Promise<void> {
   const api = state.api
   if (!api) return
+  const device = state.devices.find(entry => entry.id === deviceId && !entry.stale && entry.agents.includes(agent))
+  if (!device) { toast('该设备上的会话入口当前不可用', 'error'); return }
   const result = await api.command('create', { deviceId, agent, sessionId: null }, {})
-  if (!result.ok) { toast(name + '：' + result.message, 'error'); return }
-  await openDevice(state.devices.find((entry) => entry.id === deviceId) ?? { id: deviceId, name, agents: [agent], connectedAt: 0, lastSeen: 0, syncing: false, stale: false })
+  if (state.api !== api) return
+  if (!result.ok) { toast(agentLabel(agent) + '：' + result.message, 'error'); return }
+  await openDevice(device)
 }
 
 function sessionsView(): Child[] {
   const device = state.devices.find((entry) => entry.id === state.deviceId)
   const header = topbar(device?.name ?? '会话', '选择会话', [
     backButton('home'),
-    ...(device?.agents ?? []).map((agent) => button('新会话 · ' + namedAgent(agent, device?.id), () => {
-      void startNamedSession(device?.id ?? '', agent, namedAgent(agent, device?.id))
+    ...(device?.agents ?? []).map((agent) => button('新会话 · ' + agentLabel(agent), () => {
+      if (device) void startDeviceSession(device.id, agent)
     }, { class: 'icon-button' })),
   ])
   const search = el('input', {
@@ -998,7 +1007,7 @@ function sessionsView(): Child[] {
   for (const [agent, rows] of groups) {
     rows.sort((a, b) => b.updatedAt - a.updatedAt)
     sections.push(el('div', { class: 'agent-group' },
-      el('h3', { class: 'agent-title', text: namedAgent(agent, device?.id) + ' · ' + rows.length + ' 个会话' }),
+      el('h3', { class: 'agent-title', text: agentLabel(agent) + ' · ' + rows.length + ' 个会话' }),
       ...rows.map((row) => el('button', {
         class: 'session',
         onClick: () => { vibrate(); void openSession(state.deviceId ?? row.deviceId, row) },
@@ -1505,22 +1514,40 @@ function phoneApi(): MarshalApi | null {
 }
 
 async function loadBoard(): Promise<void> {
+  clearTimeout(boardPoll)
   const api = phoneApi()
   if (!api) { toast('看板需要手机配对凭证', 'error'); return }
+  const load = ++boardLoad
   const result = await api.board()
-  boardTasks = result.ok ? result.data.tasks : []
-  boardRevisions = result.ok ? result.data.revisions : {}
-  if (!result.ok) toast(result.message, 'error')
-  if (state.view === 'board') render()
+  if (load !== boardLoad || state.api !== api || state.view !== 'board') return
+  if (result.ok) {
+    boardTasks = result.data.tasks
+    boardRevisions = result.data.revisions
+    boardReceipts = result.data.receipts
+    if (boardReceipts.some(receipt => receipt.state === 'queued')) {
+      boardPoll = setTimeout(() => { if (state.view === 'board') void loadBoard() }, 3000)
+    }
+  } else toast(result.message, 'error')
+  render()
 }
 
 async function writeBoard(body: Record<string, unknown>): Promise<void> {
   const api = phoneApi()
   if (!api) return
   const result = await api.boardWrite(body)
+  if (state.api !== api || state.view !== 'board') return
   if (!result.ok) { toast(result.message, 'error'); return }
-  toast(result.data.code === 'queued' ? '已交给这台电脑，修订不一致时会拒绝' : '看板已更新')
+  toast(result.data.commandId ? '已排队，等待电脑回执' : '已排队，请刷新看板确认结果')
   await loadBoard()
+}
+
+const BOARD_RECEIPT_ACTION = { create: '新建', edit: '修改', move: '移动', delete: '删除' }
+const BOARD_RECEIPT_STATE = { queued: '等待回执', applied: '已应用', rejected: '已拒绝', unconfirmed: '结果未确认' }
+const BOARD_RECEIPT_REASON: Record<string, string> = {
+  conflict: '看板修订冲突',
+  unsupported: '电脑未启用该操作',
+  unavailable: '电脑未返回有效修订',
+  expired: '未在时限内收到回执',
 }
 
 function boardView(): Child[] {
@@ -1538,6 +1565,16 @@ function boardView(): Child[] {
       }, { class: 'primary' }),
       head === undefined ? el('p', { class: 'empty', text: '还没有这台电脑的看板修订。空看板也会带修订号，收到之后才能新建。' }) : null,
     ),
+    ...(boardReceipts.length > 0 ? [el('section', { class: 'card' },
+      el('h2', { text: '最近操作' }),
+      ...boardReceipts.slice(0, 8).map(receipt => {
+        const device = state.devices.find(item => item.id === receipt.deviceId)
+        const reason = receipt.code === undefined ? '' : BOARD_RECEIPT_REASON[receipt.code]
+        return el('p', { role: 'status', text: (device?.name ?? receipt.deviceId) + ' · '
+          + BOARD_RECEIPT_ACTION[receipt.action] + ' · ' + BOARD_RECEIPT_STATE[receipt.state]
+          + (reason ? '（' + reason + '）' : '') })
+      }),
+    )] : []),
     ...boardTasks.map((task) => el('div', { class: 'card' },
       el('h2', { text: task.title }),
       el('p', { class: 'empty', text: task.status + ' · 修订 ' + task.revision }),
@@ -1560,17 +1597,21 @@ function boardView(): Child[] {
 async function loadMemory(): Promise<void> {
   const api = phoneApi()
   if (!api) { toast('记忆需要手机配对凭证', 'error'); return }
+  clearTimeout(memoryPoll)
+  const load = ++memoryLoad
   const result = await api.memory()
+  if (load !== memoryLoad || state.api !== api || state.view !== 'memory') return
   memoryEntries = result.ok ? result.data : []
   if (!result.ok) toast(result.message, 'error')
-  if (state.view === 'memory') render()
+  else memoryPoll = setTimeout(() => { if (state.view === 'memory') void loadMemory() }, 15_000)
+  render()
 }
 
 function memoryView(): Child[] {
   return [
     topbar('记忆', '只读', [backButton('home'), button('刷新', () => { void loadMemory() }, { class: 'icon-button' })]),
     ...memoryEntries.map((entry) => el('div', { class: 'card' },
-      el('h2', { text: (entry.agent || '全局') + ' · ' + entry.layer }),
+      el('h2', { text: entry.layer === 'global' ? '全局 · 可共享' : (entry.agent || entry.deviceId) + ' · ' + entry.layer }),
       el('p', { text: entry.text }),
     )),
     memoryEntries.length === 0 ? el('p', { class: 'empty', text: '还没有可读的记忆。内容共享关闭时电脑不会外发正文。' }) : null,

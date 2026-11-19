@@ -10,7 +10,7 @@ import { HubRelay } from "./relay.js";
 import { mountHubSocket, webServerPort } from "./server.js";
 import { createHubSync } from "./sync.js";
 import { createAccountLogin } from "./account.js";
-import { createHubMemorySync } from "./memory-sync.js";
+import { accountOwnerForDevice, createHubMemorySync } from "./memory-sync.js";
 import { createPhoneHub } from "./phone.js";
 import { deliverPush, noticeForEvent } from "./push-send.js";
 import { readFileSync } from 'node:fs';
@@ -56,6 +56,8 @@ export function mountHub(webServer, config, logger) {
             now: Date.now,
             ...(config.dshAccountHash === undefined ? {} : { ownerHash: config.dshAccountHash }),
             store: install.store,
+            nodeConnection: id => registry.get(id)?.connectionId,
+            accountOwnerForNode: accountOwnerForDevice,
             findNode: (tokenDigest) => {
                 const row = install.store.findByTokenDigest(tokenDigest);
                 return row !== undefined && row.role !== 'phone' ? row : undefined;

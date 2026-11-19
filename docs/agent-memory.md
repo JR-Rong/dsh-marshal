@@ -51,7 +51,7 @@ Agent 进入一个工作区时，同时读取该工作区的共享记忆；换�
 - 会话开始：注入 Agent profile/handoff、当前 Workspace 交接、Global 规则；
 - 每条新用户消息：按最后一条用户消息做一次 top-k 召回；
 - 系统提示按“固定区 + 相关区”拼装，超预算整条裁剪；
-- 会话 turn/end 后 60 秒：过滤 → 摘要模型提炼 → 规则打分 → 写 Agent episode；
+- 成功的 `turn/end` 到达时，锁定回合文本与 Agent 身份。60 秒防抖期取最新一份已完成回合，再提炼、打分并写入该 Agent；
 - summaryProvider / summaryModel 留空，或当天 token 达到 `dailyTokenCap`（默认 50000）时，退回本地启发式，不再调用模型；
 - 摘要走插件其余路径同一个 `prepareCall` 包装。provider 不限定 qwen，填什么就调什么；
 - 用量记在 `summary-usage.json`，按 UTC 日累计模型返回的 token，没有用量字段时按字符估算。

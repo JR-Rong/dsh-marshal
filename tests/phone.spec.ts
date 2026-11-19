@@ -212,7 +212,7 @@ describe('phone credentials', () => {
     expect(boardCapabilities(host.board).apply).toEqual([])
     const faces = await readPhoneFaces(host, true)
     expect(faces.tasks).toEqual([{ id: 't', title: '报告', status: 'todo' }])
-    expect(faces.memory).toBeNull()
+    expect(faces.memory).toEqual({ code: 'unavailable' })
     expect(await applyBoardCommand(host, { id: 'c1', action: 'edit', baseRevision: 3, taskId: 't', title: '新标题' })).toEqual({ ok: false, code: 'unsupported' })
     const ready = {
       board: {
@@ -222,5 +222,97 @@ describe('phone credentials', () => {
       },
     }
     expect((await applyBoardCommand(ready, { id: 'c1', action: 'edit', baseRevision: 3, taskId: 't', title: '新标题' })).ok).toBe(true)
+  })
+})
+
+describe('phone transfer regressions', () => {
+  it('keeps the last board when the snapshot is missing or stale and accepts a current empty snapshot', () => {
+    const devices = store()
+    const { entry: device } = devices.add('mac', 'Mac')
+    const hub = createPhoneHub({ store: devices })
+    const auth = { ok: true as const, device }
+    hub.writeTasks(auth, { read: true, revision: 7, tasks: [{ id: 't', title: 'current' }] })
+    hub.writeTasks(auth, { ...forwardBody({ tasks: null, memory: null, roster: null }) })
+    hub.writeTasks(auth, { read: true, revision: 6, tasks: [] })
+    expect(hub.tasksFor('mac').map(task => task.title)).toEqual(['current'])
+    expect(hub.revisions()).toEqual({ mac: 7 })
+    hub.writeTasks(auth, { read: true, revision: 8, tasks: [] })
+    expect(hub.tasksFor('mac')).toEqual([])
+    expect(hub.revisions()).toEqual({ mac: 8 })
+  })
+
+  it('scopes command receipts to the initiating phone and ignores another node’s acknowledgement', () => {
+    const devices = store()
+    const { entry: mac } = devices.add('mac', 'Mac')
+    const { entry: other } = devices.add('other', 'Other')
+    let now = 5000
+    const hub = createPhoneHub({ store: devices, now: () => now })
+    const macAuth = { ok: true as const, device: mac }
+    const pair = (installation: string) => ({ ok: true as const, phone:
+      hub.redeem(hub.issuePairing('account-a', 'https://hub.example').code, 'Phone', installation).record,
+    })
+    const first = pair('phone-first')
+    const second = pair('phone-second')
+    hub.writeTasks(macAuth, { read: true, revision: 7, tasks: [] })
+    expect(hub.writeTasks(first, { deviceId: 'mac', action: 'create' }).conflict).toBe(true)
+    const applied = hub.writeTasks(first, { deviceId: 'mac', action: 'create', baseRevision: 7 })
+    const rejected = hub.writeTasks(second, { deviceId: 'mac', action: 'delete', baseRevision: 7 })
+    const lost = hub.writeTasks(first, { deviceId: 'mac', action: 'delete', baseRevision: 7 })
+    hub.writeTasks({ ok: true, device: other }, { applied: [applied.commandId] })
+    expect(hub.commandsFor('mac').map(command => command.id)).toContain(applied.commandId)
+    hub.writeTasks(macAuth, { read: true, applied: [applied.commandId], rejected: [{ id: rejected.commandId, code: 'conflict' }] })
+    expect(hub.receiptsFor(first)).toEqual([
+      { id: applied.commandId, deviceId: 'mac', action: 'create', state: 'applied' },
+      { id: lost.commandId, deviceId: 'mac', action: 'delete', state: 'queued' },
+    ])
+    expect(hub.receiptsFor(second)).toEqual([
+      { id: rejected.commandId, deviceId: 'mac', action: 'delete', state: 'rejected', code: 'conflict' },
+    ])
+    now += 120_000
+    expect(hub.commandsFor('mac')).toEqual([])
+    expect(hub.receiptsFor(first)[0]).toMatchObject({ id: lost.commandId, state: 'unconfirmed', code: 'expired' })
+  })
+
+  it('keeps distinct host member IDs and drops ambiguous legacy route placeholders', async () => {
+    const devices = store()
+    const { entry: device } = devices.add('mac', 'Mac')
+    const hub = createPhoneHub({ store: devices })
+    const faces = await readPhoneFaces({ roster: { list: () => ({ agents: [
+      { id: 'a', name: '同名' }, { id: 'b', name: '同名' }, { agent: 'dsh', name: 'unknown' },
+      { agent: 'legacy-member', name: 'Old' }, { id: 'a', name: 'Duplicate' },
+    ] }) } }, true)
+    hub.writeRoster({ ok: true, device }, faces.roster)
+    expect(hub.readRoster()).toEqual([
+      { id: 'a', deviceId: 'mac', name: '同名' },
+      { id: 'b', deviceId: 'mac', name: '同名' },
+      { id: 'legacy-member', deviceId: 'mac', name: 'Old' },
+    ])
+  })
+
+  it('requires advertised revision checks and a strictly newer revision on successful writes', async () => {
+    const cmd = { id: 'move-a', action: 'move', baseRevision: 7 }
+    let calls = 0
+    const host = (revision: boolean, resultRevision?: number) => ({
+      board: {
+        capabilities: () => ({ revision, apply: ['move'] }),
+        apply: () => { calls++; return { tasks: [], revision: resultRevision } },
+      },
+    })
+    await expect(applyBoardCommand(host(false, 8), cmd)).resolves.toEqual({ ok: false, code: 'unsupported' })
+    expect(calls).toBe(0)
+    await expect(applyBoardCommand(host(true), cmd)).resolves.toEqual({ ok: false, code: 'unavailable' })
+    await expect(applyBoardCommand(host(true, 6), cmd)).resolves.toEqual({ ok: false, code: 'unavailable' })
+    await expect(applyBoardCommand(host(true, 7), cmd)).resolves.toEqual({ ok: false, code: 'conflict' })
+    await expect(applyBoardCommand(host(true, 8), cmd)).resolves.toEqual({ ok: true, revision: 8 })
+  })
+
+  it('propagates withheld apart from an unavailable or genuinely empty memory snapshot', async () => {
+    const host = { memory: { readPhone: () => { throw new Error('must not read when withheld') } } }
+    await expect(readPhoneFaces(host, false)).resolves.toMatchObject({ memory: { code: 'withheld' } })
+    await expect(readPhoneFaces(host, true)).resolves.toMatchObject({ memory: { code: 'unavailable' } })
+    await expect(readPhoneFaces({ memory: { readPhone: () => ({ code: 'withheld' }) } }, true))
+      .resolves.toMatchObject({ memory: { code: 'withheld' } })
+    await expect(readPhoneFaces({ memory: { readPhone: () => ({ entries: [] }) } }, true))
+      .resolves.toMatchObject({ memory: { entries: [] } })
   })
 })

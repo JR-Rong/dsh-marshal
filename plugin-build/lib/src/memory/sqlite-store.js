@@ -256,13 +256,21 @@ export class MemoryStore {
         return mapMemory(row);
     }
 
-    list(scope, ownerId, { limit = 100, kinds } = {}) {
+    list(scope, ownerId, { limit = 100, kinds, visibility } = {}) {
         const db = this.db(scope, ownerId);
         const cap = Math.max(1, Math.min(500, Number(limit) || 100));
-        const rows = Array.isArray(kinds) && kinds.length > 0
-            ? db.prepare(`SELECT * FROM memories WHERE scope=? AND owner_id=? AND archived=0 AND kind IN (${kinds.map(() => '?').join(',')}) ORDER BY pinned DESC, importance DESC, updated_at DESC LIMIT ?`).all(scope, ownerId, ...kinds, cap)
-            : db.prepare('SELECT * FROM memories WHERE scope=? AND owner_id=? AND archived=0 ORDER BY pinned DESC, importance DESC, updated_at DESC LIMIT ?').all(scope, ownerId, cap);
-        return rows.map(mapMemory);
+        const clauses = ['scope=?', 'owner_id=?', 'archived=0'];
+        const params = [scope, ownerId];
+        if (Array.isArray(kinds) && kinds.length > 0) {
+            clauses.push('kind IN (' + kinds.map(() => '?').join(',') + ')');
+            params.push(...kinds);
+        }
+        if (visibility !== undefined) {
+            clauses.push('visibility=?', 'superseded_by IS NULL');
+            params.push(visibility);
+        }
+        return db.prepare('SELECT * FROM memories WHERE ' + clauses.join(' AND ')
+            + ' ORDER BY pinned DESC, importance DESC, updated_at DESC LIMIT ?').all(...params, cap).map(mapMemory);
     }
 
     forget(scope, ownerId, id) {

@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import test from 'node:test';
 import { createHubMemorySync, handleMemorySyncMigrate } from '../lib/src/hub/memory-sync.js';
-import { createAgentMemoryService } from '../lib/src/memory/agent-memory.js';
+import { createAgentMemoryService, mountAgentMemory } from '../lib/src/memory/agent-memory.js';
 import { createMemoryHttpAuth, resolveDesktopOwner } from '../lib/src/memory/http-auth.js';
 import { createMemoryRoutes } from '../lib/src/memory/http.js';
 import { attachFileProposals, createMemoryService } from '../lib/src/memory/mount.js';
@@ -184,4 +184,71 @@ test('injection without a session id fails closed as a group', () => {
     const roster = { ids: new Set(), status: 'missing' };
     assert.equal(sessionIsGroup({ agentId: 'agent-1' }, roster), true);
     assert.equal(sessionIsGroup({ agentId: 'agent-1', sessionId: 'solo', group: false }, roster), false);
+});
+
+test('debounced capture keeps the completed turn and owner when a new turn starts', async (t) => {
+    const root = tempRoot();
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    let listener;
+    let unmount;
+    const ledger = {
+        teams: [{ id: 'team', members: [{ id: 'agent-a', name: '甲' }, { id: 'agent-b', name: '乙' }] }],
+        runs: [{ sessionId: 'session-a', teamId: 'team', memberId: 'agent-a' }],
+    };
+    const ctx = {
+        inject() {},
+        effect(setup, label) {
+            if (label === 'marshal: agent memory session capture') unmount = setup();
+        },
+        on(name, callback) {
+            assert.equal(name, 'session/event');
+            listener = callback;
+        },
+    };
+    const service = mountAgentMemory(ctx, { memoryRoot: root, deviceId: 'dev-a' }, { ledger });
+    t.after(() => {
+        unmount?.();
+        service.store.close();
+        rmSync(root, { recursive: true, force: true });
+    });
+    const ended = { type: 'turn/end', seq: 3, data: { turn: 1, reason: 'completed' } };
+    const session = {
+        id: 'session-a',
+        events: [
+            { type: 'user/message', seq: 1, data: { content: '给 PR A 写测试' } },
+            { type: 'assistant/message', seq: 2, data: { turn: 1, message: { content: 'PR A 测试通过' } } },
+        ],
+    };
+    listener(session, ended);
+    session.events.push(ended, { type: 'user/message', seq: 4, data: { content: '给 PR B 评估设计' } });
+    ledger.runs[0].memberId = 'agent-b';
+    t.mock.timers.tick(60_000);
+    await Promise.resolve();
+    const [entry] = service.store.list('agent', 'agent-a');
+    assert.match(entry?.content ?? '', /用户目标：给 PR A 写测试\n\n结论：PR A 测试通过/);
+    assert.equal(entry?.sourceSession, 'session-a');
+    assert.equal(service.store.list('agent', 'agent-b').length, 0);
+
+    await service.summarizeSession(session);
+    const [manual] = service.store.list('agent', 'agent-b');
+    assert.equal(manual?.content, entry?.content);
+});
+
+test('phone projection exposes only active global entries marked visible to all', (t) => {
+    const root = tempRoot();
+    const service = createAgentMemoryService({ root });
+    t.after(() => {
+        service.store.close();
+        rmSync(root, { recursive: true, force: true });
+    });
+    service.store.remember('agent', 'agent-a', { title: '私有', content: '仅 Agent 可用' });
+    service.store.remember('workspace', 'project-a', { title: '项目笔记', content: '仅项目可用' });
+    service.store.remember('global', 'global', { title: '只限单聊', content: '仅单聊可用', visibility: 'no-group' });
+    service.store.propose({ title: '待审批', content: '候选', visibility: 'all' });
+    const entry = service.store.remember('global', 'global', { title: '约定', content: '已共享', visibility: 'all' });
+    assert.deepEqual(service.readPhone({ allowContent: false, capBytes: 1000 }), { code: 'withheld' });
+    assert.deepEqual(service.readPhone({ allowContent: true, capBytes: 10 }), { entries: [] });
+    assert.deepEqual(service.readPhone({ allowContent: true, capBytes: 1000 }), {
+        entries: [{ id: entry.id, layer: 'global', agent: '', text: '约定\n已共享' }],
+    });
 });

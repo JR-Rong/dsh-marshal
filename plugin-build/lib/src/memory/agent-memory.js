@@ -188,18 +188,55 @@ function sessionEvents(session) {
     catch { return []; }
 }
 
-function recentDialog(session) {
+function dialogFor(events) {
     const messages = [];
-    for (const event of sessionEvents(session)) {
+    for (const event of events) {
+        if (event?.surfaceOp !== undefined && event.surfaceOp !== 'append') continue;
         if (event?.type === 'user/message') messages.push({ role: 'user', text: textOfContent(event.data?.content) });
         else if (event?.type === 'assistant/message') messages.push({ role: 'assistant', text: textOfContent(event.data?.message?.content) });
     }
     return messages.filter(message => message.text.trim() !== '').slice(-16);
 }
 
-function heuristicSummary(session) {
-    const dialog = recentDialog(session);
+function completedDialog(session, endEvent) {
+    const events = sessionEvents(session);
+    const isEnd = event => event?.type === 'turn/end';
+    const succeeded = event => event.data?.reason == null || event.data.reason === 'completed';
+    if (endEvent !== undefined && !succeeded(endEvent)) return [];
+    let end = events.findLastIndex(event => isEnd(event) && (endEvent === undefined
+        ? succeeded(event)
+        : event === endEvent
+            || (Number.isSafeInteger(endEvent.seq) && endEvent.seq === event.seq)
+            || (endEvent.data?.turn !== undefined && endEvent.data.turn === event.data?.turn)));
+    if (end === -1) {
+        if (endEvent !== undefined) {
+            // Some hosts emit the end hook before adding the terminal record to the session.
+            if (!Number.isSafeInteger(endEvent.seq) || events.some(event => !Number.isSafeInteger(event?.seq))) return [];
+            end = events.findIndex(event => event.seq >= endEvent.seq);
+            if (end === -1) end = events.length;
+        } else {
+            if (events.some(isEnd)) return [];
+            // Older logs may lack turn markers. Exclude any still-unanswered tail.
+            const assistant = events.findLastIndex(event => event?.type === 'assistant/message');
+            return assistant < 0 ? [] : dialogFor(events.slice(0, assistant + 1));
+        }
+    }
+    const before = events.slice(0, end);
+    const previous = before.findLastIndex(isEnd);
+    const turn = (endEvent ?? events[end])?.data?.turn;
+    const dialog = dialogFor(before.slice(previous + 1)
+        .filter(event => turn === undefined || event?.data?.turn === undefined || event.data.turn === turn));
+    return dialog.at(-1)?.role === 'assistant' ? dialog : [];
+}
+
+function captureSummary(service, session, endEvent) {
+    const dialog = completedDialog(session, endEvent);
     if (dialog.length === 0) return undefined;
+    const { agentId, sessionId } = resolveMemoryIdentity({ session }, { deviceId: service.deviceId, ledger: service.ledger });
+    return agentId === undefined ? undefined : { agentId, sessionId, dialog };
+}
+
+function heuristicSummary(dialog) {
     const user = [...dialog].reverse().find(message => message.role === 'user');
     const assistant = [...dialog].reverse().find(message => message.role === 'assistant');
     const content = [
@@ -229,7 +266,7 @@ function memoryBlock(service, identity) {
             try { service.store.decay(target.scope, target.ownerId); service.lastDecay.set(key, Date.now()); } catch { /* decay must not break injection */ }
         }
     }
-    const lastUser = recentDialog(identity.session).filter(message => message.role === 'user').at(-1);
+    const lastUser = dialogFor(sessionEvents(identity.session)).filter(message => message.role === 'user').at(-1);
     const query = lastUser?.text ?? '';
     const cacheKey = (identity.sessionId ?? 'global') + (group ? ':group' : ':direct');
     const cached = service.blockCache.get(cacheKey);
@@ -301,10 +338,8 @@ function parseMemoryArray(text) {
     catch { return undefined; }
 }
 
-async function refineSession(service, session) {
-    const dialog = recentDialog(session).slice(-12);
-    if (dialog.length === 0) return [];
-    const text = dialog.map(message => (message.role === 'user' ? '用户：' : '助手：') + message.text.slice(0, 1600)).join('\n');
+async function refineDialog(service, dialog) {
+    const text = dialog.slice(-12).map(message => (message.role === 'user' ? '用户：' : '助手：') + message.text.slice(0, 1600)).join('\n');
     const cap = Number(service.settings.dailyTokenCap);
     const at = typeof service.now === 'function' ? service.now() : Date.now();
     if (Number.isFinite(cap) && cap > 0 && service.llm !== undefined && service.settings.summaryProvider !== '' && service.settings.summaryModel !== '') {
@@ -325,8 +360,8 @@ async function refineSession(service, session) {
             }
         }
     }
-    const summary = heuristicSummary(session);
-    return summary === undefined ? [] : [{ kind: 'event', title: summary.title, content: summary.content, importance: 45, tags: summary.tags }];
+    const summary = heuristicSummary(dialog);
+    return [{ kind: 'event', title: summary.title, content: summary.content, importance: 45, tags: summary.tags }];
 }
 
 function normalizeRefined(entry) {
@@ -434,6 +469,22 @@ export function agentMemoryTool(service) {
     };
 }
 
+async function writeSummary(service, snapshot) {
+    if (snapshot === undefined) return 0;
+    const entries = await refineDialog(service, snapshot.dialog);
+    let written = 0;
+    for (const raw of entries) {
+        const entry = normalizeRefined(raw);
+        if (entry === undefined) continue;
+        const stored = service.store.remember('agent', snapshot.agentId, entry, {
+            sessionId: snapshot.sessionId, deviceId: service.deviceId,
+        });
+        if (stored !== undefined) written++;
+    }
+    if (written > 0) service.cacheVersion++;
+    return written;
+}
+
 export function createAgentMemoryService({ root, logger, deviceId, hubUrl, token, passphrase, now = Date.now, ledger, groupsFile, groupsRoot, fileText, fileMemory, fetchImpl } = {}) {
     const store = new MemoryStore({ root, logger, now });
     const sync = createMemorySyncClient({ hubUrl, token, passphrase, deviceId, fetchImpl });
@@ -451,19 +502,20 @@ export function createAgentMemoryService({ root, logger, deviceId, hubUrl, token
         if (typeof fileMemory?.store?.promptText === 'function') return fileMemory.store.promptText(cwd) ?? '';
         return '';
     };
-    service.summarizeSession = async session => {
-        const identity = resolveMemoryIdentity({ session }, { deviceId, ledger: service.ledger });
-        if (identity.agentId === undefined) return 0;
-        const entries = await refineSession(service, session);
-        let written = 0;
-        for (const raw of entries) {
-            const entry = normalizeRefined(raw);
-            if (entry === undefined) continue;
-            service.store.remember('agent', identity.agentId, entry, { sessionId: identity.sessionId, deviceId });
-            written++;
+    service.summarizeSession = session => writeSummary(service, captureSummary(service, session));
+    service.readPhone = ({ allowContent, capBytes }) => {
+        if (!allowContent) return { code: 'withheld' };
+        const entries = [];
+        let remaining = Number.isSafeInteger(capBytes) ? Math.max(0, Math.min(24_000, capBytes)) : 0;
+        for (const item of store.list('global', 'global', { visibility: 'all', limit: 24 })) {
+            const text = (item.title + '\n' + item.content)
+                .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '').slice(0, 2000);
+            const size = Buffer.byteLength(text);
+            if (size === 0 || size > remaining) continue;
+            entries.push({ id: item.id, layer: 'global', agent: '', text });
+            remaining -= size;
         }
-        if (written > 0) service.cacheVersion++;
-        return written;
+        return { entries };
     };
     service.saveSettings = patch => {
         const next = { ...service.settings, ...(patch !== null && typeof patch === 'object' ? patch : {}) };
@@ -550,7 +602,7 @@ export function createAgentMemoryService({ root, logger, deviceId, hubUrl, token
 
 export function mountAgentMemory(ctx, config, options = {}) {
     const service = createAgentMemoryService({
-        root: config.memoryRoot, logger: options.logger ?? ctx.logger, deviceId: config.deviceId,
+        root: config.memoryRoot, logger: options.logger ?? ctx.logger, deviceId: config.deviceId, ledger: options.ledger,
         hubUrl: config.hubUrl, token: config.token, passphrase: process.env.DSH_MARSHAL_MEMORY_SYNC_KEY,
         fileMemory: options.fileMemory, groupsFile: options.groupsFile,
         groupsRoot: options.groupsRoot ?? config.groupsRoot, fileText: options.fileText,
@@ -570,25 +622,21 @@ export function mountAgentMemory(ctx, config, options = {}) {
             return scoped.tools.register(definition);
         }, 'marshal: agent memory tool');
     });
-    // Session-end capture. A configured summary model refines the dialog through the
-    // shared prepareCall wrapper until dailyTokenCap is spent; otherwise the local heuristic runs.
+    // Capture the completed dialog and its owner while the terminal event is current.
+    // Each session coalesces to the latest completed turn during its debounce window.
     const timers = new Map();
     try {
         ctx.effect(() => {
             const off = ctx.on?.('session/event', (session, event) => {
                 if (event?.type !== 'turn/end' || service.settings.autoSummary === false) return;
-                const id = session?.id;
-                if (typeof id !== 'string') return;
-                const old = timers.get(id);
-                if (old !== undefined) clearTimeout(old);
+                const snapshot = captureSummary(service, session, event);
+                if (snapshot === undefined || typeof snapshot.sessionId !== 'string') return;
+                const id = snapshot.sessionId;
+                clearTimeout(timers.get(id));
                 const timer = setTimeout(() => {
                     timers.delete(id);
-                    try {
-                        const identity = resolveMemoryIdentity({ session }, { deviceId: config.deviceId });
-                        if (identity.agentId === undefined) return;
-                        void service.summarizeSession(session).catch(error => (options.logger ?? ctx.logger)?.warn?.('marshal memory: session summary failed: ' + (error?.message ?? error)));
-                    }
-                    catch (error) { (options.logger ?? ctx.logger)?.warn?.('marshal memory: session summary failed: ' + (error?.message ?? error)); }
+                    if (service.settings.autoSummary === false) return;
+                    void writeSummary(service, snapshot).catch(error => (options.logger ?? ctx.logger)?.warn?.('marshal memory: session summary failed: ' + (error?.message ?? error)));
                 }, 60_000);
                 timers.set(id, timer);
             });

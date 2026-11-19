@@ -446,7 +446,6 @@ export function mountGroups(ctx, config, options = {}) {
         : ctx.llm;
     const drafter = createAgentDrafter({ llm, defaultModel: readDefaultModel });
     const promptAbort = new AbortController();
-    if (typeof ctx.effect === 'function') ctx.effect(() => () => promptAbort.abort(), 'marshal: groups prompt lifetime');
     const platformHash = async () => {
         try {
             const account = typeof ctx.get === 'function' ? ctx.get('deepseekAccount') : undefined;
@@ -481,6 +480,10 @@ export function mountGroups(ctx, config, options = {}) {
         reader: createReplyReader(surface),
         logger: options.logger ?? ctx.logger,
     });
+    if (typeof ctx.effect === 'function') ctx.effect(() => () => {
+        promptAbort.abort();
+        service.dispose();
+    }, 'marshal: groups prompt lifetime');
     ctx.inject(['tools'], (scoped) => {
         scoped.effect(() => {
             const agents = createAgentsHttpClient({

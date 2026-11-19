@@ -62,6 +62,79 @@ describe('phone guard', () => {
     expect(allowed.statusCode).not.toBe(401)
   })
 
+  it('drops phone memory on withdrawal, a changed grant, a disconnect, or a stale projection', async () => {
+    const devices = freshStore()
+    const node = devices.add('mac', 'Mac')
+    devices.setPolicy('mac', { allowContent: true })
+    let now = 5000
+    const registry = new DeviceRegistry()
+    let connectionId = 'connection-1'
+    const attach = () => registry.attach({ id: 'mac', name: 'Mac', agents: ['dsh'] }, { send() {} }, now,
+      { connectionId, nodeEpoch: 'node-test' })
+    attach()
+    const relay = new HubRelay({ registry, now: () => now, hubEpoch: 'hub-test' })
+    const phone = createPhoneHub({
+      store: devices, now: () => now,
+      findNode: digest => devices.findByTokenDigest(digest),
+      nodeConnection: id => registry.get(id)?.connectionId,
+      accountOwnerForNode: () => 'account-a',
+    })
+    web = createMemoryWeb()
+    routes = registerMarshalRoutes({
+      webServer: web.webServer, registry, relay, requireToken: TOKEN, publicOrigin: ORIGIN,
+      phone, loginFailureDelayMs: 0,
+    })
+    const client = phone.redeem(phone.issuePairing('account-a', ORIGIN).code, 'Phone', 'test-install')
+    const other = phone.redeem(phone.issuePairing('account-b', ORIGIN).code, 'Other phone', 'other-install')
+    const channel = web
+    const path = '/marshal/api/memory'
+    const put = (body: unknown) => channel.request(path, {
+      method: 'POST', headers: { authorization: 'Bearer mnd1.' + node.token, 'content-type': 'application/json' },
+      body: JSON.stringify({ connectionId, policyRevision: devices.findById('mac')?.policyRevision, ...(body as object) }),
+    })
+    const get = async (credential = client.credential) => JSON.parse((await channel.request(path, {
+      headers: { authorization: 'Bearer ' + credential },
+    })).body).entries as unknown[]
+    const published = { entries: [{ id: 'memory', layer: 'global', text: 'approved' }] }
+
+    const post = await put(published)
+    expect(post.statusCode).toBe(200)
+    expect(JSON.parse(post.body)).toEqual({ ok: true })
+    expect(await get()).toHaveLength(1)
+    expect(await get(other.credential)).toEqual([])
+    await put({ code: 'unavailable' })
+    expect(await get()).toHaveLength(1)
+    await put({ code: 'withheld' })
+    expect(await get()).toEqual([])
+
+    await put(published)
+    devices.setPolicy('mac', { allowContent: false })
+    await put(published)
+    expect(await get()).toEqual([])
+    devices.setPolicy('mac', { allowContent: true })
+    expect(await get()).toEqual([])
+    await put(published)
+    devices.setPolicy('mac', { allowContent: false })
+    devices.setPolicy('mac', { allowContent: true })
+    expect(await get()).toEqual([])
+
+    await put(published)
+    registry.detach('mac')
+    expect(await get()).toEqual([])
+    connectionId = 'connection-2'
+    attach()
+    await put({ ...published, connectionId: 'connection-1' })
+    expect(await get()).toEqual([])
+    await put(published)
+    expect(await get()).toHaveLength(1)
+    connectionId = 'connection-3'
+    attach()
+    expect(await get()).toEqual([])
+    await put(published)
+    now += 45_000
+    expect(await get()).toEqual([])
+  })
+
   it('closes streams on revoke and keeps the phone row', () => {
     const devices = freshStore()
     const phone = createPhoneHub({ store: devices, now: () => 1_000 })
