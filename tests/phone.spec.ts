@@ -75,6 +75,8 @@ describe('phone credentials', () => {
           { id: 'accept', label: '允许一次' },
           { id: 'decline', label: '拒绝' },
           { id: 'cancel', label: '取消' },
+          { id: 'accept', label: '总是' },
+          { id: 'permit-once', label: '允许一次' },
           { id: 'acceptForSession', label: '本会话内允许' },
         ],
       },
@@ -95,6 +97,8 @@ describe('phone credentials', () => {
     expect(command?.allowedIds.has('decline')).toBe(true)
     expect(command?.allowedIds.has('cancel')).toBe(true)
     expect(command?.allowedIds.has('acceptForSession')).toBe(false)
+    expect(command?.allowedIds.has('permit-once')).toBe(false)
+    expect(command?.allowedIds.size).toBe(3)
     expect(controllerCommandAllowed('answer', answer('accept'), command ?? undefined)).toBe(true)
     expect(controllerCommandAllowed('answer', answer('decline'), command ?? undefined)).toBe(true)
     expect(controllerCommandAllowed('answer', answer('cancel'), command ?? undefined)).toBe(true)
@@ -134,6 +138,42 @@ describe('phone credentials', () => {
     hub.watch(auth, 'mac|dsh|s1')
     hub.unwatch(auth, 'mac|dsh|s1')
     expect(hub.watchedBy(phone.record.id).size).toBe(0)
+  })
+
+  it('uses a card expiry and refuses a new card when 64 are still unanswered', () => {
+    const devices = store()
+    let at = 1_000
+    const hub = createPhoneHub({ store: devices, now: () => at })
+    const card = onceDecisionIds({ approval: { decisions: [{ id: 'decline', label: '拒绝' }] } })
+    if (!card) throw new Error('card')
+    expect(hub.rememberCard('short', card, 5_000)).toBe(true)
+    expect(hub.rememberCard('default', card)).toBe(true)
+    for (let index = 0; index < 62; index += 1) expect(hub.rememberCard('held-' + index, card)).toBe(true)
+    expect(hub.rememberCard('overflow', card)).toBe(false)
+    expect(hub.cardFor('held-0')?.allowedIds.has('decline')).toBe(true)
+    expect(hub.cardFor('overflow')).toBeUndefined()
+    at = 5_000
+    expect(hub.cardFor('short')).toBeUndefined()
+    expect(hub.cardFor('default')?.allowedIds.has('decline')).toBe(true)
+    expect(hub.rememberCard('after-expiry', card)).toBe(true)
+    expect(hub.cardFor('held-0')).toBeDefined()
+    at = 1_000 + 15 * 60_000
+    expect(hub.cardFor('default')).toBeUndefined()
+  })
+
+  it('keeps each Live Activity token under its own session', () => {
+    const devices = store()
+    const hub = createPhoneHub({ store: devices, now: () => 5_000 })
+    const issued = hub.issuePairing('account-a', 'https://hub.example')
+    const phone = hub.redeem(issued.code, '我的手机', 'install-live')
+    const auth = hub.authenticate(phone.credential.slice('mph1.'.length))
+    expect(auth.ok).toBe(true)
+    if (!auth.ok) return
+    hub.registerPush(auth, { provider: 'apns', token: 'device', liveTokens: { s1: 'aaa', s2: 'bbb' } })
+    expect(devices.findById(phone.record.id)?.liveTokens).toEqual({ s1: 'aaa', s2: 'bbb' })
+    hub.registerPush(auth, { provider: 'apns', token: 'device', liveTokens: { s2: 'bbb' } })
+    expect(devices.findById(phone.record.id)?.liveTokens).toEqual({ s2: 'bbb' })
+    expect(devices.findById(phone.record.id)?.liveToken).toBeUndefined()
   })
 
   it('does not mark a push delivered when the key is missing', async () => {

@@ -114,5 +114,22 @@ describe('push senders', () => {
     expect(result.delivered).toBe(true)
     expect(noticeForEvent('turn.started', { deviceId: 'd', agent: 'dsh', sessionId: 's' }, new Set())).toBeNull()
     expect(noticeForEvent('turn.started', { deviceId: 'd', agent: 'dsh', sessionId: 's' }, new Set(['d|dsh|s']))?.kind).toBe('run-start')
+    expect(noticeForEvent('turn.started', { deviceId: 'd', agent: 'dsh', sessionId: 's' }, new Set(['d|dsh|s']))?.sessionId).toBe('s')
+  })
+
+  it('updates the Live Activity for that session and not a shared token', async () => {
+    const { privateKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' })
+    const path = join(mkdtempSync(join(tmpdir(), 'marshal-apns-')), 'key.pem')
+    writeFileSync(path, privateKey.export({ type: 'pkcs8', format: 'pem' }))
+    const paths: string[] = []
+    const result = await deliverPush({
+      config: { apns: { keyId: 'KEY123', teamId: 'TEAM', bundleId: 'com.example.marshal', keyPath: path } },
+      deviceId: 'phone-sessions',
+      target: { provider: 'apns', token: 'device', liveToken: 'shared', liveTokens: { s1: 'one', s2: 'two' } },
+      notice: { kind: 'approval', title: '审批', body: '一次', dedupeKey: 'approval:session-s1', sessionId: 's1' },
+      apnsPost: async (request) => { paths.push(request.headers[':path'] ?? ''); return 200 },
+    })
+    expect(result.delivered).toBe(true)
+    expect(paths).toEqual(['/3/device/device', '/3/device/one'])
   })
 })

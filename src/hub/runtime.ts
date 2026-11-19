@@ -77,6 +77,7 @@ export function mountHub(webServer: WebServerLike, config: MarshalConfig, logger
             provider: target.pushProvider,
             token: target.pushToken,
             ...(target.liveToken === undefined ? {} : { liveToken: target.liveToken }),
+            ...(target.liveTokens === undefined ? {} : { liveTokens: target.liveTokens }),
           },
           notice,
         }).then((result) => {

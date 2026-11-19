@@ -9,7 +9,7 @@ export const PAIRING_TTL_MS = 60_000
 export const MAX_OPEN_CODES = 8
 export const PHONE_PREFIX = 'mph1.'
 export const NODE_PREFIX = 'mnd1.'
-const UNSAFE_APPROVAL = /always|persist|remember|session|don'?t\s*ask|总是|始终|会话内/i
+const ALLOWED_DECISION = new Set(['accept', 'decline', 'cancel'])
 
 export interface TaskCard {
   readonly id: string
@@ -68,7 +68,7 @@ export interface PendingDecisionCard {
   readonly allowedIds: ReadonlySet<string>
 }
 
-/** 允许「这一次」的 accept，以及 decline / cancel。拒绝总是、记住、会话内这类放宽。 */
+/** 审批只允许 accept、decline、cancel 这三个 id。其它 id 一律拒绝。提问没有 approval，不受这道限制。 */
 export function onceDecisionIds(card: unknown): PendingDecisionCard | null {
   if (typeof card !== 'object' || card === null) return null
   const record = card as Record<string, unknown>
@@ -80,11 +80,8 @@ export function onceDecisionIds(card: unknown): PendingDecisionCard | null {
   if (Array.isArray(approval.decisions)) {
     for (const raw of approval.decisions) {
       if (typeof raw !== 'object' || raw === null) continue
-      const decision = raw as { id?: unknown; label?: unknown }
-      const id = typeof decision.id === 'string' ? decision.id : ''
-      const label = typeof decision.label === 'string' ? decision.label : ''
-      if (!id || UNSAFE_APPROVAL.test(id) || UNSAFE_APPROVAL.test(label)) continue
-      allowedIds.add(id)
+      const id = (raw as { id?: unknown }).id
+      if (typeof id === 'string' && ALLOWED_DECISION.has(id)) allowedIds.add(id)
     }
   }
   return { approval: true, allowedIds }
@@ -169,7 +166,6 @@ export function createPhoneHub(options: {
     const at = now()
     const rows = [...pendingCards.entries()]
       .filter(([, item]) => item.expiresAt > at)
-      .slice(-MAX_CARDS)
       .map(([requestId, item]) => ({
         requestId,
         approval: item.card.approval,
@@ -253,16 +249,18 @@ export function createPhoneHub(options: {
       streams.delete(id)
       open?.forEach((close) => close())
     },
-    rememberCard(requestId: string, card: PendingDecisionCard) {
+    rememberCard(requestId: string, card: PendingDecisionCard, expiresAt?: number): boolean {
       const at = now()
       for (const [id, item] of pendingCards) if (item.expiresAt <= at) pendingCards.delete(id)
-      while (pendingCards.size >= MAX_CARDS) {
-        const oldest = pendingCards.keys().next().value
-        if (oldest === undefined) break
-        pendingCards.delete(oldest)
+      const expiry = typeof expiresAt === 'number' && Number.isFinite(expiresAt) ? expiresAt : at + CARD_TTL_MS
+      if (!(expiry > at)) {
+        if (pendingCards.delete(requestId)) saveCards()
+        return false
       }
-      pendingCards.set(requestId, { card, expiresAt: at + CARD_TTL_MS })
+      if (!pendingCards.has(requestId) && pendingCards.size >= MAX_CARDS) return false
+      pendingCards.set(requestId, { card, expiresAt: expiry })
       saveCards()
+      return true
     },
     forgetCard(requestId: string) {
       if (!pendingCards.delete(requestId)) return
@@ -389,7 +387,12 @@ export function createPhoneHub(options: {
       roster.set(auth.device.id, next)
       return next
     },
-    registerPush(auth: PhoneAuth, target: { provider: 'apns' | 'fcm' | 'huawei'; token: string; liveToken?: string }) {
+    registerPush(auth: PhoneAuth, target: {
+      provider: 'apns' | 'fcm' | 'huawei'
+      token: string
+      liveToken?: string
+      liveTokens?: Readonly<Record<string, string>>
+    }) {
       if (!auth.ok || !target.token) throw Object.assign(new Error('unauthorized'), { code: 'unauthorized' })
       options.store.setPhonePush(auth.phone.id, target)
     },

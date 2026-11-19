@@ -1,6 +1,11 @@
 import { createSign, randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import http2 from 'node:http2';
+function activityToken(target, sessionId) {
+    if (sessionId)
+        return target.liveTokens?.[sessionId] || undefined;
+    return target.liveToken;
+}
 const seen = new Map();
 const sentAt = new Map();
 function b64url(value) {
@@ -55,15 +60,16 @@ export async function deliverPush(input) {
             ...(input.apnsPost === undefined ? {} : { post: input.apnsPost }),
         });
         const liveKind = input.notice.kind === 'run-start' || input.notice.kind === 'run-finish' || input.notice.kind === 'approval';
+        const activity = activityToken(input.target, input.notice.sessionId);
         if (input.notice.kind === 'approval') {
             const alert = await post(input.target.token, false);
-            if (input.target.liveToken)
-                await post(input.target.liveToken, true);
+            if (activity)
+                await post(activity, true);
             return alert >= 200 && alert < 300
                 ? { delivered: true, reason: 'sent' }
                 : { delivered: false, reason: 'provider-' + alert };
         }
-        const status = await post(liveKind && input.target.liveToken ? input.target.liveToken : input.target.token, Boolean(liveKind && input.target.liveToken));
+        const status = await post(liveKind && activity ? activity : input.target.token, Boolean(liveKind && activity));
         return status >= 200 && status < 300
             ? { delivered: true, reason: 'sent' }
             : { delivered: false, reason: 'provider-' + status };
@@ -225,9 +231,11 @@ function postApns(input) {
 }
 export function noticeForEvent(kind, payload, watched) {
     const record = typeof payload === 'object' && payload !== null ? payload : {};
-    const sessionKey = [record.deviceId, record.agent, record.sessionId].every((part) => typeof part === 'string')
-        ? String(record.deviceId) + '|' + String(record.agent) + '|' + String(record.sessionId)
+    const sessionId = typeof record.sessionId === 'string' && record.sessionId ? record.sessionId : undefined;
+    const sessionKey = typeof record.deviceId === 'string' && typeof record.agent === 'string' && sessionId
+        ? record.deviceId + '|' + record.agent + '|' + sessionId
         : '';
+    const sessionField = sessionId === undefined ? {} : { sessionId };
     if (kind === 'input.requested') {
         const approval = typeof record.approval === 'object' && record.approval !== null;
         const id = typeof record.requestId === 'string' ? record.requestId : randomBytes(4).toString('hex');
@@ -236,6 +244,7 @@ export function noticeForEvent(kind, payload, watched) {
             title: approval ? '需要审批' : '需要回答',
             body: approval ? '只允许这一次' : '有一条提问',
             dedupeKey: (approval ? 'approval:' : 'question:') + id,
+            ...sessionField,
         };
     }
     if ((kind === 'turn.started' || kind === 'turn.completed') && sessionKey && watched.has(sessionKey)) {
@@ -244,6 +253,7 @@ export function noticeForEvent(kind, payload, watched) {
             title: kind === 'turn.started' ? '开始运行' : '运行结束',
             body: sessionKey,
             dedupeKey: kind + ':' + sessionKey,
+            ...sessionField,
         };
     }
     return null;

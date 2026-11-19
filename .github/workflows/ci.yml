@@ -83,6 +83,9 @@ jobs:
       - name: assembleDebug
         working-directory: mobile/android
         run: chmod +x ./gradlew && ./gradlew assembleDebug --console=plain
+      - name: android unit tests
+        working-directory: mobile/android
+        run: ./gradlew testDebugUnitTest --console=plain
 
   ios:
     runs-on: macos-15

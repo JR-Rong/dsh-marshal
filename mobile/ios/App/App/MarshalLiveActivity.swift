@@ -10,10 +10,34 @@ struct MarshalAttributes: ActivityAttributes {
     var session: String
 }
 
-/// 每个会话只保留一个 Live Activity。结束时关掉它，并记下更新令牌。
+/// 每个会话只保留一个 Live Activity。更新令牌按会话存放，一签发就通知应用发给 Hub。
 @available(iOS 16.2, *)
 enum MarshalLiveActivity {
+    private static let tokensKey = "marshal.push.live.sessions"
     private static var activities: [String: Activity<MarshalAttributes>] = [:]
+
+    static func remember(token: String, session: String) {
+        guard !session.isEmpty, !token.isEmpty else { return }
+        var map = UserDefaults.standard.dictionary(forKey: tokensKey) as? [String: String] ?? [:]
+        map[session] = token
+        UserDefaults.standard.set(map, forKey: tokensKey)
+        NotificationCenter.default.post(
+            name: Notification.Name("marshal.liveToken"),
+            object: nil,
+            userInfo: ["session": session, "token": token]
+        )
+    }
+
+    static func forget(session: String) {
+        var map = UserDefaults.standard.dictionary(forKey: tokensKey) as? [String: String] ?? [:]
+        map.removeValue(forKey: session)
+        UserDefaults.standard.set(map, forKey: tokensKey)
+        NotificationCenter.default.post(
+            name: Notification.Name("marshal.liveToken"),
+            object: nil,
+            userInfo: ["session": session, "token": ""]
+        )
+    }
 
     static func start(title: String, phase: String, session: String) {
         let state = MarshalAttributes.ContentState(title: title, phase: phase)
@@ -31,7 +55,7 @@ enum MarshalLiveActivity {
             Task {
                 for await tokenData in activity.pushTokenUpdates {
                     let token = tokenData.map { String(format: "%02x", $0) }.joined()
-                    UserDefaults.standard.set(token, forKey: "marshal.push.live")
+                    remember(token: token, session: session)
                 }
             }
         } catch {
@@ -40,6 +64,7 @@ enum MarshalLiveActivity {
     }
 
     static func end(session: String) {
+        forget(session: session)
         guard let activity = activities.removeValue(forKey: session) else { return }
         let state = MarshalAttributes.ContentState(title: "已结束", phase: "done")
         Task { await activity.end(ActivityContent(state: state, staleDate: nil), dismissalPolicy: .immediate) }
@@ -48,9 +73,10 @@ enum MarshalLiveActivity {
     static func registerPushToken() {
         Task {
             for await activity in Activity<MarshalAttributes>.activityUpdates {
+                let session = activity.attributes.session
                 for await tokenData in activity.pushTokenUpdates {
                     let token = tokenData.map { String(format: "%02x", $0) }.joined()
-                    UserDefaults.standard.set(token, forKey: "marshal.push.live")
+                    remember(token: token, session: session)
                     UserDefaults.standard.removeObject(forKey: "marshal.push.live.error")
                 }
             }

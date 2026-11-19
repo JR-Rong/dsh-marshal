@@ -24,6 +24,8 @@ export interface DeviceRecord {
   /** 推送令牌是厂商发送所必需的，设备文件权限 0600。控制器凭证仍然只存摘要。 */
   readonly pushToken?: string
   readonly liveToken?: string
+  /** Live Activity 更新令牌，按会话存放。空对象表示手机已经清掉全部活动。 */
+  readonly liveTokens?: Readonly<Record<string, string>>
   readonly lastSeen?: number
 }
 
@@ -148,6 +150,25 @@ function validateRecord(value: unknown, index: number): ValidatedRecord {
   }
 }
 
+function sanitizeLiveTokens(value: unknown): Record<string, string> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return {}
+  const out: Record<string, string> = {}
+  for (const [session, token] of Object.entries(value)) {
+    if (Object.keys(out).length >= 32) break
+    if (session.length === 0 || session.length > 128 || /[\x00-\x1f\x7f]/.test(session)) continue
+    if (typeof token !== 'string' || token.length === 0 || token.length > 512) continue
+    out[session] = token
+  }
+  return out
+}
+
+function withoutActivityTokens(record: DeviceRecord): DeviceRecord {
+  const copy: DeviceRecord = { ...record }
+  delete (copy as { liveToken?: string }).liveToken
+  delete (copy as { liveTokens?: Readonly<Record<string, string>> }).liveTokens
+  return copy
+}
+
 function parsePhoneFields(value: Record<string, unknown>, index: number): {
   role?: 'phone'
   accountHash?: string
@@ -155,6 +176,7 @@ function parsePhoneFields(value: Record<string, unknown>, index: number): {
   pushProvider?: 'apns' | 'fcm' | 'huawei'
   pushToken?: string
   liveToken?: string
+  liveTokens?: Readonly<Record<string, string>>
   lastSeen?: number
 } {
   if (value.role !== undefined && value.role !== 'phone') {
@@ -172,6 +194,7 @@ function parsePhoneFields(value: Record<string, unknown>, index: number): {
   const installationId = text('installationId')
   const pushToken = text('pushToken')
   const liveToken = text('liveToken')
+  const liveTokens = sanitizeLiveTokens(value.liveTokens)
   if (value.pushProvider !== undefined && value.pushProvider !== 'apns' && value.pushProvider !== 'fcm' && value.pushProvider !== 'huawei') {
     throw new DeviceStateError('invalid', `devices[${index}].pushProvider is unknown`)
   }
@@ -184,6 +207,7 @@ function parsePhoneFields(value: Record<string, unknown>, index: number): {
     ...(installationId === undefined ? {} : { installationId }),
     ...(pushToken === undefined ? {} : { pushToken }),
     ...(liveToken === undefined ? {} : { liveToken }),
+    ...(Object.keys(liveTokens).length > 0 ? { liveTokens } : {}),
     ...(value.pushProvider === 'apns' || value.pushProvider === 'fcm' || value.pushProvider === 'huawei'
       ? { pushProvider: value.pushProvider }
       : {}),
@@ -488,16 +512,30 @@ export class DeviceStore {
     })
   }
 
-  setPhonePush(id: string, target: { provider: 'apns' | 'fcm' | 'huawei'; token: string; liveToken?: string }): void {
+  setPhonePush(id: string, target: {
+    provider: 'apns' | 'fcm' | 'huawei'
+    token: string
+    liveToken?: string
+    liveTokens?: Readonly<Record<string, string>>
+  }): void {
     this.mutate(state => {
       const current = state.devices.find(device => device.id === id)
       if (current?.role !== 'phone' || current.revoked) throw new DeviceStateError('unknown-device', 'phone not found')
-      const entry: DeviceRecord = {
-        ...current,
-        pushProvider: target.provider,
-        pushToken: target.token,
-        ...(target.liveToken === undefined ? {} : { liveToken: target.liveToken }),
-      }
+      const replacingActivities = target.liveTokens !== undefined
+      const liveTokens = replacingActivities ? sanitizeLiveTokens(target.liveTokens) : undefined
+      const entry: DeviceRecord = replacingActivities
+        ? {
+            ...withoutActivityTokens(current),
+            pushProvider: target.provider,
+            pushToken: target.token,
+            ...(liveTokens !== undefined && Object.keys(liveTokens).length > 0 ? { liveTokens } : {}),
+          }
+        : {
+            ...current,
+            pushProvider: target.provider,
+            pushToken: target.token,
+            ...(target.liveToken === undefined ? {} : { liveToken: target.liveToken }),
+          }
       return {
         state: { ...state, devices: state.devices.map(device => device.id === id ? entry : device) },
         result: undefined,

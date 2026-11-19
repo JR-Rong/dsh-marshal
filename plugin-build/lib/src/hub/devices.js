@@ -86,6 +86,23 @@ function validateRecord(value, index) {
         revisionUnconfirmed,
     };
 }
+function sanitizeLiveTokens(value) {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return {};
+    const out = {};
+    for (const [session, token] of Object.entries(value)) {
+        if (Object.keys(out).length >= 32) break;
+        if (session.length === 0 || session.length > 128 || /[\x00-\x1f\x7f]/.test(session)) continue;
+        if (typeof token !== 'string' || token.length === 0 || token.length > 512) continue;
+        out[session] = token;
+    }
+    return out;
+}
+function withoutActivityTokens(record) {
+    const copy = { ...record };
+    delete copy.liveToken;
+    delete copy.liveTokens;
+    return copy;
+}
 function parsePhoneFields(value, index) {
     if (value.role !== undefined && value.role !== 'phone') {
         throw new DeviceStateError('invalid', `devices[${index}].role must be phone`);
@@ -102,6 +119,7 @@ function parsePhoneFields(value, index) {
     const installationId = text('installationId');
     const pushToken = text('pushToken');
     const liveToken = text('liveToken');
+    const liveTokens = sanitizeLiveTokens(value.liveTokens);
     if (value.pushProvider !== undefined && value.pushProvider !== 'apns' && value.pushProvider !== 'fcm' && value.pushProvider !== 'huawei') {
         throw new DeviceStateError('invalid', `devices[${index}].pushProvider is unknown`);
     }
@@ -114,6 +132,7 @@ function parsePhoneFields(value, index) {
         ...(installationId === undefined ? {} : { installationId }),
         ...(pushToken === undefined ? {} : { pushToken }),
         ...(liveToken === undefined ? {} : { liveToken }),
+        ...(Object.keys(liveTokens).length > 0 ? { liveTokens } : {}),
         ...(value.pushProvider === 'apns' || value.pushProvider === 'fcm' || value.pushProvider === 'huawei' ? { pushProvider: value.pushProvider } : {}),
         ...(typeof value.lastSeen === 'number' ? { lastSeen: value.lastSeen } : {}),
     };
@@ -419,12 +438,21 @@ export class DeviceStore {
             const current = state.devices.find(device => device.id === id);
             if (current?.role !== 'phone' || current.revoked)
                 throw new DeviceStateError('unknown-device', 'phone not found');
-            const entry = {
-                ...current,
-                pushProvider: target.provider,
-                pushToken: target.token,
-                ...(target.liveToken === undefined ? {} : { liveToken: target.liveToken }),
-            };
+            const replacingActivities = target.liveTokens !== undefined;
+            const liveTokens = replacingActivities ? sanitizeLiveTokens(target.liveTokens) : undefined;
+            const entry = replacingActivities
+                ? {
+                    ...withoutActivityTokens(current),
+                    pushProvider: target.provider,
+                    pushToken: target.token,
+                    ...(liveTokens !== undefined && Object.keys(liveTokens).length > 0 ? { liveTokens } : {}),
+                }
+                : {
+                    ...current,
+                    pushProvider: target.provider,
+                    pushToken: target.token,
+                    ...(target.liveToken === undefined ? {} : { liveToken: target.liveToken }),
+                };
             return {
                 state: { ...state, devices: state.devices.map(device => device.id === id ? entry : device) },
                 result: undefined,

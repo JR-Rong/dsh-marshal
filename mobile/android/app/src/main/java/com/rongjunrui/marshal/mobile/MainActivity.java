@@ -13,7 +13,6 @@ import androidx.core.app.NotificationCompat;
 import androidx.core.content.ContextCompat;
 
 import com.getcapacitor.BridgeActivity;
-import com.google.firebase.messaging.FirebaseMessaging;
 import com.huawei.hms.aaid.HmsInstanceId;
 import com.rongjunrui.marshalstream.PushTokens;
 
@@ -38,9 +37,7 @@ public class MainActivity extends BridgeActivity {
             @Override public void show(String title, String body) { showOngoing(MainActivity.this, title, body); }
             @Override public void clear() { cancelOngoing(MainActivity.this); }
         };
-        FirebaseMessaging.getInstance().getToken().addOnSuccessListener(token -> {
-            if (token != null && !token.isEmpty()) PushTokens.update("fcm", token);
-        });
+        PushBootstrap.readFirebase(this);
         new Thread(this::readHuaweiToken).start();
     }
 

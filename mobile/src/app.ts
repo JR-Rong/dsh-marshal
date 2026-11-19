@@ -23,6 +23,7 @@ import { openQrScanner } from './lib/scanner.ts'
 import { installationId, readConfig, readPinGuard, removeConfig, writeConfig, writePinGuard } from './lib/storage.ts'
 import { createLock, pinDelay, verifyPin, isValidPin, type LockRecord } from './lib/lock.ts'
 import { decideDeepLink, linkCarriesSecret, parsePairingLink } from './lib/deeplink.ts'
+import { livePhaseAfterApproval } from './lib/live.ts'
 import { resolveSettingsToken, SETTINGS_TOKEN_PLACEHOLDER } from './lib/settings-token.ts'
 import {
   setupChrome, inNativeShell, openExternal, vibrate, exitApp,
@@ -285,14 +286,15 @@ async function registerDevicePush(): Promise<void> {
   if (!api) return
   try {
     const plugin = await import('marshal-stream')
-    const events = plugin.MarshalStream as unknown as { addListener(name: string, cb: () => void): Promise<unknown>; pushToken?: () => Promise<{ ok?: boolean; provider?: string; token?: string; liveToken?: string }> }
+    const events = plugin.MarshalStream as unknown as { addListener(name: string, cb: () => void): Promise<unknown>; pushToken?: () => Promise<{ ok?: boolean; provider?: string; token?: string; liveToken?: string; liveTokens?: Record<string, string> }> }
     if (!pushListening) {
       pushListening = true
       await events.addListener('pushToken', () => { void registerDevicePush() })
+      await events.addListener('liveToken', () => { void registerDevicePush() })
     }
     const token = await events.pushToken?.()
     if (!token || token.ok !== true || !token.token || (token.provider !== 'apns' && token.provider !== 'fcm' && token.provider !== 'huawei')) return
-    await api.registerPush(token.provider, token.token, token.liveToken)
+    await api.registerPush(token.provider, token.token, token.liveToken, token.provider === 'apns' ? token.liveTokens ?? {} : undefined)
   } catch { /* 浏览器预览没有推送插件 */ }
 }
 
@@ -482,7 +484,8 @@ async function onFrame(frame: StreamFrame): Promise<void> {
     case 'input.resolved': {
       const requestId = typeof payload.requestId === 'string' ? payload.requestId : ''
       state.cards = state.cards.filter((card) => card.requestId !== requestId)
-      void showLive('已处理', 'done', typeof event.sessionId === 'string' ? event.sessionId : requestId, true)
+      const phase = livePhaseAfterApproval(state.running)
+      void showLive(phase.title, phase.phase, typeof event.sessionId === 'string' ? event.sessionId : requestId, phase.end)
       render()
       return
     }

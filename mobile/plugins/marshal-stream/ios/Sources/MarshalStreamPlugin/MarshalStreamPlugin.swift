@@ -48,8 +48,8 @@ public class MarshalStreamPlugin: CAPPlugin, CAPBridgedPlugin {
             return
         }
         var result: [String: Any] = ["ok": true, "provider": "apns", "token": token]
-        if let live = defaults.string(forKey: "marshal.push.live"), !live.isEmpty {
-            result["liveToken"] = live
+        if let live = defaults.dictionary(forKey: "marshal.push.live.sessions") as? [String: String] {
+            result["liveTokens"] = live
         }
         call.resolve(result)
     }
@@ -59,6 +59,12 @@ public class MarshalStreamPlugin: CAPPlugin, CAPBridgedPlugin {
             let token = note.userInfo?["token"] as? String ?? ""
             if token.isEmpty { return }
             self?.notifyListeners("pushToken", data: ["ok": true, "provider": "apns", "token": token])
+        }
+        NotificationCenter.default.addObserver(forName: Notification.Name("marshal.liveToken"), object: nil, queue: .main) { [weak self] note in
+            self?.notifyListeners("liveToken", data: [
+                "session": note.userInfo?["session"] as? String ?? "",
+                "token": note.userInfo?["token"] as? String ?? "",
+            ])
         }
     }
 

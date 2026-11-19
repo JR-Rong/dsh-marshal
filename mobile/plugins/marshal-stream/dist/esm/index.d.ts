@@ -10,6 +10,7 @@ export interface PushTokenResult {
   provider?: 'apns' | 'fcm' | 'huawei'
   token?: string
   liveToken?: string
+  liveTokens?: Record<string, string>
   reason?: string
 }
 

@@ -418,7 +418,8 @@ export function registerMarshalRoutes(options) {
         if (event.kind === 'input.resolved') phone.forgetCard(requestId);
         if (event.kind === 'input.requested') {
             const card = onceDecisionIds(payload);
-            if (card) phone.rememberCard(requestId, card);
+            const expiresAt = typeof payload.expiresAt === 'number' && Number.isFinite(payload.expiresAt) ? payload.expiresAt : undefined;
+            if (card) phone.rememberCard(requestId, card, expiresAt);
         }
     }));
     // 每条 SSE 流一个清理函数：取消订阅、清心跳，并把自己从集合里移除。
@@ -1126,10 +1127,12 @@ export function registerMarshalRoutes(options) {
             json(res, 400, { ok: false, code: 'invalid-args' });
             return;
         }
+        const liveTokens = body.liveTokens;
         phone.registerPush(auth, {
             provider,
             token: body.token,
             ...(typeof body.liveToken === 'string' ? { liveToken: body.liveToken } : {}),
+            ...(typeof liveTokens === 'object' && liveTokens !== null && !Array.isArray(liveTokens) ? { liveTokens } : {}),
         });
         json(res, 200, { ok: true });
     }));

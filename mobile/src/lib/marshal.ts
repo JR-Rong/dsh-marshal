@@ -476,8 +476,15 @@ export class MarshalApi {
     return { ok: true, data: entries }
   }
 
-  async registerPush(provider: 'apns' | 'fcm' | 'huawei', token: string, liveToken?: string): Promise<ApiResult<Record<string, unknown>>> {
-    return this.request('/marshal/api/push-token', { body: { provider, token, ...(liveToken ? { liveToken } : {}) } })
+  async registerPush(provider: 'apns' | 'fcm' | 'huawei', token: string, liveToken?: string, liveTokens?: Record<string, string>): Promise<ApiResult<Record<string, unknown>>> {
+    return this.request('/marshal/api/push-token', {
+      body: {
+        provider,
+        token,
+        ...(liveToken ? { liveToken } : {}),
+        ...(liveTokens ? { liveTokens } : {}),
+      },
+    })
   }
 
   async watchSession(target: Target): Promise<ApiResult<Record<string, unknown>>> {
@@ -612,10 +619,9 @@ function parseOptions(raw: unknown): CardOption[] {
   })
 }
 
-/** 任何「总是 / 记住 / 会话内」语义的审批选项都不得呈现或发送。 */
+/** 手机只呈现 accept、decline、cancel。其它 id 不显示，也不发送。 */
 export function decisionIsSafe(decision: CardOption): boolean {
-  const unsafe = /always|persist|remember|session|don'?t\s*ask|总是|始终|会话内/i
-  return !unsafe.test(decision.id) && !unsafe.test(decision.label)
+  return decision.id === 'accept' || decision.id === 'decline' || decision.id === 'cancel'
 }
 
 export function parseControls(value: unknown): SessionControls | null {
