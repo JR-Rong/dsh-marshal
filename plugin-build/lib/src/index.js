@@ -294,6 +294,42 @@ function applyNode(ctx, config) {
             nodeEpoch, seq: 0, ts: Date.now(), kind, payload,
         };
     };
+    let lastInventory;
+    const publishInventory = () => {
+        try {
+            const ledger = readAgentsLedger();
+            const handshake = link.handshake;
+            if (handshake !== undefined) {
+                const inventory = {
+                    v: 2, type: 'device.inventory',
+                    connectionId: handshake.connectionId, nodeEpoch: handshake.nodeEpoch,
+                    deviceName: config.deviceName,
+                    squads: ledger.teams.map(team => ({
+                        id: team.id,
+                        name: team.name,
+                        ...(team.workspaceId ? { workspaceId: team.workspaceId } : {}),
+                        members: team.members.map(member => ({
+                            id: member.id,
+                            name: member.name,
+                            ...(member.preset === undefined ? {} : { preset: member.preset }),
+                            ...(member.permission === undefined ? {} : { permission: member.permission }),
+                            ...(member.model === undefined ? {} : { model: member.model }),
+                            ...(member.reasoningEffort === undefined ? {} : { reasoningEffort: member.reasoningEffort }),
+                            ...(member.brief === undefined ? {} : { brief: member.brief }),
+                            ...(member.sessionId === undefined ? {} : { sessionId: member.sessionId }),
+                        })),
+                    })),
+                    codex: config.agents.includes('codex'),
+                };
+                const serialized = encodeFrame(inventory);
+                if (serialized !== lastInventory) {
+                    link.sendControl(serialized);
+                    lastInventory = serialized;
+                }
+            }
+        }
+        catch { /* inventory is optional metadata */ }
+    };
     const link = new NodeLink({
         ...(hubCa === undefined ? {} : { ca: hubCa }),
         url: config.hubUrl, token: config.token, deviceId: config.deviceId,
@@ -321,33 +357,8 @@ function applyNode(ctx, config) {
         onHandshake: (binding, previous) => {
             discussions?.invalidate();
             void discussions?.announce().catch(() => { });
-            try {
-                const ledger = readAgentsLedger();
-                const handshake = link.handshake;
-                if (handshake !== undefined) {
-                    link.sendControl(encodeFrame({
-                        v: 2, type: 'device.inventory',
-                        connectionId: handshake.connectionId, nodeEpoch: handshake.nodeEpoch,
-                        deviceName: config.deviceName,
-                        squads: ledger.teams.map(team => ({
-                            id: team.id,
-                            name: team.name,
-                            members: team.members.map(member => ({
-                                id: member.id,
-                                name: member.name,
-                                ...(member.preset === undefined ? {} : { preset: member.preset }),
-                                ...(member.permission === undefined ? {} : { permission: member.permission }),
-                                ...(member.model === undefined ? {} : { model: member.model }),
-                                ...(member.reasoningEffort === undefined ? {} : { reasoningEffort: member.reasoningEffort }),
-                                ...(member.brief === undefined ? {} : { brief: member.brief }),
-                                ...(member.sessionId === undefined ? {} : { sessionId: member.sessionId }),
-                            })),
-                        })),
-                        codex: config.agents.includes('codex'),
-                    }));
-                }
-            }
-            catch { /* inventory is optional metadata */ }
+            lastInventory = undefined;
+            publishInventory();
             const tightened = (previous?.policies.allowContent === true && binding.policies.allowContent !== true)
                 || (previous?.policies.allowInteractions === true && binding.policies.allowInteractions !== true);
             // 每个 relay 都先按新协商复核旧卡：授权变化（含仅 revision 变化）立即结算，
@@ -374,9 +385,14 @@ function applyNode(ctx, config) {
         },
         onError: error => ctx.logger.warn(`marshal: link error: ${errorName(error)}`),
     });
+    const inventoryTimer = config.groups ? setInterval(() => {
+        if (link.online) publishInventory();
+    }, 5_000) : undefined;
+    inventoryTimer?.unref();
     if (config.allowDiscussion)
         discussions = createNodeDiscussions({
             enabled: true, journal, link: () => link,
+            allowsTaskWorkspace: workspaceId => config.groups && readAgentsLedger().teams.some(team => team.workspaceId === workspaceId),
             port: createDiscussionPort({ agents: config.agents, ...(ctx.llm === undefined ? {} : { llm: ctx.llm }),
                 ...(config.codexExecutable === undefined ? {} : { codexExecutable: config.codexExecutable }),
                 ...(config.claudeExecutable === undefined ? {} : { claudeExecutable: config.claudeExecutable }),
@@ -481,6 +497,7 @@ function applyNode(ctx, config) {
         })
         : undefined;
     ctx.effect(() => () => {
+        clearInterval(inventoryTimer);
         stopRelay?.();
         discussions?.dispose();
         nodeSync?.dispose();

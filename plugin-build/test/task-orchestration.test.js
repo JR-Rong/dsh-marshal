@@ -183,11 +183,14 @@ test('desktop board routes enforce workspace authorization and launch the select
     const ledgerDir = join(root, 'dsh-agents');
     mkdirSync(ledgerDir);
     writeFileSync(join(ledgerDir, 'ledger.json'), JSON.stringify({ teams: [
-        { id: 'team', name: 'Main', workspaceId: 'workspace-a', members: [{ id: 'leader', name: '负责人' }] },
+        { id: 'team', name: 'Main', workspaceId: 'workspace-a', members: [
+            { id: 'leader', name: '负责人' }, { id: 'backup', name: '接手负责人' },
+        ] },
         { id: 'foreign', name: 'Remote', workspaceId: 'workspace-b', ownerId: 'different-operator',
             members: [{ id: 'other', name: '其他人' }] },
     ] }));
     const memory = createAgentMemoryService({ root: join(root, 'memory') });
+    const relayAssignments = [];
     const routes = new Map();
     const hostBoard = createLocalBoard(join(root, 'host-board.json'));
     const disposers = [];
@@ -195,8 +198,10 @@ test('desktop board routes enforce workspace authorization and launch the select
     const origin = 'http://127.0.0.1:29310';
     t.mock.method(globalThis, 'fetch', async (url, init) => {
         assert.equal(url, origin + '/dsh-agents/api/run');
-        assert.deepEqual(JSON.parse(init.body), { teamId: 'team', memberId: 'leader' });
-        return Response.json({ run: { sessionId: 'leader-session' } });
+        const assignment = JSON.parse(init.body);
+        assert.equal(assignment.teamId, 'team');
+        relayAssignments.push(assignment.memberId);
+        return Response.json({ run: { sessionId: assignment.memberId + '-session' } });
     });
     t.after(() => {
         for (const dispose of disposers.reverse()) dispose?.();
@@ -256,7 +261,7 @@ test('desktop board routes enforce workspace authorization and launch the select
     const cookies = opened.headers['set-cookie'].map(line => line.split(';')[0]);
     const headers = { cookie: cookies.join('; '), 'x-marshal-csrf': cookies[1].split('=')[1] };
     const catalog = await request('/marshal/tasks/orchestration', undefined, headers);
-    assert.deepEqual(catalog.data.leaders.map(leader => leader.id), ['team/leader']);
+    assert.deepEqual(catalog.data.leaders.map(leader => leader.id), ['team/leader', 'team/backup']);
 
     const input = { title: '测试工作区交接', orchestration: { leaderId, choice: 'none' } };
     assert.equal((await request('/marshal/tasks/create', input)).code, 401);
@@ -275,5 +280,26 @@ test('desktop board routes enforce workspace authorization and launch the select
     assert.equal(prompts.length, 1);
     assert.match(prompts[0].content[0].text, /测试工作区交接/);
     assert.equal(memory.store.list('workspace', 'workspace-a').length, 1);
-    assert.equal((await request('/marshal/tasks/state')).data.tasks[0].workflow, undefined);
+    assert.deepEqual((await request('/marshal/tasks/state')).data.tasks, []);
+    const roomId = task.taskRoom.id;
+    const action = (action, extra = {}) => request('/marshal/task-rooms/action', { roomId, action, ...extra }, headers);
+    const pageAt = workspaceId => '/marshal/task-rooms/page?roomId=' + roomId + '&workspaceId=' + workspaceId;
+    assert.equal((await request(pageAt('workspace-b'), undefined, headers)).code, 403);
+    const before = await request(pageAt('workspace-a'), undefined, headers);
+    assert.equal(before.data.records.filter(item => item.kind === 'batch').length, 1);
+    assert.equal(before.data.room.id, roomId);
+    const archived = await action('close');
+    assert.equal(archived.data.room.closed, true);
+    assert.equal((await action('send', { text: 'closed room' })).data.code, 'task-room-closed');
+    const accepted = await action('reassign', { leaderId: 'team/backup' });
+    assert.equal(accepted.code, 200, JSON.stringify(accepted.data));
+    await setImmediate();
+    const after = await request(pageAt('workspace-a'), undefined, headers);
+    assert.equal(after.data.room.id, roomId);
+    assert.equal(after.data.room.closed, false);
+    const runs = after.data.records.filter(item => item.kind === 'batch');
+    assert.deepEqual(runs.map(item => item.phase), ['start', 'reassign']);
+    assert.notEqual(runs[0].runId, runs[1].runId);
+    assert.deepEqual(relayAssignments, ['leader', 'backup']);
+    assert.equal((await request('/marshal/tasks/delete', { taskId: task.id }, headers)).data.code, 'task-room-archive');
 });

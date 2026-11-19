@@ -600,7 +600,15 @@ window.__ModuleLoader__.load({
     function MarshalPanel({ marshalContext, openSession, openPanel, workspaceService, SessionProvider, renderSlot }) {
       const [attempt, retry] = React.useState(0);
       const [tab, setTab] = React.useState(() => pendingTab || 'session');
-      const chooseTab = value => { pendingTab = null; setTab(value); };
+      const [roomTask, setRoomTask] = React.useState(null);
+      const [focusedTask, focusTask] = React.useState('');
+      const chooseTab = value => {
+        pendingTab = null;
+        if (value === 'taskRooms') setRoomTask(null);
+        setTab(value);
+      };
+      const openTaskRoom = task => { setRoomTask(task); setTab('taskRooms'); };
+      const openBoard = taskId => { focusTask(taskId ?? ''); setTab('tasks'); };
       React.useEffect(() => {
         const onTab = event => { if (event && typeof event.detail === 'string') setTab(event.detail); };
         window.addEventListener('marshal:tab', onTab);
@@ -813,7 +821,7 @@ window.__ModuleLoader__.load({
         h('header', { style: { padding: '12px 20px', minHeight: 54, display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderBottom: '1px solid #8883', flexShrink: 0 } },
           h('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } }, h(MarshalIcon), h('h1', { style: { fontSize: 16, fontWeight: 600, margin: 0 } }, '调度官'), h('span', { style: { fontSize: 12, opacity: .55 } }, state.account ? state.account.name + ' · ' + state.workspaceName : '原生会话')),
           h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' } },
-            h(MarshalNav, { active: tab, onTab: chooseTab, openPanel, compact: true }),
+            h(MarshalNav, { active: tab, onTab: chooseTab, compact: true }),
             health && (!health.capabilities?.agents || !health.capabilities?.taskBoard) && h('span', { style: { fontSize: 11, color: dswTheme.danger } },
               '缺少：' + [!health.capabilities?.agents ? '智能体后端' : '', !health.capabilities?.taskBoard ? '任务看板后端' : ''].filter(Boolean).join('、')),
             h('button', { type: 'button', style: buttonStyle, onClick: () => retry(value => value + 1) }, '重新连接'))),
@@ -821,7 +829,8 @@ window.__ModuleLoader__.load({
         tab === 'agents' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex' } }, h(AgentsPage, { onOpenGroups: () => chooseTab('groups'), openSession, workspaceService })),
         tab === 'cross' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex' } }, h(CrossGroupsPage)),
         tab === 'memory' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex' } }, h(MemoryPage)),
-        tab === 'tasks' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex' } }, h(TaskBoardPage, { openSession })),
+        tab === 'tasks' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex' } }, h(TaskBoardPage, { openSession, openTaskRoom, focusedTask })),
+        tab === 'taskRooms' && h(TaskRoomsPage, { key: roomTask?.id ?? 'archive', task: roomTask, openBoard }),
         tab === 'session' && h('div', { style: { display: 'flex', flex: 1, minHeight: 0 } },
           address && h('iframe', { ref: iframe, onLoad: connect, title: '调度官设备与群聊', src: address,
             sandbox: 'allow-scripts allow-same-origin allow-forms', allow: 'clipboard-write', referrerPolicy: 'no-referrer',
@@ -1161,8 +1170,8 @@ window.__ModuleLoader__.load({
       ensure();
     }
 
-    function MarshalNav({ active, onTab, openPanel, compact = false }) {
-      const tabs = [['session', '会话'], ['groups', '群聊'], ['agents', '智能体'], ['cross', '跨设备'], ['memory', '记忆']];
+    function MarshalNav({ active, onTab, compact = false }) {
+      const tabs = [['session', '会话'], ['groups', '群聊'], ['taskRooms', '工单群'], ['agents', '智能体'], ['cross', '跨设备'], ['memory', '记忆']];
       const button = (key, label) => h('button', {
         key, type: 'button', 'aria-pressed': active === key,
         style: {
@@ -1196,7 +1205,7 @@ window.__ModuleLoader__.load({
             background: active === 'tasks' ? 'color-mix(in srgb, currentColor 16%, transparent)' : 'transparent',
             color: 'inherit', fontWeight: active === 'tasks' ? 600 : 400,
           },
-          onClick: () => { if (openPanel && openPanel('task-board')) return; onTab('tasks'); },
+          onClick: () => onTab('tasks'),
         }, '任务看板'));
     }
 
@@ -1657,7 +1666,7 @@ window.__ModuleLoader__.load({
         report && h('pre', { style: { margin: '8px 0 0', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontSize: 12 } }, report));
     }
 
-    function TaskBoardPage({ openSession }) {
+    function TaskBoardPage({ openSession, openTaskRoom, focusedTask }) {
       const [tasks, setTasks] = React.useState(null);
       const [error, setError] = React.useState('');
       const [busy, setBusy] = React.useState(false);
@@ -1668,6 +1677,10 @@ window.__ModuleLoader__.load({
       const [catalog, setCatalog] = React.useState(null);
       const [catalogError, setCatalogError] = React.useState('');
       const [leaderId, setLeaderId] = React.useState('');
+      const [workspaceId, setWorkspaceId] = React.useState('');
+      const [workspaces, setWorkspaces] = React.useState([]);
+      const selectedLeader = catalog?.leaders.find(item => item.id === leaderId);
+      const workspace = selectedLeader?.workspaceId ?? workspaceId;
       const [choice, setChoice] = React.useState('leader');
       const [templateId, setTemplateId] = React.useState('pr-review');
       const [prUrl, setPrUrl] = React.useState('');
@@ -1683,19 +1696,29 @@ window.__ModuleLoader__.load({
       ];
 
       const load = async () => {
-        try { const data = await fetchJson('marshal/tasks/state'); setTasks(data.tasks || []); setError(''); }
+        try { const data = await fetchJson('marshal/tasks/state', undefined, true); setTasks(data.tasks || []); setError(''); }
         catch (e) { setError(friendlyError(e, '任务看板')); }
       };
       React.useEffect(() => {
         void load();
         void fetchJson('marshal/tasks/orchestration', undefined, true)
           .then(setCatalog).catch(() => setCatalogError('编排配置暂不可用。'));
+        void fetchJson('marshal/task-rooms/workspaces', undefined, true).then(data => {
+          setWorkspaces(data.workspaces);
+          if (data.workspaces.length === 1) setWorkspaceId(data.workspaces[0].id);
+        }).catch(() => {});
         const timer = setInterval(() => { void load(); }, 3000);
         return () => clearInterval(timer);
       }, []);
 
+      const focusAvailable = list.some(item => item.id === focusedTask);
+      React.useEffect(() => {
+        if (focusedTask && focusAvailable) document.getElementById('marshal-ticket-' + focusedTask)?.scrollIntoView({ block: 'nearest' });
+      }, [focusedTask, focusAvailable]);
+
       const create = async () => {
         if (!title.trim()) { setError('请填写标题'); return; }
+        if (!workspace) { setError('请选择工单所属的工作区'); return; }
         if (requiresPr && !prUrl.trim()) { setError('请填写要审查的 PR 链接'); return; }
         const orchestration = leaderId ? {
           leaderId, choice,
@@ -1706,9 +1729,9 @@ window.__ModuleLoader__.load({
         setError('');
         try {
           const result = await fetchJson('marshal/tasks/create', {
-            title: title.trim(), description: description.trim(),
+            title: title.trim(), description: description.trim(), workspaceId: workspace,
             ...(orchestration === undefined ? {} : { orchestration }),
-          }, orchestration !== undefined);
+          }, true);
           setTasks(result.tasks || []);
           setTitle('');
           setDescription('');
@@ -1755,7 +1778,7 @@ window.__ModuleLoader__.load({
         const step = workflow?.state === 'handed-off' ? '已交给 Leader'
           : workflow?.state === 'interrupted' ? '运行中断，可重试'
           : taskPhases[workflow?.phase];
-        return h('div', { key: task.id, style: { border: '1px solid ' + dswTheme.border, borderRadius: 10, background: dswTheme.layer, padding: 10, display: 'grid', gap: 8 } },
+        return h('div', { key: task.id, id: 'marshal-ticket-' + task.id, style: { border: '1px solid ' + dswTheme.border, borderRadius: 10, background: dswTheme.layer, padding: 10, display: 'grid', gap: 8 } },
           h('div', { style: { fontSize: 13, fontWeight: 500, lineHeight: 1.45 } }, task.title),
           task.description && h('div', { style: { fontSize: 11, color: dswTheme.faint, lineHeight: 1.55, display: '-webkit-box', WebkitLineClamp: 3, WebkitBoxOrient: 'vertical', overflow: 'hidden' } }, task.description),
           workflow && h('div', { style: uiMuted }, workflow.leaderName + ' · ' + modeLabel),
@@ -1768,9 +1791,10 @@ window.__ModuleLoader__.load({
             workflow.reviewers.map(reviewer => reviewer.name + ' · ' + reviewer.model).join(' / ')),
           workflow?.reportId && h(TaskReviewReport, { key: workflow.reportId, taskId: task.id }),
           h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' } },
+            h('button', { type: 'button', style: uiButton(false), onClick: () => openTaskRoom?.(task) }, '工单群'),
             task.sessionId && h('button', { type: 'button', style: { ...uiButton(false), padding: '3px 8px', fontSize: 11 }, onClick: () => openSession && openSession(task.sessionId) }, '打开会话'),
-            task.status !== 'running' && workflow?.state !== 'done' && h('button', { type: 'button', disabled: busy, style: { ...uiButton(true), padding: '3px 8px', fontSize: 11 }, onClick: () => { void run(task); } }, workflow?.state === 'failed' || workflow?.state === 'interrupted' ? '重试' : '运行'),
-            h('button', { type: 'button', style: { ...uiButton(false), padding: '3px 8px', fontSize: 11, color: confirmId === task.id ? dswTheme.danger : dswTheme.text }, onClick: () => { void remove(task); } }, confirmId === task.id ? '确认删除' : '删除')));
+            workflow && !task.taskRoom?.closed && task.status !== 'running' && workflow.state !== 'done' && h('button', { type: 'button', disabled: busy, style: { ...uiButton(true), padding: '3px 8px', fontSize: 11 }, onClick: () => { void run(task); } }, workflow?.state === 'failed' || workflow?.state === 'interrupted' ? '重试' : '运行'),
+            !task.taskRoom && h('button', { type: 'button', style: { ...uiButton(false), padding: '3px 8px', fontSize: 11, color: confirmId === task.id ? dswTheme.danger : dswTheme.text }, onClick: () => { void remove(task); } }, confirmId === task.id ? '确认删除' : '删除')));
       };
 
       return h('section', { style: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', background: dswTheme.bg, color: dswTheme.text } },
@@ -1783,6 +1807,10 @@ window.__ModuleLoader__.load({
         formOpen && h('div', { style: { margin: '14px 20px 0', padding: 14, border: '1px solid ' + dswTheme.border, borderRadius: 12, background: dswTheme.layer, display: 'grid', gap: 10 } },
           h(Field, { label: '标题' }, h('input', { value: title, onChange: event => setTitle(event.target.value), placeholder: '这张卡片要做什么', style: uiInput })),
           h(Field, { label: '描述（可选）' }, h('textarea', { value: description, onChange: event => setDescription(event.target.value), rows: 3, placeholder: '背景、验收标准、约束…', style: { ...uiInput, resize: 'vertical', lineHeight: 1.6 } })),
+          !leaderId && h(Field, { label: '工作区' }, h('select', { value: workspaceId, style: uiInput,
+            onChange: event => setWorkspaceId(event.target.value) },
+            h('option', { value: '' }, '选择工作区'),
+            workspaces.map(item => h('option', { key: item.id, value: item.id }, item.name)))),
           catalog?.memoryAvailable && catalog.leaders.length > 0 && h(Field, { label: 'Leader' },
             h('select', { value: leaderId, onChange: event => setLeaderId(event.target.value), style: uiInput },
               h('option', { value: '' }, '普通卡片'),
@@ -1806,7 +1834,7 @@ window.__ModuleLoader__.load({
             h('button', { type: 'button', style: uiButton(false), onClick: () => setFormOpen(false) }, '取消'),
             h('button', { type: 'button', disabled: busy, style: { ...uiButton(true), opacity: busy ? .6 : 1 }, onClick: () => { void create(); } }, busy ? '处理中…' : '创建'))),
         list.length === 0 && !formOpen
-          ? h(EmptyState, { title: '还没有卡片', hint: '新建一张卡片，运行后会为它开一个会话。', action: '新建卡片', onAction: () => setFormOpen(true) })
+          ? h(EmptyState, { title: '还没有卡片', hint: '新建一张卡片，每张卡片都有一个工单群。', action: '新建卡片', onAction: () => setFormOpen(true) })
           : h('div', { style: { flex: 1, minHeight: 0, overflow: 'auto', padding: 16, display: 'flex', gap: 12, alignItems: 'flex-start' } },
               columns.map(column => {
                 const items = list.filter(task => task.status === column.key);
@@ -1815,6 +1843,189 @@ window.__ModuleLoader__.load({
                     column.label, h('span', { style: { color: dswTheme.faint } }, items.length)),
                   h('div', { style: { display: 'grid', gap: 8 } }, items.map(card)));
               })));
+    }
+
+    function TaskRoomsPage({ task, openBoard }) {
+      const bound = task?.taskRoom;
+      const [workspace, setWorkspace] = React.useState(bound?.workspaceId ?? task?.workflow?.workspaceId ?? '');
+      const [workspaces, setWorkspaces] = React.useState([]);
+      const [leaders, setLeaders] = React.useState([]);
+      const [rooms, setRooms] = React.useState([]);
+      const [id, setId] = React.useState(bound?.id ?? '');
+      const [view, setView] = React.useState(null);
+      const [peers, setPeers] = React.useState([]);
+      const [notice, setNotice] = React.useState('');
+      const [error, setError] = React.useState('');
+      const [busy, setBusy] = React.useState(false);
+      const [leader, setLeader] = React.useState('');
+      const [remote, setRemote] = React.useState('');
+      const [draft, setDraft] = React.useState('');
+      const cursor = React.useRef(0);
+      const selection = React.useRef('');
+      const viewKey = workspace + '/' + id;
+      selection.current = viewKey;
+      const prefix = 'marshal/task-rooms/';
+      const query = values => '?' + new URLSearchParams(values);
+      const url = prefix + 'page' + query({ roomId: id, workspaceId: workspace });
+      const loadList = () => workspace ? fetchJson(prefix + 'list' + query({ workspaceId: workspace }), undefined, true) : Promise.resolve({ rooms: [] });
+
+      React.useEffect(() => {
+        let alive = true;
+        void fetchJson(prefix + 'workspaces', undefined, true).then(data => {
+          if (!alive) return;
+          setWorkspaces(data.workspaces);
+          setWorkspace(current => current || (data.workspaces.length === 1 ? data.workspaces[0].id : ''));
+        }).catch(e => { if (alive) setError(e.message); });
+        void fetchJson('marshal/tasks/orchestration', undefined, true)
+          .then(data => { if (alive) setLeaders(data.leaders ?? []); }).catch(() => {});
+        return () => { alive = false; };
+      }, []);
+      React.useEffect(() => {
+        let alive = true;
+        setRooms([]);
+        setNotice('');
+        void loadList().then(data => {
+          if (!alive) return;
+          setRooms(data.rooms);
+          setNotice(data.hubError ? 'Hub 群聊暂不可读取。' : '');
+        }).catch(e => { if (alive) setError(e.message); });
+        return () => { alive = false; };
+      }, [workspace]);
+      const mergePage = (data, key) => {
+        if (selection.current !== key) return;
+        cursor.current = Math.max(cursor.current, data.records.at(-1)?.seq ?? 0);
+        setView(previous => {
+          const records = new Map((previous?.key === key ? previous.records : []).map(record => [record.seq, record]));
+          for (const record of data.records) records.set(record.seq, record);
+          return { ...data, key, records: [...records.values()].sort((a, b) => a.seq - b.seq) };
+        });
+      };
+      const failedRead = (e, key) => {
+        if (selection.current !== key) return;
+        if (['forbidden', 'workspace-forbidden', 'unauthorized', 'task-room-not-found'].includes(e.code)) {
+          cursor.current = 0;
+          setView(null);
+        }
+        setError(e.message);
+      };
+      React.useEffect(() => {
+        cursor.current = 0;
+        setView(null);
+        setPeers([]);
+        setDraft('');
+        setLeader('');
+        setRemote('');
+        if (!id || !workspace) return;
+        let alive = true;
+        let inFlight = false;
+        const load = async () => {
+          if (inFlight) return;
+          inFlight = true;
+          try {
+            const data = await fetchJson(url + (cursor.current ? '&after=' + cursor.current : ''), undefined, true);
+            if (alive) mergePage(data, viewKey);
+          } catch (e) { if (alive) failedRead(e, viewKey); }
+          finally { inFlight = false; }
+        };
+        void load();
+        const timer = setInterval(load, 2500);
+        return () => { alive = false; clearInterval(timer); };
+      }, [id, workspace]);
+      const visible = view?.key === viewKey ? view : null;
+      const room = visible?.room;
+      React.useEffect(() => {
+        if (!visible?.origin) return;
+        let alive = true;
+        void fetchJson(prefix + 'peers' + query({ roomId: id }), undefined, true)
+          .then(data => { if (alive) setPeers(data.peers ?? []); }).catch(() => {});
+        return () => { alive = false; };
+      }, [id, visible?.origin]);
+
+      const bind = async () => {
+        if (!workspace || !task) return;
+        setBusy(true);
+        setError('');
+        try {
+          const result = await fetchJson(prefix + 'open', { taskId: task.id, workspaceId: workspace }, true);
+          setId(result.room.id);
+          setRooms(current => current.some(item => item.id === result.room.id) ? current : [result.room, ...current]);
+        }
+        catch (e) { setError(e.message); }
+        finally { setBusy(false); }
+      };
+      const act = async (action, data = {}) => {
+        if (!room || busy) return;
+        setBusy(true);
+        setError('');
+        const key = viewKey;
+        try {
+          await fetchJson(prefix + 'action', { roomId: room.id, action, ...data }, true);
+          if (action === 'send' && selection.current === key) setDraft('');
+          mergePage(await fetchJson(url + '&after=' + cursor.current, undefined, true), key);
+        }
+        catch (e) { failedRead(e, key); }
+        finally { setBusy(false); }
+      };
+      const older = async () => {
+        if (!visible?.records[0] || busy) return;
+        setBusy(true);
+        try { mergePage(await fetchJson(url + '&before=' + visible.records[0].seq, undefined, true), viewKey); }
+        catch (e) { failedRead(e, viewKey); }
+        finally { setBusy(false); }
+      };
+      const button = (label, onClick, disabled = false, primary = false) =>
+        h('button', { type: 'button', style: uiButton(primary), onClick, disabled }, label);
+      const runLabel = { start: '首次运行', retry: '重试', reassign: '改派', conversation: '群聊开始' };
+      const controlsLocked = busy || visible?.busy === true;
+      return h('section', { 'aria-label': '工单群', style: { display: 'flex', flex: 1, minHeight: 0, width: '100%', background: dswTheme.bg } },
+        h('aside', { style: { width: 'min(30%, 260px)', flexShrink: 0, padding: 14, overflowY: 'auto', borderRight: '1px solid ' + dswTheme.border } },
+          h('h2', { style: { fontSize: 15, margin: '0 0 12px' } }, '工单群'),
+          h(Field, { label: '工作区' }, h('select', { value: workspace, style: uiInput,
+            onChange: event => { setWorkspace(event.target.value); setId(''); setError(''); } },
+            h('option', { value: '' }, '选择工作区'),
+            workspaces.map(item => h('option', { key: item.id, value: item.id }, item.name)))),
+          notice && h('p', { style: uiMuted }, notice),
+          rooms.map(item => h('button', { key: item.id, type: 'button', 'aria-pressed': id === item.id,
+            style: { ...uiButton(id === item.id), display: 'block', width: '100%', marginTop: 8, textAlign: 'left', overflowWrap: 'anywhere' },
+            onClick: () => { setError(''); setId(item.id); } }, item.title))),
+        h('main', { style: { display: 'flex', flexDirection: 'column', flex: 1, minWidth: 0, minHeight: 0 } },
+          h('header', { style: { padding: 14, borderBottom: '1px solid ' + dswTheme.border, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' } },
+            button('回任务看板', () => openBoard(visible?.origin ? room?.taskId : task?.id)),
+            h('strong', null, room?.title ?? task?.title ?? '工单群聊'),
+            room && h('span', { style: uiMuted }, (room.storage === 'hub' ? 'Hub 归档' : room.storage === 'moving' ? '转存中' : '原设备归档') + (room.closed ? ' · 已关单' : '')),
+            visible?.origin && button(room.closed ? '重开工单' : '关单归档', () => { void act(room.closed ? 'reopen' : 'close'); }, controlsLocked),
+            visible?.runState === 'interrupted' && h('span', { style: uiMuted }, '上一批次在节点重启时中断'),
+            visible?.origin && button('重试', () => { void act('retry'); }, controlsLocked)),
+          error && h('div', { role: 'alert', style: { padding: '8px 14px', color: dswTheme.danger } }, error),
+          !id && task && h('div', { style: { padding: 14 } }, button('绑定工单群', () => { void bind(); }, !workspace || busy, true)),
+          !room && !task && h('div', { style: { ...uiMuted, padding: 14 } }, '选择工作区和工单可以查看历史。'),
+          room && h('section', { 'aria-label': '群聊记录', style: { padding: 14, flex: 1, minHeight: 0, overflowY: 'auto' } },
+            visible.records[0]?.seq > 1 && button('加载更早消息', () => { void older(); }, busy),
+            visible.records.map(record => h('article', { key: record.seq,
+              style: { borderTop: '1px solid ' + dswTheme.border, padding: '10px 0', marginTop: 6 } },
+              h('div', { style: uiMuted }, [
+                record.kind === 'batch' ? '批次 ' + (record.runId?.slice(0, 8) ?? '') + ' · ' + (runLabel[record.phase] ?? record.phase) : record.actor,
+                record.kind !== 'batch' ? taskPhases[record.phase] : undefined,
+                new Date(record.at).toLocaleString(),
+              ].filter(Boolean).join(' · ')),
+              h('div', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', marginTop: 4 } }, record.text)))),
+          visible?.origin && h('footer', { style: { padding: 12, borderTop: '1px solid ' + dswTheme.border, display: 'grid', gap: 8 } },
+            h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6 } },
+              h('select', { 'aria-label': '改派 Leader', value: leader, style: uiInput, onChange: event => { setLeader(event.target.value); setRemote(''); } },
+                h('option', { value: '' }, '选择本机 Leader'),
+                leaders.filter(item => item.workspaceId === workspace).map(item => h('option', { key: item.id, value: item.id }, item.name))),
+              peers.length > 0 && h('select', { 'aria-label': '改派到其它设备', value: remote, style: uiInput,
+                onChange: event => { setRemote(event.target.value); setLeader(''); } },
+                h('option', { value: '' }, '选择跨设备 Agent'),
+                peers.flatMap(peer => peer.models.map(model => h('option',
+                  { key: peer.id + '/' + model.id, value: JSON.stringify({ deviceId: peer.id, modelId: model.id }) },
+                  peer.name + ' · ' + model.agent + ' · ' + model.model)))),
+              button('改派并运行', () => { void act('reassign', remote ? { remote: JSON.parse(remote) } : { leaderId: leader }); },
+                controlsLocked || (!leader && !remote))),
+            !room.closed && h('div', { style: { display: 'flex', alignItems: 'flex-end', gap: 8 } },
+              h('textarea', { 'aria-label': '工单群消息', value: draft, onChange: event => setDraft(event.target.value), rows: 2,
+                placeholder: '发给当前负责人', style: { ...uiInput, flex: 1, resize: 'vertical' } }),
+              button('发送', () => { void act('send', { text: draft }); }, controlsLocked || !draft.trim(), true)))));
     }
 
     function AgentsPage({ onOpenGroups, openSession, workspaceService }) {
@@ -2160,7 +2371,7 @@ window.__ModuleLoader__.load({
             name: 'conversation.session.header.actions',
             id: 'marshal-quick-nav',
             order: 40,
-          }, () => h(MarshalNav, { active: 'session', onTab: goTab, openPanel, compact: true })));
+          }, () => h(MarshalNav, { active: 'session', onTab: goTab, compact: true })));
         } catch (error) { /* older host without the conversation header action slot */ }
         const ensureTaskboardHeader = () => {
           const root = document.querySelector('[data-dsh-taskboard-view]');

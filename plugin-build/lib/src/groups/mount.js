@@ -7,6 +7,9 @@ import { readAgentsLedger } from './inventory.js';
 import { createAgentDrafter } from './draft.js';
 import { createCrossClient } from './cross-client.js';
 import { createLocalBoard } from './local-board.js';
+import { createTaskRooms } from './task-rooms.js';
+import { createTaskRoomStore, TaskRoomKey } from './task-room-store.js';
+import { createTaskRoomRoutes, taskRoomAccess, taskRoomAudit, visibleTaskRoom } from './task-room-routes.js';
 import { createTaskOrchestration } from './task-orchestration.js';
 import { createDiscussionPort } from '../discussions/ports.js';
 import { createAgentsHttpClient, agentToolDefinitions } from './agent-tools.js';
@@ -116,7 +119,9 @@ function exact(method, path, handler, open = false) {
             }
             catch (error) {
                 const code = errorCode(error);
-                write(res, code === 'group-not-found' ? 404 : 400, {
+                const status = ['group-not-found', 'task-room-not-found', 'task-not-found'].includes(code) ? 404
+                    : code === 'unauthorized' ? 401 : ['forbidden', 'workspace-forbidden'].includes(code) ? 403 : 400;
+                write(res, status, {
                     ok: false,
                     code,
                     message: error instanceof Error ? error.message : String(error),
@@ -144,16 +149,17 @@ export function buildHealthBody(req, info) {
     };
 }
 
-function taskView(task, workflow) {
+function taskView(task, workflow, room) {
     const executions = Array.isArray(task.executions) ? task.executions : [];
     const latest = executions.length > 0 ? executions[executions.length - 1] : undefined;
     return {
         id: task.id,
         title: task.title,
-        status: workflow === undefined || workflow.state === 'ready' ? task.status
+        status: room?.closed ? 'done' : workflow === undefined || workflow.state === 'ready' ? task.status
             : workflow.state === 'running' || workflow.state === 'handed-off' ? 'running'
-            : workflow.state === 'done' ? 'done' : 'failed',
+            : workflow.state === 'done' ? (room ? 'todo' : 'done') : 'failed',
         ...(workflow === undefined ? {} : { workflow }),
+        ...(room === undefined ? {} : { taskRoom: visibleTaskRoom(room) }),
         ...(task.description === undefined ? {} : { description: task.description }),
         ...(task.parentId === undefined ? {} : { parentId: task.parentId }),
         ...(task.permission === undefined ? {} : { permission: task.permission }),
@@ -166,7 +172,7 @@ function taskView(task, workflow) {
     };
 }
 
-function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, memory, auth, allowedOrigins, orchestration) {
+function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, memory, auth, allowedOrigins, orchestration, rooms) {
     const authenticate = (req, write = false) => auth.authenticate(req, { write, origins: allowedOrigins() });
     const allowed = (access, target, ledger) => access.ok && auth.allows(access.session, {
         agentId: target.agentId, workspaceId: target.workspaceId,
@@ -182,12 +188,18 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
     const taskList = (snapshot, req, source) => {
         const access = authenticate(req);
         const ledger = access.ok ? auth.loadLedger() : undefined;
-        return (Array.isArray(snapshot.tasks) ? snapshot.tasks : []).map(task => {
+        return (Array.isArray(snapshot.tasks) ? snapshot.tasks : []).flatMap(task => {
             const target = orchestration?.target(source, task.id);
-            return taskView(task, target && allowed(access, { workspaceId: target.workspaceId }, ledger) ? orchestration.view(source, task.id) : undefined);
+            const room = rooms?.find(source, task.id);
+            if (room && !taskRoomAccess(access, room, allowed, ledger)) return [];
+            if (target && !allowed(access, { workspaceId: target.workspaceId }, ledger)) return [];
+            return [taskView(task, target ? orchestration.view(source, task.id) : undefined, room)];
         });
     };
+    const roomRoutes = createTaskRoomRoutes({ exact, write, readBody, authenticate, allowed, auth, rooms,
+        orchestration, getBoard, boardSource, getInitiator: () => initiator.replace(/^marshal:/, '') });
     return [
+        ...roomRoutes.routes,
         exact('GET', '/marshal/health', async (req, res) => {
             const ledger = readAgentsLedger();
             write(res, 200, buildHealthBody(req, {
@@ -255,31 +267,48 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             const id = randomUUID();
             let prepared;
             let existing;
-            if (body.orchestration !== undefined) {
-                if (!orchestration) {
+            let scope;
+            if (body.orchestration !== undefined || body.workspaceId !== undefined) {
+                if (body.orchestration !== undefined && !orchestration) {
                     write(res, 503, { ok: false, code: 'orchestration-unavailable' });
                     return;
                 }
                 // Authorize before looking up the requested leader, then check the bound workspace.
                 const access = authenticate(req, true);
                 if (!access.ok) { write(res, access.status, { ok: false, code: access.code }); return; }
-                prepared = orchestration.prepare(body.orchestration);
-                if (!allowed(access, prepared)) {
+                prepared = body.orchestration === undefined ? undefined : orchestration.prepare(body.orchestration);
+                const workspaceId = TaskRoomKey.parse(prepared?.workspaceId ?? body.workspaceId);
+                if (body.workspaceId !== undefined && body.workspaceId !== workspaceId) {
+                    write(res, 400, { ok: false, code: 'workspace-conflict' });
+                    return;
+                }
+                if (!allowed(access, prepared ?? { workspaceId })) {
                     write(res, 403, { ok: false, code: 'workspace-forbidden' });
                     return;
                 }
+                if (!rooms) {
+                    write(res, 503, { ok: false, code: 'task-rooms-unavailable' });
+                    return;
+                }
+                scope = { workspaceId, ownerId: access.session.ownerId };
                 existing = new Set((board.snapshot().tasks ?? []).map(task => task.id));
             }
             const snapshot = await board.apply(randomUUID(), { kind: 'create', id, input }, initiator);
-            if (prepared) {
+            if (scope) {
                 const added = (snapshot.tasks ?? []).filter(task => !existing.has(task.id));
                 const created = added.find(task => task.id === id) ?? (added.length === 1 ? added[0] : undefined);
                 if (!created) {
                     write(res, 409, { ok: false, code: 'task-create-not-observed' });
                     return;
                 }
-                try { orchestration.attach(source, created.id, prepared); }
+                try {
+                    if (prepared) orchestration.attach(source, created.id, prepared);
+                    rooms.ensure(source, created, scope.workspaceId, scope.ownerId);
+                }
                 catch {
+                    if (prepared) {
+                        try { orchestration.remove(source, created.id); } catch { /* preserve original error */ }
+                    }
                     try { await board.apply(randomUUID(), { kind: 'delete', taskId: created.id }, initiator); }
                     catch { /* A host without rollback can leave an unconfigured card. */ }
                     write(res, 500, { ok: false, code: 'task-orchestration-not-saved', message: '无法保存任务编排。' });
@@ -301,6 +330,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             }
             const source = boardSource();
             const workflow = orchestration?.target(source, body.taskId);
+            const boundRoom = rooms?.find(source, body.taskId);
             if (workflow) {
                 if (!authorize(req, res, workflow)) return;
                 const snapshot = board.snapshot();
@@ -309,8 +339,34 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
                     write(res, 404, { ok: false, code: 'task-not-found' });
                     return;
                 }
-                orchestration.start(source, task);
+                const access = authenticate(req, true);
+                const room = boundRoom ?? rooms?.ensure(source, task, workflow.workspaceId, access.session.ownerId);
+                if (!room || !taskRoomAccess(access, room, allowed)) {
+                    write(res, 403, { ok: false, code: 'workspace-forbidden' });
+                    return;
+                }
+                roomRoutes.assertIdle(room);
+                if (room.closed) {
+                    write(res, 409, { ok: false, code: 'task-room-closed', message: '工单已归档，请从工单群重开或重试。' });
+                    return;
+                }
+                orchestration.start(source, task, taskRoomAudit(rooms, room));
                 write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
+                return;
+            }
+            if (boundRoom) {
+                const access = authenticate(req, true);
+                if (!taskRoomAccess(access, boundRoom, allowed)) {
+                    write(res, 403, { ok: false, code: 'workspace-forbidden' });
+                    return;
+                }
+                roomRoutes.assertIdle(boundRoom);
+                const current = await rooms.page(boundRoom.id, { limit: 1 });
+                if (current.room.closed) {
+                    write(res, 409, { ok: false, code: 'task-room-closed' });
+                    return;
+                }
+                write(res, 409, { ok: false, code: 'invalid-leader', message: '请打开工单群，选择该工作区的 Leader 后运行。' });
                 return;
             }
             const snapshot = await board.apply(randomUUID(), { kind: 'run', taskId: body.taskId }, initiator);
@@ -329,6 +385,16 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             }
             const source = boardSource();
             const workflow = orchestration?.target(source, body.taskId);
+            const boundRoom = rooms?.find(source, body.taskId);
+            if (boundRoom) {
+                const access = authenticate(req, true);
+                if (!taskRoomAccess(access, boundRoom, allowed)) {
+                    write(res, 403, { ok: false, code: 'workspace-forbidden' });
+                    return;
+                }
+                write(res, 409, { ok: false, code: 'task-room-archive', message: '此工单已有群聊。请在工单群里关单归档。' });
+                return;
+            }
             if (workflow && !authorize(req, res, workflow)) return;
             orchestration?.assertIdle(source, body.taskId);
             const snapshot = await board.apply(randomUUID(), { kind: 'delete', taskId: body.taskId }, initiator);
@@ -591,6 +657,11 @@ export function mountGroups(ctx, config, options = {}) {
             throw new Error('marshal: agents no-web-server');
         },
     });
+    let rooms;
+    try {
+        rooms = createTaskRooms({ store: createTaskRoomStore(join(root, 'task-rooms.sqlite')),
+            deviceId: config.deviceId, hub: crossClient?.taskRoom });
+    } catch { options.logger?.warn?.('marshal: local task room archive unavailable'); }
     let orchestration;
     try {
         orchestration = createTaskOrchestration({
@@ -611,6 +682,7 @@ export function mountGroups(ctx, config, options = {}) {
     catch { options.logger?.warn?.('marshal: task orchestration unavailable'); }
     if (typeof ctx.effect === 'function') ctx.effect(() => () => {
         orchestration?.dispose();
+        rooms?.close();
         promptAbort.abort();
         service.dispose();
     }, 'marshal: groups prompt lifetime');
@@ -642,7 +714,7 @@ export function mountGroups(ctx, config, options = {}) {
                 }
                 catch { /* desktop origin is enough when the host has no public origin */ }
                 return origins;
-            }, orchestration).map((route) => scoped.webServer.register(route));
+            }, orchestration, rooms).map((route) => scoped.webServer.register(route));
             return () => {
                 for (const dispose of disposers) dispose();
             };

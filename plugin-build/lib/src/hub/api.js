@@ -882,6 +882,20 @@ export function registerMarshalRoutes(options) {
             json(res, 400, { ok: false, code: error instanceof Error ? error.message : 'send-failed' });
         }
     }));
+    register('/marshal/api/task-rooms', guard(async (req, res) => {
+        if (req.method !== 'POST') { methodNotAllowed(res, 'POST'); return; }
+        const device = deviceFromBearer(req);
+        if (!device) { deny(res, 401, 'unauthorized'); return; }
+        if (!options.taskRooms) { deny(res, 503, 'task-rooms-unavailable'); return; }
+        const read = await readJsonBody(req, res, 512 * 1024);
+        if (!read.ok) return;
+        try { json(res, 200, { ok: true, ...await options.taskRooms.handle(device, read.value) }); }
+        catch (error) {
+            const code = typeof error?.code === 'string' && /^[a-z-]{2,64}$/.test(error.code) ? error.code : 'invalid-task-room';
+            const httpStatus = code === 'workspace-forbidden' ? 403 : code === 'task-room-not-found' ? 404 : 400;
+            json(res, httpStatus, { ok: false, code, message: code === 'invalid-task-room' ? '工单群请求或存储不可用。' : error.message });
+        }
+    }));
     register('/marshal/api/memory-sync/push', guard(async (req, res) => {
         await handleMemorySyncPush(req, res, { memorySync, deviceFromRequest: deviceFromBearer, operatorId });
     }));
