@@ -68,3 +68,12 @@ export async function verifyPin(pin: string, record: LockRecord): Promise<boolea
 export function isValidPin(pin: string): boolean {
   return /^\d{4,8}$/.test(pin)
 }
+
+export const PIN_MAX_ATTEMPTS = 5
+
+/** 第 1 次错等 1 秒，之后翻倍，第 5 次起至少 60 秒。 */
+export function pinDelay(failures: number): number {
+  if (failures <= 0) return 0
+  const stepped = Math.min(60_000, 1_000 * 2 ** (failures - 1))
+  return failures >= PIN_MAX_ATTEMPTS ? Math.max(60_000, stepped) : stepped
+}

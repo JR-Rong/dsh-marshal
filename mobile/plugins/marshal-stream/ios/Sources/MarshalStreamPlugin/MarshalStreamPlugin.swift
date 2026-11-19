@@ -85,7 +85,11 @@ final class StreamBox: NSObject, URLSessionDataDelegate {
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         request.setValue("no-store", forHTTPHeaderField: "Cache-Control")
         if let token, !token.isEmpty {
-            request.setValue(token, forHTTPHeaderField: "x-marshal-token")
+            if token.hasPrefix("mph1.") || token.hasPrefix("mnd1.") {
+                request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization")
+            } else {
+                request.setValue(token, forHTTPHeaderField: "x-marshal-token")
+            }
         }
         if let lastEventId, !lastEventId.isEmpty {
             request.setValue(lastEventId, forHTTPHeaderField: "Last-Event-ID")

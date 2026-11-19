@@ -42,6 +42,8 @@ export interface MarshalConfig {
   label: string
   /** 应用锁；null 表示未启用。 */
   lock: AppLock | null
+  /** 局域网 DSH 工作台。默认关闭，打开后才保存桥令牌并连接本机电脑。 */
+  lanBridge?: boolean
   /** 群聊账号会话；null/缺省表示未用 ticket 登录。 */
   account?: AccountSession | null
   updatedAt: number
@@ -145,6 +147,7 @@ export function parseConfig(raw: unknown): MarshalConfig | null {
     token,
     label: typeof value.label === 'string' ? value.label.slice(0, 60) : '',
     lock,
+    ...(value.lanBridge === true ? { lanBridge: true } : {}),
     ...(account === null ? {} : { account }),
     updatedAt: typeof value.updatedAt === 'number' && Number.isFinite(value.updatedAt) ? value.updatedAt : Date.now(),
   }

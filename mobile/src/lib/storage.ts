@@ -9,6 +9,10 @@ import { Capacitor } from '@capacitor/core'
 import { parseConfig, type MarshalConfig } from './config.ts'
 
 const STORE_KEY = 'dsh-marshal-mobile.config'
+const BRIDGE_KEY = 'dsh-marshal-mobile.bridge'
+const PIN_KEY = 'dsh-marshal-mobile.pin-guard'
+
+let bridgeMemory: string | null = null
 
 export function isNativeRuntime(): boolean {
   try {
@@ -58,6 +62,59 @@ export async function writeConfig(config: MarshalConfig): Promise<void> {
   const storage = webStorage()
   if (!storage) throw new Error('本机存储不可用')
   storage.setItem(STORE_KEY, serialized)
+}
+
+async function readSecret(key: string): Promise<string | null> {
+  if (isNativeRuntime()) {
+    try { return await SecureStorage.getItem(key) } catch { return null }
+  }
+  return key === BRIDGE_KEY ? bridgeMemory : null
+}
+
+async function writeSecret(key: string, value: string | null): Promise<void> {
+  if (key === BRIDGE_KEY) bridgeMemory = value
+  if (!isNativeRuntime()) return
+  if (value === null) {
+    try { await SecureStorage.removeItem(key) } catch { /* already gone */ }
+    return
+  }
+  await SecureStorage.setItem(key, value)
+}
+
+export async function readBridgeRecord(): Promise<string | null> {
+  const value = await readSecret(BRIDGE_KEY)
+  bridgeMemory = value
+  return value
+}
+
+export async function writeBridgeRecord(value: string | null): Promise<void> {
+  await writeSecret(BRIDGE_KEY, value)
+}
+
+const INSTALL_KEY = 'dsh-marshal-mobile.installation'
+
+export async function installationId(): Promise<string> {
+  const existing = isNativeRuntime()
+    ? await readSecret(INSTALL_KEY)
+    : (() => { try { return window.sessionStorage.getItem(INSTALL_KEY) } catch { return null } })()
+  if (existing) return existing
+  const created = crypto.randomUUID()
+  if (isNativeRuntime()) await writeSecret(INSTALL_KEY, created)
+  else { try { window.sessionStorage.setItem(INSTALL_KEY, created) } catch { /* 这一页内仍返回新值 */ } }
+  return created
+}
+
+export async function readPinGuard(): Promise<string | null> {
+  if (isNativeRuntime()) return readSecret(PIN_KEY)
+  try { return window.sessionStorage.getItem(PIN_KEY) } catch { return null }
+}
+
+export async function writePinGuard(value: string | null): Promise<void> {
+  if (isNativeRuntime()) { await writeSecret(PIN_KEY, value); return }
+  try {
+    if (value === null) window.sessionStorage.removeItem(PIN_KEY)
+    else window.sessionStorage.setItem(PIN_KEY, value)
+  } catch { /* 浏览器预览记不住也只影响这一页 */ }
 }
 
 export async function removeConfig(): Promise<void> {

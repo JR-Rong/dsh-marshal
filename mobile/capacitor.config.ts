@@ -14,17 +14,12 @@ const config: CapacitorConfig = {
   webDir: 'dist',
   server: {
     androidScheme: 'https',
-    allowNavigation: ['*'],
   },
   ios: {
     contentInset: 'always',
     allowsLinkPreview: false,
   },
-  android: {
-    // DSH 远程桥 /ios/v1 在局域网/USB adb reverse 下是 ws://；WebView 源是
-    // https://localhost，必须允许混合内容才能连本机桥。Hub 仍走 https。
-    allowMixedContent: true,
-  },
+  android: {},
   plugins: {
     CapacitorHttp: { enabled: true },
     SplashScreen: {

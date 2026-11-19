@@ -64,7 +64,10 @@ export async function requestJson(url: string, options: JsonOptions = {}): Promi
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? TIMEOUT_MS)
   const headers: Record<string, string> = { accept: 'application/json' }
-  if (options.token) headers[TOKEN_HEADER] = options.token
+  if (options.token) {
+    if (options.token.startsWith('mph1.') || options.token.startsWith('mnd1.')) headers.authorization = 'Bearer ' + options.token
+    else headers[TOKEN_HEADER] = options.token
+  }
   if (options.body !== undefined) headers['content-type'] = 'application/json'
   try {
     const response = await fetch(url, {

@@ -7,17 +7,23 @@ export type DeepLinkDecision =
   | { action: 'confirm'; hubUrl: string }
   | { action: 'same' }
 
+/** 旧的一码把管理令牌、群聊票或桥令牌放进链接。这类链接整段丢弃。 */
+export function linkCarriesSecret(url: string): boolean {
+  return /marshal:\/\/setup\b/i.test(url)
+    || /[?&#](?:token|ticket|hubToken|bridgeToken|dashboardToken)=/i.test(url)
+    || /"(?:hubToken|bridgeToken|dashboardToken)"/.test(url)
+}
+
 /** 锁屏时整条忽略。已配置的 Hub 被换成别的地址时，必须先让用户确认。 */
 export function decideDeepLink(input: {
   url: string
   locked: boolean
   configuredHub: string | null
 }): DeepLinkDecision {
-  if (input.locked) return { action: 'ignore' }
+  if (input.locked || linkCarriesSecret(input.url)) return { action: 'ignore' }
   let hub: string | null = null
   try {
     const parsed = new URL(input.url)
-    if (parsed.protocol === 'marshal:' && parsed.hostname === 'pair') return { action: 'ignore' }
     hub = parsed.searchParams.get('hub')
   } catch {
     return { action: 'ignore' }

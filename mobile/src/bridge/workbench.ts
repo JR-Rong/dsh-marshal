@@ -1,16 +1,16 @@
 /**
  * DSH remote-bridge workbench: the agent-first mobile surface.
  *
- * Full-screen overlay independent of the Hub views. Pairing stores the device
- * token in localStorage; the bridge is /ios/v1 (protocol v1). Tabs: agents,
+ * Full-screen overlay independent of the Hub views. The bridge token stays in
+ * the keychain or encrypted storage. Tabs: agents,
  * sessions, task board, groups (Hub), memory (not yet served remotely).
  */
 import { BridgeClient, bridgeHost, classifyPairing, pairBridge, parsePairPayload, stripBridgeToken } from '../lib/bridge.ts'
 import { openQrScanner } from '../lib/scanner.ts'
 import type { BridgeDevice, BridgePresetRow, BridgeRunRow, BridgeSessionRow, BridgeSquadRow, BridgeTaskRow } from '../lib/bridge.ts'
+import { readBridgeRecord, writeBridgeRecord } from '../lib/storage.ts'
 
 const STYLE_ID = 'bridge-workbench-style'
-const STORE_KEY = 'dsh-marshal-mobile.bridge'
 
 type Tab = 'agents' | 'sessions' | 'board' | 'groups' | 'memory'
 
@@ -117,10 +117,11 @@ function injectStyle(): void {
   document.head.appendChild(style)
 }
 
-function readStored(): StoredBridge | null {
+let bridgeCache: StoredBridge | null = null
+
+function parseStored(raw: string | null): StoredBridge | null {
+  if (!raw) return null
   try {
-    const raw = window.localStorage.getItem(STORE_KEY)
-    if (!raw) return null
     const value = JSON.parse(raw) as Partial<StoredBridge>
     if (typeof value.url !== 'string' || typeof value.deviceToken !== 'string' || typeof value.deviceId !== 'string') return null
     return { url: stripBridgeToken(value.url), deviceToken: value.deviceToken, deviceId: value.deviceId }
@@ -129,17 +130,28 @@ function readStored(): StoredBridge | null {
   }
 }
 
-function store(device: StoredBridge): void {
-  try { window.localStorage.setItem(STORE_KEY, JSON.stringify(device)) } catch { /* ignore */ }
+export async function loadBridgeDevice(): Promise<StoredBridge | null> {
+  bridgeCache = parseStored(await readBridgeRecord())
+  return bridgeCache
 }
 
-function unstore(): void {
-  try { window.localStorage.removeItem(STORE_KEY) } catch { /* ignore */ }
+function readStored(): StoredBridge | null {
+  return bridgeCache
 }
 
-/** Persist a freshly paired bridge device for the scanner entry points. */
-export function saveBridgeDevice(device: BridgeDevice): void {
-  store({ url: stripBridgeToken(device.url), deviceToken: device.deviceToken, deviceId: device.deviceId })
+async function store(device: StoredBridge): Promise<void> {
+  bridgeCache = device
+  await writeBridgeRecord(JSON.stringify(device))
+}
+
+async function unstore(): Promise<void> {
+  bridgeCache = null
+  await writeBridgeRecord(null)
+}
+
+/** 桥令牌只进钥匙串 / 加密存储，不进 localStorage。 */
+export async function saveBridgeDevice(device: BridgeDevice): Promise<void> {
+  await store({ url: stripBridgeToken(device.url), deviceToken: device.deviceToken, deviceId: device.deviceId })
 }
 
 function prettyAgentName(name: string | undefined): string {
@@ -242,7 +254,7 @@ class Workbench {
   }
 
   async start(): Promise<void> {
-    this.#device = readStored()
+    this.#device = await loadBridgeDevice()
     this.render()
     if (this.#device) await this.connect()
   }
@@ -511,7 +523,7 @@ class Workbench {
   sessionDetail(): (Node | string)[] {
     const session = this.#sessions.find((item) => item.id === this.#sessionId)
     const messages = this.#messages.map((message) => h('div', { class: 'bw-msg ' + message.role },
-      h('span', { class: 'bw-role', text: message.role === 'user' ? '皇上' : message.role === 'reason' ? '思考' : 'DSH' }),
+      h('span', { class: 'bw-role', text: message.role === 'user' ? '我' : message.role === 'reason' ? '思考' : 'DSH' }),
       message.text,
     ))
     const input = h('textarea', { placeholder: '给这个会话发消息…', value: this.#draft }) as HTMLTextAreaElement
@@ -584,13 +596,13 @@ class Workbench {
     return [
       h('div', { class: 'bw-card' },
         h('h3', { text: '记忆：远程桥还没有这一面' }),
-        h('p', { text: 'DSH remote-bridge v1 目前没有 memory 方法。臣不画空列表糊弄皇上；要接记忆，需要给远程桥加一个 memory 扩展后再上手机端。' }),
+        h('p', { text: '远程桥还没有记忆接口，这里先空着。DSH 补上 docs/dsh-phone-api.md 里的 memory.readPhone 之后才会显示。' }),
       ),
     ]
   }
 
   unpair(): void {
-    unstore()
+    void unstore()
     this.#device = null
     this.#client?.close()
     this.#client = null

@@ -9,6 +9,12 @@ import { Capacitor, CapacitorHttp } from '@capacitor/core'
 import type { MarshalConfig } from './config.ts'
 
 export const TOKEN_HEADER = 'x-marshal-token'
+
+/** 手机凭证走 Bearer mph1.；管理令牌仍走原来的头，两种不会混用。 */
+export function authHeaders(token: string): Record<string, string> {
+  if (token.startsWith('mph1.') || token.startsWith('mnd1.')) return { authorization: 'Bearer ' + token }
+  return { [TOKEN_HEADER]: token }
+}
 const DEFAULT_TIMEOUT_MS = 15_000
 
 export interface Target {
@@ -220,7 +226,7 @@ export class MarshalApi {
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
     const headers: Record<string, string> = { accept: 'application/json' }
     const token = options.token ?? this.token
-    if (token) headers[TOKEN_HEADER] = token
+    if (token) Object.assign(headers, authHeaders(token))
     if (options.body !== undefined) headers['content-type'] = 'application/json'
     // Android WebView 的原生 fetch 会带上 Origin: https://localhost，Hub 会按来源拒绝（403）。
     // 原生栈显式发 Hub 的精确 Origin；浏览器里由同源/代理处理，不手写这个禁止头。

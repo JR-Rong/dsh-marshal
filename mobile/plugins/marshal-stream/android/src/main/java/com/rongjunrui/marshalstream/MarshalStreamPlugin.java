@@ -92,7 +92,11 @@ public class MarshalStreamPlugin extends Plugin {
             conn.setRequestProperty("Accept", "text/event-stream");
             conn.setRequestProperty("Cache-Control", "no-store");
             if (token != null && !token.isEmpty()) {
-                conn.setRequestProperty("x-marshal-token", token);
+                if (token.startsWith("mph1.") || token.startsWith("mnd1.")) {
+                    conn.setRequestProperty("Authorization", "Bearer " + token);
+                } else {
+                    conn.setRequestProperty("x-marshal-token", token);
+                }
             }
             if (lastEventId != null && !lastEventId.isEmpty()) {
                 conn.setRequestProperty("Last-Event-ID", lastEventId);

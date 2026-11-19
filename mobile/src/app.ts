@@ -10,16 +10,18 @@ import {
   type Capability, type DeviceRow, type InputCard, type SessionRow, type Target, type SessionControls,
 } from './lib/marshal.ts'
 import {
-  AccountApi, buildPreviewInput, buildSendPayload, extractTicket, loginWithTicket, parseOnboardLink, parseRoom, ticketFingerprint,
+  AccountApi, buildPreviewInput, buildSendPayload, extractTicket, loginWithTicket, parseOnboardLink, parseRoom,
   type DiscussionCatalogItem, type DiscussionRoom, type GroupPreview, type RoomSummary,
 } from './lib/account.ts'
 import type { AccountSession } from './lib/config.ts'
 import { openEventStream, type StreamHandle, type StreamFrame } from './lib/sse.ts'
-import { hasStoredBridge, openBridgeWorkbench, saveBridgeDevice } from './bridge/workbench.ts'
-import { classifyPairing, pairBridge, parsePairPayload, parseUnifiedPairing, type UnifiedPairing } from './lib/bridge.ts'
+import { hasStoredBridge, loadBridgeDevice, openBridgeWorkbench, saveBridgeDevice } from './bridge/workbench.ts'
+import { classifyPairing, pairBridge, parsePairPayload, parseUnifiedPairing } from './lib/bridge.ts'
 import { openQrScanner } from './lib/scanner.ts'
-import { readConfig, writeConfig, removeConfig } from './lib/storage.ts'
-import { createLock, verifyPin, isValidPin, type LockRecord } from './lib/lock.ts'
+import { installationId, readConfig, readPinGuard, removeConfig, writeConfig, writePinGuard } from './lib/storage.ts'
+import { createLock, pinDelay, verifyPin, isValidPin, type LockRecord } from './lib/lock.ts'
+import { decideDeepLink, linkCarriesSecret, parsePairingLink } from './lib/deeplink.ts'
+import { resolveSettingsToken, SETTINGS_TOKEN_PLACEHOLDER } from './lib/settings-token.ts'
 import {
   setupChrome, inNativeShell, openExternal, vibrate, exitApp,
   watchNetwork, watchDeepLinks, watchBackButton,
@@ -231,8 +233,9 @@ export async function start(): Promise<void> {
   } else {
     await enterApp()
   }
-  // 已配对 DSH 的手机，下次打开直接进入 agent-first 工作台；有应用锁时不抢在解锁前打开。
-  if (!config?.lock) {
+  await loadBridgeDevice()
+  // 局域网工作台默认关闭，也不盖在锁屏上。
+  if (config?.lanBridge && !config.lock && state.view !== 'lock') {
     setTimeout(() => { if (hasStoredBridge()) openDshWorkbench() }, 250)
   }
   await watchNetwork((online) => {
@@ -734,8 +737,8 @@ function setupView(): Child[] {
       el('h2', { text: '连接电脑' }),
       el('p', { class: 'empty', text: '用摄像头扫电脑「跨设备」页的二维码，自动完成配对。' }),
       button('扫码配对', scanPairing, { class: 'primary block scan-button' }),
-      el('p', { class: 'notice', text: 'Hub「手机连接」与 DSH「配对 iPhone」的二维码都能扫。' }),
-      ...(hasStoredBridge() ? [button('打开已配对的 DSH 工作台', openDshWorkbench, { class: 'block' })] : []),
+      el('p', { class: 'notice', text: '扫电脑上正在倒计时的配对码。码里只有 Hub 地址。' }),
+      ...(state.config?.lanBridge && hasStoredBridge() ? [button('打开局域网工作台', openDshWorkbench, { class: 'block' })] : []),
     ),
     themeCard(),
     manual,
@@ -799,40 +802,28 @@ function openDshWorkbench(): void {
   })
 }
 
-/** One QR: pair the DSH bridge first, then apply the Hub half, then open the workbench. */
-async function applyUnifiedPairing(payload: UnifiedPairing): Promise<void> {
-  let bridgeReady = false
-  try {
-    const device = await pairBridge({ token: payload.bridgeToken, url: payload.bridge })
-    saveBridgeDevice(device)
-    bridgeReady = true
-  } catch (error) {
-    toast('DSH 工作台配对失败：' + (error instanceof Error ? error.message : '未知错误'), 'error')
-  }
-  const params = new URLSearchParams({ hub: payload.hub, token: payload.hubToken })
-  if (payload.ticket) params.set('ticket', payload.ticket)
-  await handleDeepLink('marshal://open?' + params.toString())
-  if (bridgeReady) openDshWorkbench()
-}
-
 async function handleScannedPairing(text: string): Promise<void> {
   const raw = text.trim()
-  if (!raw) return
-  const kind = classifyPairing(raw)
-  if (kind === 'unified') {
-    const unified = parseUnifiedPairing(raw)
-    if (unified) { await applyUnifiedPairing(unified); return }
+  if (!raw || appLocked()) return
+  if (linkCarriesSecret(raw) || parseUnifiedPairing(raw)) {
+    toast('这个码里有旧令牌，已忽略。请扫电脑上新的配对码。', 'error')
+    return
   }
+  const kind = classifyPairing(raw)
   if (kind === 'hub') { await handleDeepLink(raw); return }
   if (kind !== 'bridge') {
     toast('这个二维码不是配对链接，请扫「跨设备」页的码', 'error')
     return
   }
+  if (!state.config?.lanBridge) {
+    toast('局域网工作台默认关闭。要连本机电脑，先到设置里打开。', 'error')
+    return
+  }
   try {
     const payload = parsePairPayload(raw)
     const device = await pairBridge(payload)
-    saveBridgeDevice(device)
-    openDshWorkbench()
+    await saveBridgeDevice(device)
+    if (!appLocked()) openDshWorkbench()
   } catch (error) {
     toast(error instanceof Error ? error.message : '配对失败', 'error')
   }
@@ -1202,112 +1193,101 @@ function accountUsable(): boolean {
   return !!state.account && state.account.expiresAt > Date.now()
 }
 
-const LAST_TICKET_KEY = 'dsh-marshal-mobile.last-ticket'
-
-function readLastTicket(): { fp: string; at: number } | null {
-  try {
-    const raw = window.localStorage.getItem(LAST_TICKET_KEY)
-    if (!raw) return null
-    const value = JSON.parse(raw) as { fp?: unknown; at?: unknown }
-    if (typeof value.fp !== 'string' || typeof value.at !== 'number') return null
-    return { fp: value.fp, at: value.at }
-  } catch {
-    return null
-  }
+function appLocked(): boolean {
+  return state.view === 'lock' || (state.view === 'booting' && !!state.config?.lock)
 }
 
-function writeLastTicket(fp: string, at: number): void {
-  try { window.localStorage.setItem(LAST_TICKET_KEY, JSON.stringify({ fp, at })) } catch { /* 存不下就算了 */ }
+async function readPinState(): Promise<{ failures: number; until: number }> {
+  const raw = await readPinGuard()
+  if (!raw) return { failures: 0, until: 0 }
+  try {
+    const value = JSON.parse(raw) as { failures?: unknown; until?: unknown }
+    return {
+      failures: typeof value.failures === 'number' ? value.failures : 0,
+      until: typeof value.until === 'number' ? value.until : 0,
+    }
+  } catch {
+    return { failures: 0, until: 0 }
+  }
 }
 
 /**
- * 一键配对深链：marshal://open?hub=...&token=...&ticket=...
- * 有 token 就直接配好 Hub 并进主界面；有 ticket 再顺带登录群聊。
- * 应用锁未解除时只暂存整条链接，解锁后重放，不能绕过锁。
+ * 深链只接受 marshal://pair?code&hub。锁屏时直接丢掉，不排队。
+ * 带管理令牌、群聊票或桥令牌的旧链接整段忽略。
  */
 async function handleDeepLink(raw: string): Promise<void> {
-  const unified = parseUnifiedPairing(raw)
-  if (unified) { await applyUnifiedPairing(unified); return }
-  const parsed = parseOnboardLink(raw)
-  if (!parsed) return
-  if (state.config?.lock && state.view === 'lock') {
-    state.pendingDeepLink = raw
-    toast('解锁后完成配对')
+  if (appLocked()) return
+  if (linkCarriesSecret(raw) || parseUnifiedPairing(raw)) {
+    toast('这个链接带有旧令牌，已忽略。请扫电脑上新的配对码。', 'error')
     return
   }
-  if (parsed.ticket) {
-    // 冷启动时 getLaunchUrl 与 appUrlOpen 可能把同一张 ticket 送两遍；ticket 只能用一次。
-    const fp = ticketFingerprint(parsed.ticket)
-    const last = readLastTicket()
-    if (last && last.fp === fp && Date.now() - last.at < 24 * 60 * 60_000) {
-      toast('这张 ticket 已处理过；请到电脑端点「刷新二维码」重新生成', 'error')
-      return
+  const pairing = parsePairingLink(raw)
+  if (pairing?.hubUrl) {
+    const decision = decideDeepLink({ url: raw, locked: false, configuredHub: state.config?.hubUrl ?? null })
+    if (decision.action === 'invalid') { toast(decision.error, 'error'); return }
+    if (decision.action === 'confirm') {
+      const host = new URL(decision.hubUrl).host
+      if (!window.confirm('把 Hub 换成 ' + host + '？已保存的令牌会被清掉。')) return
     }
-    writeLastTicket(fp, Date.now())
-  }
-  let hub: string | undefined
-  if (parsed.hub !== undefined) {
-    const normalized = normalizeHubUrl(parsed.hub)
-    if (!normalized.ok) { toast(normalized.error, 'error'); return }
-    hub = normalized.value
-  }
-  let token: string | undefined
-  if (parsed.token !== undefined) {
-    const normalized = normalizeToken(parsed.token)
-    if (!normalized.ok) { toast(normalized.error, 'error'); return }
-    token = normalized.value
-  }
-  if (!state.config && !hub) {
-    toast('配对链接缺少 Hub 地址', 'error')
+    await redeemPairingCode(pairing.hubUrl, pairing.code)
     return
   }
-  const next = state.config ?? makeConfig({ hubUrl: hub as string })
-  const hubChanged = hub !== undefined && next.hubUrl !== hub
-  if (hub !== undefined) next.hubUrl = hub
-  if (token !== undefined) next.token = token
+  const parsed = parseOnboardLink(raw)
+  if (!parsed?.hub) return
+  const decision = decideDeepLink({ url: raw, locked: false, configuredHub: state.config?.hubUrl ?? null })
+  if (decision.action === 'invalid') { toast(decision.error, 'error'); return }
+  if (decision.action !== 'prefill' && decision.action !== 'confirm' && decision.action !== 'same') return
+  if (decision.action === 'confirm') {
+    const host = new URL(decision.hubUrl).host
+    if (!window.confirm('把 Hub 换成 ' + host + '？已保存的令牌会被清掉。')) return
+  }
+  const hub = decision.action === 'same' ? state.config?.hubUrl : decision.hubUrl
+  if (!hub) return
+  const next = state.config ?? makeConfig({ hubUrl: hub })
+  const hubChanged = next.hubUrl !== hub
+  next.hubUrl = hub
+  if (hubChanged || !state.config) next.token = ''
   if (hubChanged) next.account = null
   next.updatedAt = Date.now()
-  if (hub !== undefined || token !== undefined) {
-    try {
-      await writeConfig(next)
-    } catch {
-      toast('配对信息保存失败', 'error')
-    }
-    state.config = next
-    state.account = next.account ?? null
-  }
-  if (token !== undefined) {
-    await enterApp()
-    if (state.view === 'setup') {
-      toast('Hub 拒绝了管理令牌，请核对配对二维码', 'error')
-      return
-    }
-    if (parsed.ticket) {
-      const ok = await loginTicket(parsed.ticket)
-      if (!ok) { state.view = 'home'; render() }
-    }
-    toast('配对完成')
+  try { await writeConfig(next) } catch { toast('配对信息保存失败', 'error'); return }
+  state.config = next
+  state.account = next.account ?? null
+  state.view = next.token ? state.view : 'setup'
+  render()
+  toast(hubChanged ? '已更换 Hub，请重新配对' : '已填入 Hub 地址')
+  return
+}
+
+async function redeemPairingCode(hubUrl: string, code: string): Promise<void> {
+  let response: Response
+  try {
+    response = await fetch(hubUrl + '/marshal/api/pairing/redeem', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify({ code, name: '我的手机', installationId: await installationId() }),
+    })
+  } catch {
+    toast('连不上 Hub', 'error')
     return
   }
-  if (parsed.ticket) {
-    if (!state.config) {
-      toast('请先填入 Hub 地址', 'error')
-      state.view = 'setup'
-      render()
-      return
-    }
-    const ok = await loginTicket(parsed.ticket)
-    if (!ok) {
-      state.view = state.config.token ? 'home' : 'setup'
-      render()
-    }
+  if (!response.ok) { toast('配对码无效或已过期，请扫电脑上最新的码', 'error'); return }
+  const body = await response.json() as { credential?: unknown }
+  if (typeof body.credential !== 'string' || !body.credential.startsWith('mph1.')) {
+    toast('Hub 没有返回手机凭证', 'error')
     return
   }
-  if (hub !== undefined) {
-    state.view = 'setup'
-    render()
-    toast('已从链接填入 Hub 地址')
+  const previous = state.config
+  const next: MarshalConfig = {
+    ...(previous ?? makeConfig({ hubUrl })),
+    hubUrl,
+    token: body.credential,
+    ...(previous && previous.hubUrl !== hubUrl ? { account: null } : {}),
+    updatedAt: Date.now(),
   }
+  try { await writeConfig(next) } catch { toast('凭证保存失败', 'error'); return }
+  state.config = next
+  toast('配对完成')
+  if (!appLocked()) await enterApp()
 }
 
 async function loginTicket(ticket: string): Promise<boolean> {
@@ -1768,7 +1748,7 @@ function settingsView(): Child[] {
   const config = state.config
   if (!config) { state.view = 'setup'; return setupView() }
   const hubInput = el('input', { type: 'url', inputmode: 'url', autocomplete: 'url', value: config.hubUrl }) as HTMLInputElement
-  const tokenInput = el('input', { type: 'password', autocomplete: 'off', value: config.token, placeholder: '管理令牌' }) as HTMLInputElement
+  const tokenInput = el('input', { type: 'password', autocomplete: 'off', value: '', placeholder: config.token ? SETTINGS_TOKEN_PLACEHOLDER : '管理令牌' }) as HTMLInputElement
   const result = el('p', { class: 'empty', text: '' })
   const ticketInput = el('input', {
     type: 'text', autocomplete: 'off',
@@ -1834,15 +1814,28 @@ function settingsView(): Child[] {
       el('h2', { text: '连接' }),
       el('div', { class: 'form' },
         el('div', { class: 'field' }, el('label', { text: 'Hub 地址' }), hubInput),
-        el('div', { class: 'field' }, el('label', { text: '管理令牌' }), tokenInput,
-          el('small', { text: '存于 iOS Keychain / Android EncryptedSharedPreferences' })),
+        el('details', {},
+          el('summary', { text: '高级：管理令牌' }),
+          el('div', { class: 'field' }, tokenInput,
+            el('small', { text: '管理令牌能控制这台 Hub 上的全部设备。平时用配对码，不要把令牌留在手机上。' })),
+        ),
         button('测试连接', () => { void testSettings(hubInput, tokenInput, result) }, { class: 'block' }),
         button('保存', () => { void saveSettings(hubInput, tokenInput, result) }, { class: 'primary block' }),
         result,
       ),
     ),
     accountCard,
-    el('div', { class: 'card' }, el('h2', { text: '安全' }), lockRow),
+    el('div', { class: 'card' }, el('h2', { text: '安全' }), lockRow,
+      el('div', { class: 'row-between' },
+        el('div', { class: 'label' }, el('strong', { text: '局域网工作台' }), el('span', { text: config.lanBridge ? '已打开，可连接同一网络的电脑' : '默认关闭' })),
+        button(config.lanBridge ? '关闭' : '打开', () => {
+          void writeConfig({ ...config, lanBridge: !config.lanBridge, updatedAt: Date.now() }).then(( ) => {
+            state.config = { ...config, lanBridge: !config.lanBridge }
+            render()
+          })
+        }, { class: 'icon-button' }),
+      ),
+    ),
     el('div', { class: 'card' },
       el('h2', { text: '节点' }),
       el('div', { class: 'row-between' },
@@ -1878,13 +1871,15 @@ async function testSettings(hubInput: HTMLInputElement, tokenInput: HTMLInputEle
 async function saveSettings(hubInput: HTMLInputElement, tokenInput: HTMLInputElement, result: HTMLElement): Promise<void> {
   const config = state.config
   if (!config) return
-  const parsed = readSetup(hubInput, tokenInput)
-  if (!parsed.ok) { result.textContent = parsed.error; return }
-  const hubChanged = parsed.hubUrl !== config.hubUrl
+  const hub = normalizeHubUrl(hubInput.value)
+  if (!hub.ok) { result.textContent = hub.error; return }
+  const token = resolveSettingsToken({ typed: tokenInput.value, saved: config.token, previousHub: config.hubUrl, nextHub: hub.value })
+  if (!token.ok) { result.textContent = token.error; return }
+  const hubChanged = hub.value !== config.hubUrl
   const next: MarshalConfig = {
     ...config,
-    hubUrl: parsed.hubUrl,
-    token: parsed.token,
+    hubUrl: hub.value,
+    token: token.token,
     ...(hubChanged ? { account: null } : {}),
     updatedAt: Date.now(),
   }
@@ -1995,8 +1990,22 @@ function lockView(): Child[] {
       return
     }
     if (!config.lock) { state.view = 'home'; render(); return }
+    const guard = await readPinState()
+    if (guard.until > Date.now()) {
+      state.pinError = '请等待 ' + Math.ceil((guard.until - Date.now()) / 1000) + ' 秒后再试'
+      render()
+      return
+    }
     const ok = await verifyPin(pin, config.lock)
-    if (!ok) { state.pinError = 'PIN 不正确'; render(); return }
+    if (!ok) {
+      const failures = guard.failures + 1
+      const until = Date.now() + pinDelay(failures)
+      await writePinGuard(JSON.stringify({ failures, until }))
+      state.pinError = 'PIN 不正确，请等待 ' + Math.ceil(pinDelay(failures) / 1000) + ' 秒'
+      render()
+      return
+    }
+    await writePinGuard(null)
     if (purpose === 'disable') {
       await persistLock(null)
       state.view = 'settings'
@@ -2005,10 +2014,8 @@ function lockView(): Child[] {
       return
     }
     state.pinError = ''
-    await enterApp()
-    const pending = state.pendingDeepLink
     state.pendingDeepLink = null
-    if (pending) await handleDeepLink(pending)
+    await enterApp()
   }
 
   const press = (digit: string): void => {
