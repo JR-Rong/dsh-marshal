@@ -2,7 +2,7 @@ import ActivityKit
 import WidgetKit
 import SwiftUI
 
-@available(iOS 16.1, *)
+@available(iOS 16.2, *)
 struct MarshalAttributes: ActivityAttributes {
     public struct ContentState: Codable, Hashable {
         var title: String
@@ -11,7 +11,7 @@ struct MarshalAttributes: ActivityAttributes {
     var session: String
 }
 
-@available(iOS 16.1, *)
+@available(iOS 16.2, *)
 struct MarshalActivityWidget: Widget {
     var body: some WidgetConfiguration {
         ActivityConfiguration(for: MarshalAttributes.self) { context in
@@ -33,7 +33,7 @@ struct MarshalActivityWidget: Widget {
     }
 }
 
-@available(iOS 16.1, *)
+@available(iOS 16.2, *)
 @main
 struct MarshalActivityBundle: WidgetBundle {
     var body: some Widget {

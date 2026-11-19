@@ -410,15 +410,15 @@ export function registerMarshalRoutes(options) {
     const idleMs = options.sessionIdleMs ?? SESSION_IDLE_MS;
     const failureDelayMs = options.loginFailureDelayMs ?? 250;
     const disposers = [];
-    const pendingCards = new Map();
     disposers.push(relay.subscribe((event) => {
+        if (phone === undefined) return;
         const payload = typeof event.payload === 'object' && event.payload !== null ? event.payload : {};
         const requestId = typeof payload.requestId === 'string' ? payload.requestId : '';
         if (!requestId) return;
-        if (event.kind === 'input.resolved') pendingCards.delete(requestId);
-        if (event.kind === 'input.requested' && typeof onceDecisionIds === 'function') {
+        if (event.kind === 'input.resolved') phone.forgetCard(requestId);
+        if (event.kind === 'input.requested') {
             const card = onceDecisionIds(payload);
-            if (card) pendingCards.set(requestId, card);
+            if (card) phone.rememberCard(requestId, card);
         }
     }));
     // 每条 SSE 流一个清理函数：取消订阅、清心跳，并把自己从集合里移除。
@@ -1013,7 +1013,7 @@ export function registerMarshalRoutes(options) {
                 deny(res, 401, 'unauthorized');
                 return;
             }
-            json(res, 200, { ok: true, tasks: phone.tasksFor() });
+            json(res, 200, { ok: true, tasks: phone.tasksFor(), revisions: phone.revisions() });
             return;
         }
         if (req.method !== 'POST') {
@@ -1153,6 +1153,20 @@ export function registerMarshalRoutes(options) {
             return;
         }
         phone.watch(auth, body.deviceId + '|' + body.agent + '|' + body.sessionId);
+        json(res, 200, { ok: true });
+    }));
+    register('/marshal/api/unwatch', guard(async (req, res) => {
+        if (req.method !== 'POST' || phone === undefined) { methodNotAllowed(res, 'POST'); return; }
+        const parsed = parseBearer(headerValue(req, 'authorization'));
+        const auth = parsed?.kind === 'phone' ? phone.authenticate(parsed.token) : undefined;
+        if (auth === undefined || !auth.ok) { deny(res, 401, 'unauthorized'); return; }
+        const read = await readJsonBody(req, res, SMALL_BODY_LIMIT);
+        if (!read.ok) return;
+        const body = asRecord(read.value);
+        if (!body || typeof body.deviceId !== 'string' || typeof body.agent !== 'string' || typeof body.sessionId !== 'string') {
+            json(res, 400, { ok: false, code: 'invalid-args' }); return;
+        }
+        phone.unwatch(auth, body.deviceId + '|' + body.agent + '|' + body.sessionId);
         json(res, 200, { ok: true });
     }));
     register('/marshal/api/sessions', guard((req, res) => {
@@ -1311,7 +1325,7 @@ export function registerMarshalRoutes(options) {
             return;
         }
         const requestId = typeof body.args === 'object' && body.args !== null ? body.args.requestId : undefined;
-        const pending = typeof requestId === 'string' ? pendingCards.get(requestId) : undefined;
+        const pending = phone !== undefined && typeof requestId === 'string' ? phone.cardFor(requestId) : undefined;
         if (asPhone !== undefined && !controllerCommandAllowed(op, body.args, pending)) {
             json(res, 403, { ok: false, code: 'forbidden' });
             return;

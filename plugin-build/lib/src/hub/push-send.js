@@ -48,18 +48,22 @@ export async function deliverPush(input) {
         const jwt = signApnsJwt(key, keyId, teamId, now);
         if (!jwt)
             return { delivered: false, reason: 'key-unreadable' };
-        const live = input.notice.kind === 'run-start' || input.notice.kind === 'run-finish' || input.notice.kind === 'approval';
-        const token = live && input.target.liveToken ? input.target.liveToken : input.target.token;
-        const status = await postApns({
-            token,
-            jwt,
-            bundleId: input.config?.apns?.bundleId ?? '',
-            notice: input.notice,
-            sandbox: input.config?.apns?.environment !== 'production',
-            live: live && Boolean(input.target.liveToken),
-            now,
+        const bundleId = input.config?.apns?.bundleId ?? '';
+        const sandbox = input.config?.apns?.environment !== 'production';
+        const post = async (token, live) => postApns({
+            token, jwt, bundleId, notice: input.notice, sandbox, live, now,
             ...(input.apnsPost === undefined ? {} : { post: input.apnsPost }),
         });
+        const liveKind = input.notice.kind === 'run-start' || input.notice.kind === 'run-finish' || input.notice.kind === 'approval';
+        if (input.notice.kind === 'approval') {
+            const alert = await post(input.target.token, false);
+            if (input.target.liveToken)
+                await post(input.target.liveToken, true);
+            return alert >= 200 && alert < 300
+                ? { delivered: true, reason: 'sent' }
+                : { delivered: false, reason: 'provider-' + alert };
+        }
+        const status = await post(liveKind && input.target.liveToken ? input.target.liveToken : input.target.token, Boolean(liveKind && input.target.liveToken));
         return status >= 200 && status < 300
             ? { delivered: true, reason: 'sent' }
             : { delivered: false, reason: 'provider-' + status };
@@ -86,11 +90,17 @@ async function deliverFcm(config, target, notice, now, fetcher) {
     }));
     const cached = fcmCache.get(email);
     let access = cached && cached.exp > now + 60_000 ? cached.token : '';
+    let assertion = '';
+    try {
+        const signer = createSign('RSA-SHA256');
+        signer.update(header + '.' + claims);
+        assertion = header + '.' + claims + '.' + signer.sign(key).toString('base64url');
+    }
+    catch {
+        return { delivered: false, reason: 'key-unreadable' };
+    }
     try {
         if (!access) {
-            const signer = createSign('RSA-SHA256');
-            signer.update(header + '.' + claims);
-            const assertion = header + '.' + claims + '.' + signer.sign(key).toString('base64url');
             const tokenResponse = await fetcher('https://oauth2.googleapis.com/token', {
                 method: 'POST',
                 headers: { 'content-type': 'application/x-www-form-urlencoded' },
@@ -107,12 +117,18 @@ async function deliverFcm(config, target, notice, now, fetcher) {
         const send = await fetcher('https://fcm.googleapis.com/v1/projects/' + encodeURIComponent(project) + '/messages:send', {
             method: 'POST',
             headers: { authorization: 'Bearer ' + access, 'content-type': 'application/json' },
-            body: JSON.stringify({ message: { token: target.token, notification: { title: notice.title, body: notice.body } } }),
+            body: JSON.stringify({
+                message: {
+                    token: target.token,
+                    notification: { title: notice.title, body: notice.body },
+                    data: { kind: notice.kind },
+                },
+            }),
         });
         return send.ok ? { delivered: true, reason: 'sent' } : { delivered: false, reason: 'provider-' + send.status };
     }
     catch {
-        return { delivered: false, reason: 'key-unreadable' };
+        return { delivered: false, reason: 'network' };
     }
 }
 async function deliverHuawei(config, target, notice, fetcher) {

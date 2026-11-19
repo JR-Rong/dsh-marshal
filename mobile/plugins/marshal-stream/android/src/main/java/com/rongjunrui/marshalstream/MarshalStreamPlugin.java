@@ -60,7 +60,10 @@ public class MarshalStreamPlugin extends Plugin {
     public void startLiveActivity(PluginCall call) {
         String title = call.getString("title", "调度官");
         String phase = call.getString("phase", "");
-        if (PushTokens.onLive != null) PushTokens.onLive.show(title, phase);
+        if (PushTokens.onLive != null) {
+            if (Boolean.TRUE.equals(call.getBoolean("end", false))) PushTokens.onLive.clear();
+            else PushTokens.onLive.show(title, phase);
+        }
         call.resolve();
     }
 

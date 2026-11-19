@@ -1,4 +1,6 @@
 import { randomBytes } from 'node:crypto'
+import { readFileSync, writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { phoneTokenDigest, sha256Hex, type DeviceRecord, type DeviceStore } from './devices.ts'
 import { qrSvg } from './qr.ts'
@@ -61,16 +63,20 @@ export function parseBearer(header: string | undefined): { kind: 'phone' | 'node
   return undefined
 }
 
-const ONCE_MARK = /once|这一次|仅此一次|允许一次|只这一次/
+export interface PendingDecisionCard {
+  readonly approval: boolean
+  readonly allowedIds: ReadonlySet<string>
+}
 
-export function onceDecisionIds(card: unknown): { approval: boolean; onceIds: ReadonlySet<string> } | null {
+/** 允许「这一次」的 accept，以及 decline / cancel。拒绝总是、记住、会话内这类放宽。 */
+export function onceDecisionIds(card: unknown): PendingDecisionCard | null {
   if (typeof card !== 'object' || card === null) return null
   const record = card as Record<string, unknown>
   const approval = typeof record.approval === 'object' && record.approval !== null
     ? record.approval as Record<string, unknown>
     : undefined
-  if (!approval) return { approval: false, onceIds: new Set() }
-  const onceIds = new Set<string>()
+  if (!approval) return { approval: false, allowedIds: new Set() }
+  const allowedIds = new Set<string>()
   if (Array.isArray(approval.decisions)) {
     for (const raw of approval.decisions) {
       if (typeof raw !== 'object' || raw === null) continue
@@ -78,17 +84,17 @@ export function onceDecisionIds(card: unknown): { approval: boolean; onceIds: Re
       const id = typeof decision.id === 'string' ? decision.id : ''
       const label = typeof decision.label === 'string' ? decision.label : ''
       if (!id || UNSAFE_APPROVAL.test(id) || UNSAFE_APPROVAL.test(label)) continue
-      if (ONCE_MARK.test(id) || ONCE_MARK.test(label)) onceIds.add(id)
+      allowedIds.add(id)
     }
   }
-  return { approval: true, onceIds }
+  return { approval: true, allowedIds }
 }
 
-/** 审批必须对上 Hub 已经见过的卡片，并且只能选「这一次」。提问不受这道限制。 */
-export function phoneAnswerAllowed(args: unknown, card: { approval: boolean; onceIds: ReadonlySet<string> } | undefined): boolean {
+/** 审批必须对上 Hub 已经见过的卡片，并且只能选卡片上的非持久决定。提问不受这道限制。 */
+export function phoneAnswerAllowed(args: unknown, card: PendingDecisionCard | undefined): boolean {
   if (!card) return false
   if (!card.approval) return true
-  if (card.onceIds.size === 0) return false
+  if (card.allowedIds.size === 0) return false
   if (typeof args !== 'object' || args === null || !Array.isArray((args as { answers?: unknown }).answers)) return false
   return (args as { answers: unknown[] }).answers.every((answer) => {
     if (typeof answer !== 'object' || answer === null) return false
@@ -97,11 +103,11 @@ export function phoneAnswerAllowed(args: unknown, card: { approval: boolean; onc
       ? row.selectedOptionIds.filter((id): id is string => typeof id === 'string' && id.length > 0)
       : []
     const ids = selected.length > 0 ? selected : (typeof row.id === 'string' ? [row.id] : [])
-    return ids.length > 0 && ids.every((id) => card.onceIds.has(id))
+    return ids.length > 0 && ids.every((id) => card.allowedIds.has(id))
   })
 }
 
-export function controllerCommandAllowed(op: string, args: unknown, card?: { approval: boolean; onceIds: ReadonlySet<string> }): boolean {
+export function controllerCommandAllowed(op: string, args: unknown, card?: PendingDecisionCard): boolean {
   const allowed = new Set(['prompt', 'answer', 'interrupt', 'create', 'fork', 'observe', 'cancel'])
   if (!allowed.has(op)) return false
   if (op !== 'answer') return true
@@ -132,6 +138,47 @@ export function createPhoneHub(options: {
   const boardRevision = new Map<string, number>()
   const watched = new Map<string, Set<string>>()
   const MAX_WATCHED = 32
+  const MAX_COMMANDS = 32
+  const MAX_CARDS = 64
+  const CARD_TTL_MS = 15 * 60_000
+  const DEVICE_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,79}$/
+  const cardFile = join(dirname(options.store.file), 'pending-cards.json')
+  const pendingCards = new Map<string, { card: PendingDecisionCard; expiresAt: number }>()
+  const loadCards = (): void => {
+    let raw = ''
+    try { raw = readFileSync(cardFile, 'utf8') } catch { return }
+    let parsed: unknown
+    try { parsed = JSON.parse(raw) } catch { return }
+    if (!Array.isArray(parsed)) return
+    const at = now()
+    for (const row of parsed) {
+      if (typeof row !== 'object' || row === null) continue
+      const item = row as { requestId?: unknown; approval?: unknown; allowedIds?: unknown; expiresAt?: unknown }
+      if (typeof item.requestId !== 'string' || typeof item.expiresAt !== 'number' || item.expiresAt <= at) continue
+      const allowedIds = new Set<string>()
+      if (Array.isArray(item.allowedIds)) {
+        for (const id of item.allowedIds) if (typeof id === 'string' && id) allowedIds.add(id)
+      }
+      pendingCards.set(item.requestId, {
+        card: { approval: item.approval === true, allowedIds },
+        expiresAt: item.expiresAt,
+      })
+    }
+  }
+  const saveCards = (): void => {
+    const at = now()
+    const rows = [...pendingCards.entries()]
+      .filter(([, item]) => item.expiresAt > at)
+      .slice(-MAX_CARDS)
+      .map(([requestId, item]) => ({
+        requestId,
+        approval: item.card.approval,
+        allowedIds: [...item.card.allowedIds],
+        expiresAt: item.expiresAt,
+      }))
+    try { writeFileSync(cardFile, JSON.stringify(rows), { mode: 0o600 }) } catch { /* 卡片缓存写失败不影响应答 */ }
+  }
+  loadCards()
 
   const purgeCodes = (): void => {
     const at = now()
@@ -206,6 +253,38 @@ export function createPhoneHub(options: {
       streams.delete(id)
       open?.forEach((close) => close())
     },
+    rememberCard(requestId: string, card: PendingDecisionCard) {
+      const at = now()
+      for (const [id, item] of pendingCards) if (item.expiresAt <= at) pendingCards.delete(id)
+      while (pendingCards.size >= MAX_CARDS) {
+        const oldest = pendingCards.keys().next().value
+        if (oldest === undefined) break
+        pendingCards.delete(oldest)
+      }
+      pendingCards.set(requestId, { card, expiresAt: at + CARD_TTL_MS })
+      saveCards()
+    },
+    forgetCard(requestId: string) {
+      if (!pendingCards.delete(requestId)) return
+      saveCards()
+    },
+    cardFor(requestId: string) {
+      const found = pendingCards.get(requestId)
+      if (!found) return undefined
+      if (found.expiresAt <= now()) {
+        pendingCards.delete(requestId)
+        saveCards()
+        return undefined
+      }
+      return found.card
+    },
+    revisions() {
+      return Object.fromEntries(boardRevision)
+    },
+    unwatch(auth: PhoneAuth, key: string) {
+      if (!auth.ok) return
+      watched.get(auth.phone.id)?.delete(key)
+    },
     watch(auth: PhoneAuth, key: string) {
       if (!auth.ok || !key) return
       const set = watched.get(auth.phone.id) ?? new Set<string>()
@@ -268,7 +347,7 @@ export function createPhoneHub(options: {
         return { tasks: next, conflict: false }
       }
       const deviceId = typeof body.deviceId === 'string' ? body.deviceId : ''
-      if (!deviceId) throw Object.assign(new Error('invalid'), { code: 'invalid' })
+      if (!DEVICE_ID.test(deviceId)) throw Object.assign(new Error('invalid'), { code: 'invalid' })
       const current = tasks.get(deviceId) ?? []
       const head = boardRevision.get(deviceId)
       if (head === undefined) return { tasks: current, conflict: true }
@@ -287,7 +366,9 @@ export function createPhoneHub(options: {
         ...(typeof body.taskId === 'string' ? { taskId: body.taskId } : {}),
         ...(body.status === 'todo' || body.status === 'doing' || body.status === 'done' ? { status: body.status } : {}),
       }
-      queued.set(deviceId, [...(queued.get(deviceId) ?? []), command])
+      const queue = queued.get(deviceId) ?? []
+      if (queue.length >= MAX_COMMANDS) throw Object.assign(new Error('size-limit'), { code: 'size-limit' })
+      queued.set(deviceId, [...queue, command])
       return { tasks: current, conflict: false }
     },
     readMemory(deviceId?: string) {
@@ -326,7 +407,7 @@ function normalizeTasks(raw: unknown, deviceId: string, boardRevision: number | 
       id: item.id.slice(0, 80),
       deviceId,
       title: item.title.trim().slice(0, 120),
-      detail: typeof item.detail === 'string' ? item.detail.slice(0, 2000) : '',
+      detail: (typeof item.detail === 'string' ? item.detail : typeof item.description === 'string' ? item.description : '').slice(0, 2000),
       status: item.status === 'doing' || item.status === 'done' ? item.status : 'todo',
       revision: typeof boardRevision === 'number'
         ? boardRevision

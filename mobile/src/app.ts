@@ -285,24 +285,24 @@ async function registerDevicePush(): Promise<void> {
   if (!api) return
   try {
     const plugin = await import('marshal-stream')
-    const token = await plugin.MarshalStream.pushToken?.()
-    if (!token || token.ok !== true || !token.token || (token.provider !== 'apns' && token.provider !== 'fcm' && token.provider !== 'huawei')) return
-    await api.registerPush(token.provider, token.token, token.liveToken)
-    const events = plugin.MarshalStream as unknown as { addListener(name: string, cb: () => void): Promise<unknown> }
+    const events = plugin.MarshalStream as unknown as { addListener(name: string, cb: () => void): Promise<unknown>; pushToken?: () => Promise<{ ok?: boolean; provider?: string; token?: string; liveToken?: string }> }
     if (!pushListening) {
       pushListening = true
       await events.addListener('pushToken', () => { void registerDevicePush() })
     }
+    const token = await events.pushToken?.()
+    if (!token || token.ok !== true || !token.token || (token.provider !== 'apns' && token.provider !== 'fcm' && token.provider !== 'huawei')) return
+    await api.registerPush(token.provider, token.token, token.liveToken)
   } catch { /* 浏览器预览没有推送插件 */ }
 }
 
 let pushListening = false
 
-async function showLive(title: string, phase: string): Promise<void> {
+async function showLive(title: string, phase: string, session = phase, end = false): Promise<void> {
   try {
     const plugin = await import('marshal-stream')
-    const native = plugin.MarshalStream as unknown as { startLiveActivity?: (options: { title: string; phase: string }) => Promise<void> }
-    await native.startLiveActivity?.({ title, phase })
+    const native = plugin.MarshalStream as unknown as { startLiveActivity?: (options: { title: string; phase: string; session: string; end: boolean }) => Promise<void> }
+    await native.startLiveActivity?.({ title, phase, session, end })
   } catch { /* 浏览器没有 Live Activity */ }
 }
 
@@ -359,7 +359,10 @@ async function openSession(deviceId: string, row: SessionRow): Promise<void> {
   const api = state.api
   if (!api) return
   const previous = state.session
-  if (previous) void api.unsubscribe(targetOf(previous), subscriptionId)
+  if (previous) {
+    void api.unsubscribe(targetOf(previous), subscriptionId)
+    void api.unwatchSession(targetOf(previous))
+  }
   state.session = { ...row, deviceId }
   state.capability = row.capability
   state.running = row.running
@@ -471,7 +474,7 @@ async function onFrame(frame: StreamFrame): Promise<void> {
       const card = payload as unknown as InputCard
       if (typeof card.requestId === 'string') {
         state.cards = [...state.cards.filter((entry) => entry.requestId !== card.requestId), card]
-        if (card.approval) void showLive('待审批', 'approval')
+        if (card.approval) void showLive('待审批', 'approval', typeof event.sessionId === 'string' ? event.sessionId : card.requestId)
         render()
       }
       return
@@ -479,6 +482,7 @@ async function onFrame(frame: StreamFrame): Promise<void> {
     case 'input.resolved': {
       const requestId = typeof payload.requestId === 'string' ? payload.requestId : ''
       state.cards = state.cards.filter((card) => card.requestId !== requestId)
+      void showLive('已处理', 'done', typeof event.sessionId === 'string' ? event.sessionId : requestId, true)
       render()
       return
     }
@@ -490,8 +494,8 @@ async function onFrame(frame: StreamFrame): Promise<void> {
       return
     }
     case 'message.completed': closeOpenMessages(); return
-    case 'turn.started': state.running = true; void showLive('运行中', 'run-start'); render(); return
-    case 'turn.completed': state.running = false; closeOpenMessages(); render(); return
+    case 'turn.started': state.running = true; void showLive('运行中', 'run-start', typeof event.sessionId === 'string' ? event.sessionId : 'run'); render(); return
+    case 'turn.completed': state.running = false; closeOpenMessages(); void showLive('已结束', 'run-finish', typeof event.sessionId === 'string' ? event.sessionId : 'run', true); render(); return
     case 'tool.started':
       state.messages.push({ id: String(event.seq), role: 'tool', text: '▶ ' + String(payload.name ?? payload.tool ?? 'tool'), open: false, at: Date.now() })
       render(); return
@@ -938,6 +942,7 @@ let sessionQuery = ''
 let sessionLimit = SESSION_PAGE_SIZE
 let roster: Array<{ deviceId: string; agent: string; name: string }> = []
 let boardTasks: Array<{ id: string; deviceId: string; title: string; detail: string; status: string; revision: number }> = []
+let boardRevisions: Record<string, number> = {}
 let memoryEntries: Array<{ id: string; deviceId: string; layer: string; agent: string; text: string }> = []
 let groupKey = ''
 
@@ -1325,11 +1330,12 @@ async function watchForegroundLock(): Promise<void> {
     const { App } = await import('@capacitor/app')
     let away = false
     await App.addListener('appStateChange', ({ isActive }) => {
-      if (!state.config?.lock) return
       if (!isActive) { away = true; return }
       if (!away) return
       away = false
       void registerDevicePush()
+      document.getElementById('bridge-workbench')?.remove()
+      if (!state.config?.lock) return
       state.view = 'lock'
       render()
     })
@@ -1499,7 +1505,8 @@ async function loadBoard(): Promise<void> {
   const api = phoneApi()
   if (!api) { toast('看板需要手机配对凭证', 'error'); return }
   const result = await api.board()
-  boardTasks = result.ok ? result.data : []
+  boardTasks = result.ok ? result.data.tasks : []
+  boardRevisions = result.ok ? result.data.revisions : {}
   if (!result.ok) toast(result.message, 'error')
   if (state.view === 'board') render()
 }
@@ -1515,26 +1522,32 @@ async function writeBoard(body: Record<string, unknown>): Promise<void> {
 
 function boardView(): Child[] {
   const title = el('input', { type: 'text', placeholder: '新任务标题' }) as HTMLInputElement
-  const deviceId = boardTasks[0]?.deviceId || state.devices[0]?.id || ''
-  const head = boardTasks.reduce((max, task) => Math.max(max, task.revision), 0)
+  const deviceId = state.deviceId || boardTasks[0]?.deviceId || state.devices[0]?.id || ''
+  const head = boardRevisions[deviceId]
   return [
-    topbar('任务看板', '只改你选中的那台电脑', [backButton('home'), button('刷新', () => { void loadBoard() }, { class: 'icon-button' })]),
+    topbar('任务看板', '每台电脑用自己的修订号', [backButton('home'), button('刷新', () => { void loadBoard() }, { class: 'icon-button' })]),
     el('div', { class: 'card' },
       title,
-      button('新建', () => { void writeBoard({ deviceId, action: 'create', title: title.value, baseRevision: head }) }, { class: 'primary' }),
+      button('新建', () => {
+        const revision = boardRevisions[deviceId]
+        if (revision === undefined || !deviceId) { toast('这台电脑还没有上报看板修订', 'error'); return }
+        void writeBoard({ deviceId, action: 'create', title: title.value, baseRevision: revision })
+      }, { class: 'primary' }),
+      head === undefined ? el('p', { class: 'empty', text: '还没有这台电脑的看板修订。空看板也会带修订号，收到之后才能新建。' }) : null,
     ),
     ...boardTasks.map((task) => el('div', { class: 'card' },
       el('h2', { text: task.title }),
       el('p', { class: 'empty', text: task.status + ' · 修订 ' + task.revision }),
       el('div', { class: 'choices' },
-        button('待办', () => { void writeBoard({ deviceId: task.deviceId, action: 'move', taskId: task.id, status: 'todo', baseRevision: head }) }),
-        button('进行中', () => { void writeBoard({ deviceId: task.deviceId, action: 'move', taskId: task.id, status: 'doing', baseRevision: head }) }),
-        button('完成', () => { void writeBoard({ deviceId: task.deviceId, action: 'move', taskId: task.id, status: 'done', baseRevision: head }) }),
+        button('待办', () => { const revision = boardRevisions[task.deviceId]; if (revision === undefined) return; void writeBoard({ deviceId: task.deviceId, action: 'move', taskId: task.id, status: 'todo', baseRevision: revision }) }),
+        button('进行中', () => { const revision = boardRevisions[task.deviceId]; if (revision === undefined) return; void writeBoard({ deviceId: task.deviceId, action: 'move', taskId: task.id, status: 'doing', baseRevision: revision }) }),
+        button('完成', () => { const revision = boardRevisions[task.deviceId]; if (revision === undefined) return; void writeBoard({ deviceId: task.deviceId, action: 'move', taskId: task.id, status: 'done', baseRevision: revision }) }),
         button('改标题', () => {
           const next = window.prompt('新标题', task.title)
-          if (next && next.trim()) void writeBoard({ deviceId: task.deviceId, action: 'edit', taskId: task.id, title: next.trim(), baseRevision: head })
+          const revision = boardRevisions[task.deviceId]
+          if (next && next.trim() && revision !== undefined) void writeBoard({ deviceId: task.deviceId, action: 'edit', taskId: task.id, title: next.trim(), baseRevision: revision })
         }),
-        button('删除', () => { void writeBoard({ deviceId: task.deviceId, action: 'delete', taskId: task.id, baseRevision: head }) }, { class: 'danger' }),
+        button('删除', () => { const revision = boardRevisions[task.deviceId]; if (revision === undefined) return; void writeBoard({ deviceId: task.deviceId, action: 'delete', taskId: task.id, baseRevision: revision }) }, { class: 'danger' }),
       ),
     )),
     boardTasks.length === 0 ? el('p', { class: 'empty', text: '电脑还没有上报看板。空列表不会当成“已经清空”。' }) : null,

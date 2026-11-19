@@ -54,11 +54,24 @@ public class MarshalStreamPlugin: CAPPlugin, CAPBridgedPlugin {
         call.resolve(result)
     }
 
+    override public func load() {
+        NotificationCenter.default.addObserver(forName: Notification.Name("marshal.pushToken"), object: nil, queue: .main) { [weak self] note in
+            let token = note.userInfo?["token"] as? String ?? ""
+            if token.isEmpty { return }
+            self?.notifyListeners("pushToken", data: ["ok": true, "provider": "apns", "token": token])
+        }
+    }
+
     @objc func startLiveActivity(_ call: CAPPluginCall) {
         NotificationCenter.default.post(
             name: Notification.Name("marshal.live"),
             object: nil,
-            userInfo: ["title": call.getString("title") ?? "调度官", "phase": call.getString("phase") ?? ""]
+            userInfo: [
+                "title": call.getString("title") ?? "调度官",
+                "phase": call.getString("phase") ?? "",
+                "session": call.getString("session") ?? call.getString("phase") ?? "",
+                "end": call.getBool("end") ?? false,
+            ]
         )
         call.resolve()
     }

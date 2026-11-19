@@ -19,12 +19,17 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
                 UserDefaults.standard.set("denied", forKey: "marshal.push.error")
             }
         }
-        if #available(iOS 16.1, *) {
+        if #available(iOS 16.2, *) {
             MarshalLiveActivity.registerPushToken()
             NotificationCenter.default.addObserver(forName: Notification.Name("marshal.live"), object: nil, queue: .main) { note in
                 let title = note.userInfo?["title"] as? String ?? "调度官"
                 let phase = note.userInfo?["phase"] as? String ?? ""
-                MarshalLiveActivity.start(title: title, phase: phase)
+                let session = note.userInfo?["session"] as? String ?? phase
+                if note.userInfo?["end"] as? Bool == true {
+                    MarshalLiveActivity.end(session: session)
+                } else {
+                    MarshalLiveActivity.start(title: title, phase: phase, session: session)
+                }
             }
         }
         return true
@@ -34,6 +39,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         let token = deviceToken.map { String(format: "%02x", $0) }.joined()
         UserDefaults.standard.set(token, forKey: "marshal.push.token")
         UserDefaults.standard.removeObject(forKey: "marshal.push.error")
+        NotificationCenter.default.post(name: Notification.Name("marshal.pushToken"), object: nil, userInfo: ["token": token])
     }
 
     func application(_ application: UIApplication, didFailToRegisterForRemoteNotificationsWithError error: Error) {

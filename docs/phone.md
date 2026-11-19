@@ -18,7 +18,7 @@ Hub 从设备表旁边的 `push.json` 读钥匙，文件权限应是 0600。缺�
 }
 ```
 
-把 `PLACEHOLDER` 换成真实值，并把钥匙放到 `keyPath` 指的文件。不要把钥匙提交进仓库。FCM 走 HTTP v1：`https://oauth2.googleapis.com/token` 换访问令牌，再 `POST https://fcm.googleapis.com/v1/projects/{projectId}/messages:send`。华为走 `https://oauth-login.cloud.huawei.com/oauth2/v3/token` 和 `https://push-api.cloud.huawei.com/v1/{appId}/messages:send`。Android 上运行中的任务和待审批用常驻通知。真正的华为 Live View 胶囊是 HarmonyOS 原生能力，不能从 Android 应用里调用，需要单独的 HarmonyOS 应用。局域网工作台在 Android 上必须用 `wss://`，系统不允许明文 WebSocket。
+把 `PLACEHOLDER` 换成真实值，并把钥匙放到 `keyPath` 指的文件。不要把钥匙提交进仓库。FCM 走 HTTP v1：`https://oauth2.googleapis.com/token` 换访问令牌，再 `POST https://fcm.googleapis.com/v1/projects/{projectId}/messages:send`。华为走 `https://oauth-login.cloud.huawei.com/oauth2/v3/token` 和 `https://push-api.cloud.huawei.com/v1/{appId}/messages:send`。Android 上运行中的任务和待审批用常驻通知，图标是 `ic_stat_notify`。真正的华为 Live View 胶囊是 HarmonyOS 原生能力，不能从 Android 应用里调用，需要单独的 HarmonyOS 应用。华为推送令牌用 `HmsInstanceId.getToken(appId, "HCM")` 在后台线程读取。把 `agconnect-services.json` 放到 `mobile/android/app/src/main/assets/`（或让 AGConnect Gradle 插件自动初始化）之后才会取到 app id；没有这份文件就不编造令牌。局域网工作台在 Android 上必须用 `wss://`，系统不允许明文 WebSocket。
 
 桌面「手机连接」向 `/marshal/api/pairing` 领取二维码。到期前 5 秒用上一张码作为 `replace` 再领一张，Hub 会作废同一账号还没使用的旧码。二维码正文只有 `marshal://pair?code=…&hub=…`。
 

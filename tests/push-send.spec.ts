@@ -35,16 +35,20 @@ describe('push senders', () => {
     expect(first.delivered).toBe(true)
     expect(second.delivered).toBe(true)
     expect(seen[0]?.host).toBe('api.sandbox.push.apple.com')
-    expect(seen[0]?.headers['apns-push-type']).toBe('liveactivity')
-    expect(seen[0]?.headers['apns-topic']).toBe('com.example.marshal.push-type.liveactivity')
-    expect(seen[0]?.headers[':path']).toBe('/3/device/activity')
+    expect(seen[0]?.headers['apns-push-type']).toBe('alert')
+    expect(seen[0]?.headers[':path']).toBe('/3/device/device')
+    expect(seen[1]?.headers['apns-push-type']).toBe('liveactivity')
+    expect(seen[1]?.headers['apns-topic']).toBe('com.example.marshal.push-type.liveactivity')
+    expect(seen[1]?.headers[':path']).toBe('/3/device/activity')
     const signature = String(seen[0]?.headers.authorization).split('.').at(-1) ?? ''
     expect(Buffer.from(signature, 'base64url').length).toBe(64)
-    expect(seen[0]?.headers.authorization).toBe(seen[1]?.headers.authorization)
-    const payload = JSON.parse(seen[0]?.body ?? '{}') as { aps: { event?: string; 'content-state'?: { title: string }; timestamp?: number } }
-    expect(payload.aps.event).toBe('update')
-    expect(payload.aps['content-state']?.title).toBe('审批')
-    expect(typeof payload.aps.timestamp).toBe('number')
+    expect(seen[0]?.headers.authorization).toBe(seen[2]?.headers.authorization)
+    const alert = JSON.parse(seen[0]?.body ?? '{}') as { aps: { alert?: { title: string } } }
+    const live = JSON.parse(seen[1]?.body ?? '{}') as { aps: { event?: string; 'content-state'?: { title: string }; timestamp?: number } }
+    expect(alert.aps.alert?.title).toBe('审批')
+    expect(live.aps.event).toBe('update')
+    expect(live.aps['content-state']?.title).toBe('审批')
+    expect(typeof live.aps.timestamp).toBe('number')
   })
 
   it('does not call FCM when the key is missing', async () => {
@@ -63,20 +67,34 @@ describe('push senders', () => {
 
   it('posts FCM HTTP v1 and records a non-2xx as failure', async () => {
     const urls: string[] = []
+    let body = ''
     const result = await deliverPush({
       config: { fcm: { projectId: 'proj', clientEmail: 'bot@proj.iam.gserviceaccount.com', privateKeyPath: keyFile() } },
       deviceId: 'phone-2',
       target: { provider: 'fcm', token: 'device-token' },
       notice: { kind: 'approval', title: '审批', body: '只允许这一次', dedupeKey: 'approval:fcm' },
-      fetchImpl: (async (url: string) => {
+      fetchImpl: (async (url: string, init?: { body?: string }) => {
         urls.push(String(url))
+        if (typeof init?.body === 'string' && String(url).includes('fcm.googleapis.com')) body = init.body
         if (String(url).includes('oauth2.googleapis.com')) return new Response(JSON.stringify({ access_token: 'ya29' }), { status: 200 })
         return new Response('no', { status: 403 })
       }) as typeof fetch,
     })
+    expect(JSON.parse(body).message.data.kind).toBe('approval')
     expect(urls[0]).toBe('https://oauth2.googleapis.com/token')
     expect(urls[1]).toBe('https://fcm.googleapis.com/v1/projects/proj/messages:send')
     expect(result).toEqual({ delivered: false, reason: 'provider-403' })
+  })
+
+  it('reports an FCM network failure as network', async () => {
+    const result = await deliverPush({
+      config: { fcm: { projectId: 'proj', clientEmail: 'net@proj.iam.gserviceaccount.com', privateKeyPath: keyFile() } },
+      deviceId: 'phone-net',
+      target: { provider: 'fcm', token: 'device-token' },
+      notice: { kind: 'question', title: '提问', body: '请回答', dedupeKey: 'question:net' },
+      fetchImpl: (async () => { throw new Error('socket') }) as typeof fetch,
+    })
+    expect(result).toEqual({ delivered: false, reason: 'network' })
   })
 
   it('posts Huawei Push Kit and only notifies watched sessions', async () => {

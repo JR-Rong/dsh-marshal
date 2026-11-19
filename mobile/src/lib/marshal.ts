@@ -414,9 +414,15 @@ export class MarshalApi {
     return { ok: true, data: agents }
   }
 
-  async board(): Promise<ApiResult<Array<{ id: string; deviceId: string; title: string; detail: string; status: string; revision: number }>>> {
-    const result = await this.request<{ tasks?: unknown }>('/marshal/api/board')
+  async board(): Promise<ApiResult<{ tasks: Array<{ id: string; deviceId: string; title: string; detail: string; status: string; revision: number }>; revisions: Record<string, number> }>> {
+    const result = await this.request<{ tasks?: unknown; revisions?: unknown }>('/marshal/api/board')
     if (!result.ok) return result
+    const revisions: Record<string, number> = {}
+    if (typeof result.data?.revisions === 'object' && result.data.revisions !== null) {
+      for (const [id, value] of Object.entries(result.data.revisions as Record<string, unknown>)) {
+        if (typeof value === 'number') revisions[id] = value
+      }
+    }
     const tasks = Array.isArray(result.data?.tasks) ? result.data.tasks.flatMap((row) => {
       if (typeof row !== 'object' || row === null) return []
       const item = row as Record<string, unknown>
@@ -430,7 +436,13 @@ export class MarshalApi {
         revision: typeof item.revision === 'number' ? item.revision : 0,
       }]
     }) : []
-    return { ok: true, data: tasks }
+    return { ok: true, data: { tasks, revisions } }
+  }
+
+  async unwatchSession(target: Target): Promise<ApiResult<Record<string, unknown>>> {
+    return this.request('/marshal/api/unwatch', {
+      body: { deviceId: target.deviceId, agent: target.agent, sessionId: target.sessionId },
+    })
   }
 
   async boardWrite(body: Record<string, unknown>): Promise<ApiResult<Record<string, unknown>>> {

@@ -77,3 +77,12 @@ jobs:
       - name: assembleDebug
         working-directory: mobile/android
         run: chmod +x ./gradlew && ./gradlew assembleDebug --console=plain
+
+  ios:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: xcodebuild app
+        run: xcodebuild -project mobile/ios/App/App.xcodeproj -target App -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO build
+      - name: xcodebuild Live Activity
+        run: xcodebuild -project mobile/ios/App/App.xcodeproj -target LiveActivity -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO build
