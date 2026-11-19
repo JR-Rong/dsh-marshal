@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import pluginPackage from '../../../package.json' with { type: 'json' };
 import { createGroupService } from './service.js';
 import { readAgentsLedger } from './inventory.js';
 import { createAgentDrafter } from './draft.js';
@@ -135,7 +136,7 @@ export function buildHealthBody(req, info) {
     return {
         ok: true,
         name: 'dsh-marshal',
-        version: '0.2.0-agent-groups.2',
+        version: pluginPackage.version,
         deviceId: info.deviceId,
         capabilities: {
             groups: true,
@@ -215,9 +216,43 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
         exact('GET', '/marshal/tasks/orchestration', async (req, res) => {
             const access = authenticate(req);
             if (!access.ok) { write(res, access.status, { ok: false, code: access.code }); return; }
-            const catalog = orchestration?.catalog() ?? { templates: [], leaders: [], memoryAvailable: false };
+            const catalog = orchestration?.catalog() ?? { templates: [], groupTemplates: [], leaders: [], memoryAvailable: false };
             const ledger = auth.loadLedger();
             write(res, 200, { ok: true, ...catalog, leaders: catalog.leaders.filter(leader => allowed(access, leader, ledger)) });
+        }),
+        exact('POST', '/marshal/tasks/preview', async (req, res) => {
+            const access = authenticate(req, true);
+            if (!access.ok) { write(res, access.status, { ok: false, code: access.code }); return; }
+            if (!orchestration) { write(res, 503, { ok: false, code: 'orchestration-unavailable' }); return; }
+            const body = await readBody(req);
+            const title = typeof body.title === 'string' ? body.title.trim() : '';
+            if (!title) throw taskError('invalid-title', '请填写工单标题。');
+            const ledger = auth.loadLedger();
+            const canUse = member => allowed(access, member, ledger);
+            const result = await orchestration.recommend(body.orchestration, { title, description: body.description }, canUse);
+            write(res, 200, { ok: true, ...result });
+        }),
+        exact('POST', '/marshal/tasks/plan', async (req, res) => {
+            const access = authenticate(req, true);
+            if (!access.ok) { write(res, access.status, { ok: false, code: access.code }); return; }
+            if (!orchestration) { write(res, 503, { ok: false, code: 'orchestration-unavailable' }); return; }
+            const body = await readBody(req);
+            const source = boardSource();
+            const room = rooms?.find(source, body.taskId);
+            const workflow = orchestration.target(source, body.taskId);
+            const ledger = auth.loadLedger();
+            if (!workflow || !taskRoomAccess(access, room, allowed, ledger)) {
+                write(res, 404, { ok: false, code: 'task-not-found' });
+                return;
+            }
+            roomRoutes.assertIdle(room);
+            const prepared = orchestration.prepare(body.orchestration, member => allowed(access, member, ledger));
+            if (prepared.workspaceId !== room.workspaceId) {
+                write(res, 403, { ok: false, code: 'workspace-forbidden' });
+                return;
+            }
+            orchestration.configure(source, body.taskId, prepared);
+            write(res, 200, { ok: true, tasks: taskList(getBoard().snapshot(), req, source) });
         }),
         exact('GET', '/marshal/tasks/report', async (req, res) => {
             const id = new URL(req.url ?? '', 'http://localhost').searchParams.get('taskId');
@@ -276,7 +311,9 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
                 // Authorize before looking up the requested leader, then check the bound workspace.
                 const access = authenticate(req, true);
                 if (!access.ok) { write(res, access.status, { ok: false, code: access.code }); return; }
-                prepared = body.orchestration === undefined ? undefined : orchestration.prepare(body.orchestration);
+                const ledger = auth.loadLedger();
+                prepared = body.orchestration === undefined ? undefined :
+                    orchestration.prepare(body.orchestration, member => allowed(access, member, ledger));
                 const workspaceId = TaskRoomKey.parse(prepared?.workspaceId ?? body.workspaceId);
                 if (body.workspaceId !== undefined && body.workspaceId !== workspaceId) {
                     write(res, 400, { ok: false, code: 'workspace-conflict' });
@@ -350,7 +387,8 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
                     write(res, 409, { ok: false, code: 'task-room-closed', message: '工单已归档，请从工单群重开或重试。' });
                     return;
                 }
-                orchestration.start(source, task, taskRoomAudit(rooms, room));
+                orchestration.start(source, task, taskRoomAudit(rooms, room, undefined, undefined, undefined,
+                    member => allowed(access, member)));
                 write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
                 return;
             }
@@ -667,7 +705,7 @@ export function mountGroups(ctx, config, options = {}) {
         orchestration = createTaskOrchestration({
             file: join(root, 'task-orchestration.json'), inventory: readAgentsLedger, memory: options.memory,
             port: createDiscussionPort({ agents: config.agents, llm, codexExecutable: config.codexExecutable }),
-            defaultModel: readDefaultModel, logger: options.logger,
+            defaultModel: readDefaultModel, logger: options.logger, workspacePath: agents.workspace,
             startLeader: async (leader, text, signal) => {
                 const { sessionId } = await agents.chatMember(leader.teamId, leader.memberId, signal) ?? {};
                 if (typeof sessionId !== 'string' || sessionId === '') throw new Error('Leader session unavailable');

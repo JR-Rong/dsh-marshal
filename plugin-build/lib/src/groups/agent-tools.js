@@ -21,7 +21,7 @@ export function createAgentsHttpClient({ baseUrl, fetchImpl = fetch } = {}) {
     const request = async (path, body, signal) => {
         const root = base();
         const response = await fetchImpl(root + path, body === undefined ? {
-            headers: { origin: root, 'sec-fetch-site': 'same-origin' },
+            signal, headers: { origin: root, 'sec-fetch-site': 'same-origin' },
         } : {
             method: 'POST', signal,
             headers: { origin: root, 'sec-fetch-site': 'same-origin', 'content-type': 'application/json' },
@@ -51,6 +51,11 @@ export function createAgentsHttpClient({ baseUrl, fetchImpl = fetch } = {}) {
     };
     const chatMember = async (teamId, memberId, signal) => (await request('/dsh-agents/api/run', { teamId, memberId }, signal)).run;
     return {
+        async workspace(id, signal) {
+            const state = await request('/dsh-agents/api/state', undefined, signal);
+            const workspace = (state.workspaces ?? []).find(item => item.id === id);
+            return typeof workspace?.path === 'string' ? workspace.path : undefined;
+        },
         chatMember,
         async list() {
             return collect(await request('/dsh-agents/api/state'));

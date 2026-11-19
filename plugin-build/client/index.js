@@ -1642,9 +1642,16 @@ window.__ModuleLoader__.load({
       'cross-check': '互相复核',
       summarizing: 'Leader 汇总报告',
       handoff: '交接给 Leader',
+      assignment: '群角色与执行配置',
+      designing: 'Leader 设计和拆分',
+      coding: 'Coder 编码',
+      'dev-reviewing': 'Reviewer 审查',
+      'coding-assistant': '编码 Codex 子 Agent',
+      'review-assistant': '审查 Codex 子 Agent',
+      'development-patch': '固定开发补丁',
     };
 
-    function TaskReviewReport({ taskId }) {
+    function TaskReviewReport({ taskId, development }) {
       const [report, setReport] = React.useState('');
       const [error, setError] = React.useState('');
       const [loading, setLoading] = React.useState(false);
@@ -1660,7 +1667,7 @@ window.__ModuleLoader__.load({
         finally { setLoading(false); }
       };
       return h('details', { onToggle: load },
-        h('summary', { style: { cursor: 'pointer' } }, '审查报告'),
+        h('summary', { style: { cursor: 'pointer' } }, development ? '开发交付报告' : '审查报告'),
         loading && h('p', { style: uiMuted }, '读取中…'),
         error && h('p', { role: 'alert' }, error),
         report && h('pre', { style: { margin: '8px 0 0', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontSize: 12 } }, report));
@@ -1684,6 +1691,17 @@ window.__ModuleLoader__.load({
       const [choice, setChoice] = React.useState('leader');
       const [templateId, setTemplateId] = React.useState('pr-review');
       const [prUrl, setPrUrl] = React.useState('');
+      const [editing, setEditing] = React.useState('');
+      const [plan, setPlan] = React.useState(null);
+      const [codexModels, setCodexModels] = React.useState([]);
+      const [explicitCode, setExplicitCode] = React.useState(false);
+      const selectedTemplate = plan?.templateId ?? (choice === 'template' ? templateId : choice === 'none' ? 'none' : '');
+      const recommendedTemplate = selectedTemplate === 'none' ? catalog?.plainTemplate : catalog?.templates.find(item => item.id === selectedTemplate);
+      const codeWork = selectedTemplate === 'development' || (selectedTemplate !== 'pr-review' && (plan?.codeWork ?? explicitCode));
+      const roleChoices = codeWork ? recommendedTemplate?.codingRoles : recommendedTemplate?.roles;
+      const candidates = catalog?.leaders.filter(item => item.workspaceId === workspace && item.id !== leaderId) ?? [];
+      const groupId = codeWork && selectedTemplate ? 'delivery' : recommendedTemplate?.groupTemplate;
+      const group = catalog?.groupTemplates?.find(item => item.id === groupId);
       const template = catalog?.templates.find(item => item.id === templateId);
       const requiresPr = leaderId !== '' && choice === 'template' && templateId === 'pr-review';
       const list = Array.isArray(tasks) ? tasks : [];
@@ -1716,22 +1734,92 @@ window.__ModuleLoader__.load({
         if (focusedTask && focusAvailable) document.getElementById('marshal-ticket-' + focusedTask)?.scrollIntoView({ block: 'nearest' });
       }, [focusedTask, focusAvailable]);
 
+      const choiceBody = () => ({
+        leaderId, choice, codeWork: explicitCode || undefined,
+        ...(choice === 'template' ? { templateId } : {}),
+        ...(choice !== 'none' && prUrl.trim() ? { prUrl: prUrl.trim() } : {}),
+      });
+      const recommend = async () => {
+        if (busy || !leaderId || !title.trim()) return;
+        if (requiresPr && !prUrl.trim()) { setError('请填写要审查的 PR 链接'); return; }
+        setBusy(true);
+        setError('');
+        try {
+          const result = await fetchJson('marshal/tasks/preview', {
+            title: title.trim(), description: description.trim(), orchestration: choiceBody(),
+          }, true);
+          setPlan(result.plan);
+          setCodexModels(result.codexModels ?? []);
+          setExplicitCode(result.plan.codeWork && result.plan.templateId !== 'development');
+        }
+        catch (e) { setError('推荐分工失败，' + (e.message || e)); }
+        finally { setBusy(false); }
+      };
+      const cancelForm = () => {
+        setFormOpen(false);
+        if (editing) {
+          setEditing('');
+          setTitle('');
+          setDescription('');
+          setLeaderId('');
+          setPlan(null);
+          setChoice('leader');
+          setPrUrl('');
+          setExplicitCode(false);
+        }
+      };
+      const edit = task => {
+        const workflow = task.workflow;
+        setEditing(task.id);
+        setTitle(task.title);
+        setDescription(task.description ?? '');
+        setWorkspaceId(workflow.workspaceId);
+        setLeaderId(workflow.leaderId);
+        setChoice(workflow.choice);
+        setTemplateId(workflow.templateId ?? 'pr-review');
+        setPrUrl(workflow.prUrl ?? '');
+        setPlan(workflow.planConfirmed ? workflow.plan : null);
+        setExplicitCode(Boolean(workflow.plan?.codeWork && workflow.plan?.templateId !== 'development'));
+        setError('');
+        setFormOpen(true);
+      };
+      const changeMember = (role, id) => {
+        setPlan(current => {
+          if (!current) return current;
+          const members = { ...current.members };
+          if (id) members[role] = id;
+          else delete members[role];
+          return { ...current, members };
+        });
+      };
+      const changeCodeWork = enabled => {
+        setExplicitCode(enabled);
+        setPlan(current => current && ({
+          ...current, codeWork: enabled,
+          codex: enabled ? { coding: 'auto', review: 'auto' } : { coding: null, review: null },
+        }));
+      };
       const create = async () => {
         if (!title.trim()) { setError('请填写标题'); return; }
         if (!workspace) { setError('请选择工单所属的工作区'); return; }
         if (requiresPr && !prUrl.trim()) { setError('请填写要审查的 PR 链接'); return; }
+        if (leaderId && !plan) { await recommend(); return; }
+        if (leaderId && roleChoices?.some(role => role.required && !plan.members[role.id])) {
+          setError('请指派所有必需角色。');
+          return;
+        }
         const orchestration = leaderId ? {
-          leaderId, choice,
-          ...(choice === 'template' ? { templateId } : {}),
-          ...(choice !== 'none' && prUrl.trim() ? { prUrl: prUrl.trim() } : {}),
+          ...choiceBody(), plan: { templateId: plan.templateId, codeWork: plan.codeWork, members: plan.members, codex: plan.codex },
         } : undefined;
         setBusy(true);
         setError('');
         try {
-          const result = await fetchJson('marshal/tasks/create', {
-            title: title.trim(), description: description.trim(), workspaceId: workspace,
-            ...(orchestration === undefined ? {} : { orchestration }),
-          }, true);
+          const result = editing
+            ? await fetchJson('marshal/tasks/plan', { taskId: editing, orchestration }, true)
+            : await fetchJson('marshal/tasks/create', {
+              title: title.trim(), description: description.trim(), workspaceId: workspace,
+              ...(orchestration === undefined ? {} : { orchestration }),
+            }, true);
           setTasks(result.tasks || []);
           setTitle('');
           setDescription('');
@@ -1739,9 +1827,12 @@ window.__ModuleLoader__.load({
           setChoice('leader');
           setTemplateId('pr-review');
           setPrUrl('');
+          setPlan(null);
+          setExplicitCode(false);
+          setEditing('');
           setFormOpen(false);
         }
-        catch (e) { setError('创建失败：' + (e.message || e)); }
+        catch (e) { setError((editing ? '保存分工失败，' : '创建失败，') + (e.message || e)); }
         finally { setBusy(false); }
       };
 
@@ -1781,7 +1872,8 @@ window.__ModuleLoader__.load({
         return h('div', { key: task.id, id: 'marshal-ticket-' + task.id, style: { border: '1px solid ' + dswTheme.border, borderRadius: 10, background: dswTheme.layer, padding: 10, display: 'grid', gap: 8 } },
           h('div', { style: { fontSize: 13, fontWeight: 500, lineHeight: 1.45 } }, task.title),
           task.description && h('div', { style: { fontSize: 11, color: dswTheme.faint, lineHeight: 1.55, display: '-webkit-box', WebkitLineClamp: 3, WebkitBoxOrient: 'vertical', overflow: 'hidden' } }, task.description),
-          workflow && h('div', { style: uiMuted }, workflow.leaderName + ' · ' + modeLabel),
+          workflow && h('div', { style: uiMuted }, [workflow.leaderName, modeLabel,
+            catalog?.groupTemplates?.find(item => item.id === workflow.plan?.groupTemplate)?.name].filter(Boolean).join(' · ')),
           step && h('span', { role: 'status', style: uiMuted }, step),
           workflow?.error && h('span', { role: 'alert', style: { color: dswTheme.danger, fontSize: 12 } }, workflow.error),
           workflow?.pr && h('div', { style: uiMuted, title: workflow.pr.head },
@@ -1789,9 +1881,12 @@ window.__ModuleLoader__.load({
             workflow.pr.omitted.length > 0 ? ' · ' + workflow.pr.omitted.length + ' 个文件缺少完整文本补丁' : ''),
           workflow?.reviewers?.length > 0 && h('div', { style: uiMuted },
             workflow.reviewers.map(reviewer => reviewer.name + ' · ' + reviewer.model).join(' / ')),
-          workflow?.reportId && h(TaskReviewReport, { key: workflow.reportId, taskId: task.id }),
+          workflow?.reportId && h(TaskReviewReport, { key: workflow.reportId, taskId: task.id, development: Boolean(workflow.development) }),
           h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' } },
             h('button', { type: 'button', style: uiButton(false), onClick: () => openTaskRoom?.(task) }, '工单群'),
+            workflow && workflow.state !== 'running' && h('button', {
+              type: 'button', style: uiButton(false), onClick: () => edit(task), disabled: busy,
+            }, '编辑分工'),
             task.sessionId && h('button', { type: 'button', style: { ...uiButton(false), padding: '3px 8px', fontSize: 11 }, onClick: () => openSession && openSession(task.sessionId) }, '打开会话'),
             workflow && !task.taskRoom?.closed && task.status !== 'running' && workflow.state !== 'done' && h('button', { type: 'button', disabled: busy, style: { ...uiButton(true), padding: '3px 8px', fontSize: 11 }, onClick: () => { void run(task); } }, workflow?.state === 'failed' || workflow?.state === 'interrupted' ? '重试' : '运行'),
             !task.taskRoom && h('button', { type: 'button', style: { ...uiButton(false), padding: '3px 8px', fontSize: 11, color: confirmId === task.id ? dswTheme.danger : dswTheme.text }, onClick: () => { void remove(task); } }, confirmId === task.id ? '确认删除' : '删除')));
@@ -1802,37 +1897,65 @@ window.__ModuleLoader__.load({
           h('div', null,
             h('div', { style: { fontSize: 15, fontWeight: 600 } }, '任务看板'),
             h('div', { style: uiMuted }, list.length + ' 张卡片')),
-          h('button', { type: 'button', style: uiButton(true), onClick: () => setFormOpen(value => !value) }, formOpen ? '收起' : '＋ 新建卡片')),
+          h('button', { type: 'button', disabled: busy, style: uiButton(true), onClick: () => formOpen ? cancelForm() : setFormOpen(true) }, formOpen ? '收起' : '＋ 新建卡片')),
         error && h('div', { style: { padding: '8px 20px', fontSize: 12, color: dswTheme.danger } }, error),
-        formOpen && h('div', { style: { margin: '14px 20px 0', padding: 14, border: '1px solid ' + dswTheme.border, borderRadius: 12, background: dswTheme.layer, display: 'grid', gap: 10 } },
-          h(Field, { label: '标题' }, h('input', { value: title, onChange: event => setTitle(event.target.value), placeholder: '这张卡片要做什么', style: uiInput })),
-          h(Field, { label: '描述（可选）' }, h('textarea', { value: description, onChange: event => setDescription(event.target.value), rows: 3, placeholder: '背景、验收标准、约束…', style: { ...uiInput, resize: 'vertical', lineHeight: 1.6 } })),
-          !leaderId && h(Field, { label: '工作区' }, h('select', { value: workspaceId, style: uiInput,
+        formOpen && h('fieldset', { disabled: busy, 'aria-label': editing ? '编辑工单分工' : '创建工单',
+          style: { margin: '14px 20px 0', padding: 14, minWidth: 0, minHeight: 0, overflowY: 'auto', border: '1px solid ' + dswTheme.border, borderRadius: 12, background: dswTheme.layer, display: 'grid', gap: 10 } },
+          h(Field, { label: '标题' }, h('input', { value: title, readOnly: Boolean(editing), onChange: event => { setTitle(event.target.value); setPlan(null); }, placeholder: '这张卡片要做什么', style: uiInput })),
+          h(Field, { label: '描述（可选）' }, h('textarea', { value: description, readOnly: Boolean(editing), onChange: event => { setDescription(event.target.value); setPlan(null); }, rows: 3, placeholder: '背景、验收标准、约束…', style: { ...uiInput, resize: 'vertical', lineHeight: 1.6 } })),
+          !leaderId && !editing && h(Field, { label: '工作区' }, h('select', { value: workspaceId, style: uiInput,
             onChange: event => setWorkspaceId(event.target.value) },
             h('option', { value: '' }, '选择工作区'),
             workspaces.map(item => h('option', { key: item.id, value: item.id }, item.name)))),
           catalog?.memoryAvailable && catalog.leaders.length > 0 && h(Field, { label: 'Leader' },
-            h('select', { value: leaderId, onChange: event => setLeaderId(event.target.value), style: uiInput },
-              h('option', { value: '' }, '普通卡片'),
-              catalog.leaders.map(leader => h('option', { key: leader.id, value: leader.id }, leader.name)))),
+            h('select', { value: leaderId, onChange: event => { setLeaderId(event.target.value); setPlan(null); }, style: uiInput },
+              h('option', { value: '', disabled: Boolean(editing) }, '普通卡片'),
+              catalog.leaders.filter(leader => !editing || leader.workspaceId === workspaceId).map(leader => h('option', { key: leader.id, value: leader.id }, leader.name)))),
           catalogError && h('div', { style: uiMuted }, catalogError),
           catalog && (!catalog.memoryAvailable || catalog.leaders.length === 0) && h('div', { style: uiMuted },
             '编排需要工作区记忆和已绑定工作区的 Leader。'),
           leaderId && h(Field, { label: '编排方式' },
-            h('select', { value: choice, onChange: event => setChoice(event.target.value), style: uiInput },
+            h('select', { value: choice, onChange: event => { setChoice(event.target.value); setPlan(null); }, style: uiInput },
               h('option', { value: 'leader' }, '由 Leader 选择或跳过'),
               h('option', { value: 'template' }, '指定模板'),
               h('option', { value: 'none' }, '不使用模板'))),
           leaderId && choice === 'template' && h(Field, { label: '模板' },
-            h('select', { value: templateId, onChange: event => setTemplateId(event.target.value), style: uiInput },
+            h('select', { value: templateId, onChange: event => { setTemplateId(event.target.value); setPlan(null); setExplicitCode(false); }, style: uiInput },
               (catalog?.templates ?? []).map(item => h('option', { key: item.id, value: item.id },
                 item.name + (item.automated ? ' · 自动' : ' · 由 Leader 执行')))),
             template && h('span', { style: uiMuted }, template.stages.join(' → '))),
           leaderId && (requiresPr || choice === 'leader') && h(Field, { label: requiresPr ? 'PR 链接' : 'PR 链接（可选）' },
-            h('input', { type: 'url', value: prUrl, onChange: event => setPrUrl(event.target.value), placeholder: 'GitHub 或 Gitee PR 链接', style: uiInput })),
+            h('input', { type: 'url', value: prUrl, onChange: event => { setPrUrl(event.target.value); setPlan(null); }, placeholder: 'GitHub 或 Gitee PR 链接', style: uiInput })),
+          leaderId && h('section', { 'aria-label': '运行分工', style: { display: 'grid', gap: 8, borderTop: '1px solid ' + dswTheme.border, paddingTop: 10 } },
+            h('strong', null, group ? group.name : 'Leader 推荐后预填角色'),
+            plan && recommendedTemplate && h('span', { style: uiMuted }, recommendedTemplate.name + ' · Leader ' + selectedLeader?.name),
+            selectedTemplate !== 'development' && selectedTemplate !== 'pr-review' && h('label', null,
+              h('input', { type: 'checkbox', checked: explicitCode, onChange: event => changeCodeWork(event.target.checked) }),
+              ' 包含编码与代码审查'),
+            (roleChoices ?? []).map(role => h(Field, { key: role.id, label: role.name },
+              role.id === 'codexCritic' ? h('span', { style: uiMuted }, 'Codex 独立审查席位') :
+                h('select', { style: uiInput, disabled: busy || !plan, value: plan?.members[role.id] ?? '',
+                  onChange: event => changeMember(role.id, event.target.value) },
+                  h('option', { value: '' }, role.required ? '待指派（必需）' : '待指派'),
+                  role.id === 'critic' && h('option', { value: '@dsh' }, '独立 DSH 审查席位'),
+                  candidates.filter(member => role.id !== 'coder' || ['workspace-write', 'danger-full-access'].includes(member.permission))
+                    .map(member => h('option', { key: member.id, value: member.id,
+                      disabled: Object.entries(plan?.members ?? {}).some(([slot, id]) => slot !== role.id && id === member.id) }, member.name))))),
+            (codeWork || selectedTemplate === 'pr-review') && (codeWork ? ['coding', 'review'] : ['review']).map(slot => h(Field, {
+              key: slot, label: slot === 'coding' ? '编码 Codex 子 Agent' : '审查 Codex 子 Agent',
+            }, h('select', { style: uiInput, disabled: busy || !plan, value: plan ? (plan.codex[slot] ?? 'off') : 'auto',
+              onChange: event => setPlan(current => ({ ...current, codex: { ...current.codex, [slot]: event.target.value === 'off' ? null : event.target.value } })) },
+              h('option', { value: 'auto' }, '自动选择 · 按需调用'),
+              h('option', { value: 'off' }, '关闭子调用'),
+              plan?.codex[slot] && plan.codex[slot] !== 'auto' && !codexModels.some(model => model.id === plan.codex[slot]) &&
+                h('option', { value: plan.codex[slot] }, plan.codex[slot]),
+              codexModels.filter(model => slot !== 'coding' || model.work).map(model =>
+                h('option', { key: model.id, value: model.id }, model.model)))))),
           h('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8 } },
-            h('button', { type: 'button', style: uiButton(false), onClick: () => setFormOpen(false) }, '取消'),
-            h('button', { type: 'button', disabled: busy, style: { ...uiButton(true), opacity: busy ? .6 : 1 }, onClick: () => { void create(); } }, busy ? '处理中…' : '创建'))),
+            h('button', { type: 'button', style: uiButton(false), onClick: cancelForm }, '取消'),
+            leaderId && plan && h('button', { type: 'button', style: uiButton(false), disabled: busy, onClick: () => { void recommend(); } }, '重新推荐'),
+            h('button', { type: 'button', disabled: busy, style: { ...uiButton(true), opacity: busy ? .6 : 1 }, onClick: () => { void create(); } },
+              busy ? '处理中…' : leaderId && !plan ? 'Leader 推荐分工' : editing ? '保存分工' : '创建'))),
         list.length === 0 && !formOpen
           ? h(EmptyState, { title: '还没有卡片', hint: '新建一张卡片，每张卡片都有一个工单群。', action: '新建卡片', onAction: () => setFormOpen(true) })
           : h('div', { style: { flex: 1, minHeight: 0, overflow: 'auto', padding: 16, display: 'flex', gap: 12, alignItems: 'flex-start' } },
@@ -1975,6 +2098,14 @@ window.__ModuleLoader__.load({
       };
       const button = (label, onClick, disabled = false, primary = false) =>
         h('button', { type: 'button', style: uiButton(primary), onClick, disabled }, label);
+      const downloadPatch = record => {
+        const url = URL.createObjectURL(new Blob([record.text], { type: 'text/x-diff' }));
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = 'development-' + (record.ref?.slice(0, 12) ?? record.seq) + '.patch';
+        link.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      };
       const runLabel = { start: '首次运行', retry: '重试', reassign: '改派', conversation: '群聊开始' };
       const controlsLocked = busy || visible?.busy === true;
       return h('section', { 'aria-label': '工单群', style: { display: 'flex', flex: 1, minHeight: 0, width: '100%', background: dswTheme.bg } },
@@ -2008,7 +2139,10 @@ window.__ModuleLoader__.load({
                 record.kind !== 'batch' ? taskPhases[record.phase] : undefined,
                 new Date(record.at).toLocaleString(),
               ].filter(Boolean).join(' · ')),
-              h('div', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', marginTop: 4 } }, record.text)))),
+              record.phase === 'development-patch'
+                ? h('details', null, h('summary', null, '查看固定补丁'), button('下载补丁', () => downloadPatch(record)),
+                    h('pre', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' } }, record.text))
+                : h('div', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', marginTop: 4 } }, record.text)))),
           visible?.origin && h('footer', { style: { padding: 12, borderTop: '1px solid ' + dswTheme.border, display: 'grid', gap: 8 } },
             h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6 } },
               h('select', { 'aria-label': '改派 Leader', value: leader, style: uiInput, onChange: event => { setLeader(event.target.value); setRemote(''); } },

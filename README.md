@@ -36,7 +36,7 @@
 
 > **不要从仓库根目录 `dsh plugin add dsh-marshal`。** 根 `package.json` 的 `src/` 是历史核心，不包含智能体/群聊/跨设备代码。
 >
-> 当前可安装产物：**`plugin-build/dsh-marshal-0.2.0-agent-groups.8.tgz`**。Desktop 从 **Plugins → Add plugin** 选择该 tarball；有 `dsh` 的环境用 `dsh plugin --profile desktop add <abs path>.tgz`。
+> 当前可安装产物：**`plugin-build/dsh-marshal-0.2.0-agent-groups.9.tgz`**。Desktop 从 **Plugins → Add plugin** 选择该 tarball；有 `dsh` 的环境用 `dsh plugin --profile desktop add <abs path>.tgz`。
 >
 > **必须同时安装** `@linxin666/dsh-agents`（智能体/群聊/跨设备后端）；**建议安装** `@linxin666/dsh-client-ui-task-board`（完整看板）。它们都是 DSH 插件，不是 marshal 的 npm 普通依赖。完整依赖表、命令和排障见 [INSTALL.md](INSTALL.md)。
 

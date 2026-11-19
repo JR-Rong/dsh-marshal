@@ -17,9 +17,9 @@ export function taskRoomAccess(access, room, allowed, ledger) {
     return room && access.ok && access.session.ownerId === room.ownerId && allowed(access, { workspaceId: room.workspaceId }, ledger);
 }
 
-export function taskRoomAudit(rooms, room, reason, leader, remoteTarget) {
+export function taskRoomAudit(rooms, room, reason, leader, remoteTarget, allowMember) {
     return {
-        actor: '工单操作者', reason, leader, remoteTarget,
+        actor: '工单操作者', reason, leader, remoteTarget, allowMember,
         begin: (runId, why, assignee) => rooms.begin(room.id, runId, 'Marshal', why ?? 'start',
             typeof assignee === 'string' ? '负责人 ' + assignee : '改派到 ' + assignee.deviceId + ' · ' + assignee.modelId),
         record: event => rooms.append(room.id, event),
@@ -82,7 +82,7 @@ export function createTaskRoomRoutes({
         assertIdle(room);
         orchestration.start(room.source, card, taskRoomAudit(rooms, room, action,
             leader ? { id: leader.leaderId, leaderName: leader.leaderName, agentId: leader.agentId, workspaceId: leader.workspaceId } : undefined,
-            target));
+            target, member => allowed(access, member)));
         return { room: visibleTaskRoom(rooms.local(room.id)) };
     };
     const send = async (room, body, access) => {
