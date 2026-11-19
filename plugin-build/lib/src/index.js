@@ -16,6 +16,7 @@ import { createClaudeAdapter } from "./agents/claude/adapter.js";
 import { NodeLink } from "./node/link.js";
 import { createNodeSync } from "./node/sync.js";
 import { openJournal } from "./node/journal.js";
+import { hubHttpOrigin, startPhoneRelay } from "./node/phone-sync.js";
 import { createFollower, runRoutedCommand } from "./node/runner.js";
 import { createSeqAllocator, withPublicSeq } from "./node/seq.js";
 import { createQuestionRelay } from "./node/questions.js";
@@ -445,7 +446,28 @@ function applyNode(ctx, config) {
             ctx.logger.warn(`marshal: workspace identity unavailable: ${errorName(error)}`);
         }
     }
+    const phoneHost = () => {
+        const board = lookupService(ctx, 'taskBoard');
+        const memory = lookupService(ctx, 'memory');
+        const roster = lookupService(ctx, 'roster');
+        return {
+            ...(board === undefined ? {} : { board }),
+            ...(memory === undefined ? {} : { memory }),
+            ...(roster === undefined ? {} : { roster }),
+        };
+    };
+    const stopRelay = config.hubUrl !== undefined && config.token !== undefined && config.deviceId !== undefined
+        ? startPhoneRelay({
+            host: phoneHost,
+            allowContent: config.privacy === 'content',
+            origin: hubHttpOrigin(config.hubUrl),
+            token: config.token,
+            deviceId: config.deviceId,
+            ...(hubCa === undefined ? {} : { ca: hubCa }),
+        })
+        : undefined;
     ctx.effect(() => () => {
+        stopRelay?.();
         discussions?.dispose();
         nodeSync?.dispose();
         for (const item of bindings.values()) {
@@ -460,4 +482,10 @@ function applyNode(ctx, config) {
         journal.close();
     }, 'marshal: node link');
     link.start();
+}
+function lookupService(ctx, name) {
+    const bag = ctx;
+    if (typeof bag.get !== 'function') return undefined;
+    try { return bag.get(name); }
+    catch { return undefined; }
 }

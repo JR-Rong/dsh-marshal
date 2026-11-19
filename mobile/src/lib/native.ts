@@ -59,14 +59,26 @@ export async function watchNetwork(onChange: (online: boolean) => void): Promise
   }
 }
 
-/** 深链 marshal://open?hub=...；返回取消函数。 */
+/**
+ * 深链 marshal://open?hub=...&ticket=...；返回取消函数。
+ * 冷启动时 appUrlOpen 可能早于监听器注册，补一次 getLaunchUrl，并按 URL 去重。
+ */
 export async function watchDeepLinks(onUrl: (url: string) => void): Promise<() => void> {
   if (!inNativeShell()) return () => undefined
   try {
     const { App } = await import('@capacitor/app')
+    let lastUrl = ''
+    const emit = (url: string): void => {
+      if (!url || url === lastUrl) return
+      lastUrl = url
+      onUrl(url)
+    }
     const handle = await App.addListener('appUrlOpen', (event) => {
-      if (typeof event.url === 'string') onUrl(event.url)
+      if (typeof event.url === 'string') emit(event.url)
     })
+    void App.getLaunchUrl().then((launch) => {
+      if (launch && typeof launch.url === 'string') emit(launch.url)
+    }).catch(() => { /* 没有启动 URL 就算了 */ })
     return () => {
       void handle.remove()
     }

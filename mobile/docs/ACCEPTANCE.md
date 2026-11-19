@@ -132,7 +132,7 @@ xcodebuild -project ios/App/App.xcodeproj -scheme App -configuration Debug \
 ## 六、未覆盖 / 已知限制
 
 1. **未在真机或模拟器安装 APK**：本机没有 AVD，也没有连接的 Android 设备。安装验证建议：`adb install -r app-debug.apk`。
-2. **iOS 未编译**：Xcode 许可未同意（需皇上在终端执行，臣无密码不可代劳）。
+2. **iOS 未编译**：Xcode 许可未同意（需要机主在终端执行，这里没有那台机器的密码）。
 3. **无推送**：Hub 无 push 通道，审批/提问不会主动弹通知。
 4. **控制台为 Hub 页面**：功能保真以「与浏览器同页」实现，不做重写；因此控制台交互受 Hub 页面自身设计约束。
 5. **release 签名未配**：只产出 debug APK。

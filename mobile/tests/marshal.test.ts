@@ -72,7 +72,10 @@ test('can 只认能力文档里的操作列表', () => {
 })
 
 test('审批选项过滤「总是/记住/会话内」语义', () => {
-  assert.equal(decisionIsSafe({ id: 'allow-once', label: '允许这一次' }), true)
+  assert.equal(decisionIsSafe({ id: 'accept', label: '允许这一次' }), true)
+  assert.equal(decisionIsSafe({ id: 'decline', label: '拒绝' }), true)
+  assert.equal(decisionIsSafe({ id: 'cancel', label: '取消' }), true)
+  assert.equal(decisionIsSafe({ id: 'allow-once', label: '允许这一次' }), false)
   assert.equal(decisionIsSafe({ id: 'allow-always', label: '总是允许' }), false)
   assert.equal(decisionIsSafe({ id: 'x', label: '会话内都允许' }), false)
   assert.equal(decisionIsSafe({ id: "don't ask again", label: '别再问' }), false)
@@ -86,7 +89,7 @@ test('parseCards 丢弃坏卡并规范问题与审批', () => {
     },
     {
       requestId: 'r2',
-      approval: { action: '执行命令', detail: 'rm -rf', decisions: [{ id: 'allow', label: '允许' }, { id: 'always', label: '总是允许' }] },
+      approval: { action: '执行命令', detail: 'rm -rf', decisions: [{ id: 'accept', label: '允许' }, { id: 'always', label: '总是允许' }, { id: 'decline', label: '拒绝' }] },
     },
     { requestId: '' },
     'junk',
@@ -95,7 +98,7 @@ test('parseCards 丢弃坏卡并规范问题与审批', () => {
   assert.equal(cards[0].questions?.length, 1)
   assert.equal(cards[0].questions?.[0].options?.length, 1)
   assert.equal(cards[1].approval?.action, '执行命令')
-  assert.equal(cards[1].approval?.decisions.length, 1)
+  assert.equal(cards[1].approval?.decisions.length, 2)
 })
 
 test('parseCards 对非数组输入返回空', () => {

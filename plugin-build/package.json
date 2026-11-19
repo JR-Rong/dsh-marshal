@@ -1,6 +1,6 @@
 {
   "name": "dsh-marshal",
-  "version": "0.2.0-agent-groups.2",
+  "version": "0.2.0-agent-groups.4",
   "description": "Cross-device agent groups with resident DSH sessions, task board and memory.",
   "icon": "icon.svg",
   "type": "module",
@@ -20,6 +20,7 @@
   "dependencies": {
     "entities": "9.0.0",
     "marked": "18.1.2",
+    "uqr": "0.1.3",
     "ws": "^8.21.3",
     "zod": "^4.4.3"
   },
