@@ -921,8 +921,8 @@ window.__ModuleLoader__.load({
       }
       return '';
     }
-    async function ensureMemorySession() {
-      if (readBrowserCookie(MEMORY_CSRF_COOKIE) !== '') return;
+    async function ensureMemorySession(refresh = false) {
+      if (!refresh && readBrowserCookie(MEMORY_CSRF_COOKIE) !== '') return;
       memorySessionPromise ??= fetch(new URL('marshal/memory/session', document.baseURI), {
         method: 'POST',
         credentials: 'same-origin',
@@ -933,15 +933,16 @@ window.__ModuleLoader__.load({
           throw new Error('memory-auth');
         }
         return response.json();
-      }).catch(error => { memorySessionPromise = undefined; throw error; });
+      }).finally(() => { memorySessionPromise = undefined; });
       await memorySessionPromise;
     }
-    async function fetchJson(path, body) {
+    async function fetchJson(path, body, workspaceAuth = false) {
       const memory = String(path).startsWith('marshal/memory') && !String(path).startsWith('marshal/memory/session');
-      if (memory) await ensureMemorySession();
+      const authenticated = memory || workspaceAuth;
+      if (authenticated) await ensureMemorySession();
       const headers = {};
       if (body !== undefined) headers['content-type'] = 'application/json';
-      if (memory) {
+      if (authenticated) {
         const csrf = readBrowserCookie(MEMORY_CSRF_COOKIE);
         if (csrf !== '') headers['x-marshal-csrf'] = csrf;
       }
@@ -951,12 +952,18 @@ window.__ModuleLoader__.load({
         headers,
         body: JSON.stringify(body),
       };
-      const response = await fetch(new URL(path, document.baseURI), init);
+      const url = new URL(path, document.baseURI);
+      let response = await fetch(url, init);
+      if (authenticated && response.status === 401) {
+        await ensureMemorySession(true);
+        headers['x-marshal-csrf'] = readBrowserCookie(MEMORY_CSRF_COOKIE);
+        response = await fetch(url, init);
+      }
       let data = null;
       try { data = await response.json(); } catch { data = null; }
       if (!response.ok || (data !== null && data.ok === false)) {
         const code = data && (data.code || data.message) ? (data.code || data.message) : 'HTTP ' + response.status;
-        const error = new Error(String(code));
+        const error = new Error(String(workspaceAuth ? data?.message || code : code));
         error.code = data && data.code;
         throw error;
       }
@@ -1619,6 +1626,37 @@ window.__ModuleLoader__.load({
                 h('button', { type: 'button', disabled: busy, style: { ...uiButton(true), opacity: busy ? .6 : 1 }, onClick: () => { void send(); } }, '发送')))));
     }
 
+    const taskPhases = {
+      selecting: 'Leader 选择编排',
+      material: '读取 PR 快照',
+      reviewing: 'DSH 和 Codex 独立审查',
+      'cross-check': '互相复核',
+      summarizing: 'Leader 汇总报告',
+      handoff: '交接给 Leader',
+    };
+
+    function TaskReviewReport({ taskId }) {
+      const [report, setReport] = React.useState('');
+      const [error, setError] = React.useState('');
+      const [loading, setLoading] = React.useState(false);
+      const load = async event => {
+        if (!event.currentTarget.open || report || loading) return;
+        setLoading(true);
+        setError('');
+        try {
+          const data = await fetchJson('marshal/tasks/report?taskId=' + encodeURIComponent(taskId), undefined, true);
+          setReport(data.report);
+        }
+        catch (e) { setError(e.code === 'report-not-found' ? '该工作区报告已不可用。' : String(e.message || e)); }
+        finally { setLoading(false); }
+      };
+      return h('details', { onToggle: load },
+        h('summary', { style: { cursor: 'pointer' } }, '审查报告'),
+        loading && h('p', { style: uiMuted }, '读取中…'),
+        error && h('p', { role: 'alert' }, error),
+        report && h('pre', { style: { margin: '8px 0 0', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontSize: 12 } }, report));
+    }
+
     function TaskBoardPage({ openSession }) {
       const [tasks, setTasks] = React.useState(null);
       const [error, setError] = React.useState('');
@@ -1627,6 +1665,14 @@ window.__ModuleLoader__.load({
       const [title, setTitle] = React.useState('');
       const [description, setDescription] = React.useState('');
       const [confirmId, setConfirmId] = React.useState('');
+      const [catalog, setCatalog] = React.useState(null);
+      const [catalogError, setCatalogError] = React.useState('');
+      const [leaderId, setLeaderId] = React.useState('');
+      const [choice, setChoice] = React.useState('leader');
+      const [templateId, setTemplateId] = React.useState('pr-review');
+      const [prUrl, setPrUrl] = React.useState('');
+      const template = catalog?.templates.find(item => item.id === templateId);
+      const requiresPr = leaderId !== '' && choice === 'template' && templateId === 'pr-review';
       const list = Array.isArray(tasks) ? tasks : [];
       const columns = [
         { key: 'backlog', label: '待规划' },
@@ -1642,20 +1688,35 @@ window.__ModuleLoader__.load({
       };
       React.useEffect(() => {
         void load();
+        void fetchJson('marshal/tasks/orchestration', undefined, true)
+          .then(setCatalog).catch(() => setCatalogError('编排配置暂不可用。'));
         const timer = setInterval(() => { void load(); }, 3000);
         return () => clearInterval(timer);
       }, []);
 
       const create = async () => {
         if (!title.trim()) { setError('请填写标题'); return; }
+        if (requiresPr && !prUrl.trim()) { setError('请填写要审查的 PR 链接'); return; }
+        const orchestration = leaderId ? {
+          leaderId, choice,
+          ...(choice === 'template' ? { templateId } : {}),
+          ...(choice !== 'none' && prUrl.trim() ? { prUrl: prUrl.trim() } : {}),
+        } : undefined;
         setBusy(true);
         setError('');
         try {
-          await fetchJson('marshal/tasks/create', { title: title.trim(), description: description.trim() });
+          const result = await fetchJson('marshal/tasks/create', {
+            title: title.trim(), description: description.trim(),
+            ...(orchestration === undefined ? {} : { orchestration }),
+          }, orchestration !== undefined);
+          setTasks(result.tasks || []);
           setTitle('');
           setDescription('');
+          setLeaderId('');
+          setChoice('leader');
+          setTemplateId('pr-review');
+          setPrUrl('');
           setFormOpen(false);
-          await load();
         }
         catch (e) { setError('创建失败：' + (e.message || e)); }
         finally { setBusy(false); }
@@ -1664,7 +1725,10 @@ window.__ModuleLoader__.load({
       const run = async (task) => {
         setBusy(true);
         setError('');
-        try { await fetchJson('marshal/tasks/run', { taskId: task.id }); await load(); }
+        try {
+          const result = await fetchJson('marshal/tasks/run', { taskId: task.id }, Boolean(task.workflow));
+          setTasks(result.tasks || []);
+        }
         catch (e) { setError('运行失败：' + (e.message || e)); }
         finally { setBusy(false); }
       };
@@ -1673,29 +1737,71 @@ window.__ModuleLoader__.load({
         if (confirmId !== task.id) { setConfirmId(task.id); return; }
         setBusy(true);
         setError('');
-        try { await fetchJson('marshal/tasks/delete', { taskId: task.id }); setConfirmId(''); await load(); }
+        try {
+          const result = await fetchJson('marshal/tasks/delete', { taskId: task.id }, Boolean(task.workflow));
+          setTasks(result.tasks || []);
+          setConfirmId('');
+        }
         catch (e) { setError('删除失败：' + (e.message || e)); }
         finally { setBusy(false); }
       };
 
-      const card = task => h('div', { key: task.id, style: { border: '1px solid ' + dswTheme.border, borderRadius: 10, background: dswTheme.layer, padding: 10, display: 'grid', gap: 8 } },
-        h('div', { style: { fontSize: 13, fontWeight: 500, lineHeight: 1.45 } }, task.title),
-        task.description && h('div', { style: { fontSize: 11, color: dswTheme.faint, lineHeight: 1.55, display: '-webkit-box', WebkitLineClamp: 3, WebkitBoxOrient: 'vertical', overflow: 'hidden' } }, task.description),
-        h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' } },
-          task.sessionId && h('button', { type: 'button', style: { ...uiButton(false), padding: '3px 8px', fontSize: 11 }, onClick: () => openSession && openSession(task.sessionId) }, '打开会话'),
-          task.status !== 'running' && h('button', { type: 'button', disabled: busy, style: { ...uiButton(true), padding: '3px 8px', fontSize: 11 }, onClick: () => { void run(task); } }, '运行'),
-          h('button', { type: 'button', style: { ...uiButton(false), padding: '3px 8px', fontSize: 11, color: confirmId === task.id ? dswTheme.danger : dswTheme.text }, onClick: () => { void remove(task); } }, confirmId === task.id ? '确认删除' : '删除')));
+      const card = task => {
+        const workflow = task.workflow;
+        const execution = workflow?.selected ?? workflow?.templateId;
+        const templateName = catalog?.templates.find(item => item.id === execution)?.name;
+        const modeLabel = execution === 'none' || workflow?.choice === 'none' ? '普通任务'
+          : templateName ?? (workflow?.choice === 'leader' ? '由 Leader 决定' : '编排任务');
+        const step = workflow?.state === 'handed-off' ? '已交给 Leader'
+          : workflow?.state === 'interrupted' ? '运行中断，可重试'
+          : taskPhases[workflow?.phase];
+        return h('div', { key: task.id, style: { border: '1px solid ' + dswTheme.border, borderRadius: 10, background: dswTheme.layer, padding: 10, display: 'grid', gap: 8 } },
+          h('div', { style: { fontSize: 13, fontWeight: 500, lineHeight: 1.45 } }, task.title),
+          task.description && h('div', { style: { fontSize: 11, color: dswTheme.faint, lineHeight: 1.55, display: '-webkit-box', WebkitLineClamp: 3, WebkitBoxOrient: 'vertical', overflow: 'hidden' } }, task.description),
+          workflow && h('div', { style: uiMuted }, workflow.leaderName + ' · ' + modeLabel),
+          step && h('span', { role: 'status', style: uiMuted }, step),
+          workflow?.error && h('span', { role: 'alert', style: { color: dswTheme.danger, fontSize: 12 } }, workflow.error),
+          workflow?.pr && h('div', { style: uiMuted, title: workflow.pr.head },
+            h('a', { href: workflow.pr.url, target: '_blank', rel: 'noreferrer' }, 'PR'), ' · ' + workflow.pr.head.slice(0, 10),
+            workflow.pr.omitted.length > 0 ? ' · ' + workflow.pr.omitted.length + ' 个文件缺少完整文本补丁' : ''),
+          workflow?.reviewers?.length > 0 && h('div', { style: uiMuted },
+            workflow.reviewers.map(reviewer => reviewer.name + ' · ' + reviewer.model).join(' / ')),
+          workflow?.reportId && h(TaskReviewReport, { key: workflow.reportId, taskId: task.id }),
+          h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' } },
+            task.sessionId && h('button', { type: 'button', style: { ...uiButton(false), padding: '3px 8px', fontSize: 11 }, onClick: () => openSession && openSession(task.sessionId) }, '打开会话'),
+            task.status !== 'running' && workflow?.state !== 'done' && h('button', { type: 'button', disabled: busy, style: { ...uiButton(true), padding: '3px 8px', fontSize: 11 }, onClick: () => { void run(task); } }, workflow?.state === 'failed' || workflow?.state === 'interrupted' ? '重试' : '运行'),
+            h('button', { type: 'button', style: { ...uiButton(false), padding: '3px 8px', fontSize: 11, color: confirmId === task.id ? dswTheme.danger : dswTheme.text }, onClick: () => { void remove(task); } }, confirmId === task.id ? '确认删除' : '删除')));
+      };
 
       return h('section', { style: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', background: dswTheme.bg, color: dswTheme.text } },
         h('header', { style: { padding: '14px 20px', borderBottom: '1px solid ' + dswTheme.border, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexShrink: 0 } },
           h('div', null,
             h('div', { style: { fontSize: 15, fontWeight: 600 } }, '任务看板'),
-            h('div', { style: uiMuted }, list.length + ' 张卡片 · 运行中的卡片会自动建会话')),
+            h('div', { style: uiMuted }, list.length + ' 张卡片')),
           h('button', { type: 'button', style: uiButton(true), onClick: () => setFormOpen(value => !value) }, formOpen ? '收起' : '＋ 新建卡片')),
         error && h('div', { style: { padding: '8px 20px', fontSize: 12, color: dswTheme.danger } }, error),
         formOpen && h('div', { style: { margin: '14px 20px 0', padding: 14, border: '1px solid ' + dswTheme.border, borderRadius: 12, background: dswTheme.layer, display: 'grid', gap: 10 } },
           h(Field, { label: '标题' }, h('input', { value: title, onChange: event => setTitle(event.target.value), placeholder: '这张卡片要做什么', style: uiInput })),
           h(Field, { label: '描述（可选）' }, h('textarea', { value: description, onChange: event => setDescription(event.target.value), rows: 3, placeholder: '背景、验收标准、约束…', style: { ...uiInput, resize: 'vertical', lineHeight: 1.6 } })),
+          catalog?.memoryAvailable && catalog.leaders.length > 0 && h(Field, { label: 'Leader' },
+            h('select', { value: leaderId, onChange: event => setLeaderId(event.target.value), style: uiInput },
+              h('option', { value: '' }, '普通卡片'),
+              catalog.leaders.map(leader => h('option', { key: leader.id, value: leader.id }, leader.name)))),
+          catalogError && h('div', { style: uiMuted }, catalogError),
+          catalog && (!catalog.memoryAvailable || catalog.leaders.length === 0) && h('div', { style: uiMuted },
+            '编排需要工作区记忆和已绑定工作区的 Leader。'),
+          leaderId && h(Field, { label: '编排方式' },
+            h('select', { value: choice, onChange: event => setChoice(event.target.value), style: uiInput },
+              h('option', { value: 'leader' }, '由 Leader 选择或跳过'),
+              h('option', { value: 'template' }, '指定模板'),
+              h('option', { value: 'none' }, '不使用模板'))),
+          leaderId && choice === 'template' && h(Field, { label: '模板' },
+            h('select', { value: templateId, onChange: event => setTemplateId(event.target.value), style: uiInput },
+              (catalog?.templates ?? []).map(item => h('option', { key: item.id, value: item.id },
+                item.name + (item.automated ? ' · 自动' : ' · 由 Leader 执行')))),
+            template && h('span', { style: uiMuted }, template.stages.join(' → '))),
+          leaderId && (requiresPr || choice === 'leader') && h(Field, { label: requiresPr ? 'PR 链接' : 'PR 链接（可选）' },
+            h('input', { type: 'url', value: prUrl, onChange: event => setPrUrl(event.target.value), placeholder: 'GitHub 或 Gitee PR 链接', style: uiInput })),
           h('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8 } },
             h('button', { type: 'button', style: uiButton(false), onClick: () => setFormOpen(false) }, '取消'),
             h('button', { type: 'button', disabled: busy, style: { ...uiButton(true), opacity: busy ? .6 : 1 }, onClick: () => { void create(); } }, busy ? '处理中…' : '创建'))),

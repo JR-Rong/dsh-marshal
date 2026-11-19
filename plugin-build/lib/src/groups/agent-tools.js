@@ -18,12 +18,12 @@ export function createAgentsHttpClient({ baseUrl, fetchImpl = fetch } = {}) {
         if (typeof value !== 'string' || value === '') throw new Error('marshal: agents no-web-server');
         return value.replace(/\/+$/, '');
     };
-    const request = async (path, body) => {
+    const request = async (path, body, signal) => {
         const root = base();
         const response = await fetchImpl(root + path, body === undefined ? {
             headers: { origin: root, 'sec-fetch-site': 'same-origin' },
         } : {
-            method: 'POST',
+            method: 'POST', signal,
             headers: { origin: root, 'sec-fetch-site': 'same-origin', 'content-type': 'application/json' },
             body: JSON.stringify(body),
         });
@@ -49,7 +49,9 @@ export function createAgentsHttpClient({ baseUrl, fetchImpl = fetch } = {}) {
         if (agent === undefined) throw new Error('agent-not-found');
         return agent;
     };
+    const chatMember = async (teamId, memberId, signal) => (await request('/dsh-agents/api/run', { teamId, memberId }, signal)).run;
     return {
+        chatMember,
         async list() {
             return collect(await request('/dsh-agents/api/state'));
         },
@@ -85,7 +87,7 @@ export function createAgentsHttpClient({ baseUrl, fetchImpl = fetch } = {}) {
         },
         async chat(memberId) {
             const agent = await findAgent(memberId);
-            return (await request('/dsh-agents/api/run', { teamId: agent.squadId, memberId })).run;
+            return chatMember(agent.squadId, memberId);
         },
     };
 }

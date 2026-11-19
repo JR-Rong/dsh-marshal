@@ -58,6 +58,9 @@ try {
   const entry = packedPkg.exports?.['.']
   if (typeof entry !== 'string' || !entry.startsWith('./lib/')) throw new Error('tgz is missing its plugin entry')
   symlinkSync(join(root, 'node_modules'), join(extracted, 'node_modules'), 'dir')
+  const packedClient = join(extracted, 'package', 'client', 'index.js')
+  if (!readFileSync(packedClient).equals(readFileSync(join(plugin, 'client', 'index.js')))) throw new Error('tgz client differs')
+  execFileSync(process.execPath, ['--check', packedClient], { stdio: 'inherit' })
   const installedPlugin = await import(pathToFileURL(join(extracted, 'package', entry)).href)
   if (typeof installedPlugin.apply !== 'function') throw new Error('tgz entry does not export apply')
   console.log('plugin tgz matches plugin-build/lib (' + packed.length + ' files)')

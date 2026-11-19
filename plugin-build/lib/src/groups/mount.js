@@ -7,6 +7,8 @@ import { readAgentsLedger } from './inventory.js';
 import { createAgentDrafter } from './draft.js';
 import { createCrossClient } from './cross-client.js';
 import { createLocalBoard } from './local-board.js';
+import { createTaskOrchestration } from './task-orchestration.js';
+import { createDiscussionPort } from '../discussions/ports.js';
 import { createAgentsHttpClient, agentToolDefinitions } from './agent-tools.js';
 import { createDshSurface } from '../adapters/dsh/surface.js';
 import { createMemoryRoutes } from '../memory/http.js';
@@ -142,25 +144,49 @@ export function buildHealthBody(req, info) {
     };
 }
 
-function taskView(task) {
+function taskView(task, workflow) {
     const executions = Array.isArray(task.executions) ? task.executions : [];
     const latest = executions.length > 0 ? executions[executions.length - 1] : undefined;
     return {
         id: task.id,
         title: task.title,
-        status: task.status,
+        status: workflow === undefined || workflow.state === 'ready' ? task.status
+            : workflow.state === 'running' || workflow.state === 'handed-off' ? 'running'
+            : workflow.state === 'done' ? 'done' : 'failed',
+        ...(workflow === undefined ? {} : { workflow }),
         ...(task.description === undefined ? {} : { description: task.description }),
         ...(task.parentId === undefined ? {} : { parentId: task.parentId }),
         ...(task.permission === undefined ? {} : { permission: task.permission }),
         ...(task.mode === undefined ? {} : { mode: task.mode }),
         ...(latest === undefined || latest.sessionId === undefined ? {} : { sessionId: latest.sessionId }),
         ...(latest === undefined || latest.result === undefined ? {} : { result: latest.result }),
+        ...(workflow?.sessionId === undefined ? {} : { sessionId: workflow.sessionId }),
         createdAt: task.createdAt,
         updatedAt: task.updatedAt,
     };
 }
 
-function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource = () => 'local', memory, auth, allowedOrigins) {
+function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, memory, auth, allowedOrigins, orchestration) {
+    const authenticate = (req, write = false) => auth.authenticate(req, { write, origins: allowedOrigins() });
+    const allowed = (access, target, ledger) => access.ok && auth.allows(access.session, {
+        agentId: target.agentId, workspaceId: target.workspaceId,
+    }, ledger);
+    const authorize = (req, res, target) => {
+        const access = authenticate(req, true);
+        if (allowed(access, target)) return true;
+        write(res, access.ok ? 403 : access.status, {
+            ok: false, code: access.ok ? 'workspace-forbidden' : access.code, message: '当前桌面会话无权操作该工作区的编排。',
+        });
+        return false;
+    };
+    const taskList = (snapshot, req, source) => {
+        const access = authenticate(req);
+        const ledger = access.ok ? auth.loadLedger() : undefined;
+        return (Array.isArray(snapshot.tasks) ? snapshot.tasks : []).map(task => {
+            const target = orchestration?.target(source, task.id);
+            return taskView(task, target && allowed(access, { workspaceId: target.workspaceId }, ledger) ? orchestration.view(source, task.id) : undefined);
+        });
+    };
     return [
         exact('GET', '/marshal/health', async (req, res) => {
             const ledger = readAgentsLedger();
@@ -174,6 +200,29 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource = 
             }));
         }, true),
         ...createMemoryRoutes({ memory, auth, allowedOrigins }).map(route => exact(route.method, route.path, route.handler, true)),
+        exact('GET', '/marshal/tasks/orchestration', async (req, res) => {
+            const access = authenticate(req);
+            if (!access.ok) { write(res, access.status, { ok: false, code: access.code }); return; }
+            const catalog = orchestration?.catalog() ?? { templates: [], leaders: [], memoryAvailable: false };
+            const ledger = auth.loadLedger();
+            write(res, 200, { ok: true, ...catalog, leaders: catalog.leaders.filter(leader => allowed(access, leader, ledger)) });
+        }),
+        exact('GET', '/marshal/tasks/report', async (req, res) => {
+            const id = new URL(req.url ?? '', 'http://localhost').searchParams.get('taskId');
+            const source = boardSource();
+            const access = authenticate(req);
+            const target = orchestration?.target(source, id);
+            if (!target || !allowed(access, { workspaceId: target.workspaceId })) {
+                write(res, access.ok ? 404 : access.status, { ok: false, code: access.ok ? 'report-not-found' : access.code });
+                return;
+            }
+            const report = orchestration.report(source, id);
+            if (report === undefined) {
+                write(res, 404, { ok: false, code: 'report-not-found' });
+                return;
+            }
+            write(res, 200, { ok: true, report });
+        }),
         exact('GET', '/marshal/tasks/state', async (req, res) => {
             const board = getBoard();
             if (board === undefined) {
@@ -183,7 +232,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource = 
             const snapshot = board.snapshot();
             write(res, 200, {
                 ok: true,
-                tasks: (Array.isArray(snapshot.tasks) ? snapshot.tasks : []).map(taskView),
+                tasks: taskList(snapshot, req, boardSource()),
                 ...(snapshot.sessionDefaultPermission === undefined ? {} : { sessionDefaultPermission: snapshot.sessionDefaultPermission }),
             });
         }),
@@ -202,8 +251,42 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource = 
             const description = typeof body.description === 'string' ? body.description.trim() : '';
             const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
             const input = { title, description, prompt: prompt || description || title };
-            const snapshot = await board.apply(randomUUID(), { kind: 'create', id: randomUUID(), input }, initiator);
-            write(res, 200, { ok: true, tasks: (Array.isArray(snapshot.tasks) ? snapshot.tasks : []).map(taskView) });
+            const source = boardSource();
+            const id = randomUUID();
+            let prepared;
+            let existing;
+            if (body.orchestration !== undefined) {
+                if (!orchestration) {
+                    write(res, 503, { ok: false, code: 'orchestration-unavailable' });
+                    return;
+                }
+                // Authorize before looking up the requested leader, then check the bound workspace.
+                const access = authenticate(req, true);
+                if (!access.ok) { write(res, access.status, { ok: false, code: access.code }); return; }
+                prepared = orchestration.prepare(body.orchestration);
+                if (!allowed(access, prepared)) {
+                    write(res, 403, { ok: false, code: 'workspace-forbidden' });
+                    return;
+                }
+                existing = new Set((board.snapshot().tasks ?? []).map(task => task.id));
+            }
+            const snapshot = await board.apply(randomUUID(), { kind: 'create', id, input }, initiator);
+            if (prepared) {
+                const added = (snapshot.tasks ?? []).filter(task => !existing.has(task.id));
+                const created = added.find(task => task.id === id) ?? (added.length === 1 ? added[0] : undefined);
+                if (!created) {
+                    write(res, 409, { ok: false, code: 'task-create-not-observed' });
+                    return;
+                }
+                try { orchestration.attach(source, created.id, prepared); }
+                catch {
+                    try { await board.apply(randomUUID(), { kind: 'delete', taskId: created.id }, initiator); }
+                    catch { /* A host without rollback can leave an unconfigured card. */ }
+                    write(res, 500, { ok: false, code: 'task-orchestration-not-saved', message: '无法保存任务编排。' });
+                    return;
+                }
+            }
+            write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
         }),
         exact('POST', '/marshal/tasks/run', async (req, res) => {
             const board = getBoard();
@@ -216,8 +299,22 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource = 
                 write(res, 400, { ok: false, code: 'invalid-task' });
                 return;
             }
+            const source = boardSource();
+            const workflow = orchestration?.target(source, body.taskId);
+            if (workflow) {
+                if (!authorize(req, res, workflow)) return;
+                const snapshot = board.snapshot();
+                const task = (snapshot.tasks ?? []).find(item => item.id === body.taskId);
+                if (!task) {
+                    write(res, 404, { ok: false, code: 'task-not-found' });
+                    return;
+                }
+                orchestration.start(source, task);
+                write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
+                return;
+            }
             const snapshot = await board.apply(randomUUID(), { kind: 'run', taskId: body.taskId }, initiator);
-            write(res, 200, { ok: true, tasks: (Array.isArray(snapshot.tasks) ? snapshot.tasks : []).map(taskView) });
+            write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
         }),
         exact('POST', '/marshal/tasks/delete', async (req, res) => {
             const board = getBoard();
@@ -230,8 +327,15 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource = 
                 write(res, 400, { ok: false, code: 'invalid-task' });
                 return;
             }
+            const source = boardSource();
+            const workflow = orchestration?.target(source, body.taskId);
+            if (workflow && !authorize(req, res, workflow)) return;
+            orchestration?.assertIdle(source, body.taskId);
             const snapshot = await board.apply(randomUUID(), { kind: 'delete', taskId: body.taskId }, initiator);
-            write(res, 200, { ok: true, tasks: (Array.isArray(snapshot.tasks) ? snapshot.tasks : []).map(taskView) });
+            if (workflow && !(snapshot.tasks ?? []).some(task => task.id === body.taskId)) {
+                orchestration.remove(source, body.taskId);
+            }
+            write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
         }),
         exact('POST', '/marshal/workspaces/agent', async (req, res) => {
             const body = await readBody(req);
@@ -480,20 +584,38 @@ export function mountGroups(ctx, config, options = {}) {
         reader: createReplyReader(surface),
         logger: options.logger ?? ctx.logger,
     });
+    const agents = createAgentsHttpClient({
+        baseUrl: () => {
+            if (typeof webServer?.getOrigin === 'function') return webServer.getOrigin();
+            if (typeof webServer?.port === 'number') return 'http://127.0.0.1:' + webServer.port;
+            throw new Error('marshal: agents no-web-server');
+        },
+    });
+    let orchestration;
+    try {
+        orchestration = createTaskOrchestration({
+            file: join(root, 'task-orchestration.json'), inventory: readAgentsLedger, memory: options.memory,
+            port: createDiscussionPort({ agents: config.agents, llm, codexExecutable: config.codexExecutable }),
+            defaultModel: readDefaultModel, logger: options.logger,
+            startLeader: async (leader, text, signal) => {
+                const { sessionId } = await agents.chatMember(leader.teamId, leader.memberId, signal) ?? {};
+                if (typeof sessionId !== 'string' || sessionId === '') throw new Error('Leader session unavailable');
+                signal.throwIfAborted();
+                await ctx.sessionController.prompt({
+                    requestId: randomUUID(), sessionId, content: [{ type: 'text', text }],
+                }, signal);
+                return sessionId;
+            },
+        });
+    }
+    catch { options.logger?.warn?.('marshal: task orchestration unavailable'); }
     if (typeof ctx.effect === 'function') ctx.effect(() => () => {
+        orchestration?.dispose();
         promptAbort.abort();
         service.dispose();
     }, 'marshal: groups prompt lifetime');
     ctx.inject(['tools'], (scoped) => {
         scoped.effect(() => {
-            const agents = createAgentsHttpClient({
-                baseUrl: () => {
-                    const server = webServer;
-                    if (server !== undefined && typeof server.getOrigin === 'function') return server.getOrigin();
-                    if (server !== undefined && typeof server.port === 'number') return 'http://127.0.0.1:' + server.port;
-                    throw new Error('marshal: agents no-web-server');
-                },
-            });
             const disposers = agentToolDefinitions({ agents, service })
                 .map((definition) => scoped.tools.register(definition));
             return () => {
@@ -520,7 +642,7 @@ export function mountGroups(ctx, config, options = {}) {
                 }
                 catch { /* desktop origin is enough when the host has no public origin */ }
                 return origins;
-            }).map((route) => scoped.webServer.register(route));
+            }, orchestration).map((route) => scoped.webServer.register(route));
             return () => {
                 for (const dispose of disposers) dispose();
             };
