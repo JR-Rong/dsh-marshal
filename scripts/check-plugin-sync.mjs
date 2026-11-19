@@ -1,7 +1,8 @@
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs'
+import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 const root = new URL('..', import.meta.url).pathname
 const plugin = join(root, 'plugin-build')
@@ -54,6 +55,11 @@ try {
   }
   const packedPkg = JSON.parse(readFileSync(join(extracted, 'package/package.json'), 'utf8'))
   if (!packedPkg.dependencies?.uqr) throw new Error('tgz is missing the uqr dependency')
+  const entry = packedPkg.exports?.['.']
+  if (typeof entry !== 'string' || !entry.startsWith('./lib/')) throw new Error('tgz is missing its plugin entry')
+  symlinkSync(join(root, 'node_modules'), join(extracted, 'node_modules'), 'dir')
+  const installedPlugin = await import(pathToFileURL(join(extracted, 'package', entry)).href)
+  if (typeof installedPlugin.apply !== 'function') throw new Error('tgz entry does not export apply')
   console.log('plugin tgz matches plugin-build/lib (' + packed.length + ' files)')
 } finally {
   rmSync(extracted, { recursive: true, force: true })

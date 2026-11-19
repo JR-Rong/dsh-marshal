@@ -28,7 +28,6 @@ import { mountDispatch } from "./dispatch/mount.js";
 import { attachFileProposals, mountMemory } from "./memory/mount.js";
 import { mountAgentMemory } from "./memory/agent-memory.js";
 import { mountGroups } from "./groups/mount.js";
-import { readAgentsLedger } from "./groups/inventory.js";
 import { mountWorkspaceIdentity } from "./groups/workspace-identity.js";
 export const name = 'marshal';
 export function apply(ctx, raw) {
