@@ -26,7 +26,6 @@ import { createInteractionRelay } from './node/interactions.ts'
 import { createAuditLog } from './node/audit.ts'
 import { createPrivacyProjector, type PrivacyProjector } from './node/privacy.ts'
 import { mountSetup } from './setup.ts'
-import { forwardPhoneState, hubHttpOrigin } from './hub/phone.ts'
 
 export const name = 'marshal'
 
@@ -405,17 +404,7 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
     logger: ctx.logger,
   })
 
-  const forwardTimer = setInterval(() => {
-    void forwardPhoneState({
-      hubHttpOrigin: hubHttpOrigin(config.hubUrl!),
-      token: config.token!,
-      roster: config.agents.map((agent) => ({ deviceId: config.deviceId!, agent, name: agent })),
-    })
-  }, 60_000)
-  forwardTimer.unref()
-
   ctx.effect(() => () => {
-    clearInterval(forwardTimer)
     discussions?.dispose()
     nodeSync?.dispose()
     for (const item of bindings.values()) {

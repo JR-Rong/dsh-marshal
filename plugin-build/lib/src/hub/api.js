@@ -8,7 +8,6 @@ import { COMMAND_OPS } from "../wire/frames.js";
 import { parseCommandArgs } from "../wire/commands.js";
 import { MAX_FRAME_BYTES } from "../wire/limits.js";
 import { PAGE_HTML, DESKTOP_PAGE_HTML } from "./page.js";
-import { controllerCommandAllowed, noticeForEvent, registerPhoneRoutes } from "./phone.js";
 export const SESSION_COOKIE = '__Host-marshal-session';
 export const CSRF_COOKIE = '__Host-marshal-csrf';
 export const DESKTOP_SESSION_COOKIE = '__Host-marshal-desktop-session';
@@ -462,17 +461,11 @@ export function registerMarshalRoutes(options) {
         }
         if (tokenHeader === undefined || tokenHeader === '')
             return undefined;
-        if (tokenMatches(tokenHeader)) {
-            if (!auth.allowToken)
-                return undefined;
-            return { kind: 'token' };
-        }
-        if (auth.allowDevice !== true || options.phone === undefined)
+        if (!auth.allowToken)
             return undefined;
-        const phoneAuth = options.phone.authenticate(tokenHeader);
-        if (!phoneAuth.ok)
+        if (!tokenMatches(tokenHeader))
             return undefined;
-        return { kind: 'device', phone: phoneAuth };
+        return { kind: 'token' };
     };
     const csrfMatches = (req, session) => {
         const cookie = readCookie(req, csrfCookieName);
@@ -784,21 +777,14 @@ export function registerMarshalRoutes(options) {
         });
     }));
     const readAccess = { allowToken: true, refresh: true, write: false };
-    const deviceRead = { allowToken: true, allowDevice: true, refresh: true, write: false };
-    const deviceWrite = { allowToken: true, allowDevice: true, refresh: true, write: true };
     register('/marshal/api/devices', guard((req, res) => {
         if (req.method !== 'GET') {
             methodNotAllowed(res, 'GET');
             return;
         }
-        if (authorize(req, res, deviceRead) === undefined)
+        if (authorize(req, res, readAccess) === undefined)
             return;
-        const connected = registry.list(now()).map(row => publicDevice({ ...row, name: options.deviceStore?.findById(row.id)?.name ?? row.name }, relay, sync, options.inventories?.get(row.id)));
-        const seen = new Set(connected.map(row => row.id));
-        const controllers = (options.phone?.listControllers() ?? [])
-            .filter(item => !seen.has(item.id))
-            .map(item => ({ id: item.id, name: item.name, agents: [], connectedAt: 0, lastSeen: now(), syncing: false, stale: false, role: 'controller' }));
-        json(res, 200, { devices: [...connected, ...controllers] });
+        json(res, 200, { devices: registry.list(now()).map(row => publicDevice({ ...row, name: options.deviceStore?.findById(row.id)?.name ?? row.name }, relay, sync, options.inventories?.get(row.id))) });
     }));
     const crossGroups = options.crossGroups;
     const crossAuth = (req, res, write) => {
@@ -894,7 +880,7 @@ export function registerMarshalRoutes(options) {
             methodNotAllowed(res, 'GET');
             return;
         }
-        if (authorize(req, res, deviceRead) === undefined)
+        if (authorize(req, res, readAccess) === undefined)
             return;
         const query = new URL(req.url ?? '/', 'http://localhost').searchParams;
         // 空串 `?device=` 与缺参等价。
@@ -906,14 +892,9 @@ export function registerMarshalRoutes(options) {
             methodNotAllowed(res, 'GET, POST');
             return;
         }
-        const tokenHeader = headerValue(req, 'x-marshal-token');
-        const phoneAuth = tokenHeader && options.phone ? options.phone.authenticate(tokenHeader) : undefined;
-        const asController = phoneAuth && phoneAuth.ok && phoneAuth.role === 'controller';
-        if (!asController) {
-            const auth = authorize(req, res, { allowToken: false, refresh: true, write: req.method === 'POST' });
-            if (auth?.kind !== 'session')
-                return;
-        }
+        const auth = authorize(req, res, { allowToken: false, refresh: true, write: req.method === 'POST' });
+        if (auth?.kind !== 'session')
+            return;
         const groups = options.discussions;
         if (!groups) {
             json(res, 503, { ok: false, code: 'unsupported' });
@@ -931,10 +912,6 @@ export function registerMarshalRoutes(options) {
             const data = asRecord(body.value);
             if (!data || typeof data.action !== 'string') {
                 json(res, 400, { code: 'invalid-args' });
-                return;
-            }
-            if (asController && data.action !== 'send') {
-                json(res, 403, { ok: false, code: 'unsupported' });
                 return;
             }
             let value;
@@ -1015,8 +992,7 @@ export function registerMarshalRoutes(options) {
             methodNotAllowed(res, 'POST');
             return;
         }
-        const auth = authorize(req, res, deviceWrite);
-        if (auth === undefined)
+        if (authorize(req, res, { allowToken: true, refresh: true, write: true }) === undefined)
             return;
         const read = await readJsonBody(req, res, MAX_FRAME_BYTES - 4096);
         if (!read.ok)
@@ -1049,10 +1025,6 @@ export function registerMarshalRoutes(options) {
             return { ...record, subscriptionId: randomUUID() };
         })();
         // 参数在 hub 侧先按 op 校验；非法参数不进入中继，也不消耗幂等键。
-        if (auth.kind === 'device' && (auth.phone.role !== 'controller' || !controllerCommandAllowed(op, rawArgs))) {
-            json(res, 403, { ok: false, code: 'unsupported' });
-            return;
-        }
         let args;
         try {
             args = parseCommandArgs(op, rawArgs);
@@ -1071,7 +1043,7 @@ export function registerMarshalRoutes(options) {
             methodNotAllowed(res, 'GET');
             return;
         }
-        if (authorize(req, res, deviceRead) === undefined)
+        if (authorize(req, res, readAccess) === undefined)
             return;
         const query = new URL(req.url ?? '/', 'http://localhost').searchParams;
         const deviceId = query.get('deviceId') ?? '';
@@ -1107,7 +1079,7 @@ export function registerMarshalRoutes(options) {
             methodNotAllowed(res, 'POST');
             return;
         }
-        if (authorize(req, res, deviceWrite) === undefined)
+        if (authorize(req, res, { allowToken: true, refresh: true, write: true }) === undefined)
             return;
         const read = await readJsonBody(req, res, SMALL_BODY_LIMIT);
         if (!read.ok)
@@ -1143,7 +1115,7 @@ export function registerMarshalRoutes(options) {
             methodNotAllowed(res, 'POST');
             return;
         }
-        if (authorize(req, res, deviceWrite) === undefined)
+        if (authorize(req, res, { allowToken: true, refresh: true, write: true }) === undefined)
             return;
         const read = await readJsonBody(req, res, SMALL_BODY_LIMIT);
         if (!read.ok)
@@ -1189,7 +1161,7 @@ export function registerMarshalRoutes(options) {
             return;
         }
         // SSE 心跳不刷新空闲期，登录态只由普通 API 请求续期。
-        const auth = authorize(req, res, { allowToken: true, allowDevice: true, refresh: false, write: false });
+        const auth = authorize(req, res, { allowToken: true, refresh: false, write: false });
         if (auth === undefined)
             return;
         const sessionId = auth.kind === 'session' ? auth.session.id : undefined;
@@ -1240,9 +1212,6 @@ export function registerMarshalRoutes(options) {
         const purgeBase = new Map();
         const degraded = new Set();
         const deliver = (event, cursor) => {
-            const notice = noticeForEvent(event.kind, event.payload);
-            if (notice)
-                void options.phone?.notify(notice);
             // 观测后发生过内容清理：暂存/回放中的旧帧一律不再发出。
             if (purgeBase.get(event.deviceId) !== relay.purgeGeneration(event.deviceId))
                 return;
@@ -1422,22 +1391,6 @@ export function registerMarshalRoutes(options) {
         stagedChars = 0;
         phase = 'live';
     }));
-    if (options.phone) {
-        registerPhoneRoutes({
-            phone: options.phone,
-            publicOrigin,
-            register,
-            guard,
-            json,
-            deny,
-            methodNotAllowed,
-            authorize,
-            readJsonBody,
-            headerValue,
-            asRecord,
-            smallBodyLimit: SMALL_BODY_LIMIT,
-        });
-    }
     const sweep = setInterval(pruneSessions, options.sessionSweepMs ?? 1_000);
     sweep.unref();
     return {

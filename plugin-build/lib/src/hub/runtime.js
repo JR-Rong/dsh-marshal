@@ -10,7 +10,6 @@ import { HubRelay } from "./relay.js";
 import { mountHubSocket, webServerPort } from "./server.js";
 import { createHubSync } from "./sync.js";
 import { createAccountLogin } from "./account.js";
-import { createPhoneHub } from "./phone.js";
 import { createHubMemorySync } from "./memory-sync.js";
 /** Shared Hub composition for the desktop host and the standalone cloud service. */
 export function mountHub(webServer, config, logger) {
@@ -84,16 +83,10 @@ export function mountHub(webServer, config, logger) {
             },
         });
         disposers.push(() => socket.dispose());
-        const phone = createPhoneHub({
-            ...(config.dshAccountHash === undefined ? {} : { ownerHash: config.dshAccountHash }),
-            ...(config.publicOrigin === undefined ? {} : { publicOrigin: config.publicOrigin }),
-            ...(config.push === undefined ? {} : { push: config.push }),
-            findNode: (tokenDigest) => install.store.findByTokenDigest(tokenDigest),
-        });
         for (const desktopEmbed of [false, true]) {
             disposers.push(registerMarshalRoutes({
                 webServer, registry, relay, sync, deviceStore: install.store, inventories, ...(discussions === undefined ? {} : { discussions }), crossGroups, memorySync, desktopEmbed, requireToken: config.dashboardToken,
-                publicOrigin: config.publicOrigin, operatorId: install.operatorId, phone,
+                publicOrigin: config.publicOrigin, operatorId: install.operatorId,
                 ...(accountLogin === undefined ? {} : { accountLogin }),
             }).dispose);
         }

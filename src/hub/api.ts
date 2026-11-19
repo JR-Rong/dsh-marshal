@@ -14,7 +14,6 @@ import type { DeviceRegistry } from './registry.ts'
 import type { CommandOutcome, CommandStatusOutcome, HubRelay } from './relay.ts'
 import type { HubSync } from './sync.ts'
 import { PAGE_HTML, DESKTOP_PAGE_HTML } from './page.ts'
-import { controllerCommandAllowed, noticeForEvent, registerPhoneRoutes, type PhoneHub } from './phone.ts'
 
 export interface ApiOptions {
   readonly accountLogin?: AccountLogin
@@ -38,8 +37,6 @@ export interface ApiOptions {
   readonly sessionIdleMs?: number
   readonly loginFailureDelayMs?: number
   readonly sessionSweepMs?: number
-  /** 手机控制端：配对、任务板、只读记忆、花名册和推送。 */
-  readonly phone?: PhoneHub
 }
 
 type Handler = (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
@@ -60,15 +57,10 @@ interface ServerSession {
   lastSeenAt: number
 }
 
-type AuthContext =
-  | { readonly kind: 'session'; readonly session: ServerSession }
-  | { readonly kind: 'token' }
-  | { readonly kind: 'device'; readonly phone: Extract<ReturnType<PhoneHub['authenticate']>, { ok: true }> }
+type AuthContext = { readonly kind: 'session'; readonly session: ServerSession } | { readonly kind: 'token' }
 
 interface AuthOptions {
   readonly allowToken: boolean
-  /** 手机控制端或节点凭证。不能代替管理令牌做账号管理。 */
-  readonly allowDevice?: boolean
   /** 普通 API 请求刷新空闲期；session/SSE 不续期。 */
   readonly refresh: boolean
   /** 浏览器写操作额外要求精确 Origin 与匹配服务端会话值的 CSRF。 */
@@ -510,14 +502,9 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
       return { kind: 'session', session }
     }
     if (tokenHeader === undefined || tokenHeader === '') return undefined
-    if (tokenMatches(tokenHeader)) {
-      if (!auth.allowToken) return undefined
-      return { kind: 'token' }
-    }
-    if (auth.allowDevice !== true || options.phone === undefined) return undefined
-    const phoneAuth = options.phone.authenticate(tokenHeader)
-    if (!phoneAuth.ok) return undefined
-    return { kind: 'device', phone: phoneAuth }
+    if (!auth.allowToken) return undefined
+    if (!tokenMatches(tokenHeader)) return undefined
+    return { kind: 'token' }
   }
 
   const csrfMatches = (req: IncomingMessage, session: ServerSession): boolean => {
@@ -756,21 +743,11 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
   }))
 
   const readAccess: AuthOptions = { allowToken: true, refresh: true, write: false }
-  const deviceRead: AuthOptions = { allowToken: true, allowDevice: true, refresh: true, write: false }
-  const deviceWrite: AuthOptions = { allowToken: true, allowDevice: true, refresh: true, write: true }
 
   register('/marshal/api/devices', guard((req, res) => {
     if (req.method !== 'GET') { methodNotAllowed(res, 'GET'); return }
-    if (authorize(req, res, deviceRead) === undefined) return
-    const connected = registry.list(now()).map(row => publicDevice({ ...row, name: options.deviceStore?.findById(row.id)?.name ?? row.name }, relay, sync))
-    const seen = new Set(connected.map(row => String((row as { id: string }).id)))
-    const controllers = (options.phone?.listControllers() ?? [])
-      .filter(item => !seen.has(item.id))
-      .map(item => ({
-        id: item.id, name: item.name, agents: [] as string[], connectedAt: 0, lastSeen: now(),
-        syncing: false, stale: false, role: 'controller' as const,
-      }))
-    json(res, 200, { devices: [...connected, ...controllers] })
+    if (authorize(req, res, readAccess) === undefined) return
+    json(res, 200, { devices: registry.list(now()).map(row => publicDevice({ ...row, name: options.deviceStore?.findById(row.id)?.name ?? row.name }, relay, sync)) })
   }))
 
   register('/marshal/api/device-name', guard(async (req, res) => {
@@ -793,7 +770,7 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
 
   register('/marshal/api/sessions', guard((req, res) => {
     if (req.method !== 'GET') { methodNotAllowed(res, 'GET'); return }
-    if (authorize(req, res, deviceRead) === undefined) return
+    if (authorize(req, res, readAccess) === undefined) return
     const query = new URL(req.url ?? '/', 'http://localhost').searchParams
     // 空串 `?device=` 与缺参等价。
     const device = query.get('device') || undefined
@@ -802,13 +779,8 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
 
   register('/marshal/api/discussions', guard(async (req, res) => {
     if (req.method !== 'GET' && req.method !== 'POST') { methodNotAllowed(res, 'GET, POST'); return }
-    const tokenHeader = headerValue(req, 'x-marshal-token')
-    const phoneAuth = tokenHeader && options.phone ? options.phone.authenticate(tokenHeader) : undefined
-    const asController = phoneAuth && phoneAuth.ok && phoneAuth.role === 'controller'
-    if (!asController) {
-      const auth = authorize(req, res, { allowToken: false, refresh: true, write: req.method === 'POST' })
-      if (auth?.kind !== 'session') return
-    }
+    const auth = authorize(req, res, { allowToken: false, refresh: true, write: req.method === 'POST' })
+    if (auth?.kind !== 'session') return
     const groups = options.discussions
     if (!groups) { json(res, 503, { ok: false, code: 'unsupported' }); return }
     try {
@@ -819,7 +791,6 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
       const body = await readJsonBody(req, res, 32768); if (!body.ok) return
       const data = asRecord(body.value)
       if (!data || typeof data.action !== 'string') { json(res, 400, { code: 'invalid-args' }); return }
-      if (asController && data.action !== 'send') { json(res, 403, { ok: false, code: 'unsupported' }); return }
       let value: unknown
       if (data.action === 'preview') value = { preview: groups.preview(data.input) }
       else if (data.action === 'preset') value = { presets: groups.savePreset(data.input) }
@@ -859,8 +830,7 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
 
   register('/marshal/api/command', guard(async (req, res) => {
     if (req.method !== 'POST') { methodNotAllowed(res, 'POST'); return }
-    const auth = authorize(req, res, deviceWrite)
-    if (auth === undefined) return
+    if (authorize(req, res, { allowToken: true, refresh: true, write: true }) === undefined) return
     const read = await readJsonBody(req, res, MAX_FRAME_BYTES - 4096)
     if (!read.ok) return
     const body = asRecord(read.value) as CommandBody | undefined
@@ -885,9 +855,6 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
       return { ...record, subscriptionId: randomUUID() }
     })()
     // 参数在 hub 侧先按 op 校验；非法参数不进入中继，也不消耗幂等键。
-    if (auth.kind === 'device' && (auth.phone.role !== 'controller' || !controllerCommandAllowed(op, rawArgs))) {
-      json(res, 403, { ok: false, code: 'unsupported' }); return
-    }
     let args: ReturnType<typeof parseCommandArgs>
     try {
       args = parseCommandArgs(op as CommandOp, rawArgs)
@@ -902,7 +869,7 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
 
   register('/marshal/api/command-status', guard(async (req, res) => {
     if (req.method !== 'GET') { methodNotAllowed(res, 'GET'); return }
-    if (authorize(req, res, deviceRead) === undefined) return
+    if (authorize(req, res, readAccess) === undefined) return
     const query = new URL(req.url ?? '/', 'http://localhost').searchParams
     const deviceId = query.get('deviceId') ?? ''
     const agent = query.get('agent') ?? ''
@@ -935,7 +902,7 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
 
   register('/marshal/api/inputs', guard(async (req, res) => {
     if (req.method !== 'POST') { methodNotAllowed(res, 'POST'); return }
-    if (authorize(req, res, deviceWrite) === undefined) return
+    if (authorize(req, res, { allowToken: true, refresh: true, write: true }) === undefined) return
     const read = await readJsonBody(req, res, SMALL_BODY_LIMIT)
     if (!read.ok) return
     const body = asRecord(read.value)
@@ -965,7 +932,7 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
   // 历史补看用不透明 cursor 与有界 limit；每次随机幂等键，node 对 observe 不落 journal。
   register('/marshal/api/history', guard(async (req, res) => {
     if (req.method !== 'POST') { methodNotAllowed(res, 'POST'); return }
-    if (authorize(req, res, deviceWrite) === undefined) return
+    if (authorize(req, res, { allowToken: true, refresh: true, write: true }) === undefined) return
     const read = await readJsonBody(req, res, SMALL_BODY_LIMIT)
     if (!read.ok) return
     const body = asRecord(read.value)
@@ -1004,7 +971,7 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
   register('/marshal/api/stream', guard(async (req, res) => {
     if (req.method !== 'GET') { methodNotAllowed(res, 'GET'); return }
     // SSE 心跳不刷新空闲期，登录态只由普通 API 请求续期。
-    const auth = authorize(req, res, { allowToken: true, allowDevice: true, refresh: false, write: false })
+    const auth = authorize(req, res, { allowToken: true, refresh: false, write: false })
     if (auth === undefined) return
     const sessionId = auth.kind === 'session' ? auth.session.id : undefined
 
@@ -1062,8 +1029,6 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
     const degraded = new Set<string>()
 
     const deliver = (event: EventFrame, cursor: string | undefined): void => {
-      const notice = noticeForEvent(event.kind, event.payload)
-      if (notice) void options.phone?.notify(notice)
       // 观测后发生过内容清理：暂存/回放中的旧帧一律不再发出。
       if (purgeBase.get(event.deviceId) !== relay.purgeGeneration(event.deviceId)) return
       // 权威代次来自中继：快照后已换代的事件（含回放）一律丢弃，不能污染新时间线。
@@ -1229,23 +1194,6 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
     phase = 'live'
   }))
 
-  if (options.phone) {
-    registerPhoneRoutes({
-      phone: options.phone,
-      publicOrigin,
-      register,
-      guard,
-      json,
-      deny,
-      methodNotAllowed,
-      authorize,
-      readJsonBody,
-      headerValue,
-      asRecord,
-      smallBodyLimit: SMALL_BODY_LIMIT,
-    })
-  }
-
   const sweep = setInterval(pruneSessions, options.sessionSweepMs ?? 1_000)
   sweep.unref()
 
@@ -1254,6 +1202,7 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
       if (disposed) return
       disposed = true
       clearInterval(sweep)
+      // 先断开所有流，再摘掉路由；遍历副本，避免边删边迭代。
       for (const cleanup of [...streams]) cleanup()
       streams.clear()
       sessionStreams.clear()
@@ -1263,4 +1212,3 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
     },
   }
 }
-

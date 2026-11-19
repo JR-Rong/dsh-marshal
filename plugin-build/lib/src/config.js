@@ -4,7 +4,7 @@ const KNOWN_KEYS = new Set([
     'role', 'hubUrl', 'hubCaFile', 'token', 'deviceId', 'deviceName', 'dashboardToken', 'publicOrigin',
     'privacy', 'questionRelay', 'approvalRelay', 'answerTimeoutMs', 'approvalTimeoutMs',
     'agents', 'codexExecutable', 'claudeExecutable', 'ringBufferMinutes', 'redaction',
-    'allowDiscussion', 'devicesFile', 'accountLogin', 'dshAccountHash', 'push',
+    'allowDiscussion', 'devicesFile', 'accountLogin', 'dshAccountHash',
     'dispatch', 'memory', 'dispatchRoot', 'memoryRoot', 'groups', 'groupsRoot',
 ]);
 const WEAK_DASHBOARD_TOKENS = new Set([
@@ -262,7 +262,6 @@ export function parseConfig(raw, hostname) {
     }
     if (role === 'hub' && accountLogin && dshAccountHash === undefined)
         throw new Error('marshal: account login requires a bound DSH owner');
-    const push = parsePush(input.push);
     return Object.freeze({
         role,
         ...(hubUrl === undefined ? {} : { hubUrl }),
@@ -292,33 +291,5 @@ export function parseConfig(raw, hostname) {
         groups,
         ...(groupsRoot === undefined ? {} : { groupsRoot }),
         ...(dshAccountHash === undefined ? {} : { dshAccountHash: dshAccountHash }),
-        ...(push === undefined ? {} : { push }),
     });
-}
-function parsePush(raw) {
-    if (raw === undefined)
-        return undefined;
-    if (typeof raw !== 'object' || raw === null || Array.isArray(raw))
-        throw new Error('marshal: config.push must be an object');
-    const read = (key, fields) => {
-        const value = raw[key];
-        if (value === undefined)
-            return undefined;
-        if (typeof value !== 'object' || value === null)
-            throw new Error(`marshal: config.push.${key} must be an object`);
-        const out = {};
-        for (const field of fields) {
-            if (value[field] === undefined)
-                continue;
-            if (typeof value[field] !== 'string')
-                throw new Error(`marshal: config.push.${key}.${field} must be a string`);
-            out[field] = value[field];
-        }
-        return out;
-    };
-    return {
-        ...(read('apns', ['keyId', 'teamId', 'bundleId', 'keyPath']) ? { apns: read('apns', ['keyId', 'teamId', 'bundleId', 'keyPath']) } : {}),
-        ...(read('fcm', ['projectId', 'clientEmail', 'privateKeyPath']) ? { fcm: read('fcm', ['projectId', 'clientEmail', 'privateKeyPath']) } : {}),
-        ...(read('huawei', ['appId', 'clientId', 'clientSecretPath']) ? { huawei: read('huawei', ['appId', 'clientId', 'clientSecretPath']) } : {}),
-    };
 }

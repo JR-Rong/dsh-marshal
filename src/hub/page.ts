@@ -148,7 +148,7 @@ ${NATIVE_BRIDGE_CSS}
 </style></head>
 <body>
 <div id="loginView" hidden>
-  <div class="brand"><div><h1>调度官</h1><p>跨设备会话管理</p></div><a href="/marshal/pair">手机配对</a></div>
+  <div class="brand"><div><h1>调度官</h1><p>跨设备会话管理</p></div></div>
   <section class="login-box" aria-labelledby="loginHeading">
     <h2 id="loginHeading">连接调度中心</h2>
     <form id="loginForm">

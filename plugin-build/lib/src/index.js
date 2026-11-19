@@ -3,7 +3,6 @@ import { createNodeDiscussions } from "./discussions/node.js";
 import { DISCUSSION_FEATURE } from "./discussions/types.js";
 import { hasWriteControl } from "./adapters/types.js";
 import { mountHub } from "./hub/runtime.js";
-import { forwardPhoneState, hubHttpOrigin } from "./hub/phone.js";
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { mountSidebarConnection } from "./sidebar.js";
@@ -446,16 +445,7 @@ function applyNode(ctx, config) {
             ctx.logger.warn(`marshal: workspace identity unavailable: ${errorName(error)}`);
         }
     }
-    const forwardTimer = setInterval(() => {
-        void forwardPhoneState({
-            hubHttpOrigin: hubHttpOrigin(config.hubUrl),
-            token: config.token,
-            roster: config.agents.map((agent) => ({ deviceId: config.deviceId, agent, name: agent })),
-        });
-    }, 60_000);
-    forwardTimer.unref();
     ctx.effect(() => () => {
-        clearInterval(forwardTimer);
         discussions?.dispose();
         nodeSync?.dispose();
         for (const item of bindings.values()) {

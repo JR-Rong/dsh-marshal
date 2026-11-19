@@ -4,8 +4,8 @@ import type { CapacitorConfig } from '@capacitor/cli'
  * 调度官手机端壳配置。
  *
  * 关键约束：
- * - 本应用只承载「客户端」：没有 server 角色、没有入站监听。
- * - 外部链接交给系统浏览器，WebView 不放行任意导航。
+ * - 本应用只承载「客户端」：没有 server 角色、没有入站监听，Hub 页面在应用内打开。
+ * - allowNavigation 放行外部地址，是为了让 Hub 控制台在应用内直接加载（同源 Cookie / SSE 才可用）。
  * - CapacitorHttp 打开后，外壳自身的设备/会话查询走原生网络栈，不受 CORS 限制。
  */
 const config: CapacitorConfig = {
@@ -14,6 +14,7 @@ const config: CapacitorConfig = {
   webDir: 'dist',
   server: {
     androidScheme: 'https',
+    allowNavigation: ['*'],
   },
   ios: {
     contentInset: 'always',

@@ -102,7 +102,7 @@ export interface HistoryItem {
 
 export type ApiFailure =
   | 'unauthorized' | 'rate-limited' | 'unreachable' | 'timeout'
-  | 'server' | 'malformed' | 'rejected' | 'conflict' | 'unknown'
+  | 'server' | 'malformed' | 'rejected' | 'conflict'
 
 export type ApiResult<T> =
   | { ok: true; data: T }
@@ -118,7 +118,6 @@ export function describeFailure(error: ApiFailure, code?: string): string {
     case 'malformed': return 'Hub 返回了无法解析的数据'
     case 'rejected': return 'Hub 拒绝：' + (code ?? 'invalid')
     case 'conflict': return '状态冲突：' + (code ?? 'conflict')
-    case 'unknown': return '结果未知，未当作成功'
   }
 }
 
@@ -216,9 +215,6 @@ export class MarshalApi {
       }
       const record = (body ?? {}) as Record<string, unknown>
       const code = typeof record.code === 'string' ? record.code : undefined
-      if (response.status === 202) {
-        return { ok: false, error: 'unknown', message: describeFailure('unknown', code), status: 202, ...(code ? { code } : {}) }
-      }
       const failure = statusFailure(response.status)
       if (failure) {
         return { ok: false, error: failure, message: describeFailure(failure, code), status: response.status, ...(code ? { code } : {}) }
@@ -256,12 +252,9 @@ export class MarshalApi {
     })
     if (!result.ok) return result
     const body = result.data ?? {}
-    if (body.status === 'rejected' || body.ok === false) {
+    if (body.status === 'rejected') {
       const code = typeof body.code === 'string' ? body.code : 'invalid'
       return { ok: false, error: 'rejected', message: describeFailure('rejected', code), code }
-    }
-    if (body.ok !== true || (body.status !== 'accepted' && body.status !== 'confirmed')) {
-      return { ok: false, error: 'unknown', message: describeFailure('unknown'), status: 200 }
     }
     return { ok: true, data: body }
   }
@@ -328,107 +321,6 @@ export class MarshalApi {
     if (!result.ok) return result
     return { ok: true, data: result.data ?? {} }
   }
-
-  async redeemPairing(code: string, name: string): Promise<ApiResult<{ deviceId: string; credential: string }>> {
-    const result = await this.request<{ ok?: boolean; deviceId?: unknown; credential?: unknown }>(
-      '/marshal/api/pairing/redeem',
-      { body: { code, name }, token: '' },
-    )
-    if (!result.ok) return result
-    const deviceId = result.data?.deviceId
-    const credential = result.data?.credential
-    if (typeof deviceId !== 'string' || typeof credential !== 'string' || !credential) {
-      return { ok: false, error: 'malformed', message: describeFailure('malformed') }
-    }
-    return { ok: true, data: { deviceId, credential } }
-  }
-
-  async roster(): Promise<ApiResult<RosterAgent[]>> {
-    const result = await this.request<{ agents?: unknown }>('/marshal/api/roster')
-    if (!result.ok) return result
-    const rows = Array.isArray(result.data?.agents) ? result.data.agents : []
-    const agents: RosterAgent[] = []
-    for (const row of rows) {
-      if (typeof row !== 'object' || row === null) continue
-      const item = row as Record<string, unknown>
-      if (typeof item.deviceId !== 'string' || typeof item.agent !== 'string' || typeof item.name !== 'string') continue
-      agents.push({ deviceId: item.deviceId, agent: item.agent, name: item.name })
-    }
-    return { ok: true, data: agents }
-  }
-
-  async tasks(): Promise<ApiResult<TaskCard[]>> {
-    const result = await this.request<{ tasks?: unknown }>('/marshal/api/tasks')
-    if (!result.ok) return result
-    return { ok: true, data: parseTasks(result.data?.tasks) }
-  }
-
-  async taskWrite(body: Record<string, unknown>): Promise<ApiResult<TaskCard[]>> {
-    const result = await this.request<{ tasks?: unknown }>('/marshal/api/tasks', { body })
-    if (!result.ok) return result
-    return { ok: true, data: parseTasks(result.data?.tasks) }
-  }
-
-  async memory(): Promise<ApiResult<MemoryEntry[]>> {
-    const result = await this.request<{ entries?: unknown }>('/marshal/api/memory')
-    if (!result.ok) return result
-    const rows = Array.isArray(result.data?.entries) ? result.data.entries : []
-    const entries: MemoryEntry[] = []
-    for (const row of rows) {
-      if (typeof row !== 'object' || row === null) continue
-      const item = row as Record<string, unknown>
-      if (typeof item.id !== 'string' || typeof item.text !== 'string') continue
-      entries.push({
-        id: item.id,
-        agent: typeof item.agent === 'string' ? item.agent : '',
-        text: item.text,
-      })
-    }
-    return { ok: true, data: entries }
-  }
-
-  async registerPush(body: { provider: string; token: string; liveToken?: string }): Promise<ApiResult<true>> {
-    const result = await this.request<{ ok?: boolean }>('/marshal/api/push/register', { body })
-    if (!result.ok) return result
-    return { ok: true, data: true }
-  }
-}
-
-export interface RosterAgent {
-  deviceId: string
-  agent: string
-  name: string
-}
-
-export interface TaskCard {
-  id: string
-  title: string
-  detail: string
-  status: 'todo' | 'doing' | 'done'
-}
-
-export interface MemoryEntry {
-  id: string
-  agent: string
-  text: string
-}
-
-function parseTasks(raw: unknown): TaskCard[] {
-  if (!Array.isArray(raw)) return []
-  const tasks: TaskCard[] = []
-  for (const row of raw) {
-    if (typeof row !== 'object' || row === null) continue
-    const item = row as Record<string, unknown>
-    if (typeof item.id !== 'string' || typeof item.title !== 'string') continue
-    const status = item.status === 'doing' || item.status === 'done' ? item.status : 'todo'
-    tasks.push({
-      id: item.id,
-      title: item.title,
-      detail: typeof item.detail === 'string' ? item.detail : '',
-      status,
-    })
-  }
-  return tasks
 }
 
 /* ------------------------------ 纯解析函数 ------------------------------ */
@@ -491,11 +383,6 @@ function parseOptions(raw: unknown): CardOption[] {
     if (typeof item.id !== 'string' || typeof item.label !== 'string') return []
     return [{ id: item.id, label: item.label, ...(item.ambiguous === true ? { ambiguous: true } : {}) }]
   })
-}
-
-/** 审批按钮只来自 Hub 下发的安全选项，客户端不另外追加「拒绝」。 */
-export function approvalChoices(decisions: CardOption[] | undefined): CardOption[] {
-  return (decisions ?? []).filter(decisionIsSafe)
 }
 
 /** 任何「总是 / 记住 / 会话内」语义的审批选项都不得呈现或发送。 */
