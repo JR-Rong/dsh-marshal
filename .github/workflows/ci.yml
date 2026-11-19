@@ -104,6 +104,6 @@ jobs:
       - name: cap sync ios
         run: npx cap sync ios
       - name: xcodebuild app
-        run: xcodebuild -project ios/App/App.xcodeproj -target App -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+        run: xcodebuild -project ios/App/App.xcodeproj -scheme App -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
       - name: xcodebuild Live Activity
-        run: xcodebuild -project ios/App/App.xcodeproj -target LiveActivity -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+        run: xcodebuild -project ios/App/App.xcodeproj -scheme LiveActivity -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
