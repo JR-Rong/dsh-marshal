@@ -6,9 +6,8 @@
  *   node desktop-pairing/inject-phone-connect.mjs --revert
  *   node desktop-pairing/inject-phone-connect.mjs --dry-run
  *
- * 读取本机 hub.json 的 dashboardToken 与 node 配置的 hubUrl，写进插件 client。
- * 令牌不打印；客户端文件收紧到 0600；首次注入自动备份 index.js.bak-phone-connect。
- * 令牌轮换后重跑本脚本即可；回滚用 --revert。
+ * 只把按钮脚本写进插件 client。配对码由页面当场向 Hub 领取，脚本里不放令牌。
+ * 客户端文件收紧到 0600；首次注入自动备份 index.js.bak-phone-connect。回滚用 --revert。
  *
  * 需要写插件目录权限。默认路径可用环境变量覆盖：
  *   MARSHAL_PLUGIN_CLIENT / MARSHAL_HUB_JSON / MARSHAL_NODE_CONFIG / MARSHAL_MOBILE_ROOT
@@ -20,10 +19,6 @@ import { execFileSync } from 'node:child_process'
 const home = process.env.HOME || ''
 const pluginClient = process.env.MARSHAL_PLUGIN_CLIENT
   || path.join(home, '.dsh-marshal/install-20261031/plugin-ui/client/index.js')
-const hubJsonPath = process.env.MARSHAL_HUB_JSON
-  || path.join(home, '.dsh-marshal/install-20261031/hub.json')
-const nodeConfigPath = process.env.MARSHAL_NODE_CONFIG
-  || path.join(home, '.dsh/profiles/desktop/cordis.patch.yml')
 const mobileRoot = process.env.MARSHAL_MOBILE_ROOT
   || path.join(import.meta.dirname, '..')
 const templatePath = path.join(import.meta.dirname, 'marshal-phone-connect.js')
@@ -52,37 +47,8 @@ if (revert) {
   process.exit(0)
 }
 
-const hubJson = JSON.parse(fs.readFileSync(hubJsonPath, 'utf8'))
-const token = typeof hubJson.dashboardToken === 'string' ? hubJson.dashboardToken : ''
-if (token.length < 16) {
-  console.error('hub.json 里没有可用的 dashboardToken')
-  process.exit(2)
-}
-let hub = ''
-try {
-  const cfg = fs.readFileSync(nodeConfigPath, 'utf8')
-  const match = cfg.match(/"hubUrl"\s*:\s*"([^"]+)"|hubUrl\s*:\s*([^\s]+)/)
-  const raw = match?.[1] ?? match?.[2] ?? ''
-  if (raw) {
-    const url = new URL(raw)
-    url.protocol = 'https:'
-    hub = url.origin
-  }
-} catch { /* fallback */ }
-if (!hub && typeof hubJson.publicOrigin === 'string') {
-  const url = new URL(hubJson.publicOrigin)
-  url.protocol = 'https:'
-  hub = url.origin
-}
-if (!hub) {
-  console.error('找不到 Hub 地址')
-  process.exit(2)
-}
-
 const block = fs.readFileSync(templatePath, 'utf8')
   .replace('/* __QRCODE_LIB__ */', () => fs.readFileSync(qrPath, 'utf8'))
-  .replace('"__HUB__"', JSON.stringify(hub))
-  .replace('"__TOKEN__"', JSON.stringify(token))
 let client = fs.readFileSync(pluginClient, 'utf8')
 const marker = client.indexOf(START)
 if (marker >= 0) client = client.slice(0, marker)
@@ -90,7 +56,7 @@ if (!client.endsWith('\n')) client += '\n'
 const next = client + START + '\n' + block + '\n' + END + '\n'
 
 if (dryRun) {
-  console.log(JSON.stringify({ dryRun: true, wouldWrite: pluginClient, hub, tokenLen: token.length, tokenPrefix: token.slice(0, 6) + '…', bytes: next.length }))
+  console.log(JSON.stringify({ dryRun: true, wouldWrite: pluginClient, bytes: next.length }))
   process.exit(0)
 }
 
@@ -105,4 +71,4 @@ try {
   console.error('语法检查失败，已恢复备份：' + String(error))
   process.exit(1)
 }
-console.log(JSON.stringify({ ok: true, pluginClient, backup: backupPath, hub, tokenLen: token.length, tokenPrefix: token.slice(0, 6) + '…', bytes: next.length }))
+console.log(JSON.stringify({ ok: true, pluginClient, backup: backupPath, bytes: next.length }))

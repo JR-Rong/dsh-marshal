@@ -26,6 +26,7 @@ import { createInteractionRelay } from './node/interactions.ts'
 import { createAuditLog } from './node/audit.ts'
 import { createPrivacyProjector, type PrivacyProjector } from './node/privacy.ts'
 import { mountSetup } from './setup.ts'
+import { hubHttpOrigin, mountDesktopPairing, startPhoneRelay, type PhoneHost } from './node/phone-sync.ts'
 
 export const name = 'marshal'
 
@@ -404,7 +405,36 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
     logger: ctx.logger,
   })
 
+  const phoneHost = (): PhoneHost => {
+    const board = lookupService(ctx, 'taskBoard')
+    const memory = lookupService(ctx, 'memory')
+    const roster = lookupService(ctx, 'roster')
+    return {
+      ...(board === undefined ? {} : { board: board as NonNullable<PhoneHost['board']> }),
+      ...(memory === undefined ? {} : { memory: memory as NonNullable<PhoneHost['memory']> }),
+      ...(roster === undefined ? {} : { roster: roster as NonNullable<PhoneHost['roster']> }),
+    }
+  }
+  const stopRelay = config.hubUrl !== undefined && config.token !== undefined && config.deviceId !== undefined
+    ? startPhoneRelay({
+        host: phoneHost,
+        allowContent: config.privacy === 'content',
+        origin: hubHttpOrigin(config.hubUrl),
+        token: config.token,
+        deviceId: config.deviceId,
+        ...(hubCa === undefined ? {} : { ca: hubCa }),
+      })
+    : undefined
+  ctx.inject(['webServer'], (scoped) => {
+    if (scoped.webServer === undefined || config.hubUrl === undefined || config.token === undefined) return
+    scoped.effect(() => mountDesktopPairing(scoped.webServer!, {
+      hubUrl: config.hubUrl!,
+      token: config.token!,
+      ...(hubCa === undefined ? {} : { ca: hubCa }),
+    }), 'marshal: desktop pairing')
+  })
   ctx.effect(() => () => {
+    stopRelay?.()
     discussions?.dispose()
     nodeSync?.dispose()
     for (const item of bindings.values()) {
@@ -418,4 +448,10 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
     journal.close()
   }, 'marshal: node link')
   link.start()
+}
+
+function lookupService(ctx: MarshalContext, name: string): unknown {
+  const bag = ctx as MarshalContext & { get?: (service: string) => unknown }
+  if (typeof bag.get !== 'function') return undefined
+  try { return bag.get(name) } catch { return undefined }
 }

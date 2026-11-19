@@ -3,8 +3,6 @@
   'use strict';
   if (typeof document === 'undefined') return;
   /* __QRCODE_LIB__ */
-  var HUB = "__HUB__";
-  var TOKEN = "__TOKEN__";
   var MODAL_ID = 'marshal-phone-connect-modal';
   var STYLE_ID = 'marshal-phone-connect-inline-style';
   var BUTTON_ID = 'marshal-phone-connect-inline';
@@ -146,11 +144,10 @@
     modal.innerHTML = [
       '<div class="card">',
       '<div class="head"><strong>手机连接 · 一个码</strong><button class="ghost" data-close type="button">关闭</button></div>',
-      '<p class="muted">扫一次：自动配好 Hub 与 DSH 工作台（智能体 / 会话 / 任务看板），不再分开扫。</p>',
+      '<p class="muted">扫这一个码即可。二维码只有 Hub 地址和 60 秒一次性配对码，到期前 5 秒自动更换。</p>',
       '<div data-qr></div>',
       '<p class="status" data-status>正在生成…</p>',
-      '<p class="warn">二维码含 Hub 管理令牌与一次性 DSH 配对令牌；只给自己的手机扫，扫完请关闭。</p>',
-      '<div class="actions"><button class="primary" data-refresh type="button">刷新二维码</button><button data-copy type="button">复制配对链接</button></div>',
+      '<div class="actions"><button class="primary" data-refresh type="button">刷新二维码</button></div>',
       '</div>'
     ].join('');
     document.body.appendChild(modal);
@@ -170,129 +167,79 @@
       modal.remove();
     }
 
-    function toBase64Url(text) {
-      var bytes = new TextEncoder().encode(text);
-      var binary = '';
-      for (var i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
-      return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-    }
-
-    function stripBridgeToken(url) {
-      try {
-        var parsed = new URL(url);
-        parsed.searchParams.delete('token');
-        return parsed.toString();
-      } catch (error) {
-        return url;
-      }
-    }
-
-    async function readTicket() {
-      try {
-        var response = await fetch(new URL('marshal/account/login', document.baseURI), {
-          method: 'POST',
-          headers: { 'x-marshal-account': '1' },
-          cache: 'no-store'
-        });
-        var data = await response.json();
-        if (data && data.ok && typeof data.ticket === 'string') {
-          return { ticket: data.ticket, expiresAt: typeof data.expiresAt === 'number' ? data.expiresAt : 0 };
+    function readCsrf() {
+      var parts = String(document.cookie || '').split(';');
+      for (var i = 0; i < parts.length; i += 1) {
+        var item = parts[i].trim();
+        var names = ['__Host-marshal-csrf=', '__Host-marshal-desktop-csrf='];
+        for (var n = 0; n < names.length; n += 1) {
+          if (item.indexOf(names[n]) === 0) return decodeURIComponent(item.slice(names[n].length));
         }
-      } catch (error) { /* ticket is optional */ }
-      return { ticket: '', expiresAt: 0 };
+      }
+      return '';
     }
 
-    async function readBridge() {
-      try {
-        var response = await fetch(new URL('remote-bridge/pair/token', document.baseURI), { cache: 'no-store' });
-        if (!response.ok) return null;
-        var data = await response.json();
-        if (!data || typeof data.token !== 'string' || typeof data.url !== 'string') return null;
-        if (!/^wss?:\/\//.test(data.url)) return null;
-        return {
-          token: data.token,
-          url: stripBridgeToken(data.url),
-          expiresAt: typeof data.expiresAt === 'number' ? data.expiresAt : Date.now() + 30000
-        };
-      } catch (error) {
-        return null;
+    async function issue(replace) {
+      var headers = { 'content-type': 'application/json' };
+      var csrf = readCsrf();
+      if (csrf) headers['x-marshal-csrf'] = csrf;
+      var body = JSON.stringify(replace ? { replace: replace } : {});
+      var response = await fetch(new URL('marshal/api/pairing', document.baseURI), {
+        method: 'POST', headers: headers, body: body, cache: 'no-store', credentials: 'same-origin'
+      });
+      if (response.status === 401 || response.status === 403) {
+        response = await fetch(new URL('marshal/desktop-pairing', document.baseURI), {
+          method: 'POST', headers: { 'content-type': 'application/json' }, body: body, cache: 'no-store'
+        });
       }
+      if (!response.ok) throw new Error('pairing ' + response.status);
+      return response.json();
     }
 
-    async function generate() {
-      if (!HUB || TOKEN.length < 16) {
-        setStatus('未注入 Hub 或管理令牌，请联系管理员重打补丁。');
-        return;
-      }
+    async function generate(replace) {
       setStatus('正在生成…');
       if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null; }
-      var results = await Promise.all([readTicket(), readBridge()]);
-      var ticketData = results[0];
-      var bridge = results[1];
-      var ticket = ticketData.ticket;
-      var ticketExpiresAt = ticketData.expiresAt;
-      var payload = { v: 1, hub: HUB, hubToken: TOKEN };
-      if (ticket) payload.ticket = ticket;
-      if (bridge) {
-        payload.bridge = bridge.url;
-        payload.bridgeToken = bridge.token;
-        currentLink = 'marshal://setup?payload=' + toBase64Url(JSON.stringify(payload));
-      } else {
-        var params = new URLSearchParams();
-        params.set('hub', HUB);
-        params.set('token', TOKEN);
-        if (ticket) params.set('ticket', ticket);
-        currentLink = 'marshal://open?' + params.toString();
+      var data;
+      try { data = await issue(replace); }
+      catch (error) {
+        setStatus('领不到配对码。请先在这台电脑登录 Hub，或等节点连上 Hub。');
+        return;
       }
-      var svg = qrSvg(currentLink);
+      if (!data || typeof data.url !== 'string' || data.url.indexOf('marshal://pair?') !== 0 || typeof data.expiresAt !== 'number') {
+        setStatus('配对服务返回的不是一次性配对码。');
+        return;
+      }
+      currentLink = data.url;
+      var svg = typeof data.svg === 'string' && data.svg.indexOf('<svg') === 0 ? data.svg : qrSvg(data.url);
       if (!svg) {
         setStatus('二维码生成失败，请点「刷新二维码」重试。');
         return;
       }
       qrBox.innerHTML = svg;
       if (timer) { clearInterval(timer); timer = null; }
-      var bridgeExpiresAt = bridge ? bridge.expiresAt : 0;
-      var primaryExpiresAt = bridgeExpiresAt || ticketExpiresAt;
       function updateStatus() {
-        var left = primaryExpiresAt ? Math.max(0, Math.round((primaryExpiresAt - Date.now()) / 1000)) : 0;
-        var ticketLeft = ticketExpiresAt ? Math.max(0, Math.round((ticketExpiresAt - Date.now()) / 1000)) : 0;
-        if (bridge) {
-          if (left <= 0) {
-            setStatus('DSH 配对令牌已过期；正在自动刷新，请扫最新二维码。');
-          } else {
-            setStatus('一个码：Hub + DSH 工作台；DSH 配对剩余 ' + left + ' 秒' + (ticket ? '；群聊 ticket ' + ticketLeft + ' 秒' : ''));
-          }
-        } else {
-          setStatus('仅 Hub（DSH 配对端口未就绪）；Hub + 令牌已生成' + (ticket ? '；群聊 ticket ' + ticketLeft + ' 秒' : ''));
-        }
+        var left = Math.max(0, Math.round((data.expiresAt - Date.now()) / 1000));
+        setStatus(left > 0 ? '配对码剩余 ' + left + ' 秒，到期前 5 秒自动更换' : '正在更换配对码…');
       }
       updateStatus();
       timer = setInterval(updateStatus, 1000);
-      if (bridge && bridgeExpiresAt > Date.now()) {
-        var delay = Math.max(1000, bridgeExpiresAt - Date.now() - 5000);
-        refreshTimer = setTimeout(function () {
-          if (document.getElementById(MODAL_ID)) void generate();
-        }, delay);
-      }
+      var delay = Math.max(1000, data.expiresAt - Date.now() - 5000);
+      refreshTimer = setTimeout(function () {
+        if (document.getElementById(MODAL_ID)) void generate(data.code);
+      }, delay);
     }
 
     modal.addEventListener('click', function (event) {
       if (event.target === modal) close();
     });
     modal.querySelector('[data-close]').addEventListener('click', close);
-    modal.querySelector('[data-refresh]').addEventListener('click', function () { void generate(); });
-    modal.querySelector('[data-copy]').addEventListener('click', function () {
-      var button = modal.querySelector('[data-copy]');
-      if (!currentLink) return;
-      var done = function () { button.textContent = '已复制'; setTimeout(function () { button.textContent = '复制配对链接'; }, 2000); };
-      var fail = function () { button.textContent = '复制失败，请扫码'; };
-      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
-        navigator.clipboard.writeText(currentLink).then(done).catch(fail);
-      } else {
-        fail();
-      }
-    });
+    modal.querySelector('[data-refresh]').addEventListener('click', function () { void generate(currentCode()); });
     void generate();
+
+    function currentCode() {
+      try { return new URL(currentLink).searchParams.get('code') || ''; }
+      catch (error) { return ''; }
+    }
   }
 
   if (document.readyState === 'loading') {

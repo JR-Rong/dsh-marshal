@@ -11,6 +11,9 @@ import { mountHubSocket, webServerPort } from "./server.js";
 import { createHubSync } from "./sync.js";
 import { createAccountLogin } from "./account.js";
 import { createHubMemorySync } from "./memory-sync.js";
+import { createPhoneHub } from "./phone.js";
+import { deliverPush, noticeForEvent } from "./push-send.js";
+import { readFileSync } from 'node:fs';
 /** Shared Hub composition for the desktop host and the standalone cloud service. */
 export function mountHub(webServer, config, logger) {
     if (config.role !== 'hub')
@@ -49,6 +52,41 @@ export function mountHub(webServer, config, logger) {
         catch {
             logger.warn('marshal: group discussion storage requires recovery; group calls disabled');
         }
+        const phone = createPhoneHub({
+            now: Date.now,
+            store: install.store,
+            findNode: (tokenDigest) => {
+                const row = install.store.findByTokenDigest(tokenDigest);
+                return row !== undefined && row.role !== 'phone' ? row : undefined;
+            },
+        });
+        const pushConfig = readPushConfig(config.devicesFile);
+        const stopPush = relay.subscribe((event) => {
+            const payload = typeof event.payload === 'object' && event.payload !== null ? event.payload : {};
+            const notice = noticeForEvent(event.kind, {
+                ...payload,
+                deviceId: event.deviceId,
+                agent: event.agent,
+                sessionId: event.sessionId,
+            }, phone.watchedKeys());
+            if (notice === null) return;
+            for (const target of install.store.phones()) {
+                if (target.pushProvider === undefined || target.pushToken === undefined) continue;
+                void deliverPush({
+                    config: pushConfig,
+                    deviceId: target.id,
+                    target: {
+                        provider: target.pushProvider,
+                        token: target.pushToken,
+                        ...(target.liveToken === undefined ? {} : { liveToken: target.liveToken }),
+                    },
+                    notice,
+                }).then((result) => {
+                    if (!result.delivered) logger.warn(`marshal: push ${result.reason}`);
+                });
+            }
+        });
+        disposers.push(stopPush);
         const crossGroups = createCrossGroups({ relay: relay, now: Date.now, file: join(dirname(config.devicesFile), 'cross-groups.json') });
         disposers.push(() => crossGroups.dispose());
         const socket = mountHubSocket({
@@ -85,7 +123,7 @@ export function mountHub(webServer, config, logger) {
         disposers.push(() => socket.dispose());
         for (const desktopEmbed of [false, true]) {
             disposers.push(registerMarshalRoutes({
-                webServer, registry, relay, sync, deviceStore: install.store, inventories, ...(discussions === undefined ? {} : { discussions }), crossGroups, memorySync, desktopEmbed, requireToken: config.dashboardToken,
+                webServer, registry, relay, sync, deviceStore: install.store, phone, inventories, ...(discussions === undefined ? {} : { discussions }), crossGroups, memorySync, desktopEmbed, requireToken: config.dashboardToken,
                 publicOrigin: config.publicOrigin, operatorId: install.operatorId,
                 ...(accountLogin === undefined ? {} : { accountLogin }),
             }).dispose);
@@ -96,5 +134,15 @@ export function mountHub(webServer, config, logger) {
     catch (error) {
         dispose();
         throw error;
+    }
+}
+function readPushConfig(devicesFile) {
+    try {
+        const text = readFileSync(join(dirname(devicesFile), 'push.json'), 'utf8');
+        const parsed = JSON.parse(text);
+        return typeof parsed === 'object' && parsed !== null ? parsed : undefined;
+    }
+    catch {
+        return undefined;
     }
 }

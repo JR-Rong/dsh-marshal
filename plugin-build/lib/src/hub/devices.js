@@ -78,8 +78,41 @@ function validateRecord(value, index) {
             policyRevision: revisionUnconfirmed ? 0 : policyRevision,
             ...(revokedAt === undefined ? {} : { revokedAt }),
             ...(ownerId === undefined ? {} : { ownerId }),
+            ...parsePhoneFields(value, index),
         },
         revisionUnconfirmed,
+    };
+}
+function parsePhoneFields(value, index) {
+    if (value.role !== undefined && value.role !== 'phone') {
+        throw new DeviceStateError('invalid', `devices[${index}].role must be phone`);
+    }
+    const text = (key) => {
+        const field = value[key];
+        if (field === undefined) return undefined;
+        if (typeof field !== 'string' || field.length === 0 || field.length > 512) {
+            throw new DeviceStateError('invalid', `devices[${index}].${key} must be a short string`);
+        }
+        return field;
+    };
+    const accountHash = text('accountHash');
+    const installationId = text('installationId');
+    const pushToken = text('pushToken');
+    const liveToken = text('liveToken');
+    if (value.pushProvider !== undefined && value.pushProvider !== 'apns' && value.pushProvider !== 'fcm' && value.pushProvider !== 'huawei') {
+        throw new DeviceStateError('invalid', `devices[${index}].pushProvider is unknown`);
+    }
+    if (value.lastSeen !== undefined && (typeof value.lastSeen !== 'number' || !Number.isInteger(value.lastSeen) || value.lastSeen < 0)) {
+        throw new DeviceStateError('invalid', `devices[${index}].lastSeen must be an integer >= 0`);
+    }
+    return {
+        ...(value.role === 'phone' ? { role: 'phone' } : {}),
+        ...(accountHash === undefined ? {} : { accountHash }),
+        ...(installationId === undefined ? {} : { installationId }),
+        ...(pushToken === undefined ? {} : { pushToken }),
+        ...(liveToken === undefined ? {} : { liveToken }),
+        ...(value.pushProvider === 'apns' || value.pushProvider === 'fcm' || value.pushProvider === 'huawei' ? { pushProvider: value.pushProvider } : {}),
+        ...(typeof value.lastSeen === 'number' ? { lastSeen: value.lastSeen } : {}),
     };
 }
 function parseHighWatermarks(value) {
@@ -327,6 +360,68 @@ export class DeviceStore {
             const devices = [...state.devices];
             devices[index] = entry;
             return { state: { version: DEVICES_FILE_VERSION, devices }, result: { entry, revision: entry.policyRevision } };
+        });
+    }
+    phones() {
+        return this.state.devices.filter(device => device.role === 'phone' && !device.revoked);
+    }
+    /** 同一安装再次配对会换掉旧摘要，旧凭证立刻失效。 */
+    enrollPhone(input) {
+        const name = input.name.trim();
+        if (!name || name.length > 80 || /[\x00-\x1f\x7f]/.test(name))
+            throw new DeviceStateError('invalid', 'invalid phone name');
+        if (!input.installationId || input.installationId.length > 128)
+            throw new DeviceStateError('invalid', 'invalid installation');
+        if (!input.accountHash || input.accountHash.length > 128)
+            throw new DeviceStateError('invalid', 'invalid account');
+        const credential = 'mph1.' + randomBytes(32).toString('base64url');
+        const tokenDigest = sha256Hex(credential.slice('mph1.'.length));
+        const id = 'phone-' + sha256Hex(input.installationId).slice(0, 32);
+        return this.mutate(state => {
+            const current = state.devices.find(device => device.id === id);
+            const entry = {
+                id,
+                name,
+                tokenDigest,
+                revoked: false,
+                allowContent: false,
+                allowInteractions: true,
+                allowDiscussion: true,
+                policyRevision: current === undefined ? 1 : current.policyRevision + 1,
+                role: 'phone',
+                accountHash: input.accountHash,
+                installationId: input.installationId,
+            };
+            const devices = current === undefined
+                ? [...state.devices, entry]
+                : state.devices.map(device => device.id === id ? entry : device);
+            return { state: { ...state, devices }, result: { record: entry, credential } };
+        });
+    }
+    touchPhone(id, at) {
+        const current = this.findById(id);
+        if (current?.role !== 'phone' || current.revoked)
+            return;
+        this.mutate(state => {
+            const devices = state.devices.map(device => device.id === id ? { ...device, lastSeen: at } : device);
+            return { state: { ...state, devices }, result: undefined };
+        });
+    }
+    setPhonePush(id, target) {
+        this.mutate(state => {
+            const current = state.devices.find(device => device.id === id);
+            if (current?.role !== 'phone' || current.revoked)
+                throw new DeviceStateError('unknown-device', 'phone not found');
+            const entry = {
+                ...current,
+                pushProvider: target.provider,
+                pushToken: target.token,
+                ...(target.liveToken === undefined ? {} : { liveToken: target.liveToken }),
+            };
+            return {
+                state: { ...state, devices: state.devices.map(device => device.id === id ? entry : device) },
+                result: undefined,
+            };
         });
     }
     rename(id, rawName) {
