@@ -240,6 +240,7 @@ export async function start(): Promise<void> {
     await enterApp()
   }
   await loadBridgeDevice()
+  void watchForegroundLock()
   // 局域网工作台默认关闭，也不盖在锁屏上。
   if (config?.lanBridge && !config.lock && state.view !== 'lock') {
     setTimeout(() => { if (hasStoredBridge()) openDshWorkbench() }, 250)
@@ -287,8 +288,15 @@ async function registerDevicePush(): Promise<void> {
     const token = await plugin.MarshalStream.pushToken?.()
     if (!token || token.ok !== true || !token.token || (token.provider !== 'apns' && token.provider !== 'fcm' && token.provider !== 'huawei')) return
     await api.registerPush(token.provider, token.token, token.liveToken)
+    const events = plugin.MarshalStream as unknown as { addListener(name: string, cb: () => void): Promise<unknown> }
+    if (!pushListening) {
+      pushListening = true
+      await events.addListener('pushToken', () => { void registerDevicePush() })
+    }
   } catch { /* 浏览器预览没有推送插件 */ }
 }
+
+let pushListening = false
 
 async function openStream(): Promise<void> {
   const api = state.api
@@ -1303,6 +1311,22 @@ function accountUsable(): boolean {
   return !!state.account && state.account.expiresAt > Date.now()
 }
 
+async function watchForegroundLock(): Promise<void> {
+  try {
+    const { App } = await import('@capacitor/app')
+    let away = false
+    await App.addListener('appStateChange', ({ isActive }) => {
+      if (!state.config?.lock) return
+      if (!isActive) { away = true; return }
+      if (!away) return
+      away = false
+      void registerDevicePush()
+      state.view = 'lock'
+      render()
+    })
+  } catch { /* 浏览器预览没有这个事件 */ }
+}
+
 function appLocked(): boolean {
   return state.view === 'lock' || (state.view === 'booting' && !!state.config?.lock)
 }
@@ -1335,9 +1359,12 @@ async function handleDeepLink(raw: string): Promise<void> {
   if (pairing?.hubUrl) {
     const decision = decideDeepLink({ url: raw, locked: false, configuredHub: state.config?.hubUrl ?? null })
     if (decision.action === 'invalid') { toast(decision.error, 'error'); return }
-    if (decision.action === 'confirm') {
-      const host = new URL(decision.hubUrl).host
-      if (!window.confirm('把 Hub 换成 ' + host + '？已保存的令牌会被清掉。')) return
+    if (decision.action === 'confirm' || decision.action === 'prefill') {
+      const host = new URL(decision.action === 'confirm' ? decision.hubUrl : pairing.hubUrl).host
+      const prompt = decision.action === 'confirm'
+        ? '把 Hub 换成 ' + host + '？已保存的令牌会被清掉。'
+        : '连接到 ' + host + ' 并兑换这个配对码？'
+      if (!window.confirm(prompt)) return
     }
     await redeemPairingCode(pairing.hubUrl, pairing.code)
     return

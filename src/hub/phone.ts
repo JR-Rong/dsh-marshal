@@ -1,6 +1,6 @@
-import { createHash, randomBytes } from 'node:crypto'
+import { randomBytes } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import type { DeviceRecord, DeviceStore } from './devices.ts'
+import { phoneTokenDigest, sha256Hex, type DeviceRecord, type DeviceStore } from './devices.ts'
 import { qrSvg } from './qr.ts'
 
 export const PAIRING_TTL_MS = 60_000
@@ -61,22 +61,59 @@ export function parseBearer(header: string | undefined): { kind: 'phone' | 'node
   return undefined
 }
 
-export function controllerCommandAllowed(op: string, args: unknown): boolean {
-  const allowed = new Set(['prompt', 'answer', 'interrupt', 'create', 'fork', 'observe', 'cancel'])
-  if (!allowed.has(op)) return false
-  if (op !== 'answer' || typeof args !== 'object' || args === null) return true
-  const record = args as { card?: unknown; answers?: unknown }
-  if (record.card !== 'approval') return true
-  if (!Array.isArray(record.answers)) return false
-  return record.answers.every((answer) => {
+const ONCE_MARK = /once|这一次|仅此一次|允许一次|只这一次/
+
+export function onceDecisionIds(card: unknown): { approval: boolean; onceIds: ReadonlySet<string> } | null {
+  if (typeof card !== 'object' || card === null) return null
+  const record = card as Record<string, unknown>
+  const approval = typeof record.approval === 'object' && record.approval !== null
+    ? record.approval as Record<string, unknown>
+    : undefined
+  if (!approval) return { approval: false, onceIds: new Set() }
+  const onceIds = new Set<string>()
+  if (Array.isArray(approval.decisions)) {
+    for (const raw of approval.decisions) {
+      if (typeof raw !== 'object' || raw === null) continue
+      const decision = raw as { id?: unknown; label?: unknown }
+      const id = typeof decision.id === 'string' ? decision.id : ''
+      const label = typeof decision.label === 'string' ? decision.label : ''
+      if (!id || UNSAFE_APPROVAL.test(id) || UNSAFE_APPROVAL.test(label)) continue
+      if (ONCE_MARK.test(id) || ONCE_MARK.test(label)) onceIds.add(id)
+    }
+  }
+  return { approval: true, onceIds }
+}
+
+/** 审批必须对上 Hub 已经见过的卡片，并且只能选「这一次」。提问不受这道限制。 */
+export function phoneAnswerAllowed(args: unknown, card: { approval: boolean; onceIds: ReadonlySet<string> } | undefined): boolean {
+  if (!card) return false
+  if (!card.approval) return true
+  if (card.onceIds.size === 0) return false
+  if (typeof args !== 'object' || args === null || !Array.isArray((args as { answers?: unknown }).answers)) return false
+  return (args as { answers: unknown[] }).answers.every((answer) => {
     if (typeof answer !== 'object' || answer === null) return false
-    const id = (answer as { id?: unknown }).id
-    return typeof id === 'string' && id.length > 0 && !UNSAFE_APPROVAL.test(id)
+    const row = answer as { id?: unknown; selectedOptionIds?: unknown }
+    const selected = Array.isArray(row.selectedOptionIds)
+      ? row.selectedOptionIds.filter((id): id is string => typeof id === 'string' && id.length > 0)
+      : []
+    const ids = selected.length > 0 ? selected : (typeof row.id === 'string' ? [row.id] : [])
+    return ids.length > 0 && ids.every((id) => card.onceIds.has(id))
   })
 }
 
+export function controllerCommandAllowed(op: string, args: unknown, card?: { approval: boolean; onceIds: ReadonlySet<string> }): boolean {
+  const allowed = new Set(['prompt', 'answer', 'interrupt', 'create', 'fork', 'observe', 'cancel'])
+  if (!allowed.has(op)) return false
+  if (op !== 'answer') return true
+  return phoneAnswerAllowed(args, card)
+}
+
 function digest(value: string): string {
-  return createHash('sha256').update(value, 'utf8').digest('hex')
+  return phoneTokenDigest(value)
+}
+
+function nodeDigest(value: string): string {
+  return sha256Hex(value)
 }
 
 export function createPhoneHub(options: {
@@ -92,8 +129,9 @@ export function createPhoneHub(options: {
   const memory = new Map<string, MemoryEntry[]>()
   const roster = new Map<string, RosterAgent[]>()
   const streams = new Map<string, Set<() => void>>()
-  const watched = new Set<string>()
-  let serial = 0
+  const boardRevision = new Map<string, number>()
+  const watched = new Map<string, Set<string>>()
+  const MAX_WATCHED = 32
 
   const purgeCodes = (): void => {
     const at = now()
@@ -116,7 +154,7 @@ export function createPhoneHub(options: {
 
   function authenticateNode(token: string): NodeAuth {
     if (!token) return { ok: false, code: 'unauthorized' }
-    const row = options.findNode?.(digest(token))
+    const row = options.findNode?.(nodeDigest(token))
     if (!row || row.role === 'phone') return { ok: false, code: 'unauthorized' }
     if (row.revoked) return { ok: false, code: 'revoked' }
     return { ok: true, device: row }
@@ -170,10 +208,13 @@ export function createPhoneHub(options: {
     },
     watch(auth: PhoneAuth, key: string) {
       if (!auth.ok || !key) return
-      watched.add(key)
+      const set = watched.get(auth.phone.id) ?? new Set<string>()
+      if (!set.has(key) && set.size >= MAX_WATCHED) return
+      set.add(key)
+      watched.set(auth.phone.id, set)
     },
-    watchedKeys() {
-      return watched
+    watchedBy(phoneId: string) {
+      return watched.get(phoneId) ?? new Set<string>()
     },
     seen(phoneId: string) {
       options.store.touchPhone(phoneId, now())
@@ -205,7 +246,10 @@ export function createPhoneHub(options: {
       if (!auth.ok) throw Object.assign(new Error('unauthorized'), { code: 'unauthorized' })
       if ('device' in auth) {
         if (body.read !== true) return { tasks: tasks.get(auth.device.id) ?? [], conflict: false }
-        const next = normalizeTasks(body.tasks, auth.device.id)
+        if (typeof body.revision === 'number' && Number.isInteger(body.revision) && body.revision >= 0) {
+          boardRevision.set(auth.device.id, body.revision)
+        }
+        const next = normalizeTasks(body.tasks, auth.device.id, boardRevision.get(auth.device.id))
         tasks.set(auth.device.id, next)
         const drop = new Set<string>()
         if (Array.isArray(body.applied)) {
@@ -226,7 +270,8 @@ export function createPhoneHub(options: {
       const deviceId = typeof body.deviceId === 'string' ? body.deviceId : ''
       if (!deviceId) throw Object.assign(new Error('invalid'), { code: 'invalid' })
       const current = tasks.get(deviceId) ?? []
-      const head = current.reduce((max, item) => Math.max(max, item.revision), 0)
+      const head = boardRevision.get(deviceId)
+      if (head === undefined) return { tasks: current, conflict: true }
       const base = typeof body.baseRevision === 'number' ? body.baseRevision : head
       if (base !== head) return { tasks: current, conflict: true }
       const action = body.action
@@ -234,7 +279,7 @@ export function createPhoneHub(options: {
         throw Object.assign(new Error('unsupported'), { code: 'unsupported' })
       }
       const command: TaskCommand = {
-        id: 'cmd-' + String(++serial),
+        id: randomBytes(16).toString('hex'),
         deviceId,
         action,
         baseRevision: base,
@@ -270,7 +315,7 @@ export function createPhoneHub(options: {
   }
 }
 
-function normalizeTasks(raw: unknown, deviceId: string): TaskCard[] {
+function normalizeTasks(raw: unknown, deviceId: string, boardRevision: number | undefined): TaskCard[] {
   if (!Array.isArray(raw)) return []
   const cards: TaskCard[] = []
   for (const row of raw) {
@@ -283,7 +328,9 @@ function normalizeTasks(raw: unknown, deviceId: string): TaskCard[] {
       title: item.title.trim().slice(0, 120),
       detail: typeof item.detail === 'string' ? item.detail.slice(0, 2000) : '',
       status: item.status === 'doing' || item.status === 'done' ? item.status : 'todo',
-      revision: typeof item.revision === 'number' ? item.revision : 1,
+      revision: typeof boardRevision === 'number'
+        ? boardRevision
+        : (typeof item.revision === 'number' ? item.revision : 0),
     })
   }
   return cards

@@ -38,6 +38,12 @@ describe('phone guard', () => {
       webServer: web.webServer, registry, relay, requireToken: TOKEN, publicOrigin: ORIGIN,
       deviceStore: devices, phone, loginFailureDelayMs: 0,
     })
+    const pairing = await web.request('/marshal/api/pairing', {
+      method: 'POST',
+      headers: { authorization: 'Bearer mnd1.' + node.token, 'content-type': 'application/json' },
+      body: '{}',
+    })
+    expect(pairing.statusCode).toBe(403)
     const denied = await web.request('/marshal/api/sessions', {
       headers: { authorization: 'Bearer mnd1.' + node.token },
     })

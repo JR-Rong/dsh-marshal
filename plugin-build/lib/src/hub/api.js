@@ -1,6 +1,6 @@
 import { ControlsSchema } from "../agents/controls.js";
 import { AccountLoginError } from "./account.js";
-import { controllerCommandAllowed, createPhoneHub, parseBearer } from "./phone.js";
+import { controllerCommandAllowed, createPhoneHub, onceDecisionIds, parseBearer } from "./phone.js";
 import { DeviceStateError } from "./devices.js";
 import { DiscussionError } from "../discussions/types.js";
 import { handleMemorySyncMigrate, handleMemorySyncPull, handleMemorySyncPush } from "./memory-sync.js";
@@ -410,6 +410,17 @@ export function registerMarshalRoutes(options) {
     const idleMs = options.sessionIdleMs ?? SESSION_IDLE_MS;
     const failureDelayMs = options.loginFailureDelayMs ?? 250;
     const disposers = [];
+    const pendingCards = new Map();
+    disposers.push(relay.subscribe((event) => {
+        const payload = typeof event.payload === 'object' && event.payload !== null ? event.payload : {};
+        const requestId = typeof payload.requestId === 'string' ? payload.requestId : '';
+        if (!requestId) return;
+        if (event.kind === 'input.resolved') pendingCards.delete(requestId);
+        if (event.kind === 'input.requested' && typeof onceDecisionIds === 'function') {
+            const card = onceDecisionIds(payload);
+            if (card) pendingCards.set(requestId, card);
+        }
+    }));
     // 每条 SSE 流一个清理函数：取消订阅、清心跳，并把自己从集合里移除。
     const streams = new Set();
     const sessionStreams = new Map();
@@ -925,28 +936,16 @@ export function registerMarshalRoutes(options) {
             methodNotAllowed(res, 'POST');
             return;
         }
-        const parsed = parseBearer(headerValue(req, 'authorization'));
-        let accountHash = '';
-        if (parsed?.kind === 'node') {
-            const node = phone.authenticateNode(parsed.token);
-            if (!node.ok) {
-                deny(res, 401, 'unauthorized');
-                return;
-            }
-            accountHash = node.device.accountHash ?? node.device.id;
-        }
-        else if (parsed?.kind === 'phone') {
+        if (parseBearer(headerValue(req, 'authorization'))) {
             deny(res, 403, 'forbidden');
             return;
         }
-        else {
-            const auth = authorize(req, res, { allowToken: false, refresh: true, write: true });
-            if (auth?.kind !== 'session' || auth.session.account === undefined) {
-                json(res, 403, { ok: false, code: 'account-required' });
-                return;
-            }
-            accountHash = auth.session.account.accountHash;
+        const auth = authorize(req, res, { allowToken: false, refresh: true, write: true });
+        if (auth?.kind !== 'session' || auth.session.account === undefined) {
+            json(res, 403, { ok: false, code: 'account-required' });
+            return;
         }
+        const accountHash = auth.session.account.accountHash;
         const read = await readJsonBody(req, res, SMALL_BODY_LIMIT);
         if (!read.ok)
             return;
@@ -1198,11 +1197,15 @@ export function registerMarshalRoutes(options) {
             if (!body.ok)
                 return;
             const data = asRecord(body.value);
-            if (!data || typeof data.action !== 'string') {
-                json(res, 400, { code: 'invalid-args' });
-                return;
-            }
-            let value;
+        if (!data || typeof data.action !== 'string') {
+            json(res, 400, { code: 'invalid-args' });
+            return;
+        }
+        if (asPhone !== undefined && (data.action === 'configure' || data.action === 'preset')) {
+            json(res, 403, { ok: false, code: 'forbidden' });
+            return;
+        }
+        let value;
             if (data.action === 'preview')
                 value = { preview: groups.preview(data.input) };
             else if (data.action === 'preset')
@@ -1307,7 +1310,9 @@ export function registerMarshalRoutes(options) {
             json(res, 400, { ok: false, code: 'invalid-args' });
             return;
         }
-        if (asPhone !== undefined && !controllerCommandAllowed(op, body.args)) {
+        const requestId = typeof body.args === 'object' && body.args !== null ? body.args.requestId : undefined;
+        const pending = typeof requestId === 'string' ? pendingCards.get(requestId) : undefined;
+        if (asPhone !== undefined && !controllerCommandAllowed(op, body.args, pending)) {
             json(res, 403, { ok: false, code: 'forbidden' });
             return;
         }

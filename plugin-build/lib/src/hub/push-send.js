@@ -29,6 +29,8 @@ function allowSend(deviceId, dedupeKey, now) {
     seen.set(deviceId + '|' + dedupeKey, now);
     return undefined;
 }
+const jwtCache = new Map();
+const fcmCache = new Map();
 export async function deliverPush(input) {
     const now = input.now ?? Date.now();
     const blocked = allowSend(input.deviceId, input.notice.dedupeKey, now);
@@ -43,18 +45,21 @@ export async function deliverPush(input) {
         const teamId = input.config?.apns?.teamId;
         if (!key || !keyId || !teamId || keyId.includes('PLACEHOLDER'))
             return { delivered: false, reason: 'key-unreadable' };
-        const header = b64url(JSON.stringify({ alg: 'ES256', kid: keyId }));
-        const claims = b64url(JSON.stringify({ iss: teamId, iat: Math.floor(now / 1000) }));
-        const signer = createSign('SHA256');
-        signer.update(header + '.' + claims);
-        let jwt = header + '.' + claims + '.';
-        try {
-            jwt += signer.sign(key).toString('base64url');
-        }
-        catch {
+        const jwt = signApnsJwt(key, keyId, teamId, now);
+        if (!jwt)
             return { delivered: false, reason: 'key-unreadable' };
-        }
-        const status = await postApns(input.target.token, jwt, input.config?.apns?.bundleId ?? '', input.notice);
+        const live = input.notice.kind === 'run-start' || input.notice.kind === 'run-finish' || input.notice.kind === 'approval';
+        const token = live && input.target.liveToken ? input.target.liveToken : input.target.token;
+        const status = await postApns({
+            token,
+            jwt,
+            bundleId: input.config?.apns?.bundleId ?? '',
+            notice: input.notice,
+            sandbox: input.config?.apns?.environment !== 'production',
+            live: live && Boolean(input.target.liveToken),
+            now,
+            ...(input.apnsPost === undefined ? {} : { post: input.apnsPost }),
+        });
         return status >= 200 && status < 300
             ? { delivered: true, reason: 'sent' }
             : { delivered: false, reason: 'provider-' + status };
@@ -79,35 +84,35 @@ async function deliverFcm(config, target, notice, now, fetcher) {
         iat: Math.floor(now / 1000),
         exp: Math.floor(now / 1000) + 3600,
     }));
-    const signer = createSign('RSA-SHA256');
-    signer.update(header + '.' + claims);
-    let assertion = header + '.' + claims + '.';
+    const cached = fcmCache.get(email);
+    let access = cached && cached.exp > now + 60_000 ? cached.token : '';
     try {
-        assertion += signer.sign(key).toString('base64url');
-    }
-    catch {
-        return { delivered: false, reason: 'key-unreadable' };
-    }
-    try {
-        const tokenResponse = await fetcher('https://oauth2.googleapis.com/token', {
-            method: 'POST',
-            headers: { 'content-type': 'application/x-www-form-urlencoded' },
-            body: 'grant_type=' + encodeURIComponent('urn:ietf:params:oauth:grant-type:jwt-bearer') + '&assertion=' + encodeURIComponent(assertion),
-        });
-        if (!tokenResponse.ok)
-            return { delivered: false, reason: 'provider-' + tokenResponse.status };
-        const tokenBody = await tokenResponse.json();
-        if (!tokenBody.access_token)
-            return { delivered: false, reason: 'provider-rejected' };
+        if (!access) {
+            const signer = createSign('RSA-SHA256');
+            signer.update(header + '.' + claims);
+            const assertion = header + '.' + claims + '.' + signer.sign(key).toString('base64url');
+            const tokenResponse = await fetcher('https://oauth2.googleapis.com/token', {
+                method: 'POST',
+                headers: { 'content-type': 'application/x-www-form-urlencoded' },
+                body: 'grant_type=' + encodeURIComponent('urn:ietf:params:oauth:grant-type:jwt-bearer') + '&assertion=' + encodeURIComponent(assertion),
+            });
+            if (!tokenResponse.ok)
+                return { delivered: false, reason: 'provider-' + tokenResponse.status };
+            const tokenBody = await tokenResponse.json();
+            if (!tokenBody.access_token)
+                return { delivered: false, reason: 'provider-rejected' };
+            access = tokenBody.access_token;
+            fcmCache.set(email, { token: access, exp: now + 50 * 60_000 });
+        }
         const send = await fetcher('https://fcm.googleapis.com/v1/projects/' + encodeURIComponent(project) + '/messages:send', {
             method: 'POST',
-            headers: { authorization: 'Bearer ' + tokenBody.access_token, 'content-type': 'application/json' },
+            headers: { authorization: 'Bearer ' + access, 'content-type': 'application/json' },
             body: JSON.stringify({ message: { token: target.token, notification: { title: notice.title, body: notice.body } } }),
         });
         return send.ok ? { delivered: true, reason: 'sent' } : { delivered: false, reason: 'provider-' + send.status };
     }
     catch {
-        return { delivered: false, reason: 'network' };
+        return { delivered: false, reason: 'key-unreadable' };
     }
 }
 async function deliverHuawei(config, target, notice, fetcher) {
@@ -136,9 +141,13 @@ async function deliverHuawei(config, target, notice, fetcher) {
                 message: {
                     token: [target.token],
                     notification: { title: notice.title, body: notice.body },
-                    android: target.liveToken
-                        ? { notification: { foreground_show: true, importance: 'NORMAL' }, category: 'CATEGORY_PROGRESS' }
-                        : { notification: { foreground_show: true } },
+                    android: {
+                        notification: {
+                            title: notice.title,
+                            body: notice.body,
+                            click_action: { type: 3 },
+                        },
+                    },
                 },
             }),
         });
@@ -148,24 +157,54 @@ async function deliverHuawei(config, target, notice, fetcher) {
         return { delivered: false, reason: 'network' };
     }
 }
-function postApns(token, jwt, bundleId, notice) {
+function signApnsJwt(key, keyId, teamId, now) {
+    const cached = jwtCache.get(keyId + '|' + teamId);
+    if (cached && cached.exp > now + 60_000)
+        return cached.jwt;
+    const header = b64url(JSON.stringify({ alg: 'ES256', kid: keyId }));
+    const claims = b64url(JSON.stringify({ iss: teamId, iat: Math.floor(now / 1000) }));
+    const signer = createSign('SHA256');
+    signer.update(header + '.' + claims);
+    try {
+        const jwt = header + '.' + claims + '.' + signer.sign({ key, dsaEncoding: 'ieee-p1363' }).toString('base64url');
+        jwtCache.set(keyId + '|' + teamId, { jwt, exp: now + 50 * 60_000 });
+        return jwt;
+    }
+    catch {
+        return undefined;
+    }
+}
+function postApns(input) {
+    const host = input.sandbox ? 'api.sandbox.push.apple.com' : 'api.push.apple.com';
+    const headers = {
+        ':method': 'POST',
+        ':path': '/3/device/' + input.token,
+        authorization: 'bearer ' + input.jwt,
+        'apns-topic': input.live ? input.bundleId + '.push-type.liveactivity' : input.bundleId,
+        'apns-push-type': input.live ? 'liveactivity' : 'alert',
+    };
+    const body = input.live
+        ? JSON.stringify({
+            aps: {
+                timestamp: Math.floor(input.now / 1000),
+                event: 'update',
+                'content-state': { title: input.notice.title, phase: input.notice.kind },
+            },
+        })
+        : JSON.stringify({ aps: { alert: { title: input.notice.title, body: input.notice.body } } });
+    if (input.post)
+        return input.post({ host, path: headers[':path'], headers, body });
     return new Promise((resolve) => {
-        const client = http2.connect('https://api.push.apple.com');
+        const client = http2.connect('https://' + host);
         client.on('error', () => { client.close(); resolve(0); });
-        const req = client.request({
-            ':method': 'POST',
-            ':path': '/3/device/' + token,
-            authorization: 'bearer ' + jwt,
-            'apns-topic': notice.kind === 'run-start' || notice.kind === 'run-finish' ? bundleId + '.push-type.liveactivity' : bundleId,
-            'apns-push-type': notice.kind === 'run-start' || notice.kind === 'run-finish' ? 'liveactivity' : 'alert',
-        });
-        req.on('response', (headers) => {
-            const status = Number(headers[':status'] ?? 0);
+        const req = client.request(headers);
+        req.on('response', (response) => {
+            const status = Number(response[':status'] ?? 0);
             client.close();
             resolve(status);
         });
         req.on('error', () => { client.close(); resolve(0); });
-        req.end(JSON.stringify({ aps: { alert: { title: notice.title, body: notice.body } } }));
+        req.end(body);
     });
 }
 export function noticeForEvent(kind, payload, watched) {

@@ -1,6 +1,6 @@
 import { ControlsSchema } from '../agents/controls.ts'
 import { AccountLoginError, type AccountLogin, type AccountIdentity } from './account.ts'
-import { controllerCommandAllowed, createPhoneHub, pairingPage, parseBearer } from './phone.ts'
+import { controllerCommandAllowed, createPhoneHub, onceDecisionIds, pairingPage, parseBearer } from './phone.ts'
 import { DeviceStateError, type DeviceStore } from './devices.ts'
 import type { Discussions } from './discussions/coordinator.ts'
 import { DiscussionError } from '../discussions/types.ts'
@@ -457,6 +457,17 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
   const idleMs = options.sessionIdleMs ?? SESSION_IDLE_MS
   const failureDelayMs = options.loginFailureDelayMs ?? 250
   const disposers: (() => void)[] = []
+  const pendingCards = new Map<string, { approval: boolean; onceIds: ReadonlySet<string> }>()
+  disposers.push(relay.subscribe((event) => {
+    const payload = typeof event.payload === 'object' && event.payload !== null ? event.payload as Record<string, unknown> : {}
+    const requestId = typeof payload.requestId === 'string' ? payload.requestId : ''
+    if (!requestId) return
+    if (event.kind === 'input.resolved') pendingCards.delete(requestId)
+    if (event.kind === 'input.requested') {
+      const card = onceDecisionIds(payload)
+      if (card) pendingCards.set(requestId, card)
+    }
+  }))
   // 每条 SSE 流一个清理函数：取消订阅、清心跳，并把自己从集合里移除。
   const streams = new Set<() => void>()
   const sessionStreams = new Map<string, Set<() => void>>()
@@ -809,19 +820,10 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
 
   register('/marshal/api/pairing', guard(async (req, res) => {
     if (req.method !== 'POST' || phone === undefined) { methodNotAllowed(res, 'POST'); return }
-    const parsed = parseBearer(headerValue(req, 'authorization'))
-    let accountHash = ''
-    if (parsed?.kind === 'node') {
-      const node = phone.authenticateNode(parsed.token)
-      if (!node.ok) { deny(res, 401, 'unauthorized'); return }
-      accountHash = node.device.accountHash ?? node.device.id
-    } else if (parsed?.kind === 'phone') {
-      deny(res, 403, 'forbidden'); return
-    } else {
-      const auth = authorize(req, res, { allowToken: false, refresh: true, write: true })
-      if (auth?.kind !== 'session' || auth.session.account === undefined) { json(res, 403, { ok: false, code: 'account-required' }); return }
-      accountHash = auth.session.account.accountHash
-    }
+    if (parseBearer(headerValue(req, 'authorization'))) { deny(res, 403, 'forbidden'); return }
+    const auth = authorize(req, res, { allowToken: false, refresh: true, write: true })
+    if (auth?.kind !== 'session' || auth.session.account === undefined) { json(res, 403, { ok: false, code: 'account-required' }); return }
+    const accountHash = auth.session.account.accountHash
     const read = await readJsonBody(req, res, SMALL_BODY_LIMIT)
     if (!read.ok) return
     const body = asRecord(read.value) ?? {}
@@ -975,6 +977,9 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
       const body = await readJsonBody(req, res, 32768); if (!body.ok) return
       const data = asRecord(body.value)
       if (!data || typeof data.action !== 'string') { json(res, 400, { code: 'invalid-args' }); return }
+      if (asPhone !== undefined && (data.action === 'configure' || data.action === 'preset')) {
+        json(res, 403, { ok: false, code: 'forbidden' }); return
+      }
       let value: unknown
       if (data.action === 'preview') value = { preview: groups.preview(data.input) }
       else if (data.action === 'preset') value = { presets: groups.savePreset(data.input) }
@@ -1035,7 +1040,9 @@ export function registerMarshalRoutes(options: ApiOptions): { dispose(): void } 
     if (op.startsWith('discussion.') || !(COMMAND_OPS as readonly string[]).includes(op)) {
       json(res, 400, { ok: false, code: 'invalid-args' }); return
     }
-    if (asPhone !== undefined && !controllerCommandAllowed(op, body.args)) {
+    const requestId = typeof body.args === 'object' && body.args !== null ? (body.args as { requestId?: unknown }).requestId : undefined
+    const pending = typeof requestId === 'string' ? pendingCards.get(requestId) : undefined
+    if (asPhone !== undefined && !controllerCommandAllowed(op, body.args, pending)) {
       json(res, 403, { ok: false, code: 'forbidden' }); return
     }
     // 每次 subscribe 都由 hub 签发新的不透明 id；页面在 HTTP 结果里取回并按 tab

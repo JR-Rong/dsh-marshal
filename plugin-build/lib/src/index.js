@@ -16,7 +16,7 @@ import { createClaudeAdapter } from "./agents/claude/adapter.js";
 import { NodeLink } from "./node/link.js";
 import { createNodeSync } from "./node/sync.js";
 import { openJournal } from "./node/journal.js";
-import { hubHttpOrigin, mountDesktopPairing, startPhoneRelay } from "./node/phone-sync.js";
+import { hubHttpOrigin, startPhoneRelay } from "./node/phone-sync.js";
 import { createFollower, runRoutedCommand } from "./node/runner.js";
 import { createSeqAllocator, withPublicSeq } from "./node/seq.js";
 import { createQuestionRelay } from "./node/questions.js";
@@ -466,14 +466,6 @@ function applyNode(ctx, config) {
             ...(hubCa === undefined ? {} : { ca: hubCa }),
         })
         : undefined;
-    ctx.inject(['webServer'], (scoped) => {
-        if (scoped.webServer === undefined || config.hubUrl === undefined || config.token === undefined) return;
-        scoped.effect(() => mountDesktopPairing(scoped.webServer, {
-            hubUrl: config.hubUrl,
-            token: config.token,
-            ...(hubCa === undefined ? {} : { ca: hubCa }),
-        }), 'marshal: desktop pairing');
-    });
     ctx.effect(() => () => {
         stopRelay?.();
         discussions?.dispose();

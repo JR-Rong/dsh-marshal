@@ -187,11 +187,6 @@
       var response = await fetch(new URL('marshal/api/pairing', document.baseURI), {
         method: 'POST', headers: headers, body: body, cache: 'no-store', credentials: 'same-origin'
       });
-      if (response.status === 401 || response.status === 403) {
-        response = await fetch(new URL('marshal/desktop-pairing', document.baseURI), {
-          method: 'POST', headers: { 'content-type': 'application/json' }, body: body, cache: 'no-store'
-        });
-      }
       if (!response.ok) throw new Error('pairing ' + response.status);
       return response.json();
     }
@@ -202,7 +197,7 @@
       var data;
       try { data = await issue(replace); }
       catch (error) {
-        setStatus('领不到配对码。请先在这台电脑登录 Hub，或等节点连上 Hub。');
+        setStatus('领不到配对码。请用已登录的 Hub 页面打开「手机配对」，节点凭证不能发配对码。');
         return;
       }
       if (!data || typeof data.url !== 'string' || data.url.indexOf('marshal://pair?') !== 0 || typeof data.expiresAt !== 'number') {

@@ -54,6 +54,7 @@ export function mountHub(webServer, config, logger) {
         }
         const phone = createPhoneHub({
             now: Date.now,
+            ...(config.dshAccountHash === undefined ? {} : { ownerHash: config.dshAccountHash }),
             store: install.store,
             findNode: (tokenDigest) => {
                 const row = install.store.findByTokenDigest(tokenDigest);
@@ -63,15 +64,15 @@ export function mountHub(webServer, config, logger) {
         const pushConfig = readPushConfig(config.devicesFile);
         const stopPush = relay.subscribe((event) => {
             const payload = typeof event.payload === 'object' && event.payload !== null ? event.payload : {};
-            const notice = noticeForEvent(event.kind, {
-                ...payload,
-                deviceId: event.deviceId,
-                agent: event.agent,
-                sessionId: event.sessionId,
-            }, phone.watchedKeys());
-            if (notice === null) return;
             for (const target of install.store.phones()) {
                 if (target.pushProvider === undefined || target.pushToken === undefined) continue;
+                const notice = noticeForEvent(event.kind, {
+                    ...payload,
+                    deviceId: event.deviceId,
+                    agent: event.agent,
+                    sessionId: event.sessionId,
+                }, phone.watchedBy(target.id));
+                if (notice === null) continue;
                 void deliverPush({
                     config: pushConfig,
                     deviceId: target.id,

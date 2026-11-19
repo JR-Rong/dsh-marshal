@@ -82,30 +82,17 @@ public class MainActivity extends BridgeActivity {
         }
     }
 
-    /** 官方 Live View 不可用时，用一条常驻通知兜底。 */
+    /** 运行中的任务和待审批用常驻通知。华为 Live View 胶囊要 HarmonyOS 原生应用，Android 上不调用。 */
     public static void showOngoing(android.content.Context context, String title, String body) {
-        if (!startLiveView(context, title, body)) {
-            NotificationManager manager = (NotificationManager) context.getSystemService(NOTIFICATION_SERVICE);
-            if (Build.VERSION.SDK_INT >= 26) {
-                manager.createNotificationChannel(new NotificationChannel("marshal", "调度官", NotificationManager.IMPORTANCE_LOW));
-            }
-            manager.notify(42, new NotificationCompat.Builder(context, "marshal")
-                    .setSmallIcon(android.R.drawable.stat_notify_chat)
-                    .setContentTitle(title)
-                    .setContentText(body)
-                    .setOngoing(true)
-                    .build());
+        NotificationManager manager = (NotificationManager) context.getSystemService(NOTIFICATION_SERVICE);
+        if (Build.VERSION.SDK_INT >= 26) {
+            manager.createNotificationChannel(new NotificationChannel("marshal", "调度官", NotificationManager.IMPORTANCE_LOW));
         }
-    }
-
-    private static boolean startLiveView(android.content.Context context, String title, String body) {
-        try {
-            Class<?> type = Class.forName("com.huawei.hms.liveview.LiveView");
-            Object client = type.getMethod("getInstance", android.content.Context.class).invoke(null, context);
-            type.getMethod("start", String.class, String.class).invoke(client, title, body);
-            return true;
-        } catch (Throwable ignored) {
-            return false;
-        }
+        manager.notify(42, new NotificationCompat.Builder(context, "marshal")
+                .setSmallIcon(android.R.drawable.stat_notify_chat)
+                .setContentTitle(title)
+                .setContentText(body)
+                .setOngoing(true)
+                .build());
     }
 }

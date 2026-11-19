@@ -1,0 +1,52 @@
+import { execFileSync } from 'node:child_process'
+import { mkdtempSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join, relative } from 'node:path'
+
+const root = new URL('..', import.meta.url).pathname
+const plugin = join(root, 'plugin-build')
+const packedName = readdirSync(plugin).find((name) => name.endsWith('.tgz'))
+if (!packedName) throw new Error('plugin-build is missing its tgz')
+const pkg = JSON.parse(readFileSync(join(plugin, 'package.json'), 'utf8'))
+if (!pkg.dependencies?.uqr) throw new Error('plugin-build package.json is missing uqr')
+if (!packedName.includes(pkg.version)) throw new Error('tgz name does not include ' + pkg.version)
+
+const phone = readFileSync(join(plugin, 'lib/src/hub/phone.js'), 'utf8')
+const devices = readFileSync(join(plugin, 'lib/src/hub/devices.js'), 'utf8')
+const server = readFileSync(join(plugin, 'lib/src/hub/server.js'), 'utf8')
+const push = readFileSync(join(plugin, 'lib/src/hub/push-send.js'), 'utf8')
+for (const [file, needle] of [
+  [phone, 'phoneTokenDigest'],
+  [phone, 'onceDecisionIds'],
+  [devices, 'phoneTokenDigest'],
+  [server, "record.role === 'phone'"],
+  [push, 'ieee-p1363'],
+  [push, 'click_action'],
+]) {
+  if (!file.includes(needle)) throw new Error('plugin-build is missing ' + needle)
+}
+const srcPhone = readFileSync(join(root, 'src/hub/phone.ts'), 'utf8')
+if (!srcPhone.includes('phoneTokenDigest') || !srcPhone.includes('onceDecisionIds')) {
+  throw new Error('src/hub/phone.ts is missing the review fixes')
+}
+
+function filesUnder(dir) {
+  const out = []
+  for (const name of readdirSync(dir)) {
+    const path = join(dir, name)
+    if (statSync(path).isDirectory()) out.push(...filesUnder(path))
+    else out.push(relative(dir, path))
+  }
+  return out.sort()
+}
+const extracted = mkdtempSync(join(tmpdir(), 'marshal-tgz-'))
+execFileSync('tar', ['-xzf', join(plugin, packedName), '-C', extracted])
+const packedLib = join(extracted, 'package', 'lib')
+const live = filesUnder(join(plugin, 'lib'))
+const packed = filesUnder(packedLib)
+if (live.join('\n') !== packed.join('\n')) {
+  throw new Error('tgz lib tree does not match plugin-build/lib')
+}
+const packedPkg = JSON.parse(readFileSync(join(extracted, 'package/package.json'), 'utf8'))
+if (!packedPkg.dependencies?.uqr) throw new Error('tgz is missing the uqr dependency')
+console.log('plugin tgz matches plugin-build/lib (' + packed.length + ' files)')

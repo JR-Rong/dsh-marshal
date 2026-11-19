@@ -70,6 +70,11 @@ export function sha256Hex(value: string): string {
   return createHash('sha256').update(value, 'utf8').digest('hex')
 }
 
+/** 手机凭证和节点凭证分开摘要，避免去掉 mph1. 前缀后被当成节点令牌。 */
+export function phoneTokenDigest(secret: string): string {
+  return sha256Hex('marshal-phone-v1\0' + secret)
+}
+
 export function emptyDevicesState(): DevicesState {
   return { version: DEVICES_FILE_VERSION, devices: [] }
 }
@@ -448,10 +453,11 @@ export class DeviceStore {
     if (!input.installationId || input.installationId.length > 128) throw new DeviceStateError('invalid', 'invalid installation')
     if (!input.accountHash || input.accountHash.length > 128) throw new DeviceStateError('invalid', 'invalid account')
     const credential = 'mph1.' + randomBytes(32).toString('base64url')
-    const tokenDigest = sha256Hex(credential.slice('mph1.'.length))
+    const tokenDigest = phoneTokenDigest(credential.slice('mph1.'.length))
     const id = 'phone-' + sha256Hex(input.installationId).slice(0, 32)
     return this.mutate(state => {
       const current = state.devices.find(device => device.id === id)
+      if (current?.revoked) throw new DeviceStateError('revoked', 'phone enrollment revoked')
       const entry: DeviceRecord = {
         id,
         name,
@@ -475,6 +481,7 @@ export class DeviceStore {
   touchPhone(id: string, at: number): void {
     const current = this.findById(id)
     if (current?.role !== 'phone' || current.revoked) return
+    if (typeof current.lastSeen === 'number' && at - current.lastSeen < 60_000) return
     this.mutate(state => {
       const devices = state.devices.map(device => device.id === id ? { ...device, lastSeen: at } : device)
       return { state: { ...state, devices }, result: undefined }

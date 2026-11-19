@@ -26,7 +26,7 @@ import { createInteractionRelay } from './node/interactions.ts'
 import { createAuditLog } from './node/audit.ts'
 import { createPrivacyProjector, type PrivacyProjector } from './node/privacy.ts'
 import { mountSetup } from './setup.ts'
-import { hubHttpOrigin, mountDesktopPairing, startPhoneRelay, type PhoneHost } from './node/phone-sync.ts'
+import { hubHttpOrigin, startPhoneRelay, type PhoneHost } from './node/phone-sync.ts'
 
 export const name = 'marshal'
 
@@ -425,14 +425,6 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
         ...(hubCa === undefined ? {} : { ca: hubCa }),
       })
     : undefined
-  ctx.inject(['webServer'], (scoped) => {
-    if (scoped.webServer === undefined || config.hubUrl === undefined || config.token === undefined) return
-    scoped.effect(() => mountDesktopPairing(scoped.webServer!, {
-      hubUrl: config.hubUrl!,
-      token: config.token!,
-      ...(hubCa === undefined ? {} : { ca: hubCa }),
-    }), 'marshal: desktop pairing')
-  })
   ctx.effect(() => () => {
     stopRelay?.()
     discussions?.dispose()

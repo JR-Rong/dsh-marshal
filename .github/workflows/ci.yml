@@ -39,6 +39,10 @@ jobs:
         run: pnpm run typecheck:test
       - name: vitest
         run: pnpm exec vitest run
+      - name: plugin tests
+        run: node --test plugin-build/test/*.test.js
+      - name: plugin package matches sources
+        run: node scripts/check-plugin-sync.mjs
 
   mobile:
     runs-on: ubuntu-latest

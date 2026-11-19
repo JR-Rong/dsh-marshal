@@ -191,9 +191,24 @@ export function startPhoneRelay(input) {
             return;
         const faces = await readPhoneFaces(input.host(), input.allowContent);
         const memory = input.allowContent ? faces.memory : null;
+        if (memory !== null) {
+            await postNodeJsonRead({
+                origin: input.origin, path: '/marshal/api/memory', token: input.token,
+                body: { entries: memory },
+                ...(input.ca === undefined ? {} : { ca: input.ca }),
+            });
+        }
+        if (faces.roster !== null) {
+            await postNodeJsonRead({
+                origin: input.origin, path: '/marshal/api/roster', token: input.token,
+                body: { agents: faces.roster },
+                ...(input.ca === undefined ? {} : { ca: input.ca }),
+            });
+        }
         const first = await postBoard({
-            ...forwardBody({ tasks: faces.tasks, memory, roster: faces.roster }),
+            ...forwardBody({ tasks: faces.tasks, memory: null, roster: null }),
             deviceId: input.deviceId,
+            ...(faces.revision === null ? {} : { revision: faces.revision }),
         });
         const commands = Array.isArray(first.body?.commands)
             ? first.body.commands
@@ -220,8 +235,9 @@ export function startPhoneRelay(input) {
             return;
         const after = await readPhoneFaces(input.host(), input.allowContent);
         await postBoard({
-            ...forwardBody({ tasks: after.tasks, memory: input.allowContent ? after.memory : null, roster: after.roster }),
+            ...forwardBody({ tasks: after.tasks, memory: null, roster: null }),
             deviceId: input.deviceId,
+            ...(after.revision === null ? {} : { revision: after.revision }),
             applied,
             rejected,
         });
@@ -230,43 +246,6 @@ export function startPhoneRelay(input) {
     timer.unref?.();
     void tick();
     return () => { stopped = true; clearInterval(timer); };
-}
-export function mountDesktopPairing(webServer, input) {
-    return webServer.register({
-        kind: 'exact',
-        path: '/marshal/desktop-pairing',
-        handler: async (req, res) => {
-            const remote = req.socket.remoteAddress ?? '';
-            const loopback = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1';
-            if (!loopback) {
-                res.writeHead(403).end('forbidden');
-                return;
-            }
-            if (req.method !== 'POST') {
-                res.writeHead(405, { allow: 'POST' }).end();
-                return;
-            }
-            const chunks = [];
-            for await (const chunk of req)
-                chunks.push(chunk);
-            let replace;
-            try {
-                const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-                if (typeof body.replace === 'string' && body.replace !== '')
-                    replace = body.replace;
-            }
-            catch { /* 空正文当成第一次领取 */ }
-            const outcome = await postNodeJsonRead({
-                origin: hubHttpOrigin(input.hubUrl),
-                path: '/marshal/api/pairing',
-                token: input.token,
-                body: replace === undefined ? {} : { replace },
-                ...(input.ca === undefined ? {} : { ca: input.ca }),
-            });
-            res.writeHead(outcome.status || 502, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-            res.end(JSON.stringify(outcome.body));
-        },
-    });
 }
 function postNodeJsonRead(input) {
     const url = new URL(input.path, input.origin);

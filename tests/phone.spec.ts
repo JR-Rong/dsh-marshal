@@ -2,7 +2,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { DeviceStore, emptyDevicesState, serializeDevicesState, sha256Hex } from '../src/hub/devices.ts'
+import { DeviceStore, emptyDevicesState, phoneTokenDigest, serializeDevicesState, sha256Hex } from '../src/hub/devices.ts'
 import { createPhoneHub, controllerCommandAllowed, pairingRefreshDelay, parseBearer } from '../src/hub/phone.ts'
 import { deliverPush } from '../src/hub/push-send.ts'
 import { applyBoardCommand, boardCapabilities, forwardBody, readPhoneFaces } from '../src/node/phone-sync.ts'
@@ -49,14 +49,31 @@ describe('phone credentials', () => {
     expect(closed).toBe(true)
     const secret = first.credential.slice('mph1.'.length)
     expect(hub.authenticate(secret).ok).toBe(false)
-    expect(devices.findByTokenDigest(sha256Hex(secret))?.revoked ?? false).toBe(false)
+    expect(devices.findByTokenDigest(sha256Hex(secret))).toBeUndefined()
+    expect(devices.findByTokenDigest(phoneTokenDigest(secret))).toBeUndefined()
     expect(hub.authenticate(second.credential.slice('mph1.'.length)).ok).toBe(true)
+    expect(devices.findByTokenDigest(phoneTokenDigest(second.credential.slice('mph1.'.length)))?.role).toBe('phone')
   })
 
-  it('allows a question whose option id contains session and refuses a standing approval', () => {
-    expect(controllerCommandAllowed('answer', { card: 'question', answers: [{ id: 'session-1' }] })).toBe(true)
-    expect(controllerCommandAllowed('answer', { card: 'approval', answers: [{ id: 'always' }] })).toBe(false)
-    expect(controllerCommandAllowed('answer', { card: 'approval', answers: [{ id: 'once' }] })).toBe(true)
+  it('does not revive a revoked phone when the same installation pairs again', () => {
+    const devices = store()
+    const hub = createPhoneHub({ store: devices, now: () => 5_000 })
+    const issued = hub.issuePairing('account-a', 'https://hub.example')
+    const first = hub.redeem(issued.code, '我的手机', 'install-revoked')
+    hub.revoke(first.record.id)
+    const again = hub.issuePairing('account-a', 'https://hub.example')
+    expect(() => hub.redeem(again.code, '我的手机', 'install-revoked')).toThrow()
+    expect(devices.findById(first.record.id)?.revoked).toBe(true)
+  })
+
+  it('allows a question and only the once decision on a pending approval card', () => {
+    const question = { approval: false, onceIds: new Set<string>() }
+    const approval = { approval: true, onceIds: new Set(['once']) }
+    expect(controllerCommandAllowed('answer', { requestId: 'q', answers: [{ id: 'session-1', selectedOptionIds: ['session-1'] }] }, question)).toBe(true)
+    expect(controllerCommandAllowed('answer', { requestId: 'a', answers: [{ id: 'a', selectedOptionIds: ['always'] }] }, approval)).toBe(false)
+    expect(controllerCommandAllowed('answer', { requestId: 'a', answers: [{ id: 'a', selectedOptionIds: ['once'] }] }, approval)).toBe(true)
+    expect(controllerCommandAllowed('answer', { requestId: 'a', answers: [{ id: 'once', selectedOptionIds: [] }] }, approval)).toBe(true)
+    expect(controllerCommandAllowed('answer', { requestId: 'missing', answers: [{ id: 'once', selectedOptionIds: ['once'] }] })).toBe(false)
   })
 
   it('does not mark a push delivered when the key is missing', async () => {

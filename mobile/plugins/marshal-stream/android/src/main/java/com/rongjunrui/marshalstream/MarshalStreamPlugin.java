@@ -24,6 +24,17 @@ public class MarshalStreamPlugin extends Plugin {
 
     private final Map<String, Stream> streams = new ConcurrentHashMap<>();
 
+    @Override
+    public void load() {
+        PushTokens.onChange = () -> {
+            JSObject event = new JSObject();
+            event.put("ok", true);
+            event.put("provider", PushTokens.provider);
+            event.put("token", PushTokens.token);
+            notifyListeners("pushToken", event);
+        };
+    }
+
     @PluginMethod
     public void open(PluginCall call) {
         String url = call.getString("url");

@@ -14,6 +14,39 @@ function keyFile(): string {
 }
 
 describe('push senders', () => {
+  it('signs APNs in raw r||s and sends live activity updates to the activity token', async () => {
+    const { privateKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' })
+    const path = join(mkdtempSync(join(tmpdir(), 'marshal-apns-')), 'key.pem')
+    writeFileSync(path, privateKey.export({ type: 'pkcs8', format: 'pem' }))
+    const seen: Array<{ host: string; headers: Record<string, string | undefined>; body: string }> = []
+    const notice = { kind: 'approval' as const, title: '审批', body: '一次', dedupeKey: 'approval:apns-live' }
+    const input = {
+      config: { apns: { keyId: 'KEY123', teamId: 'TEAM', bundleId: 'com.example.marshal', keyPath: path } },
+      deviceId: 'phone-apns',
+      target: { provider: 'apns' as const, token: 'device', liveToken: 'activity' },
+      notice,
+      apnsPost: async (request: { host: string; headers: Record<string, string | undefined>; body: string }) => {
+        seen.push(request)
+        return 200
+      },
+    }
+    const first = await deliverPush(input)
+    const second = await deliverPush({ ...input, notice: { ...notice, dedupeKey: 'approval:apns-live-2' } })
+    expect(first.delivered).toBe(true)
+    expect(second.delivered).toBe(true)
+    expect(seen[0]?.host).toBe('api.sandbox.push.apple.com')
+    expect(seen[0]?.headers['apns-push-type']).toBe('liveactivity')
+    expect(seen[0]?.headers['apns-topic']).toBe('com.example.marshal.push-type.liveactivity')
+    expect(seen[0]?.headers[':path']).toBe('/3/device/activity')
+    const signature = String(seen[0]?.headers.authorization).split('.').at(-1) ?? ''
+    expect(Buffer.from(signature, 'base64url').length).toBe(64)
+    expect(seen[0]?.headers.authorization).toBe(seen[1]?.headers.authorization)
+    const payload = JSON.parse(seen[0]?.body ?? '{}') as { aps: { event?: string; 'content-state'?: { title: string }; timestamp?: number } }
+    expect(payload.aps.event).toBe('update')
+    expect(payload.aps['content-state']?.title).toBe('审批')
+    expect(typeof payload.aps.timestamp).toBe('number')
+  })
+
   it('does not call FCM when the key is missing', async () => {
     let called = false
     const result = await deliverPush({
