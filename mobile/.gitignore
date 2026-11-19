@@ -11,3 +11,5 @@ ios/App/DerivedData/
 .DS_Store
 local.properties
 artifacts/
+node_modules
+ios/App/App/public/

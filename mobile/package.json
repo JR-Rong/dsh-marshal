@@ -1,15 +1,19 @@
 {
   "name": "dsh-marshal-mobile",
-  "version": "0.1.0",
+  "version": "0.6.0",
   "private": true,
   "type": "module",
-  "description": "调度官手机端（Android / iOS）：dsh-marshal 的只读客户端外壳，不承载 hub/node",
+  "description": "调度官手机端 node（Android / iOS）：自绘界面直连 dsh-marshal Hub，不承载 hub、不监听端口",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "live:check": "node --experimental-strip-types scripts/live-check.ts",
+    "live:ui": "node scripts/ui-live.mjs",
+    "ticket": "node scripts/issue-ticket.mjs",
+    "onboard": "node scripts/onboard-qr.mjs",
     "cap:sync": "npm run build && cap sync",
     "android:add": "cap add android",
     "ios:add": "cap add ios",
@@ -20,6 +24,7 @@
     "@aparajita/capacitor-secure-storage": "^8.0.1",
     "@capacitor/android": "8.6.2",
     "@capacitor/app": "8.1.2",
+    "@capacitor/camera": "^8.2.6",
     "@capacitor/core": "8.6.2",
     "@capacitor/ios": "8.6.2",
     "@capacitor/keyboard": "8.0.6",
@@ -27,11 +32,14 @@
     "@capacitor/preferences": "8.0.1",
     "@capacitor/splash-screen": "8.0.2",
     "@capacitor/status-bar": "8.0.4",
+    "jsqr": "^1.4.0",
     "marshal-stream": "file:./plugins/marshal-stream"
   },
   "devDependencies": {
     "@capacitor/cli": "8.6.2",
     "playwright-core": "^1.65.1",
+    "qrcode": "^1.5.4",
+    "qrcode-generator": "^2.0.4",
     "typescript": "^5.9.3",
     "vite": "^8.3.8"
   }

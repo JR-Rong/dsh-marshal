@@ -22,6 +22,7 @@ export interface ElProps {
   'aria-label'?: string
   onClick?: (event: MouseEvent) => void
   onInput?: (event: Event) => void
+  onChange?: (event: Event) => void
   onSubmit?: (event: Event) => void
   [key: string]: unknown
 }
@@ -38,6 +39,7 @@ export function el<K extends keyof HTMLElementTagNameMap>(
     else if (key === 'text') node.textContent = String(value)
     else if (key === 'onClick') node.addEventListener('click', value as EventListener)
     else if (key === 'onInput') node.addEventListener('input', value as EventListener)
+    else if (key === 'onChange') node.addEventListener('change', value as EventListener)
     else if (key === 'onSubmit') node.addEventListener('submit', value as EventListener)
     else if (key === 'value') (node as unknown as { value: string }).value = String(value)
     else if (key === 'disabled') (node as unknown as { disabled: boolean }).disabled = Boolean(value)

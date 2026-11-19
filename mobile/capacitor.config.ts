@@ -21,7 +21,9 @@ const config: CapacitorConfig = {
     allowsLinkPreview: false,
   },
   android: {
-    allowMixedContent: false,
+    // DSH 远程桥 /ios/v1 在局域网/USB adb reverse 下是 ws://；WebView 源是
+    // https://localhost，必须允许混合内容才能连本机桥。Hub 仍走 https。
+    allowMixedContent: true,
   },
   plugins: {
     CapacitorHttp: { enabled: true },

@@ -16,6 +16,22 @@ export interface AppLock {
   iterations: number
 }
 
+/**
+ * 账号 ticket 换来的浏览器会话。
+ * 只用于群聊接口（discussions 只认 cookie），不替代管理令牌。
+ */
+export interface AccountSession {
+  /** 原样保存的 Cookie 头：__Host-marshal-session=…; __Host-marshal-csrf=… */
+  cookies: string
+  /** 服务端会话绑定的 CSRF token，写请求必须同时放在 x-marshal-csrf 头里。 */
+  csrf: string
+  /** 会话绝对到期时间（毫秒）；Hub 侧 8 小时。 */
+  expiresAt: number
+  /** 可选：票面账号摘要/名称，仅用于界面显示。 */
+  accountHash?: string
+  name?: string
+}
+
 export interface MarshalConfig {
   version: number
   /** 规范化后的 Hub origin，例如 https://hub.example.com（无尾斜杠、无路径）。 */
@@ -26,6 +42,8 @@ export interface MarshalConfig {
   label: string
   /** 应用锁；null 表示未启用。 */
   lock: AppLock | null
+  /** 群聊账号会话；null/缺省表示未用 ticket 登录。 */
+  account?: AccountSession | null
   updatedAt: number
 }
 
@@ -120,13 +138,36 @@ export function parseConfig(raw: unknown): MarshalConfig | null {
   if (!normalized.ok) return null
   const token = typeof value.token === 'string' ? value.token : ''
   const lock = parseLock(value.lock)
+  const account = parseAccount(value.account)
   return {
     version: CONFIG_VERSION,
     hubUrl: normalized.value,
     token,
     label: typeof value.label === 'string' ? value.label.slice(0, 60) : '',
     lock,
+    ...(account === null ? {} : { account }),
     updatedAt: typeof value.updatedAt === 'number' && Number.isFinite(value.updatedAt) ? value.updatedAt : Date.now(),
+  }
+}
+
+/** Cookie/CSRF 只接受单行、可控长度的字符串，防止把头注入或写坏存储。 */
+function parseAccount(raw: unknown): AccountSession | null {
+  if (typeof raw !== 'object' || raw === null) return null
+  const value = raw as Record<string, unknown>
+  if (typeof value.cookies !== 'string' || !value.cookies || value.cookies.length > 4_096) return null
+  if (typeof value.csrf !== 'string' || !value.csrf || value.csrf.length > 512) return null
+  if (/[\x00-\x1f\x7f]/.test(value.cookies) || /[\x00-\x1f\x7f]/.test(value.csrf)) return null
+  if (typeof value.expiresAt !== 'number' || !Number.isFinite(value.expiresAt) || value.expiresAt <= 0) return null
+  return {
+    cookies: value.cookies,
+    csrf: value.csrf,
+    expiresAt: Math.round(value.expiresAt),
+    ...(typeof value.accountHash === 'string' && /^[a-f0-9]{64}$/.test(value.accountHash)
+      ? { accountHash: value.accountHash }
+      : {}),
+    ...(typeof value.name === 'string' && value.name.trim()
+      ? { name: value.name.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 80) }
+      : {}),
   }
 }
 
@@ -146,6 +187,7 @@ export function makeConfig(input: { hubUrl: string; token?: string; label?: stri
     token: input.token ?? '',
     label: input.label ?? '',
     lock: null,
+    account: null,
     updatedAt: Date.now(),
   }
 }
