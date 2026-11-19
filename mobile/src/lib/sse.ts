@@ -6,11 +6,13 @@
  */
 import { Capacitor } from '@capacitor/core'
 import { MarshalStream } from 'marshal-stream'
+import { nextResumeCursor, noteStreamDrop, noteStreamOpen, shouldReconnectStream } from './stream.ts'
 
 export interface StreamFrame {
   /** SSE 事件名：message（默认）/ reset / error */
   event: string
   data: unknown
+  id?: string
 }
 
 export interface StreamHandle {
@@ -24,7 +26,11 @@ export interface StreamOptions {
   onError?: (message: string) => void
   /** 断开后是否自动重连，默认 true。 */
   reconnect?: boolean
+  /** 多路流各自的 id。缺省时自动分配，互不影响。 */
+  id?: string
 }
+
+let streamSerial = 0
 
 function isNative(): boolean {
   try {
@@ -44,9 +50,9 @@ function parseData(raw: string): unknown {
 
 export async function openEventStream(options: StreamOptions): Promise<StreamHandle> {
   const { url, token, onFrame, onError, reconnect = true } = options
+  const id = options.id ?? 's' + String(++streamSerial)
 
   if (!isNative()) {
-    // 浏览器里没有原生通道，只能靠同源/CORS；测试时会注入假 EventSource。
     const source = new EventSource(url)
     const forward = (event: string) => (message: MessageEvent) => {
       onFrame({ event, data: parseData(String(message.data)) })
@@ -61,35 +67,53 @@ export async function openEventStream(options: StreamOptions): Promise<StreamHan
   let handle: { remove: () => Promise<void> } | null = null
   let retryTimer: ReturnType<typeof setTimeout> | null = null
   let attempt = 0
+  let lastEventId: string | null = null
 
   const start = async (): Promise<void> => {
     if (closed) return
     handle = await MarshalStream.addListener('message', (message) => {
-      if (message.event === 'error') {
-        onError?.(message.data)
+      if (message.streamId && message.streamId !== id) return
+      if (message.event === 'open') {
+        attempt = noteStreamOpen()
+        return
+      }
+      if (shouldReconnectStream({ event: message.event, closed, reconnect })) {
+        if (message.event === 'error') onError?.(message.data || 'SSE 断开')
         scheduleReconnect()
         return
       }
-      onFrame({ event: message.event || 'message', data: parseData(message.data) })
+      const frame: StreamFrame = {
+        event: message.event || 'message',
+        data: parseData(message.data),
+        ...(message.id ? { id: message.id } : {}),
+      }
+      lastEventId = nextResumeCursor(lastEventId, frame)
+      onFrame(frame)
     })
-    await MarshalStream.open({ url, token })
+    await MarshalStream.open({
+      url,
+      token,
+      id,
+      ...(lastEventId ? { lastEventId } : {}),
+    })
   }
 
   const scheduleReconnect = (): void => {
-    if (closed || !reconnect) return
-    attempt += 1
-    const delay = Math.min(15_000, 500 * 2 ** Math.min(attempt, 5))
+    if (!shouldReconnectStream({ event: 'end', closed, reconnect }) || retryTimer) return
+    const next = noteStreamDrop(attempt)
+    attempt = next.attempt
     retryTimer = setTimeout(() => {
+      retryTimer = null
       void (async () => {
         try {
           await handle?.remove()
-          await MarshalStream.close()
+          await MarshalStream.close({ id })
         } catch {
           /* 清干净即可 */
         }
         await start()
       })()
-    }, delay)
+    }, next.delayMs)
   }
 
   await start()
@@ -99,7 +123,7 @@ export async function openEventStream(options: StreamOptions): Promise<StreamHan
       closed = true
       if (retryTimer) clearTimeout(retryTimer)
       void handle?.remove()
-      void MarshalStream.close()
+      void MarshalStream.close({ id })
     },
   }
 }
