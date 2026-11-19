@@ -28,6 +28,7 @@ public class MainActivity extends BridgeActivity {
             ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.POST_NOTIFICATIONS}, POST_NOTIFICATIONS);
         }
         readPushToken();
+        PushTokens.onLive = (title, body) -> showOngoing(this, title, body);
     }
 
     /** FCM 与华为推送都走官方类。类不在 classpath 上就记 unconfigured，不编造令牌。 */

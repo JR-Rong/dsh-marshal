@@ -14,7 +14,8 @@ public class MarshalStreamPlugin: CAPPlugin, CAPBridgedPlugin {
     public let pluginMethods: [CAPPluginMethod] = [
         CAPPluginMethod(name: "open", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "close", returnType: CAPPluginReturnPromise),
-        CAPPluginMethod(name: "pushToken", returnType: CAPPluginReturnPromise)
+        CAPPluginMethod(name: "pushToken", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "startLiveActivity", returnType: CAPPluginReturnPromise)
     ]
 
     private let lock = NSLock()
@@ -51,6 +52,15 @@ public class MarshalStreamPlugin: CAPPlugin, CAPBridgedPlugin {
             result["liveToken"] = live
         }
         call.resolve(result)
+    }
+
+    @objc func startLiveActivity(_ call: CAPPluginCall) {
+        NotificationCenter.default.post(
+            name: Notification.Name("marshal.live"),
+            object: nil,
+            userInfo: ["title": call.getString("title") ?? "调度官", "phase": call.getString("phase") ?? ""]
+        )
+        call.resolve()
     }
 
     @objc func close(_ call: CAPPluginCall) {
@@ -216,3 +226,4 @@ final class StreamBox: NSObject, URLSessionDataDelegate {
         }
     }
 }
+

@@ -57,6 +57,14 @@ public class MarshalStreamPlugin extends Plugin {
     }
 
     @PluginMethod
+    public void startLiveActivity(PluginCall call) {
+        String title = call.getString("title", "调度官");
+        String phase = call.getString("phase", "");
+        if (PushTokens.onLive != null) PushTokens.onLive.show(title, phase);
+        call.resolve();
+    }
+
+    @PluginMethod
     public void pushToken(PluginCall call) {
         JSObject result = new JSObject();
         String token = PushTokens.token;

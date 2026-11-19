@@ -7,6 +7,8 @@ public final class PushTokens {
     public static volatile String liveToken;
     public static volatile String reason = "unconfigured";
     public static volatile Runnable onChange;
+    public interface LiveNotice { void show(String title, String body); }
+    public static volatile LiveNotice onLive;
 
     private PushTokens() {}
 

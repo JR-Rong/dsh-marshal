@@ -298,6 +298,14 @@ async function registerDevicePush(): Promise<void> {
 
 let pushListening = false
 
+async function showLive(title: string, phase: string): Promise<void> {
+  try {
+    const plugin = await import('marshal-stream')
+    const native = plugin.MarshalStream as unknown as { startLiveActivity?: (options: { title: string; phase: string }) => Promise<void> }
+    await native.startLiveActivity?.({ title, phase })
+  } catch { /* 浏览器没有 Live Activity */ }
+}
+
 async function openStream(): Promise<void> {
   const api = state.api
   if (!api || !api.token) return
@@ -463,6 +471,7 @@ async function onFrame(frame: StreamFrame): Promise<void> {
       const card = payload as unknown as InputCard
       if (typeof card.requestId === 'string') {
         state.cards = [...state.cards.filter((entry) => entry.requestId !== card.requestId), card]
+        if (card.approval) void showLive('待审批', 'approval')
         render()
       }
       return
@@ -481,7 +490,7 @@ async function onFrame(frame: StreamFrame): Promise<void> {
       return
     }
     case 'message.completed': closeOpenMessages(); return
-    case 'turn.started': state.running = true; render(); return
+    case 'turn.started': state.running = true; void showLive('运行中', 'run-start'); render(); return
     case 'turn.completed': state.running = false; closeOpenMessages(); render(); return
     case 'tool.started':
       state.messages.push({ id: String(event.seq), role: 'tool', text: '▶ ' + String(payload.name ?? payload.tool ?? 'tool'), open: false, at: Date.now() })

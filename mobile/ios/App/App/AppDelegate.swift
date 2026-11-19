@@ -21,6 +21,11 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         }
         if #available(iOS 16.1, *) {
             MarshalLiveActivity.registerPushToken()
+            NotificationCenter.default.addObserver(forName: Notification.Name("marshal.live"), object: nil, queue: .main) { note in
+                let title = note.userInfo?["title"] as? String ?? "调度官"
+                let phase = note.userInfo?["phase"] as? String ?? ""
+                MarshalLiveActivity.start(title: title, phase: phase)
+            }
         }
         return true
     }
