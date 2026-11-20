@@ -1732,6 +1732,8 @@ window.__ModuleLoader__.load({
         '.mtb-search{width:170px;box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 16%,transparent));background:var(--dsw-alias-bg-base,transparent);color:var(--dsw-alias-label-primary,inherit);border-radius:999px;padding:3.5px 10px;font-size:11.5px;font-family:inherit;outline:none}',
         '.mtb-search:focus{border-color:var(--dsw-alias-brand-primary,#6366f1)}',
         '.mtb-tagbar-label{font-size:11px;color:var(--dsw-alias-label-secondary,color-mix(in srgb,currentColor 60%,transparent));margin-left:4px}',
+        '.mtb-notice{padding:9px 20px;font-size:12px;display:flex;align-items:center;justify-content:space-between;gap:10px;background:color-mix(in srgb,#8b5cf6 14%,transparent);border-bottom:1px solid color-mix(in srgb,#8b5cf6 32%,transparent);color:var(--dsw-alias-label-primary,inherit)}',
+        '.mtb-warn-hint{padding:8px 11px;border-radius:9px;font-size:12px;line-height:1.5;background:color-mix(in srgb,#8b5cf6 13%,transparent);border:1px solid color-mix(in srgb,#8b5cf6 38%,transparent);color:var(--dsw-alias-label-primary,inherit)}',
         '.mtb-tag{display:inline-flex;align-items:center;gap:4px;max-width:100%;border-radius:999px;padding:1.5px 8px;font-size:11px;line-height:1.5;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--dsw-alias-label-primary,inherit);border:1px solid var(--mtb-tag-border,color-mix(in srgb,currentColor 22%,transparent));background:var(--mtb-tag-fill,color-mix(in srgb,currentColor 8%,transparent))}',
         '.mtb-tag-btn{cursor:pointer;font-family:inherit;transition:opacity .12s,transform .12s,box-shadow .12s}',
         '.mtb-tag-btn:hover{transform:translateY(-1px)}',
@@ -1797,7 +1799,9 @@ window.__ModuleLoader__.load({
         '.mtb-icon-btn{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border:0;background:transparent;color:var(--dsw-alias-label-secondary,inherit);border-radius:6px;cursor:pointer;padding:0;transition:background .12s,color .12s}',
         '.mtb-icon-btn:hover{background:var(--dsw-alias-interactive-bg-hover,color-mix(in srgb,currentColor 9%,transparent));color:var(--dsw-alias-label-primary,inherit)}',
         '.mtb-backdrop{position:absolute;inset:0;z-index:20;background:rgba(0,0,0,.32);display:flex;justify-content:flex-end;backdrop-filter:blur(1.5px)}',
-        '.mtb-drawer{width:min(490px,94%);height:100%;display:flex;flex-direction:column;background:var(--dsw-alias-bg-base,#16181d);color:var(--dsw-alias-label-primary,inherit);border-left:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 14%,transparent));box-shadow:-12px 0 36px rgba(0,0,0,.28)}',
+        '.mtb-modal-backdrop{position:absolute;inset:0;z-index:25;background:rgba(0,0,0,.38);display:flex;align-items:center;justify-content:center;padding:20px;backdrop-filter:blur(2px)}',
+        '.mtb-modal{width:min(540px,100%);max-height:86vh;display:flex;flex-direction:column;border-radius:16px;overflow:hidden;background:var(--dsw-alias-bg-base,#16181d);color:var(--dsw-alias-label-primary,inherit);border:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 16%,transparent));box-shadow:0 20px 56px rgba(0,0,0,.4)}',
+        '.mtb-drawer{width:min(510px,94%);height:100%;display:flex;flex-direction:column;background:var(--dsw-alias-bg-base,#16181d);color:var(--dsw-alias-label-primary,inherit);border-left:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 14%,transparent));box-shadow:-12px 0 36px rgba(0,0,0,.28)}',
         '.mtb-drawer-head{padding:14px 18px;display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--dsw-alias-border-l1,color-mix(in srgb,currentColor 10%,transparent));flex-shrink:0;background:color-mix(in srgb,var(--mtb-accent) 8%,transparent)}',
         '.mtb-drawer-body{flex:1;min-height:0;overflow-y:auto;padding:18px;display:flex;flex-direction:column;gap:14px}',
         '.mtb-drawer-sec{display:grid;gap:8px;padding:11px 13px;border-radius:10px;border:1px solid var(--dsw-alias-border-l1,color-mix(in srgb,currentColor 10%,transparent));background:color-mix(in srgb,currentColor 3%,transparent)}',
@@ -1810,15 +1814,21 @@ window.__ModuleLoader__.load({
         '.mtb-btn-accent:hover:not(:disabled){background:color-mix(in srgb,var(--mtb-accent) 28%,transparent)}',
         '.mtb-btn-confirm{border-color:color-mix(in srgb,#10b981 48%,transparent);background:color-mix(in srgb,#10b981 18%,transparent);color:var(--dsw-alias-label-primary,inherit);font-weight:600}',
         '.mtb-btn-confirm:hover:not(:disabled){background:color-mix(in srgb,#10b981 28%,transparent)}',
+        '.mtb-btn-ai{border-color:color-mix(in srgb,#8b5cf6 48%,transparent);background:color-mix(in srgb,#8b5cf6 14%,transparent);color:var(--dsw-alias-label-primary,inherit);font-weight:600}',
+        '.mtb-btn-ai:hover:not(:disabled){background:color-mix(in srgb,#8b5cf6 24%,transparent)}',
         '.mtb-btn-danger{color:#ef4444;border-color:color-mix(in srgb,#ef4444 48%,transparent);background:color-mix(in srgb,#ef4444 12%,transparent)}',
         '.mtb-move{border:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 16%,transparent));background:var(--dsw-alias-bg-base,transparent);color:var(--dsw-alias-label-primary,inherit);border-radius:8px;padding:4px 8px;font-size:12px;line-height:1.3;cursor:pointer;font-family:inherit;outline:none}',
-        '.mtb-form{margin:14px 20px 0;padding:16px;min-width:0;max-height:66vh;overflow-y:auto;border:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 14%,transparent));border-radius:14px;background:var(--dsw-alias-bg-layer-2,color-mix(in srgb,currentColor 5%,transparent));display:grid;gap:12px;box-shadow:0 8px 24px -12px rgba(0,0,0,.24)}',
+        '.mtb-form{margin:14px 20px 0;padding:16px;min-width:0;max-height:68vh;overflow-y:auto;border:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 14%,transparent));border-radius:14px;background:var(--dsw-alias-bg-layer-2,color-mix(in srgb,currentColor 5%,transparent));display:grid;gap:12px;box-shadow:0 8px 24px -12px rgba(0,0,0,.24)}',
         '.mtb-tpl-grid{display:flex;flex-wrap:wrap;gap:6px}',
         '.mtb-tpl-pill{border:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 16%,transparent));background:var(--dsw-alias-bg-base,transparent);color:var(--dsw-alias-label-primary,inherit);border-radius:9px;padding:6px 11px;font-size:12px;line-height:1.3;cursor:pointer;font-family:inherit;transition:border-color .12s,background .12s}',
         '.mtb-tpl-pill:hover:not(:disabled){border-color:var(--dsw-alias-brand-primary,#6366f1)}',
         '.mtb-tpl-pill[data-active="true"]{border-color:var(--dsw-alias-brand-primary,#6366f1);background:color-mix(in srgb,var(--dsw-alias-brand-primary,#6366f1) 16%,transparent);font-weight:600}',
         '.mtb-tpl-pill:disabled{opacity:.48;cursor:not-allowed}',
         '.mtb-sub-row{display:flex;align-items:center;gap:8px;padding:6px 9px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1,color-mix(in srgb,currentColor 10%,transparent));background:var(--dsw-alias-bg-base,transparent)}',
+        '.mtb-att-list{display:flex;flex-wrap:wrap;gap:8px}',
+        '.mtb-att-card{display:inline-flex;align-items:center;gap:8px;padding:5px 9px;border-radius:9px;border:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 16%,transparent));background:var(--dsw-alias-bg-base,transparent);font-size:11.5px;max-width:240px}',
+        '.mtb-att-thumb{width:34px;height:34px;border-radius:6px;object-fit:cover;flex-shrink:0;border:1px solid var(--dsw-alias-border-l1,transparent)}',
+        '.mtb-exec-row{display:grid;gap:4px;padding:8px 10px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1,color-mix(in srgb,currentColor 10%,transparent));background:var(--dsw-alias-bg-base,transparent);font-size:11.5px}',
         '.mtb-archive-grid{flex:1;min-height:0;overflow:auto;padding:16px 20px;display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:10px;align-content:start}',
       ].join('\n');
       document.head.appendChild(style);
@@ -1834,6 +1844,13 @@ window.__ModuleLoader__.load({
       if (hr < 24) return hr + 'h';
       const d = new Date(ts);
       return (d.getMonth() + 1) + '/' + d.getDate();
+    }
+
+    function formatBytes(bytes) {
+      if (typeof bytes !== 'number' || !Number.isFinite(bytes)) return '';
+      if (bytes < 1024) return bytes + ' B';
+      if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+      return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
     }
 
     function taskTagTone(name) {
@@ -1853,7 +1870,61 @@ window.__ModuleLoader__.load({
       return kind && rest ? { kind, text: rest } : { text };
     }
 
+    function clientAmbiguityHint(title, description, prompt, hasAttachments, hasPr) {
+      const cleanTitle = String(title || '').trim();
+      const cleanDesc = String(description || '').trim();
+      const cleanPrompt = String(prompt || '').trim();
+      if (!cleanTitle || hasAttachments || hasPr) return '';
+      const body = cleanDesc || (cleanPrompt !== cleanTitle ? cleanPrompt : '');
+      const combined = (cleanTitle + ' ' + body).trim();
+      if (/(看着办|随便|待定|待确认|不确定|再议|模糊|\bTBD\b|\bTODO\b|\?{2,}|？{2,})/i.test(combined)) {
+        return '描述中包含「待定/不确定/看着办」等未明确表述，创建后将自动放入「待确认」列等待确认。';
+      }
+      const hasSpecific = /(https?:\/\/|#[0-9]+|PR\s*#?[0-9]+|\/[\w.-]+\/|\.[a-z]{1,5}\b|验收|步骤|目标|需求|修复|实现|新增|删除|接口|测试|指标|≥|<=|->|→)/i.test(combined);
+      if (body.length === 0 && cleanTitle.replace(/\s+/g, '').length < 14 && !hasSpecific) {
+        return '缺少任务描述且标题较简略，创建后将自动转入「待确认」列等待补充确认。';
+      }
+      if (body.length < 16 && /(?:^|[\s，,。！？!?])(帮我|请)?(看下|看看|弄一下|搞一下|处理一下|优化一下|改一下|修一下|研究一下|完善一下|整理一下|查一下|调整一下|跟进一下|想想办法)(?:$|[\s，,。！？!?])/.test(combined) && !hasSpecific) {
+        return '任务描述较为宽泛、缺少明确对象或验收标准，创建后将自动转入「待确认」列等待确认。';
+      }
+      return '';
+    }
+
+    function flattenModelCatalog(raw) {
+      const cat = raw?.catalog ?? raw;
+      const out = [];
+      const groups = Array.isArray(cat?.groups) ? cat.groups : [];
+      for (const group of groups) {
+        const provider = group?.id || group?.provider;
+        if (typeof provider !== 'string' || !provider) continue;
+        for (const item of Array.isArray(group.models) ? group.models : []) {
+          if (!item || typeof item.id !== 'string' || !item.id) continue;
+          const route = provider + '/' + item.id;
+          const efforts = Array.isArray(item.reasoning?.efforts)
+            ? item.reasoning.efforts.map(e => typeof e === 'string' ? e : e?.id).filter(Boolean)
+            : [];
+          out.push({
+            route,
+            provider,
+            id: item.id,
+            label: (item.label || item.name || item.id) + ' (' + provider + ')',
+            efforts,
+          });
+        }
+      }
+      const def = cat?.default?.provider && cat?.default?.model ? cat.default.provider + '/' + cat.default.model : '';
+      return { options: out, defaultRoute: def };
+    }
+
     const PRIORITY_TAGS = ['P0', 'P1', 'P2', 'P3'];
+    const DEFAULT_REASONING_EFFORTS = [
+      { id: 'low', label: '低 (low)' },
+      { id: 'medium', label: '中 (medium)' },
+      { id: 'high', label: '高 (high)' },
+      { id: 'xhigh', label: '极高 (xhigh)' },
+    ];
+    const IMAGE_MEDIA_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
+    const PARSE_MODEL_STORAGE_KEY = 'dsh.taskBoard.parseModel.v1';
 
     const TASK_PERMISSION_LABELS = {
       'read-only': '只读',
@@ -1867,17 +1938,40 @@ window.__ModuleLoader__.load({
       cancelled: '已取消',
     };
 
+    const PERMISSION_RANK = { 'read-only': 0, 'workspace-write': 1, 'danger-full-access': 2 };
+
     function TaskBoardPage({ openSession, openTaskRoom, focusedTask, openNativeBoard }) {
       const [tasks, setTasks] = React.useState(null);
+      const [sessionDefaultPerm, setSessionDefaultPerm] = React.useState('read-only');
       const [error, setError] = React.useState('');
+      const [notice, setNotice] = React.useState('');
       const [busy, setBusy] = React.useState(false);
       const [formOpen, setFormOpen] = React.useState(false);
+      const [parseOpen, setParseOpen] = React.useState(false);
+      const [parseInput, setParseInput] = React.useState('');
+      const [parseModel, setParseModel] = React.useState(() => {
+        try { return globalThis.localStorage?.getItem(PARSE_MODEL_STORAGE_KEY) || ''; } catch { return ''; }
+      });
+      const [parseBusy, setParseBusy] = React.useState(false);
+      const [parseError, setParseError] = React.useState('');
+      const [modelOptions, setModelOptions] = React.useState([]);
+      const [defaultModelRoute, setDefaultModelRoute] = React.useState('');
+
       const [title, setTitle] = React.useState('');
       const [description, setDescription] = React.useState('');
+      const [formPrompt, setFormPrompt] = React.useState('');
       const [formTags, setFormTags] = React.useState([]);
       const [newTagDraft, setNewTagDraft] = React.useState('');
       const [formParentId, setFormParentId] = React.useState('');
       const [formPermission, setFormPermission] = React.useState('');
+      const [formModel, setFormModel] = React.useState('');
+      const [formEffort, setFormEffort] = React.useState('');
+      const [formReuseSession, setFormReuseSession] = React.useState(false);
+      const [formAttachments, setFormAttachments] = React.useState([]);
+      const [uploading, setUploading] = React.useState(false);
+      const [assignedAgent, setAssignedAgent] = React.useState('');
+      const [orchestrationMode, setOrchestrationMode] = React.useState('plain');
+
       const [confirmId, setConfirmId] = React.useState('');
       const [dragTaskId, setDragTaskId] = React.useState('');
       const [dropCol, setDropCol] = React.useState('');
@@ -1891,11 +1985,18 @@ window.__ModuleLoader__.load({
       const [editDesc, setEditDesc] = React.useState('');
       const [editPrompt, setEditPrompt] = React.useState('');
       const [editPerm, setEditPerm] = React.useState('');
+      const [editModel, setEditModel] = React.useState('');
+      const [editEffort, setEditEffort] = React.useState('');
+      const [editReuseSession, setEditReuseSession] = React.useState(false);
+      const [editFreezeGoal, setEditFreezeGoal] = React.useState('');
       const [drawerTagDraft, setDrawerTagDraft] = React.useState('');
       const [newSubtaskTitle, setNewSubtaskTitle] = React.useState('');
       const [linkChildId, setLinkChildId] = React.useState('');
       const [cronDraft, setCronDraft] = React.useState('');
+      const [cronMode, setCronMode] = React.useState('cron');
+      const [onceDraft, setOnceDraft] = React.useState('');
       const [cronEnabled, setCronEnabled] = React.useState(false);
+
       const [catalog, setCatalog] = React.useState(null);
       const [catalogError, setCatalogError] = React.useState('');
       const [leaderId, setLeaderId] = React.useState('');
@@ -1918,7 +2019,8 @@ window.__ModuleLoader__.load({
       const groupId = codeWork && selectedTemplate ? 'delivery' : recommendedTemplate?.groupTemplate;
       const group = catalog?.groupTemplates?.find(item => item.id === groupId);
       const template = catalog?.templates.find(item => item.id === templateId);
-      const requiresPr = leaderId !== '' && choice === 'template' && templateId === 'pr-review';
+      const requiresPr = orchestrationMode === 'template' && leaderId !== '' && choice === 'template' && templateId === 'pr-review';
+
       const allTasks = Array.isArray(tasks) ? tasks : [];
       const allActive = allTasks.filter(task => task.archivedAt === undefined);
       const archivedTasks = allTasks.filter(task => task.archivedAt !== undefined);
@@ -1965,7 +2067,12 @@ window.__ModuleLoader__.load({
       const knownStatuses = new Set(columns.map(c => c.key));
 
       const load = async () => {
-        try { const data = await fetchJson('marshal/tasks/state', undefined, true); setTasks(data.tasks || []); setError(''); }
+        try {
+          const data = await fetchJson('marshal/tasks/state', undefined, true);
+          setTasks(data.tasks || []);
+          if (typeof data.sessionDefaultPermission === 'string') setSessionDefaultPerm(data.sessionDefaultPermission);
+          setError('');
+        }
         catch (e) { setError(friendlyError(e, '任务看板')); }
       };
       React.useEffect(() => {
@@ -1977,16 +2084,30 @@ window.__ModuleLoader__.load({
           setWorkspaces(data.workspaces);
           if (data.workspaces.length === 1) setWorkspaceId(data.workspaces[0].id);
         }).catch(() => {});
+        void fetch('api/task-board/model-catalog', { credentials: 'same-origin' })
+          .then(r => r.ok ? r.json() : null)
+          .then(raw => {
+            if (!raw) return;
+            const flat = flattenModelCatalog(raw);
+            setModelOptions(flat.options);
+            setDefaultModelRoute(flat.defaultRoute);
+            setParseModel(cur => cur || flat.defaultRoute || flat.options[0]?.route || '');
+          }).catch(() => {});
         const timer = setInterval(() => { void load(); }, 3000);
         return () => clearInterval(timer);
       }, []);
 
       React.useEffect(() => {
-        if (!selectedId) return undefined;
-        const onKey = event => { if (event.key === 'Escape') { setSelectedId(''); setConfirmId(''); setDrawerEditing(false); } };
+        if (!selectedId && !parseOpen) return undefined;
+        const onKey = event => {
+          if (event.key === 'Escape') {
+            if (parseOpen) setParseOpen(false);
+            else { setSelectedId(''); setConfirmId(''); setDrawerEditing(false); }
+          }
+        };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
-      }, [selectedId]);
+      }, [selectedId, parseOpen]);
 
       const selectedTask = selectedId ? allTasks.find(item => item.id === selectedId) : undefined;
       React.useEffect(() => {
@@ -1999,7 +2120,13 @@ window.__ModuleLoader__.load({
           setEditDesc(selectedTask.description || '');
           setEditPrompt(selectedTask.prompt || '');
           setEditPerm(selectedTask.permission || '');
+          setEditModel(selectedTask.model || '');
+          setEditEffort(selectedTask.reasoningEffort || '');
+          setEditReuseSession(selectedTask.reuseSession === true);
+          setEditFreezeGoal(selectedTask.freeze?.goal || '');
           setCronDraft(selectedTask.schedule?.cron || '');
+          setCronMode(selectedTask.schedule?.mode === 'once' ? 'once' : 'cron');
+          setOnceDraft(selectedTask.schedule?.at ? new Date(selectedTask.schedule.at - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 16) : '');
           setCronEnabled(selectedTask.schedule?.enabled === true);
         }
       }, [selectedId]);
@@ -2008,6 +2135,70 @@ window.__ModuleLoader__.load({
       React.useEffect(() => {
         if (focusedTask && focusAvailable) document.getElementById('marshal-ticket-' + focusedTask)?.scrollIntoView({ block: 'nearest' });
       }, [focusedTask, focusAvailable]);
+
+      const effortsForModel = route => {
+        const hit = modelOptions.find(m => m.route === route);
+        if (hit && hit.efforts.length > 0) {
+          return hit.efforts.map(id => DEFAULT_REASONING_EFFORTS.find(d => d.id === id) ?? { id, label: id });
+        }
+        return DEFAULT_REASONING_EFFORTS;
+      };
+
+      const uploadFiles = async (fileList, onUploaded) => {
+        const files = Array.from(fileList || []).slice(0, 8);
+        if (files.length === 0) return;
+        setUploading(true);
+        setError('');
+        try {
+          const uploaded = [];
+          for (const file of files) {
+            const mediaType = file.type || 'application/octet-stream';
+            const kind = IMAGE_MEDIA_TYPES.has(mediaType.toLowerCase()) ? 'image' : 'file';
+            const qs = new URLSearchParams({ kind, name: file.name || 'attachment', mediaType });
+            const resp = await fetch('api/task-board/attachments/upload?' + qs.toString(), {
+              method: 'POST',
+              credentials: 'same-origin',
+              headers: { 'content-type': mediaType },
+              body: file,
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok || !data?.attachment) throw new Error(data?.error || ('上传失败 HTTP ' + resp.status));
+            uploaded.push(data.attachment);
+          }
+          onUploaded(uploaded);
+        }
+        catch (e) { setError('上传附件失败：' + (e.message || e)); }
+        finally { setUploading(false); }
+      };
+
+      const runAiParse = async () => {
+        const text = parseInput.trim();
+        if (!text || parseBusy) return;
+        const route = parseModel || defaultModelRoute || modelOptions[0]?.route || '';
+        if (!route) { setParseError('未检测到可用的解析模型，请先在 DSH 中配置模型。'); return; }
+        setParseBusy(true);
+        setParseError('');
+        try {
+          try { globalThis.localStorage?.setItem(PARSE_MODEL_STORAGE_KEY, route); } catch {}
+          const resp = await fetch('api/task-board/parse', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ text, model: route }),
+          });
+          const data = await resp.json().catch(() => ({}));
+          if (!resp.ok || !data?.draft) throw new Error(data?.error || ('解析失败 HTTP ' + resp.status));
+          setTitle(data.draft.title || '');
+          setDescription(data.draft.description || '');
+          setFormPrompt(data.draft.prompt || '');
+          setPlan(null);
+          setParseOpen(false);
+          setFormOpen(true);
+          setNotice('AI 已解析任务草稿，可继续补充标签、Agent Leader、模型或直接创建。');
+        }
+        catch (e) { setParseError('AI 解析失败：' + (e.message || e)); }
+        finally { setParseBusy(false); }
+      };
 
       const choiceBody = () => ({
         leaderId, choice, codeWork: explicitCode || undefined,
@@ -2036,10 +2227,17 @@ window.__ModuleLoader__.load({
           setEditing('');
           setTitle('');
           setDescription('');
+          setFormPrompt('');
           setFormTags([]);
           setNewTagDraft('');
           setFormParentId('');
           setFormPermission('');
+          setFormModel('');
+          setFormEffort('');
+          setFormReuseSession(false);
+          setFormAttachments([]);
+          setAssignedAgent('');
+          setOrchestrationMode('plain');
           setLeaderId('');
           setPlan(null);
           setChoice('leader');
@@ -2053,12 +2251,19 @@ window.__ModuleLoader__.load({
         setEditing(task.id);
         setTitle(task.title);
         setDescription(task.description ?? '');
+        setFormPrompt(task.prompt ?? '');
         setFormTags((task.tags ?? []).map(t => t.name));
         setNewTagDraft('');
         setFormParentId(task.parentId ?? '');
         setFormPermission(task.permission ?? '');
+        setFormModel(task.model ?? '');
+        setFormEffort(task.reasoningEffort ?? '');
+        setFormReuseSession(task.reuseSession === true);
+        setFormAttachments(Array.isArray(task.attachments) ? task.attachments : []);
         setWorkspaceId(workflow.workspaceId);
         setLeaderId(workflow.leaderId);
+        setAssignedAgent(workflow.leaderId);
+        setOrchestrationMode(workflow.choice === 'template' ? 'template' : workflow.choice === 'none' ? 'none' : 'leader');
         setChoice(workflow.choice);
         setTemplateId(workflow.templateId ?? 'pr-review');
         setPrUrl(workflow.prUrl ?? '');
@@ -2070,22 +2275,24 @@ window.__ModuleLoader__.load({
       const pickOrchestrationMode = (mode, tplId) => {
         setPlan(null);
         setExplicitCode(false);
+        setOrchestrationMode(mode);
         if (mode === 'plain') {
           setLeaderId('');
           setChoice('leader');
           return;
         }
         const availLeaders = catalog?.leaders ?? [];
-        if (!leaderId && availLeaders.length > 0) setLeaderId(availLeaders[0].id);
-        if (mode === 'leader') {
-          setChoice('leader');
-        }
-        else if (mode === 'template') {
-          setChoice('template');
-          if (tplId) setTemplateId(tplId);
-        }
-        else if (mode === 'none') {
-          setChoice('none');
+        const picked = assignedAgent || leaderId || availLeaders[0]?.id || '';
+        if (picked) { setLeaderId(picked); setAssignedAgent(picked); }
+        if (mode === 'leader') setChoice('leader');
+        else if (mode === 'template') { setChoice('template'); if (tplId) setTemplateId(tplId); }
+        else if (mode === 'none') setChoice('none');
+      };
+      const handleAssignAgent = id => {
+        setAssignedAgent(id);
+        if (orchestrationMode !== 'plain') {
+          setLeaderId(id);
+          setPlan(null);
         }
       };
       const toggleFormTag = name => {
@@ -2121,39 +2328,60 @@ window.__ModuleLoader__.load({
       };
       const create = async () => {
         if (!title.trim()) { setError('请填写标题'); return; }
+        const useOrch = orchestrationMode !== 'plain' && leaderId !== '';
         if (leaderId && !workspace) { setError('请选择工单所属的工作区'); return; }
         if (requiresPr && !prUrl.trim()) { setError('请填写要审查的 PR 链接'); return; }
-        if (leaderId && !plan) { await recommend(); return; }
-        if (leaderId && roleChoices?.some(role => role.required && !plan.members[role.id])) {
+        if (useOrch && !plan) { await recommend(); return; }
+        if (useOrch && roleChoices?.some(role => role.required && !plan.members[role.id])) {
           setError('请指派所有必需角色。');
           return;
         }
-        const orchestration = leaderId ? {
+        const orchestration = useOrch ? {
           ...choiceBody(), plan: { templateId: plan.templateId, codeWork: plan.codeWork, members: plan.members, codex: plan.codex },
         } : undefined;
         const pendingDraftTags = newTagDraft.split(/[,，]/).map(s => s.trim()).filter(Boolean);
-        const mergedTagNames = [...new Set([...formTags, ...pendingDraftTags])];
+        const assignedObj = assignedAgent ? catalog?.leaders.find(item => item.id === assignedAgent) : undefined;
+        const agentTag = assignedObj ? ['智能体:' + assignedObj.name] : [];
+        const mergedTagNames = [...new Set([...formTags, ...pendingDraftTags, ...agentTag])];
         const parsedTags = mergedTagNames.map(name => ({ name }));
+        const effectiveWorkspace = useOrch ? workspace : (workspaceId || '');
         setBusy(true);
         setError('');
+        setNotice('');
         try {
           const result = editing
             ? await fetchJson('marshal/tasks/plan', { taskId: editing, orchestration }, true)
             : await fetchJson('marshal/tasks/create', {
-              title: title.trim(), description: description.trim(),
+              title: title.trim(),
+              description: description.trim(),
+              ...(formPrompt.trim() ? { prompt: formPrompt.trim() } : {}),
               ...(parsedTags.length > 0 ? { tags: parsedTags } : {}),
+              ...(formAttachments.length > 0 ? { attachments: formAttachments } : {}),
               ...(formParentId ? { parentId: formParentId } : {}),
               ...(formPermission ? { permission: formPermission } : {}),
-              ...(workspace ? { workspaceId: workspace } : {}),
+              ...(formModel ? { model: formModel } : {}),
+              ...(formEffort ? { reasoningEffort: formEffort } : {}),
+              ...(formReuseSession ? { reuseSession: true } : {}),
+              ...(effectiveWorkspace ? { workspaceId: effectiveWorkspace } : {}),
               ...(orchestration === undefined ? {} : { orchestration }),
-            }, Boolean(workspace || orchestration));
+            }, Boolean(effectiveWorkspace || orchestration));
           setTasks(result.tasks || []);
+          if (result.movedToReview) {
+            setNotice('任务描述较模糊（' + (result.ambiguityReason || '信息尚不明确') + '），已自动转入「待确认」列等待确认。');
+          }
           setTitle('');
           setDescription('');
+          setFormPrompt('');
           setFormTags([]);
           setNewTagDraft('');
           setFormParentId('');
           setFormPermission('');
+          setFormModel('');
+          setFormEffort('');
+          setFormReuseSession(false);
+          setFormAttachments([]);
+          setAssignedAgent('');
+          setOrchestrationMode('plain');
           setLeaderId('');
           setChoice('leader');
           setTemplateId('pr-review');
@@ -2191,7 +2419,7 @@ window.__ModuleLoader__.load({
       };
 
       const updateTask = async (task, patch) => {
-        if (busy || !task) return;
+        if (busy || !task) return false;
         setBusy(true);
         setError('');
         try {
@@ -2223,7 +2451,7 @@ window.__ModuleLoader__.load({
         setError('');
         try {
           const result = await fetchJson('marshal/tasks/create', {
-            title: subTitle, description: '', parentId: parentTask.id,
+            title: subTitle, description: '', parentId: parentTask.id, skipAmbiguityCheck: true,
           }, false);
           setTasks(result.tasks || []);
           setNewSubtaskTitle('');
@@ -2240,9 +2468,14 @@ window.__ModuleLoader__.load({
           const result = await fetchJson('marshal/tasks/create', {
             title: task.title + '（副本）',
             description: task.description ?? '',
+            skipAmbiguityCheck: true,
             ...(task.prompt ? { prompt: task.prompt } : {}),
             ...(task.tags?.length ? { tags: task.tags } : {}),
             ...(task.permission ? { permission: task.permission } : {}),
+            ...(task.model ? { model: task.model } : {}),
+            ...(task.reasoningEffort ? { reasoningEffort: task.reasoningEffort } : {}),
+            ...(task.reuseSession ? { reuseSession: true } : {}),
+            ...(task.attachments?.length ? { attachments: task.attachments } : {}),
           }, false);
           setTasks(result.tasks || []);
         }
@@ -2287,13 +2520,28 @@ window.__ModuleLoader__.load({
         finally { setBusy(false); }
       };
 
-      const saveSchedule = async (task, enabled, cron) => {
+      const confirmPermission = async (task) => {
         if (busy || !task) return;
         setBusy(true);
         setError('');
         try {
+          const result = await fetchJson('marshal/tasks/confirm-permission', { taskId: task.id }, Boolean(task.workflow || task.taskRoom));
+          setTasks(result.tasks || []);
+        }
+        catch (e) { setError('确认权限失败：' + (e.message || e)); }
+        finally { setBusy(false); }
+      };
+
+      const saveSchedule = async (task, enabled, mode, cron, onceIso) => {
+        if (busy || !task) return;
+        setBusy(true);
+        setError('');
+        try {
+          const at = mode === 'once' && onceIso ? Math.floor(new Date(onceIso).getTime()) : undefined;
           const result = await fetchJson('marshal/tasks/schedule', {
-            taskId: task.id, enabled, mode: 'cron', ...(cron.trim() ? { cron: cron.trim() } : {}),
+            taskId: task.id, enabled, mode,
+            ...(mode === 'cron' && cron.trim() ? { cron: cron.trim() } : {}),
+            ...(mode === 'once' && Number.isFinite(at) ? { at } : {}),
           }, Boolean(task.workflow || task.taskRoom));
           setTasks(result.tasks || []);
         }
@@ -2323,6 +2571,21 @@ window.__ModuleLoader__.load({
       const iconSession = () => h('svg', { width: 13, height: 13, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.9, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': 'true' },
         h('path', { d: 'M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z' }));
 
+      const renderAttachments = (items, onRemove) => {
+        if (!Array.isArray(items) || items.length === 0) return null;
+        return h('div', { className: 'mtb-att-list' },
+          items.map(att => h('div', { key: att.attachmentId, className: 'mtb-att-card', title: att.name + ' (' + formatBytes(att.bytes) + ')' },
+            att.kind === 'image' && h('img', {
+              className: 'mtb-att-thumb',
+              src: 'api/task-board/attachments/image?id=' + encodeURIComponent(att.attachmentId),
+              alt: att.name,
+            }),
+            h('div', { style: { minWidth: 0, flex: 1 } },
+              h('div', { style: { fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, att.name),
+              h('div', { style: { fontSize: 10.5, color: dswTheme.dim } }, formatBytes(att.bytes))),
+            onRemove && h('button', { type: 'button', className: 'mtb-tag-x', 'aria-label': '移除附件 ' + att.name, onClick: () => onRemove(att.attachmentId) }, '×'))));
+      };
+
       const card = (task, column) => {
         const workflow = task.workflow;
         const step = workflow?.state === 'handed-off' ? '已交给 Leader'
@@ -2342,6 +2605,7 @@ window.__ModuleLoader__.load({
           : task.status === 'review' ? '待确认'
           : task.result ? (TASK_RESULT_LABELS[task.result] ?? task.result) : '';
         const subs = subtaskStats.get(task.id);
+        const attCount = Array.isArray(task.attachments) ? task.attachments.length : 0;
         return h('article', {
           key: task.id,
           id: 'marshal-ticket-' + task.id,
@@ -2376,6 +2640,7 @@ window.__ModuleLoader__.load({
             task.parentId && h('span', { className: 'mtb-card-micro' }, '子任务'),
             subs && h('span', { className: 'mtb-card-micro' }, subs.done + '/' + subs.total + ' 子任务'),
             workflow?.leaderName && h('span', { className: 'mtb-card-micro', title: workflow.leaderName }, workflow.leaderName),
+            attCount > 0 && h('span', { className: 'mtb-card-micro' }, '📎 ' + attCount),
             task.freeze && h('span', { className: 'mtb-card-micro', title: task.freeze.goal || '已冻结' }, '已冻结'),
             task.schedule?.enabled && h('span', { className: 'mtb-card-micro' }, task.schedule.mode === 'once' ? '定时一次' : '定时'),
             timeLabel && h('span', { className: 'mtb-card-time' }, timePrefix + timeLabel)),
@@ -2409,6 +2674,41 @@ window.__ModuleLoader__.load({
 
       const selectedColumn = selectedTask ? (columns.find(c => c.key === selectedTask.status) ?? columns[1]) : undefined;
 
+      const renderParseModal = () => {
+        if (!parseOpen) return null;
+        return h('div', {
+          className: 'mtb-modal-backdrop',
+          onClick: e => { if (e.target === e.currentTarget && !parseBusy) setParseOpen(false); },
+        },
+          h('div', { className: 'mtb-modal', role: 'dialog', 'aria-label': 'AI 自动解析任务' },
+            h('div', { className: 'mtb-drawer-head', style: { '--mtb-accent': '#8b5cf6' } },
+              h('span', { className: 'mtb-dot' }),
+              h('strong', { style: { fontSize: 14, flex: 1 } }, '✨ AI 自动解析任务'),
+              h('button', { type: 'button', className: 'mtb-icon-btn', disabled: parseBusy, onClick: () => setParseOpen(false) }, '✕')),
+            h('div', { style: { padding: 18, display: 'grid', gap: 12, overflowY: 'auto' } },
+              h('div', { style: { fontSize: 12, color: dswTheme.dim, lineHeight: 1.55 } },
+                '粘贴聊天记录、Issue 原文、零散想法或需求段落，AI 将自动提炼出结构化的标题、描述与执行指令并填入新建卡片表单。'),
+              h(Field, { label: '解析模型' },
+                h('select', { style: uiInput, value: parseModel, disabled: parseBusy, onChange: e => setParseModel(e.target.value) },
+                  modelOptions.length === 0
+                    ? h('option', { value: '' }, '未读取到模型目录')
+                    : modelOptions.map(opt => h('option', { key: opt.route, value: opt.route }, opt.label)))),
+              h(Field, { label: '原始任务文本' },
+                h('textarea', {
+                  style: { ...uiInput, resize: 'vertical', lineHeight: 1.6 },
+                  rows: 7,
+                  value: parseInput,
+                  disabled: parseBusy,
+                  placeholder: '例如：帮我把登录接口的 403 问题查清楚并修复，加回归测试并验证重启后生效…',
+                  onChange: e => setParseInput(e.target.value),
+                })),
+              parseError && h('div', { role: 'alert', style: { color: dswTheme.danger, fontSize: 12 } }, parseError)),
+            h('div', { className: 'mtb-drawer-foot', style: { justifyContent: 'flex-end' } },
+              h('button', { type: 'button', className: 'mtb-btn', disabled: parseBusy, onClick: () => setParseOpen(false) }, '取消'),
+              h('button', { type: 'button', className: 'mtb-btn mtb-btn-ai', disabled: parseBusy || !parseInput.trim(), onClick: () => { void runAiParse(); } },
+                parseBusy ? '解析中…' : '✨ 解析并填入表单'))));
+      };
+
       const renderDrawer = () => {
         if (!selectedTask || !selectedColumn) return null;
         const task = selectedTask;
@@ -2424,13 +2724,25 @@ window.__ModuleLoader__.load({
         const isRunning = task.status === 'running' || task.openExecution === true || workflow?.state === 'running';
         const canMove = !busy && !archived && !isRunning && !task.taskRoom?.closed;
         const permLabel = task.permission ? (TASK_PERMISSION_LABELS[task.permission] ?? task.permission) : '';
+        const needsPermConfirm = Boolean(!archived && task.permission && (PERMISSION_RANK[task.permission] ?? 0) > (PERMISSION_RANK[sessionDefaultPerm] ?? 0) && !task.permissionConfirmedAt);
         const currentTagNames = (task.tags ?? []).map(t => t.name);
+        const currentAgentTag = currentTagNames.find(n => n.startsWith('智能体:'));
         const parentCard = task.parentId ? allTasks.find(t => t.id === task.parentId) : undefined;
         const childCards = allActive.filter(t => t.parentId === task.id);
         const linkableChildren = allActive.filter(t => t.id !== task.id && t.parentId === undefined && t.id !== task.parentId && !allActive.some(c => c.parentId === t.id));
         const suggestedDrawerTags = [...new Set([...PRIORITY_TAGS, ...knownTags.map(t => t.name)])].filter(name => !currentTagNames.includes(name));
+        const drawerAttachments = Array.isArray(task.attachments) ? task.attachments : [];
+        const drawerExecutions = Array.isArray(task.executions) ? [...task.executions].reverse() : [];
+        const drawerAmbiguity = !archived && task.status === 'review' && drawerExecutions.length === 0
+          ? clientAmbiguityHint(task.title, task.description, task.prompt, drawerAttachments.length > 0, Boolean(workflow?.pr))
+          : '';
         const toggleDrawerTag = async name => {
           const nextNames = currentTagNames.includes(name) ? currentTagNames.filter(n => n !== name) : [...currentTagNames, name];
+          await updateTask(task, { tags: nextNames.length > 0 ? nextNames.map(n => ({ name: n })) : null });
+        };
+        const assignDrawerAgentLeader = async agentName => {
+          const cleaned = currentTagNames.filter(n => !n.startsWith('智能体:'));
+          const nextNames = agentName ? [...cleaned, '智能体:' + agentName] : cleaned;
           await updateTask(task, { tags: nextNames.length > 0 ? nextNames.map(n => ({ name: n })) : null });
         };
         const addDrawerTag = async () => {
@@ -2446,6 +2758,10 @@ window.__ModuleLoader__.load({
             description: editDesc,
             prompt: editPrompt,
             ...(editPerm ? { permission: editPerm } : {}),
+            model: editModel,
+            reasoningEffort: editEffort,
+            reuseSession: editReuseSession,
+            freeze: editFreezeGoal.trim() ? { goal: editFreezeGoal.trim() } : null,
           });
           if (ok) setDrawerEditing(false);
         };
@@ -2468,16 +2784,34 @@ window.__ModuleLoader__.load({
               !archived && !isRunning && h('button', { type: 'button', className: 'mtb-btn', onClick: () => setDrawerEditing(v => !v) }, drawerEditing ? '取消编辑' : '编辑'),
               h('button', { type: 'button', className: 'mtb-icon-btn', 'aria-label': '关闭详情', onClick: () => { setSelectedId(''); setConfirmId(''); setDrawerEditing(false); } }, '✕')),
             h('div', { className: 'mtb-drawer-body' },
+              drawerAmbiguity && h('div', { className: 'mtb-warn-hint' },
+                '⚠ ' + drawerAmbiguity + ' 点右上角「编辑」补充后可点击下方「移回待办」继续执行。'),
+              needsPermConfirm && h('div', { className: 'mtb-warn-hint', style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 } },
+                h('span', null, '此卡片权限（' + permLabel + '）高于默认基线，运行前需人工确认。'),
+                h('button', { type: 'button', className: 'mtb-btn mtb-btn-confirm', disabled: busy, onClick: () => { void confirmPermission(task); } }, '确认高权限')),
+
               drawerEditing
                 ? h('div', { className: 'mtb-drawer-sec' },
                     h(Field, { label: '标题' }, h('input', { style: uiInput, value: editTitle, onChange: e => setEditTitle(e.target.value) })),
                     h(Field, { label: '描述' }, h('textarea', { style: { ...uiInput, resize: 'vertical', lineHeight: 1.55 }, rows: 4, value: editDesc, onChange: e => setEditDesc(e.target.value) })),
                     h(Field, { label: '执行指令 Prompt' }, h('textarea', { style: { ...uiInput, resize: 'vertical', lineHeight: 1.55 }, rows: 3, value: editPrompt, onChange: e => setEditPrompt(e.target.value) })),
-                    h(Field, { label: '权限预设' }, h('select', { style: uiInput, value: editPerm, onChange: e => setEditPerm(e.target.value) },
-                      h('option', { value: '' }, '跟随默认'),
-                      h('option', { value: 'read-only' }, '只读'),
-                      h('option', { value: 'workspace-write' }, '工作区可写'),
-                      h('option', { value: 'danger-full-access' }, '完全权限'))),
+                    h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 } },
+                      h(Field, { label: '模型' }, h('select', { style: uiInput, value: editModel, onChange: e => setEditModel(e.target.value) },
+                        h('option', { value: '' }, '跟随默认模型'),
+                        modelOptions.map(opt => h('option', { key: opt.route, value: opt.route }, opt.label)))),
+                      h(Field, { label: '思考强度' }, h('select', { style: uiInput, value: editEffort, onChange: e => setEditEffort(e.target.value) },
+                        h('option', { value: '' }, '跟随默认'),
+                        effortsForModel(editModel).map(opt => h('option', { key: opt.id, value: opt.id }, opt.label))))),
+                    h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 } },
+                      h(Field, { label: '权限预设' }, h('select', { style: uiInput, value: editPerm, onChange: e => setEditPerm(e.target.value) },
+                        h('option', { value: '' }, '跟随默认'),
+                        h('option', { value: 'read-only' }, '只读'),
+                        h('option', { value: 'workspace-write' }, '工作区可写'),
+                        h('option', { value: 'danger-full-access' }, '完全权限'))),
+                      h(Field, { label: '冻结目标（可选，清空解冻）' }, h('input', { style: uiInput, value: editFreezeGoal, placeholder: '例如：等 PR #6 合并后推进', onChange: e => setEditFreezeGoal(e.target.value) }))),
+                    h('label', { style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 } },
+                      h('input', { type: 'checkbox', checked: editReuseSession, onChange: e => setEditReuseSession(e.target.checked) }),
+                      '复用上次执行会话（保留上下文）'),
                     h('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 6 } },
                       h('button', { type: 'button', className: 'mtb-btn', onClick: () => setDrawerEditing(false) }, '取消'),
                       h('button', { type: 'button', className: 'mtb-btn mtb-btn-accent', disabled: busy || !editTitle.trim(), onClick: () => { void saveDrawerEdit(); } }, '保存修改')))
@@ -2486,10 +2820,28 @@ window.__ModuleLoader__.load({
                     h('div', { className: 'mtb-card-meta' },
                       task.createdAt && h('span', null, '创建于 ' + new Date(task.createdAt).toLocaleString()),
                       Number(task.runCount || 0) > 0 && h('span', null, '· ' + task.runCount + ' 次运行'),
-                      permLabel && h('span', { className: 'mtb-card-micro' }, permLabel)),
+                      permLabel && h('span', { className: 'mtb-card-micro' }, permLabel),
+                      task.model && h('span', { className: 'mtb-card-micro' }, task.model),
+                      task.reasoningEffort && h('span', { className: 'mtb-card-micro' }, '思考: ' + task.reasoningEffort),
+                      task.reuseSession && h('span', { className: 'mtb-card-micro' }, '复用会话'),
+                      task.freeze && h('span', { className: 'mtb-card-micro' }, '已冻结' + (task.freeze.goal ? ': ' + task.freeze.goal : ''))),
                     task.description
                       ? h('div', { style: { fontSize: 13, lineHeight: 1.65, whiteSpace: 'pre-wrap', wordBreak: 'break-word', padding: '10px 12px', borderRadius: 10, background: 'color-mix(in srgb, currentColor 4%, transparent)', border: '1px solid var(--dsw-alias-border-l1, color-mix(in srgb, currentColor 10%, transparent))' } }, task.description)
-                      : h('div', { style: uiMuted }, '暂无描述')),
+                      : h('div', { style: uiMuted }, '暂无描述'),
+                    task.prompt && task.prompt !== task.description && task.prompt !== task.title && h('details', { className: 'mtb-drawer-sec' },
+                      h('summary', { style: { cursor: 'pointer', fontSize: 12, fontWeight: 600, color: dswTheme.dim } }, '执行指令 Prompt'),
+                      h('pre', { style: { margin: '6px 0 0', whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 12, lineHeight: 1.55, fontFamily: 'inherit' } }, task.prompt))),
+
+              !archived && (catalog?.leaders?.length ?? 0) > 0 && h('div', { className: 'mtb-drawer-sec' },
+                h('div', { className: 'mtb-drawer-sec-title' }, '指派 Agent Leader'),
+                h('select', {
+                  style: uiInput,
+                  disabled: busy,
+                  value: currentAgentTag ? currentAgentTag.slice(4) : '',
+                  onChange: e => { void assignDrawerAgentLeader(e.target.value); },
+                },
+                  h('option', { value: '' }, '未指派'),
+                  catalog.leaders.map(item => h('option', { key: item.id, value: item.name }, item.name)))),
 
               h('div', { className: 'mtb-drawer-sec' },
                 h('div', { className: 'mtb-drawer-sec-title' }, '标签与优先级'),
@@ -2514,6 +2866,29 @@ window.__ModuleLoader__.load({
                     'data-tag-tone': taskTagTone(name), disabled: busy,
                     onClick: () => { void toggleDrawerTag(name); },
                   }, '＋ ' + name)))),
+
+              h('div', { className: 'mtb-drawer-sec' },
+                h('div', { className: 'mtb-drawer-sec-title' },
+                  '附件（图片 / 文件）',
+                  !archived && drawerAttachments.length < 8 && h('label', { className: 'mtb-btn', style: { cursor: uploading ? 'wait' : 'pointer', padding: '3px 9px', fontSize: 11 } },
+                    uploading ? '上传中…' : '📎 上传附件',
+                    h('input', {
+                      type: 'file', multiple: true, style: { display: 'none' }, disabled: uploading || busy,
+                      onChange: e => {
+                        const fl = e.target.files;
+                        e.target.value = '';
+                        void uploadFiles(fl, added => {
+                          const merged = [...drawerAttachments, ...added].slice(0, 8);
+                          void updateTask(task, { attachments: merged });
+                        });
+                      },
+                    }))),
+                drawerAttachments.length === 0
+                  ? h('span', { style: uiMuted }, '暂无附件')
+                  : renderAttachments(drawerAttachments, archived ? undefined : attId => {
+                      const remaining = drawerAttachments.filter(a => a.attachmentId !== attId);
+                      void updateTask(task, { attachments: remaining.length > 0 ? remaining : null });
+                    })),
 
               h('div', { className: 'mtb-drawer-sec' },
                 h('div', { className: 'mtb-drawer-sec-title' },
@@ -2549,14 +2924,38 @@ window.__ModuleLoader__.load({
 
               !archived && h('details', { className: 'mtb-drawer-sec' },
                 h('summary', { style: { cursor: 'pointer', fontSize: 12, fontWeight: 600, color: dswTheme.dim } },
-                  '定时执行 (Cron)' + (task.schedule?.enabled ? ' · 已开启' : '')),
+                  '定时执行 (Cron / 单次)' + (task.schedule?.enabled ? ' · 已开启' : '')),
                 h('div', { style: { display: 'grid', gap: 8, marginTop: 8 } },
-                  h('label', { style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 } },
-                    h('input', { type: 'checkbox', checked: cronEnabled, onChange: e => setCronEnabled(e.target.checked) }),
-                    '启用 Cron 定时调度'),
-                  h('div', { style: { display: 'flex', gap: 6 } },
-                    h('input', { style: { ...uiInput, padding: '5px 9px', fontFamily: 'monospace' }, value: cronDraft, placeholder: '5 段 cron，例如 0 9 * * *', onChange: e => setCronDraft(e.target.value) }),
-                    h('button', { type: 'button', className: 'mtb-btn', disabled: busy, onClick: () => { void saveSchedule(task, cronEnabled, cronDraft); } }, '保存定时')))),
+                  h('div', { style: { display: 'flex', alignItems: 'center', gap: 12, fontSize: 12 } },
+                    h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+                      h('input', { type: 'checkbox', checked: cronEnabled, onChange: e => setCronEnabled(e.target.checked) }),
+                      '启用定时'),
+                    h('select', { className: 'mtb-move', value: cronMode, onChange: e => setCronMode(e.target.value) },
+                      h('option', { value: 'cron' }, '周期 Cron'),
+                      h('option', { value: 'once' }, '单次触发'))),
+                  cronMode === 'cron'
+                    ? h(React.Fragment, null,
+                        h('div', { style: { display: 'flex', gap: 5, flexWrap: 'wrap' } },
+                          [['每小时', '0 * * * *'], ['每天 09:00', '0 9 * * *'], ['工作日 09:30', '30 9 * * 1-5']].map(([lbl, expr]) =>
+                            h('button', { key: expr, type: 'button', className: 'mtb-btn', style: { padding: '2px 8px', fontSize: 11 }, onClick: () => { setCronDraft(expr); setCronEnabled(true); } }, lbl))),
+                        h('div', { style: { display: 'flex', gap: 6 } },
+                          h('input', { style: { ...uiInput, padding: '5px 9px', fontFamily: 'monospace' }, value: cronDraft, placeholder: '5 段 cron，例如 0 9 * * *', onChange: e => setCronDraft(e.target.value) }),
+                          h('button', { type: 'button', className: 'mtb-btn', disabled: busy, onClick: () => { void saveSchedule(task, cronEnabled, 'cron', cronDraft, onceDraft); } }, '保存定时')))
+                    : h('div', { style: { display: 'flex', gap: 6 } },
+                        h('input', { type: 'datetime-local', style: { ...uiInput, padding: '5px 9px' }, value: onceDraft, onChange: e => setOnceDraft(e.target.value) }),
+                        h('button', { type: 'button', className: 'mtb-btn', disabled: busy, onClick: () => { void saveSchedule(task, cronEnabled, 'once', cronDraft, onceDraft); } }, '保存定时')))),
+
+              drawerExecutions.length > 0 && h('details', { className: 'mtb-drawer-sec', open: drawerExecutions.length <= 3 },
+                h('summary', { style: { cursor: 'pointer', fontSize: 12, fontWeight: 600, color: dswTheme.dim } },
+                  '执行历史（' + drawerExecutions.length + ' 条）'),
+                h('div', { style: { display: 'grid', gap: 6, marginTop: 8 } },
+                  drawerExecutions.map((ex, idx) => h('div', { key: ex.id || idx, className: 'mtb-exec-row' },
+                    h('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+                      h('span', { className: 'mtb-result', 'data-tone': ex.result || 'running' },
+                        ex.result ? (TASK_RESULT_LABELS[ex.result] ?? ex.result) : '运行中'),
+                      ex.startedAt && h('span', { style: { color: dswTheme.dim } }, new Date(ex.startedAt).toLocaleString()),
+                      ex.sessionId && h('button', { type: 'button', className: 'mtb-icon-pill', style: { marginLeft: 'auto' }, onClick: () => openSession && openSession(ex.sessionId) }, '打开会话')),
+                    ex.error && h('div', { style: { color: dswTheme.danger } }, ex.error))))),
 
               workflow && h('div', { className: 'mtb-drawer-sec' },
                 h('div', { style: { fontSize: 12, fontWeight: 600 } }, [workflow.leaderName, modeLabel,
@@ -2572,6 +2971,7 @@ window.__ModuleLoader__.load({
 
             h('div', { className: 'mtb-drawer-foot' },
               !archived && task.status === 'review' && canMove && h('button', { type: 'button', className: 'mtb-btn mtb-btn-confirm', disabled: busy, onClick: () => { void move(task, 'done'); } }, '确认完成'),
+              !archived && task.status === 'review' && canMove && h('button', { type: 'button', className: 'mtb-btn', disabled: busy, onClick: () => { void move(task, 'todo'); } }, '移回待办'),
               !archived && !task.taskRoom?.closed && task.status !== 'running' && (!workflow || workflow.state !== 'done') && h('button', { type: 'button', disabled: busy, className: 'mtb-btn mtb-btn-accent', onClick: () => { void run(task); } }, workflow?.state === 'failed' || workflow?.state === 'interrupted' ? '重试' : '运行'),
               !archived && isRunning && !workflow && h('button', { type: 'button', className: 'mtb-btn', disabled: busy, onClick: () => { void settleTask(task); } }, '终止运行'),
               h('button', { type: 'button', className: 'mtb-btn', onClick: () => { setSelectedId(''); openTaskRoom?.(task); } }, '进入工单群'),
@@ -2591,6 +2991,7 @@ window.__ModuleLoader__.load({
       const canOrchestrate = Boolean(catalog?.memoryAvailable && catalog?.leaders?.length > 0);
       const topLevelParents = allActive.filter(item => item.parentId === undefined);
       const allTagSuggestions = [...new Set([...PRIORITY_TAGS, ...knownTags.map(t => t.name)])];
+      const liveAmbiguityHint = !editing ? clientAmbiguityHint(title, description, formPrompt, formAttachments.length > 0, Boolean(prUrl.trim())) : '';
 
       return h('section', { className: 'mtb-page' },
         h('header', { className: 'mtb-head' },
@@ -2619,6 +3020,7 @@ window.__ModuleLoader__.load({
               showArchive ? '返回看板' : '归档 (' + archivedTasks.length + ')'),
             !showArchive && h('button', { type: 'button', style: uiButton(false), onClick: () => setCompactCards(v => !v) }, compactCards ? '展开卡片' : '紧凑视图'),
             openNativeBoard && h('button', { type: 'button', style: uiButton(false), onClick: () => openNativeBoard(), title: '切换到 DSH 原版任务看板' }, '原版看板'),
+            h('button', { type: 'button', className: 'mtb-btn mtb-btn-ai', style: { padding: '6px 11px' }, onClick: () => { setParseError(''); setParseOpen(true); } }, '✨ AI 解析任务'),
             h('button', { type: 'button', disabled: busy, style: uiButton(true), onClick: () => formOpen ? cancelForm() : setFormOpen(true) }, formOpen ? '收起' : '＋ 新建卡片'))),
 
         !showArchive && h('div', { className: 'mtb-tagbar', 'aria-label': '搜索与标签筛选' },
@@ -2645,11 +3047,22 @@ window.__ModuleLoader__.load({
             onClick: () => setActiveTag(current => current === tag.name ? '' : tag.name),
           }, tag.name))),
 
+        notice && h('div', { className: 'mtb-notice', role: 'status' },
+          h('span', null, notice),
+          h('button', { type: 'button', className: 'mtb-icon-btn', onClick: () => setNotice('') }, '✕')),
         error && h('div', { style: { padding: '8px 20px', fontSize: 12, color: dswTheme.danger } }, error),
 
         formOpen && h('fieldset', { disabled: busy, 'aria-label': editing ? '编辑工单分工' : '创建工单', className: 'mtb-form' },
+          h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 } },
+            h('strong', { style: { fontSize: 13 } }, editing ? '编辑工单分工' : '新建任务卡片'),
+            !editing && h('button', { type: 'button', className: 'mtb-btn mtb-btn-ai', onClick: () => { setParseError(''); setParseOpen(true); } }, '✨ 从文本 AI 自动解析')),
           h(Field, { label: '标题' }, h('input', { value: title, readOnly: Boolean(editing), onChange: event => { setTitle(event.target.value); setPlan(null); }, placeholder: '这张卡片要做什么', style: uiInput })),
-          h(Field, { label: '描述（可选）' }, h('textarea', { value: description, readOnly: Boolean(editing), onChange: event => { setDescription(event.target.value); setPlan(null); }, rows: 3, placeholder: '背景、验收标准、约束…', style: { ...uiInput, resize: 'vertical', lineHeight: 1.6 } })),
+          h(Field, { label: '描述（建议写清目标与验收标准；若模糊将自动转入「待确认」）' }, h('textarea', { value: description, readOnly: Boolean(editing), onChange: event => { setDescription(event.target.value); setPlan(null); }, rows: 3, placeholder: '背景、目标、验收标准、约束…', style: { ...uiInput, resize: 'vertical', lineHeight: 1.6 } })),
+          liveAmbiguityHint && h('div', { className: 'mtb-warn-hint' }, '⚠ ' + liveAmbiguityHint),
+
+          !editing && h('details', { style: { fontSize: 12 } },
+            h('summary', { style: { cursor: 'pointer', color: dswTheme.dim, fontWeight: 500 } }, '执行指令 Prompt（可选，留空自动沿用描述）'),
+            h('textarea', { value: formPrompt, onChange: event => setFormPrompt(event.target.value), rows: 3, placeholder: '下发给执行智能体的具体指令…', style: { ...uiInput, marginTop: 6, resize: 'vertical', lineHeight: 1.55 } })),
 
           !editing && h(Field, { label: '标签与优先级（点选已有标签，或输入新建）' },
             formTags.length > 0 && h('div', { className: 'mtb-card-tags' },
@@ -2675,33 +3088,61 @@ window.__ModuleLoader__.load({
                 onClick: () => toggleFormTag(name),
               }, (formTags.includes(name) ? '✓ ' : '＋ ') + name)))),
 
-          !editing && h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 10 } },
-            topLevelParents.length > 0 && h(Field, { label: '关联父任务（可选，设为子任务）' },
-              h('select', { value: formParentId, style: uiInput, onChange: event => setFormParentId(event.target.value) },
-                h('option', { value: '' }, '独立任务（无父任务）'),
-                topLevelParents.map(item => h('option', { key: item.id, value: item.id }, item.title)))),
+          !editing && h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(175px, 1fr))', gap: 10 } },
+            (catalog?.leaders?.length ?? 0) > 0 && h(Field, { label: '指派 Agent Leader（可选）' },
+              h('select', { value: assignedAgent, style: uiInput, onChange: event => handleAssignAgent(event.target.value) },
+                h('option', { value: '' }, '暂不指派'),
+                catalog.leaders.map(item => h('option', { key: item.id, value: item.id }, item.name)))),
+            h(Field, { label: '模型（可选）' },
+              h('select', { value: formModel, style: uiInput, onChange: event => setFormModel(event.target.value) },
+                h('option', { value: '' }, '跟随默认模型'),
+                modelOptions.map(opt => h('option', { key: opt.route, value: opt.route }, opt.label)))),
+            h(Field, { label: '思考强度（可选）' },
+              h('select', { value: formEffort, style: uiInput, onChange: event => setFormEffort(event.target.value) },
+                h('option', { value: '' }, '跟随默认'),
+                effortsForModel(formModel).map(opt => h('option', { key: opt.id, value: opt.id }, opt.label)))),
             h(Field, { label: '权限预设（可选）' },
               h('select', { value: formPermission, style: uiInput, onChange: event => setFormPermission(event.target.value) },
                 h('option', { value: '' }, '跟随默认权限'),
                 h('option', { value: 'read-only' }, '只读'),
                 h('option', { value: 'workspace-write' }, '工作区可写'),
                 h('option', { value: 'danger-full-access' }, '完全权限'))),
-            !leaderId && workspaces.length > 0 && h(Field, { label: '工作区（可选）' },
+            topLevelParents.length > 0 && h(Field, { label: '关联父任务（设为子任务）' },
+              h('select', { value: formParentId, style: uiInput, onChange: event => setFormParentId(event.target.value) },
+                h('option', { value: '' }, '独立任务（无父任务）'),
+                topLevelParents.map(item => h('option', { key: item.id, value: item.id }, item.title)))),
+            orchestrationMode === 'plain' && workspaces.length > 0 && h(Field, { label: '工作区（可选）' },
               h('select', { value: workspaceId, style: uiInput, onChange: event => setWorkspaceId(event.target.value) },
                 h('option', { value: '' }, '不绑定工作区'),
                 workspaces.map(item => h('option', { key: item.id, value: item.id }, item.name))))),
+
+          !editing && h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 10 } },
+            h('label', { style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, cursor: 'pointer' } },
+              h('input', { type: 'checkbox', checked: formReuseSession, onChange: event => setFormReuseSession(event.target.checked) }),
+              '复用上次执行会话'),
+            h('label', { className: 'mtb-btn', style: { cursor: uploading ? 'wait' : 'pointer' } },
+              uploading ? '附件上传中…' : '📎 选择附件上传（图片 / 文件，可选）',
+              h('input', {
+                type: 'file', multiple: true, style: { display: 'none' }, disabled: uploading || busy,
+                onChange: event => {
+                  const fl = event.target.files;
+                  event.target.value = '';
+                  void uploadFiles(fl, added => setFormAttachments(prev => [...prev, ...added].slice(0, 8)));
+                },
+              }))),
+          !editing && renderAttachments(formAttachments, attId => setFormAttachments(prev => prev.filter(a => a.attachmentId !== attId))),
 
           h(Field, { label: 'Agent 编排模板' },
             h('div', { className: 'mtb-tpl-grid' },
               !editing && h('button', {
                 type: 'button', className: 'mtb-tpl-pill',
-                'data-active': !leaderId ? 'true' : undefined,
+                'data-active': orchestrationMode === 'plain' ? 'true' : undefined,
                 onClick: () => pickOrchestrationMode('plain'),
               }, '普通卡片'),
               h('button', {
                 type: 'button', className: 'mtb-tpl-pill',
                 disabled: !canOrchestrate,
-                'data-active': leaderId && choice === 'leader' ? 'true' : undefined,
+                'data-active': orchestrationMode === 'leader' ? 'true' : undefined,
                 onClick: () => pickOrchestrationMode('leader'),
               }, '由 Leader 自动选模板'),
               (catalog?.templates ?? []).map(item => h('button', {
@@ -2709,28 +3150,24 @@ window.__ModuleLoader__.load({
                 type: 'button',
                 className: 'mtb-tpl-pill',
                 disabled: !canOrchestrate,
-                'data-active': leaderId && choice === 'template' && templateId === item.id ? 'true' : undefined,
+                'data-active': orchestrationMode === 'template' && templateId === item.id ? 'true' : undefined,
                 onClick: () => pickOrchestrationMode('template', item.id),
                 title: item.stages.join(' → '),
               }, item.name + (item.automated ? ' · 自动' : ''))),
               h('button', {
                 type: 'button', className: 'mtb-tpl-pill',
                 disabled: !canOrchestrate,
-                'data-active': leaderId && choice === 'none' ? 'true' : undefined,
+                'data-active': orchestrationMode === 'none' ? 'true' : undefined,
                 onClick: () => pickOrchestrationMode('none'),
               }, '仅派给 Leader（无模板）')),
-            leaderId && choice === 'template' && template && h('span', { style: uiMuted }, '阶段：' + template.stages.join(' → ')),
+            orchestrationMode === 'template' && template && h('span', { style: uiMuted }, '阶段：' + template.stages.join(' → ')),
             catalogError && h('div', { style: uiMuted }, catalogError),
             catalog && !canOrchestrate && h('div', { style: uiMuted }, '提示：需开启工作区记忆并至少有一个已绑定工作区的智能体作为 Leader，方可启用编排模板。')),
 
-          leaderId && canOrchestrate && h(Field, { label: '负责 Leader' },
-            h('select', { value: leaderId, onChange: event => { setLeaderId(event.target.value); setPlan(null); }, style: uiInput },
-              catalog.leaders.filter(leader => !editing || leader.workspaceId === workspaceId).map(leader => h('option', { key: leader.id, value: leader.id }, leader.name)))),
-
-          leaderId && (requiresPr || choice === 'leader') && h(Field, { label: requiresPr ? 'PR 链接' : 'PR 链接（可选）' },
+          orchestrationMode !== 'plain' && leaderId && (requiresPr || choice === 'leader') && h(Field, { label: requiresPr ? 'PR 链接' : 'PR 链接（可选）' },
             h('input', { type: 'url', value: prUrl, onChange: event => { setPrUrl(event.target.value); setPlan(null); }, placeholder: 'GitHub 或 Gitee PR 链接', style: uiInput })),
 
-          leaderId && h('section', { 'aria-label': '运行分工', style: { display: 'grid', gap: 8, borderTop: '1px solid ' + dswTheme.border, paddingTop: 10 } },
+          orchestrationMode !== 'plain' && leaderId && h('section', { 'aria-label': '运行分工', style: { display: 'grid', gap: 8, borderTop: '1px solid ' + dswTheme.border, paddingTop: 10 } },
             h('strong', null, group ? group.name : 'Leader 推荐后预填角色'),
             plan && recommendedTemplate && h('span', { style: uiMuted }, recommendedTemplate.name + ' · Leader ' + selectedLeader?.name),
             selectedTemplate !== 'development' && selectedTemplate !== 'pr-review' && h('label', null,
@@ -2758,9 +3195,9 @@ window.__ModuleLoader__.load({
 
           h('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8 } },
             h('button', { type: 'button', style: uiButton(false), onClick: cancelForm }, '取消'),
-            leaderId && plan && h('button', { type: 'button', style: uiButton(false), disabled: busy, onClick: () => { void recommend(); } }, '重新推荐'),
-            h('button', { type: 'button', disabled: busy, style: { ...uiButton(true), opacity: busy ? .6 : 1 }, onClick: () => { void create(); } },
-              busy ? '处理中…' : leaderId && !plan ? 'Leader 推荐分工' : editing ? '保存分工' : '创建'))),
+            orchestrationMode !== 'plain' && leaderId && plan && h('button', { type: 'button', style: uiButton(false), disabled: busy, onClick: () => { void recommend(); } }, '重新推荐'),
+            h('button', { type: 'button', disabled: busy || uploading, style: { ...uiButton(true), opacity: busy || uploading ? .6 : 1 }, onClick: () => { void create(); } },
+              busy ? '处理中…' : orchestrationMode !== 'plain' && leaderId && !plan ? 'Leader 推荐分工' : editing ? '保存分工' : '创建'))),
 
         showArchive
           ? h('div', { className: 'mtb-archive-grid' },
@@ -2777,7 +3214,7 @@ window.__ModuleLoader__.load({
                         h('button', { type: 'button', className: 'mtb-icon-pill mtb-icon-pill-confirm', onClick: e => { e.stopPropagation(); void restoreTask(task); } }, '恢复')));
                   }))
           : allActive.length === 0 && !formOpen
-            ? h(EmptyState, { title: '还没有卡片', hint: '新建一张卡片，每张卡片都有一个工单群。', action: '新建卡片', onAction: () => setFormOpen(true) })
+            ? h(EmptyState, { title: '还没有卡片', hint: '新建一张卡片，或点上方「✨ AI 解析任务」快速生成。', action: '新建卡片', onAction: () => setFormOpen(true) })
             : h('div', { className: 'mtb-grid' },
                 columns.map(column => {
                   const items = list.filter(task => (knownStatuses.has(task.status) ? task.status : 'todo') === column.key);
@@ -2814,7 +3251,8 @@ window.__ModuleLoader__.load({
                         ? h('div', { className: 'mtb-empty' }, column.empty)
                         : items.map(task => card(task, column))));
                 })),
-        renderDrawer());
+        renderDrawer(),
+        renderParseModal());
     }
     function TaskRoomsPage({ task, openBoard }) {
       const bound = task?.taskRoom;

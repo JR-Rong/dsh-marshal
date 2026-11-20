@@ -11,6 +11,7 @@ import { defaultSettings } from '../lib/src/superagent/settings.js';
 import { parseModelJson, VerdictSchema } from '../lib/src/groups/task-plans.js';
 import { createTaskOrchestration } from '../lib/src/groups/task-orchestration.js';
 import { createLocalBoard } from '../lib/src/groups/local-board.js';
+import { detectAmbiguousTask } from '../lib/src/groups/mount.js';
 import { mountSuperagent } from '../lib/src/superagent/mount.js';
 import { createFakeBoard, createFakeContext, createFakeMemory, loggerFixture } from './superagent-support.js';
 
@@ -186,6 +187,10 @@ test('shipped client keeps plain card create/run working and sends auth for task
     assert.ok(source.includes("fetchJson('marshal/tasks/set-parent'"), 'board should support linking subtasks');
     assert.ok(source.includes("fetchJson('marshal/tasks/update'"), 'board should support editing tags and card details');
     assert.ok(source.includes('--mtb-res-c'), 'bottom-left result badge should use high-contrast explicit dot + label-primary text');
+    assert.ok(source.includes('api/task-board/parse'), 'board should expose AI task draft parser modal');
+    assert.ok(source.includes('api/task-board/model-catalog'), 'board should load models and reasoning efforts');
+    assert.ok(source.includes('api/task-board/attachments/upload'), 'board should support optional attachment uploads');
+    assert.ok(source.includes('指派 Agent Leader'), 'board should support assigning an Agent Leader');
 });
 
 test('mountSuperagent adopts connection trust with only the real connection service (no connection.authentication)', async () => {
@@ -248,4 +253,12 @@ test('embedded patched task-board host runtime is bundled with review settlement
     const embedded = readFileSync(new URL('../lib/src/task-board/index.js', import.meta.url), 'utf8');
     assert.ok(embedded.includes('mountOnce("@linxin666/dsh-client-ui-task-board"'));
     assert.ok(embedded.includes('if (outcome === "succeeded") return task.schedule?.enabled === true ? "todo" : "review";'));
+});
+
+test('detectAmbiguousTask routes vague or underspecified tickets to review while passing clear ones', () => {
+    assert.ok(detectAmbiguousTask({ title: '优化一下', description: '' }));
+    assert.ok(detectAmbiguousTask({ title: '帮我处理一下页面', description: '看着办' }));
+    assert.ok(detectAmbiguousTask({ title: '看板改进', description: '细节待定' }));
+    assert.equal(detectAmbiguousTask({ title: '修复 PR #7 看板左下角对比度', description: '把 .mtb-result 改为高对比主文本色并验证暗色/亮色主题。' }), undefined);
+    assert.equal(detectAmbiguousTask({ title: '看看截图', description: '', hasAttachments: true }), undefined);
 });

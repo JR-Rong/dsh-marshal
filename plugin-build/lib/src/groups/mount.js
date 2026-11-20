@@ -168,11 +168,63 @@ function normalizeCardTags(raw) {
     return out.length > 0 ? out : undefined;
 }
 
+const VAGUE_TASK_PATTERNS = [
+    /(?:^|[\s，,。！？!?])(帮我|请)?(看下|看看|弄一下|搞一下|处理一下|优化一下|改一下|修一下|研究一下|完善一下|整理一下|查一下|调整一下|跟进一下|想想办法)(?:$|[\s，,。！？!?])/,
+    /(看着办|随便|待定|待确认|不确定|再议|模糊|\bTBD\b|\bTODO\b|\?{2,}|？{2,})/i,
+];
+const SPECIFIC_TASK_SIGNAL = /(https?:\/\/|#[0-9]+|PR\s*#?[0-9]+|\/[\w.-]+\/|\.[a-z]{1,5}\b|验收|步骤|目标|需求|修复|实现|新增|删除|接口|测试|指标|≥|<=|->|→)/i;
+
+export function detectAmbiguousTask({ title = '', description = '', prompt = '', hasAttachments = false, hasPr = false } = {}) {
+    const cleanTitle = String(title).trim();
+    const cleanDesc = String(description).trim();
+    const cleanPrompt = String(prompt).trim();
+    const body = cleanDesc || (cleanPrompt !== cleanTitle ? cleanPrompt : '');
+    const combined = (cleanTitle + ' ' + body).trim();
+    if (hasAttachments || hasPr) return undefined;
+    if (VAGUE_TASK_PATTERNS[1].test(combined)) {
+        return '任务描述包含「待定/不确定/看着办」等未明确内容';
+    }
+    if (body.length === 0 && cleanTitle.replace(/\s+/g, '').length < 14 && !SPECIFIC_TASK_SIGNAL.test(cleanTitle)) {
+        return '缺少任务描述且标题较简略，目标与验收标准尚不明确';
+    }
+    if (body.length < 16 && VAGUE_TASK_PATTERNS[0].test(combined) && !SPECIFIC_TASK_SIGNAL.test(combined)) {
+        return '任务描述偏向宽泛指令，缺少具体对象或验收标准';
+    }
+    return undefined;
+}
+
+function normalizeAttachmentsPayload(raw) {
+    if (!Array.isArray(raw)) return undefined;
+    const out = [];
+    for (const item of raw.slice(0, 8)) {
+        if (!item || typeof item !== 'object') continue;
+        if (item.kind !== 'image' && item.kind !== 'file') continue;
+        if (typeof item.attachmentId !== 'string' || !item.attachmentId) continue;
+        if (typeof item.name !== 'string' || !item.name) continue;
+        if (typeof item.mediaType !== 'string' || !item.mediaType) continue;
+        if (typeof item.sha256 !== 'string' || !item.sha256) continue;
+        if (typeof item.bytes !== 'number' || !Number.isInteger(item.bytes) || item.bytes < 0) continue;
+        const entry = {
+            kind: item.kind,
+            attachmentId: item.attachmentId,
+            name: item.name,
+            bytes: item.bytes,
+            mediaType: item.mediaType,
+            sha256: item.sha256,
+            ...(item.kind === 'image' && typeof item.width === 'number' && typeof item.height === 'number'
+                ? { width: item.width, height: item.height } : {}),
+        };
+        out.push(entry);
+    }
+    return out.length > 0 ? out : undefined;
+}
+
 function taskView(task, workflow, room) {
     const executions = Array.isArray(task.executions) ? task.executions : [];
     const latest = executions.length > 0 ? executions[executions.length - 1] : undefined;
     const openExecution = executions.some(item => item && item.endedAt === undefined);
     const tags = normalizeCardTags(task.tags);
+    const attachments = normalizeAttachmentsPayload(task.attachments);
     return {
         id: task.id,
         title: task.title,
@@ -187,12 +239,28 @@ function taskView(task, workflow, room) {
         ...(task.permission === undefined ? {} : { permission: task.permission }),
         ...(task.permissionConfirmedAt === undefined ? {} : { permissionConfirmedAt: task.permissionConfirmedAt }),
         ...(task.mode === undefined ? {} : { mode: task.mode }),
+        ...(typeof task.model === 'string' && task.model !== '' ? { model: task.model } : {}),
+        ...(typeof task.reasoningEffort === 'string' && task.reasoningEffort !== '' ? { reasoningEffort: task.reasoningEffort } : {}),
+        ...(typeof task.reuseSession === 'boolean' ? { reuseSession: task.reuseSession } : {}),
         ...(tags === undefined ? {} : { tags }),
-        ...(executions.length > 0 ? { runCount: executions.length } : {}),
+        ...(attachments === undefined ? {} : { attachments }),
+        ...(executions.length > 0 ? {
+            runCount: executions.length,
+            executions: executions.slice(-10).map(item => ({
+                id: item.id,
+                ...(item.sessionId ? { sessionId: item.sessionId } : {}),
+                ...(typeof item.startedAt === 'number' ? { startedAt: item.startedAt } : {}),
+                ...(typeof item.endedAt === 'number' ? { endedAt: item.endedAt } : {}),
+                ...(item.result ? { result: item.result } : {}),
+                ...(item.error ? { error: String(item.error).slice(0, 400) } : {}),
+                ...(item.external ? { external: true } : {}),
+                ...(item.initiatedBy ? { initiatedBy: item.initiatedBy } : {}),
+            })),
+        } : {}),
         ...(openExecution ? { openExecution: true } : {}),
         ...(latest?.startedAt === undefined ? {} : { startedAt: latest.startedAt }),
         ...(latest?.endedAt === undefined ? {} : { endedAt: latest.endedAt }),
-        ...(task.schedule !== undefined ? { schedule: { enabled: task.schedule.enabled === true, mode: task.schedule.mode, ...(typeof task.schedule.cron === 'string' ? { cron: task.schedule.cron } : {}), ...(task.schedule.nextRunAt === undefined ? {} : { nextRunAt: task.schedule.nextRunAt }) } } : {}),
+        ...(task.schedule !== undefined ? { schedule: { enabled: task.schedule.enabled === true, mode: task.schedule.mode, ...(typeof task.schedule.cron === 'string' ? { cron: task.schedule.cron } : {}), ...(typeof task.schedule.at === 'number' ? { at: task.schedule.at } : {}), ...(task.schedule.nextRunAt === undefined ? {} : { nextRunAt: task.schedule.nextRunAt }) } } : {}),
         ...(task.freeze !== undefined ? { freeze: { goal: typeof task.freeze.goal === 'string' ? task.freeze.goal : '' } } : {}),
         ...(task.archivedAt === undefined ? {} : { archivedAt: task.archivedAt }),
         ...(latest === undefined || latest.sessionId === undefined ? {} : { sessionId: latest.sessionId }),
@@ -328,13 +396,26 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             const description = typeof body.description === 'string' ? body.description.trim() : '';
             const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
             const tags = normalizeCardTags(body.tags);
+            const attachments = normalizeAttachmentsPayload(body.attachments);
             const parentId = typeof body.parentId === 'string' && body.parentId.trim() !== '' ? body.parentId.trim() : undefined;
             const permission = ['read-only', 'workspace-write', 'danger-full-access'].includes(body.permission) ? body.permission : undefined;
+            const model = typeof body.model === 'string' && body.model.trim() !== '' ? body.model.trim() : undefined;
+            const reasoningEffort = typeof body.reasoningEffort === 'string' && body.reasoningEffort.trim() !== '' ? body.reasoningEffort.trim() : undefined;
+            const reuseSession = typeof body.reuseSession === 'boolean' ? body.reuseSession : undefined;
+            const ambiguityReason = body.skipAmbiguityCheck === true ? undefined : detectAmbiguousTask({
+                title, description, prompt,
+                hasAttachments: attachments !== undefined,
+                hasPr: typeof body.orchestration?.prUrl === 'string' && body.orchestration.prUrl.trim() !== '',
+            });
             const input = {
                 title, description, prompt: prompt || description || title,
                 ...(tags === undefined ? {} : { tags }),
+                ...(attachments === undefined ? {} : { attachments }),
                 ...(parentId === undefined ? {} : { parentId }),
                 ...(permission === undefined ? {} : { permission }),
+                ...(model === undefined ? {} : { model }),
+                ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+                ...(reuseSession === undefined ? {} : { reuseSession }),
             };
             const source = boardSource();
             const id = randomUUID();
@@ -368,10 +449,11 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
                 scope = { workspaceId, ownerId: access.session.ownerId };
                 existing = new Set((board.snapshot().tasks ?? []).map(task => task.id));
             }
-            const snapshot = await board.apply(randomUUID(), { kind: 'create', id, input }, initiator);
+            const beforeIds = existing ?? new Set((board.snapshot().tasks ?? []).map(task => task.id));
+            let snapshot = await board.apply(randomUUID(), { kind: 'create', id, input }, initiator);
+            const added = (snapshot.tasks ?? []).filter(task => !beforeIds.has(task.id));
+            const created = (snapshot.tasks ?? []).find(task => task.id === id) ?? (added.length === 1 ? added[0] : undefined);
             if (scope) {
-                const added = (snapshot.tasks ?? []).filter(task => !existing.has(task.id));
-                const created = added.find(task => task.id === id) ?? (added.length === 1 ? added[0] : undefined);
                 if (!created) {
                     write(res, 409, { ok: false, code: 'task-create-not-observed' });
                     return;
@@ -390,7 +472,18 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
                     return;
                 }
             }
-            write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
+            let movedToReview = false;
+            if (ambiguityReason !== undefined && created && created.status !== 'review' && created.status !== 'running') {
+                try {
+                    snapshot = await board.apply(randomUUID(), { kind: 'move', taskId: created.id, status: 'review' }, initiator);
+                    movedToReview = true;
+                } catch { /* keep created status if board refuses move */ }
+            }
+            write(res, 200, {
+                ok: true,
+                tasks: taskList(snapshot, req, source),
+                ...(movedToReview ? { movedToReview: true, ambiguityReason } : {}),
+            });
         }),
         exact('POST', '/marshal/tasks/run', async (req, res) => {
             const board = getBoard();

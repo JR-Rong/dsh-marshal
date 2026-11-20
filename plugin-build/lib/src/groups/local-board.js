@@ -24,7 +24,11 @@ export function createLocalBoard(file) {
             const tags = Array.isArray(input.tags) ? input.tags.filter(t => t && typeof t.name === 'string' && t.name.trim() !== '').map(t => ({ name: t.name.trim(), ...(typeof t.promptPrefix === 'string' && t.promptPrefix.trim() !== '' ? { promptPrefix: t.promptPrefix.trim() } : {}) })) : undefined;
             const parentId = typeof input.parentId === 'string' && input.parentId.trim() !== '' ? input.parentId.trim() : undefined;
             const permission = ['read-only', 'workspace-write', 'danger-full-access'].includes(input.permission) ? input.permission : undefined;
-            save([{ id: action.id ?? randomUUID(), title, description: typeof input.description === 'string' ? input.description : '', prompt: typeof input.prompt === 'string' ? input.prompt : title, status: 'todo', priority: 0, ...(parentId ? { parentId } : {}), ...(permission ? { permission } : {}), ...(tags && tags.length > 0 ? { tags } : {}), executions: [], createdAt: at, updatedAt: at }, ...tasks]);
+            const model = typeof input.model === 'string' && input.model.trim() !== '' ? input.model.trim() : undefined;
+            const reasoningEffort = typeof input.reasoningEffort === 'string' && input.reasoningEffort.trim() !== '' ? input.reasoningEffort.trim() : undefined;
+            const reuseSession = typeof input.reuseSession === 'boolean' ? input.reuseSession : undefined;
+            const attachments = Array.isArray(input.attachments) && input.attachments.length > 0 ? input.attachments : undefined;
+            save([{ id: action.id ?? randomUUID(), title, description: typeof input.description === 'string' ? input.description : '', prompt: typeof input.prompt === 'string' ? input.prompt : title, status: 'todo', priority: 0, ...(parentId ? { parentId } : {}), ...(permission ? { permission } : {}), ...(model ? { model } : {}), ...(reasoningEffort ? { reasoningEffort } : {}), ...(reuseSession !== undefined ? { reuseSession } : {}), ...(attachments ? { attachments } : {}), ...(tags && tags.length > 0 ? { tags } : {}), executions: [], createdAt: at, updatedAt: at }, ...tasks]);
             return snapshot();
         }
         if (action?.kind === 'update' && action.patch && typeof action.patch === 'object') {
@@ -36,6 +40,14 @@ export function createLocalBoard(file) {
                 if (typeof p.description === 'string') next.description = p.description;
                 if (typeof p.prompt === 'string') next.prompt = p.prompt;
                 if (['read-only', 'workspace-write', 'danger-full-access'].includes(p.permission)) next.permission = p.permission;
+                if (typeof p.model === 'string') { if (p.model.trim()) next.model = p.model.trim(); else delete next.model; }
+                if (typeof p.reasoningEffort === 'string') { if (p.reasoningEffort.trim()) next.reasoningEffort = p.reasoningEffort.trim(); else delete next.reasoningEffort; }
+                if (p.reuseSession === null) delete next.reuseSession;
+                else if (typeof p.reuseSession === 'boolean') next.reuseSession = p.reuseSession;
+                if (p.attachments === null) delete next.attachments;
+                else if (Array.isArray(p.attachments)) next.attachments = p.attachments;
+                if (p.freeze === null) delete next.freeze;
+                else if (p.freeze && typeof p.freeze === 'object') next.freeze = p.freeze;
                 if (p.tags === null) delete next.tags;
                 else if (Array.isArray(p.tags)) next.tags = p.tags;
                 return next;
