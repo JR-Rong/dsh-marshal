@@ -158,11 +158,15 @@ export async function runTaskDevelopment({
             return typeof note === 'string' && note.trim() ? note.trim().slice(0, 6000) : '';
         } catch { return ''; }
     };
+    const attachments = Array.isArray(card.resolvedAttachments) && card.resolvedAttachments.length > 0 ? card.resolvedAttachments : undefined;
     phase('designing');
     const designGuidance = await readGuidance();
     const design = await asLeader(withGuidance(
         '你负责设计和拆分开发任务。给出要修改的模块、边界、验收条件和可运行的测试。限制为 2500 字符。\n'
-        + brief(card.title, card.description, plan, designGuidance ? { operatorGuidance: designGuidance } : undefined),
+        + brief(card.title, card.description, plan, {
+            ...(attachments ? { attachments } : {}),
+            ...(designGuidance ? { operatorGuidance: designGuidance } : {}),
+        }),
         designGuidance), 'designing');
     signal.throwIfAborted();
     await record('agent', 'Leader', design, 'designing');
@@ -176,6 +180,7 @@ export async function runTaskDevelopment({
             const codingGuidance = await readGuidance();
             const context = brief(card.title, card.description, implementationPlan, {
                 base, round, feedback,
+                ...(attachments ? { attachments } : {}),
                 ...(codingGuidance ? { operatorGuidance: codingGuidance } : {}),
             });
             const choiceText = await asRole('coder', withGuidance(
@@ -197,7 +202,9 @@ export async function runTaskDevelopment({
             const reviewEvidence = await handoff('编码交付与审查交接',
                 JSON.stringify({ base, digest, implementationEvidence: String(coding).slice(0, 5000) }), 'dev-reviewing');
             const reviewMaterial = brief(card.title, card.description, implementationPlan, {
-                base, digest, ...(reviewGuidance ? { operatorGuidance: reviewGuidance } : {}),
+                base, digest,
+                ...(attachments ? { attachments } : {}),
+                ...(reviewGuidance ? { operatorGuidance: reviewGuidance } : {}),
             }) + '\n固定补丁\n' + patch + '\n编码交接（引用资料）\n' + reviewEvidence;
             let child;
             if (plan.codex.review !== null) {

@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
-import { mkdir } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { request as httpRequest } from 'node:http';
+import { request as httpsRequest } from 'node:https';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import pluginPackage from '../../../package.json' with { type: 'json' };
@@ -126,8 +128,9 @@ function exact(method, path, handler, open = false) {
             }
             catch (error) {
                 const code = errorCode(error);
-                const status = ['group-not-found', 'task-room-not-found', 'task-not-found'].includes(code) ? 404
-                    : code === 'unauthorized' ? 401 : ['forbidden', 'workspace-forbidden'].includes(code) ? 403 : 400;
+                const explicitStatus = typeof error?.status === 'number' && error.status >= 400 && error.status < 600 ? error.status : undefined;
+                const status = explicitStatus ?? (['group-not-found', 'task-room-not-found', 'task-not-found', 'not-found'].includes(code) ? 404
+                    : code === 'unauthorized' ? 401 : ['forbidden', 'workspace-forbidden'].includes(code) ? 403 : 400);
                 write(res, status, {
                     ok: false,
                     code,
@@ -197,30 +200,106 @@ export function detectAmbiguousTask({ title = '', description = '', prompt = '',
     return undefined;
 }
 
-function normalizeAttachmentsPayload(raw) {
+const ATTACHMENT_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
+const ATTACHMENT_MEDIA_TYPE_RE = /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/;
+const ATTACHMENT_SHA256_RE = /^[0-9a-f]{64}$/;
+const ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024;
+const ATTACHMENT_TOTAL_MAX_BYTES = 32 * 1024 * 1024;
+
+export function canonicalAttachmentName(raw) {
+    const cleaned = String(raw ?? '')
+        .replace(/[\u0000-\u001f\u007f/\\]+/g, '_')
+        .trim()
+        .slice(0, 180);
+    return cleaned === '' || cleaned === '.' || cleaned === '..' ? 'attachment' : cleaned;
+}
+
+export function normalizeAttachmentsPayload(raw) {
     if (!Array.isArray(raw)) return undefined;
     const out = [];
-    for (const item of raw.slice(0, 8)) {
+    const seen = new Set();
+    let totalBytes = 0;
+    for (const item of raw) {
+        if (out.length >= 8) break;
         if (!item || typeof item !== 'object') continue;
         if (item.kind !== 'image' && item.kind !== 'file') continue;
-        if (typeof item.attachmentId !== 'string' || !item.attachmentId) continue;
-        if (typeof item.name !== 'string' || !item.name) continue;
-        if (typeof item.mediaType !== 'string' || !item.mediaType) continue;
-        if (typeof item.sha256 !== 'string' || !item.sha256) continue;
-        if (typeof item.bytes !== 'number' || !Number.isInteger(item.bytes) || item.bytes < 0) continue;
-        const entry = {
-            kind: item.kind,
-            attachmentId: item.attachmentId,
-            name: item.name,
-            bytes: item.bytes,
-            mediaType: item.mediaType,
-            sha256: item.sha256,
-            ...(item.kind === 'image' && typeof item.width === 'number' && typeof item.height === 'number'
-                ? { width: item.width, height: item.height } : {}),
-        };
-        out.push(entry);
+        if (typeof item.attachmentId !== 'string') continue;
+        const attachmentId = item.attachmentId.trim();
+        if (!attachmentId || attachmentId.length > 128 || attachmentId.includes('/') || attachmentId.includes('\\') || attachmentId.includes('..') || seen.has(attachmentId)) continue;
+        if (typeof item.bytes !== 'number' || !Number.isInteger(item.bytes) || item.bytes < 0 || item.bytes > ATTACHMENT_MAX_BYTES) continue;
+        if (totalBytes + item.bytes > ATTACHMENT_TOTAL_MAX_BYTES) continue;
+        const mediaType = typeof item.mediaType === 'string' ? item.mediaType.trim().toLowerCase() : '';
+        if (!mediaType || mediaType.length > 128 || !ATTACHMENT_MEDIA_TYPE_RE.test(mediaType)) continue;
+        const sha256 = typeof item.sha256 === 'string' ? item.sha256.trim().toLowerCase() : '';
+        if (!ATTACHMENT_SHA256_RE.test(sha256)) continue;
+        const name = canonicalAttachmentName(item.name);
+        if (item.kind === 'image') {
+            if (!ATTACHMENT_IMAGE_TYPES.has(mediaType)) continue;
+            if (typeof item.width !== 'number' || !Number.isInteger(item.width) || item.width < 1 || item.width > 32768) continue;
+            if (typeof item.height !== 'number' || !Number.isInteger(item.height) || item.height < 1 || item.height > 32768) continue;
+            seen.add(attachmentId);
+            totalBytes += item.bytes;
+            out.push({ kind: 'image', attachmentId, name, bytes: item.bytes, mediaType, sha256, width: item.width, height: item.height });
+        }
+        else {
+            seen.add(attachmentId);
+            totalBytes += item.bytes;
+            out.push({ kind: 'file', attachmentId, name, bytes: item.bytes, mediaType, sha256 });
+        }
     }
     return out.length > 0 ? out : undefined;
+}
+
+function actionCarriesAttachments(action) {
+    if (!action || typeof action !== 'object') return false;
+    if (action.kind === 'create') return Array.isArray(action.input?.attachments) && action.input.attachments.length > 0;
+    if (action.kind === 'update') return Array.isArray(action.patch?.attachments) && action.patch.attachments.length > 0;
+    return false;
+}
+
+export function postVerifiedBoardAction(origin, req, requestId, action, initiator) {
+    const url = new URL('/api/task-board/action', origin);
+    const body = JSON.stringify({
+        requestId,
+        action,
+        ...(typeof initiator === 'string' && initiator.trim() !== '' ? { initiator } : {}),
+    });
+    const headers = {
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(body)),
+        connection: 'close',
+        origin: url.origin,
+        'sec-fetch-site': 'same-origin',
+        ...(typeof req?.headers?.cookie === 'string' && req.headers.cookie !== '' ? { cookie: req.headers.cookie } : {}),
+        ...(typeof req?.headers?.authorization === 'string' && req.headers.authorization !== '' ? { authorization: req.headers.authorization } : {}),
+    };
+    const transport = url.protocol === 'https:' ? httpsRequest : httpRequest;
+    return new Promise((resolve, reject) => {
+        const upstream = transport(url, { method: 'POST', headers, timeout: 15_000 }, response => {
+            const chunks = [];
+            response.on('data', chunk => chunks.push(Buffer.from(chunk)));
+            response.on('end', () => {
+                const raw = Buffer.concat(chunks).toString('utf8');
+                let parsed;
+                try { parsed = raw ? JSON.parse(raw) : {}; }
+                catch { parsed = {}; }
+                const status = response.statusCode ?? 500;
+                if (status >= 200 && status < 300 && parsed && typeof parsed === 'object') {
+                    resolve(parsed);
+                    return;
+                }
+                const err = new Error(typeof parsed?.error === 'string' && parsed.error
+                    ? parsed.error
+                    : '任务看板拒绝了附件操作（HTTP ' + status + '）');
+                err.code = typeof parsed?.code === 'string' && parsed.code ? parsed.code : 'attachment-action-failed';
+                err.status = status >= 400 && status < 600 ? status : 400;
+                reject(err);
+            });
+        });
+        upstream.on('timeout', () => upstream.destroy(Object.assign(new Error('附件校验请求超时'), { code: 'attachment-timeout', status: 504 })));
+        upstream.on('error', err => reject(err));
+        upstream.end(body);
+    });
 }
 
 function taskView(task, workflow, room, ticketNumbers) {
@@ -283,7 +362,23 @@ function taskView(task, workflow, room, ticketNumbers) {
 }
 
 function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, memory, auth, allowedOrigins, orchestration, rooms, extras = {}) {
-    const { root: groupsRootDir, rosters, ticketNumbers, sessionTitles, sessionController, config, llm, readDefaultModel, workspacePath } = extras;
+    const {
+        root: groupsRootDir, rosters, ticketNumbers, sessionTitles, sessionController, config, llm, readDefaultModel,
+        workspacePath, webOrigin, getAttachmentStore, resolveAttachments,
+    } = extras;
+    const applyBoardAction = async (req, board, source, action, actionInitiator = initiator) => {
+        const requestId = randomUUID();
+        if (source === 'host' && actionCarriesAttachments(action)) {
+            if (typeof board.applyVerified === 'function') {
+                return board.applyVerified(requestId, action, actionInitiator);
+            }
+            const origin = typeof webOrigin === 'function' ? webOrigin() : undefined;
+            if (typeof origin === 'string' && origin !== '') {
+                return postVerifiedBoardAction(origin, req, requestId, action, actionInitiator);
+            }
+        }
+        return board.apply(requestId, action, actionInitiator);
+    };
     const authenticate = (req, write = false) => auth.authenticate(req, { write, origins: allowedOrigins() });
     const allowed = (access, target, ledger) => access.ok && auth.allows(access.session, {
         agentId: target.agentId, workspaceId: target.workspaceId,
@@ -309,8 +404,11 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             return [taskView(task, target ? orchestration.view(source, task.id) : undefined, room, ticketNumbers)];
         });
     };
-    const roomRoutes = createTaskRoomRoutes({ exact, write, readBody, authenticate, allowed, auth, rooms,
-        orchestration, getBoard, boardSource, getInitiator: () => initiator.replace(/^marshal:/, ''), ticketNumbers, workspacePath });
+    const roomRoutes = createTaskRoomRoutes({
+        exact, write, readBody, authenticate, allowed, auth, rooms,
+        orchestration, getBoard, boardSource, getInitiator: () => initiator.replace(/^marshal:/, ''),
+        ticketNumbers, workspacePath, normalizeAttachments: normalizeAttachmentsPayload, resolveAttachments,
+    });
     return [
         ...roomRoutes.routes,
         exact('GET', '/marshal/health', async (req, res) => {
@@ -382,6 +480,75 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             }
             write(res, 200, { ok: true, report });
         }),
+        exact('GET', '/marshal/tasks/attachment', async (req, res) => {
+            const board = getBoard();
+            if (board === undefined) {
+                write(res, 503, { ok: false, code: 'no-task-board' });
+                return;
+            }
+            const params = new URL(req.url ?? '', 'http://localhost').searchParams;
+            const taskId = params.get('taskId') ?? '';
+            const attachmentId = params.get('id') ?? '';
+            if (!taskId || !attachmentId) {
+                write(res, 400, { ok: false, code: 'invalid-attachment-query' });
+                return;
+            }
+            const source = boardSource();
+            const task = (board.snapshot().tasks ?? []).find(item => item.id === taskId);
+            if (!task) {
+                write(res, 404, { ok: false, code: 'task-not-found' });
+                return;
+            }
+            const access = authenticate(req);
+            const ledger = access.ok ? auth.loadLedger() : undefined;
+            const room = rooms?.find(source, taskId);
+            const target = orchestration?.target(source, taskId);
+            if (room && !taskRoomAccess(access, room, allowed, ledger)) {
+                write(res, access.ok ? 403 : access.status, { ok: false, code: access.ok ? 'workspace-forbidden' : access.code });
+                return;
+            }
+            if (target && !allowed(access, { workspaceId: target.workspaceId }, ledger)) {
+                write(res, access.ok ? 403 : access.status, { ok: false, code: access.ok ? 'workspace-forbidden' : access.code });
+                return;
+            }
+            const att = (normalizeAttachmentsPayload(task.attachments) ?? []).find(item => item.attachmentId === attachmentId);
+            if (!att) {
+                write(res, 404, { ok: false, code: 'not-found', message: '未在该工单上找到对应附件。' });
+                return;
+            }
+            const store = typeof getAttachmentStore === 'function' ? getAttachmentStore() : undefined;
+            if (!store) {
+                write(res, 503, { ok: false, code: 'storage-unavailable', message: '当前环境未挂载附件存储服务。' });
+                return;
+            }
+            if (att.kind === 'image') {
+                const stored = await store.readImage({
+                    attachmentId: att.attachmentId, mediaType: att.mediaType, bytes: att.bytes,
+                    width: att.width, height: att.height, name: att.name,
+                });
+                const buf = Buffer.from(stored.data);
+                res.writeHead(200, {
+                    'content-type': stored.ref.mediaType,
+                    'content-length': String(buf.byteLength),
+                    'content-disposition': "inline; filename*=UTF-8''" + encodeURIComponent(att.name),
+                    'x-content-type-options': 'nosniff',
+                    'cache-control': 'no-store',
+                });
+                res.end(buf);
+                return;
+            }
+            res.writeHead(200, {
+                'content-type': 'application/octet-stream',
+                'content-length': String(att.bytes),
+                'content-disposition': "attachment; filename*=UTF-8''" + encodeURIComponent(att.name),
+                'x-content-type-options': 'nosniff',
+                'cache-control': 'no-store',
+            });
+            for await (const chunk of store.readFileStream({ attachmentId: att.attachmentId, name: att.name, bytes: att.bytes })) {
+                res.write(Buffer.from(chunk));
+            }
+            res.end();
+        }),
         exact('GET', '/marshal/tasks/state', async (req, res) => {
             const board = getBoard();
             if (board === undefined) {
@@ -411,6 +578,10 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
             const tags = normalizeCardTags(body.tags);
             const attachments = normalizeAttachmentsPayload(body.attachments);
+            if (Array.isArray(body.attachments) && body.attachments.length > 0 && attachments === undefined) {
+                write(res, 400, { ok: false, code: 'invalid-attachments', message: '附件元数据无效或超过限制（最多 8 个，单文件 ≤ 10MB）。' });
+                return;
+            }
             const parentId = typeof body.parentId === 'string' && body.parentId.trim() !== '' ? body.parentId.trim() : undefined;
             const explicitPermission = ['read-only', 'workspace-write', 'danger-full-access'].includes(body.permission) ? body.permission : undefined;
             const permission = explicitPermission ?? ((body.workspaceId || body.orchestration) ? 'workspace-write' : undefined);
@@ -478,7 +649,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
                 ...(reuseSession === undefined ? {} : { reuseSession }),
             };
             const beforeIds = existing ?? new Set((board.snapshot().tasks ?? []).map(task => task.id));
-            let snapshot = await board.apply(randomUUID(), { kind: 'create', id, input }, initiator);
+            let snapshot = await applyBoardAction(req, board, source, { kind: 'create', id, input }, initiator);
             const added = (snapshot.tasks ?? []).filter(task => !beforeIds.has(task.id));
             const created = (snapshot.tasks ?? []).find(task => task.id === id) ?? (added.length === 1 ? added[0] : undefined);
             if (scope) {
@@ -697,13 +868,31 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             if (typeof body.description === 'string') patch.description = body.description;
             if (typeof body.prompt === 'string') patch.prompt = body.prompt;
             if (['read-only', 'workspace-write', 'danger-full-access'].includes(body.permission)) patch.permission = body.permission;
+            if (typeof body.model === 'string') patch.model = body.model.trim();
+            if (typeof body.reasoningEffort === 'string') patch.reasoningEffort = body.reasoningEffort.trim();
+            if (body.reuseSession === null || typeof body.reuseSession === 'boolean') patch.reuseSession = body.reuseSession;
+            if (body.freeze === null) patch.freeze = null;
+            else if (body.freeze && typeof body.freeze === 'object' && typeof body.freeze.goal === 'string') {
+                patch.freeze = body.freeze.goal.trim() !== '' ? { goal: body.freeze.goal.trim() } : null;
+            }
             if (body.tags === null) patch.tags = null;
             else if (Array.isArray(body.tags)) {
                 const tags = normalizeCardTags(body.tags);
                 patch.tags = tags ?? null;
             }
+            if (body.attachments === null || (Array.isArray(body.attachments) && body.attachments.length === 0)) {
+                patch.attachments = null;
+            }
+            else if (Array.isArray(body.attachments)) {
+                const normalized = normalizeAttachmentsPayload(body.attachments);
+                if (normalized === undefined) {
+                    write(res, 400, { ok: false, code: 'invalid-attachments', message: '附件元数据无效或超过限制（最多 8 个，单文件 ≤ 10MB）。' });
+                    return;
+                }
+                patch.attachments = normalized;
+            }
             if (Object.keys(patch).length === 0) { write(res, 400, { ok: false, code: 'empty-patch' }); return; }
-            const snapshot = await board.apply(randomUUID(), { kind: 'update', taskId: body.taskId, patch }, initiator);
+            const snapshot = await applyBoardAction(req, board, source, { kind: 'update', taskId: body.taskId, patch }, initiator);
             write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
         }),
         exact('POST', '/marshal/tasks/set-parent', async (req, res) => {
@@ -1351,10 +1540,71 @@ export function mountGroups(ctx, config, options = {}) {
         reader: createReplyReader(surface),
         logger: options.logger ?? ctx.logger,
     });
+    const resolveWebOrigin = () => {
+        try {
+            if (typeof webServer?.getOrigin === 'function') {
+                const origin = webServer.getOrigin();
+                if (typeof origin === 'string' && origin !== '') return origin;
+            }
+        }
+        catch { /* fall back to port */ }
+        if (typeof webServer?.port === 'number') return 'http://127.0.0.1:' + webServer.port;
+        return undefined;
+    };
+    const getAttachmentStore = () => {
+        if (options.attachments !== undefined) return typeof options.attachments === 'function' ? options.attachments() : options.attachments;
+        if (typeof ctx.get !== 'function') return undefined;
+        try {
+            const store = ctx.get('attachments');
+            return store !== undefined && store !== null && typeof store.saveImage === 'function' ? store : undefined;
+        }
+        catch { return undefined; }
+    };
+    const attachmentCacheDir = join(root, 'ticket-attachments');
+    const resolveTicketAttachments = async card => {
+        const list = normalizeAttachmentsPayload(card?.attachments);
+        if (!list || list.length === 0) return [];
+        const store = getAttachmentStore();
+        const resolved = [];
+        for (const att of list) {
+            const summary = {
+                kind: att.kind,
+                attachmentId: att.attachmentId,
+                name: att.name,
+                bytes: att.bytes,
+                mediaType: att.mediaType,
+                ...(att.kind === 'image' ? { width: att.width, height: att.height } : {}),
+            };
+            if (store) {
+                try {
+                    if (att.kind === 'file' && typeof store.fileHostPath === 'function') {
+                        const filePath = store.fileHostPath({ attachmentId: att.attachmentId, name: att.name, bytes: att.bytes });
+                        if (typeof filePath === 'string' && filePath !== '') summary.path = filePath;
+                    }
+                    else if (att.kind === 'image' && typeof store.readImage === 'function') {
+                        await mkdir(attachmentCacheDir, { recursive: true });
+                        const safeId = att.attachmentId.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 64);
+                        const imagePath = join(attachmentCacheDir, safeId + '-' + att.name);
+                        if (!existsSync(imagePath)) {
+                            const stored = await store.readImage({
+                                attachmentId: att.attachmentId, mediaType: att.mediaType, bytes: att.bytes,
+                                width: att.width, height: att.height, name: att.name,
+                            });
+                            await writeFile(imagePath, Buffer.from(stored.data), { mode: 0o600 });
+                        }
+                        summary.path = imagePath;
+                    }
+                }
+                catch { /* keep metadata even if file projection is unavailable */ }
+            }
+            resolved.push(summary);
+        }
+        return resolved;
+    };
     const agents = createAgentsHttpClient({
         baseUrl: () => {
-            if (typeof webServer?.getOrigin === 'function') return webServer.getOrigin();
-            if (typeof webServer?.port === 'number') return 'http://127.0.0.1:' + webServer.port;
+            const origin = resolveWebOrigin();
+            if (origin) return origin;
             throw new Error('marshal: agents no-web-server');
         },
     });
@@ -1394,6 +1644,7 @@ export function mountGroups(ctx, config, options = {}) {
             file: join(root, 'task-orchestration.json'), inventory: readAgentsLedger, memory: options.memory,
             port: createDiscussionPort({ agents: config.agents, llm, codexExecutable: config.codexExecutable }),
             defaultModel: readDefaultModel, logger: options.logger, workspacePath: agents.workspace,
+            resolveAttachments: resolveTicketAttachments,
             leaderAutoReview: true,
             onState: moveCardStatus,
             onPermissionBlocked: async (_source, taskId) => {
@@ -1492,7 +1743,11 @@ export function mountGroups(ctx, config, options = {}) {
                 }
                 catch { /* desktop origin is enough when the host has no public origin */ }
                 return origins;
-            }, orchestration, rooms, { root, rosters, ticketNumbers, sessionTitles, sessionController: ctx.sessionController, config, llm, readDefaultModel, workspacePath: agents.workspace }).map((route) => scoped.webServer.register(route));
+            }, orchestration, rooms, {
+                root, rosters, ticketNumbers, sessionTitles, sessionController: ctx.sessionController,
+                config, llm, readDefaultModel, workspacePath: agents.workspace,
+                webOrigin: resolveWebOrigin, getAttachmentStore, resolveAttachments: resolveTicketAttachments,
+            }).map((route) => scoped.webServer.register(route));
             return () => {
                 for (const dispose of disposers) dispose();
             };

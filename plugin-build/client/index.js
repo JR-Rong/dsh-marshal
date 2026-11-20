@@ -2151,6 +2151,7 @@ window.__ModuleLoader__.load({
         '.mtr-main{display:flex;flex-direction:column;flex:1;min-width:0;min-height:0}',
         '.mtr-header{padding:11px 18px;border-bottom:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.16));display:flex;gap:10px;flex-wrap:wrap;align-items:center;background:var(--dsw-alias-bg-layer-1,rgba(128,128,128,.02))}',
         '.mtr-review-bar{margin:10px 18px 0;padding:11px 14px;border-radius:12px;border:1px solid color-mix(in srgb,#8b5cf6 42%,transparent);background:color-mix(in srgb,#8b5cf6 10%,var(--dsw-alias-bg-layer-2,rgba(128,128,128,.06)));display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px}',
+        '.mtr-att-bar{margin:8px 18px 0;padding:8px 12px;border-radius:10px;border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.16));background:var(--dsw-alias-bg-layer-1,rgba(128,128,128,.04));display:flex;flex-wrap:wrap;align-items:center;gap:8px}',
         '.mtr-stream{flex:1;min-height:0;overflow-y:auto;padding:16px 20px;display:flex;flex-direction:column;gap:14px}',
         '.mtr-sys-row{display:flex;justify-content:center;margin:2px 0}',
         '.mtr-sys-pill{max-width:86%;padding:4px 12px;border-radius:999px;font-size:11.5px;line-height:1.45;color:var(--dsw-alias-label-secondary,rgba(140,145,158,.92));background:color-mix(in srgb,currentColor 7%,transparent);border:1px solid color-mix(in srgb,currentColor 10%,transparent);text-align:center;overflow-wrap:anywhere}',
@@ -2657,6 +2658,8 @@ window.__ModuleLoader__.load({
         '.mtb-sub-row{display:flex;align-items:center;gap:8px;padding:6px 9px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1,color-mix(in srgb,currentColor 10%,transparent));background:var(--dsw-alias-bg-base,transparent)}',
         '.mtb-att-list{display:flex;flex-wrap:wrap;gap:8px}',
         '.mtb-att-card{display:inline-flex;align-items:center;gap:8px;padding:5px 9px;border-radius:9px;border:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 16%,transparent));background:var(--dsw-alias-bg-base,transparent);font-size:11.5px;max-width:240px}',
+        '.mtb-att-link{color:inherit;text-decoration:none;font-weight:500;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+        '.mtb-att-link:hover{text-decoration:underline;color:var(--dsw-alias-brand-primary,#6366f1)}',
         '.mtb-att-thumb{width:34px;height:34px;border-radius:6px;object-fit:cover;flex-shrink:0;border:1px solid var(--dsw-alias-border-l1,transparent)}',
         '.mtb-exec-row{display:grid;gap:4px;padding:8px 10px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1,color-mix(in srgb,currentColor 10%,transparent));background:var(--dsw-alias-bg-base,transparent);font-size:11.5px}',
         '.mtb-review-panel{display:grid;gap:9px;padding:12px 14px;border-radius:12px;border:1px solid color-mix(in srgb,#8b5cf6 42%,transparent);background:color-mix(in srgb,#8b5cf6 9%,var(--dsw-alias-bg-layer-2,transparent))}',
@@ -2755,7 +2758,89 @@ window.__ModuleLoader__.load({
       { id: 'xhigh', label: '极高 (xhigh)' },
     ];
     const IMAGE_MEDIA_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
+    const EXT_MEDIA_TYPES = {
+      png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif',
+      pdf: 'application/pdf', json: 'application/json', md: 'text/markdown', txt: 'text/plain',
+      log: 'text/plain', csv: 'text/csv', patch: 'text/x-diff', diff: 'text/x-diff',
+      yaml: 'text/yaml', yml: 'text/yaml', html: 'text/html', xml: 'application/xml', zip: 'application/zip',
+    };
+    const MAX_SINGLE_ATTACHMENT_BYTES = 10 * 1024 * 1024;
     const PARSE_MODEL_STORAGE_KEY = 'dsh.taskBoard.parseModel.v1';
+
+    function resolveClientApiUrl(relativePath) {
+      try {
+        const base = typeof document !== 'undefined' && document.baseURI ? document.baseURI : window.location.href;
+        return new URL(relativePath, base).toString();
+      } catch {
+        return relativePath;
+      }
+    }
+
+    function inferAttachmentMediaType(file) {
+      const raw = String(file?.type || '').trim().toLowerCase();
+      if (/^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/.test(raw)) return raw;
+      const name = String(file?.name || '').trim();
+      const dot = name.lastIndexOf('.');
+      const ext = dot >= 0 ? name.slice(dot + 1).toLowerCase() : '';
+      return EXT_MEDIA_TYPES[ext] || 'application/octet-stream';
+    }
+
+    function serializeAttachmentForWire(att) {
+      if (!att || typeof att !== 'object') return att;
+      return {
+        kind: att.kind,
+        attachmentId: att.attachmentId,
+        name: att.name,
+        bytes: att.bytes,
+        mediaType: String(att.mediaType || 'application/octet-stream').toLowerCase(),
+        sha256: String(att.sha256 || '').toLowerCase(),
+        ...(att.kind === 'image' ? { width: att.width, height: att.height } : {}),
+      };
+    }
+
+    function attachmentHref(taskId, att, previewMap) {
+      if (!att?.attachmentId) return '';
+      const localUrl = previewMap?.get?.(att.attachmentId);
+      if (localUrl) return localUrl;
+      if (taskId) {
+        return resolveClientApiUrl('marshal/tasks/attachment?taskId=' + encodeURIComponent(taskId) + '&id=' + encodeURIComponent(att.attachmentId));
+      }
+      if (att.kind === 'image') {
+        return resolveClientApiUrl('api/task-board/attachments/image?id=' + encodeURIComponent(att.attachmentId));
+      }
+      return '';
+    }
+
+    async function uploadAttachmentFiles(fileList, previewMap) {
+      const files = Array.from(fileList || []).slice(0, 8);
+      if (files.length === 0) return [];
+      const uploaded = [];
+      for (const file of files) {
+        if (typeof file.size === 'number' && file.size > MAX_SINGLE_ATTACHMENT_BYTES) {
+          throw new Error('文件「' + (file.name || 'attachment') + '」超过单文件 10 MB 限制');
+        }
+        const mediaType = inferAttachmentMediaType(file);
+        const kind = IMAGE_MEDIA_TYPES.has(mediaType) ? 'image' : 'file';
+        const qs = new URLSearchParams({ kind, name: file.name || 'attachment', mediaType });
+        const uploadUrl = resolveClientApiUrl('api/task-board/attachments/upload?' + qs.toString());
+        const resp = await fetch(uploadUrl, {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'content-type': 'application/octet-stream' },
+          body: file,
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok || !data?.attachment) {
+          throw new Error(data?.error || data?.message || ('上传失败 HTTP ' + resp.status));
+        }
+        const normalized = serializeAttachmentForWire(data.attachment);
+        if (normalized.kind === 'image' && previewMap && typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function') {
+          try { previewMap.set(normalized.attachmentId, URL.createObjectURL(file)); } catch {}
+        }
+        uploaded.push(normalized);
+      }
+      return uploaded;
+    }
 
     const TASK_PERMISSION_LABELS = {
       'read-only': '只读',
@@ -3085,28 +3170,25 @@ window.__ModuleLoader__.load({
         return DEFAULT_REASONING_EFFORTS;
       };
 
+      const previewUrlsRef = React.useRef(new Map());
+      React.useEffect(() => () => {
+        for (const blobUrl of previewUrlsRef.current.values()) {
+          try { URL.revokeObjectURL(blobUrl); } catch {}
+        }
+        previewUrlsRef.current.clear();
+      }, []);
+
       const uploadFiles = async (fileList, onUploaded) => {
         const files = Array.from(fileList || []).slice(0, 8);
         if (files.length === 0) return;
         setUploading(true);
         setError('');
         try {
-          const uploaded = [];
-          for (const file of files) {
-            const mediaType = file.type || 'application/octet-stream';
-            const kind = IMAGE_MEDIA_TYPES.has(mediaType.toLowerCase()) ? 'image' : 'file';
-            const qs = new URLSearchParams({ kind, name: file.name || 'attachment', mediaType });
-            const resp = await fetch('api/task-board/attachments/upload?' + qs.toString(), {
-              method: 'POST',
-              credentials: 'same-origin',
-              headers: { 'content-type': mediaType },
-              body: file,
-            });
-            const data = await resp.json().catch(() => ({}));
-            if (!resp.ok || !data?.attachment) throw new Error(data?.error || ('上传失败 HTTP ' + resp.status));
-            uploaded.push(data.attachment);
+          const uploaded = await uploadAttachmentFiles(files, previewUrlsRef.current);
+          if (uploaded.length > 0) {
+            onUploaded(uploaded);
+            setNotice('已上传 ' + uploaded.length + ' 个附件：' + uploaded.map(item => item.name).join('、'));
           }
-          onUploaded(uploaded);
         }
         catch (e) { setError('上传附件失败：' + (e.message || e)); }
         finally { setUploading(false); }
@@ -3308,7 +3390,7 @@ window.__ModuleLoader__.load({
               description: description.trim(),
               ...(formPrompt.trim() ? { prompt: formPrompt.trim() } : {}),
               ...(parsedTags.length > 0 ? { tags: parsedTags } : {}),
-              ...(formAttachments.length > 0 ? { attachments: formAttachments } : {}),
+              ...(formAttachments.length > 0 ? { attachments: formAttachments.map(serializeAttachmentForWire) } : {}),
               ...(formParentId ? { parentId: formParentId } : {}),
               ...(formPermission ? { permission: formPermission } : {}),
               ...(formModel ? { model: formModel } : {}),
@@ -3469,7 +3551,7 @@ window.__ModuleLoader__.load({
             ...(task.model ? { model: task.model } : {}),
             ...(task.reasoningEffort ? { reasoningEffort: task.reasoningEffort } : {}),
             ...(task.reuseSession ? { reuseSession: true } : {}),
-            ...(task.attachments?.length ? { attachments: task.attachments } : {}),
+            ...(task.attachments?.length ? { attachments: task.attachments.map(serializeAttachmentForWire) } : {}),
           }, false);
           setTasks(result.tasks || []);
         }
@@ -3565,19 +3647,43 @@ window.__ModuleLoader__.load({
       const iconSession = () => h('svg', { width: 13, height: 13, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.9, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': 'true' },
         h('path', { d: 'M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z' }));
 
-      const renderAttachments = (items, onRemove) => {
+      const renderAttachments = (items, onRemove, taskId = '') => {
         if (!Array.isArray(items) || items.length === 0) return null;
         return h('div', { className: 'mtb-att-list' },
-          items.map(att => h('div', { key: att.attachmentId, className: 'mtb-att-card', title: att.name + ' (' + formatBytes(att.bytes) + ')' },
-            att.kind === 'image' && h('img', {
-              className: 'mtb-att-thumb',
-              src: 'api/task-board/attachments/image?id=' + encodeURIComponent(att.attachmentId),
-              alt: att.name,
-            }),
-            h('div', { style: { minWidth: 0, flex: 1 } },
-              h('div', { style: { fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, att.name),
-              h('div', { style: { fontSize: 10.5, color: dswTheme.dim } }, formatBytes(att.bytes))),
-            onRemove && h('button', { type: 'button', className: 'mtb-tag-x', 'aria-label': '移除附件 ' + att.name, onClick: () => onRemove(att.attachmentId) }, '×'))));
+          items.map(att => {
+            const href = attachmentHref(taskId, att, previewUrlsRef.current);
+            const fallbackImgSrc = resolveClientApiUrl('api/task-board/attachments/image?id=' + encodeURIComponent(att.attachmentId));
+            const imgSrc = previewUrlsRef.current.get(att.attachmentId)
+              || (taskId ? href : fallbackImgSrc);
+            return h('div', { key: att.attachmentId, className: 'mtb-att-card', title: att.name + ' (' + formatBytes(att.bytes) + ')' },
+              att.kind === 'image'
+                ? h('img', {
+                    className: 'mtb-att-thumb',
+                    src: imgSrc,
+                    alt: att.name,
+                    onError: ev => {
+                      if (ev.currentTarget.dataset.fallback !== '1' && ev.currentTarget.src !== fallbackImgSrc) {
+                        ev.currentTarget.dataset.fallback = '1';
+                        ev.currentTarget.src = fallbackImgSrc;
+                      }
+                    },
+                  })
+                : h('span', { style: { fontSize: 15, flexShrink: 0 }, 'aria-hidden': 'true' }, '📄'),
+              h('div', { style: { minWidth: 0, flex: 1 } },
+                href
+                  ? h('a', {
+                      className: 'mtb-att-link',
+                      href,
+                      target: '_blank',
+                      rel: 'noreferrer',
+                      download: att.kind === 'file' ? att.name : undefined,
+                      onClick: ev => ev.stopPropagation(),
+                    }, att.name)
+                  : h('div', { style: { fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, att.name),
+                h('div', { style: { fontSize: 10.5, color: dswTheme.dim } },
+                  formatBytes(att.bytes) + (att.kind === 'image' && att.width && att.height ? ' · ' + att.width + '×' + att.height : ''))),
+              onRemove && h('button', { type: 'button', className: 'mtb-tag-x', 'aria-label': '移除附件 ' + att.name, onClick: () => onRemove(att.attachmentId) }, '×'));
+          }));
       };
 
       const card = (task, column) => {
@@ -3804,6 +3910,12 @@ window.__ModuleLoader__.load({
               !archived && !isRunning && h('button', { type: 'button', className: 'mtb-btn', onClick: () => setDrawerEditing(v => !v) }, drawerEditing ? '取消编辑' : '编辑'),
               h('button', { type: 'button', className: 'mtb-icon-btn', 'aria-label': '关闭详情', onClick: () => { setSelectedId(''); setConfirmId(''); setDrawerEditing(false); } }, '✕')),
             h('div', { className: 'mtb-drawer-body' },
+              error && h('div', { role: 'alert', style: { padding: '8px 12px', borderRadius: 9, fontSize: 12, color: dswTheme.danger, background: 'color-mix(in srgb, #ef4444 10%, transparent)', border: '1px solid color-mix(in srgb, #ef4444 30%, transparent)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 } },
+                h('span', null, error),
+                h('button', { type: 'button', className: 'mtb-icon-btn', onClick: () => setError('') }, '✕')),
+              notice && h('div', { role: 'status', style: { padding: '8px 12px', borderRadius: 9, fontSize: 12, color: '#10b981', background: 'color-mix(in srgb, #10b981 10%, transparent)', border: '1px solid color-mix(in srgb, #10b981 30%, transparent)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 } },
+                h('span', null, notice),
+                h('button', { type: 'button', className: 'mtb-icon-btn', onClick: () => setNotice('') }, '✕')),
               !archived && task.status === 'review' && (() => {
                 const reviewMeta = describeReviewState(task, workflow, drawerAmbiguity, needsPermConfirm);
                 return h('div', { className: 'mtb-review-panel' },
@@ -3921,16 +4033,20 @@ window.__ModuleLoader__.load({
 
               h('div', { className: 'mtb-drawer-sec' },
                 h('div', { className: 'mtb-drawer-sec-title' },
-                  '附件（图片 / 文件）',
+                  '附件（图片 / 文件，最多 8 个）',
                   !archived && drawerAttachments.length < 8 && h('label', { className: 'mtb-btn', style: { cursor: uploading ? 'wait' : 'pointer', padding: '3px 9px', fontSize: 11 } },
                     uploading ? '上传中…' : '📎 上传附件',
                     h('input', {
                       type: 'file', multiple: true, style: { display: 'none' }, disabled: uploading || busy,
                       onChange: e => {
-                        const fl = e.target.files;
+                        const picked = Array.from(e.target.files || []);
                         e.target.value = '';
-                        void uploadFiles(fl, added => {
-                          const merged = [...drawerAttachments, ...added].slice(0, 8);
+                        void uploadFiles(picked, added => {
+                          const existingIds = new Set(drawerAttachments.map(a => a.attachmentId));
+                          const merged = [
+                            ...drawerAttachments.map(serializeAttachmentForWire),
+                            ...added.filter(a => !existingIds.has(a.attachmentId)),
+                          ].slice(0, 8);
                           void updateTask(task, { attachments: merged });
                         });
                       },
@@ -3938,9 +4054,9 @@ window.__ModuleLoader__.load({
                 drawerAttachments.length === 0
                   ? h('span', { style: uiMuted }, '暂无附件')
                   : renderAttachments(drawerAttachments, archived ? undefined : attId => {
-                      const remaining = drawerAttachments.filter(a => a.attachmentId !== attId);
+                      const remaining = drawerAttachments.filter(a => a.attachmentId !== attId).map(serializeAttachmentForWire);
                       void updateTask(task, { attachments: remaining.length > 0 ? remaining : null });
-                    })),
+                    }, task.id)),
 
               h('div', { className: 'mtb-drawer-sec' },
                 h('div', { className: 'mtb-drawer-sec-title' },
@@ -4145,7 +4261,25 @@ window.__ModuleLoader__.load({
             h('strong', { style: { fontSize: 13 } }, editing ? '编辑工单分工' : '新建任务卡片'),
             !editing && h('button', { type: 'button', className: 'mtb-btn mtb-btn-ai', onClick: () => { setParseError(''); setParseOpen(true); } }, '✨ 从文本 AI 自动解析')),
           h(Field, { label: '标题' }, h('input', { value: title, readOnly: Boolean(editing), onChange: event => { setTitle(event.target.value); setPlan(null); }, placeholder: '这张卡片要做什么', style: uiInput })),
-          h(Field, { label: '描述（建议写清目标与验收标准；若模糊将自动转入「待确认」）' }, h('textarea', { value: description, readOnly: Boolean(editing), onChange: event => { setDescription(event.target.value); setPlan(null); }, rows: 3, placeholder: '背景、目标、验收标准、约束…', style: { ...uiInput, resize: 'vertical', lineHeight: 1.6 } })),
+          h(Field, { label: '描述（建议写清目标与验收标准；可直接粘贴截图或文件；若模糊将自动转入「待确认」）' }, h('textarea', {
+            value: description,
+            readOnly: Boolean(editing),
+            onChange: event => { setDescription(event.target.value); setPlan(null); },
+            onPaste: event => {
+              if (editing || uploading || busy) return;
+              const pasted = Array.from(event.clipboardData?.files || []);
+              if (pasted.length > 0) {
+                event.preventDefault();
+                void uploadFiles(pasted, added => setFormAttachments(prev => {
+                  const existingIds = new Set(prev.map(a => a.attachmentId));
+                  return [...prev, ...added.filter(a => !existingIds.has(a.attachmentId))].slice(0, 8);
+                }));
+              }
+            },
+            rows: 3,
+            placeholder: '背景、目标、验收标准、约束（支持 ⌘/Ctrl+V 直接粘贴截图附件）…',
+            style: { ...uiInput, resize: 'vertical', lineHeight: 1.6 },
+          })),
           liveAmbiguityHint && h('div', { className: 'mtb-warn-hint' }, '⚠ ' + liveAmbiguityHint),
 
           !editing && h('details', { style: { fontSize: 12 } },
@@ -4209,13 +4343,16 @@ window.__ModuleLoader__.load({
               h('input', { type: 'checkbox', checked: formReuseSession, onChange: event => setFormReuseSession(event.target.checked) }),
               '复用上次执行会话'),
             h('label', { className: 'mtb-btn', style: { cursor: uploading ? 'wait' : 'pointer' } },
-              uploading ? '附件上传中…' : '📎 选择附件上传（图片 / 文件，可选）',
+              uploading ? '附件上传中…' : ('📎 选择附件上传（图片 / 文件' + (formAttachments.length > 0 ? ' · 已添加 ' + formAttachments.length + '/8' : '，可选') + '）'),
               h('input', {
-                type: 'file', multiple: true, style: { display: 'none' }, disabled: uploading || busy,
+                type: 'file', multiple: true, style: { display: 'none' }, disabled: uploading || busy || formAttachments.length >= 8,
                 onChange: event => {
-                  const fl = event.target.files;
+                  const picked = Array.from(event.target.files || []);
                   event.target.value = '';
-                  void uploadFiles(fl, added => setFormAttachments(prev => [...prev, ...added].slice(0, 8)));
+                  void uploadFiles(picked, added => setFormAttachments(prev => {
+                    const existingIds = new Set(prev.map(a => a.attachmentId));
+                    return [...prev, ...added.filter(a => !existingIds.has(a.attachmentId))].slice(0, 8);
+                  }));
                 },
               }))),
           !editing && renderAttachments(formAttachments, attId => setFormAttachments(prev => prev.filter(a => a.attachmentId !== attId))),
@@ -4281,6 +4418,7 @@ window.__ModuleLoader__.load({
               codexModels.filter(model => slot !== 'coding' || model.work).map(model =>
                 h('option', { key: model.id, value: model.id }, model.model)))))),
 
+          error && h('div', { role: 'alert', style: { padding: '7px 10px', borderRadius: 8, fontSize: 12, color: dswTheme.danger, background: 'color-mix(in srgb, #ef4444 10%, transparent)', border: '1px solid color-mix(in srgb, #ef4444 28%, transparent)' } }, error),
           h('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8 } },
             h('button', { type: 'button', style: uiButton(false), onClick: cancelForm }, '取消'),
             orchestrationMode !== 'plain' && leaderId && plan && h('button', { type: 'button', style: uiButton(false), disabled: busy, onClick: () => { void recommend(); } }, '重新推荐'),
@@ -4386,6 +4524,7 @@ window.__ModuleLoader__.load({
       const [error, setError] = React.useState('');
       const [busy, setBusy] = React.useState(false);
       const [sendingChat, setSendingChat] = React.useState(false);
+      const [uploadingAtt, setUploadingAtt] = React.useState(false);
       const [leader, setLeader] = React.useState('');
       const [remote, setRemote] = React.useState('');
       const [draft, setDraft] = React.useState('');
@@ -4395,6 +4534,13 @@ window.__ModuleLoader__.load({
       const inputRef = React.useRef(null);
       const stickBottomRef = React.useRef(true);
       const prevLastSeqRef = React.useRef(0);
+      const roomPreviewUrlsRef = React.useRef(new Map());
+      React.useEffect(() => () => {
+        for (const blobUrl of roomPreviewUrlsRef.current.values()) {
+          try { URL.revokeObjectURL(blobUrl); } catch {}
+        }
+        roomPreviewUrlsRef.current.clear();
+      }, []);
       const viewKey = workspace + '/' + id;
       selection.current = viewKey;
       const prefix = 'marshal/task-rooms/';
@@ -4403,6 +4549,7 @@ window.__ModuleLoader__.load({
       const loadList = () => workspace ? fetchJson(prefix + 'list' + query({ workspaceId: workspace }), undefined, true) : Promise.resolve({ rooms: [] });
 
       React.useEffect(() => {
+        ensureBoardStyles();
         ensureTaskRoomStyles();
         let alive = true;
         void fetchJson(prefix + 'workspaces', undefined, true).then(data => {
@@ -4690,6 +4837,35 @@ window.__ModuleLoader__.load({
       const localLeaderChoices = leaders.filter(item => item.global || item.workspaceId === workspace);
       const primaryParticipants = participants.filter(p => p.primary);
       const mentionTargets = primaryParticipants.length > 0 ? primaryParticipants : participants.slice(0, 6);
+      const roomTaskId = visible?.taskId || room?.taskId || task?.id || '';
+      const roomAttachments = Array.isArray(visible?.attachments) ? visible.attachments : (Array.isArray(task?.attachments) ? task.attachments : []);
+      const uploadRoomAttachments = async pickedFiles => {
+        const files = Array.from(pickedFiles || []).slice(0, 8);
+        if (!roomTaskId || files.length === 0 || uploadingAtt) return;
+        setUploadingAtt(true);
+        setError('');
+        const key = viewKey;
+        try {
+          const uploaded = await uploadAttachmentFiles(files, roomPreviewUrlsRef.current);
+          if (uploaded.length === 0) return;
+          const existingIds = new Set(roomAttachments.map(a => a.attachmentId));
+          const merged = [
+            ...roomAttachments.map(serializeAttachmentForWire),
+            ...uploaded.filter(a => !existingIds.has(a.attachmentId)),
+          ].slice(0, 8);
+          await fetchJson('marshal/tasks/update', { taskId: roomTaskId, attachments: merged }, true);
+          if (id && workspace) {
+            mergePage(await fetchJson(url + (cursor.current ? '&after=' + cursor.current : ''), undefined, true), key);
+          }
+          if (selection.current === key) {
+            setNotice('已上传 ' + uploaded.length + ' 个工单附件：' + uploaded.map(item => item.name).join('、'));
+          }
+        } catch (e) {
+          if (selection.current === key) setError('上传附件失败：' + (e.message || e));
+        } finally {
+          setUploadingAtt(false);
+        }
+      };
 
       return h('section', { 'aria-label': '工单群', className: 'mtr-shell' },
         h('aside', { className: 'mtr-side' },
@@ -4740,6 +4916,23 @@ window.__ModuleLoader__.load({
                 button('↻ 按群内意见继续执行', () => { void act('revise', draft.trim() ? { text: draft.trim() } : {}); }, busy)));
           })(),
 
+          room && roomAttachments.length > 0 && h('div', { className: 'mtr-att-bar' },
+            h('span', { style: { fontSize: 11.5, fontWeight: 600, color: dswTheme.dim } }, '📎 工单附件 (' + roomAttachments.length + ')：'),
+            h('div', { className: 'mtb-att-list' },
+              roomAttachments.map(att => {
+                const href = attachmentHref(roomTaskId, att, roomPreviewUrlsRef.current);
+                const fallbackImgSrc = resolveClientApiUrl('api/task-board/attachments/image?id=' + encodeURIComponent(att.attachmentId));
+                const imgSrc = roomPreviewUrlsRef.current.get(att.attachmentId) || (roomTaskId ? href : fallbackImgSrc);
+                return h('div', { key: att.attachmentId, className: 'mtb-att-card', title: att.name + ' (' + formatBytes(att.bytes) + ')' },
+                  att.kind === 'image'
+                    ? h('img', { className: 'mtb-att-thumb', src: imgSrc, alt: att.name })
+                    : h('span', { style: { fontSize: 14 }, 'aria-hidden': 'true' }, '📄'),
+                  href
+                    ? h('a', { className: 'mtb-att-link', href, target: '_blank', rel: 'noreferrer', download: att.kind === 'file' ? att.name : undefined }, att.name)
+                    : h('span', { style: { fontWeight: 500 } }, att.name),
+                  h('span', { style: { fontSize: 10.5, color: dswTheme.dim } }, formatBytes(att.bytes)));
+              }))),
+
           !id && task && h('div', { style: { padding: 18 } }, button('开启此工单群聊', () => { void bind(); }, !workspace || busy, true)),
           !room && !task && h('div', { style: { ...uiMuted, padding: 24, margin: 'auto', textAlign: 'center' } }, '从左侧选择一个工单群，即可查看智能体协作过程并随时参与讨论。'),
 
@@ -4781,6 +4974,19 @@ window.__ModuleLoader__.load({
                 className: 'mtr-mention-chip',
                 onClick: () => insertMention('全体'),
               }, '@全体'),
+              roomTaskId && !isWorkflowRunning && roomAttachments.length < 8 && h('label', {
+                className: 'mtr-mention-chip',
+                style: { cursor: uploadingAtt ? 'wait' : 'pointer' },
+              },
+                uploadingAtt ? '附件上传中…' : '📎 补充附件',
+                h('input', {
+                  type: 'file', multiple: true, style: { display: 'none' }, disabled: uploadingAtt || busy,
+                  onChange: ev => {
+                    const picked = Array.from(ev.target.files || []);
+                    ev.target.value = '';
+                    void uploadRoomAttachments(picked);
+                  },
+                })),
               room.closed && h('span', { style: { fontSize: 11, color: '#f59e0b', marginLeft: 'auto' } }, '工单已归档，发送消息将自动重开讨论')),
 
             h('div', { style: { display: 'flex', alignItems: 'flex-end', gap: 8 } },

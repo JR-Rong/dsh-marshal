@@ -81,7 +81,8 @@ export function taskRoomAudit(rooms, room, reason, leader, remoteTarget, allowMe
 }
 
 export function createTaskRoomRoutes({
-    exact, write, readBody, authenticate, allowed, auth, rooms, orchestration, getBoard, boardSource, getInitiator, ticketNumbers, workspacePath,
+    exact, write, readBody, authenticate, allowed, auth, rooms, orchestration, getBoard, boardSource, getInitiator,
+    ticketNumbers, workspacePath, normalizeAttachments, resolveAttachments,
 }) {
     const viewRoom = room => visibleTaskRoom(room, ticketNumbers);
     const operations = new Set();
@@ -173,11 +174,17 @@ export function createTaskRoomRoutes({
                 }));
             messages.push({ actor: '工单操作者', kind: 'user', text });
             while (messages.length > 1 && Buffer.byteLength(JSON.stringify(messages)) > 40 * 1024) messages.shift();
+            const resolvedAttachments = Array.isArray(card?.attachments) && card.attachments.length > 0
+                ? (typeof resolveAttachments === 'function'
+                    ? await resolveAttachments(card)
+                    : (typeof normalizeAttachments === 'function' ? (normalizeAttachments(card.attachments) ?? []) : card.attachments))
+                : [];
             const contextPayload = {
                 ticket: {
                     title: card?.title ?? room.title,
                     ...(card?.description ? { description: String(card.description).slice(0, 3000) } : {}),
                     status: card?.status,
+                    ...(resolvedAttachments.length > 0 ? { attachments: resolvedAttachments } : {}),
                     ...(workflowView ? { workflowState: workflowView.state, workflowPhase: workflowView.phase, reviewSummary: workflowView.reviewSummary } : {}),
                 },
                 messages,
@@ -390,11 +397,16 @@ export function createTaskRoomRoutes({
             const participants = origin
                 ? (orchestration?.participants?.(page.room.source, page.room.taskId, page.room.workspaceId, extractAgentTag(card), member => allowed(access, member)) ?? [])
                 : [];
+            const cardAttachments = origin && Array.isArray(card?.attachments)
+                ? ((typeof normalizeAttachments === 'function' ? normalizeAttachments(card.attachments) : card.attachments) ?? [])
+                : [];
             return {
                 ...page, room: viewRoom(page.room), origin, runState,
                 busy: origin && (operations.has(id) || runState === 'running'),
                 chatBusy: origin && chatOperations.has(id),
                 cardStatus,
+                taskId: page.room.taskId,
+                attachments: cardAttachments,
                 ...(workflowView ? { workflow: workflowView } : {}),
                 patchAvailable,
                 participants,
