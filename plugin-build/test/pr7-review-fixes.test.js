@@ -18,8 +18,8 @@ import { memoryTargetAllowed } from '../lib/src/memory/http-auth.js';
 import { parseConfig } from '../lib/src/config.js';
 import { createLocalBoard } from '../lib/src/groups/local-board.js';
 import { detectAmbiguousTask } from '../lib/src/groups/mount.js';
-import { mountSuperagent } from '../lib/src/superagent/mount.js';
-import { createFakeBoard, createFakeContext, createFakeMemory, loggerFixture } from './superagent-support.js';
+import { createSuperagentBridge, mountSuperagent } from '../lib/src/superagent/mount.js';
+import { agentsFixture, createFakeBoard, createFakeContext, createFakeMemory, loggerFixture, memberFixture, taskFixture } from './superagent-support.js';
 
 const tempRoot = () => mkdtempSync(join(tmpdir(), 'marshal-pr7-fixes-'));
 const mnemonBin = process.env.MARSHAL_TEST_MNEMON;
@@ -650,4 +650,96 @@ test('POST /marshal/memory/remember forwards cue and shipped client .22 exposes 
     assert.ok(clientSrc.includes('collapseEmptyCols'), 'TaskBoard should expose 1-click collapse empty columns');
     assert.ok(clientSrc.includes('mtb-edge-pan-right'), 'TaskBoard should render right-edge quick jump cue');
     assert.ok(clientSrc.includes('legacyReadOnly'), 'Agent chat list should label cleaned legacy sessions as read-only archive');
+});
+
+// --- .23 universal todo auto-dispatch regardless of trigger source ---
+test('superagent auto-dispatches any todo card regardless of trigger source (tool, marshal UI, move from backlog) while skipping backlog/review/scheduled/already-recorded', async () => {
+    const dir = tempRoot();
+    const backlogCard = taskFixture({ id: 'card-backlog', title: '待规划卡', status: 'backlog', workspaceId: 'ws-canonical-1' });
+    const reviewCard = taskFixture({ id: 'card-review', title: '待确认卡', status: 'review' });
+    const scheduledCard = taskFixture({ id: 'card-sched', title: '定时卡', status: 'todo', schedule: { enabled: true, mode: 'cron', cron: '0 9 * * *' } });
+    const board = createFakeBoard({ tasks: [backlogCard, reviewCard, scheduledCard] });
+    // Extend fake board apply() to handle create & move like the real Host task board
+    const baseApply = board.apply;
+    const extraTasks = [backlogCard, reviewCard, scheduledCard];
+    const listeners = new Set();
+    const origSub = board.subscribe;
+    const origSnap = board.snapshot;
+    let customTasks = structuredClone(extraTasks);
+    const fakeBoard = {
+        ...board,
+        actions: [],
+        snapshot: () => ({ tasks: structuredClone(customTasks), sessionDefaultPermission: 'danger-full-access' }),
+        subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
+        async apply(requestId, action, initiator) {
+            fakeBoard.actions.push({ requestId, action, initiator });
+            if (action.kind === 'create') {
+                customTasks.push({
+                    id: action.id, status: 'todo', executions: [], createdAt: Date.now(), updatedAt: Date.now(),
+                    ...action.input,
+                });
+            } else if (action.kind === 'move') {
+                const t = customTasks.find(x => x.id === action.taskId);
+                if (t) { t.status = action.status; t.updatedAt = Date.now(); }
+            } else if (action.kind === 'update') {
+                const t = customTasks.find(x => x.id === action.taskId);
+                if (t) Object.assign(t, action.patch, { updatedAt: Date.now() });
+            } else if (action.kind === 'run') {
+                const t = customTasks.find(x => x.id === action.taskId);
+                if (t) {
+                    t.status = 'running';
+                    t.executions = [...t.executions, { id: 'exec-' + (t.executions.length + 1), startedAt: Date.now(), sessionId: 'sess-' + t.id }];
+                }
+            }
+            for (const fn of listeners) fn();
+            return fakeBoard.snapshot();
+        },
+        registerExtension: () => () => {},
+    };
+    const memory = createFakeMemory([{ id: 'm-ws', scope: 'workspace', ownerId: 'ws-canonical-1', title: '工作区规范', content: '使用规范 UUID', kind: 'fact' }]);
+    const memberNoWs = memberFixture({ id: 'cx-id', name: '丞相', teamWorkspaceId: undefined, brief: '你是丞相。' });
+    const bridge = createSuperagentBridge({
+        root: dir,
+        memory,
+        readAgents: () => agentsFixture([memberNoWs]),
+        logger: loggerFixture(),
+        reconcileDelayMs: 20,
+        trustedRequest: () => true,
+    });
+    try {
+        bridge.configure({ defaultAgent: '丞相' });
+        bridge.setBoard(fakeBoard);
+        await new Promise(r => setTimeout(r, 80));
+        // backlog, review, scheduled todo must NOT be dispatched
+        assert.equal(fakeBoard.actions.filter(a => a.action.kind === 'run').length, 0);
+
+        // 1. Card created directly via tool / Marshal UI (no browser hook!) -> auto-dispatched!
+        await fakeBoard.apply('r1', { kind: 'create', id: 'card-tool', input: { title: '工具建卡', description: '不经旧钩子', prompt: '执行任务', workspaceId: 'ws-canonical-1' } }, 'agent-tool');
+        await new Promise(r => setTimeout(r, 120));
+        assert.equal(customTasks.find(t => t.id === 'card-tool').status, 'running', 'todo card created from any source must auto-wake agent');
+        assert.equal(bridge.stateStore.get('card-tool').source, 'todo');
+        assert.equal(bridge.stateStore.get('card-tool').workspaceId, 'ws-canonical-1', 'card workspaceId must flow into superagent state & memory recall');
+        assert.ok(memory.recalls.some(q => q.scope === 'workspace' && q.workspaceId === 'ws-canonical-1'), 'workspace memory must be recalled from card workspaceId even when member has no teamWorkspaceId');
+
+        // 2. Backlog card moved to todo -> auto-dispatched!
+        await fakeBoard.apply('r2', { kind: 'move', taskId: 'card-backlog', status: 'todo' }, 'marshal');
+        await new Promise(r => setTimeout(r, 120));
+        assert.equal(customTasks.find(t => t.id === 'card-backlog').status, 'running', 'backlog card moved into todo must auto-wake agent');
+
+        // 3. Subsequent board changes must never double-dispatch already-running cards
+        await new Promise(r => setTimeout(r, 80));
+        assert.equal(fakeBoard.actions.filter(a => a.action.kind === 'run' && a.action.taskId === 'card-tool').length, 1);
+        assert.equal(fakeBoard.actions.filter(a => a.action.kind === 'run' && a.action.taskId === 'card-backlog').length, 1);
+    }
+    finally {
+        bridge.close();
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test('groups/mount.js persists workspaceId on board create and task-development.js explains non-Git workspace errors clearly', () => {
+    const gmSrc = readFileSync(new URL('../lib/src/groups/mount.js', import.meta.url), 'utf8');
+    assert.ok(gmSrc.includes('cardWorkspaceId'), 'POST /marshal/tasks/create should persist workspaceId onto the task-board card');
+    const devSrc = readFileSync(new URL('../lib/src/groups/task-development.js', import.meta.url), 'utf8');
+    assert.ok(devSrc.includes('不是 Git 仓库根目录'), 'task-development.js should clearly explain non-Git workspace errors');
 });

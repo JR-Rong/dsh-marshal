@@ -34,7 +34,7 @@ export function controlPageHtml() {
 </head>
 <body>
 <h1>调度官 · Super-agent 派发桥</h1>
-<p class="hint">只接受本机同源浏览器请求。agent 的模型工具只能查看状态与对账，不能改路由或补派；配置与补派只在这个页面。</p>
+<p class="hint">只接受本机同源浏览器请求。开启「自动派发所有待办」后，无论从调度官看板、原版看板、工具或拖拽进入「待办 (todo)」的未执行工单，都会自动唤醒对应智能体处理。</p>
 
 <section>
   <h2>状态</h2>
@@ -47,6 +47,7 @@ export function controlPageHtml() {
     <div class="row"><label>默认智能体 <input type="text" id="defaultAgent" placeholder="丞相" size="24"></label></div>
     <div class="row">
       <label><input type="checkbox" id="enabled"> 启用</label>
+      <label><input type="checkbox" id="autoDispatchTodo"> 自动派发所有待办（不限来源）</label>
       <label><input type="checkbox" id="rootOnly"> 只派发根卡</label>
       <label><input type="checkbox" id="injectMemory"> 注入长期记忆</label>
     </div>
@@ -110,6 +111,7 @@ export function controlPageHtml() {
     statusEl.textContent = pretty(value);
     document.getElementById('defaultAgent').value = value.defaultAgent || '';
     document.getElementById('enabled').checked = value.enabled === true;
+    document.getElementById('autoDispatchTodo').checked = value.autoDispatchTodo !== false;
     document.getElementById('rootOnly').checked = value.rootOnly !== false;
     document.getElementById('injectMemory').checked = value.injectMemory !== false;
     document.getElementById('memoryLimit').value = String(value.memoryLimit === undefined ? 6 : value.memoryLimit);
@@ -136,6 +138,7 @@ export function controlPageHtml() {
       var patch = {
         defaultAgent: document.getElementById('defaultAgent').value.trim() || null,
         enabled: document.getElementById('enabled').checked,
+        autoDispatchTodo: document.getElementById('autoDispatchTodo').checked,
         rootOnly: document.getElementById('rootOnly').checked,
         injectMemory: document.getElementById('injectMemory').checked,
         memoryLimit: Number(document.getElementById('memoryLimit').value),

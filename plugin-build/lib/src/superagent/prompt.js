@@ -147,10 +147,16 @@ export function planCardPatch({ task, member, snapshot, prompt }) {
     return { patch, notes };
 }
 
-export function taskIsDispatchable(task, settings) {
+export function taskIsDispatchable(task, settings, options = {}) {
     if (task === null || typeof task !== 'object') return { ok: false, code: 'task-missing' };
     if (typeof task.id !== 'string' || task.id === '') return { ok: false, code: 'task-missing' };
     if (task.archivedAt !== undefined) return { ok: false, code: 'task-archived' };
+    if (options.requireTodo === true && task.status !== 'todo') {
+        return { ok: false, code: 'not-todo' };
+    }
+    if (options.requireTodo === true && task.schedule?.enabled === true) {
+        return { ok: false, code: 'scheduled-task' };
+    }
     if (settings.rootOnly === true && typeof task.parentId === 'string' && task.parentId !== '') {
         return { ok: false, code: 'subtask-suppressed' };
     }

@@ -169,7 +169,7 @@ export function createSuperagentBridge(options = {}) {
     let reconcileTimer;
     let closed = false;
     let reconcileError;
-    const reconcileDelayMs = Number.isFinite(options.reconcileDelayMs) ? options.reconcileDelayMs : 800;
+    const reconcileDelayMs = Number.isFinite(options.reconcileDelayMs) ? options.reconcileDelayMs : 400;
 
     const dispatcher = createDispatcher({
         getBoard: () => board,
@@ -185,27 +185,28 @@ export function createSuperagentBridge(options = {}) {
     const extension = createBoardExtension({
         dispatcher,
         logger,
-        onStart: host => { extensionHost = host; void reconcile('board-extension-start'); },
+        onStart: host => { extensionHost = host; void reconcile('board-extension-start', { autoDispatch: false }); },
         onStop: () => { extensionHost = undefined; },
     });
 
-    const scheduleReconcile = () => {
+    const scheduleReconcile = (reason = 'board-change') => {
         if (closed || reconcileTimer !== undefined || reconcileDelayMs < 0) return;
+        const opts = reason === 'board-mount' ? { autoDispatch: reconcileDelayMs > 0 } : { autoDispatch: true };
         if (reconcileDelayMs === 0) {
-            void reconcile('board-change');
+            void reconcile(reason, opts);
             return;
         }
         reconcileTimer = setTimeout(() => {
             reconcileTimer = undefined;
-            void reconcile('board-change');
+            void reconcile(reason, opts);
         }, reconcileDelayMs);
         if (typeof reconcileTimer.unref === 'function') reconcileTimer.unref();
     };
 
-    const reconcile = async reason => {
+    const reconcile = async (reason, filter = {}) => {
         if (closed) return { ok: false, code: 'closed' };
         try {
-            const result = await dispatcher.reconcile({}, extensionHost);
+            const result = await dispatcher.reconcile(filter, extensionHost);
             reconcileError = undefined;
             return result;
         }
@@ -242,12 +243,12 @@ export function createSuperagentBridge(options = {}) {
             logger.warn?.('marshal-superagent: board extension registration failed: ' + messageOf(cause));
         }
         try {
-            if (typeof next.subscribe === 'function') disposeSubscribe = next.subscribe(scheduleReconcile);
+            if (typeof next.subscribe === 'function') disposeSubscribe = next.subscribe(() => scheduleReconcile('board-change'));
         }
         catch (cause) {
             logger.warn?.('marshal-superagent: board subscription failed: ' + messageOf(cause));
         }
-        scheduleReconcile();
+        scheduleReconcile('board-mount');
     };
 
     const status = () => {
@@ -294,7 +295,7 @@ export function createSuperagentBridge(options = {}) {
 
     const controlConfig = async body => {
         const patch = {};
-        for (const key of ['enabled', 'rootOnly', 'injectMemory']) {
+        for (const key of ['enabled', 'autoDispatchTodo', 'rootOnly', 'injectMemory']) {
             if (typeof body?.[key] === 'boolean') patch[key] = body[key];
         }
         for (const key of ['defaultAgent', 'tagPrefix']) {
@@ -386,7 +387,7 @@ export function createSuperagentBridge(options = {}) {
     const toolDefinition = () => {
         const definition = {
             name: 'marshal_superagent',
-            description: '任务看板 × Super-agent 人工派发桥的只读面：status 查看状态、agents 列出智能体、reconcile 对账。配置与人工补派只能由皇上在本机浏览器打开 /marshal-superagent 控制页操作；agent 的模型工具不能改路由或补派。只有皇上在 GUI 新建的工单会自动派发。',
+            description: '任务看板 × Super-agent 自动派发桥的只读面：status 查看状态、agents 列出智能体、reconcile 对账与扫单。配置与人工补派只能由皇上在本机浏览器打开 /marshal-superagent 控制页操作；开启后任何来源进入「待办 (todo)」的未执行工单都会自动唤醒对应智能体处理。',
             parameters: {
                 action: { type: 'string', required: true, enum: ['status', 'agents', 'reconcile'] },
             },

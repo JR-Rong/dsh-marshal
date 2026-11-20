@@ -36,6 +36,7 @@ export function defaultSettings(now = Date.now()) {
     return {
         version: SETTINGS_VERSION,
         enabled: true,
+        autoDispatchTodo: true,
         defaultAgent: null,
         rootOnly: true,
         tagPrefix: DEFAULT_TAG_PREFIX,
@@ -73,6 +74,7 @@ export function normalizeSettings(raw, now = Date.now()) {
     return {
         version: SETTINGS_VERSION,
         enabled: boolean(value.enabled, base.enabled),
+        autoDispatchTodo: boolean(value.autoDispatchTodo, base.autoDispatchTodo),
         defaultAgent: text(value.defaultAgent, 64) ?? null,
         rootOnly: boolean(value.rootOnly, base.rootOnly),
         tagPrefix: text(value.tagPrefix, 8) ?? base.tagPrefix,

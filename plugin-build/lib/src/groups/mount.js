@@ -418,16 +418,6 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
                 hasAttachments: attachments !== undefined,
                 hasPr: typeof body.orchestration?.prUrl === 'string' && body.orchestration.prUrl.trim() !== '',
             });
-            const input = {
-                title, description, prompt: prompt || description || title,
-                ...(tags === undefined ? {} : { tags }),
-                ...(attachments === undefined ? {} : { attachments }),
-                ...(parentId === undefined ? {} : { parentId }),
-                ...(permission === undefined ? {} : { permission }),
-                ...(model === undefined ? {} : { model }),
-                ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
-                ...(reuseSession === undefined ? {} : { reuseSession }),
-            };
             const source = boardSource();
             const id = randomUUID();
             let prepared;
@@ -463,6 +453,26 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
                 scope = { workspaceId, ownerId: access.session.ownerId };
                 existing = new Set((board.snapshot().tasks ?? []).map(task => task.id));
             }
+            const cardWorkspaceId = scope?.workspaceId ?? (typeof body.workspaceId === 'string' && body.workspaceId.trim() !== '' ? body.workspaceId.trim() : undefined);
+            let cardTags = tags;
+            if (prepared?.leaderName) {
+                const hasAgentTag = Array.isArray(cardTags) && cardTags.some(t => typeof t?.name === 'string' && (t.name.startsWith('智能体:') || t.name.startsWith('@')));
+                if (!hasAgentTag) {
+                    const leaderTag = { name: ('智能体:' + prepared.leaderName).slice(0, 32) };
+                    cardTags = Array.isArray(cardTags) ? [...cardTags, leaderTag].slice(0, 8) : [leaderTag];
+                }
+            }
+            const input = {
+                title, description, prompt: prompt || description || title,
+                ...(cardWorkspaceId === undefined ? {} : { workspaceId: cardWorkspaceId }),
+                ...(cardTags === undefined ? {} : { tags: cardTags }),
+                ...(attachments === undefined ? {} : { attachments }),
+                ...(parentId === undefined ? {} : { parentId }),
+                ...(permission === undefined ? {} : { permission }),
+                ...(model === undefined ? {} : { model }),
+                ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+                ...(reuseSession === undefined ? {} : { reuseSession }),
+            };
             const beforeIds = existing ?? new Set((board.snapshot().tasks ?? []).map(task => task.id));
             let snapshot = await board.apply(randomUUID(), { kind: 'create', id, input }, initiator);
             const added = (snapshot.tasks ?? []).filter(task => !beforeIds.has(task.id));

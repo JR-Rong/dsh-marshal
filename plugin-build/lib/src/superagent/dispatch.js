@@ -54,8 +54,8 @@ export function createDispatcher(options) {
 
     const recentHumanDispatchCount = () => {
         const since = now() - 60_000;
-        const counted = new Set(['dispatched', 'running', 'settled', 'memory-pending']);
-        return stateStore.list().filter(record => record.source === 'ui' && (record.createdAt ?? 0) >= since && counted.has(record.status)).length;
+        const counted = new Set(['preparing', 'dispatched', 'running', 'settled', 'memory-pending']);
+        return stateStore.list().filter(record => record.source !== 'manual' && (record.createdAt ?? 0) >= since && counted.has(record.status)).length;
     };
 
     const status = () => {
@@ -65,6 +65,7 @@ export function createDispatcher(options) {
         return {
             ok: true,
             enabled: settings.enabled,
+            autoDispatchTodo: settings.autoDispatchTodo,
             defaultAgent: settings.defaultAgent,
             rootOnly: settings.rootOnly,
             tagPrefix: settings.tagPrefix,
@@ -175,13 +176,15 @@ export function createDispatcher(options) {
                     title: task.title,
                 });
             }
+            const effectiveWorkspaceId = (typeof task.workspaceId === 'string' && task.workspaceId.trim() !== '' ? task.workspaceId.trim() : undefined)
+                ?? member.teamWorkspaceId;
             const requestId = typeof request.requestId === 'string' && request.requestId !== '' ? request.requestId : uuid();
             const started = stateStore.put(taskId, {
                 status: 'preparing',
                 agentId: member.id,
                 agentName: member.name,
                 teamId: member.teamId,
-                ...(member.teamWorkspaceId === undefined ? {} : { workspaceId: member.teamWorkspaceId }),
+                ...(effectiveWorkspaceId === undefined ? {} : { workspaceId: effectiveWorkspaceId }),
                 title: typeof task.title === 'string' ? task.title : '',
                 source: request.source ?? 'ui',
                 requestId,
@@ -193,7 +196,7 @@ export function createDispatcher(options) {
                 try {
                     const recalled = await memory.recall({
                         agentId: member.id,
-                        ...(member.teamWorkspaceId === undefined ? {} : { workspaceId: member.teamWorkspaceId }),
+                        ...(effectiveWorkspaceId === undefined ? {} : { workspaceId: effectiveWorkspaceId }),
                         text: [task.title, task.description, task.prompt].filter(part => typeof part === 'string' && part.trim() !== '').join(' '),
                         limit: settings.memoryLimit,
                     });
@@ -392,7 +395,27 @@ export function createDispatcher(options) {
                 }
             }
         }
-        return { ok: true, checked: records.length, settled, updated };
+        let dispatched = 0;
+        const settings = settingsStore.get();
+        if (filter.taskId === undefined && filter.autoDispatch !== false && settings.autoDispatchTodo === true && inFlight.size === 0) {
+            const agents = readAgentsFn();
+            if (agents.available === true && agents.members.length > 0) {
+                const latestSnap = snapshotOf(board) ?? snapshot;
+                const candidates = [...(latestSnap.tasks ?? [])]
+                    .filter(task => task && task.status === 'todo')
+                    .sort((a, b) => (Number(a.createdAt) || 0) - (Number(b.createdAt) || 0));
+                for (const task of candidates) {
+                    if (inFlight.has(task.id)) continue;
+                    if (stateStore.get(task.id) !== undefined) continue;
+                    if (taskIsDispatchable(task, settings, { requireTodo: true }).ok !== true) continue;
+                    if (resolveAgentForTask(task, settings, agents.members).member === undefined) continue;
+                    if (recentHumanDispatchCount() >= settings.maxDispatchesPerMinute) break;
+                    const res = await dispatch({ taskId: task.id, source: 'todo' });
+                    if (res.ok === true) dispatched += 1;
+                }
+            }
+        }
+        return { ok: true, checked: records.length, settled, updated, dispatched };
     };
 
     return {
