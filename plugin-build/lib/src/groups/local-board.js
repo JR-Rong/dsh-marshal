@@ -21,7 +21,8 @@ export function createLocalBoard(file) {
             const input = action.input ?? {};
             const title = typeof input.title === 'string' ? input.title.trim() : '';
             if (title === '') throw new Error('title is required');
-            save([{ id: action.id ?? randomUUID(), title, description: typeof input.description === 'string' ? input.description : '', prompt: typeof input.prompt === 'string' ? input.prompt : title, status: 'todo', priority: 0, executions: [], createdAt: at, updatedAt: at }, ...tasks]);
+            const tags = Array.isArray(input.tags) ? input.tags.filter(t => t && typeof t.name === 'string' && t.name.trim() !== '').map(t => ({ name: t.name.trim(), ...(typeof t.promptPrefix === 'string' && t.promptPrefix.trim() !== '' ? { promptPrefix: t.promptPrefix.trim() } : {}) })) : undefined;
+            save([{ id: action.id ?? randomUUID(), title, description: typeof input.description === 'string' ? input.description : '', prompt: typeof input.prompt === 'string' ? input.prompt : title, status: 'todo', priority: 0, ...(tags && tags.length > 0 ? { tags } : {}), executions: [], createdAt: at, updatedAt: at }, ...tasks]);
             return snapshot();
         }
         if (action?.kind === 'delete') {

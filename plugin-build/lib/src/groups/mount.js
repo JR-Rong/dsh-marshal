@@ -152,9 +152,27 @@ export function buildHealthBody(req, info) {
     };
 }
 
+function normalizeCardTags(raw) {
+    if (!Array.isArray(raw)) return undefined;
+    const seen = new Set();
+    const out = [];
+    for (const item of raw) {
+        const name = (typeof item === 'string' ? item : typeof item?.name === 'string' ? item.name : '').trim().slice(0, 32);
+        if (name === '' || seen.has(name)) continue;
+        seen.add(name);
+        const promptPrefix = typeof item === 'object' && item !== null && typeof item.promptPrefix === 'string' && item.promptPrefix.trim() !== ''
+            ? item.promptPrefix.trim() : undefined;
+        out.push(promptPrefix === undefined ? { name } : { name, promptPrefix });
+        if (out.length >= 16) break;
+    }
+    return out.length > 0 ? out : undefined;
+}
+
 function taskView(task, workflow, room) {
     const executions = Array.isArray(task.executions) ? task.executions : [];
     const latest = executions.length > 0 ? executions[executions.length - 1] : undefined;
+    const openExecution = executions.some(item => item && item.endedAt === undefined);
+    const tags = normalizeCardTags(task.tags);
     return {
         id: task.id,
         title: task.title,
@@ -167,6 +185,14 @@ function taskView(task, workflow, room) {
         ...(task.parentId === undefined ? {} : { parentId: task.parentId }),
         ...(task.permission === undefined ? {} : { permission: task.permission }),
         ...(task.mode === undefined ? {} : { mode: task.mode }),
+        ...(tags === undefined ? {} : { tags }),
+        ...(executions.length > 0 ? { runCount: executions.length } : {}),
+        ...(openExecution ? { openExecution: true } : {}),
+        ...(latest?.startedAt === undefined ? {} : { startedAt: latest.startedAt }),
+        ...(latest?.endedAt === undefined ? {} : { endedAt: latest.endedAt }),
+        ...(task.schedule?.enabled === true ? { schedule: { enabled: true, mode: task.schedule.mode, ...(task.schedule.nextRunAt === undefined ? {} : { nextRunAt: task.schedule.nextRunAt }) } } : {}),
+        ...(task.freeze !== undefined ? { freeze: { goal: typeof task.freeze.goal === 'string' ? task.freeze.goal : '' } } : {}),
+        ...(task.archivedAt === undefined ? {} : { archivedAt: task.archivedAt }),
         ...(latest === undefined || latest.sessionId === undefined ? {} : { sessionId: latest.sessionId }),
         ...(latest === undefined || latest.result === undefined ? {} : { result: latest.result }),
         ...(workflow?.sessionId === undefined ? {} : { sessionId: workflow.sessionId }),
@@ -299,7 +325,8 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             }
             const description = typeof body.description === 'string' ? body.description.trim() : '';
             const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
-            const input = { title, description, prompt: prompt || description || title };
+            const tags = normalizeCardTags(body.tags);
+            const input = { title, description, prompt: prompt || description || title, ...(tags === undefined ? {} : { tags }) };
             const source = boardSource();
             const id = randomUUID();
             let prepared;

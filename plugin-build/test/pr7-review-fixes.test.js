@@ -180,6 +180,8 @@ test('shipped client keeps plain card create/run working and sends auth for task
         assert.ok(source.includes("key: '" + key + "', label: '" + label + "'"), 'missing board column ' + key);
     }
     assert.ok(source.includes('--mtb-accent'), 'board should apply per-column theme accents');
+    assert.ok(source.includes('taskTagTone'), 'board should render colored tag and priority pills');
+    assert.ok(source.includes('mtb-drawer'), 'board should open a detail drawer on card click');
 });
 
 test('mountSuperagent adopts connection trust with only the real connection service (no connection.authentication)', async () => {
@@ -216,8 +218,9 @@ test('local board supports moving tasks across all six columns including review'
     const dir = tempRoot();
     t.after(() => rmSync(dir, { recursive: true, force: true }));
     const board = createLocalBoard(join(dir, 'board.json'));
-    const created = await board.apply('r1', { kind: 'create', id: 'task-1', input: { title: '验证待确认列' } });
+    const created = await board.apply('r1', { kind: 'create', id: 'task-1', input: { title: '验证待确认列', tags: [{ name: '记忆' }, { name: 'P1' }] } });
     assert.equal(created.tasks[0].status, 'todo');
+    assert.deepEqual(created.tasks[0].tags, [{ name: '记忆' }, { name: 'P1' }]);
     const inReview = await board.apply('r2', { kind: 'move', taskId: 'task-1', status: 'review' });
     assert.equal(inReview.tasks[0].status, 'review');
     const confirmed = await board.apply('r3', { kind: 'move', taskId: 'task-1', status: 'done' });
