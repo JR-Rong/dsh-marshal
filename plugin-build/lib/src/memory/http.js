@@ -131,6 +131,7 @@ export function createMemoryRoutes({ memory, auth, allowedOrigins } = {}) {
                     importance: Number(body.importance) || 0.5,
                     tags: Array.isArray(body.tags) ? body.tags : [],
                     visibility: body.visibility,
+                    ...(typeof body.cue === 'string' && body.cue.trim() ? { cue: body.cue.trim() } : {}),
                 });
                 write(res, 200, { ok: true, item });
             }, { owner: true }),
@@ -203,7 +204,7 @@ export function createMemoryRoutes({ memory, auth, allowedOrigins } = {}) {
                     includeGlobal: session.owner === true,
                     limit: Math.max(1, Math.min(600, Number(url.get('limit')) || 400)),
                 });
-                write(res, 200, { ok: true, graph, ...(memory.usesMnemon?.(requested.agentId) ? { privateBackend: 'mnemon' } : {}) });
+                write(res, 200, { ok: true, graph, ...(memory.usesMnemon?.(requested.agentId, requested.workspaceId) ? { privateBackend: 'mnemon' } : {}) });
             }, { target: true }),
         },
         {

@@ -279,7 +279,7 @@ function taskView(task, workflow, room, ticketNumbers) {
 }
 
 function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, memory, auth, allowedOrigins, orchestration, rooms, extras = {}) {
-    const { rosters, ticketNumbers, sessionTitles, sessionController, config, llm, readDefaultModel } = extras;
+    const { root: groupsRootDir, rosters, ticketNumbers, sessionTitles, sessionController, config, llm, readDefaultModel } = extras;
     const authenticate = (req, write = false) => auth.authenticate(req, { write, origins: allowedOrigins() });
     const allowed = (access, target, ledger) => access.ok && auth.allows(access.session, {
         agentId: target.agentId, workspaceId: target.workspaceId,
@@ -906,6 +906,24 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
                     fallbackTitle: run.title,
                 });
             }
+            // Merge preserved legacy session archive (survives after legacy "Agent · *" workspaces are cleaned)
+            try {
+                const legacyFile = join(groupsRootDir ?? join(homedir(), '.dsh-marshal', 'groups'), 'legacy-agent-sessions.json');
+                const legacyData = JSON.parse(readFileSync(legacyFile, 'utf8'));
+                for (const item of Array.isArray(legacyData?.sessions) ? legacyData.sessions : []) {
+                    if (!item?.sessionId) continue;
+                    const owner = (item.agentName && agentByName.get(item.agentName)) || undefined;
+                    pushSession({
+                        sessionId: item.sessionId,
+                        teamId: owner?.team?.id || item.teamId || '',
+                        memberId: owner?.member?.id || item.memberId || '',
+                        agentName: owner?.member?.name || item.agentName || '',
+                        workspaceId: item.workspaceId || '',
+                        createdAt: Number(item.createdAt) || 0,
+                        archived: item.archived === true,
+                    });
+                }
+            } catch { /* no legacy archive file */ }
             // Merge historical sessions stored under legacy "Agent · <name>" workspaces so zero casual chats are lost
             const wsReg = readWorkspaceRegistry();
             for (const ws of wsReg.workspaces) {
@@ -1333,7 +1351,7 @@ export function mountGroups(ctx, config, options = {}) {
                 }
                 catch { /* desktop origin is enough when the host has no public origin */ }
                 return origins;
-            }, orchestration, rooms, { rosters, ticketNumbers, sessionTitles, sessionController: ctx.sessionController, config, llm, readDefaultModel }).map((route) => scoped.webServer.register(route));
+            }, orchestration, rooms, { root, rosters, ticketNumbers, sessionTitles, sessionController: ctx.sessionController, config, llm, readDefaultModel }).map((route) => scoped.webServer.register(route));
             return () => {
                 for (const dispose of disposers) dispose();
             };

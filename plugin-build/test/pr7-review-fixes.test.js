@@ -14,6 +14,7 @@ import { createWorkspaceRosters } from '../lib/src/groups/workspace-rosters.js';
 import { createTicketNumbers, withTicketPrefix } from '../lib/src/groups/ticket-numbers.js';
 import { createSessionTitles, isGenericSessionTitle, summarizeFirstMessage } from '../lib/src/groups/session-titles.js';
 import { memoryTargetAllowed } from '../lib/src/memory/http-auth.js';
+import { parseConfig } from '../lib/src/config.js';
 import { createLocalBoard } from '../lib/src/groups/local-board.js';
 import { detectAmbiguousTask } from '../lib/src/groups/mount.js';
 import { mountSuperagent } from '../lib/src/superagent/mount.js';
@@ -464,4 +465,77 @@ test('shipped client .20 exposes session rename/summarize, [GD-00001] ticket num
     assert.ok(source.includes("fetchJson('marshal/agents/sessions/summarize'"), 'client should allow summarizing session titles');
     assert.ok(source.includes('task.ticketNo'), 'board should render GD ticket numbers');
     assert.ok(source.includes('流转规则'), 'board should expose status transition guide');
+});
+
+
+// --- .21 full-fleet Mnemon, MemoryPage TDZ & TaskBoard scroll tests ---
+test('config accepts wildcard mnemonPilot.agentId="*" for full-fleet Mnemon memory', () => {
+    const cfg = parseConfig({
+        role: 'node',
+        deviceId: 'mac-1',
+        hubUrl: 'wss://hub.example/marshal/uplink',
+        token: 'a'.repeat(24),
+        mnemonPilot: { agentId: '*', executable: '/usr/local/bin/mnemon' },
+    });
+    assert.equal(cfg.mnemonPilot?.agentId, '*');
+    assert.equal(cfg.mnemonPilot?.executable, '/usr/local/bin/mnemon');
+});
+
+test('full-fleet Mnemon powers both agent and workspace scopes, migrates SQLite losslessly, and emits L1 push-index', async (t) => {
+    if (!mnemonBin) { t.skip('set MARSHAL_TEST_MNEMON to run full-fleet Mnemon tests'); return; }
+    const dir = tempRoot();
+    // Pre-seed a legacy SQLite memory before enabling full-fleet Mnemon
+    const seeded = createAgentMemoryService({ root: dir });
+    await seeded.rememberFor({ agentId: 'cx-1', scope: 'agent', title: '奏对铁律', text: '结论诚实，事实不隐瞒' });
+    seeded.store.close();
+
+    const service = createAgentMemoryService({
+        root: dir,
+        mnemonPilot: { agentId: '*', executable: mnemonBin },
+    });
+    t.after(() => { service.store.close(); rmSync(dir, { recursive: true, force: true }); });
+
+    assert.equal(service.usesMnemon('cx-1', undefined), true);
+    assert.equal(service.usesMnemon(undefined, 'ws-alpha'), true);
+
+    // Workspace shared memory writes and lists via Mnemon with cue metadata
+    const wsItem = await service.rememberFor({
+        workspaceId: 'ws-alpha',
+        scope: 'workspace',
+        title: '看板列宽需设置 min-width: 0',
+        text: '防止 6 列看板在窄窗下被外层 flex 裁切无法横滚。',
+        cue: '修改任务看板布局时',
+    });
+    assert.equal(wsItem.backend, 'mnemon');
+    assert.equal(wsItem.cue, '修改任务看板布局时');
+
+    const agentItems = await service.listFor({ agentId: 'cx-1', scope: 'agent', includeGlobal: false });
+    assert.ok(agentItems.some(item => item.title === '奏对铁律'), 'legacy SQLite row should migrate losslessly to Mnemon');
+
+    // Add a second memory so L1 index pushes beyond L0/L2
+    await service.rememberFor({ agentId: 'cx-1', scope: 'agent', title: '发版前必跑双测', text: '无 Mnemon 与带 Mnemon 两套回归都要过。', cue: '打包发版前' });
+    const prompt = await service.nativePrompt({
+        registeredAgent: true,
+        agentId: 'cx-1',
+        workspaceId: 'ws-alpha',
+        sessionId: 's-fleet',
+        session: { id: 's-fleet', header: { kind: 'direct' }, events: [{ type: 'user/message', data: { content: '你好' } }] },
+    });
+    assert.match(prompt, /Mnemon/);
+    assert.match(prompt, /奏对铁律|看板列宽|发版前必跑双测/);
+});
+
+test('shipped client .21 fixes MemoryPage realWorkspaces TDZ, wraps with ErrorBoundary, and enables TaskBoard horizontal scroll & collapse', () => {
+    const source = readFileSync(new URL('../client/index.js', import.meta.url), 'utf8');
+    const mpStart = source.indexOf('function MemoryPage(');
+    const mpEnd = source.indexOf('function AgentDirectChatsView(', mpStart);
+    const mpSrc = source.slice(mpStart, mpEnd);
+    const declIdx = mpSrc.indexOf('const realWorkspaces = React.useMemo');
+    const firstUseIdx = mpSrc.indexOf('realWorkspaces');
+    assert.ok(declIdx > 0, 'realWorkspaces declaration should exist in MemoryPage');
+    assert.equal(firstUseIdx, declIdx + 'const '.length, 'realWorkspaces must never be referenced before its declaration (TDZ bug)');
+    assert.ok(source.includes('class MarshalErrorBoundary'), 'panel should wrap tabs in an ErrorBoundary');
+    assert.ok(source.includes('.mtb-page{flex:1;min-height:0;min-width:0;width:100%;overflow:hidden'), 'TaskBoard .mtb-page must constrain min-width: 0 for horizontal scroll');
+    assert.ok(source.includes('handleGridDragOver'), 'TaskBoard should auto-scroll horizontally while dragging cards');
+    assert.ok(source.includes('toggleCollapseCol'), 'TaskBoard should allow collapsing columns into vertical rails');
 });

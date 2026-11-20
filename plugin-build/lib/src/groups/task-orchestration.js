@@ -120,13 +120,18 @@ export function createTaskOrchestration({
     const publish = (task, label, text, kind = 'episode') => {
         boundLeader(task);
         const body = text.length > 8000 ? text.slice(0, 7970).trimEnd() + '\n…（已截断，完整内容见工单群）' : text;
-        const item = memory.rememberFor({
-            workspaceId: task.workspaceId, scope: 'workspace', kind,
-            title: label + ' · ' + task.taskId.slice(0, 8) + ' · ' + task.runId.slice(0, 8),
-            text: body, importance: kind === 'handoff' ? .85 : .55,
-            tags: ['task-orchestration', 'task:' + task.taskId, 'run:' + task.runId],
-            visibility: 'group-safe',
+        const handoffTitle = label + ' · ' + task.taskId.slice(0, 8) + ' · ' + task.runId.slice(0, 8);
+        const handoffTags = ['task-orchestration', 'task:' + task.taskId, 'run:' + task.runId];
+        const item = memory.store.remember('workspace', task.workspaceId, {
+            kind, title: handoffTitle, content: body, importance: kind === 'handoff' ? .85 : .55,
+            tags: handoffTags, visibility: 'group-safe',
         });
+        if (item && memory.usesMnemon?.(undefined, task.workspaceId)) {
+            void Promise.resolve(memory.rememberEntry('workspace', task.workspaceId, {
+                kind, title: handoffTitle, content: body, importance: kind === 'handoff' ? .85 : .55,
+                tags: handoffTags, visibility: 'group-safe',
+            }, { workspaceId: task.workspaceId })).catch(() => {});
+        }
         if (!item) throw taskError('handoff-write', '无法发布当前工单的工作区交接。');
         return item.id;
     };

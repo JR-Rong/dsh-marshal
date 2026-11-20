@@ -466,15 +466,7 @@ window.__ModuleLoader__.load({
         }
       }, [initialAgentId]);
 
-      React.useEffect(() => {
-        setScope(layer);
-        setSelected(null);
-        setResults(null);
-        if (layer === 'workspace' && !workspaceId && realWorkspaces.length > 0) {
-          setWorkspaceId(realWorkspaces[0].id);
-        }
-      }, [layer, realWorkspaces]);
-
+      const [cue, setCue] = React.useState('');
       const agents = library?.agents ?? [];
       const realWorkspaces = React.useMemo(() => {
         const map = new Map();
@@ -484,6 +476,18 @@ window.__ModuleLoader__.load({
         }
         return [...map.values()];
       }, [library, extraWorkspaces]);
+
+      React.useEffect(() => {
+        setScope(layer);
+        setSelected(null);
+        setResults(null);
+      }, [layer]);
+
+      React.useEffect(() => {
+        if (layer === 'workspace' && !workspaceId && realWorkspaces.length > 0) {
+          setWorkspaceId(realWorkspaces[0].id);
+        }
+      }, [layer, workspaceId, realWorkspaces]);
 
       const activeAgentId = layer === 'agent' ? agentId : '';
       const activeWorkspaceId = layer === 'workspace' ? workspaceId : '';
@@ -533,7 +537,7 @@ window.__ModuleLoader__.load({
           const idSet = new Set(nodes.map(n => n.id));
           const edges = (rawGraph.edges || []).filter(edge => idSet.has(edge.source) && idSet.has(edge.target));
           setGraph({ nodes, edges });
-          setPrivateBackend(layer === 'agent' ? (data.privateBackend ?? '') : '');
+          setPrivateBackend(layer === 'global' ? '' : (data.privateBackend ?? ''));
           setHealth(nextHealth);
           setError('');
         }
@@ -584,17 +588,17 @@ window.__ModuleLoader__.load({
           }
           else if (scope === 'workspace') {
             if (!workspaceId) throw new Error('请先选择一个项目工作区');
-            await fetchJson('marshal/memory/remember', { workspaceId, scope: 'workspace', title: title.trim(), text: text.trim(), kind: 'fact', importance: 0.6, tags: [] });
+            await fetchJson('marshal/memory/remember', { workspaceId, scope: 'workspace', title: title.trim(), text: text.trim(), ...(cue.trim() ? { cue: cue.trim() } : {}), kind: 'fact', importance: 0.6, tags: [] });
           }
           else {
             if (!agentId) throw new Error('请先选择一个智能体');
             await fetchJson('marshal/memory/remember', {
               agentId, ...(workspaceId ? { workspaceId } : {}), scope: 'agent',
-              title: title.trim(), text: text.trim(), kind: 'fact', importance: 0.6, tags: [],
+              title: title.trim(), text: text.trim(), ...(cue.trim() ? { cue: cue.trim() } : {}), kind: 'fact', importance: 0.6, tags: [],
               ...(privateBackend === 'mnemon' && workspaceId && allowTaskRecall ? { visibility: 'group-safe' } : {}),
             });
           }
-          setTitle(''); setText(''); setAllowTaskRecall(false); setFormOpen(false); await loadGraph();
+          setTitle(''); setText(''); setCue(''); setAllowTaskRecall(false); setFormOpen(false); await loadGraph();
         }
         catch (e) { setError(friendlyError(e, '写入记忆')); }
         finally { setBusy(false); }
@@ -663,7 +667,7 @@ window.__ModuleLoader__.load({
             setHealth(null); setError('');
           }, style: { ...uiInput, width: 220 } },
             realWorkspaces.length === 0 ? h('option', { value: '' }, '暂无项目工作区') : realWorkspaces.map(ws => h('option', { key: ws.id, value: ws.id }, ws.label))),
-          layer === 'agent' && privateBackend === 'mnemon' && h('span', { style: { color: dswTheme.dim, fontSize: 11 } }, 'Mnemon · 本机私有记忆'),
+          layer !== 'global' && privateBackend === 'mnemon' && h('span', { style: { color: '#10b981', fontSize: 11, padding: '2px 8px', borderRadius: 999, border: '1px solid color-mix(in srgb, #10b981 35%, transparent)', background: 'color-mix(in srgb, #10b981 12%, transparent)' } }, 'Mnemon · 意图图谱 + 推索引引擎'),
           h('input', { value: query, onChange: event => setQuery(event.target.value), onKeyDown: event => { if (event.key === 'Enter') void search(); }, placeholder: '搜索当前层级记忆…', style: { ...uiInput, width: 190 } }),
           h('button', { type: 'button', style: uiButton(false), onClick: () => { void search(); } }, '搜索'),
           h('button', { type: 'button', style: uiButton(false), onClick: () => { setScope(layer); setFormOpen(value => !value); } }, '＋ 记忆'),
@@ -706,6 +710,7 @@ window.__ModuleLoader__.load({
               h('option', { value: 'agent' }, '智能体私有'),
               h('option', { value: 'workspace' }, '工作区共享')),
             scope === 'global' && h('select', { value: globalVisibility, onChange: event => setGlobalVisibility(event.target.value), style: { ...uiInput, width: 130 } }, h('option', { value: 'all' }, '所有会话'), h('option', { value: 'no-group' }, '仅单聊'))),
+          scope !== 'global' && h('input', { value: cue, onChange: event => setCue(event.target.value), placeholder: '触发场景 Cue（可选，例如：改看板状态机或发版前）', style: uiInput }),
           h('textarea', { value: text, onChange: event => setText(event.target.value), rows: 3, placeholder: '记忆内容…', style: { ...uiInput, resize: 'vertical' } }),
           scope === 'agent' && privateBackend === 'mnemon' && workspaceId && h('label', { style: { fontSize: 12 } },
             h('input', { type: 'checkbox', checked: allowTaskRecall, onChange: event => setAllowTaskRecall(event.target.checked) }),
@@ -728,6 +733,7 @@ window.__ModuleLoader__.load({
           selected && h('aside', { style: { width: 300, flexShrink: 0, overflow: 'auto', padding: 16, border: '1px solid #8883', borderRadius: 14, background: 'color-mix(in srgb, currentColor 3%, transparent)' } },
             h('div', { style: { fontSize: 11, color: dswTheme.dim, textTransform: 'uppercase', letterSpacing: '.06em' } }, selected.scope + ' · ' + selected.kind + (selected.scope === 'global' ? ' · ' + (selected.visibility === 'all' ? '所有会话' : '仅单聊') : '')),
             h('h3', { style: { margin: '6px 0 10px', fontSize: 16 } }, selected.title),
+            selected.cue && h('div', { style: { fontSize: 11, color: dswTheme.dim, marginBottom: 8, padding: '4px 8px', borderRadius: 6, background: 'color-mix(in srgb, currentColor 6%, transparent)' } }, '触发场景：' + selected.cue),
             selected.scope === 'global'
               ? h('div', { style: { display: 'grid', gap: 8 } },
                 h('textarea', { value: editText || selected.content || '', onChange: event => setEditText(event.target.value), rows: 6, style: { ...uiInput, resize: 'vertical' } }),
@@ -936,6 +942,21 @@ window.__ModuleLoader__.load({
             h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
               h('button', { type: 'button', style: uiButton(true), onClick: () => { onClose(); onOpenRemote(); } }, '打开远端设备会话 →'),
               h('button', { type: 'button', style: uiButton(false), onClick: onRefresh }, '重新连接')))));
+    }
+
+    class MarshalErrorBoundary extends React.Component {
+      constructor(props) { super(props); this.state = { error: null }; }
+      static getDerivedStateFromError(error) { return { error }; }
+      componentDidUpdate(prevProps) { if (prevProps.resetKey !== this.props.resetKey && this.state.error) this.setState({ error: null }); }
+      render() {
+        if (this.state.error) {
+          return h('div', { style: { flex: 1, padding: 28, display: 'grid', gap: 10, alignContent: 'center', justifyItems: 'center', textAlign: 'center' } },
+            h('div', { style: { fontSize: 14, fontWeight: 600, color: dswTheme.danger } }, '页面渲染异常'),
+            h('div', { style: { fontSize: 12, color: dswTheme.dim, maxWidth: 420, wordBreak: 'break-word' } }, String(this.state.error?.message || this.state.error)),
+            h('button', { type: 'button', style: uiButton(false), onClick: () => this.setState({ error: null }) }, '重新加载页面'));
+        }
+        return this.props.children;
+      }
     }
 
     function MarshalPanel({ marshalContext, openSession, openPanel, workspaceService, SessionProvider, renderSlot }) {
@@ -1229,8 +1250,9 @@ window.__ModuleLoader__.load({
             },
               h('span', { style: { width: 7, height: 7, borderRadius: '50%', background: deviceDotColor, flexShrink: 0 } }),
               h('span', null, deviceLabel)))),
-        tab === 'tasks' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex' } },
-          h(TaskBoardPage, { openSession, openTaskRoom, focusedTask, openNativeBoard: openPanel ? () => openPanel('task-board') : undefined, onOpenRosters: () => chooseTab('rosters') })),
+        tab === 'tasks' && h('div', { style: { flex: 1, minHeight: 0, minWidth: 0, width: '100%', overflow: 'hidden', display: 'flex' } },
+          h(MarshalErrorBoundary, { resetKey: 'tasks' },
+            h(TaskBoardPage, { openSession, openTaskRoom, focusedTask, openNativeBoard: openPanel ? () => openPanel('task-board') : undefined, onOpenRosters: () => chooseTab('rosters') }))),
         tab === 'chats' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex', overflow: 'hidden' } },
           h('nav', { 'aria-label': '会话分类', style: { width: 168, flexShrink: 0, borderRight: '1px solid ' + dswTheme.border, padding: 10, display: 'flex', flexDirection: 'column', gap: 4, background: 'color-mix(in srgb, currentColor 2%, transparent)' } },
             chatSections.map(([key, label, hint]) => h('button', {
@@ -1279,10 +1301,12 @@ window.__ModuleLoader__.load({
                   : h('p', { style: { margin: 'auto', opacity: .55 } }, notice || '选择一个远端会话，继续工作'),
                 h(Statistics, { value: state.statistics, agent: state.target?.agent })),
               !address && h('p', { role: 'status', style: { margin: 'auto', padding: 24 } }, notice)))),
-        tab === 'agents' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex' } },
-          h(AgentsPage, { onOpenChats: () => chooseTab('chats'), onOpenMemory: openAgentMemory, openSession, workspaceService, initialSubTab: agentSub })),
-        tab === 'memory' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex' } },
-          h(MemoryPage, { initialAgentId: memoryTarget.agentId, initialLayer: memoryTarget.layer })),
+        tab === 'agents' && h('div', { style: { flex: 1, minHeight: 0, minWidth: 0, width: '100%', overflow: 'hidden', display: 'flex' } },
+          h(MarshalErrorBoundary, { resetKey: 'agents' },
+            h(AgentsPage, { onOpenChats: () => chooseTab('chats'), onOpenMemory: openAgentMemory, openSession, workspaceService, initialSubTab: agentSub }))),
+        tab === 'memory' && h('div', { style: { flex: 1, minHeight: 0, minWidth: 0, width: '100%', overflow: 'hidden', display: 'flex' } },
+          h(MarshalErrorBoundary, { resetKey: 'memory' },
+            h(MemoryPage, { initialAgentId: memoryTarget.agentId, initialLayer: memoryTarget.layer }))),
         h(DeviceStatusDrawer, {
           open: deviceDrawerOpen,
           onClose: () => setDeviceDrawerOpen(false),
@@ -2072,7 +2096,7 @@ window.__ModuleLoader__.load({
       style.textContent = [
         '@keyframes mtb-pulse{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--mtb-accent) 55%,transparent)}70%{box-shadow:0 0 0 6px transparent}100%{box-shadow:0 0 0 0 transparent}}',
         '@keyframes mtb-spin{to{transform:rotate(360deg)}}',
-        '.mtb-page{flex:1;min-height:0;display:flex;flex-direction:column;position:relative;background:var(--dsw-alias-bg-base,transparent);color:var(--dsw-alias-label-primary,inherit)}',
+        '.mtb-page{flex:1;min-height:0;min-width:0;width:100%;overflow:hidden;display:flex;flex-direction:column;position:relative;background:var(--dsw-alias-bg-base,transparent);color:var(--dsw-alias-label-primary,inherit)}',
         '.mtb-head{padding:12px 20px;border-bottom:1px solid var(--dsw-alias-border-l1,color-mix(in srgb,currentColor 10%,transparent));display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;flex-shrink:0}',
         '.mtb-head-left{display:flex;align-items:center;gap:14px;flex-wrap:wrap;min-width:0}',
         '.mtb-head-right{display:flex;align-items:center;gap:8px;flex-shrink:0;flex-wrap:wrap}',
@@ -2102,11 +2126,16 @@ window.__ModuleLoader__.load({
         '.mtb-tag[data-tag-tone="p1"]{--mtb-tag-fill:#f59e0b32;--mtb-tag-border:#f59e0b82;font-weight:600;font-variant-numeric:tabular-nums}',
         '.mtb-tag[data-tag-tone="p2"]{--mtb-tag-fill:#3b82f630;--mtb-tag-border:#3b82f67a;font-weight:600;font-variant-numeric:tabular-nums}',
         '.mtb-tag[data-tag-tone="p3"]{--mtb-tag-fill:#64748b30;--mtb-tag-border:#64748b78;font-weight:600;font-variant-numeric:tabular-nums}',
-        '.mtb-grid{flex:1;min-height:0;overflow-x:auto;overflow-y:hidden;padding:14px 18px 16px;display:grid;grid-auto-flow:column;grid-auto-columns:minmax(248px,1fr);gap:12px;align-items:stretch;scrollbar-width:thin;scrollbar-color:var(--dsw-alias-border-l3,color-mix(in srgb,currentColor 24%,transparent)) transparent}',
-        '.mtb-grid::-webkit-scrollbar{height:9px}',
-        '.mtb-grid::-webkit-scrollbar-track{background:transparent}',
-        '.mtb-grid::-webkit-scrollbar-thumb{background:var(--dsw-alias-border-l3,color-mix(in srgb,currentColor 22%,transparent));border-radius:999px;border:2px solid transparent;background-clip:content-box}',
-        '.mtb-col{display:flex;flex-direction:column;min-height:0;max-height:100%;border-radius:14px;overflow:hidden;background:var(--dsw-alias-bg-layer-2,color-mix(in srgb,currentColor 4%,transparent));border:1px solid color-mix(in srgb,var(--mtb-accent) 22%,var(--dsw-alias-border-l1,color-mix(in srgb,currentColor 10%,transparent)));border-top:3px solid var(--mtb-accent);transition:border-color .15s,box-shadow .15s,background .15s}',
+        '.mtb-grid{flex:1;min-height:0;min-width:0;width:100%;box-sizing:border-box;overflow-x:auto;overflow-y:hidden;padding:14px 18px 14px;display:flex;flex-direction:row;gap:12px;align-items:stretch;scrollbar-width:auto;scrollbar-color:var(--dsw-alias-border-l3,color-mix(in srgb,currentColor 32%,transparent)) color-mix(in srgb,currentColor 6%,transparent)}',
+        '.mtb-grid::-webkit-scrollbar{height:10px}',
+        '.mtb-grid::-webkit-scrollbar-track{background:color-mix(in srgb,currentColor 5%,transparent);border-radius:999px}',
+        '.mtb-grid::-webkit-scrollbar-thumb{background:var(--dsw-alias-border-l3,color-mix(in srgb,currentColor 32%,transparent));border-radius:999px;border:2px solid transparent;background-clip:content-box}',
+        '.mtb-grid::-webkit-scrollbar-thumb:hover{background:color-mix(in srgb,currentColor 48%,transparent)}',
+        '.mtb-col{flex:1 0 232px;min-width:232px;display:flex;flex-direction:column;min-height:0;max-height:100%;border-radius:14px;overflow:hidden;background:var(--dsw-alias-bg-layer-2,color-mix(in srgb,currentColor 4%,transparent));border:1px solid color-mix(in srgb,var(--mtb-accent) 22%,var(--dsw-alias-border-l1,color-mix(in srgb,currentColor 10%,transparent)));border-top:3px solid var(--mtb-accent);transition:border-color .15s,box-shadow .15s,background .15s,flex-basis .15s}',
+        '.mtb-col[data-collapsed="true"]{flex:0 0 44px;min-width:44px;max-width:44px;cursor:pointer;align-items:center;padding:10px 4px;gap:10px}',
+        '.mtb-col-rail-title{writing-mode:vertical-rl;text-orientation:mixed;font-size:12px;font-weight:600;letter-spacing:.12em;color:var(--dsw-alias-label-secondary,inherit);user-select:none}',
+        '.mtb-pan-btn{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:999px;border:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 18%,transparent));background:color-mix(in srgb,currentColor 5%,transparent);color:inherit;cursor:pointer;font-size:11px;padding:0;flex-shrink:0}',
+        '.mtb-pan-btn:hover{background:color-mix(in srgb,currentColor 13%,transparent)}',
         '.mtb-col[data-drop="true"]{border-color:var(--mtb-accent);box-shadow:0 0 0 2px color-mix(in srgb,var(--mtb-accent) 28%,transparent);background:color-mix(in srgb,var(--mtb-accent) 7%,var(--dsw-alias-bg-layer-2,transparent))}',
         '.mtb-col-head{padding:10px 12px;display:flex;align-items:center;gap:8px;flex-shrink:0;background:color-mix(in srgb,var(--mtb-accent) 8%,transparent);border-bottom:1px solid color-mix(in srgb,var(--mtb-accent) 16%,transparent)}',
         '.mtb-dot{width:8px;height:8px;border-radius:999px;background:var(--mtb-accent);flex-shrink:0}',
@@ -2329,6 +2358,30 @@ window.__ModuleLoader__.load({
       const [dropCol, setDropCol] = React.useState('');
       const [compactCards, setCompactCards] = React.useState(false);
       const [showFlowGuide, setShowFlowGuide] = React.useState(false);
+      const [collapsedCols, setCollapsedCols] = React.useState(() => {
+        try { const raw = JSON.parse(globalThis.localStorage?.getItem('marshal.board.collapsedCols') || '[]'); return Array.isArray(raw) ? raw : []; } catch { return []; }
+      });
+      const gridRef = React.useRef(null);
+      const toggleCollapseCol = key => {
+        setCollapsedCols(prev => {
+          const next = prev.includes(key) ? prev.filter(k => k !== key) : [...prev, key];
+          try { globalThis.localStorage?.setItem('marshal.board.collapsedCols', JSON.stringify(next)); } catch {}
+          return next;
+        });
+      };
+      const panBoard = delta => {
+        const el = gridRef.current;
+        if (el) el.scrollBy({ left: delta, behavior: 'smooth' });
+      };
+      const handleGridDragOver = event => {
+        if (!dragTaskId) return;
+        const el = gridRef.current;
+        if (!el) return;
+        const rect = el.getBoundingClientRect();
+        const edge = 76;
+        if (event.clientX > rect.right - edge) el.scrollLeft += 18;
+        else if (event.clientX < rect.left + edge) el.scrollLeft -= 18;
+      };
       const [showArchive, setShowArchive] = React.useState(false);
       const [activeTag, setActiveTag] = React.useState('');
       const [searchQuery, setSearchQuery] = React.useState('');
@@ -3371,7 +3424,15 @@ window.__ModuleLoader__.load({
 
       const scrollToColumn = key => {
         setShowArchive(false);
-        document.getElementById('marshal-col-' + key)?.scrollIntoView({ behavior: 'smooth', inline: 'nearest', block: 'nearest' });
+        setCollapsedCols(prev => {
+          if (!prev.includes(key)) return prev;
+          const next = prev.filter(k => k !== key);
+          try { globalThis.localStorage?.setItem('marshal.board.collapsedCols', JSON.stringify(next)); } catch {}
+          return next;
+        });
+        setTimeout(() => {
+          document.getElementById('marshal-col-' + key)?.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
+        }, 30);
       };
 
       const canOrchestrate = Boolean(catalog?.memoryAvailable && catalog?.leaders?.length > 0);
@@ -3400,7 +3461,9 @@ window.__ModuleLoader__.load({
                   h('span', { className: 'mtb-dot', 'data-pulse': column.pulse && count > 0 ? 'true' : undefined }),
                   column.label,
                   h('strong', null, count));
-              }))),
+              }),
+              h('button', { type: 'button', className: 'mtb-pan-btn', title: '向左滚动看板列', 'aria-label': '向左滚动看板列', onClick: () => panBoard(-320) }, '◀'),
+              h('button', { type: 'button', className: 'mtb-pan-btn', title: '向右滚动看板列（查看已完成/已失败）', 'aria-label': '向右滚动看板列', onClick: () => panBoard(320) }, '▶'))),
           h('div', { className: 'mtb-head-right' },
             archivedTasks.length > 0 && h('button', { type: 'button', style: tabStyle(showArchive), onClick: () => setShowArchive(v => !v) },
               showArchive ? '返回看板' : '归档 (' + archivedTasks.length + ')'),
@@ -3609,19 +3672,24 @@ window.__ModuleLoader__.load({
                   }))
           : allActive.length === 0 && !formOpen
             ? h(EmptyState, { title: '还没有卡片', hint: '新建一张卡片，或点上方「✨ AI 解析任务」快速生成。', action: '新建卡片', onAction: () => setFormOpen(true) })
-            : h('div', { className: 'mtb-grid' },
+            : h('div', { ref: gridRef, className: 'mtb-grid', onDragOver: handleGridDragOver },
                 columns.map(column => {
                   const items = list.filter(task => (knownStatuses.has(task.status) ? task.status : 'todo') === column.key);
+                  const collapsed = collapsedCols.includes(column.key);
                   return h('section', {
                     key: column.key,
                     id: 'marshal-col-' + column.key,
                     className: 'mtb-col',
                     'data-status': column.key,
+                    'data-collapsed': collapsed ? 'true' : undefined,
                     'data-drop': dropCol === column.key ? 'true' : undefined,
                     style: { '--mtb-accent': column.accent },
+                    onClick: collapsed ? () => toggleCollapseCol(column.key) : undefined,
+                    title: collapsed ? '点击展开「' + column.label + '」列（拖拽卡片到此也可直接流转）' : undefined,
                     onDragOver: event => {
                       if (!dragTaskId) return;
                       event.preventDefault();
+                      handleGridDragOver(event);
                       if (dropCol !== column.key) setDropCol(column.key);
                     },
                     onDragLeave: event => {
@@ -3636,14 +3704,30 @@ window.__ModuleLoader__.load({
                       if (target && target.status !== column.key) void move(target, column.key);
                     },
                   },
-                    h('div', { className: 'mtb-col-head' },
-                      h('span', { className: 'mtb-dot', 'data-pulse': column.pulse && items.length > 0 ? 'true' : undefined }),
-                      h('h2', { className: 'mtb-col-title', style: { margin: 0 } }, column.label),
-                      h('span', { className: 'mtb-count' }, items.length)),
-                    h('div', { className: 'mtb-col-body' },
-                      items.length === 0
-                        ? h('div', { className: 'mtb-empty' }, column.empty)
-                        : items.map(task => card(task, column))));
+                    collapsed
+                      ? [
+                          h('span', { key: 'd', className: 'mtb-dot', 'data-pulse': column.pulse && items.length > 0 ? 'true' : undefined }),
+                          h('span', { key: 'c', className: 'mtb-count', style: { padding: '1px 6px' } }, items.length),
+                          h('span', { key: 't', className: 'mtb-col-rail-title' }, column.label),
+                        ]
+                      : [
+                          h('div', { key: 'h', className: 'mtb-col-head' },
+                            h('span', { className: 'mtb-dot', 'data-pulse': column.pulse && items.length > 0 ? 'true' : undefined }),
+                            h('h2', { className: 'mtb-col-title', style: { margin: 0 } }, column.label),
+                            h('span', { className: 'mtb-count' }, items.length),
+                            h('button', {
+                              type: 'button',
+                              className: 'mtb-icon-btn',
+                              style: { width: 20, height: 20, fontSize: 12 },
+                              title: '折叠「' + column.label + '」列以腾出空间',
+                              'aria-label': '折叠' + column.label,
+                              onClick: event => { event.stopPropagation(); toggleCollapseCol(column.key); },
+                            }, '‹')),
+                          h('div', { key: 'b', className: 'mtb-col-body' },
+                            items.length === 0
+                              ? h('div', { className: 'mtb-empty' }, column.empty)
+                              : items.map(task => card(task, column))),
+                        ]);
                 })),
         renderDrawer(),
         renderParseModal());
