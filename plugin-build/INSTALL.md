@@ -6,7 +6,7 @@
 
 当前可安装产物只有：
 
-- `plugin-build/dsh-marshal-0.2.0-agent-groups.16.tgz`（推荐，依赖会由 pnpm 安装）
+- `plugin-build/dsh-marshal-0.2.0-agent-groups.17.tgz`（推荐，依赖会由 pnpm 安装）
 - 或 `plugin-build/` 目录（需要先在那里执行 `pnpm install --prod`）
 
 ## 依赖（务必先看）
@@ -16,7 +16,7 @@ marshal 本身是一个 DSH 插件，下面两个是**同 profile 的 DSH 插件
 | 依赖包 | 是否必需 | 作用 |
 |---|---|---|
 | `@linxin666/dsh-agents` | **必需** | 提供 `/dsh-agents` 后端、智能体库、成员会话；缺它时「智能体」「群聊」「跨设备」都会提示后端未挂载 |
-| `@linxin666/dsh-client-ui-task-board` | **可选** | 提供完整原生任务看板；缺它时 marshal 使用内置轻量看板（基础建卡/运行/删除） |
+| `@linxin666/dsh-client-ui-task-board` | **已内置（无需另装）** | 含「待确认」流转、子任务、标签、Cron 定时与真实会话执行的完整看板后端已内置于 marshal 包中；若宿主已另装该插件会自动去重兼容 |
 
 安装命令（有 `dsh` 的 CLI 环境）：
 
@@ -38,7 +38,7 @@ Desktop 没有 `dsh` 命令时：打开 **Plugins → Add plugin**，搜索并�
 
 1. 打开 DeepSeek Harness；
 2. 左侧 **Plugins** → **Add plugin / 添加插件**；
-3. 选择本仓库的 `plugin-build/dsh-marshal-0.2.0-agent-groups.16.tgz`；
+3. 选择本仓库的 `plugin-build/dsh-marshal-0.2.0-agent-groups.17.tgz`；
 4. 启用后重启 DSH；打开侧边栏 **调度官**。
 
 Desktop 的插件管理器会做安装和链接；不需要也不保证有全局 `dsh` 命令。
@@ -48,7 +48,7 @@ Desktop 的插件管理器会做安装和链接；不需要也不保证有全局
 如果当前环境有 `dsh`：
 
 ```bash
-dsh plugin --profile desktop add "$(pwd)/plugin-build/dsh-marshal-0.2.0-agent-groups.16.tgz"
+dsh plugin --profile desktop add "$(pwd)/plugin-build/dsh-marshal-0.2.0-agent-groups.17.tgz"
 ```
 
 tarball 会由 pnpm 正常安装依赖（zod / ws / marked / entities）。不要用 `link:` 指到工作区目录：工作区一移动插件就坏，而且链接安装不会自动安装依赖。
@@ -77,7 +77,7 @@ GET /marshal/health
 {
   "ok": true,
   "name": "dsh-marshal",
-  "version": "0.2.0-agent-groups.16",
+  "version": "0.2.0-agent-groups.17",
   "capabilities": {
     "groups": true,
     "agents": true,

@@ -182,6 +182,10 @@ test('shipped client keeps plain card create/run working and sends auth for task
     assert.ok(source.includes('--mtb-accent'), 'board should apply per-column theme accents');
     assert.ok(source.includes('taskTagTone'), 'board should render colored tag and priority pills');
     assert.ok(source.includes('mtb-drawer'), 'board should open a detail drawer on card click');
+    assert.ok(source.includes('mtb-tpl-pill'), 'create form should expose agent orchestration templates directly');
+    assert.ok(source.includes("fetchJson('marshal/tasks/set-parent'"), 'board should support linking subtasks');
+    assert.ok(source.includes("fetchJson('marshal/tasks/update'"), 'board should support editing tags and card details');
+    assert.ok(source.includes('--mtb-res-c'), 'bottom-left result badge should use high-contrast explicit dot + label-primary text');
 });
 
 test('mountSuperagent adopts connection trust with only the real connection service (no connection.authentication)', async () => {
@@ -227,4 +231,21 @@ test('local board supports moving tasks across all six columns including review'
     assert.equal(confirmed.tasks[0].status, 'done');
     const ignored = await board.apply('r4', { kind: 'move', taskId: 'task-1', status: 'bogus' });
     assert.equal(ignored.tasks[0].status, 'done');
+    await board.apply('r5', { kind: 'create', id: 'task-2', input: { title: '子任务', parentId: 'task-1' } });
+    const updated = await board.apply('r6', { kind: 'update', taskId: 'task-2', patch: { tags: [{ name: 'P2' }] } });
+    const child = updated.tasks.find(item => item.id === 'task-2');
+    assert.equal(child.parentId, 'task-1');
+    assert.deepEqual(child.tags, [{ name: 'P2' }]);
+    const unlinked = await board.apply('r7', { kind: 'set-parent', taskId: 'task-2', parentId: null });
+    assert.equal(unlinked.tasks.find(item => item.id === 'task-2').parentId, undefined);
+    const archived = await board.apply('r8', { kind: 'archive', taskId: 'task-1' });
+    assert.ok(typeof archived.tasks.find(item => item.id === 'task-1').archivedAt === 'number');
+    const restored = await board.apply('r9', { kind: 'restore', taskId: 'task-1' });
+    assert.equal(restored.tasks.find(item => item.id === 'task-1').archivedAt, undefined);
+});
+
+test('embedded patched task-board host runtime is bundled with review settlement', () => {
+    const embedded = readFileSync(new URL('../lib/src/task-board/index.js', import.meta.url), 'utf8');
+    assert.ok(embedded.includes('mountOnce("@linxin666/dsh-client-ui-task-board"'));
+    assert.ok(embedded.includes('if (outcome === "succeeded") return task.schedule?.enabled === true ? "todo" : "review";'));
 });

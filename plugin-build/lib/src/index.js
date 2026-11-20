@@ -451,6 +451,20 @@ function applyNode(ctx, config) {
     }
     if (config.groups) {
         try {
+            ctx.inject(['systemPrompt', 'typertGateway', 'workspaceRegistry', 'webServer', 'agents', 'commands'], (scoped) => {
+                if (lookupService(ctx, 'taskBoard') !== undefined || lookupService(scoped, 'taskBoard') !== undefined) return;
+                void import('./task-board/index.js').then((tb) => {
+                    if (lookupService(ctx, 'taskBoard') !== undefined || lookupService(scoped, 'taskBoard') !== undefined) return;
+                    tb.apply(scoped, {});
+                }).catch((error) => {
+                    ctx.logger.warn(`marshal: embedded task-board unavailable: ${errorName(error)}`);
+                });
+            });
+        }
+        catch (error) {
+            ctx.logger.warn(`marshal: embedded task-board inject skipped: ${errorName(error)}`);
+        }
+        try {
             mountGroups(ctx, config, { logger: ctx.logger, memory: agentMemoryService });
         }
         catch (error) {

@@ -182,15 +182,17 @@ function taskView(task, workflow, room) {
         ...(workflow === undefined ? {} : { workflow }),
         ...(room === undefined ? {} : { taskRoom: visibleTaskRoom(room) }),
         ...(task.description === undefined ? {} : { description: task.description }),
+        ...(task.prompt === undefined ? {} : { prompt: task.prompt }),
         ...(task.parentId === undefined ? {} : { parentId: task.parentId }),
         ...(task.permission === undefined ? {} : { permission: task.permission }),
+        ...(task.permissionConfirmedAt === undefined ? {} : { permissionConfirmedAt: task.permissionConfirmedAt }),
         ...(task.mode === undefined ? {} : { mode: task.mode }),
         ...(tags === undefined ? {} : { tags }),
         ...(executions.length > 0 ? { runCount: executions.length } : {}),
         ...(openExecution ? { openExecution: true } : {}),
         ...(latest?.startedAt === undefined ? {} : { startedAt: latest.startedAt }),
         ...(latest?.endedAt === undefined ? {} : { endedAt: latest.endedAt }),
-        ...(task.schedule?.enabled === true ? { schedule: { enabled: true, mode: task.schedule.mode, ...(task.schedule.nextRunAt === undefined ? {} : { nextRunAt: task.schedule.nextRunAt }) } } : {}),
+        ...(task.schedule !== undefined ? { schedule: { enabled: task.schedule.enabled === true, mode: task.schedule.mode, ...(typeof task.schedule.cron === 'string' ? { cron: task.schedule.cron } : {}), ...(task.schedule.nextRunAt === undefined ? {} : { nextRunAt: task.schedule.nextRunAt }) } } : {}),
         ...(task.freeze !== undefined ? { freeze: { goal: typeof task.freeze.goal === 'string' ? task.freeze.goal : '' } } : {}),
         ...(task.archivedAt === undefined ? {} : { archivedAt: task.archivedAt }),
         ...(latest === undefined || latest.sessionId === undefined ? {} : { sessionId: latest.sessionId }),
@@ -326,7 +328,14 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             const description = typeof body.description === 'string' ? body.description.trim() : '';
             const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
             const tags = normalizeCardTags(body.tags);
-            const input = { title, description, prompt: prompt || description || title, ...(tags === undefined ? {} : { tags }) };
+            const parentId = typeof body.parentId === 'string' && body.parentId.trim() !== '' ? body.parentId.trim() : undefined;
+            const permission = ['read-only', 'workspace-write', 'danger-full-access'].includes(body.permission) ? body.permission : undefined;
+            const input = {
+                title, description, prompt: prompt || description || title,
+                ...(tags === undefined ? {} : { tags }),
+                ...(parentId === undefined ? {} : { parentId }),
+                ...(permission === undefined ? {} : { permission }),
+            };
             const source = boardSource();
             const id = randomUUID();
             let prepared;
@@ -467,6 +476,141 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             if (workflow && !authorize(req, res, workflow)) return;
             orchestration?.assertIdle(source, body.taskId);
             const snapshot = await board.apply(randomUUID(), { kind: 'move', taskId: body.taskId, status: body.status }, initiator);
+            write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
+        }),
+        exact('POST', '/marshal/tasks/update', async (req, res) => {
+            const board = getBoard();
+            if (board === undefined) { write(res, 503, { ok: false, code: 'no-task-board' }); return; }
+            const body = await readBody(req);
+            if (typeof body.taskId !== 'string' || body.taskId === '') { write(res, 400, { ok: false, code: 'invalid-task' }); return; }
+            const source = boardSource();
+            const workflow = orchestration?.target(source, body.taskId);
+            const boundRoom = rooms?.find(source, body.taskId);
+            if (boundRoom) {
+                const access = authenticate(req, true);
+                if (!taskRoomAccess(access, boundRoom, allowed)) { write(res, 403, { ok: false, code: 'workspace-forbidden' }); return; }
+            }
+            if (workflow && !authorize(req, res, workflow)) return;
+            orchestration?.assertIdle(source, body.taskId);
+            const patch = {};
+            if (typeof body.title === 'string' && body.title.trim() !== '') patch.title = body.title.trim();
+            if (typeof body.description === 'string') patch.description = body.description;
+            if (typeof body.prompt === 'string') patch.prompt = body.prompt;
+            if (['read-only', 'workspace-write', 'danger-full-access'].includes(body.permission)) patch.permission = body.permission;
+            if (body.tags === null) patch.tags = null;
+            else if (Array.isArray(body.tags)) {
+                const tags = normalizeCardTags(body.tags);
+                patch.tags = tags ?? null;
+            }
+            if (Object.keys(patch).length === 0) { write(res, 400, { ok: false, code: 'empty-patch' }); return; }
+            const snapshot = await board.apply(randomUUID(), { kind: 'update', taskId: body.taskId, patch }, initiator);
+            write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
+        }),
+        exact('POST', '/marshal/tasks/set-parent', async (req, res) => {
+            const board = getBoard();
+            if (board === undefined) { write(res, 503, { ok: false, code: 'no-task-board' }); return; }
+            const body = await readBody(req);
+            if (typeof body.taskId !== 'string' || body.taskId === '') { write(res, 400, { ok: false, code: 'invalid-task' }); return; }
+            const parentId = body.parentId === null || body.parentId === '' || body.parentId === undefined ? null
+                : typeof body.parentId === 'string' ? body.parentId.trim() : undefined;
+            if (parentId === undefined || parentId === body.taskId) { write(res, 400, { ok: false, code: 'invalid-parent' }); return; }
+            const source = boardSource();
+            const workflow = orchestration?.target(source, body.taskId);
+            const boundRoom = rooms?.find(source, body.taskId);
+            if (boundRoom) {
+                const access = authenticate(req, true);
+                if (!taskRoomAccess(access, boundRoom, allowed)) { write(res, 403, { ok: false, code: 'workspace-forbidden' }); return; }
+            }
+            if (workflow && !authorize(req, res, workflow)) return;
+            orchestration?.assertIdle(source, body.taskId);
+            const snapshot = await board.apply(randomUUID(), { kind: 'set-parent', taskId: body.taskId, parentId }, initiator);
+            write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
+        }),
+        exact('POST', '/marshal/tasks/archive', async (req, res) => {
+            const board = getBoard();
+            if (board === undefined) { write(res, 503, { ok: false, code: 'no-task-board' }); return; }
+            const body = await readBody(req);
+            if (typeof body.taskId !== 'string' || body.taskId === '') { write(res, 400, { ok: false, code: 'invalid-task' }); return; }
+            const source = boardSource();
+            const workflow = orchestration?.target(source, body.taskId);
+            const boundRoom = rooms?.find(source, body.taskId);
+            if (boundRoom) {
+                const access = authenticate(req, true);
+                if (!taskRoomAccess(access, boundRoom, allowed)) { write(res, 403, { ok: false, code: 'workspace-forbidden' }); return; }
+            }
+            if (workflow && !authorize(req, res, workflow)) return;
+            orchestration?.assertIdle(source, body.taskId);
+            const snapshot = await board.apply(randomUUID(), { kind: 'archive', taskId: body.taskId }, initiator);
+            write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
+        }),
+        exact('POST', '/marshal/tasks/restore', async (req, res) => {
+            const board = getBoard();
+            if (board === undefined) { write(res, 503, { ok: false, code: 'no-task-board' }); return; }
+            const body = await readBody(req);
+            if (typeof body.taskId !== 'string' || body.taskId === '') { write(res, 400, { ok: false, code: 'invalid-task' }); return; }
+            const source = boardSource();
+            const workflow = orchestration?.target(source, body.taskId);
+            const boundRoom = rooms?.find(source, body.taskId);
+            if (boundRoom) {
+                const access = authenticate(req, true);
+                if (!taskRoomAccess(access, boundRoom, allowed)) { write(res, 403, { ok: false, code: 'workspace-forbidden' }); return; }
+            }
+            if (workflow && !authorize(req, res, workflow)) return;
+            const snapshot = await board.apply(randomUUID(), { kind: 'restore', taskId: body.taskId }, initiator);
+            write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
+        }),
+        exact('POST', '/marshal/tasks/schedule', async (req, res) => {
+            const board = getBoard();
+            if (board === undefined) { write(res, 503, { ok: false, code: 'no-task-board' }); return; }
+            const body = await readBody(req);
+            if (typeof body.taskId !== 'string' || body.taskId === '') { write(res, 400, { ok: false, code: 'invalid-task' }); return; }
+            const source = boardSource();
+            const workflow = orchestration?.target(source, body.taskId);
+            const boundRoom = rooms?.find(source, body.taskId);
+            if (boundRoom) {
+                const access = authenticate(req, true);
+                if (!taskRoomAccess(access, boundRoom, allowed)) { write(res, 403, { ok: false, code: 'workspace-forbidden' }); return; }
+            }
+            if (workflow && !authorize(req, res, workflow)) return;
+            const patch = {};
+            if (typeof body.enabled === 'boolean') patch.enabled = body.enabled;
+            if (body.mode === 'cron' || body.mode === 'once') patch.mode = body.mode;
+            if (typeof body.cron === 'string') patch.cron = body.cron.trim();
+            if (typeof body.at === 'number' && Number.isInteger(body.at)) patch.at = body.at;
+            if (Object.keys(patch).length === 0) { write(res, 400, { ok: false, code: 'invalid-schedule' }); return; }
+            const snapshot = await board.apply(randomUUID(), { kind: 'set-schedule', taskId: body.taskId, patch }, initiator);
+            write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
+        }),
+        exact('POST', '/marshal/tasks/settle', async (req, res) => {
+            const board = getBoard();
+            if (board === undefined) { write(res, 503, { ok: false, code: 'no-task-board' }); return; }
+            const body = await readBody(req);
+            if (typeof body.taskId !== 'string' || body.taskId === '') { write(res, 400, { ok: false, code: 'invalid-task' }); return; }
+            const source = boardSource();
+            const workflow = orchestration?.target(source, body.taskId);
+            const boundRoom = rooms?.find(source, body.taskId);
+            if (boundRoom) {
+                const access = authenticate(req, true);
+                if (!taskRoomAccess(access, boundRoom, allowed)) { write(res, 403, { ok: false, code: 'workspace-forbidden' }); return; }
+            }
+            if (workflow && !authorize(req, res, workflow)) return;
+            const snapshot = await board.apply(randomUUID(), { kind: 'settle', taskId: body.taskId }, initiator);
+            write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
+        }),
+        exact('POST', '/marshal/tasks/confirm-permission', async (req, res) => {
+            const board = getBoard();
+            if (board === undefined) { write(res, 503, { ok: false, code: 'no-task-board' }); return; }
+            const body = await readBody(req);
+            if (typeof body.taskId !== 'string' || body.taskId === '') { write(res, 400, { ok: false, code: 'invalid-task' }); return; }
+            const source = boardSource();
+            const workflow = orchestration?.target(source, body.taskId);
+            const boundRoom = rooms?.find(source, body.taskId);
+            if (boundRoom) {
+                const access = authenticate(req, true);
+                if (!taskRoomAccess(access, boundRoom, allowed)) { write(res, 403, { ok: false, code: 'workspace-forbidden' }); return; }
+            }
+            if (workflow && !authorize(req, res, workflow)) return;
+            const snapshot = await board.apply(randomUUID(), { kind: 'confirm-permission', taskId: body.taskId }, initiator);
             write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
         }),
         exact('POST', '/marshal/tasks/delete', async (req, res) => {

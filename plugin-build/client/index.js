@@ -1723,89 +1723,103 @@ window.__ModuleLoader__.load({
         '.mtb-page{flex:1;min-height:0;display:flex;flex-direction:column;position:relative;background:var(--dsw-alias-bg-base,transparent);color:var(--dsw-alias-label-primary,inherit)}',
         '.mtb-head{padding:12px 20px;border-bottom:1px solid var(--dsw-alias-border-l1,color-mix(in srgb,currentColor 10%,transparent));display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;flex-shrink:0}',
         '.mtb-head-left{display:flex;align-items:center;gap:14px;flex-wrap:wrap;min-width:0}',
-        '.mtb-head-right{display:flex;align-items:center;gap:8px;flex-shrink:0}',
+        '.mtb-head-right{display:flex;align-items:center;gap:8px;flex-shrink:0;flex-wrap:wrap}',
         '.mtb-summary{display:flex;align-items:center;gap:6px;flex-wrap:wrap}',
-        '.mtb-summary-chip{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:999px;border:1px solid color-mix(in srgb,var(--mtb-accent) 26%,transparent);background:color-mix(in srgb,var(--mtb-accent) 9%,transparent);color:var(--dsw-alias-label-secondary,inherit);font-size:11px;line-height:1.4;cursor:pointer;font-family:inherit;transition:background .15s,border-color .15s,transform .12s}',
-        '.mtb-summary-chip:hover{background:color-mix(in srgb,var(--mtb-accent) 16%,transparent);border-color:color-mix(in srgb,var(--mtb-accent) 48%,transparent);transform:translateY(-1px)}',
-        '.mtb-summary-chip strong{font-variant-numeric:tabular-nums;font-weight:600;color:color-mix(in srgb,var(--mtb-accent) 82%,var(--dsw-alias-label-primary,currentColor))}',
+        '.mtb-summary-chip{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:999px;border:1px solid color-mix(in srgb,var(--mtb-accent) 28%,transparent);background:color-mix(in srgb,var(--mtb-accent) 10%,transparent);color:var(--dsw-alias-label-primary,inherit);font-size:11px;line-height:1.4;cursor:pointer;font-family:inherit;transition:background .15s,border-color .15s,transform .12s}',
+        '.mtb-summary-chip:hover{background:color-mix(in srgb,var(--mtb-accent) 18%,transparent);border-color:color-mix(in srgb,var(--mtb-accent) 52%,transparent);transform:translateY(-1px)}',
+        '.mtb-summary-chip strong{font-variant-numeric:tabular-nums;font-weight:700}',
         '.mtb-tagbar{padding:8px 20px;border-bottom:1px solid var(--dsw-alias-border-l1,color-mix(in srgb,currentColor 8%,transparent));display:flex;align-items:center;gap:6px;flex-wrap:wrap;flex-shrink:0;background:color-mix(in srgb,currentColor 2%,transparent)}',
-        '.mtb-tagbar-label{font-size:11px;color:var(--dsw-alias-label-tertiary,color-mix(in srgb,currentColor 48%,transparent));margin-right:2px}',
-        '.mtb-tag{display:inline-flex;align-items:center;gap:4px;max-width:100%;border-radius:999px;padding:1px 8px;font-size:11px;line-height:1.55;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--dsw-alias-label-primary,inherit);border:1px solid var(--mtb-tag-border,color-mix(in srgb,currentColor 18%,transparent));background:var(--mtb-tag-fill,color-mix(in srgb,currentColor 7%,transparent))}',
+        '.mtb-search{width:170px;box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 16%,transparent));background:var(--dsw-alias-bg-base,transparent);color:var(--dsw-alias-label-primary,inherit);border-radius:999px;padding:3.5px 10px;font-size:11.5px;font-family:inherit;outline:none}',
+        '.mtb-search:focus{border-color:var(--dsw-alias-brand-primary,#6366f1)}',
+        '.mtb-tagbar-label{font-size:11px;color:var(--dsw-alias-label-secondary,color-mix(in srgb,currentColor 60%,transparent));margin-left:4px}',
+        '.mtb-tag{display:inline-flex;align-items:center;gap:4px;max-width:100%;border-radius:999px;padding:1.5px 8px;font-size:11px;line-height:1.5;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--dsw-alias-label-primary,inherit);border:1px solid var(--mtb-tag-border,color-mix(in srgb,currentColor 22%,transparent));background:var(--mtb-tag-fill,color-mix(in srgb,currentColor 8%,transparent))}',
         '.mtb-tag-btn{cursor:pointer;font-family:inherit;transition:opacity .12s,transform .12s,box-shadow .12s}',
         '.mtb-tag-btn:hover{transform:translateY(-1px)}',
         '.mtb-tag-btn[data-active="true"]{box-shadow:0 0 0 1.5px var(--mtb-tag-border,currentColor);font-weight:600}',
-        '.mtb-tag[data-tag-tone="0"]{--mtb-tag-fill:#4e93e82e;--mtb-tag-border:#4e93e866}',
-        '.mtb-tag[data-tag-tone="1"]{--mtb-tag-fill:#2ea36a2e;--mtb-tag-border:#2ea36a66}',
-        '.mtb-tag[data-tag-tone="2"]{--mtb-tag-fill:#d08a2a2e;--mtb-tag-border:#d08a2a66}',
-        '.mtb-tag[data-tag-tone="3"]{--mtb-tag-fill:#b456c82e;--mtb-tag-border:#b456c866}',
-        '.mtb-tag[data-tag-tone="4"]{--mtb-tag-fill:#cf5f7a2e;--mtb-tag-border:#cf5f7a66}',
-        '.mtb-tag[data-tag-tone="5"]{--mtb-tag-fill:#4a9fb52e;--mtb-tag-border:#4a9fb566}',
-        '.mtb-tag[data-tag-tone="p0"]{--mtb-tag-fill:#ef444430;--mtb-tag-border:#ef444478;font-weight:600;font-variant-numeric:tabular-nums}',
-        '.mtb-tag[data-tag-tone="p1"]{--mtb-tag-fill:#f59e0b30;--mtb-tag-border:#f59e0b78;font-weight:600;font-variant-numeric:tabular-nums}',
-        '.mtb-tag[data-tag-tone="p2"]{--mtb-tag-fill:#3b82f62e;--mtb-tag-border:#3b82f670;font-weight:600;font-variant-numeric:tabular-nums}',
-        '.mtb-tag[data-tag-tone="p3"]{--mtb-tag-fill:#64748b2e;--mtb-tag-border:#64748b6e;font-weight:600;font-variant-numeric:tabular-nums}',
-        '.mtb-grid{flex:1;min-height:0;overflow-x:auto;overflow-y:hidden;padding:14px 18px 16px;display:grid;grid-auto-flow:column;grid-auto-columns:minmax(246px,1fr);gap:12px;align-items:stretch;scrollbar-width:thin;scrollbar-color:var(--dsw-alias-border-l3,color-mix(in srgb,currentColor 24%,transparent)) transparent}',
+        '.mtb-tag-x{border:0;background:transparent;color:inherit;cursor:pointer;padding:0 1px;font-size:12px;line-height:1;opacity:.75}',
+        '.mtb-tag-x:hover{opacity:1}',
+        '.mtb-tag[data-tag-tone="0"]{--mtb-tag-fill:#4e93e82e;--mtb-tag-border:#4e93e870}',
+        '.mtb-tag[data-tag-tone="1"]{--mtb-tag-fill:#2ea36a2e;--mtb-tag-border:#2ea36a70}',
+        '.mtb-tag[data-tag-tone="2"]{--mtb-tag-fill:#d08a2a2e;--mtb-tag-border:#d08a2a70}',
+        '.mtb-tag[data-tag-tone="3"]{--mtb-tag-fill:#b456c82e;--mtb-tag-border:#b456c870}',
+        '.mtb-tag[data-tag-tone="4"]{--mtb-tag-fill:#cf5f7a2e;--mtb-tag-border:#cf5f7a70}',
+        '.mtb-tag[data-tag-tone="5"]{--mtb-tag-fill:#4a9fb52e;--mtb-tag-border:#4a9fb570}',
+        '.mtb-tag[data-tag-tone="p0"]{--mtb-tag-fill:#ef444432;--mtb-tag-border:#ef444482;font-weight:600;font-variant-numeric:tabular-nums}',
+        '.mtb-tag[data-tag-tone="p1"]{--mtb-tag-fill:#f59e0b32;--mtb-tag-border:#f59e0b82;font-weight:600;font-variant-numeric:tabular-nums}',
+        '.mtb-tag[data-tag-tone="p2"]{--mtb-tag-fill:#3b82f630;--mtb-tag-border:#3b82f67a;font-weight:600;font-variant-numeric:tabular-nums}',
+        '.mtb-tag[data-tag-tone="p3"]{--mtb-tag-fill:#64748b30;--mtb-tag-border:#64748b78;font-weight:600;font-variant-numeric:tabular-nums}',
+        '.mtb-grid{flex:1;min-height:0;overflow-x:auto;overflow-y:hidden;padding:14px 18px 16px;display:grid;grid-auto-flow:column;grid-auto-columns:minmax(248px,1fr);gap:12px;align-items:stretch;scrollbar-width:thin;scrollbar-color:var(--dsw-alias-border-l3,color-mix(in srgb,currentColor 24%,transparent)) transparent}',
         '.mtb-grid::-webkit-scrollbar{height:9px}',
         '.mtb-grid::-webkit-scrollbar-track{background:transparent}',
         '.mtb-grid::-webkit-scrollbar-thumb{background:var(--dsw-alias-border-l3,color-mix(in srgb,currentColor 22%,transparent));border-radius:999px;border:2px solid transparent;background-clip:content-box}',
-        '.mtb-col{display:flex;flex-direction:column;min-height:0;max-height:100%;border-radius:14px;overflow:hidden;background:var(--dsw-alias-bg-layer-2,color-mix(in srgb,currentColor 4%,transparent));border:1px solid color-mix(in srgb,var(--mtb-accent) 20%,var(--dsw-alias-border-l1,color-mix(in srgb,currentColor 10%,transparent)));border-top:3px solid var(--mtb-accent);transition:border-color .15s,box-shadow .15s,background .15s}',
+        '.mtb-col{display:flex;flex-direction:column;min-height:0;max-height:100%;border-radius:14px;overflow:hidden;background:var(--dsw-alias-bg-layer-2,color-mix(in srgb,currentColor 4%,transparent));border:1px solid color-mix(in srgb,var(--mtb-accent) 22%,var(--dsw-alias-border-l1,color-mix(in srgb,currentColor 10%,transparent)));border-top:3px solid var(--mtb-accent);transition:border-color .15s,box-shadow .15s,background .15s}',
         '.mtb-col[data-drop="true"]{border-color:var(--mtb-accent);box-shadow:0 0 0 2px color-mix(in srgb,var(--mtb-accent) 28%,transparent);background:color-mix(in srgb,var(--mtb-accent) 7%,var(--dsw-alias-bg-layer-2,transparent))}',
-        '.mtb-col-head{padding:10px 12px;display:flex;align-items:center;gap:8px;flex-shrink:0;background:color-mix(in srgb,var(--mtb-accent) 8%,transparent);border-bottom:1px solid color-mix(in srgb,var(--mtb-accent) 15%,transparent)}',
+        '.mtb-col-head{padding:10px 12px;display:flex;align-items:center;gap:8px;flex-shrink:0;background:color-mix(in srgb,var(--mtb-accent) 8%,transparent);border-bottom:1px solid color-mix(in srgb,var(--mtb-accent) 16%,transparent)}',
         '.mtb-dot{width:8px;height:8px;border-radius:999px;background:var(--mtb-accent);flex-shrink:0}',
         '.mtb-dot[data-pulse="true"]{animation:mtb-pulse 2s cubic-bezier(.4,0,.6,1) infinite}',
         '.mtb-col-title{flex:1;min-width:0;font-size:13px;font-weight:600;letter-spacing:.01em;color:var(--dsw-alias-label-primary,inherit);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
-        '.mtb-count{font-size:11px;font-weight:600;font-variant-numeric:tabular-nums;padding:1px 8px;border-radius:999px;flex-shrink:0;background:color-mix(in srgb,var(--mtb-accent) 16%,transparent);color:color-mix(in srgb,var(--mtb-accent) 82%,var(--dsw-alias-label-primary,currentColor))}',
+        '.mtb-count{font-size:11px;font-weight:600;font-variant-numeric:tabular-nums;padding:1px 8px;border-radius:999px;flex-shrink:0;background:color-mix(in srgb,var(--mtb-accent) 16%,transparent);color:var(--dsw-alias-label-primary,inherit);border:1px solid color-mix(in srgb,var(--mtb-accent) 30%,transparent)}',
         '.mtb-col-body{flex:1;min-height:80px;overflow-y:auto;padding:10px;display:flex;flex-direction:column;gap:8px;scrollbar-width:thin}',
-        '.mtb-empty{padding:26px 12px;text-align:center;font-size:12px;color:var(--dsw-alias-label-tertiary,color-mix(in srgb,currentColor 45%,transparent));border:1px dashed color-mix(in srgb,var(--mtb-accent) 24%,transparent);border-radius:10px;background:color-mix(in srgb,var(--mtb-accent) 3%,transparent)}',
-        '.mtb-card{position:relative;overflow:hidden;border-radius:10px;padding:10px 12px 9px 14px;display:flex;flex-direction:column;gap:6px;cursor:pointer;text-align:left;background:var(--dsw-alias-bg-base,color-mix(in srgb,currentColor 3%,transparent));border:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 12%,transparent));transition:transform .12s ease,box-shadow .12s ease,border-color .12s ease,opacity .12s ease}',
-        '.mtb-card::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3.5px;background:var(--mtb-accent);opacity:.9;pointer-events:none}',
-        '.mtb-card:hover{transform:translateY(-1px);border-color:color-mix(in srgb,var(--mtb-accent) 46%,var(--dsw-alias-border-l3,transparent));box-shadow:var(--dsw-shadow-lv2,0 6px 16px -8px rgba(0,0,0,.22))}',
+        '.mtb-empty{padding:26px 12px;text-align:center;font-size:12px;color:var(--dsw-alias-label-secondary,color-mix(in srgb,currentColor 55%,transparent));border:1px dashed color-mix(in srgb,var(--mtb-accent) 24%,transparent);border-radius:10px;background:color-mix(in srgb,var(--mtb-accent) 3%,transparent)}',
+        '.mtb-card{position:relative;overflow:hidden;border-radius:10px;padding:10px 12px 9px 14px;display:flex;flex-direction:column;gap:6px;cursor:pointer;text-align:left;background:var(--dsw-alias-bg-base,color-mix(in srgb,currentColor 3%,transparent));border:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 13%,transparent));transition:transform .12s ease,box-shadow .12s ease,border-color .12s ease,opacity .12s ease}',
+        '.mtb-card::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3.5px;background:var(--mtb-accent);opacity:.92;pointer-events:none}',
+        '.mtb-card:hover{transform:translateY(-1px);border-color:color-mix(in srgb,var(--mtb-accent) 48%,var(--dsw-alias-border-l3,transparent));box-shadow:var(--dsw-shadow-lv2,0 6px 16px -8px rgba(0,0,0,.22))}',
         '.mtb-card[data-status="running"]{border-color:color-mix(in srgb,var(--mtb-accent) 55%,transparent)}',
         '.mtb-card[data-compact="true"]{padding:7px 10px 7px 13px;gap:4px}',
         '.mtb-card[data-compact="true"]:hover{transform:none;box-shadow:none}',
         '.mtb-card[data-focused="true"],.mtb-card[data-selected="true"]{box-shadow:0 0 0 2px var(--mtb-accent)}',
         '.mtb-card[data-dragging="true"]{opacity:.45;transform:none}',
         '.mtb-card-title-row{display:flex;align-items:flex-start;gap:6px;min-width:0}',
-        '.mtb-card-kind{flex:none;font-size:11px;font-weight:600;line-height:1.35;padding:1px 6px;border-radius:6px;background:color-mix(in srgb,var(--mtb-accent) 14%,transparent);color:color-mix(in srgb,var(--mtb-accent) 82%,var(--dsw-alias-label-primary,currentColor))}',
+        '.mtb-card-kind{flex:none;font-size:11px;font-weight:600;line-height:1.35;padding:1px 6px;border-radius:6px;background:color-mix(in srgb,var(--mtb-accent) 16%,transparent);color:var(--dsw-alias-label-primary,inherit);border:1px solid color-mix(in srgb,var(--mtb-accent) 34%,transparent)}',
         '.mtb-card-title{font-size:13px;font-weight:600;line-height:1.4;color:var(--dsw-alias-label-primary,inherit);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word;flex:1;min-width:0}',
         '.mtb-card[data-compact="true"] .mtb-card-title{-webkit-line-clamp:1;font-size:12px;font-weight:500}',
-        '.mtb-card-tags{display:flex;flex-wrap:wrap;gap:4px}',
-        '.mtb-card-excerpt{font-size:12px;line-height:1.48;color:var(--dsw-alias-label-secondary,color-mix(in srgb,currentColor 62%,transparent));display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word}',
-        '.mtb-card-meta{display:flex;flex-wrap:wrap;align-items:center;gap:4px 8px;font-size:11.5px;line-height:1.45;color:var(--dsw-alias-label-tertiary,color-mix(in srgb,currentColor 48%,transparent))}',
+        '.mtb-card-tags{display:flex;flex-wrap:wrap;gap:4px;align-items:center}',
+        '.mtb-card-excerpt{font-size:12px;line-height:1.48;color:var(--dsw-alias-label-secondary,color-mix(in srgb,currentColor 66%,transparent));display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word}',
+        '.mtb-card-meta{display:flex;flex-wrap:wrap;align-items:center;gap:4px 8px;font-size:11.5px;line-height:1.45;color:var(--dsw-alias-label-secondary,color-mix(in srgb,currentColor 68%,transparent))}',
         '.mtb-card-time{white-space:nowrap;font-variant-numeric:tabular-nums}',
-        '.mtb-card-micro{display:inline-flex;align-items:center;gap:3px;padding:0 7px;height:19px;border-radius:999px;font-size:11px;line-height:1;background:var(--dsw-alias-interactive-bg-hover,color-mix(in srgb,currentColor 7%,transparent));color:var(--dsw-alias-label-secondary,inherit);max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
-        '.mtb-card-foot{display:flex;align-items:center;justify-content:space-between;gap:6px;min-height:22px;margin-top:1px}',
+        '.mtb-card-micro{display:inline-flex;align-items:center;gap:3px;padding:0 7px;height:19px;border-radius:999px;font-size:11px;line-height:1;background:color-mix(in srgb,currentColor 8%,transparent);border:1px solid color-mix(in srgb,currentColor 14%,transparent);color:var(--dsw-alias-label-primary,inherit);max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+        '.mtb-card-foot{display:flex;align-items:center;justify-content:space-between;gap:6px;min-height:22px;margin-top:2px}',
         '.mtb-card-foot-left{display:flex;align-items:center;gap:6px;min-width:0;flex-wrap:wrap}',
         '.mtb-card-foot-right{display:flex;align-items:center;gap:4px;flex-shrink:0;margin-left:auto}',
-        '.mtb-result{display:inline-flex;align-items:center;padding:1px 8px;border-radius:999px;font-size:11px;font-weight:600;line-height:1.5;flex:none}',
-        '.mtb-result[data-tone="succeeded"]{color:var(--dsw-alias-state-success-primary,#10b981);background:var(--dsw-alias-state-success-secondary,color-mix(in srgb,#10b981 15%,transparent))}',
-        '.mtb-result[data-tone="review"]{color:#8b5cf6;background:color-mix(in srgb,#8b5cf6 15%,transparent)}',
-        '.mtb-result[data-tone="failed"]{color:var(--dsw-alias-state-error-primary,#ef4444);background:var(--dsw-alias-state-error-secondary,color-mix(in srgb,#ef4444 15%,transparent))}',
-        '.mtb-result[data-tone="running"]{color:var(--dsw-alias-state-warn-primary,#f59e0b);background:var(--dsw-alias-state-warn-secondary,color-mix(in srgb,#f59e0b 15%,transparent))}',
-        '.mtb-result[data-tone="cancelled"]{color:var(--dsw-alias-label-secondary,inherit);background:var(--dsw-alias-interactive-bg-hover,color-mix(in srgb,currentColor 8%,transparent))}',
-        '.mtb-runs{font-size:11.5px;color:var(--dsw-alias-label-tertiary,color-mix(in srgb,currentColor 48%,transparent));font-variant-numeric:tabular-nums;white-space:nowrap}',
+        '.mtb-result{--mtb-res-c:#94a3b8;display:inline-flex;align-items:center;gap:5px;padding:2px 8px;border-radius:999px;font-size:11.5px;font-weight:600;line-height:1.35;flex:none;color:var(--dsw-alias-label-primary,inherit);background:color-mix(in srgb,var(--mtb-res-c) 16%,transparent);border:1px solid color-mix(in srgb,var(--mtb-res-c) 46%,transparent)}',
+        '.mtb-result::before{content:"";width:6px;height:6px;border-radius:999px;background:var(--mtb-res-c);flex-shrink:0}',
+        '.mtb-result[data-tone="succeeded"]{--mtb-res-c:#10b981}',
+        '.mtb-result[data-tone="review"]{--mtb-res-c:#8b5cf6}',
+        '.mtb-result[data-tone="failed"]{--mtb-res-c:#ef4444}',
+        '.mtb-result[data-tone="running"]{--mtb-res-c:#f59e0b}',
+        '.mtb-result[data-tone="cancelled"]{--mtb-res-c:#94a3b8}',
+        '.mtb-runs{font-size:11.5px;font-weight:500;color:var(--dsw-alias-label-secondary,color-mix(in srgb,currentColor 72%,transparent));font-variant-numeric:tabular-nums;white-space:nowrap}',
         '.mtb-spinner{width:11px;height:11px;border-radius:999px;border:1.8px solid color-mix(in srgb,var(--mtb-accent) 26%,transparent);border-top-color:var(--mtb-accent);animation:mtb-spin .85s linear infinite;flex-shrink:0}',
         '.mtb-icon-pill{display:inline-flex;align-items:center;gap:4px;border:1px solid transparent;background:transparent;color:var(--dsw-alias-label-secondary,inherit);border-radius:7px;padding:2.5px 7px;font-size:11px;line-height:1.3;font-weight:500;cursor:pointer;font-family:inherit;transition:background .12s,border-color .12s,color .12s}',
-        '.mtb-icon-pill:hover{background:var(--dsw-alias-interactive-bg-hover,color-mix(in srgb,currentColor 9%,transparent));color:var(--dsw-alias-label-primary,inherit);border-color:var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 14%,transparent))}',
-        '.mtb-icon-pill-confirm{color:var(--dsw-alias-state-success-primary,#10b981);background:color-mix(in srgb,var(--dsw-alias-state-success-primary,#10b981) 12%,transparent);border-color:color-mix(in srgb,var(--dsw-alias-state-success-primary,#10b981) 32%,transparent);font-weight:600}',
-        '.mtb-icon-pill-confirm:hover{background:color-mix(in srgb,var(--dsw-alias-state-success-primary,#10b981) 22%,transparent);color:var(--dsw-alias-state-success-primary,#10b981)}',
+        '.mtb-icon-pill:hover{background:var(--dsw-alias-interactive-bg-hover,color-mix(in srgb,currentColor 9%,transparent));color:var(--dsw-alias-label-primary,inherit);border-color:var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 16%,transparent))}',
+        '.mtb-icon-pill-confirm{color:var(--dsw-alias-label-primary,inherit);background:color-mix(in srgb,#10b981 18%,transparent);border-color:color-mix(in srgb,#10b981 48%,transparent);font-weight:600}',
+        '.mtb-icon-pill-confirm:hover{background:color-mix(in srgb,#10b981 28%,transparent)}',
         '.mtb-icon-btn{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border:0;background:transparent;color:var(--dsw-alias-label-secondary,inherit);border-radius:6px;cursor:pointer;padding:0;transition:background .12s,color .12s}',
         '.mtb-icon-btn:hover{background:var(--dsw-alias-interactive-bg-hover,color-mix(in srgb,currentColor 9%,transparent));color:var(--dsw-alias-label-primary,inherit)}',
-        '.mtb-backdrop{position:absolute;inset:0;z-index:20;background:rgba(0,0,0,.28);display:flex;justify-content:flex-end;backdrop-filter:blur(1.5px)}',
-        '.mtb-drawer{width:min(460px,92%);height:100%;display:flex;flex-direction:column;background:var(--dsw-alias-bg-base,#16181d);color:var(--dsw-alias-label-primary,inherit);border-left:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 14%,transparent));box-shadow:-12px 0 36px rgba(0,0,0,.28)}',
-        '.mtb-drawer-head{padding:14px 18px;display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--dsw-alias-border-l1,color-mix(in srgb,currentColor 10%,transparent));flex-shrink:0;background:color-mix(in srgb,var(--mtb-accent) 7%,transparent)}',
+        '.mtb-backdrop{position:absolute;inset:0;z-index:20;background:rgba(0,0,0,.32);display:flex;justify-content:flex-end;backdrop-filter:blur(1.5px)}',
+        '.mtb-drawer{width:min(490px,94%);height:100%;display:flex;flex-direction:column;background:var(--dsw-alias-bg-base,#16181d);color:var(--dsw-alias-label-primary,inherit);border-left:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 14%,transparent));box-shadow:-12px 0 36px rgba(0,0,0,.28)}',
+        '.mtb-drawer-head{padding:14px 18px;display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--dsw-alias-border-l1,color-mix(in srgb,currentColor 10%,transparent));flex-shrink:0;background:color-mix(in srgb,var(--mtb-accent) 8%,transparent)}',
         '.mtb-drawer-body{flex:1;min-height:0;overflow-y:auto;padding:18px;display:flex;flex-direction:column;gap:14px}',
+        '.mtb-drawer-sec{display:grid;gap:8px;padding:11px 13px;border-radius:10px;border:1px solid var(--dsw-alias-border-l1,color-mix(in srgb,currentColor 10%,transparent));background:color-mix(in srgb,currentColor 3%,transparent)}',
+        '.mtb-drawer-sec-title{font-size:12px;font-weight:600;color:var(--dsw-alias-label-secondary,inherit);display:flex;align-items:center;justify-content:space-between;gap:8px}',
         '.mtb-drawer-foot{padding:12px 18px;border-top:1px solid var(--dsw-alias-border-l1,color-mix(in srgb,currentColor 10%,transparent));display:flex;flex-wrap:wrap;gap:7px;align-items:center;flex-shrink:0}',
         '.mtb-btn{border:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 16%,transparent));background:transparent;color:var(--dsw-alias-label-primary,inherit);border-radius:8px;padding:5px 11px;font-size:12px;line-height:1.3;font-weight:500;cursor:pointer;font-family:inherit;transition:background .12s,border-color .12s,color .12s}',
         '.mtb-btn:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover,color-mix(in srgb,currentColor 8%,transparent));border-color:var(--dsw-alias-border-l3,color-mix(in srgb,currentColor 26%,transparent))}',
         '.mtb-btn:disabled{opacity:.5;cursor:not-allowed}',
-        '.mtb-btn-accent{border-color:color-mix(in srgb,var(--mtb-accent) 40%,transparent);background:color-mix(in srgb,var(--mtb-accent) 16%,transparent);color:color-mix(in srgb,var(--mtb-accent) 86%,var(--dsw-alias-label-primary,currentColor));font-weight:600}',
-        '.mtb-btn-accent:hover:not(:disabled){background:color-mix(in srgb,var(--mtb-accent) 26%,transparent)}',
-        '.mtb-btn-confirm{border-color:color-mix(in srgb,var(--dsw-alias-state-success-primary,#10b981) 42%,transparent);background:color-mix(in srgb,var(--dsw-alias-state-success-primary,#10b981) 16%,transparent);color:color-mix(in srgb,var(--dsw-alias-state-success-primary,#10b981) 86%,var(--dsw-alias-label-primary,currentColor));font-weight:600}',
-        '.mtb-btn-confirm:hover:not(:disabled){background:color-mix(in srgb,var(--dsw-alias-state-success-primary,#10b981) 26%,transparent)}',
-        '.mtb-btn-danger{color:var(--dsw-alias-state-error-primary,#ef4444);border-color:color-mix(in srgb,var(--dsw-alias-state-error-primary,#ef4444) 45%,transparent);background:color-mix(in srgb,var(--dsw-alias-state-error-primary,#ef4444) 12%,transparent)}',
-        '.mtb-move{border:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 15%,transparent));background:var(--dsw-alias-bg-base,transparent);color:var(--dsw-alias-label-primary,inherit);border-radius:8px;padding:4px 8px;font-size:12px;line-height:1.3;cursor:pointer;font-family:inherit;outline:none}',
-        '.mtb-form{margin:14px 20px 0;padding:16px;min-width:0;max-height:58vh;overflow-y:auto;border:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 14%,transparent));border-radius:14px;background:var(--dsw-alias-bg-layer-2,color-mix(in srgb,currentColor 5%,transparent));display:grid;gap:12px;box-shadow:0 8px 24px -12px rgba(0,0,0,.24)}',
+        '.mtb-btn-accent{border-color:color-mix(in srgb,var(--mtb-accent) 46%,transparent);background:color-mix(in srgb,var(--mtb-accent) 18%,transparent);color:var(--dsw-alias-label-primary,inherit);font-weight:600}',
+        '.mtb-btn-accent:hover:not(:disabled){background:color-mix(in srgb,var(--mtb-accent) 28%,transparent)}',
+        '.mtb-btn-confirm{border-color:color-mix(in srgb,#10b981 48%,transparent);background:color-mix(in srgb,#10b981 18%,transparent);color:var(--dsw-alias-label-primary,inherit);font-weight:600}',
+        '.mtb-btn-confirm:hover:not(:disabled){background:color-mix(in srgb,#10b981 28%,transparent)}',
+        '.mtb-btn-danger{color:#ef4444;border-color:color-mix(in srgb,#ef4444 48%,transparent);background:color-mix(in srgb,#ef4444 12%,transparent)}',
+        '.mtb-move{border:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 16%,transparent));background:var(--dsw-alias-bg-base,transparent);color:var(--dsw-alias-label-primary,inherit);border-radius:8px;padding:4px 8px;font-size:12px;line-height:1.3;cursor:pointer;font-family:inherit;outline:none}',
+        '.mtb-form{margin:14px 20px 0;padding:16px;min-width:0;max-height:66vh;overflow-y:auto;border:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 14%,transparent));border-radius:14px;background:var(--dsw-alias-bg-layer-2,color-mix(in srgb,currentColor 5%,transparent));display:grid;gap:12px;box-shadow:0 8px 24px -12px rgba(0,0,0,.24)}',
+        '.mtb-tpl-grid{display:flex;flex-wrap:wrap;gap:6px}',
+        '.mtb-tpl-pill{border:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 16%,transparent));background:var(--dsw-alias-bg-base,transparent);color:var(--dsw-alias-label-primary,inherit);border-radius:9px;padding:6px 11px;font-size:12px;line-height:1.3;cursor:pointer;font-family:inherit;transition:border-color .12s,background .12s}',
+        '.mtb-tpl-pill:hover:not(:disabled){border-color:var(--dsw-alias-brand-primary,#6366f1)}',
+        '.mtb-tpl-pill[data-active="true"]{border-color:var(--dsw-alias-brand-primary,#6366f1);background:color-mix(in srgb,var(--dsw-alias-brand-primary,#6366f1) 16%,transparent);font-weight:600}',
+        '.mtb-tpl-pill:disabled{opacity:.48;cursor:not-allowed}',
+        '.mtb-sub-row{display:flex;align-items:center;gap:8px;padding:6px 9px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1,color-mix(in srgb,currentColor 10%,transparent));background:var(--dsw-alias-bg-base,transparent)}',
+        '.mtb-archive-grid{flex:1;min-height:0;overflow:auto;padding:16px 20px;display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:10px;align-content:start}',
       ].join('\n');
       document.head.appendChild(style);
     }
@@ -1839,6 +1853,8 @@ window.__ModuleLoader__.load({
       return kind && rest ? { kind, text: rest } : { text };
     }
 
+    const PRIORITY_TAGS = ['P0', 'P1', 'P2', 'P3'];
+
     const TASK_PERMISSION_LABELS = {
       'read-only': '只读',
       'workspace-write': '工作区可写',
@@ -1858,13 +1874,28 @@ window.__ModuleLoader__.load({
       const [formOpen, setFormOpen] = React.useState(false);
       const [title, setTitle] = React.useState('');
       const [description, setDescription] = React.useState('');
-      const [tagInput, setTagInput] = React.useState('');
+      const [formTags, setFormTags] = React.useState([]);
+      const [newTagDraft, setNewTagDraft] = React.useState('');
+      const [formParentId, setFormParentId] = React.useState('');
+      const [formPermission, setFormPermission] = React.useState('');
       const [confirmId, setConfirmId] = React.useState('');
       const [dragTaskId, setDragTaskId] = React.useState('');
       const [dropCol, setDropCol] = React.useState('');
       const [compactCards, setCompactCards] = React.useState(false);
+      const [showArchive, setShowArchive] = React.useState(false);
       const [activeTag, setActiveTag] = React.useState('');
+      const [searchQuery, setSearchQuery] = React.useState('');
       const [selectedId, setSelectedId] = React.useState('');
+      const [drawerEditing, setDrawerEditing] = React.useState(false);
+      const [editTitle, setEditTitle] = React.useState('');
+      const [editDesc, setEditDesc] = React.useState('');
+      const [editPrompt, setEditPrompt] = React.useState('');
+      const [editPerm, setEditPerm] = React.useState('');
+      const [drawerTagDraft, setDrawerTagDraft] = React.useState('');
+      const [newSubtaskTitle, setNewSubtaskTitle] = React.useState('');
+      const [linkChildId, setLinkChildId] = React.useState('');
+      const [cronDraft, setCronDraft] = React.useState('');
+      const [cronEnabled, setCronEnabled] = React.useState(false);
       const [catalog, setCatalog] = React.useState(null);
       const [catalogError, setCatalogError] = React.useState('');
       const [leaderId, setLeaderId] = React.useState('');
@@ -1888,7 +1919,9 @@ window.__ModuleLoader__.load({
       const group = catalog?.groupTemplates?.find(item => item.id === groupId);
       const template = catalog?.templates.find(item => item.id === templateId);
       const requiresPr = leaderId !== '' && choice === 'template' && templateId === 'pr-review';
-      const allActive = (Array.isArray(tasks) ? tasks : []).filter(task => task.archivedAt === undefined);
+      const allTasks = Array.isArray(tasks) ? tasks : [];
+      const allActive = allTasks.filter(task => task.archivedAt === undefined);
+      const archivedTasks = allTasks.filter(task => task.archivedAt !== undefined);
       const knownTags = React.useMemo(() => {
         const seen = new Set();
         const out = [];
@@ -1899,14 +1932,22 @@ window.__ModuleLoader__.load({
         }
         return out;
       }, [allActive]);
-      const list = activeTag ? allActive.filter(task => (task.tags ?? []).some(tag => tag.name === activeTag)) : allActive;
+      const q = searchQuery.trim().toLowerCase();
+      const list = allActive.filter(task => {
+        if (activeTag && !(task.tags ?? []).some(tag => tag.name === activeTag)) return false;
+        if (q) {
+          const hay = [task.title, task.description, ...(task.tags ?? []).map(t => t.name)].filter(Boolean).join(' ').toLowerCase();
+          if (!hay.includes(q)) return false;
+        }
+        return true;
+      });
       const subtaskStats = React.useMemo(() => {
         const map = new Map();
         for (const task of allActive) {
           if (!task.parentId) continue;
           const entry = map.get(task.parentId) ?? { total: 0, done: 0, running: 0, failed: 0 };
           entry.total += 1;
-          if (task.status === 'done') entry.done += 1;
+          if (task.status === 'done' || task.status === 'review') entry.done += 1;
           else if (task.status === 'running') entry.running += 1;
           else if (task.status === 'failed') entry.failed += 1;
           map.set(task.parentId, entry);
@@ -1942,9 +1983,25 @@ window.__ModuleLoader__.load({
 
       React.useEffect(() => {
         if (!selectedId) return undefined;
-        const onKey = event => { if (event.key === 'Escape') { setSelectedId(''); setConfirmId(''); } };
+        const onKey = event => { if (event.key === 'Escape') { setSelectedId(''); setConfirmId(''); setDrawerEditing(false); } };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
+      }, [selectedId]);
+
+      const selectedTask = selectedId ? allTasks.find(item => item.id === selectedId) : undefined;
+      React.useEffect(() => {
+        setDrawerEditing(false);
+        setDrawerTagDraft('');
+        setNewSubtaskTitle('');
+        setLinkChildId('');
+        if (selectedTask) {
+          setEditTitle(selectedTask.title || '');
+          setEditDesc(selectedTask.description || '');
+          setEditPrompt(selectedTask.prompt || '');
+          setEditPerm(selectedTask.permission || '');
+          setCronDraft(selectedTask.schedule?.cron || '');
+          setCronEnabled(selectedTask.schedule?.enabled === true);
+        }
       }, [selectedId]);
 
       const focusAvailable = allActive.some(item => item.id === focusedTask);
@@ -1979,7 +2036,10 @@ window.__ModuleLoader__.load({
           setEditing('');
           setTitle('');
           setDescription('');
-          setTagInput('');
+          setFormTags([]);
+          setNewTagDraft('');
+          setFormParentId('');
+          setFormPermission('');
           setLeaderId('');
           setPlan(null);
           setChoice('leader');
@@ -1993,7 +2053,10 @@ window.__ModuleLoader__.load({
         setEditing(task.id);
         setTitle(task.title);
         setDescription(task.description ?? '');
-        setTagInput((task.tags ?? []).map(t => t.name).join(', '));
+        setFormTags((task.tags ?? []).map(t => t.name));
+        setNewTagDraft('');
+        setFormParentId(task.parentId ?? '');
+        setFormPermission(task.permission ?? '');
         setWorkspaceId(workflow.workspaceId);
         setLeaderId(workflow.leaderId);
         setChoice(workflow.choice);
@@ -2003,6 +2066,42 @@ window.__ModuleLoader__.load({
         setExplicitCode(Boolean(workflow.plan?.codeWork && workflow.plan?.templateId !== 'development'));
         setError('');
         setFormOpen(true);
+      };
+      const pickOrchestrationMode = (mode, tplId) => {
+        setPlan(null);
+        setExplicitCode(false);
+        if (mode === 'plain') {
+          setLeaderId('');
+          setChoice('leader');
+          return;
+        }
+        const availLeaders = catalog?.leaders ?? [];
+        if (!leaderId && availLeaders.length > 0) setLeaderId(availLeaders[0].id);
+        if (mode === 'leader') {
+          setChoice('leader');
+        }
+        else if (mode === 'template') {
+          setChoice('template');
+          if (tplId) setTemplateId(tplId);
+        }
+        else if (mode === 'none') {
+          setChoice('none');
+        }
+      };
+      const toggleFormTag = name => {
+        const clean = String(name || '').trim();
+        if (!clean) return;
+        setFormTags(prev => prev.includes(clean) ? prev.filter(t => t !== clean) : [...prev, clean]);
+      };
+      const addNewFormTag = () => {
+        const parts = newTagDraft.split(/[,，]/).map(s => s.trim()).filter(Boolean);
+        if (parts.length === 0) return;
+        setFormTags(prev => {
+          const next = [...prev];
+          for (const p of parts) if (!next.includes(p)) next.push(p);
+          return next;
+        });
+        setNewTagDraft('');
       };
       const changeMember = (role, id) => {
         setPlan(current => {
@@ -2032,7 +2131,9 @@ window.__ModuleLoader__.load({
         const orchestration = leaderId ? {
           ...choiceBody(), plan: { templateId: plan.templateId, codeWork: plan.codeWork, members: plan.members, codex: plan.codex },
         } : undefined;
-        const parsedTags = tagInput.split(/[,，]/).map(item => item.trim()).filter(Boolean).map(name => ({ name }));
+        const pendingDraftTags = newTagDraft.split(/[,，]/).map(s => s.trim()).filter(Boolean);
+        const mergedTagNames = [...new Set([...formTags, ...pendingDraftTags])];
+        const parsedTags = mergedTagNames.map(name => ({ name }));
         setBusy(true);
         setError('');
         try {
@@ -2041,13 +2142,18 @@ window.__ModuleLoader__.load({
             : await fetchJson('marshal/tasks/create', {
               title: title.trim(), description: description.trim(),
               ...(parsedTags.length > 0 ? { tags: parsedTags } : {}),
+              ...(formParentId ? { parentId: formParentId } : {}),
+              ...(formPermission ? { permission: formPermission } : {}),
               ...(workspace ? { workspaceId: workspace } : {}),
               ...(orchestration === undefined ? {} : { orchestration }),
             }, Boolean(workspace || orchestration));
           setTasks(result.tasks || []);
           setTitle('');
           setDescription('');
-          setTagInput('');
+          setFormTags([]);
+          setNewTagDraft('');
+          setFormParentId('');
+          setFormPermission('');
           setLeaderId('');
           setChoice('leader');
           setTemplateId('pr-review');
@@ -2082,6 +2188,117 @@ window.__ModuleLoader__.load({
         }
         catch (e) { setError('移动状态失败：' + (e.message || e)); }
         finally { setBusy(false); setDragTaskId(''); setDropCol(''); }
+      };
+
+      const updateTask = async (task, patch) => {
+        if (busy || !task) return;
+        setBusy(true);
+        setError('');
+        try {
+          const result = await fetchJson('marshal/tasks/update', { taskId: task.id, ...patch }, Boolean(task.workflow || task.taskRoom));
+          setTasks(result.tasks || []);
+          return true;
+        }
+        catch (e) { setError('更新卡片失败：' + (e.message || e)); return false; }
+        finally { setBusy(false); }
+      };
+
+      const setParent = async (task, parentId) => {
+        if (busy || !task) return;
+        setBusy(true);
+        setError('');
+        try {
+          const result = await fetchJson('marshal/tasks/set-parent', { taskId: task.id, parentId: parentId || null }, Boolean(task.workflow || task.taskRoom));
+          setTasks(result.tasks || []);
+          setLinkChildId('');
+        }
+        catch (e) { setError('关联子任务失败：' + (e.message || e)); }
+        finally { setBusy(false); }
+      };
+
+      const createSubtask = async (parentTask) => {
+        const subTitle = newSubtaskTitle.trim();
+        if (busy || !parentTask || !subTitle) return;
+        setBusy(true);
+        setError('');
+        try {
+          const result = await fetchJson('marshal/tasks/create', {
+            title: subTitle, description: '', parentId: parentTask.id,
+          }, false);
+          setTasks(result.tasks || []);
+          setNewSubtaskTitle('');
+        }
+        catch (e) { setError('创建子任务失败：' + (e.message || e)); }
+        finally { setBusy(false); }
+      };
+
+      const duplicateTask = async (task) => {
+        if (busy || !task) return;
+        setBusy(true);
+        setError('');
+        try {
+          const result = await fetchJson('marshal/tasks/create', {
+            title: task.title + '（副本）',
+            description: task.description ?? '',
+            ...(task.prompt ? { prompt: task.prompt } : {}),
+            ...(task.tags?.length ? { tags: task.tags } : {}),
+            ...(task.permission ? { permission: task.permission } : {}),
+          }, false);
+          setTasks(result.tasks || []);
+        }
+        catch (e) { setError('复制卡片失败：' + (e.message || e)); }
+        finally { setBusy(false); }
+      };
+
+      const archiveTask = async (task) => {
+        if (busy || !task) return;
+        setBusy(true);
+        setError('');
+        try {
+          const result = await fetchJson('marshal/tasks/archive', { taskId: task.id }, Boolean(task.workflow || task.taskRoom));
+          setTasks(result.tasks || []);
+          if (selectedId === task.id) setSelectedId('');
+        }
+        catch (e) { setError('归档失败：' + (e.message || e)); }
+        finally { setBusy(false); }
+      };
+
+      const restoreTask = async (task) => {
+        if (busy || !task) return;
+        setBusy(true);
+        setError('');
+        try {
+          const result = await fetchJson('marshal/tasks/restore', { taskId: task.id }, Boolean(task.workflow || task.taskRoom));
+          setTasks(result.tasks || []);
+        }
+        catch (e) { setError('恢复失败：' + (e.message || e)); }
+        finally { setBusy(false); }
+      };
+
+      const settleTask = async (task) => {
+        if (busy || !task) return;
+        setBusy(true);
+        setError('');
+        try {
+          const result = await fetchJson('marshal/tasks/settle', { taskId: task.id }, Boolean(task.workflow || task.taskRoom));
+          setTasks(result.tasks || []);
+        }
+        catch (e) { setError('终止失败：' + (e.message || e)); }
+        finally { setBusy(false); }
+      };
+
+      const saveSchedule = async (task, enabled, cron) => {
+        if (busy || !task) return;
+        setBusy(true);
+        setError('');
+        try {
+          const result = await fetchJson('marshal/tasks/schedule', {
+            taskId: task.id, enabled, mode: 'cron', ...(cron.trim() ? { cron: cron.trim() } : {}),
+          }, Boolean(task.workflow || task.taskRoom));
+          setTasks(result.tasks || []);
+        }
+        catch (e) { setError('保存定时失败：' + (e.message || e)); }
+        finally { setBusy(false); }
       };
 
       const remove = async (task) => {
@@ -2190,12 +2407,12 @@ window.__ModuleLoader__.load({
               }, iconSession()))));
       };
 
-      const selectedTask = selectedId ? allActive.find(item => item.id === selectedId) : undefined;
       const selectedColumn = selectedTask ? (columns.find(c => c.key === selectedTask.status) ?? columns[1]) : undefined;
 
       const renderDrawer = () => {
         if (!selectedTask || !selectedColumn) return null;
         const task = selectedTask;
+        const archived = task.archivedAt !== undefined;
         const workflow = task.workflow;
         const execution = workflow?.selected ?? workflow?.templateId;
         const templateName = catalog?.templates.find(item => item.id === execution)?.name;
@@ -2205,16 +2422,42 @@ window.__ModuleLoader__.load({
           : workflow?.state === 'interrupted' ? '运行中断，可重试'
           : taskPhases[workflow?.phase];
         const isRunning = task.status === 'running' || task.openExecution === true || workflow?.state === 'running';
-        const canMove = !busy && !isRunning && !task.taskRoom?.closed;
+        const canMove = !busy && !archived && !isRunning && !task.taskRoom?.closed;
         const permLabel = task.permission ? (TASK_PERMISSION_LABELS[task.permission] ?? task.permission) : '';
+        const currentTagNames = (task.tags ?? []).map(t => t.name);
+        const parentCard = task.parentId ? allTasks.find(t => t.id === task.parentId) : undefined;
+        const childCards = allActive.filter(t => t.parentId === task.id);
+        const linkableChildren = allActive.filter(t => t.id !== task.id && t.parentId === undefined && t.id !== task.parentId && !allActive.some(c => c.parentId === t.id));
+        const suggestedDrawerTags = [...new Set([...PRIORITY_TAGS, ...knownTags.map(t => t.name)])].filter(name => !currentTagNames.includes(name));
+        const toggleDrawerTag = async name => {
+          const nextNames = currentTagNames.includes(name) ? currentTagNames.filter(n => n !== name) : [...currentTagNames, name];
+          await updateTask(task, { tags: nextNames.length > 0 ? nextNames.map(n => ({ name: n })) : null });
+        };
+        const addDrawerTag = async () => {
+          const parts = drawerTagDraft.split(/[,，]/).map(s => s.trim()).filter(Boolean);
+          if (parts.length === 0) return;
+          const nextNames = [...new Set([...currentTagNames, ...parts])];
+          const ok = await updateTask(task, { tags: nextNames.map(n => ({ name: n })) });
+          if (ok) setDrawerTagDraft('');
+        };
+        const saveDrawerEdit = async () => {
+          const ok = await updateTask(task, {
+            title: editTitle.trim(),
+            description: editDesc,
+            prompt: editPrompt,
+            ...(editPerm ? { permission: editPerm } : {}),
+          });
+          if (ok) setDrawerEditing(false);
+        };
+
         return h('div', {
           className: 'mtb-backdrop',
-          onClick: event => { if (event.target === event.currentTarget) { setSelectedId(''); setConfirmId(''); } },
+          onClick: event => { if (event.target === event.currentTarget) { setSelectedId(''); setConfirmId(''); setDrawerEditing(false); } },
         },
           h('aside', { className: 'mtb-drawer', 'aria-label': '卡片详情', style: { '--mtb-accent': selectedColumn.accent } },
             h('div', { className: 'mtb-drawer-head' },
-              h('span', { className: 'mtb-dot', 'data-pulse': selectedColumn.pulse ? 'true' : undefined }),
-              h('strong', { style: { fontSize: 13, flex: 1 } }, selectedColumn.label),
+              h('span', { className: 'mtb-dot', 'data-pulse': selectedColumn.pulse && !archived ? 'true' : undefined }),
+              h('strong', { style: { fontSize: 13, flex: 1 } }, archived ? '已归档 · ' + selectedColumn.label : selectedColumn.label),
               canMove && h('select', {
                 'aria-label': '切换状态',
                 className: 'mtb-move',
@@ -2222,19 +2465,100 @@ window.__ModuleLoader__.load({
                 disabled: busy,
                 onChange: event => { void move(task, event.target.value); },
               }, columns.map(col => h('option', { key: col.key, value: col.key }, col.label))),
-              h('button', { type: 'button', className: 'mtb-icon-btn', 'aria-label': '关闭详情', onClick: () => { setSelectedId(''); setConfirmId(''); } }, '✕')),
+              !archived && !isRunning && h('button', { type: 'button', className: 'mtb-btn', onClick: () => setDrawerEditing(v => !v) }, drawerEditing ? '取消编辑' : '编辑'),
+              h('button', { type: 'button', className: 'mtb-icon-btn', 'aria-label': '关闭详情', onClick: () => { setSelectedId(''); setConfirmId(''); setDrawerEditing(false); } }, '✕')),
             h('div', { className: 'mtb-drawer-body' },
-              h('h3', { style: { margin: 0, fontSize: 16, fontWeight: 600, lineHeight: 1.45, wordBreak: 'break-word' } }, task.title),
-              Array.isArray(task.tags) && task.tags.length > 0 && h('div', { className: 'mtb-card-tags' },
-                task.tags.map(tag => h('span', { key: tag.name, className: 'mtb-tag', 'data-tag-tone': taskTagTone(tag.name) }, tag.name))),
-              h('div', { className: 'mtb-card-meta' },
-                task.createdAt && h('span', null, '创建于 ' + new Date(task.createdAt).toLocaleString()),
-                Number(task.runCount || 0) > 0 && h('span', null, '· ' + task.runCount + ' 次运行'),
-                permLabel && h('span', { className: 'mtb-card-micro' }, permLabel)),
-              task.description
-                ? h('div', { style: { fontSize: 13, lineHeight: 1.65, whiteSpace: 'pre-wrap', wordBreak: 'break-word', padding: '10px 12px', borderRadius: 10, background: 'color-mix(in srgb, currentColor 4%, transparent)', border: '1px solid var(--dsw-alias-border-l1, color-mix(in srgb, currentColor 10%, transparent))' } }, task.description)
-                : h('div', { style: uiMuted }, '暂无描述'),
-              workflow && h('div', { style: { display: 'grid', gap: 6, padding: '10px 12px', borderRadius: 10, border: '1px solid var(--dsw-alias-border-l1, color-mix(in srgb, currentColor 10%, transparent))', background: 'color-mix(in srgb, currentColor 3%, transparent)' } },
+              drawerEditing
+                ? h('div', { className: 'mtb-drawer-sec' },
+                    h(Field, { label: '标题' }, h('input', { style: uiInput, value: editTitle, onChange: e => setEditTitle(e.target.value) })),
+                    h(Field, { label: '描述' }, h('textarea', { style: { ...uiInput, resize: 'vertical', lineHeight: 1.55 }, rows: 4, value: editDesc, onChange: e => setEditDesc(e.target.value) })),
+                    h(Field, { label: '执行指令 Prompt' }, h('textarea', { style: { ...uiInput, resize: 'vertical', lineHeight: 1.55 }, rows: 3, value: editPrompt, onChange: e => setEditPrompt(e.target.value) })),
+                    h(Field, { label: '权限预设' }, h('select', { style: uiInput, value: editPerm, onChange: e => setEditPerm(e.target.value) },
+                      h('option', { value: '' }, '跟随默认'),
+                      h('option', { value: 'read-only' }, '只读'),
+                      h('option', { value: 'workspace-write' }, '工作区可写'),
+                      h('option', { value: 'danger-full-access' }, '完全权限'))),
+                    h('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 6 } },
+                      h('button', { type: 'button', className: 'mtb-btn', onClick: () => setDrawerEditing(false) }, '取消'),
+                      h('button', { type: 'button', className: 'mtb-btn mtb-btn-accent', disabled: busy || !editTitle.trim(), onClick: () => { void saveDrawerEdit(); } }, '保存修改')))
+                : h(React.Fragment, null,
+                    h('h3', { style: { margin: 0, fontSize: 16, fontWeight: 600, lineHeight: 1.45, wordBreak: 'break-word' } }, task.title),
+                    h('div', { className: 'mtb-card-meta' },
+                      task.createdAt && h('span', null, '创建于 ' + new Date(task.createdAt).toLocaleString()),
+                      Number(task.runCount || 0) > 0 && h('span', null, '· ' + task.runCount + ' 次运行'),
+                      permLabel && h('span', { className: 'mtb-card-micro' }, permLabel)),
+                    task.description
+                      ? h('div', { style: { fontSize: 13, lineHeight: 1.65, whiteSpace: 'pre-wrap', wordBreak: 'break-word', padding: '10px 12px', borderRadius: 10, background: 'color-mix(in srgb, currentColor 4%, transparent)', border: '1px solid var(--dsw-alias-border-l1, color-mix(in srgb, currentColor 10%, transparent))' } }, task.description)
+                      : h('div', { style: uiMuted }, '暂无描述')),
+
+              h('div', { className: 'mtb-drawer-sec' },
+                h('div', { className: 'mtb-drawer-sec-title' }, '标签与优先级'),
+                h('div', { className: 'mtb-card-tags' },
+                  currentTagNames.length === 0
+                    ? h('span', { style: uiMuted }, '暂无标签')
+                    : currentTagNames.map(name => h('span', { key: name, className: 'mtb-tag', 'data-tag-tone': taskTagTone(name) },
+                        name,
+                        !archived && h('button', { type: 'button', className: 'mtb-tag-x', 'aria-label': '移除 ' + name, disabled: busy, onClick: () => { void toggleDrawerTag(name); } }, '×')))),
+                !archived && h('div', { style: { display: 'flex', gap: 6 } },
+                  h('input', {
+                    style: { ...uiInput, padding: '5px 9px' },
+                    value: drawerTagDraft,
+                    placeholder: '输入新标签，如 记忆 / P1…',
+                    onChange: e => setDrawerTagDraft(e.target.value),
+                    onKeyDown: e => { if (e.key === 'Enter') { e.preventDefault(); void addDrawerTag(); } },
+                  }),
+                  h('button', { type: 'button', className: 'mtb-btn', disabled: busy || !drawerTagDraft.trim(), onClick: () => { void addDrawerTag(); } }, '＋ 添加')),
+                !archived && suggestedDrawerTags.length > 0 && h('div', { className: 'mtb-card-tags' },
+                  suggestedDrawerTags.map(name => h('button', {
+                    key: name, type: 'button', className: 'mtb-tag mtb-tag-btn',
+                    'data-tag-tone': taskTagTone(name), disabled: busy,
+                    onClick: () => { void toggleDrawerTag(name); },
+                  }, '＋ ' + name)))),
+
+              h('div', { className: 'mtb-drawer-sec' },
+                h('div', { className: 'mtb-drawer-sec-title' },
+                  '父任务 / 子任务关联',
+                  childCards.length > 0 && h('span', { style: { fontWeight: 500, fontSize: 11 } }, childCards.length + ' 个子任务')),
+                parentCard && h('div', { className: 'mtb-sub-row' },
+                  h('span', { style: { fontSize: 11, color: dswTheme.faint } }, '父任务'),
+                  h('button', { type: 'button', style: { border: 0, background: 'transparent', color: 'inherit', fontWeight: 600, fontSize: 12, cursor: 'pointer', textAlign: 'left', flex: 1 }, onClick: () => setSelectedId(parentCard.id) }, parentCard.title),
+                  !archived && !isRunning && h('button', { type: 'button', className: 'mtb-btn', disabled: busy, onClick: () => { void setParent(task, null); } }, '解除')),
+                !parentCard && h(React.Fragment, null,
+                  childCards.map(child => {
+                    const cCol = columns.find(c => c.key === child.status) ?? columns[1];
+                    return h('div', { key: child.id, className: 'mtb-sub-row', style: { '--mtb-accent': cCol.accent } },
+                      h('span', { className: 'mtb-dot' }),
+                      h('button', { type: 'button', style: { border: 0, background: 'transparent', color: 'inherit', fontSize: 12, cursor: 'pointer', textAlign: 'left', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, onClick: () => setSelectedId(child.id) }, child.title),
+                      h('span', { style: { fontSize: 11, color: dswTheme.dim } }, cCol.label),
+                      !archived && child.status !== 'running' && h('button', { type: 'button', className: 'mtb-icon-btn', title: '解除子任务关联', disabled: busy, onClick: () => { void setParent(child, null); } }, '×'));
+                  }),
+                  !archived && h('div', { style: { display: 'flex', gap: 6 } },
+                    h('input', {
+                      style: { ...uiInput, padding: '5px 9px' },
+                      value: newSubtaskTitle,
+                      placeholder: '新建子任务标题…',
+                      onChange: e => setNewSubtaskTitle(e.target.value),
+                      onKeyDown: e => { if (e.key === 'Enter') { e.preventDefault(); void createSubtask(task); } },
+                    }),
+                    h('button', { type: 'button', className: 'mtb-btn', disabled: busy || !newSubtaskTitle.trim(), onClick: () => { void createSubtask(task); } }, '＋ 子任务')),
+                  !archived && linkableChildren.length > 0 && h('div', { style: { display: 'flex', gap: 6 } },
+                    h('select', { style: { ...uiInput, padding: '5px 8px', flex: 1 }, value: linkChildId, onChange: e => setLinkChildId(e.target.value) },
+                      h('option', { value: '' }, '关联已有卡片为子任务…'),
+                      linkableChildren.map(item => h('option', { key: item.id, value: item.id }, item.title))),
+                    h('button', { type: 'button', className: 'mtb-btn', disabled: busy || !linkChildId, onClick: () => { const ch = allActive.find(i => i.id === linkChildId); if (ch) void setParent(ch, task.id); } }, '关联')))),
+
+              !archived && h('details', { className: 'mtb-drawer-sec' },
+                h('summary', { style: { cursor: 'pointer', fontSize: 12, fontWeight: 600, color: dswTheme.dim } },
+                  '定时执行 (Cron)' + (task.schedule?.enabled ? ' · 已开启' : '')),
+                h('div', { style: { display: 'grid', gap: 8, marginTop: 8 } },
+                  h('label', { style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 } },
+                    h('input', { type: 'checkbox', checked: cronEnabled, onChange: e => setCronEnabled(e.target.checked) }),
+                    '启用 Cron 定时调度'),
+                  h('div', { style: { display: 'flex', gap: 6 } },
+                    h('input', { style: { ...uiInput, padding: '5px 9px', fontFamily: 'monospace' }, value: cronDraft, placeholder: '5 段 cron，例如 0 9 * * *', onChange: e => setCronDraft(e.target.value) }),
+                    h('button', { type: 'button', className: 'mtb-btn', disabled: busy, onClick: () => { void saveSchedule(task, cronEnabled, cronDraft); } }, '保存定时')))),
+
+              workflow && h('div', { className: 'mtb-drawer-sec' },
                 h('div', { style: { fontSize: 12, fontWeight: 600 } }, [workflow.leaderName, modeLabel,
                   catalog?.groupTemplates?.find(item => item.id === workflow.plan?.groupTemplate)?.name].filter(Boolean).join(' · ')),
                 step && h('div', { role: 'status', style: uiMuted }, step),
@@ -2245,31 +2569,36 @@ window.__ModuleLoader__.load({
                 workflow.reviewers?.length > 0 && h('div', { style: uiMuted },
                   workflow.reviewers.map(reviewer => reviewer.name + ' · ' + reviewer.model).join(' / ')),
                 workflow.reportId && h(TaskReviewReport, { key: workflow.reportId, taskId: task.id, development: Boolean(workflow.development) }))),
+
             h('div', { className: 'mtb-drawer-foot' },
-              task.status === 'review' && canMove && h('button', { type: 'button', className: 'mtb-btn mtb-btn-confirm', disabled: busy, onClick: () => { void move(task, 'done'); } }, '确认完成'),
-              !task.taskRoom?.closed && task.status !== 'running' && (!workflow || workflow.state !== 'done') && h('button', { type: 'button', disabled: busy, className: 'mtb-btn mtb-btn-accent', onClick: () => { void run(task); } }, workflow?.state === 'failed' || workflow?.state === 'interrupted' ? '重试' : '运行'),
+              !archived && task.status === 'review' && canMove && h('button', { type: 'button', className: 'mtb-btn mtb-btn-confirm', disabled: busy, onClick: () => { void move(task, 'done'); } }, '确认完成'),
+              !archived && !task.taskRoom?.closed && task.status !== 'running' && (!workflow || workflow.state !== 'done') && h('button', { type: 'button', disabled: busy, className: 'mtb-btn mtb-btn-accent', onClick: () => { void run(task); } }, workflow?.state === 'failed' || workflow?.state === 'interrupted' ? '重试' : '运行'),
+              !archived && isRunning && !workflow && h('button', { type: 'button', className: 'mtb-btn', disabled: busy, onClick: () => { void settleTask(task); } }, '终止运行'),
               h('button', { type: 'button', className: 'mtb-btn', onClick: () => { setSelectedId(''); openTaskRoom?.(task); } }, '进入工单群'),
               workflow && workflow.state !== 'running' && h('button', { type: 'button', className: 'mtb-btn', disabled: busy, onClick: () => edit(task) }, '编辑分工'),
               task.sessionId && h('button', { type: 'button', className: 'mtb-btn', onClick: () => openSession && openSession(task.sessionId) }, '打开会话'),
+              !archived && h('button', { type: 'button', className: 'mtb-btn', disabled: busy, onClick: () => { void duplicateTask(task); } }, '复制'),
+              !archived && !isRunning && h('button', { type: 'button', className: 'mtb-btn', disabled: busy, onClick: () => { void archiveTask(task); } }, '归档'),
+              archived && h('button', { type: 'button', className: 'mtb-btn mtb-btn-confirm', disabled: busy, onClick: () => { void restoreTask(task); } }, '恢复到看板'),
               !task.taskRoom && h('button', { type: 'button', className: confirmId === task.id ? 'mtb-btn mtb-btn-danger' : 'mtb-btn', style: { marginLeft: 'auto' }, onClick: () => { void remove(task); } }, confirmId === task.id ? '确认删除' : '删除'))));
       };
 
       const scrollToColumn = key => {
+        setShowArchive(false);
         document.getElementById('marshal-col-' + key)?.scrollIntoView({ behavior: 'smooth', inline: 'nearest', block: 'nearest' });
       };
 
-      const appendTagSuggestion = name => {
-        const current = tagInput.split(/[,，]/).map(s => s.trim()).filter(Boolean);
-        if (!current.includes(name)) setTagInput([...current, name].join(', '));
-      };
+      const canOrchestrate = Boolean(catalog?.memoryAvailable && catalog?.leaders?.length > 0);
+      const topLevelParents = allActive.filter(item => item.parentId === undefined);
+      const allTagSuggestions = [...new Set([...PRIORITY_TAGS, ...knownTags.map(t => t.name)])];
 
       return h('section', { className: 'mtb-page' },
         h('header', { className: 'mtb-head' },
           h('div', { className: 'mtb-head-left' },
             h('div', { style: { fontSize: 15, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 8 } },
               '任务看板',
-              h('span', { style: { fontSize: 11, fontWeight: 500, color: dswTheme.faint, fontVariantNumeric: 'tabular-nums' } },
-                activeTag ? list.length + '/' + allActive.length + ' 张卡片' : allActive.length + ' 张卡片')),
+              h('span', { style: { fontSize: 11, fontWeight: 500, color: dswTheme.dim, fontVariantNumeric: 'tabular-nums' } },
+                (activeTag || q) ? list.length + '/' + allActive.length + ' 张卡片' : allActive.length + ' 张卡片')),
             h('div', { className: 'mtb-summary', 'aria-label': '状态总览' },
               columns.map(column => {
                 const count = list.filter(task => (knownStatuses.has(task.status) ? task.status : 'todo') === column.key).length;
@@ -2286,12 +2615,22 @@ window.__ModuleLoader__.load({
                   h('strong', null, count));
               }))),
           h('div', { className: 'mtb-head-right' },
-            h('button', { type: 'button', style: uiButton(false), onClick: () => setCompactCards(v => !v) }, compactCards ? '展开卡片' : '紧凑视图'),
-            openNativeBoard && h('button', { type: 'button', style: uiButton(false), onClick: () => openNativeBoard(), title: '切换到 DSH 原版任务看板（含定时 Cron 与附件）' }, '原版看板'),
+            archivedTasks.length > 0 && h('button', { type: 'button', style: tabStyle(showArchive), onClick: () => setShowArchive(v => !v) },
+              showArchive ? '返回看板' : '归档 (' + archivedTasks.length + ')'),
+            !showArchive && h('button', { type: 'button', style: uiButton(false), onClick: () => setCompactCards(v => !v) }, compactCards ? '展开卡片' : '紧凑视图'),
+            openNativeBoard && h('button', { type: 'button', style: uiButton(false), onClick: () => openNativeBoard(), title: '切换到 DSH 原版任务看板' }, '原版看板'),
             h('button', { type: 'button', disabled: busy, style: uiButton(true), onClick: () => formOpen ? cancelForm() : setFormOpen(true) }, formOpen ? '收起' : '＋ 新建卡片'))),
-        knownTags.length > 0 && h('div', { className: 'mtb-tagbar', 'aria-label': '标签筛选' },
-          h('span', { className: 'mtb-tagbar-label' }, '标签'),
-          h('button', {
+
+        !showArchive && h('div', { className: 'mtb-tagbar', 'aria-label': '搜索与标签筛选' },
+          h('input', {
+            className: 'mtb-search',
+            type: 'search',
+            value: searchQuery,
+            onChange: e => setSearchQuery(e.target.value),
+            placeholder: '搜索标题 / 描述 / 标签…',
+          }),
+          knownTags.length > 0 && h('span', { className: 'mtb-tagbar-label' }, '标签'),
+          knownTags.length > 0 && h('button', {
             type: 'button',
             className: 'mtb-tag mtb-tag-btn',
             'data-active': activeTag === '' ? 'true' : undefined,
@@ -2305,37 +2644,92 @@ window.__ModuleLoader__.load({
             'data-active': activeTag === tag.name ? 'true' : undefined,
             onClick: () => setActiveTag(current => current === tag.name ? '' : tag.name),
           }, tag.name))),
+
         error && h('div', { style: { padding: '8px 20px', fontSize: 12, color: dswTheme.danger } }, error),
+
         formOpen && h('fieldset', { disabled: busy, 'aria-label': editing ? '编辑工单分工' : '创建工单', className: 'mtb-form' },
           h(Field, { label: '标题' }, h('input', { value: title, readOnly: Boolean(editing), onChange: event => { setTitle(event.target.value); setPlan(null); }, placeholder: '这张卡片要做什么', style: uiInput })),
           h(Field, { label: '描述（可选）' }, h('textarea', { value: description, readOnly: Boolean(editing), onChange: event => { setDescription(event.target.value); setPlan(null); }, rows: 3, placeholder: '背景、验收标准、约束…', style: { ...uiInput, resize: 'vertical', lineHeight: 1.6 } })),
-          !editing && h(Field, { label: '标签（可选，逗号分隔，如：记忆, P1）' },
-            h('input', { value: tagInput, onChange: event => setTagInput(event.target.value), placeholder: '记忆, P1', style: uiInput }),
-            knownTags.length > 0 && h('div', { className: 'mtb-card-tags', style: { marginTop: 4 } },
-              knownTags.map(tag => h('button', { key: tag.name, type: 'button', className: 'mtb-tag mtb-tag-btn', 'data-tag-tone': taskTagTone(tag.name), onClick: () => appendTagSuggestion(tag.name) }, '＋ ' + tag.name)))),
-          !leaderId && !editing && h(Field, { label: '工作区' }, h('select', { value: workspaceId, style: uiInput,
-            onChange: event => setWorkspaceId(event.target.value) },
-            h('option', { value: '' }, '选择工作区'),
-            workspaces.map(item => h('option', { key: item.id, value: item.id }, item.name)))),
-          catalog?.memoryAvailable && catalog.leaders.length > 0 && h(Field, { label: 'Leader' },
+
+          !editing && h(Field, { label: '标签与优先级（点选已有标签，或输入新建）' },
+            formTags.length > 0 && h('div', { className: 'mtb-card-tags' },
+              formTags.map(name => h('span', { key: name, className: 'mtb-tag', 'data-tag-tone': taskTagTone(name) },
+                name,
+                h('button', { type: 'button', className: 'mtb-tag-x', onClick: () => toggleFormTag(name) }, '×')))),
+            h('div', { style: { display: 'flex', gap: 6 } },
+              h('input', {
+                value: newTagDraft,
+                onChange: event => setNewTagDraft(event.target.value),
+                onKeyDown: event => { if (event.key === 'Enter') { event.preventDefault(); addNewFormTag(); } },
+                placeholder: '新建标签名，回车添加（如：记忆、前端、P1）',
+                style: { ...uiInput, flex: 1 },
+              }),
+              h('button', { type: 'button', className: 'mtb-btn', onClick: addNewFormTag }, '＋ 新建标签')),
+            h('div', { className: 'mtb-card-tags', style: { marginTop: 2 } },
+              allTagSuggestions.map(name => h('button', {
+                key: name,
+                type: 'button',
+                className: 'mtb-tag mtb-tag-btn',
+                'data-tag-tone': taskTagTone(name),
+                'data-active': formTags.includes(name) ? 'true' : undefined,
+                onClick: () => toggleFormTag(name),
+              }, (formTags.includes(name) ? '✓ ' : '＋ ') + name)))),
+
+          !editing && h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 10 } },
+            topLevelParents.length > 0 && h(Field, { label: '关联父任务（可选，设为子任务）' },
+              h('select', { value: formParentId, style: uiInput, onChange: event => setFormParentId(event.target.value) },
+                h('option', { value: '' }, '独立任务（无父任务）'),
+                topLevelParents.map(item => h('option', { key: item.id, value: item.id }, item.title)))),
+            h(Field, { label: '权限预设（可选）' },
+              h('select', { value: formPermission, style: uiInput, onChange: event => setFormPermission(event.target.value) },
+                h('option', { value: '' }, '跟随默认权限'),
+                h('option', { value: 'read-only' }, '只读'),
+                h('option', { value: 'workspace-write' }, '工作区可写'),
+                h('option', { value: 'danger-full-access' }, '完全权限'))),
+            !leaderId && workspaces.length > 0 && h(Field, { label: '工作区（可选）' },
+              h('select', { value: workspaceId, style: uiInput, onChange: event => setWorkspaceId(event.target.value) },
+                h('option', { value: '' }, '不绑定工作区'),
+                workspaces.map(item => h('option', { key: item.id, value: item.id }, item.name))))),
+
+          h(Field, { label: 'Agent 编排模板' },
+            h('div', { className: 'mtb-tpl-grid' },
+              !editing && h('button', {
+                type: 'button', className: 'mtb-tpl-pill',
+                'data-active': !leaderId ? 'true' : undefined,
+                onClick: () => pickOrchestrationMode('plain'),
+              }, '普通卡片'),
+              h('button', {
+                type: 'button', className: 'mtb-tpl-pill',
+                disabled: !canOrchestrate,
+                'data-active': leaderId && choice === 'leader' ? 'true' : undefined,
+                onClick: () => pickOrchestrationMode('leader'),
+              }, '由 Leader 自动选模板'),
+              (catalog?.templates ?? []).map(item => h('button', {
+                key: item.id,
+                type: 'button',
+                className: 'mtb-tpl-pill',
+                disabled: !canOrchestrate,
+                'data-active': leaderId && choice === 'template' && templateId === item.id ? 'true' : undefined,
+                onClick: () => pickOrchestrationMode('template', item.id),
+                title: item.stages.join(' → '),
+              }, item.name + (item.automated ? ' · 自动' : ''))),
+              h('button', {
+                type: 'button', className: 'mtb-tpl-pill',
+                disabled: !canOrchestrate,
+                'data-active': leaderId && choice === 'none' ? 'true' : undefined,
+                onClick: () => pickOrchestrationMode('none'),
+              }, '仅派给 Leader（无模板）')),
+            leaderId && choice === 'template' && template && h('span', { style: uiMuted }, '阶段：' + template.stages.join(' → ')),
+            catalogError && h('div', { style: uiMuted }, catalogError),
+            catalog && !canOrchestrate && h('div', { style: uiMuted }, '提示：需开启工作区记忆并至少有一个已绑定工作区的智能体作为 Leader，方可启用编排模板。')),
+
+          leaderId && canOrchestrate && h(Field, { label: '负责 Leader' },
             h('select', { value: leaderId, onChange: event => { setLeaderId(event.target.value); setPlan(null); }, style: uiInput },
-              h('option', { value: '', disabled: Boolean(editing) }, '普通卡片'),
               catalog.leaders.filter(leader => !editing || leader.workspaceId === workspaceId).map(leader => h('option', { key: leader.id, value: leader.id }, leader.name)))),
-          catalogError && h('div', { style: uiMuted }, catalogError),
-          catalog && (!catalog.memoryAvailable || catalog.leaders.length === 0) && h('div', { style: uiMuted },
-            '编排需要工作区记忆和已绑定工作区的 Leader。'),
-          leaderId && h(Field, { label: '编排方式' },
-            h('select', { value: choice, onChange: event => { setChoice(event.target.value); setPlan(null); }, style: uiInput },
-              h('option', { value: 'leader' }, '由 Leader 选择或跳过'),
-              h('option', { value: 'template' }, '指定模板'),
-              h('option', { value: 'none' }, '不使用模板'))),
-          leaderId && choice === 'template' && h(Field, { label: '模板' },
-            h('select', { value: templateId, onChange: event => { setTemplateId(event.target.value); setPlan(null); setExplicitCode(false); }, style: uiInput },
-              (catalog?.templates ?? []).map(item => h('option', { key: item.id, value: item.id },
-                item.name + (item.automated ? ' · 自动' : ' · 由 Leader 执行')))),
-            template && h('span', { style: uiMuted }, template.stages.join(' → '))),
+
           leaderId && (requiresPr || choice === 'leader') && h(Field, { label: requiresPr ? 'PR 链接' : 'PR 链接（可选）' },
             h('input', { type: 'url', value: prUrl, onChange: event => { setPrUrl(event.target.value); setPlan(null); }, placeholder: 'GitHub 或 Gitee PR 链接', style: uiInput })),
+
           leaderId && h('section', { 'aria-label': '运行分工', style: { display: 'grid', gap: 8, borderTop: '1px solid ' + dswTheme.border, paddingTop: 10 } },
             h('strong', null, group ? group.name : 'Leader 推荐后预填角色'),
             plan && recommendedTemplate && h('span', { style: uiMuted }, recommendedTemplate.name + ' · Leader ' + selectedLeader?.name),
@@ -2361,49 +2755,65 @@ window.__ModuleLoader__.load({
                 h('option', { value: plan.codex[slot] }, plan.codex[slot]),
               codexModels.filter(model => slot !== 'coding' || model.work).map(model =>
                 h('option', { key: model.id, value: model.id }, model.model)))))),
+
           h('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8 } },
             h('button', { type: 'button', style: uiButton(false), onClick: cancelForm }, '取消'),
             leaderId && plan && h('button', { type: 'button', style: uiButton(false), disabled: busy, onClick: () => { void recommend(); } }, '重新推荐'),
             h('button', { type: 'button', disabled: busy, style: { ...uiButton(true), opacity: busy ? .6 : 1 }, onClick: () => { void create(); } },
               busy ? '处理中…' : leaderId && !plan ? 'Leader 推荐分工' : editing ? '保存分工' : '创建'))),
-        allActive.length === 0 && !formOpen
-          ? h(EmptyState, { title: '还没有卡片', hint: '新建一张卡片，每张卡片都有一个工单群。', action: '新建卡片', onAction: () => setFormOpen(true) })
-          : h('div', { className: 'mtb-grid' },
-              columns.map(column => {
-                const items = list.filter(task => (knownStatuses.has(task.status) ? task.status : 'todo') === column.key);
-                return h('section', {
-                  key: column.key,
-                  id: 'marshal-col-' + column.key,
-                  className: 'mtb-col',
-                  'data-status': column.key,
-                  'data-drop': dropCol === column.key ? 'true' : undefined,
-                  style: { '--mtb-accent': column.accent },
-                  onDragOver: event => {
-                    if (!dragTaskId) return;
-                    event.preventDefault();
-                    if (dropCol !== column.key) setDropCol(column.key);
+
+        showArchive
+          ? h('div', { className: 'mtb-archive-grid' },
+              archivedTasks.length === 0
+                ? h(EmptyState, { title: '没有已归档卡片', hint: '已完成或失败的卡片可在详情中归档。', action: '返回看板', onAction: () => setShowArchive(false) })
+                : archivedTasks.map(task => {
+                    const col = columns.find(c => c.key === task.status) ?? columns[4];
+                    return h('article', { key: task.id, className: 'mtb-card', style: { '--mtb-accent': col.accent }, onClick: () => setSelectedId(task.id) },
+                      h('div', { className: 'mtb-card-title-row' }, h('span', { className: 'mtb-card-title' }, task.title)),
+                      Array.isArray(task.tags) && task.tags.length > 0 && h('div', { className: 'mtb-card-tags' },
+                        task.tags.map(tag => h('span', { key: tag.name, className: 'mtb-tag', 'data-tag-tone': taskTagTone(tag.name) }, tag.name))),
+                      h('div', { className: 'mtb-card-foot' },
+                        h('span', { className: 'mtb-runs' }, '归档于 ' + formatTaskTime(task.archivedAt)),
+                        h('button', { type: 'button', className: 'mtb-icon-pill mtb-icon-pill-confirm', onClick: e => { e.stopPropagation(); void restoreTask(task); } }, '恢复')));
+                  }))
+          : allActive.length === 0 && !formOpen
+            ? h(EmptyState, { title: '还没有卡片', hint: '新建一张卡片，每张卡片都有一个工单群。', action: '新建卡片', onAction: () => setFormOpen(true) })
+            : h('div', { className: 'mtb-grid' },
+                columns.map(column => {
+                  const items = list.filter(task => (knownStatuses.has(task.status) ? task.status : 'todo') === column.key);
+                  return h('section', {
+                    key: column.key,
+                    id: 'marshal-col-' + column.key,
+                    className: 'mtb-col',
+                    'data-status': column.key,
+                    'data-drop': dropCol === column.key ? 'true' : undefined,
+                    style: { '--mtb-accent': column.accent },
+                    onDragOver: event => {
+                      if (!dragTaskId) return;
+                      event.preventDefault();
+                      if (dropCol !== column.key) setDropCol(column.key);
+                    },
+                    onDragLeave: event => {
+                      if (dropCol === column.key && !event.currentTarget.contains(event.relatedTarget)) setDropCol('');
+                    },
+                    onDrop: event => {
+                      event.preventDefault();
+                      const droppedId = dragTaskId || event.dataTransfer?.getData('text/plain') || '';
+                      setDropCol('');
+                      setDragTaskId('');
+                      const target = allActive.find(item => item.id === droppedId);
+                      if (target && target.status !== column.key) void move(target, column.key);
+                    },
                   },
-                  onDragLeave: event => {
-                    if (dropCol === column.key && !event.currentTarget.contains(event.relatedTarget)) setDropCol('');
-                  },
-                  onDrop: event => {
-                    event.preventDefault();
-                    const droppedId = dragTaskId || event.dataTransfer?.getData('text/plain') || '';
-                    setDropCol('');
-                    setDragTaskId('');
-                    const target = allActive.find(item => item.id === droppedId);
-                    if (target && target.status !== column.key) void move(target, column.key);
-                  },
-                },
-                  h('div', { className: 'mtb-col-head' },
-                    h('span', { className: 'mtb-dot', 'data-pulse': column.pulse && items.length > 0 ? 'true' : undefined }),
-                    h('h2', { className: 'mtb-col-title', style: { margin: 0 } }, column.label),
-                    h('span', { className: 'mtb-count' }, items.length)),
-                  h('div', { className: 'mtb-col-body' },
-                    items.length === 0
-                      ? h('div', { className: 'mtb-empty' }, column.empty)
-                      : items.map(task => card(task, column))));
-              })),
+                    h('div', { className: 'mtb-col-head' },
+                      h('span', { className: 'mtb-dot', 'data-pulse': column.pulse && items.length > 0 ? 'true' : undefined }),
+                      h('h2', { className: 'mtb-col-title', style: { margin: 0 } }, column.label),
+                      h('span', { className: 'mtb-count' }, items.length)),
+                    h('div', { className: 'mtb-col-body' },
+                      items.length === 0
+                        ? h('div', { className: 'mtb-empty' }, column.empty)
+                        : items.map(task => card(task, column))));
+                })),
         renderDrawer());
     }
     function TaskRoomsPage({ task, openBoard }) {

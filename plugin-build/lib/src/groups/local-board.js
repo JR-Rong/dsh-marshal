@@ -22,7 +22,60 @@ export function createLocalBoard(file) {
             const title = typeof input.title === 'string' ? input.title.trim() : '';
             if (title === '') throw new Error('title is required');
             const tags = Array.isArray(input.tags) ? input.tags.filter(t => t && typeof t.name === 'string' && t.name.trim() !== '').map(t => ({ name: t.name.trim(), ...(typeof t.promptPrefix === 'string' && t.promptPrefix.trim() !== '' ? { promptPrefix: t.promptPrefix.trim() } : {}) })) : undefined;
-            save([{ id: action.id ?? randomUUID(), title, description: typeof input.description === 'string' ? input.description : '', prompt: typeof input.prompt === 'string' ? input.prompt : title, status: 'todo', priority: 0, ...(tags && tags.length > 0 ? { tags } : {}), executions: [], createdAt: at, updatedAt: at }, ...tasks]);
+            const parentId = typeof input.parentId === 'string' && input.parentId.trim() !== '' ? input.parentId.trim() : undefined;
+            const permission = ['read-only', 'workspace-write', 'danger-full-access'].includes(input.permission) ? input.permission : undefined;
+            save([{ id: action.id ?? randomUUID(), title, description: typeof input.description === 'string' ? input.description : '', prompt: typeof input.prompt === 'string' ? input.prompt : title, status: 'todo', priority: 0, ...(parentId ? { parentId } : {}), ...(permission ? { permission } : {}), ...(tags && tags.length > 0 ? { tags } : {}), executions: [], createdAt: at, updatedAt: at }, ...tasks]);
+            return snapshot();
+        }
+        if (action?.kind === 'update' && action.patch && typeof action.patch === 'object') {
+            const p = action.patch;
+            save(tasks.map(task => {
+                if (task.id !== action.taskId) return task;
+                const next = { ...task, updatedAt: at };
+                if (typeof p.title === 'string' && p.title.trim() !== '') next.title = p.title.trim();
+                if (typeof p.description === 'string') next.description = p.description;
+                if (typeof p.prompt === 'string') next.prompt = p.prompt;
+                if (['read-only', 'workspace-write', 'danger-full-access'].includes(p.permission)) next.permission = p.permission;
+                if (p.tags === null) delete next.tags;
+                else if (Array.isArray(p.tags)) next.tags = p.tags;
+                return next;
+            }));
+            return snapshot();
+        }
+        if (action?.kind === 'set-parent') {
+            const parentId = typeof action.parentId === 'string' && action.parentId.trim() !== '' && action.parentId !== action.taskId ? action.parentId.trim() : undefined;
+            save(tasks.map(task => {
+                if (task.id !== action.taskId) return task;
+                const next = { ...task, updatedAt: at };
+                if (parentId) next.parentId = parentId;
+                else delete next.parentId;
+                return next;
+            }));
+            return snapshot();
+        }
+        if (action?.kind === 'archive') {
+            save(tasks.map(task => task.id === action.taskId && task.status !== 'running' ? { ...task, archivedAt: at, updatedAt: at } : task));
+            return snapshot();
+        }
+        if (action?.kind === 'restore') {
+            save(tasks.map(task => {
+                if (task.id !== action.taskId) return task;
+                const next = { ...task, updatedAt: at };
+                delete next.archivedAt;
+                return next;
+            }));
+            return snapshot();
+        }
+        if (action?.kind === 'settle') {
+            save(tasks.map(task => task.id === action.taskId && task.status === 'running' ? { ...task, status: 'todo', updatedAt: at } : task));
+            return snapshot();
+        }
+        if (action?.kind === 'confirm-permission') {
+            save(tasks.map(task => task.id === action.taskId ? { ...task, permissionConfirmedAt: at, updatedAt: at } : task));
+            return snapshot();
+        }
+        if (action?.kind === 'set-schedule' && action.patch && typeof action.patch === 'object') {
+            save(tasks.map(task => task.id === action.taskId ? { ...task, schedule: { ...(task.schedule ?? {}), ...action.patch }, updatedAt: at } : task));
             return snapshot();
         }
         if (action?.kind === 'delete') {
