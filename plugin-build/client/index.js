@@ -407,6 +407,8 @@ window.__ModuleLoader__.load({
       const [library, setLibrary] = React.useState(null);
       const [agentId, setAgentId] = React.useState('');
       const [graph, setGraph] = React.useState({ nodes: [], edges: [] });
+      const [privateBackend, setPrivateBackend] = React.useState('');
+      const [allowTaskRecall, setAllowTaskRecall] = React.useState(false);
       const [selected, setSelected] = React.useState(null);
       const [error, setError] = React.useState('');
       const [query, setQuery] = React.useState('');
@@ -429,6 +431,11 @@ window.__ModuleLoader__.load({
       const agents = library?.agents ?? [];
       const agent = agents.find(item => item.id === agentId);
       const workspaceId = agent?.workspaceId;
+      const view = JSON.stringify([agentId, workspaceId]);
+      const currentView = React.useRef(view);
+      currentView.current = view;
+      const graphRequest = React.useRef(0);
+      const queryRequest = React.useRef(0);
       const load = async () => {
         try {
           const data = await loadAgentLibrary();
@@ -440,13 +447,19 @@ window.__ModuleLoader__.load({
       };
       const loadGraph = async () => {
         if (agentId === '') return;
+        const request = ++graphRequest.current;
+        const target = '?agentId=' + encodeURIComponent(agentId) + (workspaceId ? '&workspaceId=' + encodeURIComponent(workspaceId) : '');
         try {
-          const data = await fetchJson('marshal/memory/graph?agentId=' + encodeURIComponent(agentId) + (workspaceId ? '&workspaceId=' + encodeURIComponent(workspaceId) : ''));
+          const [data, nextHealth] = await Promise.all([
+            fetchJson('marshal/memory/graph' + target), fetchJson('marshal/memory/health' + target).catch(() => null),
+          ]);
+          if (currentView.current !== view || request !== graphRequest.current) return;
           setGraph(data.graph || { nodes: [], edges: [] });
-          try { setHealth(await fetchJson('marshal/memory/health?agentId=' + encodeURIComponent(agentId) + (workspaceId ? '&workspaceId=' + encodeURIComponent(workspaceId) : ''))); } catch { setHealth(null); }
+          setPrivateBackend(data.privateBackend ?? '');
+          setHealth(nextHealth);
           setError('');
         }
-        catch (e) { setError(friendlyError(e, '记忆')); }
+        catch (e) { if (currentView.current === view && request === graphRequest.current) setError(friendlyError(e, '记忆')); }
       };
       const loadProposals = async () => {
         try {
@@ -470,20 +483,26 @@ window.__ModuleLoader__.load({
       React.useEffect(() => { void load(); void fetchJson('marshal/memory/settings/get').then(setSettings).catch(() => {}); void loadProposals(); }, []);
       React.useEffect(() => { void loadGraph(); }, [agentId, workspaceId]);
       const search = async () => {
+        const request = ++queryRequest.current;
         if (query.trim() === '') { setResults(null); return; }
         try {
           const data = await fetchJson('marshal/memory/list?agentId=' + encodeURIComponent(agentId) + (workspaceId ? '&workspaceId=' + encodeURIComponent(workspaceId) : '') + '&query=' + encodeURIComponent(query));
+          if (currentView.current !== view || request !== queryRequest.current) return;
           setResults(data.items || []);
+          setError('');
         }
-        catch (e) { setError(friendlyError(e, '记忆检索')); }
+        catch (e) { if (currentView.current === view && request === queryRequest.current) setError(friendlyError(e, '记忆检索')); }
       };
       const create = async () => {
         if (title.trim() === '' || text.trim() === '') return;
         setBusy(true);
         try {
           if (scope === 'global') await fetchJson('marshal/memory/global', { title: title.trim(), text: text.trim(), kind: 'fact', importance: 0.6, tags: [], visibility: globalVisibility });
-          else await fetchJson('marshal/memory/remember', { agentId, workspaceId, scope, title: title.trim(), text: text.trim(), kind: 'fact', importance: 0.6, tags: [] });
-          setTitle(''); setText(''); setFormOpen(false); await loadGraph();
+          else await fetchJson('marshal/memory/remember', { agentId, workspaceId, scope, title: title.trim(), text: text.trim(),
+            kind: 'fact', importance: 0.6, tags: [],
+            ...(scope === 'agent' && privateBackend === 'mnemon' && workspaceId && allowTaskRecall ? { visibility: 'group-safe' } : {}),
+          });
+          setTitle(''); setText(''); setAllowTaskRecall(false); setFormOpen(false); await loadGraph();
         }
         catch (e) { setError(friendlyError(e, '写入记忆')); }
         finally { setBusy(false); }
@@ -523,8 +542,12 @@ window.__ModuleLoader__.load({
       return h('div', { style: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' } },
         h('div', { style: { padding: '14px 18px', display: 'flex', alignItems: 'center', gap: 10, borderBottom: '1px solid #8883', flexWrap: 'wrap' } },
           h('div', { style: { fontSize: 14, fontWeight: 600 } }, '记忆'),
-          h('select', { value: agentId, onChange: event => { setAgentId(event.target.value); setSelected(null); setResults(null); }, style: { ...uiInput, width: 180 } },
+          h('select', { value: agentId, disabled: busy, onChange: event => {
+            setAgentId(event.target.value); setSelected(null); setResults(null); setGraph({ nodes: [], edges: [] });
+            setPrivateBackend(''); setHealth(null); setAllowTaskRecall(false); setError('');
+          }, style: { ...uiInput, width: 180 } },
             agents.map(item => h('option', { key: item.id, value: item.id }, item.name))),
+          privateBackend === 'mnemon' && h('span', { style: { color: dswTheme.dim, fontSize: 11 } }, 'Mnemon · 本机私有记忆'),
           h('input', { value: query, onChange: event => setQuery(event.target.value), onKeyDown: event => { if (event.key === 'Enter') void search(); }, placeholder: '搜索记忆…', style: { ...uiInput, width: 220 } }),
           h('button', { type: 'button', style: uiButton(false), onClick: () => { void search(); } }, '搜索'),
           h('button', { type: 'button', style: uiButton(false), onClick: () => { setFormOpen(value => !value); } }, '＋ 记忆'),
@@ -565,6 +588,9 @@ window.__ModuleLoader__.load({
             h('select', { value: scope, onChange: event => setScope(event.target.value), style: { ...uiInput, width: 130 } }, h('option', { value: 'agent' }, 'Agent 私有'), h('option', { value: 'workspace' }, '工作区共享'), h('option', { value: 'global' }, '全局')),
             scope === 'global' && h('select', { value: globalVisibility, onChange: event => setGlobalVisibility(event.target.value), style: { ...uiInput, width: 140 } }, h('option', { value: 'all' }, '所有会话'), h('option', { value: 'no-group' }, '仅单聊'))),
           h('textarea', { value: text, onChange: event => setText(event.target.value), rows: 3, placeholder: '记忆内容…', style: { ...uiInput, resize: 'vertical' } }),
+          scope === 'agent' && privateBackend === 'mnemon' && workspaceId && h('label', { style: { fontSize: 12 } },
+            h('input', { type: 'checkbox', checked: allowTaskRecall, onChange: event => setAllowTaskRecall(event.target.checked) }),
+            ' 允许本 Agent 在当前工作区的工单中使用这条记忆'),
           h('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8 } }, h('button', { type: 'button', style: uiButton(false), onClick: () => setFormOpen(false) }, '取消'), h('button', { type: 'button', disabled: busy, style: uiButton(true), onClick: () => { void create(); } }, busy ? '保存中…' : '保存'))),
         results !== null && h('div', { style: { maxHeight: 180, overflow: 'auto', borderBottom: '1px solid #8883', padding: '8px 18px', display: 'grid', gap: 4 } },
           results.length === 0 ? h('div', { style: { fontSize: 12, color: dswTheme.dim } }, '没有匹配的记忆') : results.map(item => h('button', { key: item.id, type: 'button', onClick: () => { setSelected(item); if (item.scope === 'global') { setEditText(item.content || ''); setEditVisibility(item.visibility === 'all' ? 'all' : 'no-group'); } }, style: { textAlign: 'left', border: 0, background: 'transparent', color: 'inherit', cursor: 'pointer', padding: '5px 0' } }, '[' + item.scope + '] ' + item.title))),
@@ -914,6 +940,10 @@ window.__ModuleLoader__.load({
 
     function friendlyError(error, area) {
       const message = String(error && error.message ? error.message : error);
+      if (error?.code === 'memory-account-unavailable') return area + '需要在 DSH 中登录后重新打开。';
+      if (error?.code === 'no-agent-memory') return area + '服务尚未启用。';
+      if (error?.code === 'memory-session-invalid' || error?.code === 'unauthorized') return area + '会话已失效，请重新打开页面。';
+      if (area.startsWith('记忆') && (error?.code === 'HTTP 404' || error?.code === 'HTTP 405')) return '记忆接口未加载，请检查 Marshal 安装包版本并重启 DSH。';
       if (message.includes('404')) return area + '后端未挂载：智能体需要 @linxin666/dsh-agents，任务看板需要 task-board；安装后重启 DSH';
       if (message.includes('no-task-board') || message.includes('503')) return area + '后端未挂载：请安装 task-board 插件，或升级到带内置看板的构建';
       if (message.includes('no-ledger') || message.includes('no-web-server')) return area + '后端未就绪：请先打开一次智能体并确认 @linxin666/dsh-agents 已启用';
@@ -921,6 +951,8 @@ window.__ModuleLoader__.load({
     }
 
     const MEMORY_CSRF_COOKIE = 'marshal-memory-csrf';
+    const nativeMemory = window.location.protocol === 'dsh-app:' && window.location.hostname === 'app';
+    let desktopMemorySession;
     let memorySessionPromise;
     function readBrowserCookie(name) {
       const parts = String(document.cookie || '').split(';');
@@ -930,52 +962,59 @@ window.__ModuleLoader__.load({
       }
       return '';
     }
-    async function ensureMemorySession(refresh = false) {
-      if (!refresh && readBrowserCookie(MEMORY_CSRF_COOKIE) !== '') return;
+    async function readJson(response) {
+      try { return await response.json(); } catch { return null; }
+    }
+    function requestError(response, data, explain) {
+      const code = data?.code ?? 'HTTP ' + response.status;
+      return Object.assign(new Error(String(explain ? data?.message || code : code)), { code });
+    }
+    function memoryProof() {
+      return nativeMemory ? desktopMemorySession : (readBrowserCookie(MEMORY_CSRF_COOKIE) || undefined);
+    }
+    async function ensureMemorySession(rejected) {
+      const current = memoryProof();
+      if (current && current !== rejected) return current;
       memorySessionPromise ??= fetch(new URL('marshal/memory/session', document.baseURI), {
         method: 'POST',
         credentials: 'same-origin',
-        headers: { 'x-marshal-memory': '1' },
+        headers: { 'x-marshal-memory': '1', ...(nativeMemory ? { 'x-marshal-desktop': '1' } : {}) },
       }).then(async response => {
-        if (!response.ok) {
-          memorySessionPromise = undefined;
-          throw new Error('memory-auth');
+        const data = await readJson(response);
+        if (!response.ok || data?.ok !== true) throw requestError(response, data, true);
+        if (nativeMemory) {
+          if (typeof data.sessionToken === 'string' && typeof data.csrf === 'string') {
+            desktopMemorySession = { 'x-marshal-desktop': '1', 'x-marshal-session': data.sessionToken, 'x-marshal-csrf': data.csrf };
+          } else {
+            desktopMemorySession = undefined;
+          }
         }
-        return response.json();
+        const proof = memoryProof();
+        if (!proof) throw Object.assign(new Error('记忆会话凭证不可用。'), { code: 'memory-session-invalid' });
+        return proof;
       }).finally(() => { memorySessionPromise = undefined; });
-      await memorySessionPromise;
+      return memorySessionPromise;
     }
     async function fetchJson(path, body, workspaceAuth = false) {
       const memory = String(path).startsWith('marshal/memory') && !String(path).startsWith('marshal/memory/session');
       const authenticated = memory || workspaceAuth;
-      if (authenticated) await ensureMemorySession();
-      const headers = {};
-      if (body !== undefined) headers['content-type'] = 'application/json';
-      if (authenticated) {
-        const csrf = readBrowserCookie(MEMORY_CSRF_COOKIE);
-        if (csrf !== '') headers['x-marshal-csrf'] = csrf;
-      }
-      const init = body === undefined ? { credentials: 'same-origin', headers } : {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers,
-        body: JSON.stringify(body),
-      };
       const url = new URL(path, document.baseURI);
-      let response = await fetch(url, init);
-      if (authenticated && response.status === 401) {
-        await ensureMemorySession(true);
-        headers['x-marshal-csrf'] = readBrowserCookie(MEMORY_CSRF_COOKIE);
-        response = await fetch(url, init);
+      const send = proof => fetch(url, {
+        credentials: 'same-origin',
+        ...(body === undefined ? {} : { method: 'POST', body: JSON.stringify(body) }),
+        headers: {
+          ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+          ...(typeof proof === 'string' ? { 'x-marshal-csrf': proof } : proof),
+        },
+      });
+      const proof = authenticated ? await ensureMemorySession() : undefined;
+      let response = await send(proof);
+      let data = await readJson(response);
+      if (authenticated && (response.status === 401 || data?.code === 'memory-csrf-mismatch')) {
+        response = await send(await ensureMemorySession(proof));
+        data = await readJson(response);
       }
-      let data = null;
-      try { data = await response.json(); } catch { data = null; }
-      if (!response.ok || (data !== null && data.ok === false)) {
-        const code = data && (data.code || data.message) ? (data.code || data.message) : 'HTTP ' + response.status;
-        const error = new Error(String(workspaceAuth ? data?.message || code : code));
-        error.code = data && data.code;
-        throw error;
-      }
+      if (!response.ok || data?.ok === false) throw requestError(response, data, authenticated);
       return data;
     }
 
@@ -1649,6 +1688,7 @@ window.__ModuleLoader__.load({
       'coding-assistant': '编码 Codex 子 Agent',
       'review-assistant': '审查 Codex 子 Agent',
       'development-patch': '固定开发补丁',
+      'private-memory': '私有记忆回执',
     };
 
     function TaskReviewReport({ taskId, development }) {

@@ -5,7 +5,7 @@ Self-contained installable build of the marshal plugin.
 Install from the tarball in this directory:
 
 - Desktop: Plugins -> Add plugin -> pick the .tgz;
-- CLI: dsh plugin --profile desktop add /abs/path/dsh-marshal-0.2.0-agent-groups.9.tgz.
+- CLI: dsh plugin --profile desktop add /abs/path/dsh-marshal-0.2.0-agent-groups.10.tgz.
 
 Required DSH plugins (install in the same profile first):
 
@@ -43,3 +43,21 @@ PR 审查支持 GitHub 和 Gitee PR 链接。节点需要启用工作区记忆�
 本机运行时，群正文保存到原设备的 task-rooms.sqlite。选择同工作区的跨设备 Agent 后，原设备会将完整历史分页转存到 Hub。Hub 确认序号完整后接管正文，原设备只保留工单关联和位置。接入同一 Hub 的设备必须绑定同一个账号，并登记相同的工作区 ID。远端节点还需要启用群聊讨论策略。工单归档可在获准设备的「工单群」里查看。
 
 跨设备联动需要同时更新节点插件和安装包中的 standalone Hub。云端服务可用该安装包的 marshal-hub 入口，或继续指向其 lib/src/bin/hub.js。工单群正文随 Hub 存储目录备份。
+
+## Mnemon 私有记忆试点
+
+在节点的 Marshal 插件配置中指定一个已登记 Agent 的成员 ID 和本机 Mnemon Native 可执行文件绝对路径。试点验证使用 Mnemon 0.2.13。配置保存后重启 DSH。
+
+```yaml
+mnemonPilot:
+  agentId: "<dsh-agents 花名册的成员 ID>"
+  executable: "/usr/local/bin/mnemon"
+```
+
+试点 Agent 的新私有条目保存到 Marshal 记忆目录下的本机 Mnemon Store，既有 SQLite 条目仍可检索。其他 Agent、工作区交接和全局审批沿用现有机制。新 Mnemon 条目仅保存在本机，现有 Hub 记忆同步覆盖 SQLite 数据。移除此配置可切回 SQLite，重新启用可查看已保存的 Mnemon 条目。
+
+已登记会话可跨会话召回该 Agent 的记忆。记忆页显示所选 Agent 的后端。新建条目时可以单独授权本 Agent 在当前工作区的工单中使用，开发批次将召回数量和写入状态记到原工单群。验收经验进入该 Agent 的私有记忆。开发的工作区公共交接仍按记忆 ID 精确读取。
+
+## 记忆页会话
+
+DSH 桌面代理使用页面内的会话凭证，浏览器使用本地会话 Cookie。插件重启或会话过期时，页面会自动重建会话并重试一次。如果仍出现提示，请记录提示原文和 `/marshal/health` 的插件版本。

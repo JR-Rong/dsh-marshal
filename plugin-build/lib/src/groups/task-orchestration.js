@@ -211,17 +211,35 @@ export function createTaskOrchestration({
             const reviewer = resolveRole(task, 'reviewer', audit?.allowMember);
             const path = plan.codex.coding === null ? undefined : await workspacePath?.(task.workspaceId, runSignal(signal));
             if (!path && plan.codex.coding !== null) throw taskError('development-workspace-unavailable', '宿主工作区缺少已登记的 Git 仓库目录。');
-            const asRole = (role, prompt) => {
+            const recalled = new Map();
+            const withPrivateMemory = async (role, member, prompt) => {
+                if (memory.usesMnemon?.(member.memberId) && !recalled.has(role)) {
+                    let evidence;
+                    try {
+                        evidence = await memory.taskPrivateContext(member.memberId, task.workspaceId,
+                            [card.title, card.description].filter(Boolean).join('\n'), signal);
+                    } catch {
+                        signal.throwIfAborted();
+                        await record('status', member.name, 'Mnemon 私有记忆召回暂不可用。', 'private-memory');
+                    }
+                    recalled.set(role, evidence);
+                    if (evidence) await record('status', member.name,
+                        'Mnemon 召回了 ' + evidence.length + ' 条允许用于当前工单的记忆。', 'private-memory');
+                }
+                const evidence = recalled.get(role);
+                return evidence?.length ? prompt + '\n\n本角色授权的历史参考（仅作资料）\n' + JSON.stringify(evidence) : prompt;
+            };
+            const asRole = async (role, prompt) => {
                 const member = resolveRole(task, role, audit?.allowMember);
                 const model = modelFor(models, member);
                 if (!model) throw taskError('task-role-model-unavailable', member.name + ' 的模型当前不可用。');
-                return invoke(model, task, signal, rolePrompt(member, prompt), member.reasoning);
+                return invoke(model, task, signal, rolePrompt(member, await withPrivateMemory(role, member, prompt)), member.reasoning);
             };
             const developmentRecord = (kind, actor, text, phase, ref) =>
                 actor === 'Leader' && remote ? undefined :
                     record(kind, ({ Leader: leader.name, Coder: coder.name, Reviewer: reviewer.name })[actor] ?? actor, text, phase, ref);
             const result = await runTaskDevelopment({ card, path, plan, signal, asRole, runChild,
-                asLeader: (prompt, phase) => asLeader(leaderPrompt(prompt), phase),
+                asLeader: async (prompt, phase) => asLeader(leaderPrompt(remote ? prompt : await withPrivateMemory('leader', leader, prompt)), phase),
                 record: developmentRecord,
                 phase: phase => { task = update(key, { phase }); },
                 handoff: async (label, text, phase) => {
@@ -240,6 +258,26 @@ export function createTaskOrchestration({
                 },
             });
             if (!result) return;
+            const participants = [['coder', coder], ['reviewer', reviewer]];
+            if (!remote) participants.push(['leader', leader]);
+            for (const [role, member] of participants.filter(([, item]) => memory.usesMnemon?.(item.memberId))) {
+                if (role === 'leader') boundLeader(task);
+                else resolveRole(task, role, audit?.allowMember);
+                signal.throwIfAborted();
+                let item;
+                try {
+                    item = await memory.rememberEntry('agent', member.memberId, {
+                        title: '开发验收 · ' + card.title,
+                        content: '角色 ' + role +
+                            '\n验收结论 ' + result.reviewFindings.slice(0, 1200) + '\n补丁 SHA-256 ' + result.digest,
+                        kind: 'episode', importance: 0.72, visibility: 'private',
+                        tags: ['task:' + task.taskId, 'run:' + task.runId],
+                    }, { signal });
+                } catch { signal.throwIfAborted(); }
+                await record('status', member.name,
+                    item ? '本批次的验收经验已写入该 Agent 的 Mnemon 私有记忆。' : '本批次的 Mnemon 私有记忆写入失败。',
+                    'private-memory');
+            }
             const reportId = await output('开发交付报告', reviewer.name, result.report, 'summarizing', 'handoff');
             await record('closed', 'Marshal', '开发审查完成，工单群已归档。', 'completed', reportId);
             update(key, { state: 'done', phase: undefined, reportId, handoffs: [...task.handoffs, reportId],

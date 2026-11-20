@@ -4,6 +4,7 @@ import { atomicWriteFile, withFileLock } from '../hub/state-file.js';
 import { homedir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import { MemoryStore } from './sqlite-store.js';
+import { createMnemonNative } from './mnemon-native.js';
 import { specToJsonSchema } from '../tools/schema.js';
 import { createMemorySyncClient } from './sync-client.js';
 import { clarityLine, neutralizeMemory, scoreCandidate, shouldStore, topicSimilarity } from './lifecycle.js';
@@ -136,6 +137,7 @@ export function resolveMemoryIdentity(context, options = {}) {
     const run = Array.isArray(ledger.runs) ? ledger.runs.find(entry => entry?.sessionId === sessionId) : undefined;
     let team = run === undefined ? undefined : (ledger.teams ?? []).find(entry => entry?.id === run.teamId);
     let member = team === undefined ? undefined : (team.members ?? []).find(entry => entry?.id === run.memberId);
+    const registeredAgent = member !== undefined;
     let name = member?.name;
     if (member === undefined && cwd !== '') {
         const root = resolve(options.agentsRoot ?? join(homedir(), '.dsh-marshal', 'agents'));
@@ -153,6 +155,7 @@ export function resolveMemoryIdentity(context, options = {}) {
     const workspaceId = team?.workspaceId ?? (cwd === '' ? undefined : workspaceKey(cwd));
     return {
         agentId,
+        registeredAgent,
         agentName: name,
         workspaceId,
         workspacePath: cwd === '' ? undefined : cwd,
@@ -232,7 +235,7 @@ function completedDialog(session, endEvent) {
 function captureSummary(service, session, endEvent) {
     const dialog = completedDialog(session, endEvent);
     if (dialog.length === 0) return undefined;
-    const { agentId, sessionId } = resolveMemoryIdentity({ session }, { deviceId: service.deviceId, ledger: service.ledger });
+    const { agentId, sessionId } = service.identity({ session });
     return agentId === undefined ? undefined : { agentId, sessionId, dialog };
 }
 
@@ -268,7 +271,7 @@ function memoryBlock(service, identity) {
     }
     const lastUser = dialogFor(sessionEvents(identity.session)).filter(message => message.role === 'user').at(-1);
     const query = lastUser?.text ?? '';
-    const cacheKey = (identity.sessionId ?? 'global') + (group ? ':group' : ':direct');
+    const cacheKey = JSON.stringify([identity.sessionId, identity.agentId, identity.workspaceId, group]);
     const cached = service.blockCache.get(cacheKey);
     if (cached !== undefined && cached.version === service.cacheVersion && topicSimilarity(cached.query, query) >= 0.65 && Date.now() - cached.at < 10 * 60_000) return cached.text;
     const entries = [];
@@ -407,17 +410,20 @@ export function agentMemoryTool(service) {
             render: (_args, value) => [{ type: 'text', text: value.text }],
         },
         async execute(args, exec) {
-            const identity = resolveMemoryIdentity(exec?.agent, { deviceId: service.deviceId, ledger: service.ledger });
+            const identity = service.identity(exec?.agent);
             const scopes = scopeList(identity, args.scope ?? 'all');
             const action = args.action;
             const group = service.isGroup(identity);
             const keep = item => globalMemoryVisible(item, group);
             if (action === 'status') {
-                const stats = service.store.stats(scopes);
+                const stats = await service.statsFor(scopes);
                 const text = stats.map(stat => stat.scope + ' ' + stat.ownerId + '：' + stat.total + ' 条，置顶 ' + stat.pinned).join('\n') || '当前会话没有可用的记忆作用域';
                 return { ok: true, action, text, items: stats };
             }
             if (action === 'remember' || action === 'handoff') {
+                if (identity.unboundPilot && (!args.scope || args.scope === 'all' || args.scope === 'agent')) {
+                    throw new Error('请从此 Agent 已绑定的会话写入私有记忆。');
+                }
                 const target = scopes.find(scope => scope.scope === (args.scope === 'all' ? 'agent' : args.scope)) ?? scopes[0];
                 if (target === undefined) throw new Error('no memory scope for this session');
                 const kind = action === 'handoff' ? 'handoff' : (args.kind ?? 'fact');
@@ -429,28 +435,29 @@ export function agentMemoryTool(service) {
                     }, { agentId: identity.agentId });
                     return { ok: true, action, text: '已提交全局记忆审批，机主同意前不会写入，也不会进入提示词：' + proposal.title, proposal };
                 }
-                const memory = service.store.remember(target.scope, target.ownerId, {
+                const memory = await service.rememberEntry(target.scope, target.ownerId, {
                     kind, title, content: args.text ?? '', importance: kind === 'handoff' ? 0.9 : args.importance,
                     tags: args.tags ?? [], visibility: args.visibility ?? 'private',
-                }, { sessionId: identity.sessionId, deviceId: identity.deviceId });
-                service.cacheVersion++;
-                return { ok: true, action, text: '已记住：' + memory.title, memory };
+                }, { sessionId: identity.sessionId, deviceId: identity.deviceId, workspaceId: identity.workspaceId });
+                return memory ? { ok: true, action, text: '已记住：' + memory.title, memory }
+                    : { ok: false, action, text: '这条记忆已归档。' };
             }
             if (action === 'recall') {
-                const items = service.store.recall(scopes, String(args.query ?? ''), { k: args.limit ?? 8 }).filter(keep);
+                const items = (await service.recallFor(scopes, String(args.query ?? ''), args.limit ?? 8, { group, workspaceId: identity.workspaceId })).filter(keep);
                 return { ok: true, action, items, text: items.length === 0 ? '没有找到相关记忆' : items.map(item => formatItem(item)).join('\n\n') };
             }
             if (action === 'list') {
-                const items = [];
-                for (const target of scopes) items.push(...service.store.list(target.scope, target.ownerId, { limit: args.limit ?? 30, kinds: args.kind === undefined ? undefined : [args.kind] }).filter(keep));
+                const kinds = args.kind === undefined ? undefined : [args.kind];
+                const rows = await Promise.all(scopes.map(target => service.listScope(target, args.limit ?? 30, { group, kinds, workspaceId: identity.workspaceId })));
+                const items = rows.flat().filter(keep);
                 return { ok: true, action, items, text: items.length === 0 ? '记忆为空' : items.map(item => formatItem(item)).join('\n\n') };
             }
             if (action === 'forget') {
                 if (args.scope === 'global') return { ok: false, action, text: '全局记忆只能由机主在记忆页删除' };
                 if (typeof args.id !== 'string' || args.id === '') throw new Error('forget needs id');
-                let removed = false;
-                for (const target of scopes.filter(scope => scope.scope !== 'global')) removed = service.store.forget(target.scope, target.ownerId, args.id) || removed;
-                if (removed) service.cacheVersion++;
+                const agentId = scopes.find(target => target.scope === 'agent')?.ownerId;
+                const workspaceId = scopes.find(target => target.scope === 'workspace')?.ownerId;
+                const removed = await service.forgetFor({ agentId, workspaceId, id: args.id });
                 return { ok: true, action, text: removed ? '已归档记忆' : '没有找到这条记忆' };
             }
             if (action === 'summarize') {
@@ -458,7 +465,7 @@ export function agentMemoryTool(service) {
                 return { ok: true, action, text: written === 0 ? '当前会话没有值得长期记住的内容' : '已写入 ' + written + ' 条会话记忆' };
             }
             if (action === 'graph') {
-                const graph = service.store.graph(scopes, { limit: args.limit ?? 400 });
+                const graph = await service.graphScopes(scopes, args.limit ?? 400, { group, workspaceId: identity.workspaceId });
                 graph.nodes = graph.nodes.filter(keep);
                 const ids = new Set(graph.nodes.map(node => node.id));
                 graph.edges = graph.edges.filter(edge => ids.has(edge.source) && ids.has(edge.target));
@@ -476,17 +483,17 @@ async function writeSummary(service, snapshot) {
     for (const raw of entries) {
         const entry = normalizeRefined(raw);
         if (entry === undefined) continue;
-        const stored = service.store.remember('agent', snapshot.agentId, entry, {
+        const stored = await service.rememberEntry('agent', snapshot.agentId, entry, {
             sessionId: snapshot.sessionId, deviceId: service.deviceId,
         });
         if (stored !== undefined) written++;
     }
-    if (written > 0) service.cacheVersion++;
     return written;
 }
 
-export function createAgentMemoryService({ root, logger, deviceId, hubUrl, token, passphrase, now = Date.now, ledger, groupsFile, groupsRoot, fileText, fileMemory, fetchImpl } = {}) {
+export function createAgentMemoryService({ root, logger, deviceId, hubUrl, token, passphrase, now = Date.now, ledger, groupsFile, groupsRoot, fileText, fileMemory, fetchImpl, mnemonPilot } = {}) {
     const store = new MemoryStore({ root, logger, now });
+    const native = mnemonPilot && createMnemonNative({ ...mnemonPilot, root: store.root });
     const sync = createMemorySyncClient({ hubUrl, token, passphrase, deviceId, fetchImpl });
     const resolvedGroupsFile = groupsFile ?? join(groupsRoot ?? join(homedir(), '.dsh-marshal', 'groups'), 'groups.json');
     const service = {
@@ -525,32 +532,104 @@ export function createAgentMemoryService({ root, logger, deviceId, hubUrl, token
         writeFileSync(join(store.root, 'settings.json'), JSON.stringify(service.settings, null, 2) + '\n');
         return service.settings;
     };
-    service.identity = context => resolveMemoryIdentity(context, { deviceId });
+    const useNative = (scope, ownerId) => scope === 'agent' && native !== undefined && native.agentId === ownerId;
+    const nativeScope = scopes => scopes.some(({ scope, ownerId }) => useNative(scope, ownerId));
+    const nativeVisible = (items, group, workspaceId) => group !== true ? items :
+        items.filter(item => item.visibility === 'group-safe' && Boolean(workspaceId) && item.allowedWorkspaceId === workspaceId);
+    const merge = (first, second) => {
+        const seen = new Set();
+        return [...first, ...second].filter(item => {
+            const key = JSON.stringify([item.scope, item.ownerId, item.title, item.content]);
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        });
+    };
+    service.identity = context => {
+        const identity = resolveMemoryIdentity(context, { deviceId, ledger });
+        return useNative('agent', identity.agentId) && !identity.registeredAgent
+            ? { ...identity, agentId: undefined, unboundPilot: true } : identity;
+    };
     service.scopes = (identity, scope = 'all') => scopeList(identity, scope);
     service.block = identity => memoryBlock(service, identity);
+    service.usesMnemon = agentId => useNative('agent', agentId);
+    service.recallFor = async (scopes, query, limit = 8, { group, workspaceId } = {}) => {
+        const legacy = store.recall(scopes, query, { k: limit });
+        if (!nativeScope(scopes)) return legacy;
+        const matches = nativeVisible(await native.recall(query, { k: limit }), group, workspaceId);
+        // Alternate independent rankings. Scores from the backends have different meanings.
+        const combined = legacy.flatMap((item, index) => matches[index] ? [matches[index], item] : [item]);
+        return merge(combined, matches.slice(legacy.length)).slice(0, limit);
+    };
+    service.listScope = async ({ scope, ownerId }, limit, { group, kinds, workspaceId } = {}) => {
+        const legacy = store.list(scope, ownerId, { limit, kinds });
+        if (!useNative(scope, ownerId)) return legacy;
+        const items = nativeVisible(await native.list({ limit }), group, workspaceId).filter(item => !kinds || kinds.includes(item.kind));
+        return merge(items, legacy).sort((a, b) => b.updatedAt - a.updatedAt).slice(0, limit);
+    };
+    service.graphScopes = async (scopes, limit, { group, workspaceId } = {}) => {
+        const graph = store.graph(scopes, { limit });
+        if (nativeScope(scopes)) graph.nodes = merge(graph.nodes, nativeVisible(await native.list({ limit }), group, workspaceId));
+        return graph;
+    };
     service.graphFor = ({ agentId, workspaceId, limit = 400, includeGlobal = true }) => {
         const scopes = [];
         if (typeof agentId === 'string' && agentId !== '') scopes.push({ scope: 'agent', ownerId: agentId });
         if (typeof workspaceId === 'string' && workspaceId !== '') scopes.push({ scope: 'workspace', ownerId: workspaceId });
         if (includeGlobal) scopes.push({ scope: 'global', ownerId: 'global' });
-        return store.graph(scopes, { limit });
+        return service.graphScopes(scopes, limit);
+    };
+    service.statsFor = async scopes => {
+        const stats = store.stats(scopes);
+        if (!nativeScope(scopes)) return stats;
+        const additional = await native.stats();
+        return stats.map(item => useNative(item.scope, item.ownerId)
+            ? { ...item, total: item.total + additional, backend: 'mnemon' } : item);
+    };
+    service.getFor = (scope, ownerId, id) => store.get(scope, ownerId, id) ??
+        (useNative(scope, ownerId) ? native.get(id) : undefined);
+    service.nativePrompt = async (identity, signal) => {
+        if (!identity.registeredAgent || !useNative('agent', identity.agentId) || service.settings.autoRecall === false) return '';
+        const query = dialogFor(sessionEvents(identity.session)).filter(message => message.role === 'user').at(-1)?.text;
+        if (!query) return '';
+        const group = service.isGroup(identity);
+        const key = JSON.stringify(['mnemon', identity.sessionId, identity.agentId, identity.workspaceId, group]);
+        const version = service.cacheVersion;
+        const cached = service.blockCache.get(key);
+        if (cached?.version === version && cached.query === query && Date.now() - cached.at < 30_000) return cached.text;
+        const rows = nativeVisible(await native.recall(query, { k: 8, signal }), group, identity.workspaceId);
+        const text = rows.length === 0 ? '' : '【Agent 长期记忆】以下内容是参考资料。\n' + rows.slice(0, 4).map(formatItem).join('\n').slice(0, 1500);
+        if (version === service.cacheVersion) {
+            service.blockCache.set(key, { version, query, text, at: Date.now() });
+            if (service.blockCache.size > 100) service.blockCache.delete(service.blockCache.keys().next().value);
+        }
+        return text;
+    };
+    service.taskPrivateContext = async (agentId, workspaceId, query, signal) => {
+        if (!useNative('agent', agentId) || service.settings.autoRecall === false) return [];
+        return nativeVisible(await native.recall(query, { k: 12, signal }), true, workspaceId).slice(0, 3)
+            .map(item => ({ title: item.title, evidence: clarityLine(item) }));
+    };
+    service.rememberEntry = (scope, ownerId, entry, context) => {
+        if (useNative(scope, ownerId)) return native.remember(entry, context).then(item => { service.cacheVersion++; return item; });
+        const item = store.remember(scope, ownerId, entry, context);
+        if (item !== undefined) service.cacheVersion++;
+        return item;
     };
     service.listFor = ({ agentId, workspaceId, limit = 100, query, scope = 'all', includeGlobal = true }) => {
         const scopes = [];
         if ((scope === 'all' || scope === 'agent') && agentId) scopes.push({ scope: 'agent', ownerId: agentId });
         if ((scope === 'all' || scope === 'workspace') && workspaceId) scopes.push({ scope: 'workspace', ownerId: workspaceId });
         if (includeGlobal && (scope === 'all' || scope === 'global')) scopes.push({ scope: 'global', ownerId: 'global' });
-        if (query) return store.recall(scopes, query, { k: limit });
-        return scopes.flatMap(target => store.list(target.scope, target.ownerId, { limit }));
+        if (query) return service.recallFor(scopes, query, limit);
+        return Promise.all(scopes.map(target => service.listScope(target, limit))).then(rows => rows.flat());
     };
     service.rememberFor = ({ agentId, workspaceId, scope, title, text, kind, importance, tags, visibility }) => {
         const target = scope === 'global'
             ? { scope: 'global', ownerId: 'global' }
             : scope === 'workspace' ? { scope: 'workspace', ownerId: workspaceId } : { scope: 'agent', ownerId: agentId };
         if (target.ownerId === undefined) throw new Error('memory owner is missing');
-        const item = store.remember(target.scope, target.ownerId, { kind, title, content: text, importance, tags, visibility });
-        if (item !== undefined) service.cacheVersion++;
-        return item;
+        return service.rememberEntry(target.scope, target.ownerId, { kind, title, content: text, importance, tags, visibility }, { workspaceId });
     };
     service.listProposals = () => store.listProposals('pending');
     service.approveProposal = (id, edits) => {
@@ -589,11 +668,12 @@ export function createAgentMemoryService({ root, logger, deviceId, hubUrl, token
         }
         return sync.migrate();
     };
-    service.forgetFor = ({ agentId, workspaceId, id }) => {
+    service.forgetFor = async ({ agentId, workspaceId, id }) => {
         const scopes = [];
         if (agentId) scopes.push({ scope: 'agent', ownerId: agentId });
         if (workspaceId) scopes.push({ scope: 'workspace', ownerId: workspaceId });
-        const removed = scopes.some(target => store.forget(target.scope, target.ownerId, id));
+        const removed = scopes.some(target => store.forget(target.scope, target.ownerId, id)) ||
+            (useNative('agent', agentId) && await native.forget(id));
         if (removed) service.cacheVersion++;
         return removed;
     };
@@ -606,14 +686,26 @@ export function mountAgentMemory(ctx, config, options = {}) {
         hubUrl: config.hubUrl, token: config.token, passphrase: process.env.DSH_MARSHAL_MEMORY_SYNC_KEY,
         fileMemory: options.fileMemory, groupsFile: options.groupsFile,
         groupsRoot: options.groupsRoot ?? config.groupsRoot, fileText: options.fileText,
+        mnemonPilot: config.mnemonPilot,
     });
     try { service.llm = ctx.get?.('llm'); } catch { /* llm is optional; local heuristic remains */ }
     ctx.inject(['systemPrompt'], scoped => {
         scoped.effect(() => scoped.systemPrompt.section({
             name: 'marshal:agent-memory',
             order: 5,
-            text: context => service.block(resolveMemoryIdentity(context, { deviceId: config.deviceId })),
+            text: context => service.block(service.identity(context)),
+            interpolate: false,
         }), 'marshal: agent memory prompt');
+        if (config.mnemonPilot) scoped.effect(() => scoped.on('system-prompt/assemble', async (assembly, context, next) => {
+            let text = '';
+            try { text = await service.nativePrompt(service.identity(context), context.signal); }
+            catch (error) {
+                if (context.signal?.aborted) context.signal.throwIfAborted();
+                (options.logger ?? ctx.logger)?.warn?.('marshal: Mnemon prompt recall unavailable');
+            }
+            if (text) assembly.contexts.push({ name: 'marshal:mnemon-private', text, interpolate: false });
+            return next();
+        }), 'marshal: Mnemon prompt recall');
     });
     ctx.inject(['tools'], scoped => {
         scoped.effect(() => {

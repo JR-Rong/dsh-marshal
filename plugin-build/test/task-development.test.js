@@ -45,8 +45,12 @@ test('map the five workflows to editable group roles and scope Codex defaults to
     assert.throws(() => taskPlan({ raw: { templateId: 'development', members: { reviewer: 'foreign/agent' } }, task, candidates }), { code: 'invalid-task-assignee' });
 });
 
-for (const reviewerDelegates of [true, false]) {
-    test('run an isolated development ticket with reviewer delegation ' + reviewerDelegates, async t => {
+const nativeExecutable = process.env.MARSHAL_TEST_MNEMON;
+for (const run of [{ reviewerDelegates: true }, { reviewerDelegates: false }, { reviewerDelegates: true, pilot: true }]) {
+    const { reviewerDelegates, pilot } = run;
+    test('run an isolated development ticket with ' + (pilot ? 'private Mnemon memory' : 'reviewer delegation ' + reviewerDelegates), {
+        skip: pilot && !nativeExecutable && 'set MARSHAL_TEST_MNEMON to a native Mnemon executable',
+    }, async t => {
         const root = mkdtempSync(join(tmpdir(), 'marshal-development-evidence-'));
         const repo = join(root, 'source');
         mkdirSync(repo);
@@ -58,7 +62,9 @@ for (const reviewerDelegates of [true, false]) {
         git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'baseline']);
         writeFileSync(join(repo, 'note.txt'), 'another change in the original tree\n');
 
-        const memory = createAgentMemoryService({ root: join(root, 'memory') });
+        const memory = createAgentMemoryService({ root: join(root, 'memory'),
+            ...(pilot ? { mnemonPilot: { agentId: 'coder', executable: nativeExecutable } } : {}),
+        });
         const rooms = createTaskRooms({ store: createTaskRoomStore(join(root, 'groups.sqlite')), deviceId: 'device' });
         const calls = [];
         let reviewed = false;
@@ -84,7 +90,14 @@ for (const reviewerDelegates of [true, false]) {
                     return 'Read-only Codex found no regression';
                 }
                 if (prompt.includes('设计和拆分')) return 'Fix addition and verify the new file.';
-                if (prompt.includes('你是 Coder')) return JSON.stringify({ action: 'codex', instruction: 'Fix addition and create the new file.' });
+                if (prompt.includes('你是 Coder')) {
+                    if (pilot) {
+                        assert.match(prompt, /工作区授权的数据/);
+                        assert.doesNotMatch(prompt, /绝对私有的哨兵/);
+                    }
+                    return JSON.stringify({ action: 'codex', instruction: 'Fix addition and create the new file.' });
+                }
+                assert.doesNotMatch(prompt, /工作区授权的数据|绝对私有的哨兵/);
                 assert.match(prompt, /Backup reviewer/);
                 if (prompt.includes('字段 action')) return JSON.stringify({ action: reviewerDelegates ? 'codex' : 'continue', instruction: 'Check the return value.' });
                 if (reviewerDelegates) assert.ok(reviewed);
@@ -100,6 +113,11 @@ for (const reviewerDelegates of [true, false]) {
         });
         t.after(() => { flow.dispose(); rooms.close(); memory.store.close(); rmSync(root, { recursive: true, force: true }); });
         const card = { id: 'ticket', title: 'Fix addition' };
+        if (pilot) {
+            await memory.rememberFor({ scope: 'agent', agentId: 'coder', workspaceId: 'fixture-workspace',
+                title: 'Fix addition', text: '工作区授权的数据。', visibility: 'group-safe' });
+            await memory.rememberFor({ scope: 'agent', agentId: 'coder', title: 'Fix addition', text: '绝对私有的哨兵。' });
+        }
         const proposed = await flow.recommend(selected, card, () => true);
         assert.deepEqual(proposed.plan.members, { coder: 'team/coder', reviewer: 'team/reviewer' });
         flow.attach('host', card.id, flow.prepare({ ...selected, plan: {
@@ -134,6 +152,17 @@ for (const reviewerDelegates of [true, false]) {
         assert.ok(handoffs.some(row => row.content.includes(patch.ref)));
         assert.ok(records.some(row => row.phase === 'dev-reviewing' && handoffs.some(item => item.id === row.ref)));
         assert.equal(memory.store.list('agent', 'lead').length, 0);
+        if (pilot) {
+            const receipts = records.filter(row => row.phase === 'private-memory');
+            assert.equal(receipts.length, 2);
+            assert.match(receipts[0].text, /1 条/);
+            assert.match(receipts[1].text, /已写入/);
+            assert.ok(receipts.every(row => row.runId === state.runId));
+            assert.doesNotMatch(JSON.stringify(records), /工作区授权的数据|绝对私有的哨兵/);
+            assert.ok((await memory.listFor({ agentId: 'coder', scope: 'agent' }))
+                .some(item => item.backend === 'mnemon' && item.tags.includes('run:' + state.runId)));
+            assert.deepEqual(await memory.listFor({ agentId: 'reviewer', scope: 'agent' }), []);
+        }
         assert.equal((await rooms.page(room.id, { limit: 1 })).room.closed, true);
     });
 }

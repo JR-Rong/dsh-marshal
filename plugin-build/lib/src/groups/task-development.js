@@ -141,6 +141,7 @@ export async function runTaskDevelopment({
             }
             return {
                 base, digest,
+                reviewFindings: verdict.findings,
                 report: '## 开发交付\n\n基准提交 ' + base + '\n补丁 SHA-256 ' + digest +
                     '\n\n### Reviewer 验收结论\n\n' + verdict.findings +
                     '\n\n完整补丁和执行证据已保存在本工单群的当前批次。',

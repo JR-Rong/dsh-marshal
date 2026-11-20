@@ -39,8 +39,8 @@ function unavailable(res) {
 /**
  * Local /marshal/memory/* routes.
  * Every read and write is bound to the session created for the desktop owner.
- * Global approval and direct global edits are owner-only. CSRF matches the
- * hub rule: the header, the cookie, and the server session secret must all match.
+ * Global approval and direct global edits are owner-only. Browser writes check
+ * the CSRF cookie and header. The native DSH proxy uses proof headers instead.
  */
 export function createMemoryRoutes({ memory, auth, allowedOrigins } = {}) {
     const origins = () => typeof allowedOrigins === 'function' ? allowedOrigins() : allowedOrigins;
@@ -73,7 +73,10 @@ export function createMemoryRoutes({ memory, auth, allowedOrigins } = {}) {
                 if (auth === undefined) { unavailable(res); return; }
                 const opened = await auth.open(req, origins());
                 if (!opened.ok) { write(res, opened.status, { ok: false, code: opened.code }); return; }
-                write(res, 200, { ok: true, owner: opened.session.owner === true }, opened.cookies);
+                const session = opened.session;
+                write(res, 200, { ok: true, owner: session.owner === true,
+                    ...(session.desktop ? { sessionToken: session.id, csrf: session.csrf } : {}),
+                }, opened.cookies);
             },
         },
         {
@@ -193,20 +196,20 @@ export function createMemoryRoutes({ memory, auth, allowedOrigins } = {}) {
         },
         {
             method: 'GET', path: '/marshal/memory/graph',
-            handler: guard(false, (_req, res, { session, requested, url }) => {
-                const graph = memory.graphFor({
+            handler: guard(false, async (_req, res, { session, requested, url }) => {
+                const graph = await memory.graphFor({
                     agentId: requested.agentId,
                     workspaceId: requested.workspaceId,
                     includeGlobal: session.owner === true,
                     limit: Math.max(1, Math.min(600, Number(url.get('limit')) || 400)),
                 });
-                write(res, 200, { ok: true, graph });
+                write(res, 200, { ok: true, graph, ...(memory.usesMnemon?.(requested.agentId) ? { privateBackend: 'mnemon' } : {}) });
             }, { target: true }),
         },
         {
             method: 'GET', path: '/marshal/memory/list',
-            handler: guard(false, (_req, res, { session, requested, url }) => {
-                const items = memory.listFor({
+            handler: guard(false, async (_req, res, { session, requested, url }) => {
+                const items = await memory.listFor({
                     agentId: requested.agentId,
                     workspaceId: requested.workspaceId,
                     scope: requested.scope ?? 'all',
@@ -219,20 +222,20 @@ export function createMemoryRoutes({ memory, auth, allowedOrigins } = {}) {
         },
         {
             method: 'GET', path: '/marshal/memory/get',
-            handler: guard(false, (_req, res, { requested, url }) => {
+            handler: guard(false, async (_req, res, { requested, url }) => {
                 const scope = requested.scope === 'workspace' ? 'workspace' : requested.scope === 'global' ? 'global' : 'agent';
                 const ownerId = scope === 'workspace' ? requested.workspaceId : scope === 'global' ? 'global' : requested.agentId;
                 if (ownerId === undefined) { write(res, 400, { ok: false, code: 'invalid-owner' }); return; }
-                const item = memory.store.get(scope, ownerId, url.get('id') ?? '');
+                const item = await memory.getFor(scope, ownerId, url.get('id') ?? '');
                 if (item === undefined) { write(res, 404, { ok: false, code: 'not-found' }); return; }
                 write(res, 200, { ok: true, item });
             }, { target: true }),
         },
         {
             method: 'POST', path: '/marshal/memory/remember',
-            handler: guard(true, (_req, res, { body, requested }) => {
+            handler: guard(true, async (_req, res, { body, requested }) => {
                 if (body.scope === 'global') { write(res, 403, { ok: false, code: 'owner-only' }); return; }
-                const item = memory.rememberFor({
+                const item = await memory.rememberFor({
                     agentId: requested.agentId,
                     workspaceId: requested.workspaceId,
                     scope: body.scope === 'workspace' ? 'workspace' : 'agent',
@@ -248,9 +251,9 @@ export function createMemoryRoutes({ memory, auth, allowedOrigins } = {}) {
         },
         {
             method: 'POST', path: '/marshal/memory/forget',
-            handler: guard(true, (_req, res, { body, requested }) => {
+            handler: guard(true, async (_req, res, { body, requested }) => {
                 if (body.scope === 'global') { write(res, 403, { ok: false, code: 'owner-only' }); return; }
-                const removed = memory.forgetFor({
+                const removed = await memory.forgetFor({
                     agentId: requested.agentId,
                     workspaceId: requested.workspaceId,
                     id: typeof body.id === 'string' ? body.id : '',
@@ -260,12 +263,12 @@ export function createMemoryRoutes({ memory, auth, allowedOrigins } = {}) {
         },
         {
             method: 'GET', path: '/marshal/memory/status',
-            handler: guard(false, (_req, res, { session, requested }) => {
+            handler: guard(false, async (_req, res, { session, requested }) => {
                 const scopes = [];
                 if (requested.agentId) scopes.push({ scope: 'agent', ownerId: requested.agentId });
                 if (requested.workspaceId) scopes.push({ scope: 'workspace', ownerId: requested.workspaceId });
                 if (session.owner === true) scopes.push({ scope: 'global', ownerId: 'global' });
-                write(res, 200, { ok: true, stats: memory.store.stats(scopes) });
+                write(res, 200, { ok: true, stats: await memory.statsFor(scopes) });
             }, { target: true }),
         },
     ];
