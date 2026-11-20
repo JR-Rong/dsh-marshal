@@ -90,6 +90,24 @@ export function createFakeBoard(options = {}) {
                     sessionId: options.sessionId ?? 'session-1',
                 }];
             }
+            else if (action.kind === 'move') {
+                const task = find(action.taskId);
+                if (task === undefined) throw new Error('task not found');
+                if (task.executions.some(execution => execution.endedAt === undefined && execution.result === undefined)) {
+                    throw new Error('execution still open');
+                }
+                task.status = action.status;
+                task.updatedAt = 3;
+            }
+            else if (action.kind === 'settle') {
+                const task = find(action.taskId);
+                if (task === undefined) throw new Error('task not found');
+                const execution = task.executions[task.executions.length - 1];
+                if (execution === undefined || execution.endedAt !== undefined) throw new Error('no open execution');
+                execution.endedAt = 20;
+                execution.result = 'cancelled';
+                task.status = 'todo';
+            }
             notify();
             return snapshot();
         },
@@ -124,7 +142,7 @@ export function createFakeBoard(options = {}) {
             execution.result = outcome;
             if (details.error !== undefined) execution.error = details.error;
             if (details.summary !== undefined) execution.summary = { text: details.summary, seq: 7 };
-            task.status = outcome === 'succeeded' ? 'done' : 'failed';
+            task.status = outcome === 'succeeded' ? 'done' : outcome === 'cancelled' ? 'todo' : 'failed';
             notify();
             return execution;
         },
@@ -134,6 +152,35 @@ export function createFakeBoard(options = {}) {
         tick() { notify(); },
     };
     return board;
+}
+
+export function createFakeWorkflow(options = {}) {
+    const targets = new Map(Object.entries(options.targets ?? {
+        'task-1': { state: options.state ?? 'ready', leaderName: '丞相', agentId: 'member-2', workspaceId: 'ws-1', templateId: 'development' },
+    }));
+    const starts = [];
+    const notes = [];
+    const begins = [];
+    return {
+        starts,
+        notes,
+        begins,
+        target(taskId) { return targets.get(taskId); },
+        view(taskId) { return targets.get(taskId); },
+        setState(taskId, state) {
+            const current = targets.get(taskId);
+            if (current !== undefined) targets.set(taskId, { ...current, state });
+        },
+        async begin(taskId, runId, text) { begins.push({ taskId, runId, text }); },
+        async note(taskId, event) { notes.push({ taskId, event }); },
+        start(taskId, card, settings) {
+            starts.push({ taskId, card, settings });
+            const current = targets.get(taskId);
+            if (current !== undefined) targets.set(taskId, { ...current, state: 'running' });
+            return { ok: true, started: true, state: 'running' };
+        },
+        async move(taskId, status) { const task = targets.get(taskId); if (task !== undefined) targets.set(taskId, { ...task, state: status }); return true; },
+    };
 }
 
 export function createFakeMemory(items = []) {

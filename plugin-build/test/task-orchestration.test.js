@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -31,6 +32,7 @@ function fixture(t, options = {}) {
         readPr: async url => ({ url, base, head, diff: 'PINNED_DIFF', omitted: [] }),
         port: { catalog: async () => [dsh, codex], dispose() {}, run: options.run },
         startLeader: options.startLeader,
+        onState: options.onState,
     };
     const orchestration = createTaskOrchestration(args);
     const board = createLocalBoard(join(root, 'tasks.json'));
@@ -48,7 +50,7 @@ function fixture(t, options = {}) {
         assert.equal(view.state, expected, view.error);
         return view;
     };
-    return { orchestration, create, complete, memory, team, args };
+    return { orchestration, create, complete, memory, team, args, board };
 }
 
 test('pins both providers to immutable revisions and bounds what reaches the reviewers', async () => {
@@ -115,6 +117,22 @@ test('runs independent reviews, reads peer handoffs from Workspace, and retains 
     const reloaded = createTaskOrchestration(f.args);
     assert.equal(reloaded.view('local', card.id).state, 'done');
     assert.equal(reloaded.report('local', card.id), '## Verified review report');
+});
+
+test('a workflow reports running and review to the card owner', async t => {
+    const states = [];
+    const f = fixture(t, {
+        run: async model => model.agent + '-output',
+        onState: async (source, taskId, status) => { states.push({ source, taskId, status }); },
+    });
+    const card = await f.create({ choice: 'template', templateId: 'pr-review', prUrl: pr });
+    f.orchestration.start('local', card);
+    f.orchestration.start('local', card);
+    await f.complete(card, 'done');
+    assert.deepEqual(states, [
+        { source: 'local', taskId: card.id, status: 'running' },
+        { source: 'local', taskId: card.id, status: 'review' },
+    ]);
 });
 
 test('supports five templates, Leader selection, and opting out through the bound Agent session', async t => {
@@ -210,6 +228,7 @@ test('desktop board routes enforce workspace authorization and launch the select
         else process.env.DSH_HOME = prevHome;
         rmSync(root, { recursive: true, force: true });
     });
+    const runtime = {};
     mountGroups({
         get(name) {
             if (name === 'deepseekAccount') return {
@@ -239,7 +258,7 @@ test('desktop board routes enforce workspace authorization and launch the select
             }
         },
         effect: setup => disposers.push(setup()),
-    }, { groupsRoot: join(root, 'groups'), memoryRoot: join(root, 'memory'), agents: ['dsh'], deviceId: 'desktop' }, { memory });
+    }, { groupsRoot: join(root, 'groups'), memoryRoot: join(root, 'memory'), agents: ['dsh'], deviceId: 'desktop' }, { memory, runtime });
 
     const request = async (path, body, headers = {}) => {
         const req = Object.assign(Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body))]), {
@@ -301,5 +320,19 @@ test('desktop board routes enforce workspace authorization and launch the select
     assert.deepEqual(runs.map(item => item.phase), ['start', 'reassign']);
     assert.notEqual(runs[0].runId, runs[1].runId);
     assert.deepEqual(relayAssignments, ['leader', 'backup']);
+    // The workflow runtime is the seam the superagent bridge uses: starting a
+    // preset card through it must run the workflow AND move the board column.
+    const second = await request('/marshal/tasks/create', { title: '直连编排', orchestration: { leaderId, choice: 'none' } }, headers);
+    assert.equal(second.code, 200, JSON.stringify(second.data));
+    const secondCard = second.data.tasks[0];
+    const secondId = secondCard.id;
+    const secondRoomId = secondCard.taskRoom.id;
+    await runtime.begin(secondId, randomUUID(), '超级智能体按预设编排派单。');
+    const started = runtime.start(secondId, hostBoard.snapshot().tasks.find(item => item.id === secondId), { reason: 'auto-dispatch', skipBegin: true });
+    assert.equal(started.ok, true);
+    for (let i = 0; i < 20 && hostBoard.snapshot().tasks.find(item => item.id === secondId).status !== 'running'; i++) await setImmediate();
+    assert.equal(hostBoard.snapshot().tasks.find(item => item.id === secondId).status, 'running');
+    const secondPage = await request('/marshal/task-rooms/page?roomId=' + secondRoomId + '&workspaceId=workspace-a', undefined, headers);
+    assert.equal(secondPage.data.records.filter(item => item.kind === 'batch').length, 1, 'one dispatch opens one room batch');
     assert.equal((await request('/marshal/tasks/delete', { taskId: task.id }, headers)).data.code, 'task-room-archive');
 });

@@ -1306,6 +1306,28 @@ export function mountGroups(ctx, config, options = {}) {
     const rosters = createWorkspaceRosters(join(root, 'workspace-rosters.json'));
     const ticketNumbers = createTicketNumbers(join(root, 'ticket-numbers.json'));
     const sessionTitles = createSessionTitles(join(root, 'session-titles.json'));
+    const boardSourceOf = () => taskBoard === undefined ? 'local' : 'host';
+    // A workflow owns its card's execution, so it also owns the card's column.
+    // Writing the column here keeps the desktop board, the mobile node and the
+    // task tool in step instead of letting the view derive a status the ledger
+    // never received.
+    const moveCardStatus = async (source, taskId, status) => {
+        if (source !== boardSourceOf()) return false;
+        const board = getBoard();
+        if (board === undefined) return false;
+        let task;
+        try { task = (board.snapshot().tasks ?? []).find(item => item.id === taskId); }
+        catch { return false; }
+        if (!task || task.status === status) return false;
+        try {
+            await board.apply(randomUUID(), { kind: 'move', taskId, status }, `marshal:${config.deviceId}`);
+            return true;
+        }
+        catch (error) {
+            options.logger?.warn?.('marshal: task board move to ' + status + ' refused: ' + (error instanceof Error ? error.message : String(error)));
+            return false;
+        }
+    };
     let orchestration;
     try {
         orchestration = createTaskOrchestration({
@@ -1313,6 +1335,7 @@ export function mountGroups(ctx, config, options = {}) {
             port: createDiscussionPort({ agents: config.agents, llm, codexExecutable: config.codexExecutable }),
             defaultModel: readDefaultModel, logger: options.logger, workspacePath: agents.workspace,
             leaderAutoReview: true,
+            onState: moveCardStatus,
             onPermissionBlocked: async (_source, taskId) => {
                 const board = getBoard();
                 if (!board) return;
@@ -1330,6 +1353,51 @@ export function mountGroups(ctx, config, options = {}) {
         });
     }
     catch { options.logger?.warn?.('marshal: task orchestration unavailable'); }
+    // The superagent bridge wakes a card; when the card carries a preset
+    // workflow, the bridge must start that workflow instead of opening a plain
+    // board run. This runtime is the narrow seam between the two subsystems.
+    const runtime = options.runtime;
+    if (runtime !== undefined && runtime !== null && typeof runtime === 'object') {
+        Object.assign(runtime, {
+            available: () => orchestration !== undefined && rooms !== undefined,
+            source: boardSourceOf,
+            target: taskId => orchestration?.target(boardSourceOf(), taskId),
+            view(taskId) {
+                const source = boardSourceOf();
+                return orchestration?.target(source, taskId) === undefined ? undefined : orchestration.view(source, taskId);
+            },
+            async begin(taskId, runId, text) {
+                const room = rooms?.find(boardSourceOf(), taskId);
+                if (!room || room.closed) return undefined;
+                try { return await rooms.begin(room.id, runId, 'Marshal', 'auto-dispatch', text); }
+                catch { return undefined; }
+            },
+            async note(taskId, event) {
+                const room = rooms?.find(boardSourceOf(), taskId);
+                if (!room || room.closed) return undefined;
+                try { return await rooms.append(room.id, event); }
+                catch (error) {
+                    options.logger?.warn?.('marshal: task room message write failed: ' + (error instanceof Error ? error.message : String(error)));
+                    return undefined;
+                }
+            },
+            start(taskId, card, settings = {}) {
+                const source = boardSourceOf();
+                if (!orchestration) return { ok: false, code: 'orchestration-unavailable' };
+                if (orchestration.target(source, taskId) === undefined) return { ok: false, code: 'no-workflow' };
+                const room = rooms?.find(source, taskId);
+                const audit = room ? taskRoomAudit(rooms, room, settings.reason ?? 'auto-dispatch', undefined, undefined, () => true) : undefined;
+                // The caller may already have opened the room batch (the superagent
+                // posts its dispatch note through `begin` first); skip the second
+                // batch so one dispatch produces exactly one ticket-group run.
+                if (audit && settings.skipBegin === true) audit.begin = async () => {};
+                const started = orchestration.start(source, card, audit);
+                return { ok: true, started, state: orchestration.view(source, taskId)?.state };
+            },
+            move: moveCardStatus,
+            ticketNo: taskId => ticketNumbers?.ensure?.(taskId),
+        });
+    }
     if (typeof ctx.effect === 'function') ctx.effect(() => () => {
         orchestration?.dispose();
         rooms?.close();

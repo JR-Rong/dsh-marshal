@@ -449,6 +449,9 @@ function applyNode(ctx, config) {
             ctx.logger.warn(`marshal: dispatch unavailable: ${errorName(error)}`);
         }
     }
+    // Shared seam between the group workflow service and the superagent bridge:
+    // the bridge can only honour a card's preset orchestration if it can see it.
+    const groupsRuntime = {};
     if (config.groups) {
         try {
             ctx.inject(['systemPrompt', 'typertGateway', 'webServer'], (scoped) => {
@@ -487,7 +490,7 @@ function applyNode(ctx, config) {
             ctx.logger.warn(`marshal: embedded task-board inject skipped: ${errorName(error)}`);
         }
         try {
-            mountGroups(ctx, config, { logger: ctx.logger, memory: agentMemoryService });
+            mountGroups(ctx, config, { logger: ctx.logger, memory: agentMemoryService, runtime: groupsRuntime });
         }
         catch (error) {
             ctx.logger.warn(`marshal: groups unavailable: ${errorName(error)}`);
@@ -500,7 +503,7 @@ function applyNode(ctx, config) {
         }
     }
     try {
-        mountSuperagent(ctx, config, { logger: ctx.logger, memory: agentMemoryService });
+        mountSuperagent(ctx, config, { logger: ctx.logger, memory: agentMemoryService, workflow: groupsRuntime });
     }
     catch (error) {
         ctx.logger.warn(`marshal: superagent unavailable: ${errorName(error)}`);

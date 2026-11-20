@@ -72,7 +72,7 @@ function chooseTemplate(reply, enabled) {
 
 export function createTaskOrchestration({
     file, inventory, memory, port, defaultModel, startLeader, workspacePath, readPr = readPullRequest, logger,
-    leaderAutoReview = false, onPermissionBlocked,
+    leaderAutoReview = false, onPermissionBlocked, onState,
 }) {
     const tasks = load(file);
     const active = new Map();
@@ -116,6 +116,15 @@ export function createTaskOrchestration({
         const leader = scopeCandidates(task.workspaceId).find(item => item.id === task.leaderId);
         if (!leader) throw taskError('leader-unbound', 'Leader 已移除或更换工作区。请改派给该工作区中的 Agent。');
         return leader;
+    };
+    // The board column is the shared source of truth for every surface (desktop
+    // board, mobile node, task tool). A workflow owns the card's execution, so
+    // it must also carry the card through running -> review/failed instead of
+    // letting the column stay at whatever it was before the first run.
+    const notifyState = async (task, status) => {
+        if (typeof onState !== 'function') return;
+        try { await onState(task.source, task.taskId, status); }
+        catch { logger?.warn?.('marshal: task board status write failed for ' + task.taskId); }
     };
     const publish = async (task, label, text, kind = 'episode') => {
         boundLeader(task);
@@ -332,6 +341,7 @@ export function createTaskOrchestration({
             await record('closed', 'Marshal', '开发审查完成，工单群已归档。', 'completed', reportId);
             update(key, { state: 'done', phase: undefined, reportId, handoffs: [...task.handoffs, reportId],
                 development: { base: result.base, digest: result.digest } });
+            await notifyState(task, 'review');
             return;
         }
         if (selected !== 'pr-review') {
@@ -400,6 +410,7 @@ export function createTaskOrchestration({
         const reportId = await output('PR 审查报告', leader.name, report, 'summarizing', 'handoff', Boolean(remote));
         await record('closed', 'Marshal', '审查完成，工单群已归档。', 'completed', reportId);
         update(key, { state: 'done', phase: undefined, reportId, handoffs: [...ids, reportId] });
+        await notifyState(task, 'review');
     };
     function rolePrompt(member, prompt) {
         return '本阶段负责人 ' + JSON.stringify(member.name) + '。角色简报 '
@@ -524,6 +535,7 @@ export function createTaskOrchestration({
                 phase: fixedPlan?.codeWork ? 'designing' : task.choice === 'leader' && !fixedPlan ? 'selecting' : (fixedPlan?.templateId ?? task.templateId) === 'pr-review' ? 'material' : 'handoff',
                 error: undefined, selected: undefined, pr: undefined, handoffs: [], reviewers: undefined });
             active.set(key, controller);
+            void notifyState(started, 'running');
             void run(key, card, started, controller.signal, audit).catch(async error => {
                 if (disposed) return;
                 const allowed = ['leader-unbound', 'leader-model-unavailable', 'reviewers-unavailable', 'invalid-leader-choice',
@@ -545,6 +557,7 @@ export function createTaskOrchestration({
                     try { await onPermissionBlocked?.(source, card.id, finalMessage); }
                     catch { logger?.warn?.('marshal: failed to move permission-blocked task to review'); }
                 }
+                await notifyState(started, permissionBlocked ? 'review' : 'failed');
             }).finally(() => {
                 active.delete(key);
                 if (active.size === 0) catalog = undefined;

@@ -180,6 +180,7 @@ export function createSuperagentBridge(options = {}) {
         now,
         uuid,
         readAgents: options.readAgents ?? readAgents,
+        workflow: options.workflow,
     });
 
     const extension = createBoardExtension({
@@ -289,7 +290,7 @@ export function createSuperagentBridge(options = {}) {
         }
         const result = await dispatcher.dispatch({ taskId, source: 'ui', requestId: body?.requestId });
         if (result.ok === true) return { status: 202, body: { ok: true, code: result.code, taskId, via: result.via } };
-        const benign = new Set(['disabled', 'duplicate-dispatch', 'subtask-suppressed', 'already-running', 'already-executed', 'task-archived', 'in-flight', 'awaiting-confirmation']);
+        const benign = new Set(['disabled', 'duplicate-dispatch', 'duplicate-target', 'subtask-suppressed', 'already-running', 'already-executed', 'task-archived', 'in-flight', 'awaiting-confirmation', 'workflow-done', 'workflow-permission-blocked']);
         return { status: benign.has(result.code) ? 200 : 409, body: { ok: false, code: result.code, taskId, error: result.error } };
     };
 
@@ -302,6 +303,7 @@ export function createSuperagentBridge(options = {}) {
             if (typeof body?.[key] === 'string') patch[key] = body[key];
         }
         if (body?.memoryLimit !== undefined) patch.memoryLimit = body.memoryLimit;
+        if (body?.staleRunMinutes !== undefined) patch.staleRunMinutes = body.staleRunMinutes;
         if (body?.aliases !== null && typeof body?.aliases === 'object' && !Array.isArray(body.aliases)) patch.aliases = body.aliases;
         try {
             configure(patch);
@@ -318,7 +320,7 @@ export function createSuperagentBridge(options = {}) {
             return { status: 400, body: { ok: false, code: 'invalid-task-id' } };
         }
         const result = await dispatcher.dispatch({ taskId, source: 'manual', force: true });
-        const benign = new Set(['disabled', 'duplicate-dispatch', 'subtask-suppressed', 'already-running', 'already-executed', 'task-archived', 'in-flight']);
+        const benign = new Set(['disabled', 'duplicate-dispatch', 'duplicate-target', 'subtask-suppressed', 'already-running', 'already-executed', 'task-archived', 'in-flight', 'workflow-done', 'workflow-permission-blocked']);
         return {
             status: result.ok === true ? 202 : benign.has(result.code) ? 200 : 409,
             body: result,
@@ -474,6 +476,7 @@ export function mountSuperagent(ctx, config, options = {}) {
         readAgents: options.readAgents,
         reconcileDelayMs: options.reconcileDelayMs,
         trustedRequest: req => trustedRequest(req),
+        workflow: options.workflow,
     });
     try {
         ctx.inject(['connection'], scoped => {

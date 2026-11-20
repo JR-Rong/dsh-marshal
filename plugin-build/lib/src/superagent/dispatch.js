@@ -11,7 +11,7 @@ import { randomUUID } from 'node:crypto';
 import { composePrompt, planCardPatch, taskIsDispatchable } from './prompt.js';
 import { readAgents, resolveAgentForTask } from './agents.js';
 
-const ACTIVE = new Set(['preparing', 'dispatched', 'running']);
+const ACTIVE = new Set(['preparing', 'dispatched', 'running', 'delegated']);
 
 function messageOf(error) {
     return error instanceof Error ? error.message : String(error);
@@ -27,6 +27,7 @@ export function createDispatcher(options) {
     const settingsStore = options.settingsStore;
     const stateStore = options.stateStore;
     const memory = options.memory;
+    const workflow = options.workflow;
     const logger = options.logger ?? { warn: () => {}, info: () => {} };
     const now = options.now ?? Date.now;
     const uuid = options.uuid ?? (() => randomUUID());
@@ -52,10 +53,70 @@ export function createDispatcher(options) {
 
     const findTask = (snapshot, taskId) => (snapshot?.tasks ?? []).find(task => task?.id === taskId);
 
+    const workflowTarget = taskId => {
+        try { return workflow?.target?.(taskId); }
+        catch { return undefined; }
+    };
+
+    // A cancelled run is not a fresh todo card: the session already produced
+    // work, so the card owes a human verdict. The board's own settle rule sends
+    // `cancelled` back to todo; this bridge upgrades that one case to review so
+    // the column matches the review the board writes for a succeeded run.
+    const reviewAfterCancel = async taskId => {
+        const board = boardFor();
+        if (board === undefined) return false;
+        let task;
+        try { task = findTask(snapshotOf(board), taskId); }
+        catch { return false; }
+        if (!task || (task.status !== 'todo' && task.status !== 'running')) return false;
+        try {
+            await board.apply(uuid(), { kind: 'move', taskId, status: 'review' }, 'marshal-superagent');
+            return true;
+        }
+        catch (cause) {
+            noteError('settle ' + taskId + ' could not move the card to review: ' + messageOf(cause));
+            return false;
+        }
+    };
+
     const recentHumanDispatchCount = () => {
         const since = now() - 60_000;
-        const counted = new Set(['preparing', 'dispatched', 'running', 'settled', 'memory-pending']);
+        const counted = new Set(['preparing', 'dispatched', 'running', 'delegated', 'settled', 'memory-pending']);
         return stateStore.list().filter(record => record.source !== 'manual' && (record.createdAt ?? 0) >= since && counted.has(record.status)).length;
+    };
+
+    /**
+     * A trailing copy marker names the SAME work, not different work. Two copies
+     * of one card must not run at the same time, so the marker is stripped
+     * before cards are compared.
+     */
+    const stripCopySuffix = value => {
+        let text = value;
+        for (let guard = 0; guard < 4; guard += 1) {
+            const next = text.replace(/[(（]\s*(?:副本|cop(?:y|ies))\s*\d*\s*[)）]\s*$/iu, '').trim();
+            if (next === text) return text;
+            text = next;
+        }
+        return text;
+    };
+
+    /** Identity of the work a card asks for: one workspace plus one normalized title. */
+    const targetKeyOf = (title, workspaceId) => {
+        const text = stripCopySuffix(String(title ?? '').replace(/\s+/gu, ' ').trim().toLowerCase());
+        if (text === '') return '';
+        const scope = typeof workspaceId === 'string' && workspaceId !== '' ? workspaceId : '-';
+        return scope + '::' + text;
+    };
+
+    /** Target keys another active dispatch already owns. */
+    const activeTargetKeys = () => {
+        const keys = new Set();
+        for (const record of stateStore.list()) {
+            if (!ACTIVE.has(record.status)) continue;
+            const key = targetKeyOf(record.title, record.workspaceId);
+            if (key !== '') keys.add(key);
+        }
+        return keys;
     };
 
     const status = () => {
@@ -72,6 +133,7 @@ export function createDispatcher(options) {
             injectMemory: settings.injectMemory,
             memoryLimit: settings.memoryLimit,
             maxDispatchesPerMinute: settings.maxDispatchesPerMinute,
+            staleRunMinutes: settings.staleRunMinutes,
             board: { available: board !== undefined },
             agents: { available: agents.available, ...(agents.code === undefined ? {} : { code: agents.code }), count: agents.members.length },
             memory: { available: memory.available },
@@ -164,6 +226,83 @@ export function createDispatcher(options) {
             }
             const dispatchable = taskIsDispatchable(task, settings);
             if (dispatchable.ok !== true) return skip(taskId, dispatchable.code, { agentId: previous?.agentId, agentName: previous?.agentName });
+            // A card created through Marshal can carry a preset workflow (leader,
+            // coder, reviewer and template). Waking the card with a plain board
+            // run would bypass that preset, so the workflow is the executor here
+            // and the bridge only records the hand-off.
+            const bound = workflowTarget(task.id);
+            if (bound !== undefined && typeof workflow?.start === 'function') {
+                if (bound.state === 'done' || bound.state === 'permission-blocked') {
+                    // A finished workflow is a human decision, not a dispatch failure:
+                    // write no record, so moving the card back to todo can retry it.
+                    return { ok: false, code: 'workflow-' + bound.state, agentId: bound.agentId, agentName: bound.leaderName };
+                }
+                if (bound.state === 'running' || bound.state === 'handed-off') {
+                    return skip(taskId, 'already-running', { agentId: bound.agentId, agentName: bound.leaderName });
+                }
+                if (request.force !== true && request.source !== 'manual') {
+                    const targetKey = targetKeyOf(task.title, bound.workspaceId);
+                    if (targetKey !== '' && activeTargetKeys().has(targetKey)) {
+                        return { ok: false, code: 'duplicate-target', targetKey };
+                    }
+                }
+                if (recentHumanDispatchCount() >= settings.maxDispatchesPerMinute) {
+                    return fail(taskId, 'rate-limited', 'more than ' + settings.maxDispatchesPerMinute + ' dispatches in the last minute', {
+                        agentId: bound.agentId,
+                        agentName: bound.leaderName,
+                        title: task.title,
+                    });
+                }
+                const requestId = typeof request.requestId === 'string' && request.requestId !== '' ? request.requestId : uuid();
+                stateStore.put(taskId, {
+                    status: 'preparing',
+                    delegated: true,
+                    agentId: bound.agentId,
+                    agentName: bound.leaderName,
+                    ...(typeof bound.workspaceId === 'string' && bound.workspaceId !== '' ? { workspaceId: bound.workspaceId } : {}),
+                    title: typeof task.title === 'string' ? task.title : '',
+                    source: request.source ?? 'ui',
+                    requestId,
+                    memoryError: undefined,
+                });
+                let result;
+                try {
+                    await workflow.begin?.(taskId, requestId, '超级智能体按工单预设编排派单。');
+                    result = workflow.start(taskId, task, { reason: 'auto-dispatch', skipBegin: true });
+                }
+                catch (cause) {
+                    await workflow.note?.(taskId, {
+                        kind: 'status', actor: 'Marshal', phase: 'failed',
+                        text: '预设编排未能启动：' + messageOf(cause).slice(0, 400),
+                    });
+                    return fail(taskId, 'workflow-start-failed', messageOf(cause), {
+                        agentId: bound.agentId, agentName: bound.leaderName, notes: ['workflow-delegation'],
+                    });
+                }
+                if (result === undefined || result.ok !== true) {
+                    await workflow.note?.(taskId, {
+                        kind: 'status', actor: 'Marshal', phase: 'failed',
+                        text: '预设编排未能启动：' + String(result?.code ?? 'unknown'),
+                    });
+                    return fail(taskId, 'workflow-start-failed', result?.code ?? 'unknown', {
+                        agentId: bound.agentId, agentName: bound.leaderName, notes: ['workflow-delegation'],
+                    });
+                }
+                await workflow.note?.(taskId, {
+                    kind: 'status', actor: 'Marshal', phase: 'dispatch',
+                    text: '超级智能体已按工单预设编排启动：Leader ' + (bound.leaderName ?? '未指定')
+                        + '，模板 ' + (bound.templateId ?? '普通任务') + '。',
+                });
+                const record = stateStore.put(taskId, {
+                    status: 'delegated',
+                    delegated: true,
+                    agentId: bound.agentId,
+                    agentName: bound.leaderName,
+                    notes: ['workflow-delegation'],
+                });
+                logger.info?.('marshal-superagent: delegated ' + taskId + ' to workflow leader ' + (bound.leaderName ?? 'unknown'));
+                return { ok: true, code: 'dispatched', via: 'workflow', record };
+            }
             const agents = readAgentsFn();
             if (agents.available !== true) return fail(taskId, 'agents-unavailable', 'the dsh-agents ledger is unavailable: ' + (agents.code ?? 'unknown'));
             const resolved = resolveAgentForTask(task, settings, agents.members);
@@ -178,6 +317,16 @@ export function createDispatcher(options) {
             }
             const effectiveWorkspaceId = (typeof task.workspaceId === 'string' && task.workspaceId.trim() !== '' ? task.workspaceId.trim() : undefined)
                 ?? member.teamWorkspaceId;
+            if (request.force !== true && request.source !== 'manual') {
+                // Another card asking for the same work in the same workspace is
+                // still active. Leave this one in the todo column and write NO
+                // record, so a later reconcile can dispatch it once the sibling
+                // settles.
+                const targetKey = targetKeyOf(task.title, effectiveWorkspaceId);
+                if (targetKey !== '' && activeTargetKeys().has(targetKey)) {
+                    return { ok: false, code: 'duplicate-target', targetKey };
+                }
+            }
             const requestId = typeof request.requestId === 'string' && request.requestId !== '' ? request.requestId : uuid();
             const started = stateStore.put(taskId, {
                 status: 'preparing',
@@ -240,6 +389,10 @@ export function createDispatcher(options) {
                 ...(planned.notes.length === 0 ? {} : { notes: planned.notes }),
                 ...(memoryError === undefined ? {} : { memoryError }),
             });
+            if (execution !== undefined) {
+                await workflow?.begin?.(taskId, execution.id,
+                    '超级智能体已派单给 ' + member.name + '（' + resolved.via + '），执行会话已开启。');
+            }
             logger.info?.('marshal-superagent: dispatched ' + taskId + ' to ' + member.name + ' (' + resolved.via + ')');
             return { ok: true, code: 'dispatched', via: resolved.via, record };
         }
@@ -339,7 +492,14 @@ export function createDispatcher(options) {
         catch (cause) {
             noteError('settle ' + taskId + ' integration write failed: ' + messageOf(cause));
         }
-        return { ok: true, code: 'settled', outcome, memoryWritten: memoryResult.ok === true };
+        const movedToReview = outcome === 'cancelled' ? await reviewAfterCancel(taskId) : false;
+        if (movedToReview) stateStore.put(taskId, { movedToReview: true });
+        const outcomeLabel = outcome === 'succeeded' ? '已完成待验收' : outcome === 'cancelled' ? '已取消，保留工作待确认' : outcome;
+        await workflow?.note?.(taskId, {
+            kind: 'status', actor: 'Marshal', phase: movedToReview ? 'review' : outcome,
+            text: '执行结束：' + outcomeLabel + (error === undefined ? '。' : '。' + String(error).slice(0, 400)),
+        });
+        return { ok: true, code: 'settled', outcome, memoryWritten: memoryResult.ok === true, movedToReview };
     };
 
     /**
@@ -347,7 +507,8 @@ export function createDispatcher(options) {
      * board changes (throttled by the mount), and on demand from the tool.
      */
     const reconcile = async (filter = {}, host) => {
-        if (settingsStore.get().enabled !== true) return { ok: false, code: 'disabled', checked: 0 };
+        const settings = settingsStore.get();
+        if (settings.enabled !== true) return { ok: false, code: 'disabled', checked: 0 };
         const board = boardFor();
         if (board === undefined) return { ok: false, code: 'no-task-board', checked: 0 };
         const snapshot = snapshotOf(board);
@@ -355,6 +516,7 @@ export function createDispatcher(options) {
         const records = (filter.taskId === undefined ? stateStore.active() : [stateStore.get(filter.taskId)].filter(Boolean));
         let settled = 0;
         let updated = 0;
+        let reaped = 0;
         for (const record of records) {
             if (record.status === 'awaiting-confirmation') continue;
             const task = findTask(snapshot, record.taskId);
@@ -363,8 +525,64 @@ export function createDispatcher(options) {
                 updated += 1;
                 continue;
             }
+            if (record.delegated === true) {
+                let view;
+                try { view = workflow?.view?.(record.taskId) ?? workflowTarget(record.taskId); }
+                catch { view = undefined; }
+                const terminal = task.status === 'review' || task.status === 'done' || task.status === 'failed'
+                    || view?.state === 'done' || view?.state === 'failed' || view?.state === 'permission-blocked';
+                if (terminal) {
+                    const outcome = view?.state === 'permission-blocked' ? 'blocked'
+                    : task.status === 'failed' || view?.state === 'failed' ? 'failed' : 'succeeded';
+                    stateStore.put(record.taskId, { status: 'settled', delegated: true, outcome, memoryWritten: false });
+                    try {
+                        host?.integration?.write(record.taskId, {
+                            dispatch: {
+                                agentId: record.agentId,
+                                agentName: record.agentName,
+                                source: record.source,
+                                at: record.createdAt,
+                                ...(typeof record.requestId === 'string' ? { requestId: record.requestId } : {}),
+                            },
+                            outcome,
+                            memoryWritten: false,
+                            delegated: true,
+                        });
+                    }
+                    catch (cause) {
+                        noteError('reconcile ' + record.taskId + ' integration write failed: ' + messageOf(cause));
+                    }
+                    updated += 1;
+                }
+                continue;
+            }
             const execution = latestExecution(task);
             if (execution !== undefined) {
+                const open = execution.endedAt === undefined && execution.result === undefined;
+                if (open && record.status === 'running' && settings.staleRunMinutes > 0) {
+                    const age = now() - (record.updatedAt ?? record.createdAt ?? 0);
+                    if (age > settings.staleRunMinutes * 60_000) {
+                        // A run whose session died never settles itself. Close the open
+                        // execution so the card leaves the running column and becomes
+                        // dispatchable again; never claim that run's outcome.
+                        stateStore.put(record.taskId, {
+                            status: 'failed',
+                            error: 'run-stalled: no settle within ' + settings.staleRunMinutes + ' min',
+                        });
+                        reaped += 1;
+                        updated += 1;
+                        // Only now close the open execution: the board notification
+                        // this triggers re-enters reconcile, which must already see a
+                        // terminal record and leave it alone.
+                        try {
+                            await board.apply(uuid(), { kind: 'settle', taskId: record.taskId }, 'marshal-superagent');
+                        }
+                        catch (cause) {
+                            noteError('stale run ' + record.taskId + ' could not be settled: ' + messageOf(cause));
+                        }
+                        continue;
+                    }
+                }
                 if (typeof record.executionId === 'string' && record.executionId !== execution.id) {
                     // A manual rerun replaced the run this record opened; do not
                     // claim its outcome or write its work into the agent's memory.
@@ -396,7 +614,6 @@ export function createDispatcher(options) {
             }
         }
         let dispatched = 0;
-        const settings = settingsStore.get();
         if (filter.taskId === undefined && filter.autoDispatch !== false && settings.autoDispatchTodo === true && inFlight.size === 0) {
             const agents = readAgentsFn();
             if (agents.available === true && agents.members.length > 0) {
@@ -408,14 +625,16 @@ export function createDispatcher(options) {
                     if (inFlight.has(task.id)) continue;
                     if (stateStore.get(task.id) !== undefined) continue;
                     if (taskIsDispatchable(task, settings, { requireTodo: true }).ok !== true) continue;
-                    if (resolveAgentForTask(task, settings, agents.members).member === undefined) continue;
+                    const bound = workflowTarget(task.id);
+                    const workflowReady = bound !== undefined && ['ready', 'interrupted', 'failed'].includes(bound.state);
+                    if (!workflowReady && resolveAgentForTask(task, settings, agents.members).member === undefined) continue;
                     if (recentHumanDispatchCount() >= settings.maxDispatchesPerMinute) break;
                     const res = await dispatch({ taskId: task.id, source: 'todo' });
                     if (res.ok === true) dispatched += 1;
                 }
             }
         }
-        return { ok: true, checked: records.length, settled, updated, dispatched };
+        return { ok: true, checked: records.length, settled, updated, dispatched, reaped };
     };
 
     return {
