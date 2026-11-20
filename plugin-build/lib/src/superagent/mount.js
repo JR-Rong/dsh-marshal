@@ -475,7 +475,7 @@ export function mountSuperagent(ctx, config, options = {}) {
         trustedRequest: req => trustedRequest(req),
     });
     try {
-        ctx.inject(['connection', 'connection.authentication'], scoped => {
+        ctx.inject(['connection'], scoped => {
             scoped.effect(() => {
                 adoptConnection(typeof scoped.get === 'function' ? scoped.get('connection') : scoped.connection);
                 return () => adoptConnection(undefined);

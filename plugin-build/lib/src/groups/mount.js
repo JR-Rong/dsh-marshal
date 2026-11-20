@@ -694,7 +694,7 @@ export function mountGroups(ctx, config, options = {}) {
         };
     };
     try {
-        ctx.inject?.(['connection', 'connection.authentication'], scoped => {
+        ctx.inject?.(['connection'], scoped => {
             scoped.effect(() => {
                 adoptConnection(typeof scoped.get === 'function' ? scoped.get('connection') : scoped.connection);
                 return () => adoptConnection(undefined);

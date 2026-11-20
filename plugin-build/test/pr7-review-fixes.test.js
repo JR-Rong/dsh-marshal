@@ -10,6 +10,8 @@ import { findMember, resolveAgentForTask } from '../lib/src/superagent/agents.js
 import { defaultSettings } from '../lib/src/superagent/settings.js';
 import { parseModelJson, VerdictSchema } from '../lib/src/groups/task-plans.js';
 import { createTaskOrchestration } from '../lib/src/groups/task-orchestration.js';
+import { mountSuperagent } from '../lib/src/superagent/mount.js';
+import { createFakeBoard, createFakeContext, createFakeMemory, loggerFixture } from './superagent-support.js';
 
 const tempRoot = () => mkdtempSync(join(tmpdir(), 'marshal-pr7-fixes-'));
 const mnemonBin = process.env.MARSHAL_TEST_MNEMON;
@@ -172,4 +174,34 @@ test('shipped client keeps plain card create/run working and sends auth for task
     assert.ok(source.includes("fetchJson('marshal/tasks/run', { taskId: task.id }, Boolean(task.workflow || task.taskRoom))"));
     assert.ok(source.includes("fetchJson('marshal/tasks/delete', { taskId: task.id }, Boolean(task.workflow || task.taskRoom))"));
     assert.ok(source.includes("!task.taskRoom?.closed && task.status !== 'running' && (!workflow || workflow.state !== 'done')"));
+});
+
+test('mountSuperagent adopts connection trust with only the real connection service (no connection.authentication)', async () => {
+    const context = createFakeContext({
+        taskBoard: createFakeBoard(),
+        memory: createFakeMemory(),
+        logger: loggerFixture(),
+        connection: {
+            requestRejection(req) {
+                return String(req.headers.cookie ?? '').includes('dsh-auth-live=ok') ? undefined : 401;
+            },
+        },
+    });
+    try {
+        mountSuperagent(context, { agents: ['dsh'] }, { root: tempRoot(), memory: createFakeMemory(), logger: context.logger, reconcileDelayMs: -1 });
+        const route = context.routes.find(item => item.path === '/api/marshal-superagent/human-create');
+        assert.ok(route);
+        const invoke = async headers => {
+            let status = 0;
+            const req = { method: 'POST', headers, socket: { remoteAddress: '127.0.0.1' }, async *[Symbol.asyncIterator]() { yield Buffer.from('{"taskId":"t1","source":"board-ui"}'); } };
+            const res = { writeHead(code) { status = code; }, end() {} };
+            await route.handler(req, res);
+            return status;
+        };
+        assert.equal(await invoke({ host: '127.0.0.1:56822', 'content-type': 'application/json' }), 403);
+        assert.notEqual(await invoke({ host: '127.0.0.1:56822', 'content-type': 'application/json', cookie: 'dsh-auth-live=ok' }), 403);
+    }
+    finally {
+        context.close();
+    }
 });
