@@ -24,12 +24,13 @@ const config: CapacitorConfig = {
     SplashScreen: {
       launchShowDuration: 500,
       launchAutoHide: true,
-      backgroundColor: '#151719',
+      backgroundColor: '#1F6FEB',
       showSpinner: false,
     },
     StatusBar: {
-      style: 'DARK',
-      backgroundColor: '#151719',
+      // 跟随系统外观：浅色模式深色文字，深色模式浅色文字。
+      style: 'DEFAULT',
+      overlaysWebView: false,
     },
   },
 }

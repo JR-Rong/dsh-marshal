@@ -11,13 +11,36 @@ export function inNativeShell(): boolean {
   }
 }
 
+/**
+ * 状态栏跟随系统外观：浅色模式深色文字 + 浅灰底，深色模式浅色文字 + 纯黑底。
+ * Android 15+ 强制 edge-to-edge，背景色由系统忽略；文字样式仍然生效。
+ */
+let overlayConfigured = false
+
+async function applyStatusBar(): Promise<void> {
+  const { StatusBar, Style } = await import('@capacitor/status-bar')
+  const dark = window.matchMedia('(prefers-color-scheme: dark)').matches
+  if (!overlayConfigured) {
+    overlayConfigured = true
+    await StatusBar.setOverlaysWebView({ overlay: false }).catch(() => undefined)
+  }
+  if (Capacitor.getPlatform() === 'android') {
+    await StatusBar.setBackgroundColor({ color: dark ? '#000000' : '#F2F2F7' }).catch(() => undefined)
+  }
+  await StatusBar.setStyle({ style: dark ? Style.Dark : Style.Light }).catch(() => undefined)
+}
+
+let statusBarWatch: MediaQueryList | null = null
+
 /** 状态栏、启动图等壳层初始化。失败不阻塞业务。 */
 export async function setupChrome(): Promise<void> {
   if (!inNativeShell()) return
   try {
-    const { StatusBar, Style } = await import('@capacitor/status-bar')
-    await StatusBar.setStyle({ style: Style.Dark })
-    if (Capacitor.getPlatform() === 'android') await StatusBar.setBackgroundColor({ color: '#151719' })
+    await applyStatusBar()
+    if (!statusBarWatch) {
+      statusBarWatch = window.matchMedia('(prefers-color-scheme: dark)')
+      statusBarWatch.addEventListener('change', () => { void applyStatusBar().catch(() => undefined) })
+    }
   } catch {
     /* 插件缺失不致命 */
   }

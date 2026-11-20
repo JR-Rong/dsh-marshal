@@ -30,7 +30,6 @@ import {
   watchNetwork, watchDeepLinks, watchBackButton,
 } from './lib/native.ts'
 import { APP_TITLE, APP_VERSION, CLIENT_ONLY_NOTE } from './lib/version.ts'
-import { initTheme, readTheme, setTheme, THEMES } from './lib/theme.ts'
 
 type View = 'booting' | 'setup' | 'lock' | 'home' | 'sessions' | 'session' | 'controls' | 'groups' | 'groupRoom' | 'groupNew' | 'settings' | 'board' | 'memory'
 
@@ -150,16 +149,72 @@ const rootNode = (): HTMLElement => {
   return node
 }
 
+const TAB_ITEMS: ReadonlyArray<{ view: View; label: string; icon: string }> = [
+  { view: 'home', label: '设备', icon: 'device' },
+  { view: 'sessions', label: '会话', icon: 'chat' },
+  { view: 'board', label: '看板', icon: 'board' },
+  { view: 'settings', label: '设置', icon: 'gear' },
+]
+
+const TAB_VIEWS: ReadonlySet<View> = new Set<View>(['home', 'sessions', 'board', 'settings'])
+
+function tabIcon(kind: string): SVGElement {
+  const svg = document.createElementNS(SVG_NS, 'svg')
+  svg.setAttribute('viewBox', '0 0 24 24')
+  svg.setAttribute('aria-hidden', 'true')
+  const paths: Record<string, string> = {
+    device: 'M8 3.5h8a2 2 0 0 1 2 2v13a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2v-13a2 2 0 0 1 2-2Z M10.5 17.5h3',
+    chat: 'M4.5 6.5A2.5 2.5 0 0 1 7 4h10a2.5 2.5 0 0 1 2.5 2.5v6A2.5 2.5 0 0 1 17 15H9l-4.5 3.5v-12Z',
+    board: 'M4.5 5.5h15v6h-15z M4.5 15h7v4h-7z M14.5 15h5v4h-5z',
+    gear: 'M12 15.2a3.2 3.2 0 1 0 0-6.4 3.2 3.2 0 0 0 0 6.4Z M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.03 1.56V21a2 2 0 1 1-4 0v-.09A1.7 1.7 0 0 0 8.98 19.4a1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.62 15a1.7 1.7 0 0 0-1.56-1.03H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.6 8.98a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 8.98 4.6a1.7 1.7 0 0 0 1.03-1.56V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1.03 1.56 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9a1.7 1.7 0 0 0 1.56 1.03H21a2 2 0 1 1 0 4h-.09A1.7 1.7 0 0 0 19.4 15Z',
+  }
+  const path = document.createElementNS(SVG_NS, 'path')
+  path.setAttribute('d', paths[kind] ?? paths.device)
+  svg.append(path)
+  return svg
+}
+
+function tabBar(): HTMLElement {
+  const current = state.view
+  const secondary = current === 'groups' || current === 'groupRoom' || current === 'groupNew' || current === 'memory'
+  return el('nav', { class: 'tabbar', 'aria-label': '主导航' },
+    ...TAB_ITEMS.map((item) => el('button', {
+      class: 'tab-item' + (item.view === current || (item.view === 'home' && secondary) ? ' active' : ''),
+      'aria-label': item.label,
+      onClick: () => { vibrate(); switchTab(item.view) },
+    },
+    tabIcon(item.icon),
+    el('span', { class: 'tab-label', text: item.label }),
+    )),
+  )
+}
+
+function switchTab(view: View): void {
+  if (view === state.view) return
+  if (view === 'home') { state.view = 'home'; render(); void refreshDevices(); return }
+  if (view === 'sessions') {
+    state.view = 'sessions'
+    render()
+    const first = state.devices.find((entry) => !entry.stale)
+    if (!state.deviceId && first) void openDevice(first)
+    return
+  }
+  if (view === 'board') { state.view = 'board'; render(); void loadBoard(); return }
+  if (view === 'settings') { state.view = 'settings'; render() }
+}
+
 function render(): void {
   if (state.view !== 'groupRoom') stopGroupPoll()
   const app = rootNode()
   clear(app)
-  app.className = 'app screen-' + state.view
+  const withTabs = TAB_VIEWS.has(state.view)
+  app.className = 'app screen-' + state.view + (withTabs ? ' has-tabs' : '')
   for (const child of screenChildren()) {
     // 浏览器 append(null) 会渲染出 "null" 字样，必须先过滤空槽位。
     if (child === null || child === undefined || child === false) continue
     app.append(child as Node)
   }
+  if (withTabs) app.append(tabBar())
 }
 
 function screenChildren(): Child[] {
@@ -180,9 +235,36 @@ function screenChildren(): Child[] {
   }
 }
 
+const SVG_NS = 'http://www.w3.org/2000/svg'
+
+/** 直接复用仓库 plugin-build/icon.svg 的品牌标记：Marshal 蓝底 + 三阶信号条 + 顶灯。 */
+function logoMark(): HTMLElement {
+  const wrap = el('span', { class: 'mark', 'aria-hidden': 'true' })
+  const svg = document.createElementNS(SVG_NS, 'svg')
+  svg.setAttribute('viewBox', '0 0 64 64')
+  const rect = document.createElementNS(SVG_NS, 'rect')
+  rect.setAttribute('width', '64')
+  rect.setAttribute('height', '64')
+  rect.setAttribute('rx', '15')
+  rect.setAttribute('fill', '#1F6FEB')
+  const bars = document.createElementNS(SVG_NS, 'path')
+  bars.setAttribute('d', 'M16 42h32M20 34h24M24 26h16')
+  bars.setAttribute('stroke', '#FFFFFF')
+  bars.setAttribute('stroke-width', '4')
+  bars.setAttribute('stroke-linecap', 'round')
+  const beacon = document.createElementNS(SVG_NS, 'circle')
+  beacon.setAttribute('cx', '32')
+  beacon.setAttribute('cy', '17')
+  beacon.setAttribute('r', '4')
+  beacon.setAttribute('fill', '#FFFFFF')
+  svg.append(rect, bars, beacon)
+  wrap.append(svg)
+  return wrap
+}
+
 function brand(): HTMLElement {
   return el('div', { class: 'brand' },
-    el('div', { class: 'mark', text: '调' }),
+    logoMark(),
     el('div', {},
       el('h1', { text: '调度官' }),
       el('p', { text: '手机端 node · 直连调度中心' }),
@@ -190,25 +272,30 @@ function brand(): HTMLElement {
   )
 }
 
+/** Apple HIG：外观跟随系统，不在应用内提供换肤；强调色固定为仓库图标的品牌蓝。 */
 function themeCard(): HTMLElement {
-  const current = readTheme()
   return el('div', { class: 'card' },
-    el('h2', { text: '主题色' }),
-    el('p', { class: 'empty', text: '只改强调色，界面仍是深色；选择会记住。' }),
-    el('div', { class: 'theme-row' },
-      ...THEMES.map((option) => el('button', {
-        class: 'theme-option' + (option.id === current ? ' selected' : ''),
-        onClick: () => { setTheme(option.id); render() },
-      },
-      el('span', { class: 'theme-swatch ' + option.id }),
-      el('span', { text: option.label }),
-      )),
+    el('h2', { text: '外观' }),
+    el('div', { class: 'row-between' },
+      el('div', { class: 'label' },
+        el('strong', { text: '跟随系统' }),
+        el('span', { text: '浅色 / 深色随 iOS、Android 设置自动切换' }),
+      ),
+      el('span', { class: 'chip on', text: '自动' }),
+    ),
+    el('div', { class: 'row-between' },
+      el('div', { class: 'label' },
+        el('strong', { text: '强调色' }),
+        el('span', { text: '取自仓库应用图标 · Marshal 蓝' }),
+      ),
+      el('span', { class: 'accent-dot', 'aria-hidden': 'true' }),
     ),
   )
 }
 
-function topbar(title: string, subtitle: string, actions: Child[]): HTMLElement {
-  return el('div', { class: 'topbar' },
+function topbar(title: string, subtitle: string, actions: Child[], back?: HTMLButtonElement): HTMLElement {
+  return el('div', { class: 'topbar' + (back ? ' has-back' : '') },
+    back ?? null,
     el('div', { class: 'title' },
       el('strong', { text: title }),
       el('span', { text: subtitle }),
@@ -217,14 +304,26 @@ function topbar(title: string, subtitle: string, actions: Child[]): HTMLElement 
   )
 }
 
-function backButton(to: View, label = '返回'): HTMLButtonElement {
-  return button(label, () => { state.view = to; render() }, { class: 'icon-button' })
+function backChevron(): SVGElement {
+  const svg = document.createElementNS(SVG_NS, 'svg')
+  svg.setAttribute('viewBox', '0 0 24 24')
+  svg.setAttribute('aria-hidden', 'true')
+  const path = document.createElementNS(SVG_NS, 'path')
+  path.setAttribute('d', 'M14.5 5.5 8 12l6.5 6.5')
+  svg.append(path)
+  return svg
+}
+
+/** iOS 导航栏返回：左侧圆形 chevron，语义标签「返回」。 */
+function backButton(to: View): HTMLButtonElement {
+  const node = button('', () => { state.view = to; render() }, { class: 'back-button', 'aria-label': '返回' })
+  node.append(backChevron())
+  return node
 }
 
 /* ------------------------------ 启动 ------------------------------ */
 
 export async function start(): Promise<void> {
-  initTheme()
   state.view = 'booting'
   render()
   void setupChrome()
@@ -801,7 +900,7 @@ function setupView(): Child[] {
   return [
     brand(),
     el('div', { class: 'card setup-pair' },
-      el('div', { class: 'setup-pair-icon', text: '📷' }),
+      el('div', { class: 'setup-pair-icon' }, logoMark()),
       el('h2', { text: '连接电脑' }),
       el('p', { class: 'empty', text: '用摄像头扫电脑「跨设备」页的二维码，自动完成配对。' }),
       button('扫码配对', scanPairing, { class: 'primary block scan-button' }),
@@ -906,20 +1005,11 @@ function scanPairing(): void {
 function homeView(): Child[] {
   const config = state.config
   if (!config) { state.view = 'setup'; return setupView() }
-  const header = topbar('调度官', hubLabel(config.hubUrl), [
+  const header = topbar('设备', '手机端 node · ' + hubLabel(config.hubUrl), [
     button('扫码', scanPairing, { class: 'icon-button' }),
-    button('看板', () => { state.view = 'board'; render(); void loadBoard() }, { class: 'icon-button' }),
-    button('记忆', () => {
-      memoryEntries = []
-      state.view = 'memory'
-      render()
-      void loadMemory()
-    }, { class: 'icon-button' }),
-    button('群聊', () => { state.view = 'groups'; void loadRooms() }, { class: 'icon-button' }),
-    button('设置', () => { state.view = 'settings'; render() }, { class: 'icon-button' }),
   ])
   const banners: Child[] = []
-  if (!state.online) banners.push(el('div', { class: 'banner', text: '设备离线：网络恢复后会自动刷新。' }))
+  if (!state.online) banners.push(el('div', { class: 'banner warn', text: '设备离线：网络恢复后会自动刷新。' }))
   if (state.statusText) banners.push(el('div', { class: 'banner', text: state.statusText }))
 
   const rows = state.devices.map((device) => el('button', {
@@ -929,11 +1019,22 @@ function homeView(): Child[] {
   el('span', { class: 'dot' + (device.stale ? '' : ' online') }),
   el('span', { class: 'name', text: device.name }),
   el('span', { class: 'chip', text: device.agents.map(agentLabel).join(' / ') || '无 agent' }),
+  el('span', { class: 'chevron', 'aria-hidden': 'true' }),
   ))
 
   const members = roster.map((item) => {
     const device = state.devices.find(entry => entry.id === item.deviceId)
-    return el('p', { text: item.name + ' · ' + (device?.name ?? item.deviceId) + (device && !device.stale ? '' : '（离线）') })
+    const online = !!(device && !device.stale)
+    return el('div', { class: 'row-between' },
+      el('div', { class: 'roster-main' },
+        el('span', { class: 'dot' + (online ? ' online' : '') }),
+        el('div', { class: 'label' },
+          el('strong', { text: item.name }),
+          el('span', { text: device?.name ?? item.deviceId }),
+        ),
+      ),
+      el('span', { class: 'chip' + (online ? ' on' : ''), text: online ? '在线' : '离线' }),
+    )
   })
   return [
     header,
@@ -952,6 +1053,17 @@ function homeView(): Child[] {
     el('div', { class: 'card' },
       el('h2', { text: '设备' }),
       ...(rows.length > 0 ? rows : [el('p', { class: 'empty', text: '暂无设备在线。' })]),
+    ),
+    el('div', { class: 'card' },
+      el('h2', { text: '协作' }),
+      el('div', { class: 'row-between' },
+        el('div', { class: 'label' }, el('strong', { text: '群聊' }), el('span', { text: '跨设备智能体讨论与汇总' })),
+        button('打开', () => { state.view = 'groups'; void loadRooms() }, { class: 'icon-button' }),
+      ),
+      el('div', { class: 'row-between' },
+        el('div', { class: 'label' }, el('strong', { text: '记忆' }), el('span', { text: '智能体长期记忆 · 只读浏览' })),
+        button('打开', () => { memoryEntries = []; state.view = 'memory'; render(); void loadMemory() }, { class: 'icon-button' }),
+      ),
     ),
     el('div', { class: 'foot', text: 'v' + APP_VERSION + ' · 手机端 node · 出站直连，不承载 hub' }),
   ]
@@ -983,12 +1095,10 @@ async function startDeviceSession(deviceId: string, agent: string): Promise<void
 
 function sessionsView(): Child[] {
   const device = state.devices.find((entry) => entry.id === state.deviceId)
-  const header = topbar(device?.name ?? '会话', '选择会话', [
-    backButton('home'),
-    ...(device?.agents ?? []).map((agent) => button('新会话 · ' + agentLabel(agent), () => {
-      if (device) void startDeviceSession(device.id, agent)
-    }, { class: 'icon-button' })),
-  ])
+  const header = topbar(device?.name ?? '会话', '选择会话', [], backButton('home'))
+  const newRow = (device?.agents ?? []).map((agent) => button('新会话 · ' + agentLabel(agent), () => {
+    if (device) void startDeviceSession(device.id, agent)
+  }, { class: 'icon-button' }))
   const search = el('input', {
     type: 'search', placeholder: '搜索会话', value: sessionQuery,
     onInput: (event: Event) => { sessionQuery = (event.target as HTMLInputElement).value; sessionLimit = SESSION_PAGE_SIZE; render() },
@@ -1018,11 +1128,16 @@ function sessionsView(): Child[] {
         el('span', { text: formatTime(row.updatedAt) }),
       ),
       el('span', { class: 'state' + (row.running ? ' running' : ''), text: row.running ? '运行中' : '空闲' }),
+      el('span', { class: 'chevron', 'aria-hidden': 'true' }),
       )),
     ))
   }
   if (page.hasMore) sections.push(button('加载更多', () => { sessionLimit += SESSION_PAGE_SIZE; render() }, { class: 'block' }))
-  return [header, el('div', { class: 'card' }, ...sections)]
+  return [
+    header,
+    newRow.length > 0 ? el('div', { class: 'quick-row' }, ...newRow) : null,
+    el('div', { class: 'card' }, ...sections),
+  ]
 }
 
 function messageNode(message: Message): HTMLElement {
@@ -1134,12 +1249,11 @@ function sessionView(): Child[] {
   const session = state.session
   if (!session) { state.view = 'sessions'; return sessionsView() }
   const header = topbar(sessionTitle(session), agentLabel(session.agent) + ' · ' + (state.running ? '运行中' : '空闲'), [
-    backButton('sessions'),
     button('控制', () => { openControls() }, { class: 'icon-button' }),
     can(state.capability, 'interrupt')
       ? button('中断', () => { void interrupt() }, { class: 'icon-button danger' })
       : null,
-  ])
+  ], backButton('sessions'))
 
   const controls = state.controls
   const modelSelect = el('select', { class: 'mini-select', 'aria-label': '本次发送模型' }) as HTMLSelectElement
@@ -1235,9 +1349,8 @@ function controlsView(): Child[] {
 
   return [
     topbar('控制项', session ? sessionTitle(session) : '未选择会话', [
-      backButton('session'),
       button('刷新', () => { void refreshControls(true) }, { class: 'icon-button' }),
-    ]),
+    ], backButton('session')),
     el('div', { class: 'card' },
       el('h2', { text: '本次发送' }),
       el('p', { class: 'empty', text: '模型：' + (state.modelChoice || current.model || '沿用会话默认') }),
@@ -1555,7 +1668,7 @@ function boardView(): Child[] {
   const deviceId = state.deviceId || boardTasks[0]?.deviceId || state.devices[0]?.id || ''
   const head = boardRevisions[deviceId]
   return [
-    topbar('任务看板', '每台电脑用自己的修订号', [backButton('home'), button('刷新', () => { void loadBoard() }, { class: 'icon-button' })]),
+    topbar('任务看板', '每台电脑用自己的修订号', [button('刷新', () => { void loadBoard() }, { class: 'icon-button' })], backButton('home')),
     el('div', { class: 'card' },
       title,
       button('新建', () => {
@@ -1609,7 +1722,7 @@ async function loadMemory(): Promise<void> {
 
 function memoryView(): Child[] {
   return [
-    topbar('记忆', '只读', [backButton('home'), button('刷新', () => { void loadMemory() }, { class: 'icon-button' })]),
+    topbar('记忆', '只读', [button('刷新', () => { void loadMemory() }, { class: 'icon-button' })], backButton('home')),
     ...memoryEntries.map((entry) => el('div', { class: 'card' },
       el('h2', { text: entry.layer === 'global' ? '全局 · 可共享' : (entry.agent || entry.deviceId) + ' · ' + entry.layer }),
       el('p', { text: entry.text }),
@@ -1748,10 +1861,9 @@ function groupsView(): Child[] {
   if (!config) { state.view = 'setup'; return setupView() }
   const account = state.account
   const header = topbar('群聊', phoneApi() ? '手机凭证' : (account?.name || '未配对'), [
-    backButton('home'),
     button('刷新', () => { void loadRooms(true) }, { class: 'icon-button' }),
     phoneApi() ? button('新建', () => { openGroupNew() }, { class: 'icon-button' }) : null,
-  ])
+  ], backButton('home'))
   if (!account || account.expiresAt <= Date.now()) {
     return [
       header,
@@ -1806,10 +1918,9 @@ function groupRoomView(): Child[] {
     return groupsView()
   }
   const header = topbar(room ? room.title : '群聊', room ? groupStateLabel(room.state) + ' · 第 ' + room.rounds + '/3 轮' : '读取中…', [
-    button('房间列表', () => { stopGroupPoll(); state.view = 'groups'; render() }, { class: 'icon-button' }),
     button('刷新', () => { void refreshRoom() }, { class: 'icon-button' }),
     room && room.state !== 'closed' ? button('停止', () => { void stopRoom() }, { class: 'icon-button danger' }) : null,
-  ])
+  ], backButton('groups'))
   if (!room) {
     return [header, el('div', { class: 'card' }, el('p', { class: 'empty', text: state.groupError || '读取群聊…' }))]
   }
@@ -1946,9 +2057,7 @@ function groupNewView(): Child[] {
     state.view = 'groups'
     return groupsView()
   }
-  const header = topbar('新建群聊', '手机凭证 · 讨论模式', [
-    button('返回', () => { state.view = 'groups'; render() }, { class: 'icon-button' }),
-  ])
+  const header = topbar('新建群聊', '手机凭证 · 讨论模式', [], backButton('groups'))
   const titleInput = el('input', {
     type: 'text', value: state.groupTitle, placeholder: '群聊标题', maxlength: 200,
     onInput: (event: Event) => { state.groupTitle = (event.target as HTMLInputElement).value; state.groupPreview = null },
@@ -2081,7 +2190,7 @@ function settingsView(): Child[] {
       button('开启', () => { openLockSetup() }, { class: 'icon-button' }))
 
   return [
-    topbar('设置', hubLabel(config.hubUrl), [backButton('home')]),
+    topbar('设置', hubLabel(config.hubUrl), [], backButton('home')),
     themeCard(),
     el('div', { class: 'card' },
       el('h2', { text: '连接' }),
