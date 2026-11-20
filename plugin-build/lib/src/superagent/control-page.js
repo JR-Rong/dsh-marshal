@@ -54,6 +54,7 @@ export function controlPageHtml() {
     <div class="row">
       <label>记忆条数 <input type="number" id="memoryLimit" min="0" max="6" step="1" value="6" style="width:70px"></label>
       <label>标签前缀 <input type="text" id="tagPrefix" value="@" size="4" style="width:60px"></label>
+      <label>卡死运行回收（分钟，0 关闭）<input type="number" id="staleRunMinutes" min="0" max="1440" step="5" value="45" style="width:80px"></label>
     </div>
     <div class="row"><label>标签别名 JSON <input type="text" id="aliases" placeholder='{"工部":"工部尚书"}' size="40"></label></div>
     <button type="submit">保存配置</button>
@@ -116,6 +117,7 @@ export function controlPageHtml() {
     document.getElementById('injectMemory').checked = value.injectMemory !== false;
     document.getElementById('memoryLimit').value = String(value.memoryLimit === undefined ? 6 : value.memoryLimit);
     document.getElementById('tagPrefix').value = value.tagPrefix || '@';
+    document.getElementById('staleRunMinutes').value = String(value.staleRunMinutes === undefined ? 45 : value.staleRunMinutes);
     document.getElementById('aliases').value = JSON.stringify(value.aliases || {});
     recentEl.textContent = pretty(value.recent || []);
   }
@@ -143,6 +145,7 @@ export function controlPageHtml() {
         injectMemory: document.getElementById('injectMemory').checked,
         memoryLimit: Number(document.getElementById('memoryLimit').value),
         tagPrefix: document.getElementById('tagPrefix').value.trim() || '@',
+        staleRunMinutes: Number(document.getElementById('staleRunMinutes').value),
         aliases: aliases
       };
       fill((await call('/marshal-superagent/api/config', patch)).status);

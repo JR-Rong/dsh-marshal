@@ -52,6 +52,40 @@ export function createDispatcher(options) {
 
     const findTask = (snapshot, taskId) => (snapshot?.tasks ?? []).find(task => task?.id === taskId);
 
+    /**
+     * A trailing copy marker names the SAME work, not different work. Two copies
+     * of one card must not run at the same time, so the marker is stripped
+     * before cards are compared.
+     */
+    const stripCopySuffix = value => {
+        let text = value;
+        for (let guard = 0; guard < 4; guard += 1) {
+            const next = text.replace(/[(（]\s*(?:副本|cop(?:y|ies))\s*\d*\s*[)）]\s*$/iu, '').trim();
+            if (next === text) return text;
+            text = next;
+        }
+        return text;
+    };
+
+    /** Identity of the work a card asks for: one workspace plus one normalized title. */
+    const targetKeyOf = (title, workspaceId) => {
+        const text = stripCopySuffix(String(title ?? '').replace(/\s+/gu, ' ').trim().toLowerCase());
+        if (text === '') return '';
+        const scope = typeof workspaceId === 'string' && workspaceId !== '' ? workspaceId : '-';
+        return scope + '::' + text;
+    };
+
+    /** Target keys another active dispatch already owns. */
+    const activeTargetKeys = () => {
+        const keys = new Set();
+        for (const record of stateStore.list()) {
+            if (!ACTIVE.has(record.status)) continue;
+            const key = targetKeyOf(record.title, record.workspaceId);
+            if (key !== '') keys.add(key);
+        }
+        return keys;
+    };
+
     const recentHumanDispatchCount = () => {
         const since = now() - 60_000;
         const counted = new Set(['preparing', 'dispatched', 'running', 'settled', 'memory-pending']);
@@ -72,6 +106,7 @@ export function createDispatcher(options) {
             injectMemory: settings.injectMemory,
             memoryLimit: settings.memoryLimit,
             maxDispatchesPerMinute: settings.maxDispatchesPerMinute,
+            staleRunMinutes: settings.staleRunMinutes,
             board: { available: board !== undefined },
             agents: { available: agents.available, ...(agents.code === undefined ? {} : { code: agents.code }), count: agents.members.length },
             memory: { available: memory.available },
@@ -178,6 +213,16 @@ export function createDispatcher(options) {
             }
             const effectiveWorkspaceId = (typeof task.workspaceId === 'string' && task.workspaceId.trim() !== '' ? task.workspaceId.trim() : undefined)
                 ?? member.teamWorkspaceId;
+            if (request.force !== true && request.source !== 'manual') {
+                // Another card asking for the same work in the same workspace is
+                // still active. Leave this one in the todo column and write NO
+                // record, so a later reconcile can dispatch it once the sibling
+                // settles.
+                const targetKey = targetKeyOf(task.title, effectiveWorkspaceId);
+                if (targetKey !== '' && activeTargetKeys().has(targetKey)) {
+                    return { ok: false, code: 'duplicate-target', targetKey };
+                }
+            }
             const requestId = typeof request.requestId === 'string' && request.requestId !== '' ? request.requestId : uuid();
             const started = stateStore.put(taskId, {
                 status: 'preparing',
@@ -347,7 +392,8 @@ export function createDispatcher(options) {
      * board changes (throttled by the mount), and on demand from the tool.
      */
     const reconcile = async (filter = {}, host) => {
-        if (settingsStore.get().enabled !== true) return { ok: false, code: 'disabled', checked: 0 };
+        const settings = settingsStore.get();
+        if (settings.enabled !== true) return { ok: false, code: 'disabled', checked: 0 };
         const board = boardFor();
         if (board === undefined) return { ok: false, code: 'no-task-board', checked: 0 };
         const snapshot = snapshotOf(board);
@@ -355,6 +401,7 @@ export function createDispatcher(options) {
         const records = (filter.taskId === undefined ? stateStore.active() : [stateStore.get(filter.taskId)].filter(Boolean));
         let settled = 0;
         let updated = 0;
+        let reaped = 0;
         for (const record of records) {
             if (record.status === 'awaiting-confirmation') continue;
             const task = findTask(snapshot, record.taskId);
@@ -365,6 +412,31 @@ export function createDispatcher(options) {
             }
             const execution = latestExecution(task);
             if (execution !== undefined) {
+                const open = execution.endedAt === undefined && execution.result === undefined;
+                if (open && record.status === 'running' && settings.staleRunMinutes > 0) {
+                    const age = now() - (record.updatedAt ?? record.createdAt ?? 0);
+                    if (age > settings.staleRunMinutes * 60_000) {
+                        // A run whose session died never settles itself. Close the open
+                        // execution so the card leaves the running column and becomes
+                        // dispatchable again; never claim that run's outcome.
+                        stateStore.put(record.taskId, {
+                            status: 'failed',
+                            error: 'run-stalled: no settle within ' + settings.staleRunMinutes + ' min',
+                        });
+                        reaped += 1;
+                        updated += 1;
+                        // Only now close the open execution: the board notification
+                        // this triggers re-enters reconcile, which must already see a
+                        // terminal record and leave it alone.
+                        try {
+                            await board.apply(uuid(), { kind: 'settle', taskId: record.taskId }, 'marshal-superagent');
+                        }
+                        catch (cause) {
+                            noteError('stale run ' + record.taskId + ' could not be settled: ' + messageOf(cause));
+                        }
+                        continue;
+                    }
+                }
                 if (typeof record.executionId === 'string' && record.executionId !== execution.id) {
                     // A manual rerun replaced the run this record opened; do not
                     // claim its outcome or write its work into the agent's memory.
@@ -396,7 +468,6 @@ export function createDispatcher(options) {
             }
         }
         let dispatched = 0;
-        const settings = settingsStore.get();
         if (filter.taskId === undefined && filter.autoDispatch !== false && settings.autoDispatchTodo === true && inFlight.size === 0) {
             const agents = readAgentsFn();
             if (agents.available === true && agents.members.length > 0) {
@@ -415,7 +486,7 @@ export function createDispatcher(options) {
                 }
             }
         }
-        return { ok: true, checked: records.length, settled, updated, dispatched };
+        return { ok: true, checked: records.length, settled, updated, dispatched, reaped };
     };
 
     return {

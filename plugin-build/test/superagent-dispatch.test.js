@@ -88,6 +88,50 @@ test('upgrade keeps an awaiting-confirmation record intact through startup, noti
     assert.equal(board.actions.length, 0);
 });
 
+test('dispatch: a sibling card for the same work waits instead of running twice at once', async () => {
+    const tasks = [
+        taskFixture({ id: 'task-1', title: '开发 X（副本）' }),
+        taskFixture({ id: 'task-2', title: '开发 X' }),
+    ];
+    const { bridge, board } = setup({ settings: { defaultAgent: '工部尚书' }, tasks });
+    const first = await bridge.humanCreate({ taskId: 'task-1', source: 'board-ui' });
+    assert.equal(first.status, 202);
+    const second = await bridge.humanCreate({ taskId: 'task-2', source: 'board-ui' });
+    assert.equal(second.status, 200);
+    assert.equal(second.body.code, 'duplicate-target');
+    assert.equal(board.actions.filter(entry => entry.action.kind === 'run').length, 1);
+    // No record, so the card stays dispatchable once the sibling settles.
+    assert.equal(bridge.stateStore.get('task-2'), undefined);
+});
+
+test('reconcile: a run whose session died is settled and released instead of staying open', async () => {
+    let clock = 1_800_000_000_000;
+    const now = () => clock;
+    const { bridge, board } = setup({ settings: { defaultAgent: '工部尚书', staleRunMinutes: 30 }, now });
+    await bridge.humanCreate({ taskId: 'task-1', source: 'board-ui' });
+    assert.equal(board.snapshot().tasks[0].status, 'running');
+    clock += 31 * 60_000;
+    const result = await bridge.reconcile('test');
+    assert.equal(result.reaped, 1);
+    const record = bridge.stateStore.get('task-1');
+    assert.equal(record.status, 'failed');
+    assert.match(record.error, /run-stalled/);
+    assert.equal(board.actions.some(entry => entry.action.kind === 'settle'), true);
+    assert.equal(board.snapshot().tasks[0].executions.at(-1).result, 'cancelled');
+});
+
+test('reconcile: a healthy short run is never reaped', async () => {
+    let clock = 1_800_000_000_000;
+    const now = () => clock;
+    const { bridge, board } = setup({ settings: { defaultAgent: '工部尚书', staleRunMinutes: 30 }, now });
+    await bridge.humanCreate({ taskId: 'task-1', source: 'board-ui' });
+    clock += 59_000;
+    const result = await bridge.reconcile('test');
+    assert.equal(result.reaped, 0);
+    assert.equal(bridge.stateStore.get('task-1').status, 'running');
+    assert.equal(board.actions.some(entry => entry.action.kind === 'settle'), false);
+});
+
 test('dispatch: disabled, no-board and no-agent answer without touching the card', async () => {
     const disabled = setup({ settings: { enabled: false, defaultAgent: '工部尚书' } });
     const off = await disabled.bridge.humanCreate({ taskId: 'task-1', source: 'board-ui' });

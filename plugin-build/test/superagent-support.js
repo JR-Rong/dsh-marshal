@@ -76,6 +76,15 @@ export function createFakeBoard(options = {}) {
                 if (task === undefined) throw new Error('task not found');
                 Object.assign(task, action.patch, { updatedAt: 2 });
             }
+            else if (action.kind === 'settle') {
+                const task = find(action.taskId);
+                if (task === undefined) throw new Error('task not found');
+                if (!task.executions.some(execution => execution.endedAt === undefined)) throw new Error('task has no open execution');
+                task.executions = task.executions.map(execution => execution.endedAt === undefined
+                    ? { ...execution, endedAt: 20, result: 'cancelled', error: 'closed manually: no verdict was recorded' }
+                    : execution);
+                task.status = 'todo';
+            }
             else if (action.kind === 'run') {
                 if (failRun !== undefined) throw new Error(failRun);
                 const task = find(action.taskId);

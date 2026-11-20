@@ -44,6 +44,7 @@ export function defaultSettings(now = Date.now()) {
         injectMemory: true,
         memoryLimit: 6,
         maxDispatchesPerMinute: 10,
+        staleRunMinutes: 45,
         updatedAt: now,
     };
 }
@@ -82,6 +83,7 @@ export function normalizeSettings(raw, now = Date.now()) {
         injectMemory: boolean(value.injectMemory, base.injectMemory),
         memoryLimit: integer(value.memoryLimit, base.memoryLimit, 0, 6),
         maxDispatchesPerMinute: integer(value.maxDispatchesPerMinute, base.maxDispatchesPerMinute, 1, 60),
+        staleRunMinutes: integer(value.staleRunMinutes, base.staleRunMinutes, 0, 1440),
         updatedAt: Number.isFinite(value.updatedAt) ? value.updatedAt : now,
     };
 }
