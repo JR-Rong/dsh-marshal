@@ -11,6 +11,9 @@ import { defaultSettings } from '../lib/src/superagent/settings.js';
 import { parseModelJson, VerdictSchema } from '../lib/src/groups/task-plans.js';
 import { createTaskOrchestration, isPermissionBlockedError } from '../lib/src/groups/task-orchestration.js';
 import { createWorkspaceRosters } from '../lib/src/groups/workspace-rosters.js';
+import { createTicketNumbers, withTicketPrefix } from '../lib/src/groups/ticket-numbers.js';
+import { createSessionTitles, isGenericSessionTitle, summarizeFirstMessage } from '../lib/src/groups/session-titles.js';
+import { memoryTargetAllowed } from '../lib/src/memory/http-auth.js';
 import { createLocalBoard } from '../lib/src/groups/local-board.js';
 import { detectAmbiguousTask } from '../lib/src/groups/mount.js';
 import { mountSuperagent } from '../lib/src/superagent/mount.js';
@@ -371,4 +374,94 @@ test('shipped client .19 delivers 4-tab nav, default tasks landing, dual casual-
     assert.ok(source.includes('全局记忆与审批') && source.includes('智能体私有记忆') && source.includes('工作区共享记忆'), 'MemoryPage should render 3 orthogonal layers');
     assert.ok(source.includes('isPseudoAgentWorkspace'), 'client should hide pseudo Agent · workspaces');
     assert.ok(!source.includes('自动创建「Agent · '), 'creating a new agent must no longer create pseudo Agent · workspaces');
+});
+
+
+// --- .20 ticket numbers, session titles & workspace memory auth tests ---
+test('ticket numbers assign monotonic GD-00001 ids chronologically and prefix room titles idempotently', (t) => {
+    const dir = tempRoot();
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const file = join(dir, 'ticket-numbers.json');
+    const nums = createTicketNumbers(file);
+    nums.ensureAll([
+        { id: 'task-b', createdAt: 200 },
+        { id: 'task-a', createdAt: 100 },
+    ]);
+    assert.equal(nums.get('task-a'), 'GD-00001');
+    assert.equal(nums.get('task-b'), 'GD-00002');
+    assert.equal(nums.ensure('task-c'), 'GD-00003');
+    assert.equal(withTicketPrefix('GD-00001', '修复工作区记忆'), '[GD-00001] 修复工作区记忆');
+    assert.equal(withTicketPrefix('GD-00001', '[GD-00001] 修复工作区记忆'), '[GD-00001] 修复工作区记忆');
+
+    const reloaded = createTicketNumbers(file);
+    assert.equal(reloaded.ensure('task-d'), 'GD-00004');
+});
+
+test('session titles summarize first messages, ignore generic machine titles, and honor manual renames', (t) => {
+    const dir = tempRoot();
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const file = join(dir, 'session-titles.json');
+    const titles = createSessionTitles(file);
+
+    assert.equal(isGenericSessionTitle('marshal-agent:丞相-4m5jvl / 丞相'), true);
+    assert.equal(isGenericSessionTitle('丞相 的闲聊会话'), true);
+    assert.equal(isGenericSessionTitle('评审 dsh-agy-native 插件安全性'), false);
+
+    const auto = titles.resolve({
+        sessionId: 'session-1',
+        dshTitle: 'marshal-agent:丞相-4m5jvl / 丞相',
+        firstText: '帮我 review 一下 marshal 的 pr7，看看有没有什么问题',
+        agentName: '丞相',
+    });
+    assert.equal(auto.titleSource, 'auto');
+    assert.match(auto.title, /review.*pr7/i);
+
+    const dshReal = titles.resolve({
+        sessionId: 'session-2',
+        dshTitle: '检查系统日志OOM问题',
+        firstText: '帮我看一下系统日志',
+        agentName: '丞相',
+    });
+    assert.equal(dshReal.title, '检查系统日志OOM问题');
+    assert.equal(dshReal.titleSource, 'dsh');
+
+    titles.setCustom('session-1', 'PR7 架构深度评审');
+    const custom = titles.resolve({
+        sessionId: 'session-1',
+        dshTitle: 'marshal-agent:丞相-4m5jvl / 丞相',
+        firstText: '帮我 review 一下 marshal 的 pr7',
+        agentName: '丞相',
+    });
+    assert.equal(custom.title, 'PR7 架构深度评审');
+    assert.equal(custom.titleSource, 'custom');
+
+    assert.equal(summarizeFirstMessage('【超级智能体派发】\n智能体：丞相\n任务标题：修复内存泄漏'), '修复内存泄漏');
+});
+
+test('memoryTargetAllowed admits owner real DSH workspaces even without pinned agent teams while blocking foreign workspaces', () => {
+    const ownerSession = { owner: true, ownerId: 'owner-a' };
+    const guestSession = { owner: false, ownerId: 'owner-b' };
+    const ledger = {
+        teams: [
+            { id: 't-global', name: 'marshal-agent:丞相', members: [{ id: 'a1' }] },
+            { id: 't-foreign', workspaceId: 'ws-foreign', ownerId: 'owner-b', members: [{ id: 'a2', ownerId: 'owner-b' }] },
+        ],
+    };
+    const registered = [
+        { id: 'ws-real-project', title: 'ChassisControl', path: '/Volumes/SystemDisk/Workspace/ChassisControl' },
+        { id: 'ws-foreign', title: 'Foreign', path: '/tmp/foreign' },
+    ];
+    assert.equal(memoryTargetAllowed(ownerSession, { workspaceId: 'ws-real-project', scope: 'workspace' }, ledger, registered), true);
+    assert.equal(memoryTargetAllowed(ownerSession, { workspaceId: 'ws-foreign', scope: 'workspace' }, ledger, registered), false);
+    assert.equal(memoryTargetAllowed(ownerSession, { workspaceId: 'ws-unknown-bogus', scope: 'workspace' }, ledger, registered), false);
+    assert.equal(memoryTargetAllowed(guestSession, { workspaceId: 'ws-real-project', scope: 'workspace' }, ledger, registered), false);
+    assert.equal(memoryTargetAllowed(guestSession, { workspaceId: 'ws-foreign', scope: 'workspace' }, ledger, registered), true);
+});
+
+test('shipped client .20 exposes session rename/summarize, [GD-00001] ticket numbers, and board flow guide', () => {
+    const source = readFileSync(new URL('../client/index.js', import.meta.url), 'utf8');
+    assert.ok(source.includes("fetchJson('marshal/agents/sessions/rename'"), 'client should allow renaming sessions');
+    assert.ok(source.includes("fetchJson('marshal/agents/sessions/summarize'"), 'client should allow summarizing session titles');
+    assert.ok(source.includes('task.ticketNo'), 'board should render GD ticket numbers');
+    assert.ok(source.includes('流转规则'), 'board should expose status transition guide');
 });

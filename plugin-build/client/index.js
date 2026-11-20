@@ -470,7 +470,10 @@ window.__ModuleLoader__.load({
         setScope(layer);
         setSelected(null);
         setResults(null);
-      }, [layer]);
+        if (layer === 'workspace' && !workspaceId && realWorkspaces.length > 0) {
+          setWorkspaceId(realWorkspaces[0].id);
+        }
+      }, [layer, realWorkspaces]);
 
       const agents = library?.agents ?? [];
       const realWorkspaces = React.useMemo(() => {
@@ -749,6 +752,9 @@ window.__ModuleLoader__.load({
       const [search, setSearch] = React.useState('');
       const [busy, setBusy] = React.useState(false);
       const [error, setError] = React.useState('');
+      const [renamingId, setRenamingId] = React.useState('');
+      const [renameDraft, setRenameDraft] = React.useState('');
+      const [summarizingId, setSummarizingId] = React.useState('');
 
       const load = async () => {
         try {
@@ -784,6 +790,28 @@ window.__ModuleLoader__.load({
         });
       }, [sessions, selectedAgent, search]);
 
+      const saveRename = async sessionId => {
+        if (!sessionId) return;
+        setError('');
+        try {
+          await fetchJson('marshal/agents/sessions/rename', { sessionId, title: renameDraft.trim() });
+          setRenamingId('');
+          setRenameDraft('');
+          await load();
+        }
+        catch (e) { setError('重命名失败：' + (e.message || e)); }
+      };
+      const summarizeTitle = async sessionId => {
+        if (!sessionId || summarizingId) return;
+        setSummarizingId(sessionId);
+        setError('');
+        try {
+          await fetchJson('marshal/agents/sessions/summarize', { sessionId, clearCustom: true });
+          await load();
+        }
+        catch (e) { setError('总结标题失败：' + (e.message || e)); }
+        finally { setSummarizingId(''); }
+      };
       const startNewChat = async agent => {
         if (!agent || busy) return;
         setBusy(true);
@@ -832,15 +860,34 @@ window.__ModuleLoader__.load({
               })
               : filtered.map(item => h('div', {
                 key: item.sessionId,
-                style: { display: 'flex', alignItems: 'center', gap: 12, padding: '10px 14px', borderRadius: 10, border: '1px solid ' + dswTheme.border, background: dswTheme.layer, cursor: 'pointer' },
-                onClick: () => openSession && openSession(item.sessionId),
+                style: { display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px', borderRadius: 10, border: '1px solid ' + dswTheme.border, background: dswTheme.layer, cursor: renamingId === item.sessionId ? 'default' : 'pointer' },
+                onClick: () => { if (renamingId !== item.sessionId) openSession && openSession(item.sessionId); },
               },
                 h(Avatar, { name: item.agentName || '?', size: 30 }),
                 h('div', { style: { flex: 1, minWidth: 0 } },
-                  h('div', { style: { fontSize: 13, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, item.title || '历史会话'),
+                  renamingId === item.sessionId
+                    ? h('div', { style: { display: 'flex', gap: 6, alignItems: 'center' }, onClick: e => e.stopPropagation() },
+                        h('input', {
+                          value: renameDraft,
+                          autoFocus: true,
+                          placeholder: '输入新标题（留空恢复自动标题）',
+                          style: { ...uiInput, flex: 1, padding: '4px 8px', fontSize: 12 },
+                          onChange: e => setRenameDraft(e.target.value),
+                          onKeyDown: e => { if (e.key === 'Enter') void saveRename(item.sessionId); if (e.key === 'Escape') setRenamingId(''); },
+                        }),
+                        h('button', { type: 'button', style: { ...uiButton(true), padding: '4px 9px', fontSize: 11 }, onClick: () => { void saveRename(item.sessionId); } }, '保存'),
+                        h('button', { type: 'button', style: { ...uiButton(false), padding: '4px 8px', fontSize: 11 }, onClick: () => setRenamingId('') }, '取消'))
+                    : h('div', { style: { display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 } },
+                        h('span', { style: { fontSize: 13, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: item.title }, item.title || '历史会话'),
+                        item.titleSource === 'custom' && h('span', { style: { fontSize: 10, color: dswTheme.faint, border: '1px solid ' + dswTheme.border, borderRadius: 999, padding: '1px 6px', flexShrink: 0 } }, '已重命名'),
+                        item.titleSource === 'auto' && h('span', { style: { fontSize: 10, color: dswTheme.faint, border: '1px solid ' + dswTheme.border, borderRadius: 999, padding: '1px 6px', flexShrink: 0 } }, '自动总结'),
+                        item.archived && h('span', { style: { fontSize: 10, color: dswTheme.faint, border: '1px solid ' + dswTheme.border, borderRadius: 999, padding: '1px 6px', flexShrink: 0 } }, '已归档')),
                   h('div', { style: { fontSize: 11, color: dswTheme.faint, marginTop: 3 } },
                     [item.agentName || '智能体', formatSessionTime(item.updatedAt || item.createdAt), item.sessionId.slice(0, 8)].filter(Boolean).join(' · '))),
-                h('button', { type: 'button', style: uiButton(false), onClick: event => { event.stopPropagation(); openSession && openSession(item.sessionId); } }, '打开会话'))))));
+                renamingId !== item.sessionId && h('div', { style: { display: 'flex', gap: 6, flexShrink: 0 }, onClick: e => e.stopPropagation() },
+                  h('button', { type: 'button', title: '手动重命名', style: { ...uiButton(false), padding: '5px 8px', fontSize: 11 }, onClick: () => { setRenamingId(item.sessionId); setRenameDraft(item.title || ''); } }, '重命名'),
+                  h('button', { type: 'button', title: '根据会话首句重新总结标题', disabled: summarizingId === item.sessionId, style: { ...uiButton(false), padding: '5px 8px', fontSize: 11 }, onClick: () => { void summarizeTitle(item.sessionId); } }, summarizingId === item.sessionId ? '总结中…' : '✨ 总结'),
+                  h('button', { type: 'button', style: { ...uiButton(false), padding: '5px 10px', fontSize: 11 }, onClick: () => openSession && openSession(item.sessionId) }, '打开')))))));
     }
 
     function DeviceStatusDrawer({ open, onClose, status, onRefresh, onOpenRemote }) {
@@ -2281,6 +2328,7 @@ window.__ModuleLoader__.load({
       const [dragTaskId, setDragTaskId] = React.useState('');
       const [dropCol, setDropCol] = React.useState('');
       const [compactCards, setCompactCards] = React.useState(false);
+      const [showFlowGuide, setShowFlowGuide] = React.useState(false);
       const [showArchive, setShowArchive] = React.useState(false);
       const [activeTag, setActiveTag] = React.useState('');
       const [searchQuery, setSearchQuery] = React.useState('');
@@ -2344,7 +2392,7 @@ window.__ModuleLoader__.load({
       const list = allActive.filter(task => {
         if (activeTag && !(task.tags ?? []).some(tag => tag.name === activeTag)) return false;
         if (q) {
-          const hay = [task.title, task.description, ...(task.tags ?? []).map(t => t.name)].filter(Boolean).join(' ').toLowerCase();
+          const hay = [task.ticketNo, task.title, task.description, ...(task.tags ?? []).map(t => t.name)].filter(Boolean).join(' ').toLowerCase();
           if (!hay.includes(q)) return false;
         }
         return true;
@@ -2949,8 +2997,13 @@ window.__ModuleLoader__.load({
           style: { '--mtb-accent': column.accent },
         },
           h('div', { className: 'mtb-card-title-row' },
+            task.ticketNo && h('span', {
+              className: 'mtb-card-kind',
+              style: { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', letterSpacing: '.02em' },
+              title: '工单号 ' + task.ticketNo,
+            }, '[' + task.ticketNo + ']'),
             parsedTitle.kind && h('span', { className: 'mtb-card-kind' }, parsedTitle.kind),
-            h('span', { className: 'mtb-card-title', title: task.title }, parsedTitle.text)),
+            h('span', { className: 'mtb-card-title', title: (task.ticketNo ? '[' + task.ticketNo + '] ' : '') + task.title }, parsedTitle.text)),
           !compactCards && Array.isArray(task.tags) && task.tags.length > 0 && h('div', { className: 'mtb-card-tags' },
             task.tags.map(tag => h('span', {
               key: tag.name,
@@ -2976,10 +3029,18 @@ window.__ModuleLoader__.load({
               isRunning && h('span', { className: 'mtb-spinner', 'aria-hidden': 'true' }),
               task.status === 'review' && canMove && h('button', {
                 type: 'button',
+                className: 'mtb-icon-pill',
+                disabled: busy,
+                title: '退回待办重新修改或重跑',
+                onClick: event => { event.stopPropagation(); void move(task, 'todo'); },
+              }, '↩ 待办'),
+              task.status === 'review' && canMove && h('button', {
+                type: 'button',
                 className: 'mtb-icon-pill mtb-icon-pill-confirm',
                 disabled: busy,
+                title: '确认验收完成并移入已完成',
                 onClick: event => { event.stopPropagation(); void move(task, 'done'); },
-              }, '确认'),
+              }, '✓ 确认'),
               h('button', {
                 type: 'button',
                 className: 'mtb-icon-pill',
@@ -3097,6 +3158,7 @@ window.__ModuleLoader__.load({
           h('aside', { className: 'mtb-drawer', 'aria-label': '卡片详情', style: { '--mtb-accent': selectedColumn.accent } },
             h('div', { className: 'mtb-drawer-head' },
               h('span', { className: 'mtb-dot', 'data-pulse': selectedColumn.pulse && !archived ? 'true' : undefined }),
+              task.ticketNo && h('span', { style: { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 11, fontWeight: 600, padding: '2px 7px', borderRadius: 6, border: '1px solid ' + dswTheme.border2, background: dswTheme.layer } }, '[' + task.ticketNo + ']'),
               h('strong', { style: { fontSize: 13, flex: 1 } }, archived ? '已归档 · ' + selectedColumn.label : selectedColumn.label),
               canMove && h('select', {
                 'aria-label': '切换状态',
@@ -3342,6 +3404,7 @@ window.__ModuleLoader__.load({
           h('div', { className: 'mtb-head-right' },
             archivedTasks.length > 0 && h('button', { type: 'button', style: tabStyle(showArchive), onClick: () => setShowArchive(v => !v) },
               showArchive ? '返回看板' : '归档 (' + archivedTasks.length + ')'),
+            !showArchive && h('button', { type: 'button', style: tabStyle(showFlowGuide), onClick: () => setShowFlowGuide(v => !v), title: '查看工单 6 列状态流转规则' }, '流转规则'),
             !showArchive && h('button', { type: 'button', style: uiButton(false), onClick: () => setCompactCards(v => !v) }, compactCards ? '展开卡片' : '紧凑视图'),
             openNativeBoard && h('button', { type: 'button', style: uiButton(false), onClick: () => openNativeBoard(), title: '切换到 DSH 原版任务看板' }, '原版看板'),
             h('button', { type: 'button', className: 'mtb-btn mtb-btn-ai', style: { padding: '6px 11px' }, onClick: () => { setParseError(''); setParseOpen(true); } }, '✨ AI 解析任务'),
@@ -3371,6 +3434,13 @@ window.__ModuleLoader__.load({
             onClick: () => setActiveTag(current => current === tag.name ? '' : tag.name),
           }, tag.name))),
 
+        showFlowGuide && h('div', { style: { margin: '0 20px 8px', padding: '10px 14px', borderRadius: 10, border: '1px solid ' + dswTheme.border, background: dswTheme.layer, fontSize: 12, lineHeight: 1.65, display: 'grid', gap: 4 } },
+          h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between' } },
+            h('strong', null, '工单状态流转规则'),
+            h('button', { type: 'button', className: 'mtb-icon-btn', onClick: () => setShowFlowGuide(false) }, '✕')),
+          h('div', { style: { color: dswTheme.dim } }, '主链路：待规划 (backlog) → 待办 (todo) → 进行中 (running) → 待确认 (review) → 已完成 (done) / 已失败 (failed)'),
+          h('div', { style: { color: dswTheme.dim } }, '• 自动入「待确认」：描述模糊拦截 / 非定时工单执行完成待验收 / 派驻工作区权限受阻挂起'),
+          h('div', { style: { color: dswTheme.dim } }, '• 人工拍板：「待确认」点「✓ 确认」→ 已完成，点「↩ 待办」或直接运行 → 退回修改/重跑；「已失败」可修后重试。')),
         notice && h('div', { className: 'mtb-notice', role: 'status' },
           h('span', null, notice),
           h('button', { type: 'button', className: 'mtb-icon-btn', onClick: () => setNotice('') }, '✕')),
@@ -3434,7 +3504,7 @@ window.__ModuleLoader__.load({
             topLevelParents.length > 0 && h(Field, { label: '关联父任务（设为子任务）' },
               h('select', { value: formParentId, style: uiInput, onChange: event => setFormParentId(event.target.value) },
                 h('option', { value: '' }, '独立任务（无父任务）'),
-                topLevelParents.map(item => h('option', { key: item.id, value: item.id }, item.title)))),
+                topLevelParents.map(item => h('option', { key: item.id, value: item.id }, (item.ticketNo ? '[' + item.ticketNo + '] ' : '') + item.title)))),
             workspaces.length > 0 && h(Field, { label: orchestrationMode === 'plain' ? '目标工作区（可选）' : '目标项目工作区（必填）' },
               h('select', { value: workspaceId, style: uiInput, onChange: event => handleSelectWorkspace(event.target.value) },
                 h('option', { value: '' }, orchestrationMode === 'plain' ? '不绑定工作区' : '请选择项目工作区'),
@@ -3606,8 +3676,9 @@ window.__ModuleLoader__.load({
         let alive = true;
         void fetchJson(prefix + 'workspaces', undefined, true).then(data => {
           if (!alive) return;
-          setWorkspaces(data.workspaces);
-          setWorkspace(current => current || (data.workspaces.length === 1 ? data.workspaces[0].id : ''));
+          const filteredWs = (data.workspaces || []).filter(ws => !isPseudoAgentWorkspace(ws) || ws.id === (bound?.workspaceId ?? task?.workflow?.workspaceId));
+          setWorkspaces(filteredWs);
+          setWorkspace(current => current || (filteredWs.length === 1 ? filteredWs[0].id : ''));
         }).catch(e => { if (alive) setError(e.message); });
         void fetchJson('marshal/tasks/orchestration', undefined, true)
           .then(data => { if (alive) setLeaders(data.leaders ?? []); }).catch(() => {});
@@ -3799,6 +3870,9 @@ window.__ModuleLoader__.load({
       const [quick, setQuick] = React.useState('');
       const [quickBusy, setQuickBusy] = React.useState(false);
       const [chatBusy, setChatBusy] = React.useState(false);
+      const [renamingSessionId, setRenamingSessionId] = React.useState('');
+      const [renameSessionDraft, setRenameSessionDraft] = React.useState('');
+      const [summarizingSessionId, setSummarizingSessionId] = React.useState('');
 
       React.useEffect(() => {
         if (initialSubTab === 'rosters' || initialSubTab === 'pool') setSubTab(initialSubTab);
@@ -3972,6 +4046,28 @@ window.__ModuleLoader__.load({
         finally { setQuickBusy(false); }
       };
 
+      const saveSessionRename = async sessionId => {
+        if (!sessionId) return;
+        setError('');
+        try {
+          await fetchJson('marshal/agents/sessions/rename', { sessionId, title: renameSessionDraft.trim() });
+          setRenamingSessionId('');
+          setRenameSessionDraft('');
+          await load();
+        }
+        catch (e) { setError('重命名失败：' + (e.message || e)); }
+      };
+      const summarizeSessionTitle = async sessionId => {
+        if (!sessionId || summarizingSessionId) return;
+        setSummarizingSessionId(sessionId);
+        setError('');
+        try {
+          await fetchJson('marshal/agents/sessions/summarize', { sessionId, clearCustom: true });
+          await load();
+        }
+        catch (e) { setError('总结标题失败：' + (e.message || e)); }
+        finally { setSummarizingSessionId(''); }
+      };
       const startCasualChat = async (agent) => {
         if (!agent || chatBusy) return;
         setChatBusy(true);
@@ -4151,13 +4247,31 @@ window.__ModuleLoader__.load({
                       : h('div', { style: { display: 'grid', gap: 6, maxHeight: 320, overflow: 'auto' } },
                           agentSessions.map(item => h('div', {
                             key: item.sessionId,
-                            style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, padding: '8px 10px', borderRadius: 8, border: '1px solid ' + dswTheme.border, cursor: 'pointer' },
-                            onClick: () => openSession && openSession(item.sessionId),
+                            style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '8px 10px', borderRadius: 8, border: '1px solid ' + dswTheme.border, cursor: renamingSessionId === item.sessionId ? 'default' : 'pointer' },
+                            onClick: () => { if (renamingSessionId !== item.sessionId) openSession && openSession(item.sessionId); },
                           },
-                            h('div', { style: { minWidth: 0 } },
-                              h('div', { style: { fontSize: 12, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, item.title || '历史闲聊'),
+                            h('div', { style: { flex: 1, minWidth: 0 } },
+                              renamingSessionId === item.sessionId
+                                ? h('div', { style: { display: 'flex', gap: 6, alignItems: 'center' }, onClick: e => e.stopPropagation() },
+                                    h('input', {
+                                      value: renameSessionDraft,
+                                      autoFocus: true,
+                                      placeholder: '输入新标题（留空恢复自动标题）',
+                                      style: { ...uiInput, flex: 1, padding: '4px 8px', fontSize: 12 },
+                                      onChange: e => setRenameSessionDraft(e.target.value),
+                                      onKeyDown: e => { if (e.key === 'Enter') void saveSessionRename(item.sessionId); if (e.key === 'Escape') setRenamingSessionId(''); },
+                                    }),
+                                    h('button', { type: 'button', style: { ...uiButton(true), padding: '4px 8px', fontSize: 11 }, onClick: () => { void saveSessionRename(item.sessionId); } }, '保存'),
+                                    h('button', { type: 'button', style: { ...uiButton(false), padding: '4px 7px', fontSize: 11 }, onClick: () => setRenamingSessionId('') }, '取消'))
+                                : h('div', { style: { display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 } },
+                                    h('span', { style: { fontSize: 12, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: item.title }, item.title || '历史闲聊'),
+                                    item.titleSource === 'custom' && h('span', { style: { fontSize: 10, color: dswTheme.faint, border: '1px solid ' + dswTheme.border, borderRadius: 999, padding: '0 5px', flexShrink: 0 } }, '已重命名'),
+                                    item.titleSource === 'auto' && h('span', { style: { fontSize: 10, color: dswTheme.faint, border: '1px solid ' + dswTheme.border, borderRadius: 999, padding: '0 5px', flexShrink: 0 } }, '自动总结')),
                               h('div', { style: { fontSize: 10, color: dswTheme.faint, marginTop: 2 } }, [formatSessionTime(item.updatedAt || item.createdAt), item.sessionId.slice(0, 8)].filter(Boolean).join(' · '))),
-                            h('button', { type: 'button', style: uiButton(false), onClick: event => { event.stopPropagation(); openSession && openSession(item.sessionId); } }, '打开')))))))),
+                            renamingSessionId !== item.sessionId && h('div', { style: { display: 'flex', gap: 5, flexShrink: 0 }, onClick: e => e.stopPropagation() },
+                              h('button', { type: 'button', title: '重命名', style: { ...uiButton(false), padding: '4px 7px', fontSize: 11 }, onClick: () => { setRenamingSessionId(item.sessionId); setRenameSessionDraft(item.title || ''); } }, '重命名'),
+                              h('button', { type: 'button', title: '总结标题', disabled: summarizingSessionId === item.sessionId, style: { ...uiButton(false), padding: '4px 7px', fontSize: 11 }, onClick: () => { void summarizeSessionTitle(item.sessionId); } }, summarizingSessionId === item.sessionId ? '…' : '✨'),
+                              h('button', { type: 'button', style: { ...uiButton(false), padding: '4px 9px', fontSize: 11 }, onClick: () => openSession && openSession(item.sessionId) }, '打开'))))))))),
 
         subTab === 'rosters' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' } },
           h('div', { style: { margin: '12px 20px 0', padding: '10px 14px', border: '1px solid ' + dswTheme.border, borderRadius: 12, background: dswTheme.layer, display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 } },

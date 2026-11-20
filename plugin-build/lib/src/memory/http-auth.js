@@ -1,5 +1,7 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { agentsLedgerPath } from '../groups/inventory.js';
 import { atomicWriteFile, withFileLock } from '../hub/state-file.js';
 
@@ -127,8 +129,28 @@ export function readRawLedger(env = process.env) {
     catch { return { teams: [] }; }
 }
 
-/** Agent and workspace ids must belong to the session. Unstamped rows belong to the install owner only. */
-export function memoryTargetAllowed(session, target, ledger) {
+export function readRegisteredWorkspaces(env = process.env) {
+    const home = env.DSH_HOME || join(homedir(), '.dsh');
+    try {
+        const parsed = JSON.parse(readFileSync(join(home, 'storages', 'workspace.json'), 'utf8'));
+        const table = parsed?.tables?.workspaces;
+        if (!table || typeof table !== 'object') return [];
+        const out = [];
+        for (const [id, info] of Object.entries(table)) {
+            if (!id || !info || typeof info !== 'object') continue;
+            out.push({
+                id,
+                title: typeof info.title === 'string' ? info.title : '',
+                path: typeof info.path === 'string' ? info.path : '',
+            });
+        }
+        return out;
+    }
+    catch { return []; }
+}
+
+/** Agent and workspace ids must belong to the session. Unstamped rows and local DSH workspaces belong to the install owner only. */
+export function memoryTargetAllowed(session, target, ledger, registeredWorkspaces) {
     if (session === undefined || session === null) return false;
     const scope = target?.scope;
     if (scope === 'global' || target?.global === true) return session.owner === true;
@@ -136,14 +158,25 @@ export function memoryTargetAllowed(session, target, ledger) {
     const workspaceId = typeof target?.workspaceId === 'string' ? target.workspaceId : '';
     const agents = [];
     const workspaces = new Set();
+    const foreignWorkspaces = new Set();
     for (const team of Array.isArray(ledger?.teams) ? ledger.teams : []) {
         const teamStamp = stampOf(team);
         const teamAllowed = teamStamp !== undefined ? teamStamp === session.ownerId : session.owner === true;
-        if (teamAllowed && typeof team?.workspaceId === 'string' && team.workspaceId !== '') workspaces.add(team.workspaceId);
+        if (typeof team?.workspaceId === 'string' && team.workspaceId !== '') {
+            if (teamAllowed) workspaces.add(team.workspaceId);
+            else foreignWorkspaces.add(team.workspaceId);
+        }
         for (const member of Array.isArray(team?.members) ? team.members : []) {
             const memberStamp = stampOf(member) ?? teamStamp;
             const allowed = memberStamp !== undefined ? memberStamp === session.ownerId : session.owner === true;
             if (allowed && typeof member?.id === 'string' && member.id !== '') agents.push(member.id);
+        }
+    }
+    if (session.owner === true) {
+        const list = Array.isArray(registeredWorkspaces) ? registeredWorkspaces : readRegisteredWorkspaces();
+        for (const ws of list) {
+            const id = typeof ws === 'string' ? ws : ws?.id;
+            if (typeof id === 'string' && id !== '' && !foreignWorkspaces.has(id)) workspaces.add(id);
         }
     }
     if (agentId !== '' && !agents.includes(agentId)) return false;
@@ -152,7 +185,7 @@ export function memoryTargetAllowed(session, target, ledger) {
     return true;
 }
 
-export function createMemoryHttpAuth({ now = Date.now, resolveOwner = async () => '', installOwner, loadLedger = readRawLedger, allowedOrigins = ['dsh-app://app'], absoluteMs = MEMORY_SESSION_ABSOLUTE_MS, idleMs = MEMORY_SESSION_IDLE_MS, trustedRequest } = {}) {
+export function createMemoryHttpAuth({ now = Date.now, resolveOwner = async () => '', installOwner, loadLedger = readRawLedger, loadWorkspaces = readRegisteredWorkspaces, allowedOrigins = ['dsh-app://app'], absoluteMs = MEMORY_SESSION_ABSOLUTE_MS, idleMs = MEMORY_SESSION_IDLE_MS, trustedRequest } = {}) {
     const sessions = new Map();
     const token = () => randomBytes(32).toString('base64url');
     const expectedOwner = async () => {
@@ -234,8 +267,9 @@ export function createMemoryHttpAuth({ now = Date.now, resolveOwner = async () =
             session.lastSeenAt = at;
             return { ok: true, session };
         },
+        loadWorkspaces,
         allows(session, target, ledger = loadLedger()) {
-            return memoryTargetAllowed(session, target, ledger);
+            return memoryTargetAllowed(session, target, ledger, loadWorkspaces());
         },
     };
 }

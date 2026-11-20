@@ -14,6 +14,8 @@ import { createTaskRoomStore, TaskRoomKey } from './task-room-store.js';
 import { createTaskRoomRoutes, taskRoomAccess, taskRoomAudit, visibleTaskRoom } from './task-room-routes.js';
 import { createTaskOrchestration, isPermissionBlockedError } from './task-orchestration.js';
 import { createWorkspaceRosters } from './workspace-rosters.js';
+import { createTicketNumbers, withTicketPrefix } from './ticket-numbers.js';
+import { createSessionTitles, readProjcacheSession, readWorkspaceRegistry, summarizeFirstMessage } from './session-titles.js';
 import { dashboardAddress } from '../sidebar.js';
 import { createDiscussionPort } from '../discussions/ports.js';
 import { createAgentsHttpClient, agentToolDefinitions } from './agent-tools.js';
@@ -221,21 +223,23 @@ function normalizeAttachmentsPayload(raw) {
     return out.length > 0 ? out : undefined;
 }
 
-function taskView(task, workflow, room) {
+function taskView(task, workflow, room, ticketNumbers) {
     const executions = Array.isArray(task.executions) ? task.executions : [];
     const latest = executions.length > 0 ? executions[executions.length - 1] : undefined;
     const openExecution = executions.some(item => item && item.endedAt === undefined);
     const tags = normalizeCardTags(task.tags);
     const attachments = normalizeAttachmentsPayload(task.attachments);
+    const ticketNo = ticketNumbers?.get?.(task.id) ?? ticketNumbers?.ensure?.(task.id);
     return {
         id: task.id,
+        ...(ticketNo ? { ticketNo } : {}),
         title: task.title,
         status: room?.closed ? 'done' : workflow === undefined || workflow.state === 'ready' ? task.status
             : workflow.state === 'running' || workflow.state === 'handed-off' ? 'running'
             : workflow.state === 'permission-blocked' ? 'review'
             : workflow.state === 'done' ? (room ? 'review' : 'done') : 'failed',
         ...(workflow === undefined ? {} : { workflow }),
-        ...(room === undefined ? {} : { taskRoom: visibleTaskRoom(room) }),
+        ...(room === undefined ? {} : { taskRoom: visibleTaskRoom(room, ticketNumbers) }),
         ...(task.description === undefined ? {} : { description: task.description }),
         ...(task.prompt === undefined ? {} : { prompt: task.prompt }),
         ...(task.parentId === undefined ? {} : { parentId: task.parentId }),
@@ -275,7 +279,7 @@ function taskView(task, workflow, room) {
 }
 
 function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, memory, auth, allowedOrigins, orchestration, rooms, extras = {}) {
-    const { rosters, sessionController, config } = extras;
+    const { rosters, ticketNumbers, sessionTitles, sessionController, config, llm, readDefaultModel } = extras;
     const authenticate = (req, write = false) => auth.authenticate(req, { write, origins: allowedOrigins() });
     const allowed = (access, target, ledger) => access.ok && auth.allows(access.session, {
         agentId: target.agentId, workspaceId: target.workspaceId,
@@ -291,16 +295,18 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
     const taskList = (snapshot, req, source) => {
         const access = authenticate(req);
         const ledger = access.ok ? auth.loadLedger() : undefined;
-        return (Array.isArray(snapshot.tasks) ? snapshot.tasks : []).flatMap(task => {
+        const rawTasks = Array.isArray(snapshot.tasks) ? snapshot.tasks : [];
+        ticketNumbers?.ensureAll?.(rawTasks);
+        return rawTasks.flatMap(task => {
             const target = orchestration?.target(source, task.id);
             const room = rooms?.find(source, task.id);
             if (room && !taskRoomAccess(access, room, allowed, ledger)) return [];
             if (target && !allowed(access, { workspaceId: target.workspaceId }, ledger)) return [];
-            return [taskView(task, target ? orchestration.view(source, task.id) : undefined, room)];
+            return [taskView(task, target ? orchestration.view(source, task.id) : undefined, room, ticketNumbers)];
         });
     };
     const roomRoutes = createTaskRoomRoutes({ exact, write, readBody, authenticate, allowed, auth, rooms,
-        orchestration, getBoard, boardSource, getInitiator: () => initiator.replace(/^marshal:/, '') });
+        orchestration, getBoard, boardSource, getInitiator: () => initiator.replace(/^marshal:/, ''), ticketNumbers });
     return [
         ...roomRoutes.routes,
         exact('GET', '/marshal/health', async (req, res) => {
@@ -468,7 +474,8 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
                 }
                 try {
                     if (prepared) orchestration.attach(source, created.id, prepared);
-                    rooms.ensure(source, created, scope.workspaceId, scope.ownerId);
+                    const ticketNo = ticketNumbers?.ensure?.(created.id);
+                    rooms.ensure(source, ticketNo ? { ...created, title: withTicketPrefix(ticketNo, created.title) } : created, scope.workspaceId, scope.ownerId);
                 }
                 catch {
                     if (prepared) {
@@ -516,7 +523,8 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
                     return;
                 }
                 const access = authenticate(req, true);
-                const room = boundRoom ?? rooms?.ensure(source, task, workflow.workspaceId, access.session.ownerId);
+                const runTicketNo = ticketNumbers?.ensure?.(task.id);
+                const room = boundRoom ?? rooms?.ensure(source, runTicketNo ? { ...task, title: withTicketPrefix(runTicketNo, task.title) } : task, workflow.workspaceId, access.session.ownerId);
                 if (!room || !taskRoomAccess(access, room, allowed)) {
                     write(res, 403, { ok: false, code: 'workspace-forbidden' });
                     return;
@@ -810,54 +818,175 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             const filterAgentId = url.searchParams.get('agentId') || '';
             const filterTeamId = url.searchParams.get('teamId') || '';
             let rawRuns = [];
-            let teamsById = new Map();
+            const teamsById = new Map();
+            const agentByName = new Map();
+            const agentByWorkspace = new Map();
             try {
                 const parsed = JSON.parse(readFileSync(agentsLedgerPath(), 'utf8'));
                 if (Array.isArray(parsed?.runs)) rawRuns = parsed.runs;
                 for (const t of Array.isArray(parsed?.teams) ? parsed.teams : []) {
-                    if (t?.id) teamsById.set(t.id, t);
+                    if (!t?.id) continue;
+                    teamsById.set(t.id, t);
+                    for (const m of Array.isArray(t.members) ? t.members : []) {
+                        if (m?.name && !agentByName.has(m.name)) agentByName.set(m.name, { team: t, member: m });
+                        if (t.workspaceId && !agentByWorkspace.has(t.workspaceId)) agentByWorkspace.set(t.workspaceId, { team: t, member: m });
+                    }
                 }
             } catch { /* empty ledger */ }
             const sessionMeta = new Map();
             try {
-                const listed = typeof sessionController?.list === 'function' ? await sessionController.list() : undefined;
-                const rows = Array.isArray(listed) ? listed : Array.isArray(listed?.sessions) ? listed.sessions : [];
-                for (const s of rows) {
-                    const sid = s?.id ?? s?.sessionId;
-                    if (typeof sid === 'string' && sid) {
-                        sessionMeta.set(sid, {
-                            title: typeof s.title === 'string' ? s.title : '',
-                            updatedAt: typeof s.updatedAt === 'number' ? s.updatedAt : undefined,
-                            cwd: typeof s.cwd === 'string' ? s.cwd : undefined,
-                        });
+                if (typeof sessionController?.list === 'function') {
+                    let cursor;
+                    for (let page = 0; page < 20; page++) {
+                        const listed = await sessionController.list(cursor === undefined ? {} : { cursor });
+                        const rows = Array.isArray(listed) ? listed : Array.isArray(listed?.items) ? listed.items : Array.isArray(listed?.sessions) ? listed.sessions : [];
+                        for (const s of rows) {
+                            const sid = s?.sessionId ?? s?.id;
+                            if (typeof sid === 'string' && sid) {
+                                sessionMeta.set(sid, {
+                                    title: typeof s.title === 'string' ? s.title : (typeof s?.projections?.values?.title === 'string' ? s.projections.values.title : ''),
+                                    updatedAt: typeof s.updatedAt === 'number' ? s.updatedAt : undefined,
+                                    cwd: typeof s.cwd === 'string' ? s.cwd : undefined,
+                                });
+                            }
+                        }
+                        if (!listed?.nextCursor || listed.nextCursor === cursor) break;
+                        cursor = listed.nextCursor;
                     }
                 }
             } catch { /* session listing optional */ }
             const seen = new Set();
             const sessions = [];
+            const pushSession = ({ sessionId, teamId, memberId, agentName, workspaceId, createdAt, status, fallbackTitle, archived = false }) => {
+                if (!sessionId || seen.has(sessionId)) return;
+                if (filterAgentId && memberId !== filterAgentId) return;
+                if (filterTeamId && teamId !== filterTeamId) return;
+                seen.add(sessionId);
+                const meta = sessionMeta.get(sessionId);
+                const pc = readProjcacheSession(sessionId);
+                const effectiveCreated = createdAt || pc?.createdAt || 0;
+                const effectiveUpdated = meta?.updatedAt ?? effectiveCreated;
+                const resolved = sessionTitles
+                    ? sessionTitles.resolve({
+                        sessionId,
+                        dshTitle: pc?.title || meta?.title || '',
+                        firstText: pc?.firstText || '',
+                        agentName,
+                        fallbackTitle,
+                        createdAt: effectiveCreated,
+                    })
+                    : { title: pc?.title || meta?.title || fallbackTitle || (agentName ? agentName + ' · 闲聊' : '历史会话'), titleSource: 'dsh' };
+                sessions.push({
+                    sessionId,
+                    teamId: teamId || '',
+                    memberId: memberId || '',
+                    agentName: agentName || '',
+                    workspaceId: workspaceId || '',
+                    title: resolved.title,
+                    titleSource: resolved.titleSource,
+                    hasPreview: Boolean(pc?.firstText),
+                    archived,
+                    createdAt: effectiveCreated,
+                    updatedAt: effectiveUpdated,
+                    status: status || '',
+                });
+            };
             for (const run of rawRuns) {
                 if (!run || typeof run.sessionId !== 'string' || !run.sessionId) continue;
-                if (filterAgentId && run.memberId !== filterAgentId) continue;
-                if (filterTeamId && run.teamId !== filterTeamId) continue;
-                if (seen.has(run.sessionId)) continue;
-                seen.add(run.sessionId);
                 const team = teamsById.get(run.teamId);
                 const member = (team?.members ?? []).find(m => m.id === run.memberId);
-                const meta = sessionMeta.get(run.sessionId);
-                sessions.push({
+                pushSession({
                     sessionId: run.sessionId,
                     teamId: run.teamId,
                     memberId: run.memberId,
                     agentName: member?.name ?? run.memberName ?? '',
                     workspaceId: team?.workspaceId ?? '',
-                    title: meta?.title || run.title || (member?.name ? member.name + ' 的闲聊会话' : '历史会话'),
                     createdAt: typeof run.createdAt === 'number' ? run.createdAt : 0,
-                    updatedAt: meta?.updatedAt ?? (typeof run.updatedAt === 'number' ? run.updatedAt : (typeof run.createdAt === 'number' ? run.createdAt : 0)),
                     status: run.status ?? '',
+                    fallbackTitle: run.title,
                 });
+            }
+            // Merge historical sessions stored under legacy "Agent · <name>" workspaces so zero casual chats are lost
+            const wsReg = readWorkspaceRegistry();
+            for (const ws of wsReg.workspaces) {
+                const match = /^Agent\s*·\s*(.+)$/.exec(ws.title.trim());
+                const owner = agentByWorkspace.get(ws.id) ?? (match ? agentByName.get(match[1].trim()) : undefined);
+                if (!owner) continue;
+                for (const sid of ws.sessionIds) {
+                    pushSession({
+                        sessionId: sid,
+                        teamId: owner.team.id,
+                        memberId: owner.member.id,
+                        agentName: owner.member.name,
+                        workspaceId: ws.id,
+                        createdAt: 0,
+                        archived: wsReg.archived.has(sid),
+                    });
+                }
             }
             sessions.sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0));
             write(res, 200, { ok: true, sessions });
+        }),
+        exact('POST', '/marshal/agents/sessions/rename', async (req, res) => {
+            if (!sessionTitles) { write(res, 503, { ok: false, code: 'titles-unavailable' }); return; }
+            const body = await readBody(req);
+            const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';
+            if (!sessionId) { write(res, 400, { ok: false, code: 'invalid-session' }); return; }
+            const title = typeof body.title === 'string' ? body.title.trim() : '';
+            const saved = sessionTitles.setCustom(sessionId, title);
+            write(res, 200, { ok: true, sessionId, title: saved.custom ?? saved.auto ?? '', titleSource: saved.custom ? 'custom' : 'auto' });
+        }),
+        exact('POST', '/marshal/agents/sessions/summarize', async (req, res) => {
+            if (!sessionTitles) { write(res, 503, { ok: false, code: 'titles-unavailable' }); return; }
+            const body = await readBody(req);
+            const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';
+            if (!sessionId) { write(res, 400, { ok: false, code: 'invalid-session' }); return; }
+            const pc = readProjcacheSession(sessionId);
+            let sourceText = pc?.firstText || '';
+            if (!sourceText && typeof sessionController?.follow === 'function') {
+                try {
+                    const it = sessionController.follow({ address: { kind: 'session', sessionId }, maxMessages: 8 }, AbortSignal.timeout(3000))[Symbol.asyncIterator]();
+                    const snap = await it.next();
+                    await it.return?.();
+                    const records = Array.isArray(snap?.value?.records) ? snap.value.records : [];
+                    for (const rec of records) {
+                        const ev = rec?.event;
+                        if (ev?.type === 'user/message') {
+                            const content = ev?.data?.content ?? ev?.data?.message?.content;
+                            if (typeof content === 'string' && content.trim()) { sourceText = content; break; }
+                            if (Array.isArray(content)) {
+                                const joined = content.filter(p => p?.type === 'text' && typeof p.text === 'string').map(p => p.text).join(' ').trim();
+                                if (joined) { sourceText = joined; break; }
+                            }
+                        }
+                    }
+                } catch { /* fallback below */ }
+            }
+            let generated = '';
+            if (sourceText && llm && typeof llm.prepareCall === 'function') {
+                try {
+                    const sel = typeof readDefaultModel === 'function' ? readDefaultModel() : undefined;
+                    if (sel?.provider && sel?.model) {
+                        const call = await llm.prepareCall({
+                            provider: sel.provider,
+                            model: sel.model,
+                            system: '你是会话标题助手。根据用户首句需求，总结一个 8~18 字的简洁中文标题，只输出标题本身，不要引号、编号或解释。',
+                            messages: [{ role: 'user', content: sourceText.slice(0, 1200) }],
+                            maxTokens: 48,
+                        }, AbortSignal.timeout(12000));
+                        const text = typeof call?.text === 'string' ? call.text.trim() : '';
+                        if (text) generated = text.replace(/^["'「『【]+|["'」』】]+$/g, '').replace(/\s+/g, ' ').slice(0, 40);
+                    }
+                } catch { /* fallback to deterministic summarizer */ }
+            }
+            if (!generated) generated = summarizeFirstMessage(sourceText || pc?.title || '');
+            if (!generated) {
+                write(res, 200, { ok: true, sessionId, title: pc?.title || '未命名会话', titleSource: 'fallback' });
+                return;
+            }
+            sessionTitles.setAuto(sessionId, generated);
+            if (body.clearCustom === true) sessionTitles.setCustom(sessionId, '');
+            write(res, 200, { ok: true, sessionId, title: generated, titleSource: 'auto' });
         }),
         exact('GET', '/marshal/devices/status', async (req, res) => {
             const deviceId = initiator.replace(/^marshal:/, '');
@@ -1144,6 +1273,8 @@ export function mountGroups(ctx, config, options = {}) {
             deviceId: config.deviceId, hub: crossClient?.taskRoom });
     } catch { options.logger?.warn?.('marshal: local task room archive unavailable'); }
     const rosters = createWorkspaceRosters(join(root, 'workspace-rosters.json'));
+    const ticketNumbers = createTicketNumbers(join(root, 'ticket-numbers.json'));
+    const sessionTitles = createSessionTitles(join(root, 'session-titles.json'));
     let orchestration;
     try {
         orchestration = createTaskOrchestration({
@@ -1202,7 +1333,7 @@ export function mountGroups(ctx, config, options = {}) {
                 }
                 catch { /* desktop origin is enough when the host has no public origin */ }
                 return origins;
-            }, orchestration, rooms, { rosters, sessionController: ctx.sessionController, config }).map((route) => scoped.webServer.register(route));
+            }, orchestration, rooms, { rosters, ticketNumbers, sessionTitles, sessionController: ctx.sessionController, config, llm, readDefaultModel }).map((route) => scoped.webServer.register(route));
             return () => {
                 for (const dispose of disposers) dispose();
             };

@@ -2,15 +2,20 @@ import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { TaskRoomKey } from './task-room-store.js';
 import { taskError } from './pr-material.js';
+import { withTicketPrefix } from './ticket-numbers.js';
 
 const remoteChoice = z.object({ deviceId: TaskRoomKey, modelId: TaskRoomKey }).strict();
 const ROOM_ID = z.uuid();
 const textBody = z.string().trim().min(1).refine(text => Buffer.byteLength(text) <= 16_384);
 
-export function visibleTaskRoom(room) {
+export function visibleTaskRoom(room, ticketNumbers) {
     if (!room) return undefined;
     const { ownerId: _owner, ...view } = room;
-    return view;
+    const ticketNo = ticketNumbers?.get?.(view.taskId) ?? ticketNumbers?.ensure?.(view.taskId);
+    return {
+        ...view,
+        ...(ticketNo ? { ticketNo, title: withTicketPrefix(ticketNo, view.title) } : {}),
+    };
 }
 
 export function taskRoomAccess(access, room, allowed, ledger) {
@@ -28,8 +33,9 @@ export function taskRoomAudit(rooms, room, reason, leader, remoteTarget, allowMe
 }
 
 export function createTaskRoomRoutes({
-    exact, write, readBody, authenticate, allowed, auth, rooms, orchestration, getBoard, boardSource, getInitiator,
+    exact, write, readBody, authenticate, allowed, auth, rooms, orchestration, getBoard, boardSource, getInitiator, ticketNumbers,
 }) {
+    const viewRoom = room => visibleTaskRoom(room, ticketNumbers);
     const operations = new Set();
     const unavailable = () => taskError('task-rooms-unavailable', '工单群归档服务不可用。');
     const assertIdle = room => {
@@ -70,7 +76,7 @@ export function createTaskRoomRoutes({
             const target = action === 'reassign' ? safeTarget(body.remote) : workflow?.remoteTarget;
             let leader;
             if (body.leaderId !== undefined) {
-                leader = orchestration.prepare({ choice: 'none', leaderId: body.leaderId });
+                leader = orchestration.prepare({ choice: 'none', leaderId: body.leaderId, workspaceId: room.workspaceId });
                 if (leader.workspaceId !== room.workspaceId || !allowed(access, leader)) throw hidden();
             }
             if (!workflow && !leader) throw taskError('invalid-leader', '为这张工单指定工作区中的 Leader。');
@@ -81,7 +87,7 @@ export function createTaskRoomRoutes({
             orchestration.start(room.source, card, taskRoomAudit(rooms, room, action,
                 leader ? { id: leader.leaderId, leaderName: leader.leaderName, agentId: leader.agentId, workspaceId: leader.workspaceId } : undefined,
                 target, member => allowed(access, member)));
-            return { room: visibleTaskRoom(rooms.local(room.id)) };
+            return { room: viewRoom(rooms.local(room.id)) };
         }
         finally { operations.delete(room.id); }
     };
@@ -121,7 +127,7 @@ export function createTaskRoomRoutes({
                 throw error;
             }
             view = await rooms.page(room.id, { limit: 12 });
-            return { room: visibleTaskRoom(view.room) };
+            return { room: viewRoom(view.room) };
         }
         finally { operations.delete(room.id); }
     };
@@ -129,6 +135,14 @@ export function createTaskRoomRoutes({
         route('GET', 'workspaces', async (_req, access) => {
             const ledger = auth.loadLedger();
             const workspaces = new Map();
+            const registered = typeof auth.loadWorkspaces === 'function' ? auth.loadWorkspaces() : [];
+            for (const ws of registered) {
+                if (!ws?.id) continue;
+                if (allowed(access, { workspaceId: ws.id }, ledger)) {
+                    const label = ws.title || (ws.path ? String(ws.path).split('/').pop() : ws.id);
+                    workspaces.set(ws.id, { id: ws.id, name: label, title: ws.title || label, path: ws.path || '' });
+                }
+            }
             for (const team of ledger.teams ?? []) {
                 const id = team?.workspaceId;
                 if (typeof id === 'string' && id && allowed(access, { workspaceId: id }, ledger)) {
@@ -156,7 +170,7 @@ export function createTaskRoomRoutes({
             if (page.room.workspaceId !== workspaceId || !taskRoomAccess(access, page.room, allowed)) throw hidden();
             const origin = page.room.deviceId === getInitiator();
             const runState = origin ? orchestration?.view(page.room.source, page.room.taskId)?.state : undefined;
-            return { ...page, room: visibleTaskRoom(page.room), origin, runState,
+            return { ...page, room: viewRoom(page.room), origin, runState,
                 busy: origin && (operations.has(id) || runState === 'running') };
         }),
         route('GET', 'peers', async (req, access) => {
@@ -173,15 +187,16 @@ export function createTaskRoomRoutes({
             const existing = rooms.find(source, taskId);
             if (existing) {
                 if (!taskRoomAccess(access, existing, allowed)) throw hidden();
-                return { room: visibleTaskRoom(existing) };
+                return { room: viewRoom(existing) };
             }
             if (!workflow && !card.workspaceId && !access.session.owner) throw hidden();
             const workspaceId = workspaceCheck(access, workflow?.workspaceId ?? card.workspaceId ?? TaskRoomKey.parse(input.workspaceId));
-            const room = rooms.ensure(source, card, workspaceId, access.session.ownerId);
+            const ticketNo = ticketNumbers?.ensure?.(card.id);
+            const room = rooms.ensure(source, ticketNo ? { ...card, title: withTicketPrefix(ticketNo, card.title) } : card, workspaceId, access.session.ownerId);
             if (card.status === 'done' || workflow?.state === 'done') {
                 await rooms.append(room.id, { kind: 'closed', actor: 'Marshal', text: '工单已归档。' });
             }
-            return { room: visibleTaskRoom(rooms.local(room.id)) };
+            return { room: viewRoom(rooms.local(room.id)) };
         }),
         route('POST', 'action', async (req, access) => {
             const body = await readBody(req);
@@ -200,7 +215,7 @@ export function createTaskRoomRoutes({
                         text: closing ? '工单已关闭。群聊记录已归档。' : '工单已重开。',
                     });
                 }
-                return { room: visibleTaskRoom((await rooms.page(room.id, { limit: 1 })).room) };
+                return { room: viewRoom((await rooms.page(room.id, { limit: 1 })).room) };
             }
             finally { operations.delete(room.id); }
         }),
