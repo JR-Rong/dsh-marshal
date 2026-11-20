@@ -5,7 +5,7 @@ Self-contained installable build of the marshal plugin.
 Install from the tarball in this directory:
 
 - Desktop: Plugins -> Add plugin -> pick the .tgz;
-- CLI: dsh plugin --profile desktop add /abs/path/dsh-marshal-0.2.0-agent-groups.10.tgz.
+- CLI: dsh plugin --profile desktop add /abs/path/dsh-marshal-0.2.0-agent-groups.11.tgz.
 
 Required DSH plugins (install in the same profile first):
 
@@ -61,3 +61,9 @@ mnemonPilot:
 ## 记忆页会话
 
 DSH 桌面代理使用页面内的会话凭证，浏览器使用本地会话 Cookie。插件重启或会话过期时，页面会自动重建会话并重试一次。如果仍出现提示，请记录提示原文和 `/marshal/health` 的插件版本。
+
+## Superagent 自动派单
+
+原生任务看板由用户在界面创建的根卡可以按标记或默认 Agent 自动派单，执行仍经过看板的权限和确认流程。Marshal 编排模板的卡片由它自己的运行入口启动。旧安装可继续使用 `~/.dsh-marshal/superagent/settings.json` 和 `state.json`。等待确认的旧记录保留原状态，由用户在原工单流程中处理。
+
+派单会读取该 Agent 的记忆，执行结算后将摘要写回它的私有后端。控制页为本机宿主的 `/marshal-superagent`。修改客户端观察器后，运行 `npm run build:superagent-hook` 再打包。
