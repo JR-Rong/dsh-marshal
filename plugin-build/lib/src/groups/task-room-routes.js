@@ -138,6 +138,9 @@ export function createTaskRoomRoutes({
             const registered = typeof auth.loadWorkspaces === 'function' ? auth.loadWorkspaces() : [];
             for (const ws of registered) {
                 if (!ws?.id) continue;
+                const titleStr = String(ws.title || '').trim();
+                const pathStr = String(ws.path || '').trim();
+                if (/^Agent\s*·\s*/.test(titleStr) || /\/\.dsh-marshal\/agents\/Agent\s*·\s*/.test(pathStr)) continue;
                 if (allowed(access, { workspaceId: ws.id }, ledger)) {
                     const label = ws.title || (ws.path ? String(ws.path).split('/').pop() : ws.id);
                     workspaces.set(ws.id, { id: ws.id, name: label, title: ws.title || label, path: ws.path || '' });

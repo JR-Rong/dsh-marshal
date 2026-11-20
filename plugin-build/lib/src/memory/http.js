@@ -246,6 +246,7 @@ export function createMemoryRoutes({ memory, auth, allowedOrigins } = {}) {
                     importance: Number(body.importance) || 0.5,
                     tags: Array.isArray(body.tags) ? body.tags : [],
                     visibility: body.visibility,
+                    ...(typeof body.cue === 'string' && body.cue.trim() ? { cue: body.cue.trim() } : {}),
                 });
                 write(res, 200, { ok: true, item });
             }, { target: true }),

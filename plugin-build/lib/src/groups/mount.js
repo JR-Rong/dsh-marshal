@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -371,7 +371,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
                 write(res, access.ok ? 404 : access.status, { ok: false, code: access.ok ? 'report-not-found' : access.code });
                 return;
             }
-            const report = orchestration.report(source, id);
+            const report = await orchestration.report(source, id);
             if (report === undefined) {
                 write(res, 404, { ok: false, code: 'report-not-found' });
                 return;
@@ -876,6 +876,8 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
                         createdAt: effectiveCreated,
                     })
                     : { title: pc?.title || meta?.title || fallbackTitle || (agentName ? agentName + ' · 闲聊' : '历史会话'), titleSource: 'dsh' };
+                const sessionCwd = pc?.cwd || meta?.cwd || '';
+                const legacyReadOnly = Boolean(sessionCwd && /\/\.dsh-marshal\/agents\/Agent\s*·\s*/.test(sessionCwd) && !existsSync(sessionCwd));
                 sessions.push({
                     sessionId,
                     teamId: teamId || '',
@@ -886,6 +888,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
                     titleSource: resolved.titleSource,
                     hasPreview: Boolean(pc?.firstText),
                     archived,
+                    legacyReadOnly,
                     createdAt: effectiveCreated,
                     updatedAt: effectiveUpdated,
                     status: status || '',

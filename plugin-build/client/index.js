@@ -382,7 +382,7 @@ window.__ModuleLoader__.load({
           }
           ctx.globalAlpha = 1;
           ctx.fillStyle = 'rgba(200,215,235,0.55)'; ctx.font = '11px sans-serif';
-          ctx.fillText(nodes.length + ' memories · drag to orbit · wheel to zoom', 14, height - 14);
+          ctx.fillText(nodes.length + ' memories · ' + edges.length + ' links · drag to orbit · wheel to zoom', 14, height - 14);
           raf = requestAnimationFrame(draw);
         };
         const onPointerDown = event => { camera.dragging = true; camera.moved = false; camera.lastX = event.clientX; camera.lastY = event.clientY; canvas.setPointerCapture?.(event.pointerId); canvas.style.cursor = 'grabbing'; };
@@ -887,7 +887,8 @@ window.__ModuleLoader__.load({
                         h('span', { style: { fontSize: 13, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: item.title }, item.title || '历史会话'),
                         item.titleSource === 'custom' && h('span', { style: { fontSize: 10, color: dswTheme.faint, border: '1px solid ' + dswTheme.border, borderRadius: 999, padding: '1px 6px', flexShrink: 0 } }, '已重命名'),
                         item.titleSource === 'auto' && h('span', { style: { fontSize: 10, color: dswTheme.faint, border: '1px solid ' + dswTheme.border, borderRadius: 999, padding: '1px 6px', flexShrink: 0 } }, '自动总结'),
-                        item.archived && h('span', { style: { fontSize: 10, color: dswTheme.faint, border: '1px solid ' + dswTheme.border, borderRadius: 999, padding: '1px 6px', flexShrink: 0 } }, '已归档')),
+                        item.archived && h('span', { style: { fontSize: 10, color: dswTheme.faint, border: '1px solid ' + dswTheme.border, borderRadius: 999, padding: '1px 6px', flexShrink: 0 } }, '已归档'),
+                        item.legacyReadOnly && h('span', { title: '原独立工作区已迁出清壳，仅作历史查阅；继续对话请点「新建闲聊」', style: { fontSize: 10, color: '#f59e0b', border: '1px solid color-mix(in srgb, #f59e0b 45%, transparent)', background: 'color-mix(in srgb, #f59e0b 10%, transparent)', borderRadius: 999, padding: '1px 6px', flexShrink: 0 } }, '历史只读')),
                   h('div', { style: { fontSize: 11, color: dswTheme.faint, marginTop: 3 } },
                     [item.agentName || '智能体', formatSessionTime(item.updatedAt || item.createdAt), item.sessionId.slice(0, 8)].filter(Boolean).join(' · '))),
                 renamingId !== item.sessionId && h('div', { style: { display: 'flex', gap: 6, flexShrink: 0 }, onClick: e => e.stopPropagation() },
@@ -2136,6 +2137,13 @@ window.__ModuleLoader__.load({
         '.mtb-col-rail-title{writing-mode:vertical-rl;text-orientation:mixed;font-size:12px;font-weight:600;letter-spacing:.12em;color:var(--dsw-alias-label-secondary,inherit);user-select:none}',
         '.mtb-pan-btn{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:999px;border:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 18%,transparent));background:color-mix(in srgb,currentColor 5%,transparent);color:inherit;cursor:pointer;font-size:11px;padding:0;flex-shrink:0}',
         '.mtb-pan-btn:hover{background:color-mix(in srgb,currentColor 13%,transparent)}',
+        '.mtb-pan-btn[data-active="true"]{border-color:var(--dsw-alias-brand-primary,#6366f1);color:var(--dsw-alias-brand-primary,#6366f1);background:color-mix(in srgb,var(--dsw-alias-brand-primary,#6366f1) 12%,transparent)}',
+        '.mtb-grid-wrap{flex:1;min-height:0;min-width:0;width:100%;position:relative;display:flex;overflow:hidden}',
+        '.mtb-grid[data-panning="true"]{cursor:grabbing;user-select:none}',
+        '.mtb-edge-pan{position:absolute;top:50%;transform:translateY(-50%);z-index:4;display:inline-flex;align-items:center;gap:4px;padding:7px 10px;border-radius:999px;border:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 22%,transparent));background:var(--dsw-alias-bg-layer-1,rgba(24,26,32,.92));color:var(--dsw-alias-label-primary,inherit);box-shadow:0 4px 14px rgba(0,0,0,.28);cursor:pointer;font-size:11.5px;font-weight:600;backdrop-filter:blur(8px);transition:transform .14s,background .14s}',
+        '.mtb-edge-pan:hover{transform:translateY(-50%) scale(1.03)}',
+        '.mtb-edge-pan-left{left:10px}',
+        '.mtb-edge-pan-right{right:10px}',
         '.mtb-col[data-drop="true"]{border-color:var(--mtb-accent);box-shadow:0 0 0 2px color-mix(in srgb,var(--mtb-accent) 28%,transparent);background:color-mix(in srgb,var(--mtb-accent) 7%,var(--dsw-alias-bg-layer-2,transparent))}',
         '.mtb-col-head{padding:10px 12px;display:flex;align-items:center;gap:8px;flex-shrink:0;background:color-mix(in srgb,var(--mtb-accent) 8%,transparent);border-bottom:1px solid color-mix(in srgb,var(--mtb-accent) 16%,transparent)}',
         '.mtb-dot{width:8px;height:8px;border-radius:999px;background:var(--mtb-accent);flex-shrink:0}',
@@ -2362,6 +2370,35 @@ window.__ModuleLoader__.load({
         try { const raw = JSON.parse(globalThis.localStorage?.getItem('marshal.board.collapsedCols') || '[]'); return Array.isArray(raw) ? raw : []; } catch { return []; }
       });
       const gridRef = React.useRef(null);
+      const panDragRef = React.useRef(null);
+      const [panning, setPanning] = React.useState(false);
+      const [scrollEdge, setScrollEdge] = React.useState({ left: false, right: false });
+      const syncScrollEdges = React.useCallback(() => {
+        const el = gridRef.current;
+        if (!el) return;
+        const maxLeft = Math.max(0, el.scrollWidth - el.clientWidth);
+        const left = el.scrollLeft > 8;
+        const right = maxLeft > 8 && el.scrollLeft < maxLeft - 8;
+        setScrollEdge(prev => (prev.left === left && prev.right === right ? prev : { left, right }));
+      }, []);
+      React.useEffect(() => {
+        syncScrollEdges();
+        const el = gridRef.current;
+        if (!el) return;
+        const onScroll = () => syncScrollEdges();
+        el.addEventListener('scroll', onScroll, { passive: true });
+        let ro;
+        if (typeof ResizeObserver === 'function') {
+          ro = new ResizeObserver(() => syncScrollEdges());
+          ro.observe(el);
+        }
+        window.addEventListener('resize', onScroll);
+        return () => {
+          el.removeEventListener('scroll', onScroll);
+          window.removeEventListener('resize', onScroll);
+          ro?.disconnect();
+        };
+      }, [syncScrollEdges, collapsedCols]);
       const toggleCollapseCol = key => {
         setCollapsedCols(prev => {
           const next = prev.includes(key) ? prev.filter(k => k !== key) : [...prev, key];
@@ -2369,9 +2406,58 @@ window.__ModuleLoader__.load({
           return next;
         });
       };
+      const collapseEmptyCols = emptyKeys => {
+        setCollapsedCols(prev => {
+          const allEmptyCollapsed = emptyKeys.length > 0 && emptyKeys.every(k => prev.includes(k));
+          const next = allEmptyCollapsed ? prev.filter(k => !emptyKeys.includes(k)) : [...new Set([...prev, ...emptyKeys])];
+          try { globalThis.localStorage?.setItem('marshal.board.collapsedCols', JSON.stringify(next)); } catch {}
+          return next;
+        });
+      };
+      const expandAllCols = () => {
+        setCollapsedCols([]);
+        try { globalThis.localStorage?.setItem('marshal.board.collapsedCols', '[]'); } catch {}
+      };
       const panBoard = delta => {
         const el = gridRef.current;
         if (el) el.scrollBy({ left: delta, behavior: 'smooth' });
+      };
+      const handleGridMouseDown = event => {
+        if (event.button !== 0 || dragTaskId) return;
+        const target = event.target;
+        if (target && typeof target.closest === 'function' && target.closest('button,input,textarea,select,a,[draggable="true"],.mtb-card')) return;
+        const el = gridRef.current;
+        if (!el || el.scrollWidth <= el.clientWidth + 4) return;
+        panDragRef.current = { startX: event.clientX, startLeft: el.scrollLeft };
+        setPanning(true);
+        const onMove = moveEvent => {
+          const state = panDragRef.current;
+          if (!state) return;
+          el.scrollLeft = state.startLeft - (moveEvent.clientX - state.startX);
+        };
+        const onUp = () => {
+          panDragRef.current = null;
+          setPanning(false);
+          window.removeEventListener('mousemove', onMove);
+          window.removeEventListener('mouseup', onUp);
+        };
+        window.addEventListener('mousemove', onMove);
+        window.addEventListener('mouseup', onUp);
+      };
+      const handleGridWheel = event => {
+        const el = gridRef.current;
+        if (!el || el.scrollWidth <= el.clientWidth + 4) return;
+        if (event.shiftKey && Math.abs(event.deltaY) > 0) {
+          el.scrollLeft += event.deltaY;
+          event.preventDefault();
+          return;
+        }
+        const colBody = event.target && typeof event.target.closest === 'function' ? event.target.closest('.mtb-col-body') : null;
+        const colCanScrollY = colBody && colBody.scrollHeight > colBody.clientHeight + 2;
+        if (!colCanScrollY && Math.abs(event.deltaY) > Math.abs(event.deltaX)) {
+          el.scrollLeft += event.deltaY;
+          event.preventDefault();
+        }
       };
       const handleGridDragOver = event => {
         if (!dragTaskId) return;
@@ -3462,8 +3548,26 @@ window.__ModuleLoader__.load({
                   column.label,
                   h('strong', null, count));
               }),
-              h('button', { type: 'button', className: 'mtb-pan-btn', title: '向左滚动看板列', 'aria-label': '向左滚动看板列', onClick: () => panBoard(-320) }, '◀'),
-              h('button', { type: 'button', className: 'mtb-pan-btn', title: '向右滚动看板列（查看已完成/已失败）', 'aria-label': '向右滚动看板列', onClick: () => panBoard(320) }, '▶'))),
+              h('button', { type: 'button', className: 'mtb-pan-btn', 'data-active': scrollEdge.left ? 'true' : undefined, title: '向左滚动看板列', 'aria-label': '向左滚动看板列', onClick: () => panBoard(-320) }, '◀'),
+              h('button', { type: 'button', className: 'mtb-pan-btn', 'data-active': scrollEdge.right ? 'true' : undefined, title: '向右滚动看板列（查看已完成/已失败）', 'aria-label': '向右滚动看板列', onClick: () => panBoard(320) }, '▶'),
+              (() => {
+                const emptyKeys = columns.filter(c => list.every(t => (knownStatuses.has(t.status) ? t.status : 'todo') !== c.key)).map(c => c.key);
+                const allEmptyCollapsed = emptyKeys.length > 0 && emptyKeys.every(k => collapsedCols.includes(k));
+                return emptyKeys.length > 0 && h('button', {
+                  type: 'button',
+                  className: 'mtb-summary-chip',
+                  style: { '--mtb-accent': '#64748b' },
+                  title: allEmptyCollapsed ? '展开所有已折叠的空列' : '将无工单的空列折叠为窄条，腾出空间查看「已完成 / 已失败」',
+                  onClick: () => allEmptyCollapsed ? expandAllCols() : collapseEmptyCols(emptyKeys),
+                }, allEmptyCollapsed ? '展开空列' : '收起空列');
+              })(),
+              collapsedCols.length > 0 && h('button', {
+                type: 'button',
+                className: 'mtb-summary-chip',
+                style: { '--mtb-accent': '#6366f1' },
+                title: '展开全部 6 列',
+                onClick: expandAllCols,
+              }, '全展'))),
           h('div', { className: 'mtb-head-right' },
             archivedTasks.length > 0 && h('button', { type: 'button', style: tabStyle(showArchive), onClick: () => setShowArchive(v => !v) },
               showArchive ? '返回看板' : '归档 (' + archivedTasks.length + ')'),
@@ -3672,7 +3776,17 @@ window.__ModuleLoader__.load({
                   }))
           : allActive.length === 0 && !formOpen
             ? h(EmptyState, { title: '还没有卡片', hint: '新建一张卡片，或点上方「✨ AI 解析任务」快速生成。', action: '新建卡片', onAction: () => setFormOpen(true) })
-            : h('div', { ref: gridRef, className: 'mtb-grid', onDragOver: handleGridDragOver },
+            : h('div', { className: 'mtb-grid-wrap' },
+                scrollEdge.left && h('button', { type: 'button', className: 'mtb-edge-pan mtb-edge-pan-left', title: '向左查看前面列', onClick: () => panBoard(-340) }, '← 前列'),
+                scrollEdge.right && h('button', { type: 'button', className: 'mtb-edge-pan mtb-edge-pan-right', title: '向右查看已完成 / 已失败列', onClick: () => panBoard(340) }, '已完成 / 失败 →'),
+                h('div', {
+                  ref: gridRef,
+                  className: 'mtb-grid',
+                  'data-panning': panning ? 'true' : undefined,
+                  onMouseDown: handleGridMouseDown,
+                  onWheel: handleGridWheel,
+                  onDragOver: handleGridDragOver,
+                },
                 columns.map(column => {
                   const items = list.filter(task => (knownStatuses.has(task.status) ? task.status : 'todo') === column.key);
                   const collapsed = collapsedCols.includes(column.key);
@@ -3728,7 +3842,7 @@ window.__ModuleLoader__.load({
                               ? h('div', { className: 'mtb-empty' }, column.empty)
                               : items.map(task => card(task, column))),
                         ]);
-                })),
+                }))),
         renderDrawer(),
         renderParseModal());
     }
@@ -4350,7 +4464,8 @@ window.__ModuleLoader__.load({
                                 : h('div', { style: { display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 } },
                                     h('span', { style: { fontSize: 12, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: item.title }, item.title || '历史闲聊'),
                                     item.titleSource === 'custom' && h('span', { style: { fontSize: 10, color: dswTheme.faint, border: '1px solid ' + dswTheme.border, borderRadius: 999, padding: '0 5px', flexShrink: 0 } }, '已重命名'),
-                                    item.titleSource === 'auto' && h('span', { style: { fontSize: 10, color: dswTheme.faint, border: '1px solid ' + dswTheme.border, borderRadius: 999, padding: '0 5px', flexShrink: 0 } }, '自动总结')),
+                                    item.titleSource === 'auto' && h('span', { style: { fontSize: 10, color: dswTheme.faint, border: '1px solid ' + dswTheme.border, borderRadius: 999, padding: '0 5px', flexShrink: 0 } }, '自动总结'),
+                                    item.legacyReadOnly && h('span', { title: '原独立工作区已迁出清壳，仅作历史查阅；继续对话请点「新建闲聊」', style: { fontSize: 10, color: '#f59e0b', border: '1px solid color-mix(in srgb, #f59e0b 45%, transparent)', background: 'color-mix(in srgb, #f59e0b 10%, transparent)', borderRadius: 999, padding: '0 5px', flexShrink: 0 } }, '历史只读')),
                               h('div', { style: { fontSize: 10, color: dswTheme.faint, marginTop: 2 } }, [formatSessionTime(item.updatedAt || item.createdAt), item.sessionId.slice(0, 8)].filter(Boolean).join(' · '))),
                             renamingSessionId !== item.sessionId && h('div', { style: { display: 'flex', gap: 5, flexShrink: 0 }, onClick: e => e.stopPropagation() },
                               h('button', { type: 'button', title: '重命名', style: { ...uiButton(false), padding: '4px 7px', fontSize: 11 }, onClick: () => { setRenamingSessionId(item.sessionId); setRenameSessionDraft(item.title || ''); } }, '重命名'),

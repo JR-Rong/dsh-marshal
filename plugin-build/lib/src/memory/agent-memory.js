@@ -4,7 +4,8 @@ import { atomicWriteFile, withFileLock } from '../hub/state-file.js';
 import { homedir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import { MemoryStore } from './sqlite-store.js';
-import { createMnemonNative } from './mnemon-native.js';
+import { createMnemonNative, storeNameFor } from './mnemon-native.js';
+import { readRegisteredWorkspaces } from './http-auth.js';
 import { specToJsonSchema } from '../tools/schema.js';
 import { createMemorySyncClient } from './sync-client.js';
 import { clarityLine, neutralizeMemory, scoreCandidate, shouldStore, topicSimilarity } from './lifecycle.js';
@@ -125,8 +126,37 @@ function findMember(teams, name) {
     return undefined;
 }
 
-function workspaceKey(cwd) {
+export function workspaceKey(cwd) {
     return 'ws_' + createHash('sha256').update(resolve(cwd)).digest('hex').slice(0, 24);
+}
+
+export function isPseudoAgentWorkspace(ws) {
+    if (!ws || typeof ws !== 'object') return false;
+    const title = String(ws.title ?? '').trim();
+    const path = String(ws.path ?? '').trim();
+    if (/^Agent\s*·\s*/.test(title)) return true;
+    if (/\/\.dsh-marshal\/agents\/Agent\s*·\s*/.test(path)) return true;
+    return false;
+}
+
+export function resolveWorkspaceIdForCwd(cwd, workspaces) {
+    if (typeof cwd !== 'string' || cwd.trim() === '') return undefined;
+    const absolute = resolve(cwd);
+    const list = Array.isArray(workspaces) ? workspaces : [];
+    let bestId;
+    let bestLen = -1;
+    for (const ws of list) {
+        if (!ws || typeof ws.id !== 'string' || ws.id === '' || typeof ws.path !== 'string' || ws.path.trim() === '') continue;
+        if (isPseudoAgentWorkspace(ws)) continue;
+        const wsPath = resolve(ws.path);
+        if (absolute === wsPath || absolute.startsWith(wsPath + sep)) {
+            if (wsPath.length > bestLen) {
+                bestLen = wsPath.length;
+                bestId = ws.id;
+            }
+        }
+    }
+    return bestId ?? workspaceKey(absolute);
 }
 
 export function resolveMemoryIdentity(context, options = {}) {
@@ -152,7 +182,10 @@ export function resolveMemoryIdentity(context, options = {}) {
         }
     }
     const agentId = member?.id ?? (name === undefined ? undefined : 'legacy:' + name);
-    const workspaceId = team?.workspaceId ?? (cwd === '' ? undefined : workspaceKey(cwd));
+    const workspaces = Array.isArray(options.workspaces)
+        ? options.workspaces
+        : (options.ledger === undefined ? readRegisteredWorkspaces() : []);
+    const workspaceId = team?.workspaceId ?? (cwd === '' ? undefined : resolveWorkspaceIdForCwd(cwd, workspaces));
     return {
         agentId,
         registeredAgent,
@@ -279,8 +312,11 @@ function memoryBlock(service, identity) {
     const stable = item => item.kind === 'profile' || item.kind === 'handoff';
     const fileText = typeof service.fileText === 'function' ? service.fileText(identity) : '';
     const visible = items => dedupeMemories(fileText, items.filter(item => globalMemoryVisible(item, group)));
-    const agentItems = visible(identity.agentId === undefined ? [] : service.store.list('agent', identity.agentId, { limit: 24 }));
-    const workspaceItems = visible(identity.workspaceId === undefined ? [] : service.store.list('workspace', identity.workspaceId, { limit: 16 }));
+    const agentNative = identity.registeredAgent === true && service.usesMnemonFor?.('agent', identity.agentId) === true;
+    const workspaceNative = service.usesMnemonFor?.('workspace', identity.workspaceId) === true;
+    const sqlScopes = scopes.filter(target => !(target.scope === 'agent' && agentNative) && !(target.scope === 'workspace' && workspaceNative));
+    const agentItems = (identity.agentId === undefined || agentNative) ? [] : visible(service.store.list('agent', identity.agentId, { limit: 24 }));
+    const workspaceItems = (identity.workspaceId === undefined || workspaceNative) ? [] : visible(service.store.list('workspace', identity.workspaceId, { limit: 16 }));
     const globalItems = visible(service.store.list('global', 'global', { limit: 24 }));
     for (const item of agentItems.filter(stable)) add('【Agent】' + item.title + '：' + clarityLine(item), 120);
     for (const item of workspaceItems.filter(stable)) add('【Workspace】' + item.title + '：' + clarityLine(item), 100);
@@ -289,8 +325,8 @@ function memoryBlock(service, identity) {
     for (const item of agentItems.filter(item => !stable(item)).slice(0, 8)) add('【Agent 相关】' + item.title + '：' + clarityLine(item), 50);
     for (const item of workspaceItems.filter(item => !stable(item)).slice(0, 6)) add('【Workspace 相关】' + item.title + '：' + clarityLine(item), 40);
     for (const item of agentItems.filter(item => item.kind === 'episode').sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 2)) add('【最近·' + item.title + '】' + clarityLine(item), 30);
-    if (query.trim() !== '' && service.settings.autoRecall !== false) {
-        for (const item of visible(service.store.recall(scopes, query, { k: 6 }))) {
+    if (query.trim() !== '' && service.settings.autoRecall !== false && sqlScopes.length > 0) {
+        for (const item of visible(service.store.recall(sqlScopes, query, { k: 6 }))) {
             if (stable(item)) continue;
             add('【召回·' + item.scope + '】' + item.title + '：' + clarityLine(item), 60);
         }
@@ -519,16 +555,31 @@ async function writeSummary(service, snapshot) {
     return written;
 }
 
-export function createAgentMemoryService({ root, logger, deviceId, hubUrl, token, passphrase, now = Date.now, ledger, groupsFile, groupsRoot, fileText, fileMemory, fetchImpl, mnemonPilot } = {}) {
+export function createAgentMemoryService({ root, logger, deviceId, hubUrl, token, passphrase, now = Date.now, ledger, workspaces, groupsFile, groupsRoot, fileText, fileMemory, fetchImpl, mnemonPilot } = {}) {
     const store = new MemoryStore({ root, logger, now });
     const fleetMode = mnemonPilot?.agentId === '*';
     const nativePool = new Map();
     const migratedScopes = new Set();
+    const currentWorkspaces = () => Array.isArray(workspaces)
+        ? workspaces
+        : (ledger === undefined ? readRegisteredWorkspaces() : []);
+    const workspaceLegacyAliases = workspaceId => {
+        if (typeof workspaceId !== 'string' || workspaceId === '') return [];
+        const aliases = [];
+        for (const ws of currentWorkspaces()) {
+            if (!ws || ws.id !== workspaceId || typeof ws.path !== 'string' || ws.path.trim() === '' || isPseudoAgentWorkspace(ws)) continue;
+            const hashed = workspaceKey(ws.path);
+            if (hashed !== workspaceId && !aliases.includes(hashed)) aliases.push(hashed);
+        }
+        return aliases;
+    };
     const useNative = (scope, ownerId) => {
         if (!mnemonPilot || typeof ownerId !== 'string' || ownerId === '') return false;
         if (fleetMode) return scope === 'agent' || (scope === 'workspace' && mnemonPilot.scopes !== 'agents');
         return scope === 'agent' && mnemonPilot.agentId === ownerId;
     };
+    const isNativeAuthoritative = (scope, ownerId) =>
+        fleetMode && useNative(scope, ownerId) && migratedScopes.has(scope + ':' + ownerId);
     const nativeFor = (scope, ownerId) => {
         if (!useNative(scope, ownerId)) return undefined;
         const key = scope + ':' + ownerId;
@@ -546,28 +597,61 @@ export function createAgentMemoryService({ root, logger, deviceId, hubUrl, token
         return inst;
     };
     const ensureMigrated = async (scope, ownerId) => {
-        if (!fleetMode || !useNative(scope, ownerId)) return;
+        if (!fleetMode || !useNative(scope, ownerId)) return false;
         const key = scope + ':' + ownerId;
-        if (migratedScopes.has(key)) return;
-        migratedScopes.add(key);
-        const marker = join(store.root, 'mnemon-native', '.migrated-' + createHash('sha256').update(key).digest('hex').slice(0, 12));
-        if (existsSync(marker)) return;
+        if (migratedScopes.has(key)) return true;
+        const marker = join(store.root, 'mnemon-native', '.migrated-v2-' + createHash('sha256').update(key).digest('hex').slice(0, 12));
+        if (existsSync(marker)) {
+            migratedScopes.add(key);
+            return true;
+        }
         const inst = nativeFor(scope, ownerId);
-        if (!inst) return;
+        if (!inst) return false;
+        migratedScopes.add(key);
         try {
-            const legacyRows = store.list(scope, ownerId, { limit: 300 });
-            for (const row of legacyRows) {
-                if (row.archived) continue;
+            const toMigrate = [];
+            const seen = new Set();
+            const collect = rows => {
+                for (const row of Array.isArray(rows) ? rows : []) {
+                    if (!row || row.archived) continue;
+                    const sig = JSON.stringify([row.title, row.content]);
+                    if (seen.has(sig)) continue;
+                    seen.add(sig);
+                    toMigrate.push(row);
+                }
+            };
+            collect(store.list(scope, ownerId, { limit: 300 }));
+            if (scope === 'workspace') {
+                for (const alias of workspaceLegacyAliases(ownerId)) {
+                    collect(store.list('workspace', alias, { limit: 300 }));
+                    const aliasStoreName = storeNameFor('workspace', alias);
+                    if (existsSync(join(store.root, 'mnemon-native', 'data', aliasStoreName))) {
+                        try {
+                            const aliasInst = createMnemonNative({
+                                scope: 'workspace',
+                                ownerId: alias,
+                                executable: mnemonPilot.executable,
+                                root: store.root,
+                            });
+                            collect(await aliasInst.list({ limit: 300 }));
+                        } catch { /* ignore unreadable legacy alias store */ }
+                    }
+                }
+            }
+            for (const row of toMigrate) {
                 try {
                     await inst.remember({
                         kind: row.kind, title: row.title, content: row.content,
                         importance: row.importance, tags: row.tags, pinned: row.pinned, visibility: row.visibility,
+                        ...(typeof row.cue === 'string' && row.cue ? { cue: row.cue } : {}),
                     }, { workspaceId: scope === 'workspace' ? ownerId : row.allowedWorkspaceId });
                 } catch { /* skip single malformed legacy row */ }
             }
             writeFileSync(marker, new Date().toISOString() + '\n');
+            return true;
         } catch {
             migratedScopes.delete(key);
+            return false;
         }
     };
     const sync = createMemorySyncClient({ hubUrl, token, passphrase, deviceId, fetchImpl });
@@ -627,58 +711,77 @@ export function createAgentMemoryService({ root, logger, deviceId, hubUrl, token
         return '- ' + item.id.slice(0, 8) + ' | ' + item.scope + '/' + item.kind + ' | ' + item.title + tags + cue;
     };
     service.identity = context => {
-        const identity = resolveMemoryIdentity(context, { deviceId, ledger });
+        const identity = resolveMemoryIdentity(context, { deviceId, ledger, ...(workspaces !== undefined ? { workspaces } : {}) });
         return !fleetMode && useNative('agent', identity.agentId) && !identity.registeredAgent
             ? { ...identity, agentId: undefined, unboundPilot: true } : identity;
     };
     service.scopes = (identity, scope = 'all') => scopeList(identity, scope);
     service.block = identity => memoryBlock(service, identity);
+    service.usesMnemonFor = (scope, ownerId) => useNative(scope, ownerId);
     service.usesMnemon = (agentId, workspaceId) => useNative('agent', agentId) || useNative('workspace', workspaceId);
     service.recallFor = async (scopes, query, limit = 8, { group, workspaceId, intent } = {}) => {
-        const legacy = store.recall(scopes, query, { k: limit });
         const nativeTargets = scopes.filter(target => useNative(target.scope, target.ownerId));
-        if (nativeTargets.length === 0) return legacy;
+        if (nativeTargets.length === 0) return store.recall(scopes, query, { k: limit });
         const nativeBatches = await Promise.all(nativeTargets.map(async target => {
             await ensureMigrated(target.scope, target.ownerId);
             const inst = nativeFor(target.scope, target.ownerId);
             const rows = await inst.recall(query, { k: limit, intent });
             return nativeVisible(rows, target.scope, group, workspaceId);
         }));
+        const sqlScopes = scopes.filter(target => !isNativeAuthoritative(target.scope, target.ownerId));
+        const legacy = sqlScopes.length > 0 ? store.recall(sqlScopes, query, { k: limit }) : [];
         const matches = nativeBatches.flat().sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
-        const combined = legacy.flatMap((item, index) => matches[index] ? [matches[index], item] : [item]);
-        return merge(combined, matches.slice(legacy.length)).slice(0, limit);
+        if (legacy.length === 0) return matches.slice(0, limit);
+        const combined = matches.flatMap((item, index) => legacy[index] ? [item, legacy[index]] : [item]);
+        return merge(combined, legacy.slice(matches.length)).slice(0, limit);
     };
     service.listScope = async ({ scope, ownerId }, limit, { group, kinds, workspaceId } = {}) => {
-        const legacy = store.list(scope, ownerId, { limit, kinds });
-        if (!useNative(scope, ownerId)) return legacy;
+        if (!useNative(scope, ownerId)) return store.list(scope, ownerId, { limit, kinds });
         await ensureMigrated(scope, ownerId);
         const inst = nativeFor(scope, ownerId);
         const items = nativeVisible(await inst.list({ limit }), scope, group, workspaceId).filter(item => !kinds || kinds.includes(item.kind));
+        if (isNativeAuthoritative(scope, ownerId)) {
+            return items.sort((a, b) => b.updatedAt - a.updatedAt).slice(0, limit);
+        }
+        const legacy = store.list(scope, ownerId, { limit, kinds });
         return merge(items, legacy).sort((a, b) => b.updatedAt - a.updatedAt).slice(0, limit);
     };
     service.graphScopes = async (scopes, limit, { group, workspaceId } = {}) => {
-        const graph = store.graph(scopes, { limit });
         const nativeTargets = scopes.filter(target => useNative(target.scope, target.ownerId));
-        if (nativeTargets.length === 0) return graph;
+        if (nativeTargets.length === 0) return store.graph(scopes, { limit });
+        await Promise.all(nativeTargets.map(target => ensureMigrated(target.scope, target.ownerId)));
+        const sqlScopes = scopes.filter(target => !isNativeAuthoritative(target.scope, target.ownerId));
+        const graph = sqlScopes.length > 0 ? store.graph(sqlScopes, { limit }) : { nodes: [], edges: [] };
         const edgeKeys = new Set(graph.edges.map(e => e.source + '->' + e.target));
+        const nativeNodes = [];
+        const pendingEdges = [];
         for (const target of nativeTargets) {
-            await ensureMigrated(target.scope, target.ownerId);
             const inst = nativeFor(target.scope, target.ownerId);
             const items = nativeVisible(await inst.list({ limit }), target.scope, group, workspaceId);
-            graph.nodes = merge(graph.nodes, items);
-            const idSet = new Set(graph.nodes.map(n => n.id));
-            for (const item of items.slice(0, 24)) {
-                try {
-                    const rels = await inst.related(item.id, { depth: 1 });
-                    for (const rel of rels) {
-                        if (!idSet.has(rel.targetId)) continue;
-                        const k = item.id + '->' + rel.targetId;
-                        if (edgeKeys.has(k)) continue;
-                        edgeKeys.add(k);
-                        graph.edges.push({ source: item.id, target: rel.targetId, weight: rel.weight, kind: rel.edgeType });
-                    }
-                } catch { /* graph edges best-effort */ }
+            nativeNodes.push(...items);
+            try {
+                const edges = await inst.graphEdges();
+                pendingEdges.push(...edges);
+            } catch {
+                // Best-effort fallback if viz is unavailable
+                const relsList = await Promise.all(items.slice(0, 12).map(async item => {
+                    try {
+                        const rels = await inst.related(item.id, { depth: 1 });
+                        return rels.map(rel => ({ source: item.id, target: rel.targetId, weight: rel.weight, kind: rel.edgeType }));
+                    } catch { return []; }
+                }));
+                pendingEdges.push(...relsList.flat());
             }
+        }
+        // Keep Mnemon nodes FIRST so Mnemon UUIDs win over any unmigrated SQLite rows and match graph edges!
+        graph.nodes = merge(nativeNodes, graph.nodes);
+        const idSet = new Set(graph.nodes.map(n => n.id));
+        for (const edge of pendingEdges) {
+            if (!idSet.has(edge.source) || !idSet.has(edge.target)) continue;
+            const k = edge.source + '->' + edge.target;
+            if (edgeKeys.has(k)) continue;
+            edgeKeys.add(k);
+            graph.edges.push({ source: edge.source, target: edge.target, weight: edge.weight, kind: edge.kind });
         }
         return graph;
     };
@@ -697,17 +800,20 @@ export function createAgentMemoryService({ root, logger, deviceId, hubUrl, token
             await ensureMigrated(item.scope, item.ownerId);
             const inst = nativeFor(item.scope, item.ownerId);
             const additional = await inst.stats();
-            out.push({ ...item, total: Math.max(item.total, additional), backend: 'mnemon' });
+            const total = isNativeAuthoritative(item.scope, item.ownerId) ? additional : item.total + additional;
+            out.push({ ...item, total, backend: 'mnemon' });
         }
         return out;
     };
     service.getFor = (scope, ownerId, id) => {
-        const fromSql = store.get(scope, ownerId, id);
-        if (fromSql !== undefined) return fromSql;
         if (useNative(scope, ownerId)) {
-            return ensureMigrated(scope, ownerId).then(() => nativeFor(scope, ownerId).get(id));
+            return ensureMigrated(scope, ownerId).then(async () => {
+                const found = await nativeFor(scope, ownerId).get(id);
+                if (found !== undefined) return found;
+                return isNativeAuthoritative(scope, ownerId) ? undefined : store.get(scope, ownerId, id);
+            });
         }
-        return undefined;
+        return store.get(scope, ownerId, id);
     };
     service.linkFor = async (scopes, sourceId, targetId, options = {}) => {
         for (const target of scopes) {
@@ -738,10 +844,8 @@ export function createAgentMemoryService({ root, logger, deviceId, hubUrl, token
         for (const target of activeTargets) {
             await ensureMigrated(target.scope, target.ownerId);
             const inst = nativeFor(target.scope, target.ownerId);
-            const [recalled, listed] = await Promise.all([
-                query ? inst.recall(query, { k: 8, signal }).catch(() => []) : Promise.resolve([]),
-                inst.list({ limit: 45 }).catch(() => []),
-            ]);
+            const recalled = query ? await inst.recall(query, { k: 8, signal }).catch(() => []) : [];
+            const listed = await inst.list({ limit: 45 }).catch(() => []);
             allListed.push(...nativeVisible(listed, target.scope, group, identity.workspaceId));
             allRecalled.push(...nativeVisible(recalled, target.scope, group, identity.workspaceId));
         }
@@ -838,8 +942,23 @@ export function createAgentMemoryService({ root, logger, deviceId, hubUrl, token
         if (workspaceId) scopes.push({ scope: 'workspace', ownerId: workspaceId });
         let removed = scopes.some(target => store.forget(target.scope, target.ownerId, id));
         for (const target of scopes) {
-            if (useNative(target.scope, target.ownerId)) {
-                if (await nativeFor(target.scope, target.ownerId).forget(id)) removed = true;
+            if (!useNative(target.scope, target.ownerId)) continue;
+            await ensureMigrated(target.scope, target.ownerId);
+            const inst = nativeFor(target.scope, target.ownerId);
+            const doomed = await inst.get(id).catch(() => undefined);
+            if (await inst.forget(id)) {
+                removed = true;
+                // Also remove any pre-migration SQLite twin (same title+content) so it can never resurrect
+                if (doomed) {
+                    const owners = [target.ownerId, ...(target.scope === 'workspace' ? workspaceLegacyAliases(target.ownerId) : [])];
+                    for (const oid of owners) {
+                        for (const row of store.list(target.scope, oid, { limit: 300 })) {
+                            if (row.title === doomed.title && row.content === doomed.content) {
+                                store.forget(target.scope, oid, row.id);
+                            }
+                        }
+                    }
+                }
             }
         }
         if (removed) service.cacheVersion++;

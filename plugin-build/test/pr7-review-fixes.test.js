@@ -3,7 +3,8 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { createAgentMemoryService, mountAgentMemory } from '../lib/src/memory/agent-memory.js';
+import { createAgentMemoryService, mountAgentMemory, resolveMemoryIdentity, resolveWorkspaceIdForCwd, workspaceKey } from '../lib/src/memory/agent-memory.js';
+import { parseDotEdges } from '../lib/src/memory/mnemon-native.js';
 import { createMemoryHttpAuth, hostIsLoopback } from '../lib/src/memory/http-auth.js';
 import { createMemoryBridge } from '../lib/src/superagent/memory.js';
 import { findMember, resolveAgentForTask } from '../lib/src/superagent/agents.js';
@@ -538,4 +539,115 @@ test('shipped client .21 fixes MemoryPage realWorkspaces TDZ, wraps with ErrorBo
     assert.ok(source.includes('.mtb-page{flex:1;min-height:0;min-width:0;width:100%;overflow:hidden'), 'TaskBoard .mtb-page must constrain min-width: 0 for horizontal scroll');
     assert.ok(source.includes('handleGridDragOver'), 'TaskBoard should auto-scroll horizontally while dragging cards');
     assert.ok(source.includes('toggleCollapseCol'), 'TaskBoard should allow collapsing columns into vertical rails');
+});
+
+// --- .22 canonical workspace UUID, zero-duplication Mnemon, graph edges, cue HTTP, and TaskBoard drag-pan tests ---
+test('resolveWorkspaceIdForCwd resolves registered workspace UUID, skips legacy Agent pseudo-workspaces, and falls back to workspaceKey', () => {
+    const workspaces = [
+        { id: 'ws-default-uuid', title: 'default-workspace', path: '/tmp/ws/default-workspace' },
+        { id: 'ws-nested-uuid', title: 'nested', path: '/tmp/ws/default-workspace/sub' },
+        { id: 'ws-ghost-agent', title: 'Agent · 丞相', path: '/Users/test/.dsh-marshal/agents/Agent · 丞相' },
+    ];
+    assert.equal(resolveWorkspaceIdForCwd('/tmp/ws/default-workspace', workspaces), 'ws-default-uuid');
+    assert.equal(resolveWorkspaceIdForCwd('/tmp/ws/default-workspace/src/app', workspaces), 'ws-default-uuid');
+    assert.equal(resolveWorkspaceIdForCwd('/tmp/ws/default-workspace/sub/pkg', workspaces), 'ws-nested-uuid');
+    assert.equal(
+        resolveWorkspaceIdForCwd('/Users/test/.dsh-marshal/agents/Agent · 丞相', workspaces),
+        workspaceKey('/Users/test/.dsh-marshal/agents/Agent · 丞相'),
+    );
+    assert.equal(resolveWorkspaceIdForCwd('/tmp/unregistered/dir', workspaces), workspaceKey('/tmp/unregistered/dir'));
+
+    const id = resolveMemoryIdentity({ session: { id: 's-1', header: { cwd: '/tmp/ws/default-workspace' } } }, { ledger: { teams: [], runs: [] }, workspaces });
+    assert.equal(id.workspaceId, 'ws-default-uuid');
+});
+
+test('parseDotEdges deduplicates symmetric edges, preserves directed edges, and prioritizes non-proximity links', () => {
+    const a = '11111111-1111-4111-8111-111111111111';
+    const b = '22222222-2222-4222-8222-222222222222';
+    const c = '33333333-3333-4333-8333-333333333333';
+    const dot = [
+        'digraph mnemon {',
+        '  "' + a + '" -> "' + b + '" [label="entity", color="#2ecc71"];',
+        '  "' + b + '" -> "' + a + '" [label="entity", color="#2ecc71"];',
+        '  "' + a + '" -> "' + c + '" [label="causal", color="#e74c3c"];',
+        '  "' + b + '" -> "' + c + '" [label="proximity", color="#aaaaaa"];',
+        '}',
+    ].join('\n');
+    const edges = parseDotEdges(dot);
+    assert.equal(edges.length, 2, 'should deduplicate symmetric entity and drop proximity when meaningful edges exist');
+    assert.equal(edges[0].kind, 'causal');
+    assert.equal(edges[1].kind, 'entity');
+});
+
+test('full-fleet Mnemon eliminates SQLite duplicates, migrates legacy workspaceKey aliases, prevents double prompt injection, projects graph edges, and deletes cleanly', async (t) => {
+    if (!mnemonBin) { t.skip('set MARSHAL_TEST_MNEMON to run full-fleet Mnemon deduplication tests'); return; }
+    const dir = tempRoot();
+    const wsPath = '/tmp/marshal-canonical-ws-test';
+    const wsUuid = 'ws-uuid-canonical-001';
+    const legacyAlias = workspaceKey(wsPath);
+    const workspaces = [{ id: wsUuid, title: 'canonical-ws', path: wsPath }];
+
+    // Seed legacy SQLite rows under both agent and legacy hashed workspaceKey
+    const seeded = createAgentMemoryService({ root: dir, ledger: { teams: [], runs: [] }, workspaces });
+    await seeded.rememberFor({ agentId: 'cx-1', scope: 'agent', title: '奏对铁律', text: '结论诚实，事实不隐瞒' });
+    await seeded.rememberFor({ workspaceId: legacyAlias, scope: 'workspace', title: '工作区交接', text: '旧 cwd 哈希下的工作区交接记录', kind: 'handoff' });
+    await seeded.rememberFor({ scope: 'global', title: '全局总规', text: '全系统通用全局铁律' });
+    seeded.store.close();
+
+    const service = createAgentMemoryService({
+        root: dir,
+        ledger: { teams: [], runs: [] },
+        workspaces,
+        mnemonPilot: { agentId: '*', executable: mnemonBin },
+    });
+    t.after(() => { service.store.close(); rmSync(dir, { recursive: true, force: true }); });
+
+    // Workspace legacy alias migrates into canonical workspace UUID with zero duplicates
+    const wsItems = await service.listFor({ workspaceId: wsUuid, scope: 'workspace', includeGlobal: false });
+    assert.equal(wsItems.length, 1);
+    assert.equal(wsItems[0].title, '工作区交接');
+    assert.equal(wsItems[0].backend, 'mnemon');
+
+    // Agent SQLite rows migrate to Mnemon with zero duplicates and real Mnemon UUIDs in graph
+    const second = await service.rememberFor({
+        agentId: 'cx-1', scope: 'agent', title: '研发流程章程', text: '奏对铁律配套的研发流程章程，结论诚实。', cue: '讨论研发章程时',
+    });
+    const agentGraph = await service.graphFor({ agentId: 'cx-1', includeGlobal: false });
+    assert.equal(agentGraph.nodes.length, 2, 'must not duplicate migrated SQLite + Mnemon nodes');
+    assert.ok(agentGraph.nodes.every(n => n.backend === 'mnemon'), 'graph nodes must keep Mnemon UUIDs so edges match');
+    assert.ok(agentGraph.edges.length >= 1, 'Mnemon graph edges should be projected into MemoryGalaxy');
+
+    // SQLite memoryBlock() skips Mnemon-powered agent & workspace scopes (no double prompt injection), keeps global
+    const identity = { agentId: 'cx-1', registeredAgent: true, workspaceId: wsUuid, sessionId: 's-nodup', session: { id: 's-nodup', header: { kind: 'direct' }, events: [{ type: 'user/message', data: { content: '汇报工作区交接和奏对铁律' } }] } };
+    const sqlBlock = service.block(identity);
+    assert.match(sqlBlock, /全局总规/, 'global memory should still inject in <memory>');
+    assert.doesNotMatch(sqlBlock, /奏对铁律/, 'Mnemon-powered agent memory must not double-inject in SQLite block');
+    assert.doesNotMatch(sqlBlock, /工作区交接/, 'Mnemon-powered workspace memory must not double-inject in SQLite block');
+    const mnPrompt = await service.nativePrompt(identity);
+    assert.match(mnPrompt, /工作区交接/);
+
+    // Forgetting a migrated Mnemon memory also removes its SQLite twin and updates exact stats
+    const migratedNode = agentGraph.nodes.find(n => n.title === '奏对铁律');
+    assert.ok(migratedNode);
+    assert.equal(await service.forgetFor({ agentId: 'cx-1', id: migratedNode.id }), true);
+    const afterForget = await service.listFor({ agentId: 'cx-1', scope: 'agent', includeGlobal: false });
+    assert.equal(afterForget.length, 1);
+    assert.equal(afterForget[0].id, second.id);
+    assert.equal(service.store.list('agent', 'cx-1').length, 0, 'SQLite twin must also be removed so it cannot resurrect');
+    const stats = await service.statsFor([{ scope: 'agent', ownerId: 'cx-1' }]);
+    assert.equal(stats[0].total, 1);
+});
+
+test('POST /marshal/memory/remember forwards cue and shipped client .22 exposes TaskBoard drag-pan, collapseEmptyCols & legacyReadOnly badge', () => {
+    const httpSrc = readFileSync(new URL('../lib/src/memory/http.js', import.meta.url), 'utf8');
+    const remIdx = httpSrc.indexOf("path: '/marshal/memory/remember'");
+    assert.ok(remIdx > 0);
+    assert.ok(httpSrc.slice(remIdx, remIdx + 1200).includes('cue: body.cue.trim()'), '/marshal/memory/remember must forward cue');
+
+    const clientSrc = readFileSync(new URL('../client/index.js', import.meta.url), 'utf8');
+    assert.ok(clientSrc.includes('handleGridMouseDown'), 'TaskBoard should support drag-to-pan on empty grid canvas');
+    assert.ok(clientSrc.includes('handleGridWheel'), 'TaskBoard should support horizontal wheel scrolling');
+    assert.ok(clientSrc.includes('collapseEmptyCols'), 'TaskBoard should expose 1-click collapse empty columns');
+    assert.ok(clientSrc.includes('mtb-edge-pan-right'), 'TaskBoard should render right-edge quick jump cue');
+    assert.ok(clientSrc.includes('legacyReadOnly'), 'Agent chat list should label cleaned legacy sessions as read-only archive');
 });

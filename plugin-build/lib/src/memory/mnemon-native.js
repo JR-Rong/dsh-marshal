@@ -8,8 +8,12 @@ import { neutralizeMemory } from './lifecycle.js';
 
 const execFileAsync = promisify(execFile);
 const META = '__mm__';
+const LEGACY_META = 'marshal-v1-';
 const META_PART = /^__mm__(\d{2})-(.+)$/;
+const LEGACY_META_PART = /^marshal-v1-(\d{2})-(.+)$/;
+const RUN_ENV = ['PATH', 'HOME', 'USERPROFILE', 'SystemRoot', 'SYSTEMROOT', 'TMPDIR', 'TEMP', 'TMP'];
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const DOT_EDGE = /"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"\s*->\s*"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"\s*\[[^\]]*label="([^"]+)"/gi;
 const TAG_LIMIT = 50;
 const CATEGORIES = {
     profile: 'preference',
@@ -21,6 +25,16 @@ const CATEGORIES = {
 };
 const VALID_INTENTS = new Set(['WHY', 'WHEN', 'ENTITY', 'GENERAL']);
 const VALID_EDGE_TYPES = new Set(['causal', 'entity', 'semantic', 'supersedes', 'temporal']);
+const SYMMETRIC_EDGES = new Set(['entity', 'semantic', 'backbone', 'proximity']);
+const EDGE_WEIGHTS = {
+    causal: 0.92,
+    supersedes: 0.9,
+    entity: 0.78,
+    semantic: 0.72,
+    temporal: 0.55,
+    backbone: 0.45,
+    proximity: 0.25,
+};
 
 const memoryError = (code, message) => Object.assign(new Error(message), { code });
 const unavailable = () => memoryError('memory-backend-unavailable', 'Mnemon 记忆后端暂时不可用。');
@@ -29,24 +43,29 @@ const parseTime = value => {
     const ms = Date.parse(value ?? '');
     return Number.isFinite(ms) ? ms : Date.now();
 };
-const storeNameFor = (scope, ownerId) => {
+export const storeNameFor = (scope, ownerId) => {
     const prefix = scope === 'workspace' ? 'ws-' : 'pilot-';
     const slug = String(ownerId ?? '').replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 24) || 'owner';
     return prefix + slug + '-' + createHash('sha256').update(scope + ':' + String(ownerId ?? '')).digest('hex').slice(0, 8);
 };
 
 function decodeMeta(tags) {
-    const parts = [];
+    const modern = [];
+    const legacy = [];
     const plain = [];
     for (const tag of Array.isArray(tags) ? tags : []) {
-        const match = META_PART.exec(String(tag));
-        if (match) parts.push([Number(match[1]), match[2]]);
-        else if (!String(tag).startsWith(META)) plain.push(String(tag));
+        const s = String(tag);
+        const m1 = META_PART.exec(s);
+        if (m1) { modern.push([Number(m1[1]), m1[2]]); continue; }
+        const m2 = LEGACY_META_PART.exec(s);
+        if (m2) { legacy.push([Number(m2[1]), m2[2]]); continue; }
+        if (!s.startsWith(META) && !s.startsWith(LEGACY_META)) plain.push(s);
     }
+    const parts = modern.length > 0 ? modern : legacy;
     if (parts.length === 0) return { tags: plain };
     parts.sort((a, b) => a[0] - b[0]);
     try {
-        const parsed = JSON.parse(inflateRawSync(Buffer.from(parts.map(([, chunk]) => chunk).join(''), 'base64url')).toString('utf8'));
+        const parsed = JSON.parse(inflateRawSync(Buffer.from(parts.map(([, chunk]) => chunk).join(''), 'base64url'), { maxOutputLength: 16_000 }).toString('utf8'));
         return parsed && typeof parsed === 'object' ? { ...parsed, tags: Array.isArray(parsed.tags) ? parsed.tags : plain } : { tags: plain };
     }
     catch { return { tags: plain }; }
@@ -97,25 +116,68 @@ function entryFor(row, scope, ownerId) {
     };
 }
 
+export function parseDotEdges(dotText, maxEdges = 220) {
+    const raw = [];
+    const seen = new Set();
+    let match;
+    DOT_EDGE.lastIndex = 0;
+    while ((match = DOT_EDGE.exec(String(dotText ?? ''))) !== null) {
+        const source = match[1];
+        const target = match[2];
+        if (source === target) continue;
+        const kind = String(match[3] || 'semantic').trim().toLowerCase();
+        const key = SYMMETRIC_EDGES.has(kind)
+            ? (source < target ? source + '<->' + target + ':' + kind : target + '<->' + source + ':' + kind)
+            : (source + '->' + target + ':' + kind);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        raw.push({ source, target, kind, weight: EDGE_WEIGHTS[kind] ?? 0.5 });
+    }
+    const meaningful = raw.filter(e => e.kind !== 'proximity');
+    const selected = meaningful.length > 0 ? meaningful : raw;
+    selected.sort((a, b) => b.weight - a.weight);
+    return selected.slice(0, maxEdges);
+}
+
 export function createMnemonNative({ agentId, ownerId, scope = 'agent', executable, root, store: explicitStore }) {
     const resolvedScope = scope === 'workspace' ? 'workspace' : 'agent';
     const resolvedOwner = String(ownerId ?? agentId ?? '');
     const dataDir = join(root, 'mnemon-native');
     const store = explicitStore || storeNameFor(resolvedScope, resolvedOwner);
     mkdirSync(dataDir, { recursive: true, mode: 0o700 });
-    const env = { ...process.env, MNEMON_DATA_DIR: dataDir, MNEMON_STORE: store };
-    const run = async (args, { signal, allowMissing = false } = {}) => {
-        try {
-            const result = await execFileAsync(executable, ['--data-dir', dataDir, '--store', store, ...args], {
-                env, timeout: 3500, killSignal: 'SIGKILL', maxBuffer: 4 * 1024 * 1024, signal, windowsHide: true,
-            });
-            return JSON.parse(result.stdout);
-        }
-        catch (error) {
+    const buildEnv = () => {
+        const env = Object.fromEntries(RUN_ENV.filter(key => process.env[key] !== undefined).map(key => [key, process.env[key]]));
+        env.MNEMON_DATA_DIR = dataDir;
+        env.MNEMON_STORE = store;
+        env.MNEMON_EMBED_ENDPOINT = 'http://127.0.0.1:0';
+        env.MNEMON_MAX_INSIGHTS = '0';
+        return env;
+    };
+    let queue = Promise.resolve();
+    const runRaw = (args, { signal, allowMissing = false } = {}) => {
+        const execOnce = async () => {
             if (signal?.aborted) signal.throwIfAborted();
-            if (allowMissing && error.code === 1 && /no rows in result set|not found or already deleted/.test(error.stderr ?? '')) return undefined;
-            throw unavailable();
-        }
+            try {
+                const result = await execFileAsync(executable, ['--data-dir', dataDir, '--store', store, ...args], {
+                    env: buildEnv(), timeout: 3500, killSignal: 'SIGKILL', maxBuffer: 4 * 1024 * 1024, signal, windowsHide: true,
+                });
+                return result.stdout;
+            }
+            catch (error) {
+                if (signal?.aborted) signal.throwIfAborted();
+                if (allowMissing && error.code === 1 && /no rows in result set|not found or already deleted/.test(error.stderr ?? '')) return undefined;
+                throw unavailable();
+            }
+        };
+        const next = queue.then(execOnce, execOnce);
+        queue = next.catch(() => {});
+        return next;
+    };
+    const run = async (args, options = {}) => {
+        const stdout = await runRaw(args, options);
+        if (stdout === undefined) return undefined;
+        try { return JSON.parse(stdout); }
+        catch { throw unavailable(); }
     };
     const get = async id => UUID.test(id) ? entryFor(await run(['show', id], { allowMissing: true }), resolvedScope, resolvedOwner) : undefined;
     return {
@@ -123,6 +185,7 @@ export function createMnemonNative({ agentId, ownerId, scope = 'agent', executab
         ownerId: resolvedOwner,
         agentId: resolvedScope === 'agent' ? resolvedOwner : undefined,
         store,
+        dataDir,
         get,
         async remember(entry, context = {}) {
             const title = neutralizeMemory(entry.title ?? '').trim().replace(/\s+/g, ' ').slice(0, 160);
@@ -133,7 +196,7 @@ export function createMnemonNative({ agentId, ownerId, scope = 'agent', executab
             }
             const importance = bound(Number.isFinite(Number(entry.importance)) ? Number(entry.importance) : 0.5, 0, 1);
             const tags = (Array.isArray(entry.tags) ? entry.tags : [])
-                .filter(tag => typeof tag === 'string' && !tag.startsWith(META)).slice(0, 24).map(tag => tag.slice(0, 85));
+                .filter(tag => typeof tag === 'string' && !tag.startsWith(META) && !tag.startsWith(LEGACY_META)).slice(0, 24).map(tag => tag.slice(0, 85));
             const cue = typeof entry.cue === 'string' ? neutralizeMemory(entry.cue).trim().slice(0, 140) : '';
             const source = typeof entry.source === 'string' ? entry.source.trim().slice(0, 80) : (context.sessionId ? 'session:' + String(context.sessionId).slice(0, 48) : '');
             const sharedWorkspace = resolvedScope === 'workspace'
@@ -220,9 +283,14 @@ export function createMnemonNative({ agentId, ownerId, scope = 'agent', executab
             const items = Array.isArray(result) ? result : Array.isArray(result?.results) ? result.results : Array.isArray(result?.related) ? result.related : [];
             return items.map(row => ({
                 targetId: row?.insight?.id ?? row?.id ?? row?.target_id,
-                edgeType: row?.edge_type ?? row?.type ?? 'semantic',
+                edgeType: row?.via_edge_type ?? row?.edge_type ?? row?.type ?? 'semantic',
                 weight: Number(row?.weight ?? row?.score ?? 0.5),
             })).filter(e => typeof e.targetId === 'string' && UUID.test(e.targetId) && e.targetId !== id);
+        },
+        async graphEdges({ signal, maxEdges = 220 } = {}) {
+            const dot = await runRaw(['viz', '--format', 'dot'], { signal, allowMissing: true });
+            if (!dot) return [];
+            return parseDotEdges(dot, maxEdges);
         },
         async stats() {
             const value = (await run(['status']))?.total_insights;

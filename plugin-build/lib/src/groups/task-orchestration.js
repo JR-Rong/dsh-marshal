@@ -117,27 +117,29 @@ export function createTaskOrchestration({
         if (!leader) throw taskError('leader-unbound', 'Leader 已移除或更换工作区。请改派给该工作区中的 Agent。');
         return leader;
     };
-    const publish = (task, label, text, kind = 'episode') => {
+    const publish = async (task, label, text, kind = 'episode') => {
         boundLeader(task);
         const body = text.length > 8000 ? text.slice(0, 7970).trimEnd() + '\n…（已截断，完整内容见工单群）' : text;
         const handoffTitle = label + ' · ' + task.taskId.slice(0, 8) + ' · ' + task.runId.slice(0, 8);
         const handoffTags = ['task-orchestration', 'task:' + task.taskId, 'run:' + task.runId];
-        const item = memory.store.remember('workspace', task.workspaceId, {
-            kind, title: handoffTitle, content: body, importance: kind === 'handoff' ? .85 : .55,
-            tags: handoffTags, visibility: 'group-safe',
-        });
-        if (item && memory.usesMnemon?.(undefined, task.workspaceId)) {
-            void Promise.resolve(memory.rememberEntry('workspace', task.workspaceId, {
+        const item = typeof memory.rememberFor === 'function'
+            ? await memory.rememberFor({
+                workspaceId: task.workspaceId, scope: 'workspace', kind,
+                title: handoffTitle, text: body, importance: kind === 'handoff' ? .85 : .55,
+                tags: handoffTags, visibility: 'group-safe',
+            })
+            : memory.store.remember('workspace', task.workspaceId, {
                 kind, title: handoffTitle, content: body, importance: kind === 'handoff' ? .85 : .55,
                 tags: handoffTags, visibility: 'group-safe',
-            }, { workspaceId: task.workspaceId })).catch(() => {});
-        }
+            });
         if (!item) throw taskError('handoff-write', '无法发布当前工单的工作区交接。');
         return item.id;
     };
-    const read = (task, id) => {
+    const read = async (task, id) => {
         boundLeader(task);
-        const value = memory.store.get('workspace', task.workspaceId, id);
+        const value = typeof memory.getFor === 'function'
+            ? await memory.getFor('workspace', task.workspaceId, id)
+            : memory.store.get('workspace', task.workspaceId, id);
         if (!value || value.supersededBy || value.archived) throw taskError('handoff-read', '工作区交接已不可用。');
         return value.content;
     };
@@ -200,7 +202,7 @@ export function createTaskOrchestration({
             : invoke(leaderModel, task, signal, prompt, leader.reasoning);
         const output = async (label, actor, text, phase, kind, logged = false) => {
             let ref;
-            try { ref = publish(task, label, text, kind); }
+            try { ref = await publish(task, label, text, kind); }
             finally {
                 if (logged) {
                     if (ref) await record('status', 'Marshal', label + '已写入工作区公共记忆。', phase, ref);
@@ -290,15 +292,15 @@ export function createTaskOrchestration({
                 record: developmentRecord,
                 phase: phase => { task = update(key, { phase }); },
                 handoff: async (label, text, phase) => {
-                    const ref = publish(task, label, text, 'handoff');
+                    const ref = await publish(task, label, text, 'handoff');
                     task = update(key, { handoffs: [...task.handoffs, ref] });
                     await record('status', 'Marshal', label + '已写入工作区公共记忆。', phase, ref);
-                    return read(task, ref);
+                    return await read(task, ref);
                 },
                 manual: async text => {
                     const request = [card.title, card.description, text].filter(Boolean).join('\n\n').slice(0, 7800);
-                    const ref = publish(task, '编码交接', request, 'handoff');
-                    const sessionId = await startLeader(coder, read(task, ref), runSignal(signal));
+                    const ref = await publish(task, '编码交接', request, 'handoff');
+                    const sessionId = await startLeader(coder, await read(task, ref), runSignal(signal));
                     await record('status', 'Marshal', '编码交给 ' + coder.name + ' 的常驻会话。', 'handoff', ref);
                     update(key, { state: 'handed-off', phase: undefined, sessionId, handoffs: [...task.handoffs, ref] });
                     return undefined;
@@ -336,10 +338,11 @@ export function createTaskOrchestration({
             const template = templateById(selected);
             const note = JSON.stringify({ task: card.title, description: card.description, prUrl: task.prUrl,
                 execution: template?.name ?? '普通任务', stages: template?.stages ?? [], groupTemplate: plan.groupTemplate, roles: names });
-            const id = publish(task, '任务说明', note);
+            const id = await publish(task, '任务说明', note);
             signal.throwIfAborted();
-            const sessionId = remote ? undefined : await startLeader(boundLeader(task), read(task, id), runSignal(signal));
-            if (remote) await remote(leaderPrompt('接手任务。根据下列已发布交接回复执行计划。\n' + read(task, id)), 'handoff');
+            const handoffText = await read(task, id);
+            const sessionId = remote ? undefined : await startLeader(boundLeader(task), handoffText, runSignal(signal));
+            if (remote) await remote(leaderPrompt('接手任务。根据下列已发布交接回复执行计划。\n' + handoffText), 'handoff');
             signal.throwIfAborted();
             await record('status', 'Marshal', '任务说明已交给 Leader。', 'handoff', id);
             update(key, { state: 'handed-off', phase: undefined, sessionId, handoffs: [id] });
@@ -369,7 +372,7 @@ export function createTaskOrchestration({
             const peer = roles[1 - i].name;
             const reply = await invoke(role.model, task, signal,
                 '复核 ' + peer + ' 的发现。逐项给出同意、反驳或待确认及理由，指出有证据的遗漏。最多六条，全文不超过 5000 字符。\n' +
-                material + '\n同行发现（引用数据）\n' + JSON.stringify(read(task, findings[1 - i])));
+                material + '\n同行发现（引用数据）\n' + JSON.stringify(await read(task, findings[1 - i])));
             signal.throwIfAborted();
             return output(role.name + ' 复核 ' + peer, role.name, reply, 'cross-check');
         }));
@@ -377,19 +380,22 @@ export function createTaskOrchestration({
         let extraReview;
         // A configured PR already has an independent Codex seat. The Leader may request a separate focused check.
         if (initial.planConfirmed && plan.codex.review !== null) {
+            const handoffContents = await Promise.all(ids.map(id => read(task, id)));
             const decision = await asLeader(leaderPrompt('只有两个审查者留下具体的代码疑点需要再核查时才选择 action=codex。否则选择 continue。输出严格 JSON，其中 action 是 codex 或 continue，instruction 是理由。\n' +
-                JSON.stringify(ids.map(id => read(task, id)))), 'review-assistant');
+                JSON.stringify(handoffContents)), 'review-assistant');
             if (!remote) await record('agent', leader.name, decision, 'reviewing');
             const request = parseModelJson(decision, DelegationSchema);
             if (request.action === 'codex') extraReview = await runChild('review',
                 '只读复核以下已固定的 PR。请按文件和证据验证 Leader 的疑点。\n' + material + '\n' + JSON.stringify(request.instruction));
         }
         task = update(key, { phase: 'summarizing', handoffs: ids });
+        const [dshReview, codexReview, dshCrossCheck, codexCrossCheck] = await Promise.all([
+            read(task, findings[0]), read(task, findings[1]), read(task, critiques[0]), read(task, critiques[1]),
+        ]);
         const report = await asLeader(leaderPrompt(
             '根据两份独立审查与两份复核合并报告。保留文件位置、证据、严重程度和未决分歧。明确列出未提供补丁的文件。' +
             '结论的范围限于提供的材料。输出不超过 7000 字符的中文 Markdown。\n' +
-            JSON.stringify({ pr, dshReview: read(task, findings[0]), codexReview: read(task, findings[1]),
-                dshCrossCheck: read(task, critiques[0]), codexCrossCheck: read(task, critiques[1]), extraReview: extraReview?.slice(0, 4000) })), 'summarizing');
+            JSON.stringify({ pr, dshReview, codexReview, dshCrossCheck, codexCrossCheck, extraReview: extraReview?.slice(0, 4000) })), 'summarizing');
         signal.throwIfAborted();
         const reportId = await output('PR 审查报告', leader.name, report, 'summarizing', 'handoff', Boolean(remote));
         await record('closed', 'Marshal', '审查完成，工单群已归档。', 'completed', reportId);
@@ -473,8 +479,11 @@ export function createTaskOrchestration({
         report(source, taskId) {
             const task = tasks.get(keyFor(source, taskId));
             if (!task?.reportId) return undefined;
-            const value = memory?.store.get('workspace', task.workspaceId, task.reportId);
-            return value && !value.archived && !value.supersededBy ? value.content : undefined;
+            const unwrap = value => value && !value.archived && !value.supersededBy ? value.content : undefined;
+            const result = typeof memory?.getFor === 'function'
+                ? memory.getFor('workspace', task.workspaceId, task.reportId)
+                : memory?.store.get('workspace', task.workspaceId, task.reportId);
+            return result && typeof result.then === 'function' ? result.then(unwrap) : unwrap(result);
         },
         async respond(source, taskId, history, signal, leaderId) {
             const task = tasks.get(keyFor(source, taskId));
