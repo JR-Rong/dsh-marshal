@@ -40,9 +40,15 @@ export const DelegationSchema = z.object({
     action: z.enum(['codex', 'continue']),
     instruction: z.string().trim().min(1).max(4000),
 }).strict();
+const findingsText = z.string().trim().min(1).max(5000);
+const findingsList = z.array(z.object({
+    file: z.string().trim().min(1).max(280),
+    conclusion: z.string().trim().min(1).max(1800),
+}).strict()).min(1).max(12).transform(items =>
+    items.map(item => '- ' + item.file + '：' + item.conclusion).join('\n'));
 export const VerdictSchema = z.object({
     verdict: z.enum(['pass', 'revise', 'blocked']),
-    findings: z.string().trim().min(1).max(5000),
+    findings: z.union([findingsText, findingsList]).pipe(findingsText),
 }).strict();
 
 export function parseModelJson(text, schema) {

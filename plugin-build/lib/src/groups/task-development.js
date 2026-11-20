@@ -75,7 +75,7 @@ async function freezePatch(worktree, base, signal) {
 
 const brief = (title, description, plan, extra) => JSON.stringify({ title, description, plan, ...extra });
 const decisionFormat = '请返回严格 JSON，字段 action 可为 codex 或 continue，instruction 为具体说明。';
-const verdictFormat = '请返回严格 JSON，字段 verdict 可为 pass、revise 或 blocked，findings 为带文件依据的结论。';
+const verdictFormat = '请返回严格 JSON。verdict 为 pass、revise 或 blocked。findings 为带文件依据的字符串，或由 file 和 conclusion 两个字符串字段组成的对象数组。';
 
 export async function runTaskDevelopment({
     card, path, plan, signal, asLeader, asRole, runChild, record, handoff, phase, manual,

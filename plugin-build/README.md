@@ -5,7 +5,7 @@ Self-contained installable build of the marshal plugin.
 Install from the tarball in this directory:
 
 - Desktop: Plugins -> Add plugin -> pick the .tgz;
-- CLI: dsh plugin --profile desktop add /abs/path/dsh-marshal-0.2.0-agent-groups.11.tgz.
+- CLI: dsh plugin --profile desktop add /abs/path/dsh-marshal-0.2.0-agent-groups.12.tgz.
 
 Required DSH plugins (install in the same profile first):
 

@@ -101,7 +101,8 @@ for (const run of [{ reviewerDelegates: true }, { reviewerDelegates: false }, { 
                 assert.match(prompt, /Backup reviewer/);
                 if (prompt.includes('字段 action')) return JSON.stringify({ action: reviewerDelegates ? 'codex' : 'continue', instruction: 'Check the return value.' });
                 if (reviewerDelegates) assert.ok(reviewed);
-                return JSON.stringify({ verdict: 'pass', findings: 'Addition and the new module match the brief.' });
+                const findings = 'Addition and the new module match the brief.';
+                return JSON.stringify({ verdict: 'pass', findings: pilot ? [{ file: 'sum.mjs:1', conclusion: findings }] : findings });
             },
         };
         const flow = createTaskOrchestration({
