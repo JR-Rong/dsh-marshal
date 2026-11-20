@@ -1841,7 +1841,7 @@ window.__ModuleLoader__.load({
       };
       const create = async () => {
         if (!title.trim()) { setError('请填写标题'); return; }
-        if (!workspace) { setError('请选择工单所属的工作区'); return; }
+        if (leaderId && !workspace) { setError('请选择工单所属的工作区'); return; }
         if (requiresPr && !prUrl.trim()) { setError('请填写要审查的 PR 链接'); return; }
         if (leaderId && !plan) { await recommend(); return; }
         if (leaderId && roleChoices?.some(role => role.required && !plan.members[role.id])) {
@@ -1857,9 +1857,10 @@ window.__ModuleLoader__.load({
           const result = editing
             ? await fetchJson('marshal/tasks/plan', { taskId: editing, orchestration }, true)
             : await fetchJson('marshal/tasks/create', {
-              title: title.trim(), description: description.trim(), workspaceId: workspace,
+              title: title.trim(), description: description.trim(),
+              ...(workspace ? { workspaceId: workspace } : {}),
               ...(orchestration === undefined ? {} : { orchestration }),
-            }, true);
+            }, Boolean(workspace || orchestration));
           setTasks(result.tasks || []);
           setTitle('');
           setDescription('');
@@ -1880,7 +1881,7 @@ window.__ModuleLoader__.load({
         setBusy(true);
         setError('');
         try {
-          const result = await fetchJson('marshal/tasks/run', { taskId: task.id }, Boolean(task.workflow));
+          const result = await fetchJson('marshal/tasks/run', { taskId: task.id }, Boolean(task.workflow || task.taskRoom));
           setTasks(result.tasks || []);
         }
         catch (e) { setError('运行失败：' + (e.message || e)); }
@@ -1892,7 +1893,7 @@ window.__ModuleLoader__.load({
         setBusy(true);
         setError('');
         try {
-          const result = await fetchJson('marshal/tasks/delete', { taskId: task.id }, Boolean(task.workflow));
+          const result = await fetchJson('marshal/tasks/delete', { taskId: task.id }, Boolean(task.workflow || task.taskRoom));
           setTasks(result.tasks || []);
           setConfirmId('');
         }
@@ -1928,7 +1929,7 @@ window.__ModuleLoader__.load({
               type: 'button', style: uiButton(false), onClick: () => edit(task), disabled: busy,
             }, '编辑分工'),
             task.sessionId && h('button', { type: 'button', style: { ...uiButton(false), padding: '3px 8px', fontSize: 11 }, onClick: () => openSession && openSession(task.sessionId) }, '打开会话'),
-            workflow && !task.taskRoom?.closed && task.status !== 'running' && workflow.state !== 'done' && h('button', { type: 'button', disabled: busy, style: { ...uiButton(true), padding: '3px 8px', fontSize: 11 }, onClick: () => { void run(task); } }, workflow?.state === 'failed' || workflow?.state === 'interrupted' ? '重试' : '运行'),
+            !task.taskRoom?.closed && task.status !== 'running' && (!workflow || workflow.state !== 'done') && h('button', { type: 'button', disabled: busy, style: { ...uiButton(true), padding: '3px 8px', fontSize: 11 }, onClick: () => { void run(task); } }, workflow?.state === 'failed' || workflow?.state === 'interrupted' ? '重试' : '运行'),
             !task.taskRoom && h('button', { type: 'button', style: { ...uiButton(false), padding: '3px 8px', fontSize: 11, color: confirmId === task.id ? dswTheme.danger : dswTheme.text }, onClick: () => { void remove(task); } }, confirmId === task.id ? '确认删除' : '删除')));
       };
 

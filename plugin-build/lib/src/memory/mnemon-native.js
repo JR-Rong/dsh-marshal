@@ -86,9 +86,23 @@ export function createMnemonNative({ root, agentId, executable }) {
             if (markers.length > TAG_LIMIT) throw memoryError('invalid-memory', 'Mnemon 记忆的标签元数据过长，请缩短标签。');
             const searchableTags = tags.filter(tag => !tag.includes(',') && Buffer.byteLength(tag) <= 100)
                 .slice(0, TAG_LIMIT - markers.length);
-            const result = await run(['remember', '--cat', CATEGORIES[kind], '--imp', String(1 + Math.round(4 * importance)),
+            const rememberArgs = (extra = []) => ['remember', ...extra, '--cat', CATEGORIES[kind], '--imp', String(1 + Math.round(4 * importance)),
                 '--source', 'agent', '--tags', [...searchableTags, ...markers].join(','),
-                '--', title + '\n\n' + content], context);
+                '--', title + '\n\n' + content];
+            let result = await run(rememberArgs(), context);
+            if (result?.action === 'skipped' && UUID.test(result.replaced_id)) {
+                const existing = await get(result.replaced_id);
+                const sameMeta = existing !== undefined
+                    && existing.kind === meta.kind
+                    && existing.visibility === meta.visibility
+                    && existing.allowedWorkspaceId === meta.workspaceId
+                    && existing.pinned === meta.pinned
+                    && existing.importance === meta.importance
+                    && JSON.stringify(existing.tags) === JSON.stringify(meta.tags);
+                if (sameMeta) return existing;
+                await run(['forget', result.replaced_id], { allowMissing: true, signal: context.signal });
+                result = await run(rememberArgs(['--no-diff']), context);
+            }
             const id = result?.action === 'skipped' ? result.replaced_id : result?.action === 'added' ? result.id : undefined;
             if (!id) throw unavailable();
             const confirmed = result.action === 'added' && entryFor({ ...result, access_count: 0 }, agentId);

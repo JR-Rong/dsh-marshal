@@ -52,9 +52,19 @@ export const VerdictSchema = z.object({
 }).strict();
 
 export function parseModelJson(text, schema) {
-    const body = String(text).trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
-    try { return schema.parse(JSON.parse(body)); }
-    catch { throw taskError('invalid-role-output', 'Agent 未返回有效的阶段决定。'); }
+    const raw = String(text).trim();
+    const candidates = [raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '')];
+    for (const match of raw.matchAll(/```(?:json)?\s*([\s\S]*?)\s*```/gi)) {
+        if (match[1]) candidates.push(match[1].trim());
+    }
+    const firstBrace = raw.indexOf('{');
+    const lastBrace = raw.lastIndexOf('}');
+    if (firstBrace !== -1 && lastBrace > firstBrace) candidates.push(raw.slice(firstBrace, lastBrace + 1));
+    for (const candidate of candidates) {
+        try { return schema.parse(JSON.parse(candidate)); }
+        catch { /* try next candidate */ }
+    }
+    throw taskError('invalid-role-output', 'Agent 未返回有效的阶段决定。');
 }
 
 export function roleSlots(templateId, codeWork) {

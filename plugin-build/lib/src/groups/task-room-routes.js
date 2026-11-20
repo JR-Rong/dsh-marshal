@@ -61,29 +61,29 @@ export function createTaskRoomRoutes({
     const safeTarget = input => input === undefined ? undefined : remoteChoice.parse(input);
     const activeWorkflow = async (room, body, access, action) => {
         assertIdle(room);
-        if (boardSource() !== room.source) throw taskError('task-board-source', '请使用该工单所属的任务看板。');
-        const card = getCard(getBoard(), room.taskId);
-        let workflow = orchestration?.target(room.source, room.taskId);
-        if (!orchestration) throw unavailable();
-        const target = action === 'reassign' ? safeTarget(body.remote) : workflow?.remoteTarget;
-        let leader;
-        if (body.leaderId !== undefined) {
-            leader = orchestration.prepare({ choice: 'none', leaderId: body.leaderId });
-            if (leader.workspaceId !== room.workspaceId || !allowed(access, leader)) throw hidden();
+        operations.add(room.id);
+        try {
+            if (boardSource() !== room.source) throw taskError('task-board-source', '请使用该工单所属的任务看板。');
+            const card = getCard(getBoard(), room.taskId);
+            let workflow = orchestration?.target(room.source, room.taskId);
+            if (!orchestration) throw unavailable();
+            const target = action === 'reassign' ? safeTarget(body.remote) : workflow?.remoteTarget;
+            let leader;
+            if (body.leaderId !== undefined) {
+                leader = orchestration.prepare({ choice: 'none', leaderId: body.leaderId });
+                if (leader.workspaceId !== room.workspaceId || !allowed(access, leader)) throw hidden();
+            }
+            if (!workflow && !leader) throw taskError('invalid-leader', '为这张工单指定工作区中的 Leader。');
+            if (workflow && (workflow.workspaceId !== room.workspaceId || (!leader && !allowed(access, workflow)))) throw hidden();
+            if (target) await rooms.promote(room.id, target);
+            orchestration.assertIdle(room.source, room.taskId);
+            if (!workflow) orchestration.attach(room.source, room.taskId, leader);
+            orchestration.start(room.source, card, taskRoomAudit(rooms, room, action,
+                leader ? { id: leader.leaderId, leaderName: leader.leaderName, agentId: leader.agentId, workspaceId: leader.workspaceId } : undefined,
+                target, member => allowed(access, member)));
+            return { room: visibleTaskRoom(rooms.local(room.id)) };
         }
-        if (!workflow) {
-            if (!leader) throw taskError('invalid-leader', '为这张工单指定工作区中的 Leader。');
-            orchestration.attach(room.source, room.taskId, leader);
-            workflow = orchestration.target(room.source, room.taskId);
-        }
-        if (workflow.workspaceId !== room.workspaceId || (!leader && !allowed(access, workflow))) throw hidden();
-        if (target) await rooms.promote(room.id, target);
-        // Recheck after the cross-device copy. A second request may have started while this one was awaiting the Hub.
-        assertIdle(room);
-        orchestration.start(room.source, card, taskRoomAudit(rooms, room, action,
-            leader ? { id: leader.leaderId, leaderName: leader.leaderName, agentId: leader.agentId, workspaceId: leader.workspaceId } : undefined,
-            target, member => allowed(access, member)));
-        return { room: visibleTaskRoom(rooms.local(room.id)) };
+        finally { operations.delete(room.id); }
     };
     const send = async (room, body, access) => {
         assertIdle(room);

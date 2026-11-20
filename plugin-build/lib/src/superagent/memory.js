@@ -25,6 +25,16 @@ function itemLine(item) {
     return (title === '' ? '（无标题）' : title) + '（' + kind + '）：' + clip(content, 320);
 }
 
+function sharedCardSafe(item, scope, workspaceId) {
+    if (item === null || typeof item !== 'object') return false;
+    if (scope === 'agent') {
+        const visibility = item.visibility;
+        if (visibility === 'private' || visibility === 'never-group' || visibility === 'no-group') return false;
+        if (typeof item.allowedWorkspaceId === 'string' && item.allowedWorkspaceId !== '' && item.allowedWorkspaceId !== workspaceId) return false;
+    }
+    return true;
+}
+
 async function itemsOf(service, query) {
     if (service === undefined || service === null) return undefined;
     if (typeof service.listFor === 'function') {
@@ -35,6 +45,7 @@ async function itemsOf(service, query) {
                 scope: query.scope,
                 limit: query.limit,
                 ...(query.text === undefined || query.text === '' ? {} : { query: query.text }),
+                group: true,
                 includeGlobal: false,
             });
         }
@@ -67,14 +78,14 @@ export function createMemoryBridge(service, options = {}) {
     const recall = async ({ agentId, workspaceId, text, limit = 6 }) => {
         if (!available || limit <= 0) return { text: '', count: 0, error: undefined };
         const [agentResult, workspaceResult] = await Promise.all([
-            itemsOf(service, { scope: 'agent', agentId, limit, text }),
+            itemsOf(service, { scope: 'agent', agentId, workspaceId, limit, text }),
             itemsOf(service, { scope: 'workspace', workspaceId, limit: Math.max(1, Math.min(3, limit - 1)), text }),
         ]);
         if (agentResult === undefined && workspaceResult === undefined) {
             return { text: '', count: 0, error: 'memory-recall-failed' };
         }
-        const agentItems = agentResult ?? [];
-        const workspaceItems = workspaceResult ?? [];
+        const agentItems = (agentResult ?? []).filter(item => sharedCardSafe(item, 'agent', workspaceId));
+        const workspaceItems = (workspaceResult ?? []).filter(item => sharedCardSafe(item, 'workspace', workspaceId));
         const seen = new Set();
         const lines = [];
         for (const [scope, items] of [['agent', agentItems], ['workspace', workspaceItems]]) {

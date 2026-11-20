@@ -196,6 +196,10 @@ export async function applyBoardCommand(host: PhoneHost | undefined, command: {
     return { ok: false, code: 'unsupported' }
   }
   try {
+    const before = await readBoard(host.board)
+    if (before?.revision != null && before.revision !== command.baseRevision) {
+      return { ok: false, code: 'conflict' }
+    }
     const snap = asTasks(await host.board.apply(command.id, {
       kind: command.action,
       baseRevision: command.baseRevision,
@@ -203,8 +207,9 @@ export async function applyBoardCommand(host: PhoneHost | undefined, command: {
       ...(command.title === undefined ? {} : { input: { title: command.title } }),
       ...(command.status === undefined ? {} : { status: command.status }),
     }))
-    if (snap?.revision == null || snap.revision < command.baseRevision) return { ok: false, code: 'unavailable' }
-    if (snap.revision === command.baseRevision) {
+    const expectedBase = before?.revision ?? command.baseRevision
+    if (snap?.revision == null || snap.revision < expectedBase) return { ok: false, code: 'unavailable' }
+    if (snap.revision === expectedBase) {
       return { ok: false, code: 'conflict' }
     }
     return { ok: true, revision: snap.revision }

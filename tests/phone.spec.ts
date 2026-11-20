@@ -315,4 +315,33 @@ describe('phone transfer regressions', () => {
     await expect(readPhoneFaces({ memory: { readPhone: () => ({ entries: [] }) } }, true))
       .resolves.toMatchObject({ memory: { entries: [] } })
   })
+
+  it('resets board revision when a node reconnects with a new connectionId and rejects stale pre-apply revisions', async () => {
+    const devices = store()
+    const { entry: mac } = devices.add('mac', 'Mac')
+    let conn = 'conn-1'
+    const hub = createPhoneHub({ store: devices, nodeConnection: () => conn })
+    hub.writeTasks({ ok: true, device: mac }, { read: true, revision: 42, tasks: [{ id: 't1', title: 'Old', status: 'todo' }] })
+    expect(hub.revisions()).toEqual({ mac: 42 })
+    // Same connection ignores stale lower revision
+    hub.writeTasks({ ok: true, device: mac }, { read: true, revision: 1, tasks: [{ id: 't2', title: 'Stale', status: 'todo' }] })
+    expect(hub.revisions()).toEqual({ mac: 42 })
+    // New connection (after node restart) accepts fresh lower revision
+    conn = 'conn-2'
+    hub.writeTasks({ ok: true, device: mac }, { read: true, revision: 1, tasks: [{ id: 't3', title: 'Fresh', status: 'todo' }] })
+    expect(hub.revisions()).toEqual({ mac: 1 })
+    expect(hub.tasksFor('mac').map(t => t.id)).toEqual(['t3'])
+
+    // Pre-apply conflict detection prevents false-applied when host revision already moved past baseRevision
+    let applyCalls = 0
+    const staleHost = {
+      board: {
+        snapshot: () => ({ tasks: [], revision: 9 }),
+        capabilities: () => ({ revision: true, apply: ['move'] }),
+        apply: () => { applyCalls++; return { tasks: [], revision: 9 } },
+      },
+    }
+    await expect(applyBoardCommand(staleHost, { id: 'cmd-1', action: 'move', baseRevision: 7 })).resolves.toEqual({ ok: false, code: 'conflict' })
+    expect(applyCalls).toBe(0)
+  })
 })

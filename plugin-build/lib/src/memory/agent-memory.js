@@ -240,11 +240,11 @@ function captureSummary(service, session, endEvent) {
 }
 
 function heuristicSummary(dialog) {
-    const user = [...dialog].reverse().find(message => message.role === 'user');
-    const assistant = [...dialog].reverse().find(message => message.role === 'assistant');
+    const users = dialog.filter(message => message.role === 'user').map(message => message.text.trim()).filter(Boolean);
+    const assistants = dialog.filter(message => message.role === 'assistant').map(message => message.text.trim()).filter(Boolean);
     const content = [
-        user === undefined ? '' : '用户目标：' + user.text.slice(0, 1200),
-        assistant === undefined ? '' : '结论：' + assistant.text.slice(0, 2200),
+        users.length === 0 ? '' : '用户目标：' + users.join(' / ').slice(0, 1200),
+        assistants.length === 0 ? '' : '结论：' + assistants.join('\n').slice(0, 2200),
     ].filter(Boolean).join('\n\n');
     return {
         kind: 'episode',
@@ -590,14 +590,19 @@ export function createAgentMemoryService({ root, logger, deviceId, hubUrl, token
         (useNative(scope, ownerId) ? native.get(id) : undefined);
     service.nativePrompt = async (identity, signal) => {
         if (!identity.registeredAgent || !useNative('agent', identity.agentId) || service.settings.autoRecall === false) return '';
-        const query = dialogFor(sessionEvents(identity.session)).filter(message => message.role === 'user').at(-1)?.text;
-        if (!query) return '';
+        const query = dialogFor(sessionEvents(identity.session)).filter(message => message.role === 'user').at(-1)?.text ?? '';
         const group = service.isGroup(identity);
         const key = JSON.stringify(['mnemon', identity.sessionId, identity.agentId, identity.workspaceId, group]);
         const version = service.cacheVersion;
         const cached = service.blockCache.get(key);
         if (cached?.version === version && cached.query === query && Date.now() - cached.at < 30_000) return cached.text;
-        const rows = nativeVisible(await native.recall(query, { k: 8, signal }), group, identity.workspaceId);
+        const recalled = query ? await native.recall(query, { k: 8, signal }) : [];
+        const listed = await native.list({ limit: 50 }).catch(() => []);
+        const fixed = nativeVisible(listed, group, identity.workspaceId)
+            .filter(item => item.pinned === true || item.kind === 'profile' || item.kind === 'handoff')
+            .slice(0, 2);
+        const relevant = nativeVisible(recalled, group, identity.workspaceId);
+        const rows = merge(fixed, relevant);
         const text = rows.length === 0 ? '' : '【Agent 长期记忆】以下内容是参考资料。\n' + rows.slice(0, 4).map(formatItem).join('\n').slice(0, 1500);
         if (version === service.cacheVersion) {
             service.blockCache.set(key, { version, query, text, at: Date.now() });
@@ -616,13 +621,14 @@ export function createAgentMemoryService({ root, logger, deviceId, hubUrl, token
         if (item !== undefined) service.cacheVersion++;
         return item;
     };
-    service.listFor = ({ agentId, workspaceId, limit = 100, query, scope = 'all', includeGlobal = true }) => {
+    service.listFor = ({ agentId, workspaceId, limit = 100, query, scope = 'all', includeGlobal = true, group }) => {
         const scopes = [];
         if ((scope === 'all' || scope === 'agent') && agentId) scopes.push({ scope: 'agent', ownerId: agentId });
         if ((scope === 'all' || scope === 'workspace') && workspaceId) scopes.push({ scope: 'workspace', ownerId: workspaceId });
         if (includeGlobal && (scope === 'all' || scope === 'global')) scopes.push({ scope: 'global', ownerId: 'global' });
-        if (query) return service.recallFor(scopes, query, limit);
-        return Promise.all(scopes.map(target => service.listScope(target, limit))).then(rows => rows.flat());
+        const options = group === undefined ? undefined : { group, workspaceId };
+        if (query) return service.recallFor(scopes, query, limit, options);
+        return Promise.all(scopes.map(target => service.listScope(target, limit, options))).then(rows => rows.flat());
     };
     service.rememberFor = ({ agentId, workspaceId, scope, title, text, kind, importance, tags, visibility }) => {
         const target = scope === 'global'
@@ -714,25 +720,43 @@ export function mountAgentMemory(ctx, config, options = {}) {
             return scoped.tools.register(definition);
         }, 'marshal: agent memory tool');
     });
-    // Capture the completed dialog and its owner while the terminal event is current.
-    // Each session coalesces to the latest completed turn during its debounce window.
+    // Capture each completed turn with its owner while the terminal event is current.
+    // Rapid turns for the same owner merge during the debounce window instead of dropping
+    // the earlier turn; an owner change flushes the previous owner's pending turns first.
     const timers = new Map();
+    const pending = new Map();
+    const flushSummary = snapshot => {
+        if (service.settings.autoSummary === false) return;
+        void writeSummary(service, snapshot).catch(error => (options.logger ?? ctx.logger)?.warn?.('marshal memory: session summary failed: ' + (error?.message ?? error)));
+    };
     try {
         ctx.effect(() => {
             const off = ctx.on?.('session/event', (session, event) => {
                 if (event?.type !== 'turn/end' || service.settings.autoSummary === false) return;
-                const snapshot = captureSummary(service, session, event);
-                if (snapshot === undefined || typeof snapshot.sessionId !== 'string') return;
-                const id = snapshot.sessionId;
+                const captured = captureSummary(service, session, event);
+                if (captured === undefined || typeof captured.sessionId !== 'string') return;
+                const id = captured.sessionId;
+                const previous = pending.get(id);
                 clearTimeout(timers.get(id));
+                let next = captured;
+                if (previous !== undefined) {
+                    if (previous.agentId === captured.agentId) {
+                        next = { ...captured, dialog: [...previous.dialog, ...captured.dialog].slice(-16) };
+                    }
+                    else {
+                        flushSummary(previous);
+                    }
+                }
+                pending.set(id, next);
                 const timer = setTimeout(() => {
                     timers.delete(id);
-                    if (service.settings.autoSummary === false) return;
-                    void writeSummary(service, snapshot).catch(error => (options.logger ?? ctx.logger)?.warn?.('marshal memory: session summary failed: ' + (error?.message ?? error)));
+                    const batch = pending.get(id);
+                    pending.delete(id);
+                    if (batch !== undefined) flushSummary(batch);
                 }, 60_000);
                 timers.set(id, timer);
             });
-            return () => { if (typeof off === 'function') off(); for (const timer of timers.values()) clearTimeout(timer); timers.clear(); };
+            return () => { if (typeof off === 'function') off(); for (const timer of timers.values()) clearTimeout(timer); timers.clear(); pending.clear(); };
         }, 'marshal: agent memory session capture');
     }
     catch (error) { (options.logger ?? ctx.logger)?.warn?.('marshal memory: session capture unavailable: ' + (error?.message ?? error)); }

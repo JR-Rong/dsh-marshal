@@ -70,6 +70,14 @@ export function resolveDesktopOwner({ config, platformHash, ownerFile }) {
     };
 }
 
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]', '::1']);
+
+export function hostIsLoopback(value) {
+    if (typeof value !== 'string' || value === '') return false;
+    try { return LOOPBACK_HOSTS.has(new URL('http://' + value).hostname); }
+    catch { return false; }
+}
+
 export function isLoopbackAddress(address) {
     return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
 }
@@ -144,21 +152,29 @@ export function memoryTargetAllowed(session, target, ledger) {
     return true;
 }
 
-export function createMemoryHttpAuth({ now = Date.now, resolveOwner = async () => '', installOwner, loadLedger = readRawLedger, allowedOrigins = ['dsh-app://app'], absoluteMs = MEMORY_SESSION_ABSOLUTE_MS, idleMs = MEMORY_SESSION_IDLE_MS } = {}) {
+export function createMemoryHttpAuth({ now = Date.now, resolveOwner = async () => '', installOwner, loadLedger = readRawLedger, allowedOrigins = ['dsh-app://app'], absoluteMs = MEMORY_SESSION_ABSOLUTE_MS, idleMs = MEMORY_SESSION_IDLE_MS, trustedRequest } = {}) {
     const sessions = new Map();
     const token = () => randomBytes(32).toString('base64url');
     const expectedOwner = async () => {
         const value = typeof installOwner === 'function' ? await installOwner() : installOwner;
         return typeof value === 'string' && value !== '' ? value : undefined;
     };
+    const hostOk = req => req.headers?.host === undefined || hostIsLoopback(headerValue(req, 'host'));
+    const admitted = req => {
+        if (typeof trustedRequest !== 'function') return true;
+        try { return trustedRequest(req) === true; }
+        catch { return false; }
+    };
     const originAllowed = (req, origins) => {
         const origin = headerValue(req, 'origin');
         const list = Array.isArray(origins) ? origins : allowedOrigins;
         return typeof origin === 'string' && origin !== '' && list.includes(origin);
     };
-    // The authenticated DSH app proxy strips Origin, fetch-site and browser cookies.
-    // An originless request still needs an explicit, non-simple desktop header.
+    // The authenticated DSH app proxy strips Origin, fetch-site and browser cookies
+    // while attaching the Host's signed connection cookie. Require connection admission
+    // when the Host connection service is wired.
     const desktop = req => headerValue(req, DESKTOP_HEADER) === '1' &&
+        admitted(req) &&
         ((req.headers?.origin === undefined && req.headers?.['sec-fetch-site'] === undefined) ||
             headerValue(req, 'origin') === 'dsh-app://app');
     const matches = (value, expected) => typeof value === 'string' &&
@@ -173,7 +189,7 @@ export function createMemoryHttpAuth({ now = Date.now, resolveOwner = async () =
         loadLedger,
         cookiePair,
         async open(req, origins = allowedOrigins) {
-            if (!isLoopbackAddress(req.socket?.remoteAddress ?? '')) return { ok: false, status: 403, code: 'forbidden' };
+            if (!isLoopbackAddress(req.socket?.remoteAddress ?? '') || !hostOk(req)) return { ok: false, status: 403, code: 'forbidden' };
             if (req.headers?.['sec-fetch-site'] === 'cross-site') return { ok: false, status: 403, code: 'forbidden' };
             if (headerValue(req, 'x-marshal-memory') !== '1') return { ok: false, status: 403, code: 'forbidden' };
             const native = desktop(req);
@@ -200,7 +216,7 @@ export function createMemoryHttpAuth({ now = Date.now, resolveOwner = async () =
             };
         },
         authenticate(req, { write = false, origins = allowedOrigins } = {}) {
-            if (!isLoopbackAddress(req.socket?.remoteAddress ?? '')) return { ok: false, status: 403, code: 'forbidden' };
+            if (!isLoopbackAddress(req.socket?.remoteAddress ?? '') || !hostOk(req)) return { ok: false, status: 403, code: 'forbidden' };
             if (req.headers?.['sec-fetch-site'] === 'cross-site') return { ok: false, status: 403, code: 'forbidden' };
             const native = desktop(req);
             if ((write && !native && !originAllowed(req, origins)) ||

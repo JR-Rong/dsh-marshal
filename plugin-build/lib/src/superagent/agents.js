@@ -92,24 +92,30 @@ export function readAgents(env = process.env, home = homedir()) {
     return { available: true, file, code: undefined, members, teams };
 }
 
-function preferMember(candidates) {
+function preferMember(candidates, workspaceId) {
     if (candidates.length <= 1) return candidates[0];
-    const current = candidates.find(candidate => !candidate.legacy);
-    return current ?? candidates[0];
+    const current = candidates.filter(candidate => !candidate.legacy);
+    const pool = current.length > 0 ? current : candidates;
+    if (pool.length === 1) return pool[0];
+    if (typeof workspaceId === 'string' && workspaceId !== '') {
+        const scoped = pool.filter(candidate => candidate.teamWorkspaceId === workspaceId);
+        if (scoped.length === 1) return scoped[0];
+    }
+    return undefined;
 }
 
 /** Resolve exactly one member by id or display name. */
-export function findMember(members, query) {
+export function findMember(members, query, workspaceId) {
     if (typeof query !== 'string') return undefined;
     const value = query.trim();
     if (value === '') return undefined;
     const byId = members.filter(member => member.id === value);
     if (byId.length === 1) return byId[0];
     const exact = members.filter(member => member.name === value);
-    if (exact.length > 0) return preferMember(exact);
+    if (exact.length > 0) return preferMember(exact, workspaceId);
     const folded = value.toLocaleLowerCase();
     const loose = members.filter(member => member.name.toLocaleLowerCase() === folded);
-    if (loose.length > 0) return preferMember(loose);
+    if (loose.length > 0) return preferMember(loose, workspaceId);
     return undefined;
 }
 
@@ -139,7 +145,7 @@ export function resolveTaggedAgent(task, settings, members) {
         const stripped = stripTagPrefix(raw, prefix);
         if (stripped === '') continue;
         const alias = settings.aliases?.[stripped] ?? settings.aliases?.[stripped.toLocaleLowerCase()];
-        const member = findMember(members, alias ?? stripped);
+        const member = findMember(members, alias ?? stripped, task?.workspaceId);
         if (member !== undefined) return { member, via: 'tag', tag: raw };
     }
     return undefined;
@@ -149,7 +155,7 @@ export function resolveAgentForTask(task, settings, members) {
     const tagged = resolveTaggedAgent(task, settings, members);
     if (tagged !== undefined) return tagged;
     if (typeof settings.defaultAgent === 'string' && settings.defaultAgent.trim() !== '') {
-        const member = findMember(members, settings.defaultAgent);
+        const member = findMember(members, settings.defaultAgent, task?.workspaceId);
         if (member !== undefined) return { member, via: 'default', tag: null };
         return { member: undefined, via: 'default', error: 'default-agent-not-found: ' + settings.defaultAgent };
     }

@@ -80,11 +80,11 @@ export function createTaskOrchestration({
     };
     const publish = (task, label, text, kind = 'episode') => {
         boundLeader(task);
-        if (text.length > 8000) throw taskError('handoff-too-large', '当前交接超过 8000 字符，未写入工作区。');
+        const body = text.length > 8000 ? text.slice(0, 7970).trimEnd() + '\n…（已截断，完整内容见工单群）' : text;
         const item = memory.rememberFor({
             workspaceId: task.workspaceId, scope: 'workspace', kind,
             title: label + ' · ' + task.taskId.slice(0, 8) + ' · ' + task.runId.slice(0, 8),
-            text, importance: kind === 'handoff' ? .85 : .55,
+            text: body, importance: kind === 'handoff' ? .85 : .55,
             tags: ['task-orchestration', 'task:' + task.taskId, 'run:' + task.runId],
             visibility: 'group-safe',
         });
@@ -108,12 +108,15 @@ export function createTaskOrchestration({
         if (failed) throw failed.reason;
         return results.map(result => result.value);
     };
-    const getModels = () => (catalog ??= Promise.resolve().then(() => port?.catalog() ?? []));
+    const getModels = () => (catalog ??= Promise.resolve().then(() => port?.catalog() ?? []).catch(error => {
+        catalog = undefined;
+        throw error;
+    }));
     const modelFor = (models, leader) => {
         const fallback = defaultModel?.();
         const dsh = models.filter(model => model.agent === 'dsh');
         return leader?.model
-            ? dsh.find(model => model.provider + '/' + model.model === leader.model)
+            ? dsh.find(model => model.provider + '/' + model.model === leader.model || model.model === leader.model || model.id === leader.model)
             : dsh.find(model => model.provider === fallback?.provider && model.model === fallback?.model) ?? dsh[0];
     };
     const resolveRole = (task, role, allowed) => {
@@ -270,9 +273,9 @@ export function createTaskOrchestration({
                         title: '开发验收 · ' + card.title,
                         content: '角色 ' + role +
                             '\n验收结论 ' + result.reviewFindings.slice(0, 1200) + '\n补丁 SHA-256 ' + result.digest,
-                        kind: 'episode', importance: 0.72, visibility: 'private',
+                        kind: 'episode', importance: 0.72, visibility: 'group-safe',
                         tags: ['task:' + task.taskId, 'run:' + task.runId],
-                    }, { signal });
+                    }, { signal, workspaceId: task.workspaceId });
                 } catch { signal.throwIfAborted(); }
                 await record('status', member.name,
                     item ? '本批次的验收经验已写入该 Agent 的 Mnemon 私有记忆。' : '本批次的 Mnemon 私有记忆写入失败。',

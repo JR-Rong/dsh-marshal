@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -16,7 +17,7 @@ import { createDiscussionPort } from '../discussions/ports.js';
 import { createAgentsHttpClient, agentToolDefinitions } from './agent-tools.js';
 import { createDshSurface } from '../adapters/dsh/surface.js';
 import { createMemoryRoutes } from '../memory/http.js';
-import { createMemoryHttpAuth, resolveDesktopOwner } from '../memory/http-auth.js';
+import { createMemoryHttpAuth, hostIsLoopback, resolveDesktopOwner } from '../memory/http-auth.js';
 import { dshAccountHash, DSH_ACCOUNT_ORIGIN } from '../hub/account.js';
 
 const BODY_LIMIT = 64 * 1024;
@@ -64,6 +65,7 @@ function isLoopback(req) {
 
 function trusted(req) {
     if (req.headers['sec-fetch-site'] === 'cross-site') return false;
+    if (req.headers?.host !== undefined && !hostIsLoopback(req.headers.host)) return false;
     return isLoopback(req);
 }
 
@@ -598,7 +600,10 @@ export function mountGroups(ctx, config, options = {}) {
     const getBoard = () => taskBoard ?? localBoard;
     let taskBoard;
     let webServer;
-    const crossClient = createCrossClient({ hubUrl: config.hubUrl, token: config.token });
+    let hubCa;
+    try { hubCa = config.hubCaFile === undefined ? undefined : readFileSync(config.hubCaFile); }
+    catch { options.logger?.warn?.('marshal: groups hubCaFile unreadable'); }
+    const crossClient = createCrossClient({ hubUrl: config.hubUrl, token: config.token, ...(hubCa === undefined ? {} : { ca: hubCa }) });
     const inventory = () => {
         const ledger = readAgentsLedger();
         const result = {
@@ -665,6 +670,38 @@ export function mountGroups(ctx, config, options = {}) {
     };
     const ownerFile = join(config.memoryRoot ?? join(homedir(), '.dsh-marshal', 'memory'), 'owner.json');
     const desktopOwner = async () => resolveDesktopOwner({ config, platformHash: await platformHash(), ownerFile });
+    // Require signed DSH connection admission for originless desktop memory sessions.
+    let trustedConnection = () => false;
+    const adoptConnection = connection => {
+        if (connection === undefined || connection === null) {
+            trustedConnection = () => false;
+            return;
+        }
+        trustedConnection = req => {
+            try {
+                if (typeof connection.requestRejection === 'function') {
+                    return connection.requestRejection({ headers: req.headers }) === undefined;
+                }
+                if (typeof connection.admit === 'function') {
+                    const admission = connection.admit({ headers: req.headers });
+                    return admission !== undefined && admission.rejection === undefined && admission.peer !== undefined;
+                }
+                return false;
+            }
+            catch {
+                return false;
+            }
+        };
+    };
+    try {
+        ctx.inject?.(['connection', 'connection.authentication'], scoped => {
+            scoped.effect(() => {
+                adoptConnection(typeof scoped.get === 'function' ? scoped.get('connection') : scoped.connection);
+                return () => adoptConnection(undefined);
+            }, 'marshal: memory connection trust');
+        });
+    }
+    catch { /* connection trust fails closed until injected */ }
     const memoryAuth = createMemoryHttpAuth({
         resolveOwner: async () => {
             const owner = await desktopOwner();
@@ -675,6 +712,7 @@ export function mountGroups(ctx, config, options = {}) {
         // Unknown install owner stays non-owner. After the first signed-in owner is
         // persisted, a later logged-out local session can present that same hash.
         installOwner: async () => (await desktopOwner()).install,
+        trustedRequest: req => trustedConnection(req),
     });
     const service = createGroupService({
         root,

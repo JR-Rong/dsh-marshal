@@ -152,6 +152,7 @@ export function createPhoneHub(options: {
   const roster = new Map<string, RosterAgent[]>()
   const streams = new Map<string, Set<() => void>>()
   const boardRevision = new Map<string, number>()
+  const boardConnection = new Map<string, string>()
   const watched = new Map<string, Set<string>>()
   const MAX_WATCHED = 32
   const MAX_COMMANDS = 32
@@ -394,11 +395,15 @@ export function createPhoneHub(options: {
       if (!auth.ok) throw Object.assign(new Error('unauthorized'), { code: 'unauthorized' })
       if ('device' in auth) {
         const deviceId = auth.device.id
-        const head = boardRevision.get(deviceId)
+        const connectionId = options.nodeConnection?.(deviceId)
+        const connectionChanged = connectionId !== undefined && boardConnection.get(deviceId) !== undefined && boardConnection.get(deviceId) !== connectionId
+        const head = connectionChanged ? undefined : boardRevision.get(deviceId)
         const revision = boardRevisionOf(body.revision)
         // A failed read leaves the last snapshot intact. An actual empty snapshot still replaces it.
         if (body.read === true && Array.isArray(body.tasks) && (head === undefined || (revision !== undefined && revision >= head))) {
+          if (connectionId !== undefined) boardConnection.set(deviceId, connectionId)
           if (revision !== undefined) boardRevision.set(deviceId, revision)
+          else if (connectionChanged) boardRevision.delete(deviceId)
           tasks.set(deviceId, normalizeTasks(body.tasks, deviceId, revision))
         }
         const outcomes = new Map<string, TaskReceipt['code']>()
