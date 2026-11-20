@@ -96,7 +96,7 @@ export function taskPlan({ raw, task, candidates, recommend = false }) {
             continue;
         }
         const requested = parsed.members?.[id];
-        const available = candidates.filter(member => member.workspaceId === task.workspaceId && !used.has(member.id) &&
+        const available = candidates.filter(member => (member.global === true || member.workspaceId === task.workspaceId) && !used.has(member.id) &&
             (id !== 'coder' || codeWriter(member)));
         let member = available.find(item => item.id === requested);
         if (requested && !member && !recommend && !(requested === '@dsh' && id === 'critic')) {

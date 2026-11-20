@@ -22,16 +22,43 @@ function load(file) {
     }
 }
 
+const PERMISSION_BLOCK_PATTERN = /(confirmation-required|permission|eacces|eperm|read-only|sandbox|forbidden|access denied|not permitted|权限受阻|无权|高于默认权限|需要人工确认)/i;
+
+export function isPermissionBlockedError(error) {
+    if (!error) return false;
+    const code = typeof error.code === 'string' ? error.code : '';
+    const msg = error instanceof Error ? error.message : String(error);
+    return PERMISSION_BLOCK_PATTERN.test(code) || PERMISSION_BLOCK_PATTERN.test(msg);
+}
+
+/** Workspace-dispatched agents default to workspace-write unless card explicitly confirmed elevated access. */
+export function resolveWorkspaceAgentPermission(member, card) {
+    if (card?.permission === 'danger-full-access' && card?.permissionConfirmedAt) return 'danger-full-access';
+    if (card?.permission === 'read-only' || member?.permission === 'read-only') return 'read-only';
+    return 'workspace-write';
+}
+
+function isGlobalAgentTeam(team) {
+    if (!team || typeof team !== 'object') return false;
+    const name = typeof team.name === 'string' ? team.name : '';
+    return name === '智能体库' || name.startsWith('marshal-agent:') || typeof team.workspaceId !== 'string' || team.workspaceId === '';
+}
+
 function validChoice(body, leaders) {
     const leader = leaders.find(item => item.id === body?.leaderId);
-    if (!leader) throw taskError('invalid-leader', '请选择绑定了工作区的 Leader。');
+    if (!leader) throw taskError('invalid-leader', '请选择有效的负责 Leader。');
+    const requestedWorkspace = typeof body?.workspaceId === 'string' && body.workspaceId.trim() !== '' ? body.workspaceId.trim() : undefined;
+    const workspaceId = leader.global ? (requestedWorkspace ?? leader.workspaceId) : leader.workspaceId;
+    if (typeof workspaceId !== 'string' || workspaceId === '') {
+        throw taskError('invalid-workspace', '请为该编排工单选择目标工作区。');
+    }
     if (!['template', 'leader', 'none'].includes(body.choice)) throw taskError('invalid-template', '请选择任务的编排方式。');
     const selected = body.choice === 'template' ? templateById(body.templateId) : undefined;
     if (body.choice === 'template' && !selected) throw taskError('invalid-template', '请选择有效的编排模板。');
     const pr = body.prUrl ? parsePullRequest(body.prUrl).url : undefined;
     if (selected?.id === 'pr-review' && !pr) throw taskError('invalid-pr', 'PR 审查需要提供 PR 链接。');
     return {
-        leaderId: leader.id, leaderName: leader.name, workspaceId: leader.workspaceId, choice: body.choice,
+        leaderId: leader.id, leaderName: leader.name, workspaceId, choice: body.choice,
         ...(selected ? { templateId: selected.id } : {}), ...(pr ? { prUrl: pr } : {}),
         agentId: leader.memberId, version: TEMPLATE_VERSION, state: 'ready',
     };
@@ -45,6 +72,7 @@ function chooseTemplate(reply, enabled) {
 
 export function createTaskOrchestration({
     file, inventory, memory, port, defaultModel, startLeader, workspacePath, readPr = readPullRequest, logger,
+    leaderAutoReview = false, onPermissionBlocked,
 }) {
     const tasks = load(file);
     const active = new Map();
@@ -64,15 +92,26 @@ export function createTaskOrchestration({
         return tasks.get(key);
     };
     const leaders = () => (inventory().teams ?? []).flatMap(team => {
-        if (typeof team.workspaceId !== 'string' || team.workspaceId === '') return [];
-        return team.members.map(member => ({
+        const global = isGlobalAgentTeam(team);
+        const ws = typeof team.workspaceId === 'string' && team.workspaceId !== '' ? team.workspaceId : '';
+        if (!global && ws === '') return [];
+        return (team.members ?? []).map(member => ({
             id: team.id + '/' + member.id, teamId: team.id, memberId: member.id,
-            workspaceId: team.workspaceId, name: member.name, brief: member.brief, model: member.model,
+            workspaceId: ws, global, name: member.name, brief: member.brief, model: member.model,
             reasoning: member.reasoningEffort, permission: member.permission, agentId: member.id,
         }));
     });
-    const scopeCandidates = (workspaceId, allowed = () => true) =>
-        leaders().filter(item => item.workspaceId === workspaceId && allowed(item));
+    const scopeCandidates = (workspaceId, allowed = () => true) => {
+        const seen = new Set();
+        const out = [];
+        for (const item of leaders()) {
+            const matches = item.global ? allowed({ ...item, workspaceId }) : (item.workspaceId === workspaceId && allowed(item));
+            if (!matches || seen.has(item.id)) continue;
+            seen.add(item.id);
+            out.push(item.global ? { ...item, workspaceId } : item);
+        }
+        return out;
+    };
     const boundLeader = task => {
         const leader = scopeCandidates(task.workspaceId).find(item => item.id === task.leaderId);
         if (!leader) throw taskError('leader-unbound', 'Leader 已移除或更换工作区。请改派给该工作区中的 Agent。');
@@ -259,6 +298,7 @@ export function createTaskOrchestration({
                     update(key, { state: 'handed-off', phase: undefined, sessionId, handoffs: [...task.handoffs, ref] });
                     return undefined;
                 },
+                leaderAutoReview,
             });
             if (!result) return;
             const participants = [['coder', coder], ['reviewer', reviewer]];
@@ -359,7 +399,7 @@ export function createTaskOrchestration({
             const templateView = item => ({ ...item, roles: roleSlots(item.id, false), codingRoles: roleSlots(item.id, true) });
             return { templates: TEMPLATES.map(templateView), groupTemplates: GROUP_TEMPLATES,
                 plainTemplate: templateView({ id: 'none', name: '普通任务', groupTemplate: 'free', stages: [] }),
-                leaders: leaders().map(({ id, name, workspaceId, memberId, permission }) => ({ id, name, workspaceId, agentId: memberId, permission })),
+                leaders: leaders().map(({ id, name, workspaceId, global, memberId, permission }) => ({ id, name, workspaceId, global, agentId: memberId, permission })),
                 memoryAvailable: memory !== undefined };
         },
         prepare(body, allowed) {
@@ -451,7 +491,7 @@ export function createTaskOrchestration({
             if (active.has(key)) return true;
             if (!audit?.reason && (task.state === 'done' || task.state === 'handed-off')) return true;
             const nextLeader = audit?.leader;
-            if (nextLeader && nextLeader.workspaceId !== task.workspaceId) throw taskError('workspace-forbidden', '改派需要同一工作区的 Agent。');
+            if (nextLeader && !nextLeader.global && nextLeader.workspaceId !== task.workspaceId) throw taskError('workspace-forbidden', '改派需要同一工作区的 Agent。');
             if (!nextLeader) boundLeader(task);
             const updatedLeader = nextLeader?.id ?? task.leaderId;
             const scoped = { ...task, leaderId: updatedLeader };
@@ -479,10 +519,18 @@ export function createTaskOrchestration({
                 const message = allowed.includes(error?.code) ? error.message
                     : (typeof error?.code === 'string' && /^[a-z-]{2,60}$/.test(error.code)
                         ? '编排步骤失败（' + error.code + '）。' : '编排步骤失败，请检查节点和模型配置后重试。');
-                try { await audit?.record({ kind: 'status', runId: started.runId, actor: 'Marshal', text: message, phase: 'failed' }); }
+                const permissionBlocked = isPermissionBlockedError(error);
+                const finalMessage = permissionBlocked
+                    ? '权限受阻：' + message + ' 已自动挂入「待确认」等待审批。'
+                    : message;
+                try { await audit?.record({ kind: 'status', runId: started.runId, actor: 'Marshal', text: finalMessage, phase: permissionBlocked ? 'review' : 'failed' }); }
                 catch { logger?.warn?.('marshal: task room could not record failure'); }
-                try { update(key, { state: 'failed', error: message }); }
+                try { update(key, { state: permissionBlocked ? 'permission-blocked' : 'failed', error: finalMessage }); }
                 catch { logger?.warn?.('marshal: task orchestration state write failed'); }
+                if (permissionBlocked) {
+                    try { await onPermissionBlocked?.(source, card.id, finalMessage); }
+                    catch { logger?.warn?.('marshal: failed to move permission-blocked task to review'); }
+                }
             }).finally(() => {
                 active.delete(key);
                 if (active.size === 0) catalog = undefined;

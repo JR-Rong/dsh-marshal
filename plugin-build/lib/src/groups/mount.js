@@ -5,14 +5,16 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import pluginPackage from '../../../package.json' with { type: 'json' };
 import { createGroupService } from './service.js';
-import { readAgentsLedger } from './inventory.js';
+import { agentsLedgerPath, readAgentsLedger } from './inventory.js';
 import { createAgentDrafter } from './draft.js';
 import { createCrossClient } from './cross-client.js';
 import { createLocalBoard } from './local-board.js';
 import { createTaskRooms } from './task-rooms.js';
 import { createTaskRoomStore, TaskRoomKey } from './task-room-store.js';
 import { createTaskRoomRoutes, taskRoomAccess, taskRoomAudit, visibleTaskRoom } from './task-room-routes.js';
-import { createTaskOrchestration } from './task-orchestration.js';
+import { createTaskOrchestration, isPermissionBlockedError } from './task-orchestration.js';
+import { createWorkspaceRosters } from './workspace-rosters.js';
+import { dashboardAddress } from '../sidebar.js';
 import { createDiscussionPort } from '../discussions/ports.js';
 import { createAgentsHttpClient, agentToolDefinitions } from './agent-tools.js';
 import { createDshSurface } from '../adapters/dsh/surface.js';
@@ -230,6 +232,7 @@ function taskView(task, workflow, room) {
         title: task.title,
         status: room?.closed ? 'done' : workflow === undefined || workflow.state === 'ready' ? task.status
             : workflow.state === 'running' || workflow.state === 'handed-off' ? 'running'
+            : workflow.state === 'permission-blocked' ? 'review'
             : workflow.state === 'done' ? (room ? 'review' : 'done') : 'failed',
         ...(workflow === undefined ? {} : { workflow }),
         ...(room === undefined ? {} : { taskRoom: visibleTaskRoom(room) }),
@@ -271,7 +274,8 @@ function taskView(task, workflow, room) {
     };
 }
 
-function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, memory, auth, allowedOrigins, orchestration, rooms) {
+function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, memory, auth, allowedOrigins, orchestration, rooms, extras = {}) {
+    const { rosters, sessionController, config } = extras;
     const authenticate = (req, write = false) => auth.authenticate(req, { write, origins: allowedOrigins() });
     const allowed = (access, target, ledger) => access.ok && auth.allows(access.session, {
         agentId: target.agentId, workspaceId: target.workspaceId,
@@ -398,7 +402,8 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             const tags = normalizeCardTags(body.tags);
             const attachments = normalizeAttachmentsPayload(body.attachments);
             const parentId = typeof body.parentId === 'string' && body.parentId.trim() !== '' ? body.parentId.trim() : undefined;
-            const permission = ['read-only', 'workspace-write', 'danger-full-access'].includes(body.permission) ? body.permission : undefined;
+            const explicitPermission = ['read-only', 'workspace-write', 'danger-full-access'].includes(body.permission) ? body.permission : undefined;
+            const permission = explicitPermission ?? ((body.workspaceId || body.orchestration) ? 'workspace-write' : undefined);
             const model = typeof body.model === 'string' && body.model.trim() !== '' ? body.model.trim() : undefined;
             const reasoningEffort = typeof body.reasoningEffort === 'string' && body.reasoningEffort.trim() !== '' ? body.reasoningEffort.trim() : undefined;
             const reuseSession = typeof body.reuseSession === 'boolean' ? body.reuseSession : undefined;
@@ -432,7 +437,10 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
                 if (!access.ok) { write(res, access.status, { ok: false, code: access.code }); return; }
                 const ledger = auth.loadLedger();
                 prepared = body.orchestration === undefined ? undefined :
-                    orchestration.prepare(body.orchestration, member => allowed(access, member, ledger));
+                    orchestration.prepare({
+                        ...body.orchestration,
+                        ...(typeof body.workspaceId === 'string' && body.workspaceId.trim() !== '' ? { workspaceId: body.workspaceId.trim() } : {}),
+                    }, member => allowed(access, member, ledger));
                 const workspaceId = TaskRoomKey.parse(prepared?.workspaceId ?? body.workspaceId);
                 if (body.workspaceId !== undefined && body.workspaceId !== workspaceId) {
                     write(res, 400, { ok: false, code: 'workspace-conflict' });
@@ -538,8 +546,29 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
                 write(res, 409, { ok: false, code: 'invalid-leader', message: '请打开工单群，选择该工作区的 Leader 后运行。' });
                 return;
             }
-            const snapshot = await board.apply(randomUUID(), { kind: 'run', taskId: body.taskId }, initiator);
-            write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
+            try {
+                const snapshot = await board.apply(randomUUID(), { kind: 'run', taskId: body.taskId }, initiator);
+                write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
+            }
+            catch (error) {
+                if (isPermissionBlockedError(error)) {
+                    let snapshot = board.snapshot();
+                    let movedToReview = false;
+                    try {
+                        snapshot = await board.apply(randomUUID(), { kind: 'move', taskId: body.taskId, status: 'review' }, initiator);
+                        movedToReview = true;
+                    } catch { /* keep snapshot if move refused */ }
+                    write(res, 200, {
+                        ok: true,
+                        permissionBlocked: true,
+                        movedToReview,
+                        message: '权限受阻：' + (error instanceof Error ? error.message : String(error)) + '，工单已转入「待确认」等待确认。',
+                        tasks: taskList(snapshot, req, source),
+                    });
+                    return;
+                }
+                throw error;
+            }
         }),
         exact('POST', '/marshal/tasks/move', async (req, res) => {
             const board = getBoard();
@@ -763,6 +792,88 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             }
             catch (error) {
                 write(res, 500, { ok: false, code: 'mkdir-failed', message: error instanceof Error ? error.message : String(error) });
+            }
+        }),
+        exact('GET', '/marshal/rosters/state', async (req, res) => {
+            write(res, 200, { ok: true, rosters: rosters?.list() ?? {} });
+        }),
+        exact('POST', '/marshal/rosters/save', async (req, res) => {
+            if (!rosters) { write(res, 503, { ok: false, code: 'rosters-unavailable' }); return; }
+            const body = await readBody(req);
+            const workspaceId = typeof body.workspaceId === 'string' ? body.workspaceId.trim() : '';
+            if (!workspaceId) { write(res, 400, { ok: false, code: 'invalid-workspace' }); return; }
+            const saved = rosters.set(workspaceId, body);
+            write(res, 200, { ok: true, roster: saved, rosters: rosters.list() });
+        }),
+        exact('GET', '/marshal/agents/sessions', async (req, res) => {
+            const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+            const filterAgentId = url.searchParams.get('agentId') || '';
+            const filterTeamId = url.searchParams.get('teamId') || '';
+            let rawRuns = [];
+            let teamsById = new Map();
+            try {
+                const parsed = JSON.parse(readFileSync(agentsLedgerPath(), 'utf8'));
+                if (Array.isArray(parsed?.runs)) rawRuns = parsed.runs;
+                for (const t of Array.isArray(parsed?.teams) ? parsed.teams : []) {
+                    if (t?.id) teamsById.set(t.id, t);
+                }
+            } catch { /* empty ledger */ }
+            const sessionMeta = new Map();
+            try {
+                const listed = typeof sessionController?.list === 'function' ? await sessionController.list() : undefined;
+                const rows = Array.isArray(listed) ? listed : Array.isArray(listed?.sessions) ? listed.sessions : [];
+                for (const s of rows) {
+                    const sid = s?.id ?? s?.sessionId;
+                    if (typeof sid === 'string' && sid) {
+                        sessionMeta.set(sid, {
+                            title: typeof s.title === 'string' ? s.title : '',
+                            updatedAt: typeof s.updatedAt === 'number' ? s.updatedAt : undefined,
+                            cwd: typeof s.cwd === 'string' ? s.cwd : undefined,
+                        });
+                    }
+                }
+            } catch { /* session listing optional */ }
+            const seen = new Set();
+            const sessions = [];
+            for (const run of rawRuns) {
+                if (!run || typeof run.sessionId !== 'string' || !run.sessionId) continue;
+                if (filterAgentId && run.memberId !== filterAgentId) continue;
+                if (filterTeamId && run.teamId !== filterTeamId) continue;
+                if (seen.has(run.sessionId)) continue;
+                seen.add(run.sessionId);
+                const team = teamsById.get(run.teamId);
+                const member = (team?.members ?? []).find(m => m.id === run.memberId);
+                const meta = sessionMeta.get(run.sessionId);
+                sessions.push({
+                    sessionId: run.sessionId,
+                    teamId: run.teamId,
+                    memberId: run.memberId,
+                    agentName: member?.name ?? run.memberName ?? '',
+                    workspaceId: team?.workspaceId ?? '',
+                    title: meta?.title || run.title || (member?.name ? member.name + ' 的闲聊会话' : '历史会话'),
+                    createdAt: typeof run.createdAt === 'number' ? run.createdAt : 0,
+                    updatedAt: meta?.updatedAt ?? (typeof run.updatedAt === 'number' ? run.updatedAt : (typeof run.createdAt === 'number' ? run.createdAt : 0)),
+                    status: run.status ?? '',
+                });
+            }
+            sessions.sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0));
+            write(res, 200, { ok: true, sessions });
+        }),
+        exact('GET', '/marshal/devices/status', async (req, res) => {
+            const deviceId = initiator.replace(/^marshal:/, '');
+            let dashUrl = '';
+            try { if (config) dashUrl = dashboardAddress(config); } catch {}
+            if (cross === undefined) {
+                write(res, 200, { ok: true, deviceId, hubConfigured: false, hubOnline: false, dashboardUrl: dashUrl, devices: [] });
+                return;
+            }
+            try {
+                const cat = await cross.catalog();
+                const devices = Array.isArray(cat?.devices) ? cat.devices : [];
+                write(res, 200, { ok: true, deviceId, hubConfigured: true, hubOnline: true, dashboardUrl: dashUrl, devices });
+            }
+            catch (error) {
+                write(res, 200, { ok: true, deviceId, hubConfigured: true, hubOnline: false, dashboardUrl: dashUrl, error: error instanceof Error ? error.message : String(error), devices: [] });
             }
         }),
         exact('POST', '/marshal/workspaces/prepare', async (req, res) => {
@@ -1032,12 +1143,19 @@ export function mountGroups(ctx, config, options = {}) {
         rooms = createTaskRooms({ store: createTaskRoomStore(join(root, 'task-rooms.sqlite')),
             deviceId: config.deviceId, hub: crossClient?.taskRoom });
     } catch { options.logger?.warn?.('marshal: local task room archive unavailable'); }
+    const rosters = createWorkspaceRosters(join(root, 'workspace-rosters.json'));
     let orchestration;
     try {
         orchestration = createTaskOrchestration({
             file: join(root, 'task-orchestration.json'), inventory: readAgentsLedger, memory: options.memory,
             port: createDiscussionPort({ agents: config.agents, llm, codexExecutable: config.codexExecutable }),
             defaultModel: readDefaultModel, logger: options.logger, workspacePath: agents.workspace,
+            leaderAutoReview: true,
+            onPermissionBlocked: async (_source, taskId) => {
+                const board = getBoard();
+                if (!board) return;
+                await board.apply(randomUUID(), { kind: 'move', taskId, status: 'review' }, `marshal:${config.deviceId}`);
+            },
             startLeader: async (leader, text, signal) => {
                 const { sessionId } = await agents.chatMember(leader.teamId, leader.memberId, signal) ?? {};
                 if (typeof sessionId !== 'string' || sessionId === '') throw new Error('Leader session unavailable');
@@ -1084,7 +1202,7 @@ export function mountGroups(ctx, config, options = {}) {
                 }
                 catch { /* desktop origin is enough when the host has no public origin */ }
                 return origins;
-            }, orchestration, rooms).map((route) => scoped.webServer.register(route));
+            }, orchestration, rooms, { rosters, sessionController: ctx.sessionController, config }).map((route) => scoped.webServer.register(route));
             return () => {
                 for (const dispose of disposers) dispose();
             };

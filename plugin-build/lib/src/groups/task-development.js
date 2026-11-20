@@ -78,7 +78,7 @@ const decisionFormat = '请返回严格 JSON，字段 action 可为 codex 或 co
 const verdictFormat = '请返回严格 JSON。verdict 为 pass、revise 或 blocked。findings 为带文件依据的字符串，或由 file 和 conclusion 两个字符串字段组成的对象数组。';
 
 export async function runTaskDevelopment({
-    card, path, plan, signal, asLeader, asRole, runChild, record, handoff, phase, manual,
+    card, path, plan, signal, asLeader, asRole, runChild, record, handoff, phase, manual, leaderAutoReview = false,
 }) {
     phase('designing');
     const design = await asLeader(
@@ -139,11 +139,29 @@ export async function runTaskDevelopment({
             if (verdict.verdict !== 'pass') {
                 throw taskError('development-review-blocked', '开发变更停在审查阶段。请查看群内证据与 Reviewer 结论。');
             }
+            let leaderAuditNote = '';
+            if (leaderAutoReview) {
+                phase('summarizing');
+                const leaderCheckText = await asLeader(
+                    '你是负责 Leader，现在执行自动终审。请复核 Reviewer 结论与补丁是否满足目标且未越界。'
+                    + verdictFormat + '\n' + reviewMaterial + '\nReviewer 结论：' + verdict.findings, 'summarizing');
+                await record('agent', 'Leader', leaderCheckText, 'summarizing');
+                const leaderVerdict = parseModelJson(leaderCheckText, VerdictSchema);
+                if (leaderVerdict.verdict === 'revise' && round === 1) {
+                    feedback = await handoff('Leader 终审返工交接', leaderVerdict.findings, 'summarizing');
+                    await record('status', 'Marshal', 'Leader 自动审核要求返工，退回 Coder。', 'coding');
+                    continue;
+                }
+                if (leaderVerdict.verdict !== 'pass') {
+                    throw taskError('leader-review-blocked', 'Leader 自动审核未放行：' + leaderVerdict.findings.slice(0, 240));
+                }
+                leaderAuditNote = '\n\n### Leader 自动终审结论\n\n' + leaderVerdict.findings;
+            }
             return {
                 base, digest,
                 reviewFindings: verdict.findings,
                 report: '## 开发交付\n\n基准提交 ' + base + '\n补丁 SHA-256 ' + digest +
-                    '\n\n### Reviewer 验收结论\n\n' + verdict.findings +
+                    '\n\n### Reviewer 验收结论\n\n' + verdict.findings + leaderAuditNote +
                     '\n\n完整补丁和执行证据已保存在本工单群的当前批次。',
             };
         }

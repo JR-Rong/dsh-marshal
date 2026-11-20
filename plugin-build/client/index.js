@@ -196,7 +196,33 @@ window.__ModuleLoader__.load({
     const { createSessionBridge, targetKey } = marshalNative();
     const { Setup, readSetup } = marshalSetup(React);
     const h = React.createElement;
-    let pendingTab = 'session';
+    let pendingTab = null;
+    const ACTIVE_TAB_STORAGE_KEY = 'marshal.activeTab.v2';
+    function isPseudoAgentWorkspace(ws) {
+      if (!ws) return false;
+      const title = String(ws.title || ws.name || '').trim();
+      const path = String(ws.path || '').trim();
+      if (title.startsWith('Agent · ')) return true;
+      if (path.includes('/.dsh-marshal/agents/Agent · ') || /\/Agent · [^/]+$/.test(path)) return true;
+      return false;
+    }
+    function resolveNavTarget(raw) {
+      if (raw === 'tasks') return { tab: 'tasks' };
+      if (raw === 'chats') return { tab: 'chats' };
+      if (raw === 'groups') return { tab: 'chats', chatSection: 'groups', groupSub: 'local' };
+      if (raw === 'cross') return { tab: 'chats', chatSection: 'groups', groupSub: 'cross' };
+      if (raw === 'taskRooms') return { tab: 'chats', chatSection: 'taskRooms' };
+      if (raw === 'direct') return { tab: 'chats', chatSection: 'direct' };
+      if (raw === 'session' || raw === 'remote') return { tab: 'chats', chatSection: 'remote' };
+      if (raw === 'agents') return { tab: 'agents' };
+      if (raw === 'rosters') return { tab: 'agents', agentSub: 'rosters' };
+      if (raw === 'memory') return { tab: 'memory' };
+      return { tab: 'tasks' };
+    }
+    function formatSessionTime(ts) {
+      if (!ts) return '';
+      try { return new Date(ts).toLocaleString(); } catch { return ''; }
+    }
     const PANEL = 'dsh-marshal';
     const buttonStyle = { border: '1px solid #8885', borderRadius: 7, background: 'transparent', color: 'inherit', font: 'inherit', fontSize: 12, padding: '6px 12px', cursor: 'pointer' };
     function Statistics({ value, agent }) {
@@ -403,9 +429,12 @@ window.__ModuleLoader__.load({
       return h('canvas', { ref: canvasRef, style: { width: '100%', height: '100%', display: 'block', borderRadius: 14, background: '#05070d', cursor: 'grab', touchAction: 'none' } });
     }
 
-    function MemoryPage() {
+    function MemoryPage({ initialAgentId = '', initialLayer = '' } = {}) {
+      const [layer, setLayer] = React.useState(() => (initialLayer === 'agent' || initialLayer === 'workspace' || initialLayer === 'global') ? initialLayer : (initialAgentId ? 'agent' : 'global'));
       const [library, setLibrary] = React.useState(null);
-      const [agentId, setAgentId] = React.useState('');
+      const [extraWorkspaces, setExtraWorkspaces] = React.useState([]);
+      const [agentId, setAgentId] = React.useState(initialAgentId || '');
+      const [workspaceId, setWorkspaceId] = React.useState('');
       const [graph, setGraph] = React.useState({ nodes: [], edges: [] });
       const [privateBackend, setPrivateBackend] = React.useState('');
       const [allowTaskRecall, setAllowTaskRecall] = React.useState(false);
@@ -416,7 +445,7 @@ window.__ModuleLoader__.load({
       const [formOpen, setFormOpen] = React.useState(false);
       const [title, setTitle] = React.useState('');
       const [text, setText] = React.useState('');
-      const [scope, setScope] = React.useState('agent');
+      const [scope, setScope] = React.useState(layer);
       const [busy, setBusy] = React.useState(false);
       const [syncNotice, setSyncNotice] = React.useState('');
       const [settings, setSettings] = React.useState(null);
@@ -428,39 +457,86 @@ window.__ModuleLoader__.load({
       const [globalVisibility, setGlobalVisibility] = React.useState('no-group');
       const [editText, setEditText] = React.useState('');
       const [editVisibility, setEditVisibility] = React.useState('no-group');
+
+      React.useEffect(() => {
+        if (initialAgentId) {
+          setLayer('agent');
+          setAgentId(initialAgentId);
+          setScope('agent');
+        }
+      }, [initialAgentId]);
+
+      React.useEffect(() => {
+        setScope(layer);
+        setSelected(null);
+        setResults(null);
+      }, [layer]);
+
       const agents = library?.agents ?? [];
-      const agent = agents.find(item => item.id === agentId);
-      const workspaceId = agent?.workspaceId;
-      const view = JSON.stringify([agentId, workspaceId]);
+      const realWorkspaces = React.useMemo(() => {
+        const map = new Map();
+        for (const ws of [...(library?.workspaces ?? []), ...extraWorkspaces]) {
+          if (!ws || !ws.id || isPseudoAgentWorkspace(ws)) continue;
+          if (!map.has(ws.id)) map.set(ws.id, { id: ws.id, label: ws.title || ws.name || ws.path || ws.id, path: ws.path || '' });
+        }
+        return [...map.values()];
+      }, [library, extraWorkspaces]);
+
+      const activeAgentId = layer === 'agent' ? agentId : '';
+      const activeWorkspaceId = layer === 'workspace' ? workspaceId : '';
+      const view = JSON.stringify([layer, activeAgentId, activeWorkspaceId]);
       const currentView = React.useRef(view);
       currentView.current = view;
       const graphRequest = React.useRef(0);
       const queryRequest = React.useRef(0);
+
       const load = async () => {
         try {
-          const data = await loadAgentLibrary();
+          const [data, wsData] = await Promise.all([
+            loadAgentLibrary(),
+            fetchJson('marshal/task-rooms/workspaces', undefined, true).catch(() => ({ workspaces: [] })),
+          ]);
           setLibrary(data);
+          setExtraWorkspaces(Array.isArray(wsData?.workspaces) ? wsData.workspaces : []);
           setError('');
           setAgentId(current => current || data.agents?.[0]?.id || '');
+          const firstReal = [...(data.workspaces || []), ...(wsData?.workspaces || [])].find(ws => ws && ws.id && !isPseudoAgentWorkspace(ws));
+          if (firstReal) setWorkspaceId(current => current || firstReal.id);
         }
         catch (e) { setError(friendlyError(e, '记忆')); }
       };
+
+      const buildScopeQuery = () => {
+        const parts = [];
+        if (activeAgentId) parts.push('agentId=' + encodeURIComponent(activeAgentId));
+        if (activeWorkspaceId) parts.push('workspaceId=' + encodeURIComponent(activeWorkspaceId));
+        parts.push('scope=' + encodeURIComponent(layer));
+        return '?' + parts.join('&');
+      };
+
       const loadGraph = async () => {
-        if (agentId === '') return;
+        if (layer === 'agent' && !activeAgentId) { setGraph({ nodes: [], edges: [] }); return; }
+        if (layer === 'workspace' && !activeWorkspaceId) { setGraph({ nodes: [], edges: [] }); return; }
         const request = ++graphRequest.current;
-        const target = '?agentId=' + encodeURIComponent(agentId) + (workspaceId ? '&workspaceId=' + encodeURIComponent(workspaceId) : '');
+        const target = buildScopeQuery();
         try {
           const [data, nextHealth] = await Promise.all([
-            fetchJson('marshal/memory/graph' + target), fetchJson('marshal/memory/health' + target).catch(() => null),
+            fetchJson('marshal/memory/graph' + target),
+            fetchJson('marshal/memory/health' + target).catch(() => null),
           ]);
           if (currentView.current !== view || request !== graphRequest.current) return;
-          setGraph(data.graph || { nodes: [], edges: [] });
-          setPrivateBackend(data.privateBackend ?? '');
+          const rawGraph = data.graph || { nodes: [], edges: [] };
+          const nodes = (rawGraph.nodes || []).filter(node => node.scope === layer);
+          const idSet = new Set(nodes.map(n => n.id));
+          const edges = (rawGraph.edges || []).filter(edge => idSet.has(edge.source) && idSet.has(edge.target));
+          setGraph({ nodes, edges });
+          setPrivateBackend(layer === 'agent' ? (data.privateBackend ?? '') : '');
           setHealth(nextHealth);
           setError('');
         }
         catch (e) { if (currentView.current === view && request === graphRequest.current) setError(friendlyError(e, '记忆')); }
       };
+
       const loadProposals = async () => {
         try {
           const data = await fetchJson('marshal/memory/proposals');
@@ -480,42 +556,61 @@ window.__ModuleLoader__.load({
             setApprovalNotice('请先登录机主账号后再审批全局记忆');
         }
       };
+
       React.useEffect(() => { void load(); void fetchJson('marshal/memory/settings/get').then(setSettings).catch(() => {}); void loadProposals(); }, []);
-      React.useEffect(() => { void loadGraph(); }, [agentId, workspaceId]);
+      React.useEffect(() => { void loadGraph(); }, [layer, activeAgentId, activeWorkspaceId]);
+
       const search = async () => {
         const request = ++queryRequest.current;
         if (query.trim() === '') { setResults(null); return; }
         try {
-          const data = await fetchJson('marshal/memory/list?agentId=' + encodeURIComponent(agentId) + (workspaceId ? '&workspaceId=' + encodeURIComponent(workspaceId) : '') + '&query=' + encodeURIComponent(query));
+          const data = await fetchJson('marshal/memory/list' + buildScopeQuery() + '&query=' + encodeURIComponent(query));
           if (currentView.current !== view || request !== queryRequest.current) return;
-          setResults(data.items || []);
+          setResults((data.items || []).filter(item => item.scope === layer));
           setError('');
         }
         catch (e) { if (currentView.current === view && request === queryRequest.current) setError(friendlyError(e, '记忆检索')); }
       };
+
       const create = async () => {
         if (title.trim() === '' || text.trim() === '') return;
         setBusy(true);
         try {
-          if (scope === 'global') await fetchJson('marshal/memory/global', { title: title.trim(), text: text.trim(), kind: 'fact', importance: 0.6, tags: [], visibility: globalVisibility });
-          else await fetchJson('marshal/memory/remember', { agentId, workspaceId, scope, title: title.trim(), text: text.trim(),
-            kind: 'fact', importance: 0.6, tags: [],
-            ...(scope === 'agent' && privateBackend === 'mnemon' && workspaceId && allowTaskRecall ? { visibility: 'group-safe' } : {}),
-          });
+          if (scope === 'global') {
+            await fetchJson('marshal/memory/global', { title: title.trim(), text: text.trim(), kind: 'fact', importance: 0.6, tags: [], visibility: globalVisibility });
+          }
+          else if (scope === 'workspace') {
+            if (!workspaceId) throw new Error('请先选择一个项目工作区');
+            await fetchJson('marshal/memory/remember', { workspaceId, scope: 'workspace', title: title.trim(), text: text.trim(), kind: 'fact', importance: 0.6, tags: [] });
+          }
+          else {
+            if (!agentId) throw new Error('请先选择一个智能体');
+            await fetchJson('marshal/memory/remember', {
+              agentId, ...(workspaceId ? { workspaceId } : {}), scope: 'agent',
+              title: title.trim(), text: text.trim(), kind: 'fact', importance: 0.6, tags: [],
+              ...(privateBackend === 'mnemon' && workspaceId && allowTaskRecall ? { visibility: 'group-safe' } : {}),
+            });
+          }
           setTitle(''); setText(''); setAllowTaskRecall(false); setFormOpen(false); await loadGraph();
         }
         catch (e) { setError(friendlyError(e, '写入记忆')); }
         finally { setBusy(false); }
       };
+
       const forget = async item => {
         if (!item || !window.confirm('删除这条记忆？')) return;
         try {
           if (item.scope === 'global') await fetchJson('marshal/memory/global/forget', { id: item.id });
-          else await fetchJson('marshal/memory/forget', { agentId, workspaceId, id: item.id });
+          else await fetchJson('marshal/memory/forget', {
+            ...(item.scope === 'agent' ? { agentId } : {}),
+            ...(item.scope === 'workspace' ? { workspaceId } : {}),
+            id: item.id,
+          });
           setSelected(null); setResults(null); await loadGraph();
         }
         catch (e) { setError(friendlyError(e, '删除记忆')); }
       };
+
       const decideProposal = async (item, action) => {
         const draft = drafts[item.id] || { title: item.title, text: item.content, visibility: item.visibility === 'all' ? 'all' : 'no-group' };
         try {
@@ -530,6 +625,7 @@ window.__ModuleLoader__.load({
           else setError(friendlyError(e, '全局记忆审批'));
         }
       };
+
       const saveGlobal = async () => {
         if (!selected || selected.scope !== 'global') return;
         try {
@@ -539,23 +635,40 @@ window.__ModuleLoader__.load({
         }
         catch (e) { setError(friendlyError(e, '编辑全局记忆')); }
       };
+
+      const layerTabs = [
+        ['global', '全局记忆与审批' + (proposals.length > 0 ? ' (' + proposals.length + ')' : '')],
+        ['agent', '智能体私有记忆'],
+        ['workspace', '工作区共享记忆'],
+      ];
+
       return h('div', { style: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' } },
-        h('div', { style: { padding: '14px 18px', display: 'flex', alignItems: 'center', gap: 10, borderBottom: '1px solid #8883', flexWrap: 'wrap' } },
-          h('div', { style: { fontSize: 14, fontWeight: 600 } }, '记忆'),
-          h('select', { value: agentId, disabled: busy, onChange: event => {
+        h('div', { style: { padding: '12px 18px', display: 'flex', alignItems: 'center', gap: 10, borderBottom: '1px solid #8883', flexWrap: 'wrap' } },
+          h('div', { role: 'tablist', 'aria-label': '三层记忆视图', style: { display: 'flex', alignItems: 'center', gap: 4, padding: 3, borderRadius: 10, border: '1px solid ' + dswTheme.border, background: dswTheme.layer } },
+            layerTabs.map(([key, label]) => h('button', {
+              key, type: 'button', role: 'tab', 'aria-selected': layer === key,
+              style: tabStyle(layer === key),
+              onClick: () => setLayer(key),
+            }, label))),
+          layer === 'agent' && h('select', { value: agentId, disabled: busy, onChange: event => {
             setAgentId(event.target.value); setSelected(null); setResults(null); setGraph({ nodes: [], edges: [] });
             setPrivateBackend(''); setHealth(null); setAllowTaskRecall(false); setError('');
-          }, style: { ...uiInput, width: 180 } },
-            agents.map(item => h('option', { key: item.id, value: item.id }, item.name))),
-          privateBackend === 'mnemon' && h('span', { style: { color: dswTheme.dim, fontSize: 11 } }, 'Mnemon · 本机私有记忆'),
-          h('input', { value: query, onChange: event => setQuery(event.target.value), onKeyDown: event => { if (event.key === 'Enter') void search(); }, placeholder: '搜索记忆…', style: { ...uiInput, width: 220 } }),
+          }, style: { ...uiInput, width: 170 } },
+            agents.length === 0 ? h('option', { value: '' }, '暂无智能体') : agents.map(item => h('option', { key: item.id, value: item.id }, item.name))),
+          layer === 'workspace' && h('select', { value: workspaceId, disabled: busy, onChange: event => {
+            setWorkspaceId(event.target.value); setSelected(null); setResults(null); setGraph({ nodes: [], edges: [] });
+            setHealth(null); setError('');
+          }, style: { ...uiInput, width: 220 } },
+            realWorkspaces.length === 0 ? h('option', { value: '' }, '暂无项目工作区') : realWorkspaces.map(ws => h('option', { key: ws.id, value: ws.id }, ws.label))),
+          layer === 'agent' && privateBackend === 'mnemon' && h('span', { style: { color: dswTheme.dim, fontSize: 11 } }, 'Mnemon · 本机私有记忆'),
+          h('input', { value: query, onChange: event => setQuery(event.target.value), onKeyDown: event => { if (event.key === 'Enter') void search(); }, placeholder: '搜索当前层级记忆…', style: { ...uiInput, width: 190 } }),
           h('button', { type: 'button', style: uiButton(false), onClick: () => { void search(); } }, '搜索'),
-          h('button', { type: 'button', style: uiButton(false), onClick: () => { setFormOpen(value => !value); } }, '＋ 记忆'),
+          h('button', { type: 'button', style: uiButton(false), onClick: () => { setScope(layer); setFormOpen(value => !value); } }, '＋ 记忆'),
           h('button', { type: 'button', style: uiButton(false), onClick: () => setSettingsOpen(value => !value) }, '设置'),
           h('span', { style: { marginLeft: 'auto', fontSize: 11, color: dswTheme.dim } }, graph.nodes.length + ' 个节点 · ' + graph.edges.length + ' 条关联' + (health?.health?.length ? ' · 模糊 ' + health.health.reduce((sum, item) => sum + (item.fuzzy || 0), 0) + ' · 档案 ' + health.health.reduce((sum, item) => sum + (item.archived || 0), 0) : '')),
-          h('button', { type: 'button', style: uiButton(false), onClick: async () => { setSyncNotice('同步中…'); try { const result = await fetchJson('marshal/memory/sync', { agentId, workspaceId }); setSyncNotice('推送 ' + (result.pushed ?? 0) + ' · 拉取 ' + (result.pulled ?? 0)); await loadGraph(); } catch (e) { setSyncNotice(String(e.message || e)); } } }, '同步'),
-          h('button', { type: 'button', style: uiButton(false), onClick: async () => { setSyncNotice('迁移旧同步…'); try { const result = await fetchJson('marshal/memory/migrate-legacy', {}); setSyncNotice(result.migrated ? '已绑定 ' + result.migrated + ' 条旧记录' : '没有待迁移的旧记录'); } catch (e) { if (e && (e.code === 'sign-in-to-approve' || String(e.message || '').includes('sign-in-to-approve'))) setApprovalNotice('请先登录机主账号后再审批全局记忆'); setSyncNotice(String(e.message || e)); } } }, '迁移旧同步'),
-          h('button', { type: 'button', style: uiButton(false), onClick: () => { void loadGraph(); } }, '刷新')),
+          h('button', { type: 'button', style: uiButton(false), onClick: async () => { setSyncNotice('同步中…'); try { const result = await fetchJson('marshal/memory/sync', { ...(activeAgentId ? { agentId: activeAgentId } : {}), ...(activeWorkspaceId ? { workspaceId: activeWorkspaceId } : {}) }); setSyncNotice('推送 ' + (result.pushed ?? 0) + ' · 拉取 ' + (result.pulled ?? 0)); await loadGraph(); } catch (e) { setSyncNotice(String(e.message || e)); } } }, '同步'),
+          layer === 'global' && h('button', { type: 'button', style: uiButton(false), onClick: async () => { setSyncNotice('迁移旧同步…'); try { const result = await fetchJson('marshal/memory/migrate-legacy', {}); setSyncNotice(result.migrated ? '已绑定 ' + result.migrated + ' 条旧记录' : '没有待迁移的旧记录'); } catch (e) { if (e && (e.code === 'sign-in-to-approve' || String(e.message || '').includes('sign-in-to-approve'))) setApprovalNotice('请先登录机主账号后再审批全局记忆'); setSyncNotice(String(e.message || e)); } } }, '迁移旧同步'),
+          h('button', { type: 'button', style: uiButton(false), onClick: () => { void loadGraph(); void loadProposals(); } }, '刷新')),
         syncNotice !== '' && h('div', { style: { padding: '6px 18px', fontSize: 11, color: dswTheme.dim } }, syncNotice),
         settingsOpen && settings && h('div', { style: { padding: '10px 18px', display: 'flex', gap: 16, flexWrap: 'wrap', fontSize: 12, borderBottom: '1px solid #8883' } },
           [['autoSummary', '会话结束自动摘要'], ['autoRecall', '每轮自动召回'], ['allowGroupQuote', '群聊允许引用私有记忆']].map(([key, label]) => h('label', { key, style: { display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' } },
@@ -565,11 +678,11 @@ window.__ModuleLoader__.load({
           h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } }, '摘要 provider', h('input', { defaultValue: settings.summaryProvider ?? '', placeholder: 'empty = 本地', onBlur: async event => { const value = event.target.value.trim(); try { const saved = await fetchJson('marshal/memory/settings', { summaryProvider: value }); setSettings(saved.settings); } catch { /* keep local */ } }, style: { ...uiInput, width: 150 } })),
           h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } }, '摘要模型', h('input', { defaultValue: settings.summaryModel ?? '', placeholder: 'empty = 本地', onBlur: async event => { const value = event.target.value.trim(); try { const saved = await fetchJson('marshal/memory/settings', { summaryModel: value }); setSettings(saved.settings); } catch { /* keep local */ } }, style: { ...uiInput, width: 180 } }))),
         error !== '' && h('div', { style: { padding: '8px 18px', color: dswTheme.danger, fontSize: 12 } }, error),
-        h('section', { style: { padding: '10px 18px', borderBottom: '1px solid #8883', display: 'grid', gap: 8 } },
-          h('div', { style: { fontSize: 13, fontWeight: 600 } }, '全局记忆审批'),
+        layer === 'global' && h('section', { style: { padding: '10px 18px', borderBottom: '1px solid #8883', display: 'grid', gap: 8 } },
+          h('div', { style: { fontSize: 13, fontWeight: 600 } }, '全局记忆审批' + (proposals.length > 0 ? ' · ' + proposals.length + ' 条待处理' : '')),
           approvalNotice !== '' && h('div', { style: { fontSize: 12, color: dswTheme.danger } }, approvalNotice),
           proposals.length === 0
-            ? h('div', { style: { fontSize: 12, color: dswTheme.dim } }, '没有待审批的全局记忆。智能体提交的全局记忆会停在这里，同意后才会生效。')
+            ? h('div', { style: { fontSize: 12, color: dswTheme.dim } }, '没有待审批的全局记忆。智能体提交的全局偏好会停在这里，同意后才会生效。')
             : proposals.map(item => {
               const draft = drafts[item.id] || { title: item.title, text: item.content, visibility: item.visibility === 'all' ? 'all' : 'no-group' };
               const patch = next => setDrafts(current => ({ ...current, [item.id]: { ...draft, ...next } }));
@@ -583,14 +696,17 @@ window.__ModuleLoader__.load({
                   h('button', { type: 'button', style: uiButton(false), onClick: () => { void decideProposal(item, 'reject'); } }, '拒绝')));
             })),
         formOpen && h('div', { style: { padding: '12px 18px', display: 'grid', gap: 8, borderBottom: '1px solid #8883' } },
-          h('div', { style: { display: 'flex', gap: 8 } },
-            h('input', { value: title, onChange: event => setTitle(event.target.value), placeholder: '标题', style: { ...uiInput, flex: 1 } }),
-            h('select', { value: scope, onChange: event => setScope(event.target.value), style: { ...uiInput, width: 130 } }, h('option', { value: 'agent' }, 'Agent 私有'), h('option', { value: 'workspace' }, '工作区共享'), h('option', { value: 'global' }, '全局')),
-            scope === 'global' && h('select', { value: globalVisibility, onChange: event => setGlobalVisibility(event.target.value), style: { ...uiInput, width: 140 } }, h('option', { value: 'all' }, '所有会话'), h('option', { value: 'no-group' }, '仅单聊'))),
+          h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
+            h('input', { value: title, onChange: event => setTitle(event.target.value), placeholder: '标题', style: { ...uiInput, flex: 1, minWidth: 180 } }),
+            h('select', { value: scope, onChange: event => setScope(event.target.value), style: { ...uiInput, width: 140 } },
+              h('option', { value: 'global' }, '全局记忆'),
+              h('option', { value: 'agent' }, '智能体私有'),
+              h('option', { value: 'workspace' }, '工作区共享')),
+            scope === 'global' && h('select', { value: globalVisibility, onChange: event => setGlobalVisibility(event.target.value), style: { ...uiInput, width: 130 } }, h('option', { value: 'all' }, '所有会话'), h('option', { value: 'no-group' }, '仅单聊'))),
           h('textarea', { value: text, onChange: event => setText(event.target.value), rows: 3, placeholder: '记忆内容…', style: { ...uiInput, resize: 'vertical' } }),
           scope === 'agent' && privateBackend === 'mnemon' && workspaceId && h('label', { style: { fontSize: 12 } },
             h('input', { type: 'checkbox', checked: allowTaskRecall, onChange: event => setAllowTaskRecall(event.target.checked) }),
-            ' 允许本 Agent 在当前工作区的工单中使用这条记忆'),
+            ' 允许本智能体在所选项目工作区的工单中使用这条记忆'),
           h('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8 } }, h('button', { type: 'button', style: uiButton(false), onClick: () => setFormOpen(false) }, '取消'), h('button', { type: 'button', disabled: busy, style: uiButton(true), onClick: () => { void create(); } }, busy ? '保存中…' : '保存'))),
         results !== null && h('div', { style: { maxHeight: 180, overflow: 'auto', borderBottom: '1px solid #8883', padding: '8px 18px', display: 'grid', gap: 4 } },
           results.length === 0 ? h('div', { style: { fontSize: 12, color: dswTheme.dim } }, '没有匹配的记忆') : results.map(item => h('button', { key: item.id, type: 'button', onClick: () => { setSelected(item); if (item.scope === 'global') { setEditText(item.content || ''); setEditVisibility(item.visibility === 'all' ? 'all' : 'no-group'); } }, style: { textAlign: 'left', border: 0, background: 'transparent', color: 'inherit', cursor: 'pointer', padding: '5px 0' } }, '[' + item.scope + '] ' + item.title))),
@@ -620,33 +736,221 @@ window.__ModuleLoader__.load({
             h('div', { style: { display: 'flex', gap: 8, marginTop: 16 } },
               h('button', { type: 'button', style: uiButton(false), onClick: () => { void forget(selected); } }, '删除'),
               h('button', { type: 'button', style: uiButton(false), onClick: () => setSelected(null) }, '关闭')))),
-        graph.nodes.length === 0 && results === null && h('div', { style: { padding: '0 18px 18px', fontSize: 12, color: dswTheme.dim } }, '这个 Agent 还没有记忆。会话结束后会自动生成摘要，也可以点“＋ 记忆”手动写入。'));
+        graph.nodes.length === 0 && results === null && h('div', { style: { padding: '0 18px 18px', fontSize: 12, color: dswTheme.dim } },
+          layer === 'global' ? '还没有全局记忆。可点“＋ 记忆”写入，或审批智能体提交的偏好。'
+            : layer === 'workspace' ? '所选项目工作区还没有共享记忆。工单总结会自动沉淀到这里，也可手动写入。'
+              : '该智能体还没有私有记忆。会话结束后会自动生成摘要，也可点“＋ 记忆”手动写入。'));
+    }
+
+    function AgentDirectChatsView({ openSession, onOpenAgents, initialAgentId = '' }) {
+      const [library, setLibrary] = React.useState(null);
+      const [sessions, setSessions] = React.useState([]);
+      const [selectedAgentId, setSelectedAgentId] = React.useState(initialAgentId || 'all');
+      const [search, setSearch] = React.useState('');
+      const [busy, setBusy] = React.useState(false);
+      const [error, setError] = React.useState('');
+
+      const load = async () => {
+        try {
+          const [lib, sess] = await Promise.all([
+            loadAgentLibrary(),
+            fetchJson('marshal/agents/sessions'),
+          ]);
+          setLibrary(lib);
+          setSessions(Array.isArray(sess?.sessions) ? sess.sessions : []);
+          setError('');
+        }
+        catch (e) { setError(friendlyError(e, '智能体单聊')); }
+      };
+      React.useEffect(() => { void load(); }, []);
+      React.useEffect(() => { if (initialAgentId) setSelectedAgentId(initialAgentId); }, [initialAgentId]);
+
+      const agents = library?.agents ?? [];
+      const selectedAgent = selectedAgentId !== 'all' ? agents.find(a => a.id === selectedAgentId) : undefined;
+      const countForAgent = agent => sessions.filter(s => s.memberId === agent.id || (s.teamId === agent.squadId && s.agentName === agent.name)).length;
+
+      const filtered = React.useMemo(() => {
+        const q = search.trim().toLowerCase();
+        return sessions.filter(item => {
+          if (selectedAgent) {
+            const match = item.memberId === selectedAgent.id || (item.teamId === selectedAgent.squadId && item.agentName === selectedAgent.name);
+            if (!match) return false;
+          }
+          if (q) {
+            const hay = [item.title, item.agentName, item.sessionId].filter(Boolean).join(' ').toLowerCase();
+            if (!hay.includes(q)) return false;
+          }
+          return true;
+        });
+      }, [sessions, selectedAgent, search]);
+
+      const startNewChat = async agent => {
+        if (!agent || busy) return;
+        setBusy(true);
+        setError('');
+        try {
+          const data = await fetchJson('dsh-agents/api/run', { teamId: agent.squadId, memberId: agent.id });
+          const sessionId = data?.run?.sessionId;
+          if (!sessionId) throw new Error('未能创建会话');
+          await load();
+          openSession && openSession(sessionId);
+        }
+        catch (e) { setError('新建闲聊失败：' + (e.message || e)); }
+        finally { setBusy(false); }
+      };
+
+      return h('div', { style: { flex: 1, minHeight: 0, display: 'flex', overflow: 'hidden' } },
+        h('aside', { style: { width: 210, flexShrink: 0, borderRight: '1px solid ' + dswTheme.border, overflow: 'auto', padding: 10, display: 'flex', flexDirection: 'column', gap: 4 } },
+          h('div', { style: { fontSize: 11, color: dswTheme.faint, padding: '4px 8px', fontWeight: 600 } }, '按智能体筛选'),
+          h('button', {
+            type: 'button',
+            style: { ...tabStyle(selectedAgentId === 'all'), textAlign: 'left', display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 10px' },
+            onClick: () => setSelectedAgentId('all'),
+          }, h('span', null, '全部闲聊'), h('span', { style: { fontSize: 11, opacity: .65 } }, String(sessions.length))),
+          agents.map(agent => h('button', {
+            key: agent.id, type: 'button',
+            style: { ...tabStyle(selectedAgentId === agent.id), textAlign: 'left', display: 'flex', alignItems: 'center', gap: 8, padding: '7px 10px' },
+            onClick: () => setSelectedAgentId(agent.id),
+          },
+            h(Avatar, { name: agent.name, size: 22 }),
+            h('span', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, agent.name),
+            h('span', { style: { fontSize: 11, opacity: .65 } }, String(countForAgent(agent)))))),
+        h('div', { style: { flex: 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column' } },
+          h('div', { style: { padding: '12px 16px', borderBottom: '1px solid ' + dswTheme.border, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
+            h('div', { style: { fontSize: 14, fontWeight: 600 } }, selectedAgent ? selectedAgent.name + ' · 闲聊历史' : '全部智能体单聊历史'),
+            h('input', { value: search, onChange: event => setSearch(event.target.value), placeholder: '搜索历史会话标题或智能体…', style: { ...uiInput, width: 220, marginLeft: 'auto' } }),
+            selectedAgent && h('button', { type: 'button', disabled: busy, style: uiButton(true), onClick: () => { void startNewChat(selectedAgent); } }, busy ? '创建中…' : '＋ 新建闲聊'),
+            h('button', { type: 'button', style: uiButton(false), onClick: () => { void load(); } }, '刷新')),
+          error && h('div', { style: { padding: '8px 16px', color: dswTheme.danger, fontSize: 12 } }, error),
+          h('div', { style: { flex: 1, minHeight: 0, overflow: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 8 } },
+            filtered.length === 0
+              ? h(EmptyState, {
+                title: selectedAgent ? '还没有与「' + selectedAgent.name + '」的闲聊记录' : '暂无历史单聊会话',
+                hint: '点上方“＋ 新建闲聊”即可开启一段独立对话，所有历史对话都会永久留在这里。',
+                action: selectedAgent ? '＋ 新建闲聊' : '管理智能体',
+                onAction: () => { if (selectedAgent) void startNewChat(selectedAgent); else onOpenAgents && onOpenAgents(); },
+              })
+              : filtered.map(item => h('div', {
+                key: item.sessionId,
+                style: { display: 'flex', alignItems: 'center', gap: 12, padding: '10px 14px', borderRadius: 10, border: '1px solid ' + dswTheme.border, background: dswTheme.layer, cursor: 'pointer' },
+                onClick: () => openSession && openSession(item.sessionId),
+              },
+                h(Avatar, { name: item.agentName || '?', size: 30 }),
+                h('div', { style: { flex: 1, minWidth: 0 } },
+                  h('div', { style: { fontSize: 13, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, item.title || '历史会话'),
+                  h('div', { style: { fontSize: 11, color: dswTheme.faint, marginTop: 3 } },
+                    [item.agentName || '智能体', formatSessionTime(item.updatedAt || item.createdAt), item.sessionId.slice(0, 8)].filter(Boolean).join(' · '))),
+                h('button', { type: 'button', style: uiButton(false), onClick: event => { event.stopPropagation(); openSession && openSession(item.sessionId); } }, '打开会话'))))));
+    }
+
+    function DeviceStatusDrawer({ open, onClose, status, onRefresh, onOpenRemote }) {
+      const [copied, setCopied] = React.useState(false);
+      if (!open) return null;
+      const devices = Array.isArray(status?.devices) ? status.devices : [];
+      const onlineCount = devices.filter(d => d && d.online !== false).length;
+      const copyUrl = () => {
+        if (!status?.dashboardUrl) return;
+        try { navigator.clipboard?.writeText(status.dashboardUrl); setCopied(true); setTimeout(() => setCopied(false), 1800); } catch {}
+      };
+      return h('div', {
+        style: { position: 'fixed', inset: 0, zIndex: 40, background: 'rgba(0,0,0,.35)', display: 'flex', justifyContent: 'flex-end' },
+        onClick: onClose,
+      },
+        h('aside', {
+          'aria-label': '设备与手机状态',
+          style: { width: 360, maxWidth: '92vw', height: '100%', background: 'var(--dsw-alias-bg-base, #14161a)', color: dswTheme.text, borderLeft: '1px solid ' + dswTheme.border2, display: 'flex', flexDirection: 'column', boxShadow: '-8px 0 28px rgba(0,0,0,.28)' },
+          onClick: event => event.stopPropagation(),
+        },
+          h('div', { style: { padding: '14px 18px', borderBottom: '1px solid ' + dswTheme.border, display: 'flex', alignItems: 'center', justifyContent: 'space-between' } },
+            h('div', { style: { fontSize: 15, fontWeight: 600 } }, '设备与手机'),
+            h('button', { type: 'button', style: uiButton(false), onClick: onClose }, '关闭')),
+          h('div', { style: { flex: 1, overflow: 'auto', padding: 16, display: 'grid', gap: 14, alignContent: 'start' } },
+            h('div', { style: { padding: 12, borderRadius: 10, border: '1px solid ' + dswTheme.border, background: dswTheme.layer, display: 'grid', gap: 6 } },
+              h('div', { style: { fontSize: 12, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 8 } },
+                h('span', { style: { width: 8, height: 8, borderRadius: '50%', background: status?.hubOnline ? '#10b981' : status?.hubConfigured ? '#f59e0b' : '#9ca3af' } }),
+                status?.hubOnline ? 'Hub 已在线连接' : status?.hubConfigured ? 'Hub 连接中断' : '本机独立模式（未配置 Hub）'),
+              status?.deviceId && h('div', { style: { fontSize: 11, color: dswTheme.dim } }, '本机标识：' + status.deviceId),
+              status?.error && h('div', { style: { fontSize: 11, color: dswTheme.danger } }, status.error)),
+            h('div', { style: { display: 'grid', gap: 8 } },
+              h('div', { style: { fontSize: 12, fontWeight: 600, color: dswTheme.dim } }, '在线设备（' + onlineCount + ' / ' + devices.length + '）'),
+              devices.length === 0
+                ? h('div', { style: { fontSize: 12, color: dswTheme.faint } }, '当前仅本机可用，连接云端 Hub 后可管理多台电脑与手机。')
+                : devices.map(dev => h('div', { key: dev.deviceId || dev.id || dev.name, style: { padding: '9px 12px', borderRadius: 8, border: '1px solid ' + dswTheme.border, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 } },
+                  h('div', { style: { minWidth: 0 } },
+                    h('div', { style: { fontSize: 13, fontWeight: 500 } }, dev.name || dev.deviceName || dev.deviceId || dev.id),
+                    h('div', { style: { fontSize: 11, color: dswTheme.faint } }, [dev.deviceId || dev.id, dev.platform].filter(Boolean).join(' · '))),
+                  h('span', { style: { fontSize: 11, color: dev.online === false ? dswTheme.faint : '#10b981' } }, dev.online === false ? '离线' : '● 在线')))),
+            status?.dashboardUrl && h('div', { style: { padding: 12, borderRadius: 10, border: '1px solid ' + dswTheme.border, background: dswTheme.layer, display: 'grid', gap: 8 } },
+              h('div', { style: { fontSize: 12, fontWeight: 600 } }, '手机 / 浏览器控制入口'),
+              h('div', { style: { fontSize: 11, color: dswTheme.dim, wordBreak: 'break-all' } }, status.dashboardUrl),
+              h('div', { style: { display: 'flex', gap: 8 } },
+                h('button', { type: 'button', style: uiButton(false), onClick: copyUrl }, copied ? '已复制链接' : '复制地址'),
+                h('a', { href: status.dashboardUrl, target: '_blank', rel: 'noreferrer', style: { ...uiButton(false), textDecoration: 'none', display: 'inline-flex', alignItems: 'center' } }, '浏览器打开'))),
+            h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
+              h('button', { type: 'button', style: uiButton(true), onClick: () => { onClose(); onOpenRemote(); } }, '打开远端设备会话 →'),
+              h('button', { type: 'button', style: uiButton(false), onClick: onRefresh }, '重新连接')))));
     }
 
     function MarshalPanel({ marshalContext, openSession, openPanel, workspaceService, SessionProvider, renderSlot }) {
       const [attempt, retry] = React.useState(0);
-      const [tab, setTab] = React.useState(() => pendingTab || 'session');
+      const initialNav = React.useMemo(() => {
+        if (pendingTab) {
+          const resolved = resolveNavTarget(pendingTab);
+          pendingTab = null;
+          return resolved;
+        }
+        try {
+          const saved = globalThis.localStorage?.getItem(ACTIVE_TAB_STORAGE_KEY);
+          if (saved && ['tasks', 'chats', 'agents', 'memory'].includes(saved)) return { tab: saved };
+        } catch {}
+        return { tab: 'tasks' };
+      }, []);
+      const [tab, setTab] = React.useState(initialNav.tab);
+      const [chatSection, setChatSection] = React.useState(initialNav.chatSection || 'groups');
+      const [groupSub, setGroupSub] = React.useState(initialNav.groupSub || 'local');
+      const [agentSub, setAgentSub] = React.useState(initialNav.agentSub || 'pool');
+      const [memoryTarget, setMemoryTarget] = React.useState({ agentId: '', layer: '' });
       const [roomTask, setRoomTask] = React.useState(null);
       const [focusedTask, focusTask] = React.useState('');
+      const [deviceStatus, setDeviceStatus] = React.useState(null);
+      const [deviceDrawerOpen, setDeviceDrawerOpen] = React.useState(false);
+
       const chooseTab = value => {
         pendingTab = null;
+        const resolved = resolveNavTarget(value);
+        if (resolved.chatSection) setChatSection(resolved.chatSection);
+        if (resolved.groupSub) setGroupSub(resolved.groupSub);
+        if (resolved.agentSub) setAgentSub(resolved.agentSub);
         if (value === 'taskRooms') setRoomTask(null);
-        setTab(value);
+        setTab(resolved.tab);
+        try { globalThis.localStorage?.setItem(ACTIVE_TAB_STORAGE_KEY, resolved.tab); } catch {}
       };
-      const openTaskRoom = task => { setRoomTask(task); setTab('taskRooms'); };
+      const openTaskRoom = task => { setRoomTask(task); setChatSection('taskRooms'); setTab('chats'); };
       const openBoard = taskId => { focusTask(taskId ?? ''); setTab('tasks'); };
+      const openAgentMemory = agentId => { setMemoryTarget({ agentId, layer: 'agent' }); setTab('memory'); };
+
       React.useEffect(() => {
-        const onTab = event => { if (event && typeof event.detail === 'string') setTab(event.detail); };
+        const onTab = event => { if (event && typeof event.detail === 'string') chooseTab(event.detail); };
         window.addEventListener('marshal:tab', onTab);
         return () => { window.removeEventListener('marshal:tab', onTab); };
       }, []);
+
+      const refreshDeviceStatus = React.useCallback(() => {
+        fetchJson('marshal/devices/status')
+          .then(next => setDeviceStatus(next))
+          .catch(() => setDeviceStatus(null));
+      }, []);
+
       React.useEffect(() => {
         let alive = true;
         fetchJson('marshal/health')
           .then(next => { if (alive) setHealth(next); })
           .catch(() => { if (alive) setHealth(null); });
-        return () => { alive = false; };
-      }, [attempt]);
+        refreshDeviceStatus();
+        const timer = setInterval(refreshDeviceStatus, 15000);
+        return () => { alive = false; clearInterval(timer); };
+      }, [attempt, refreshDeviceStatus]);
+
       const [address, setAddress] = React.useState(null);
       const [setup, setSetup] = React.useState(null);
       const [state, setState] = React.useState({ authenticated: false });
@@ -696,7 +1000,11 @@ window.__ModuleLoader__.load({
         if (!bridge) return;
         setControlsBusy(true); setControlsNotice('正在读取目标智能体的模型…');
         try {
-          if (acquire) { const acquired = await invoke('acquire', {}, bridge.target); if (!acquired?.ok) throw Error('暂时无法接管会话'); }
+          if (acquire) {
+            const acquired = await invoke('acquire', {}, bridge.target);
+            if (active.current !== bridge) return;
+            if (!acquired?.ok) throw Error('未能接管会话：' + (acquired?.code || 'unknown'));
+          }
           const result = await invoke('controls', {}, bridge.target);
           if (active.current !== bridge) return;
           if (!result?.ok || !Array.isArray(result.result?.controls?.models)) throw Error('模型列表暂不可用：' + (result?.code === 'agent-crashed' ? '智能体通道暂时中断，请稍后刷新模型' : result?.code || 'unknown'));
@@ -842,51 +1150,101 @@ window.__ModuleLoader__.load({
       };
       const compact = state.authenticated && !state.group;
       const selectedModel = catalog?.models.find(model => model.id === (selection.model || catalog?.current?.model));
+      const onlineDevices = Array.isArray(deviceStatus?.devices) ? deviceStatus.devices.filter(d => d && d.online !== false).length : 0;
+      const deviceDotColor = deviceStatus?.hubOnline ? '#10b981' : deviceStatus?.hubConfigured ? '#f59e0b' : '#10b981';
+      const deviceLabel = deviceStatus?.hubOnline
+        ? (onlineDevices > 0 ? onlineDevices + ' 台在线 · 设备' : 'Hub 在线 · 设备')
+        : deviceStatus?.hubConfigured ? 'Hub 离线 · 设备' : '本机 · 设备';
+
+      const chatSections = [
+        ['groups', '常驻群聊', '本机与跨设备群'],
+        ['taskRooms', '工单群', '任务协作会话'],
+        ['direct', '智能体单聊', '历史闲聊与新建'],
+        ['remote', '远端设备会话', '云端与多设备'],
+      ];
+
       if (setup) return h(Setup, { initial: setup, onReady: () => retry(value => value + 1) });
       return h('section', { 'aria-label': '调度官', style: { height: '100%', minHeight: 0, width: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden' } },
-        h('header', { style: { padding: '12px 20px', minHeight: 54, display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderBottom: '1px solid #8883', flexShrink: 0 } },
-          h('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } }, h(MarshalIcon), h('h1', { style: { fontSize: 16, fontWeight: 600, margin: 0 } }, '调度官'), h('span', { style: { fontSize: 12, opacity: .55 } }, state.account ? state.account.name + ' · ' + state.workspaceName : '原生会话')),
+        h('header', { style: { padding: '10px 18px', minHeight: 52, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, borderBottom: '1px solid #8883', flexShrink: 0 } },
+          h('div', { style: { display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 } },
+            h(MarshalIcon),
+            h('h1', { style: { fontSize: 15, fontWeight: 600, margin: 0, whiteSpace: 'nowrap' } }, '调度官'),
+            state.account && h('span', { style: { fontSize: 11, opacity: .55, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } }, state.account.name + (state.workspaceName ? ' · ' + state.workspaceName : ''))),
           h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' } },
             h(MarshalNav, { active: tab, onTab: chooseTab, compact: true }),
             health && (!health.capabilities?.agents || !health.capabilities?.taskBoard) && h('span', { style: { fontSize: 11, color: dswTheme.danger } },
               '缺少：' + [!health.capabilities?.agents ? '智能体后端' : '', !health.capabilities?.taskBoard ? '任务看板后端' : ''].filter(Boolean).join('、')),
-            h('button', { type: 'button', style: buttonStyle, onClick: () => retry(value => value + 1) }, '重新连接'))),
-        tab === 'groups' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex' } }, h(GroupsPage, { openSession, onOpenAgents: () => chooseTab('agents') })),
-        tab === 'agents' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex' } }, h(AgentsPage, { onOpenGroups: () => chooseTab('groups'), openSession, workspaceService })),
-        tab === 'cross' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex' } }, h(CrossGroupsPage)),
-        tab === 'memory' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex' } }, h(MemoryPage)),
-        tab === 'tasks' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex' } }, h(TaskBoardPage, { openSession, openTaskRoom, focusedTask, openNativeBoard: openPanel ? () => openPanel('task-board') : undefined })),
-        tab === 'taskRooms' && h(TaskRoomsPage, { key: roomTask?.id ?? 'archive', task: roomTask, openBoard }),
-        tab === 'session' && h('div', { style: { display: 'flex', flex: 1, minHeight: 0 } },
-          address && h('iframe', { ref: iframe, onLoad: connect, title: '调度官设备与群聊', src: address,
-            sandbox: 'allow-scripts allow-same-origin allow-forms', allow: 'clipboard-write', referrerPolicy: 'no-referrer',
-            style: { width: compact ? 310 : '100%', flexShrink: 0, minHeight: 0, border: 0, borderRight: compact ? '1px solid #8883' : 0 } }),
-          compact && h('div', { style: { flex: 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column' } },
-            state.target && h('header', { style: { padding: '16px 22px 10px', flexShrink: 0 } },
-              h('div', { style: { fontSize: 15, fontWeight: 600 } }, state.title || '未命名会话'),
-              h('div', { style: { opacity: .5, fontSize: 11, marginTop: 4 } }, state.target.agent.toUpperCase() + ' · ' + (state.deviceName || state.target.deviceId)),
-              h('p', { role: 'status', style: { opacity: .65, fontSize: 12, margin: '8px 0 0' } }, notice || state.reason),
-              h('button', { type: 'button', disabled: historyBusy, style: { ...buttonStyle, marginTop: 8, marginRight: 8 }, onClick: () => { live.current = []; void loadHistory(active.current); } }, historyBusy ? '读取中…' : '刷新历史'),
-              older && h('button', { type: 'button', disabled: historyBusy, style: { ...buttonStyle, marginTop: 8 }, onClick: () => loadHistory(active.current, older) }, historyBusy ? '读取中…' : '加载更多历史')),
-            binding && h('div', { style: { padding: '8px 22px', borderBottom: '1px solid #8882', flexShrink: 0 } },
-              h('div', { style: { display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8 } },
-                h('label', { style: { fontSize: 12 } }, '模型 ', h('select', { 'aria-label': '本次发送模型', value: selection.model || '', disabled: controlsBusy || state.running,
-                  style: { ...buttonStyle, maxWidth: 250 }, onChange: event => changeSelection(event.target.value ? { model: event.target.value } : {}) },
-                  h('option', { value: '' }, '沿用会话模型'), ...(catalog?.models || []).map(model => h('option', { key: model.id, value: model.id }, model.label)))),
-                h('label', { style: { fontSize: 12 } }, '思考 ', h('select', { 'aria-label': '本次发送思考强度', value: selection.reasoning || '', disabled: !selectedModel?.efforts.length || state.running,
-                  style: buttonStyle, onChange: event => changeSelection({ model: selection.model, ...(event.target.value ? { reasoning: event.target.value } : {}) }) },
-                  h('option', { value: '' }, '默认'), ...(selectedModel?.efforts || []).map(effort => h('option', { key: effort, value: effort }, ({ off: '关闭', none: '关闭', minimal: '最低', low: '低', medium: '中', high: '高', xhigh: '很高', max: '最高', ultra: '极高' })[effort] || effort)))),
-                h('button', { type: 'button', style: buttonStyle, disabled: controlsBusy || state.running, onClick: () => loadControls(active.current, state.target.agent === 'claude' && !catalog) }, controlsBusy ? '读取中…' : catalog ? '刷新模型' : state.target.agent === 'claude' ? '接管并加载模型' : '加载模型'),
-                h('button', { type: 'button', style: buttonStyle, disabled: state.running, onClick: () => fileInput.current?.click() }, '＋ 添加附件'),
-                h('input', { ref: fileInput, type: 'file', multiple: true, 'aria-label': '上传会话附件', style: { display: 'none' }, onChange: uploadFiles })),
-              h('div', { role: 'status', style: { opacity: .55, fontSize: 11, marginTop: 6 } }, controlsNotice, ' · 每个附件 ≤10 MB'),
-              files.length > 0 && h('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 } }, files.map(item => h('span', { key: item.id, style: { border: '1px solid #8884', borderRadius: 8, padding: '3px 8px', fontSize: 12 } },
-                item.name + ' · ' + item.status, h('button', { type: 'button', 'aria-label': '移除附件 ' + item.name, style: { ...buttonStyle, border: 0, padding: '0 5px' }, onClick: () => { uploads.current = uploads.current.filter(file => file.id !== item.id); setFiles([...uploads.current]); } }, '×'))))),
-            binding ? h(SessionProvider, { session: binding, key: binding.sessionId }, renderSlot('marshal.native.body', { canSend: state.canSend, reason: state.reason }))
-              : h('p', { style: { margin: 'auto', opacity: .55 } }, notice || '选择一个会话，继续工作'),
-            h(Statistics, { value: state.statistics, agent: state.target?.agent })),
-          !address && h('p', { role: 'status', style: { margin: 'auto', padding: 24 } }, notice)));
-    }    const AGENT_TEAM_NAME = '智能体库';
+            h('button', {
+              type: 'button',
+              'aria-label': '设备与手机',
+              style: { ...buttonStyle, borderRadius: 999, padding: '5px 11px', display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 11 },
+              onClick: () => { refreshDeviceStatus(); setDeviceDrawerOpen(true); },
+            },
+              h('span', { style: { width: 7, height: 7, borderRadius: '50%', background: deviceDotColor, flexShrink: 0 } }),
+              h('span', null, deviceLabel)))),
+        tab === 'tasks' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex' } },
+          h(TaskBoardPage, { openSession, openTaskRoom, focusedTask, openNativeBoard: openPanel ? () => openPanel('task-board') : undefined, onOpenRosters: () => chooseTab('rosters') })),
+        tab === 'chats' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex', overflow: 'hidden' } },
+          h('nav', { 'aria-label': '会话分类', style: { width: 168, flexShrink: 0, borderRight: '1px solid ' + dswTheme.border, padding: 10, display: 'flex', flexDirection: 'column', gap: 4, background: 'color-mix(in srgb, currentColor 2%, transparent)' } },
+            chatSections.map(([key, label, hint]) => h('button', {
+              key, type: 'button', 'aria-pressed': chatSection === key,
+              style: { ...tabStyle(chatSection === key), textAlign: 'left', padding: '9px 10px', display: 'grid', gap: 2 },
+              onClick: () => { if (key === 'taskRooms') setRoomTask(null); setChatSection(key); },
+            },
+              h('span', { style: { fontSize: 13, fontWeight: chatSection === key ? 600 : 500 } }, label),
+              h('span', { style: { fontSize: 10, opacity: .6 } }, hint)))),
+          h('div', { style: { flex: 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' } },
+            chatSection === 'groups' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' } },
+              h('div', { style: { padding: '8px 16px', borderBottom: '1px solid ' + dswTheme.border, display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 } },
+                h('button', { type: 'button', style: tabStyle(groupSub === 'local'), onClick: () => setGroupSub('local') }, '本机常驻群'),
+                h('button', { type: 'button', style: tabStyle(groupSub === 'cross'), onClick: () => setGroupSub('cross') }, '跨设备群聊')),
+              groupSub === 'local'
+                ? h(GroupsPage, { openSession, onOpenAgents: () => chooseTab('agents') })
+                : h(CrossGroupsPage)),
+            chatSection === 'taskRooms' && h(TaskRoomsPage, { key: roomTask?.id ?? 'archive', task: roomTask, openBoard }),
+            chatSection === 'direct' && h(AgentDirectChatsView, { openSession, onOpenAgents: () => chooseTab('agents') }),
+            chatSection === 'remote' && h('div', { style: { display: 'flex', flex: 1, minHeight: 0 } },
+              address && h('iframe', { ref: iframe, onLoad: connect, title: '调度官设备与群聊', src: address,
+                sandbox: 'allow-scripts allow-same-origin allow-forms', allow: 'clipboard-write', referrerPolicy: 'no-referrer',
+                style: { width: compact ? 310 : '100%', flexShrink: 0, minHeight: 0, border: 0, borderRight: compact ? '1px solid #8883' : 0 } }),
+              compact && h('div', { style: { flex: 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column' } },
+                state.target && h('header', { style: { padding: '16px 22px 10px', flexShrink: 0 } },
+                  h('div', { style: { fontSize: 15, fontWeight: 600 } }, state.title || '未命名会话'),
+                  h('div', { style: { opacity: .5, fontSize: 11, marginTop: 4 } }, state.target.agent.toUpperCase() + ' · ' + (state.deviceName || state.target.deviceId)),
+                  h('p', { role: 'status', style: { opacity: .65, fontSize: 12, margin: '8px 0 0' } }, notice || state.reason),
+                  h('button', { type: 'button', disabled: historyBusy, style: { ...buttonStyle, marginTop: 8, marginRight: 8 }, onClick: () => { live.current = []; void loadHistory(active.current); } }, historyBusy ? '读取中…' : '刷新历史'),
+                  older && h('button', { type: 'button', disabled: historyBusy, style: { ...buttonStyle, marginTop: 8 }, onClick: () => loadHistory(active.current, older) }, historyBusy ? '读取中…' : '加载更多历史')),
+                binding && h('div', { style: { padding: '8px 22px', borderBottom: '1px solid #8882', flexShrink: 0 } },
+                  h('div', { style: { display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8 } },
+                    h('label', { style: { fontSize: 12 } }, '模型 ', h('select', { 'aria-label': '本次发送模型', value: selection.model || '', disabled: controlsBusy || state.running,
+                      style: { ...buttonStyle, maxWidth: 250 }, onChange: event => changeSelection(event.target.value ? { model: event.target.value } : {}) },
+                      h('option', { value: '' }, '沿用会话模型'), ...(catalog?.models || []).map(model => h('option', { key: model.id, value: model.id }, model.label)))),
+                    h('label', { style: { fontSize: 12 } }, '思考 ', h('select', { 'aria-label': '本次发送思考强度', value: selection.reasoning || '', disabled: !selectedModel?.efforts.length || state.running,
+                      style: buttonStyle, onChange: event => changeSelection({ model: selection.model, ...(event.target.value ? { reasoning: event.target.value } : {}) }) },
+                      h('option', { value: '' }, '默认'), ...(selectedModel?.efforts || []).map(effort => h('option', { key: effort, value: effort }, ({ off: '关闭', none: '关闭', minimal: '最低', low: '低', medium: '中', high: '高', xhigh: '很高', max: '最高', ultra: '极高' })[effort] || effort)))),
+                    h('button', { type: 'button', style: buttonStyle, disabled: controlsBusy || state.running, onClick: () => loadControls(active.current, state.target.agent === 'claude' && !catalog) }, controlsBusy ? '读取中…' : catalog ? '刷新模型' : state.target.agent === 'claude' ? '接管并加载模型' : '加载模型'),
+                    h('button', { type: 'button', style: buttonStyle, disabled: state.running, onClick: () => fileInput.current?.click() }, '＋ 添加附件'),
+                    h('input', { ref: fileInput, type: 'file', multiple: true, 'aria-label': '上传会话附件', style: { display: 'none' }, onChange: uploadFiles })),
+                  h('div', { role: 'status', style: { opacity: .55, fontSize: 11, marginTop: 6 } }, controlsNotice, ' · 每个附件 ≤10 MB'),
+                  files.length > 0 && h('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 } }, files.map(item => h('span', { key: item.id, style: { border: '1px solid #8884', borderRadius: 8, padding: '3px 8px', fontSize: 12 } },
+                    item.name + ' · ' + item.status, h('button', { type: 'button', 'aria-label': '移除附件 ' + item.name, style: { ...buttonStyle, border: 0, padding: '0 5px' }, onClick: () => { uploads.current = uploads.current.filter(file => file.id !== item.id); setFiles([...uploads.current]); } }, '×'))))),
+                binding ? h(SessionProvider, { session: binding, key: binding.sessionId }, renderSlot('marshal.native.body', { canSend: state.canSend, reason: state.reason }))
+                  : h('p', { style: { margin: 'auto', opacity: .55 } }, notice || '选择一个远端会话，继续工作'),
+                h(Statistics, { value: state.statistics, agent: state.target?.agent })),
+              !address && h('p', { role: 'status', style: { margin: 'auto', padding: 24 } }, notice)))),
+        tab === 'agents' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex' } },
+          h(AgentsPage, { onOpenChats: () => chooseTab('chats'), onOpenMemory: openAgentMemory, openSession, workspaceService, initialSubTab: agentSub })),
+        tab === 'memory' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex' } },
+          h(MemoryPage, { initialAgentId: memoryTarget.agentId, initialLayer: memoryTarget.layer })),
+        h(DeviceStatusDrawer, {
+          open: deviceDrawerOpen,
+          onClose: () => setDeviceDrawerOpen(false),
+          status: deviceStatus,
+          onRefresh: () => { retry(v => v + 1); refreshDeviceStatus(); },
+          onOpenRemote: () => { setChatSection('remote'); setTab('chats'); },
+        }));
+    }
+    const AGENT_TEAM_NAME = '智能体库';
     const dswTheme = {
       bg: 'transparent',
       layer: 'color-mix(in srgb, currentColor 5%, transparent)',
@@ -1118,15 +1476,10 @@ window.__ModuleLoader__.load({
     function installSidebarWorkspaceSwitch() {
       if (typeof document === 'undefined' || window.__marshalSidebarSwitch === true) return;
       window.__marshalSidebarSwitch = true;
-      const KEY = 'marshal.sidebar.scope';
-      let mode = localStorage.getItem(KEY) === 'agents' ? 'agents' : 'workspace';
       if (!document.getElementById('marshal-scope-style')) {
         const style = document.createElement('style');
         style.id = 'marshal-scope-style';
-        style.textContent = '[data-marshal-scope-hidden="1"]{display:none!important}'
-          + '#marshal-scope-switch{display:flex;align-items:center;gap:2px;padding:2px;margin:4px 8px 5px;border-radius:999px;border:1px solid color-mix(in srgb, currentColor 14%, transparent);background:color-mix(in srgb, currentColor 5%, transparent);flex-shrink:0;align-self:flex-start}'
-          + '#marshal-scope-switch button{border:0;background:transparent;color:inherit;font:10px/1 inherit;padding:4px 7px;border-radius:999px;cursor:pointer;white-space:nowrap}'
-          + '#marshal-scope-switch button[data-active="1"]{background:color-mix(in srgb, currentColor 14%, transparent);font-weight:600}';
+        style.textContent = '[data-marshal-scope-hidden="1"]{display:none!important}';
         document.head.appendChild(style);
       }
       const groupFor = row => {
@@ -1142,6 +1495,8 @@ window.__ModuleLoader__.load({
         return false;
       };
       const apply = () => {
+        const oldToggle = document.getElementById('marshal-scope-switch');
+        if (oldToggle) oldToggle.remove();
         const wrapper = document.querySelector('[data-slot="sidebar.workspaces"]');
         if (wrapper === null) return;
         const rows = [...wrapper.querySelectorAll('[data-row-key^="workspace:"]')];
@@ -1151,82 +1506,32 @@ window.__ModuleLoader__.load({
           if (group === undefined || seen.has(group)) continue;
           seen.add(group);
           const agent = isAgentRow(row);
-          if (agent) {
-            const title = titleNode(row);
-            if (title !== null) {
-              if (title.dataset.marshalOriginal === undefined) title.dataset.marshalOriginal = title.textContent;
-              const original = title.dataset.marshalOriginal;
-              const clean = original.replace(/^Agent\s*·\s*/, '').trim();
-              const next = mode === 'agents' ? clean : original;
-              if (title.textContent !== next) title.textContent = next;
-            }
-          }
-          group.setAttribute('data-marshal-scope-hidden', (mode === 'agents') === agent ? '0' : '1');
+          group.setAttribute('data-marshal-scope-hidden', agent ? '1' : '0');
         }
         for (const group of wrapper.querySelectorAll('[class*="groupSection"]')) {
           if (seen.has(group)) continue;
-          group.setAttribute('data-marshal-scope-hidden', mode === 'agents' ? '1' : '0');
+          group.setAttribute('data-marshal-scope-hidden', '0');
         }
       };
-      const ensure = () => {
-        const header = document.querySelector('[data-sidebar-workspace-header]');
-        if (header === null) return;
-        let toggle = header.parentElement.querySelector('#marshal-scope-switch') ?? header.querySelector('#marshal-scope-switch');
-        if (toggle === null) {
-          toggle = document.createElement('div');
-          toggle.id = 'marshal-scope-switch';
-          toggle.setAttribute('role', 'tablist');
-          toggle.setAttribute('aria-label', '切换工作区 / Agents');
-          for (const [key, label] of [['workspace', '工作区'], ['agents', 'Agents']]) {
-            const button = document.createElement('button');
-            button.type = 'button';
-            button.dataset.scope = key;
-            button.textContent = label;
-            button.onclick = event => {
-              event.preventDefault();
-              event.stopPropagation();
-              mode = key;
-              localStorage.setItem(KEY, key);
-              refresh();
-              apply();
-            };
-            toggle.appendChild(button);
-          }
-          header.parentElement.insertBefore(toggle, header.nextSibling);
-        }
-        refresh();
-        apply();
-      };
-      const refresh = () => {
-        const toggle = document.getElementById('marshal-scope-switch');
-        if (toggle === null) return;
-        for (const button of toggle.querySelectorAll('button')) button.dataset.active = button.dataset.scope === mode ? '1' : '0';
-      };
-      const schedule = () => { requestAnimationFrame(() => { ensure(); }); };
+      const schedule = () => { requestAnimationFrame(() => { apply(); }); };
       const observer = new MutationObserver(schedule);
       observer.observe(document.body, { childList: true, subtree: true });
-      setInterval(ensure, 1200);
-      ensure();
+      setInterval(apply, 1500);
+      apply();
     }
 
     function MarshalNav({ active, onTab, compact = false }) {
-      const tabs = [['session', '会话'], ['groups', '群聊'], ['taskRooms', '工单群'], ['agents', '智能体'], ['cross', '跨设备'], ['memory', '记忆']];
-      const button = (key, label) => h('button', {
-        key, type: 'button', 'aria-pressed': active === key,
-        style: {
-          border: 0, borderRadius: 999, cursor: 'pointer', whiteSpace: 'nowrap',
-          font: (compact ? '11px/1' : '12px/1') + ' inherit',
-          padding: compact ? '6px 9px' : '7px 11px',
-          background: active === key ? 'color-mix(in srgb, currentColor 16%, transparent)' : 'transparent',
-          color: 'inherit', fontWeight: active === key ? 600 : 400,
-          transition: 'background .15s ease',
-        },
-        onClick: () => onTab(key),
-      }, label);
+      const normalized = resolveNavTarget(active).tab;
+      const tabs = [
+        ['tasks', '任务看板'],
+        ['chats', '会话'],
+        ['agents', '智能体'],
+        ['memory', '记忆'],
+      ];
       return h('div', {
         id: 'marshal-quick-nav',
-        'data-active': active,
-        role: 'navigation', 'aria-label': '调度官快速切换',
+        'data-active': normalized,
+        role: 'navigation', 'aria-label': '调度官主导航',
         style: {
           display: 'flex', alignItems: 'center', gap: 2, padding: 3,
           borderRadius: 999, border: '1px solid color-mix(in srgb, currentColor 14%, transparent)',
@@ -1234,18 +1539,18 @@ window.__ModuleLoader__.load({
           flexShrink: 0, maxWidth: '100%', overflowX: 'auto',
         },
       },
-        ...tabs.map(([key, label]) => button(key, label)),
-        h('button', {
-          type: 'button', 'aria-pressed': active === 'tasks',
+        tabs.map(([key, label]) => h('button', {
+          key, type: 'button', 'aria-pressed': normalized === key,
           style: {
             border: 0, borderRadius: 999, cursor: 'pointer', whiteSpace: 'nowrap',
             font: (compact ? '11px/1' : '12px/1') + ' inherit',
-            padding: compact ? '6px 9px' : '7px 11px',
-            background: active === 'tasks' ? 'color-mix(in srgb, currentColor 16%, transparent)' : 'transparent',
-            color: 'inherit', fontWeight: active === 'tasks' ? 600 : 400,
+            padding: compact ? '6px 11px' : '7px 13px',
+            background: normalized === key ? 'color-mix(in srgb, currentColor 16%, transparent)' : 'transparent',
+            color: 'inherit', fontWeight: normalized === key ? 600 : 400,
+            transition: 'background .15s ease',
           },
-          onClick: () => onTab('tasks'),
-        }, '任务看板'));
+          onClick: () => onTab(key),
+        }, label)));
     }
 
     function Field({ label, children }) {
@@ -1940,7 +2245,7 @@ window.__ModuleLoader__.load({
 
     const PERMISSION_RANK = { 'read-only': 0, 'workspace-write': 1, 'danger-full-access': 2 };
 
-    function TaskBoardPage({ openSession, openTaskRoom, focusedTask, openNativeBoard }) {
+    function TaskBoardPage({ openSession, openTaskRoom, focusedTask, openNativeBoard, onOpenRosters }) {
       const [tasks, setTasks] = React.useState(null);
       const [sessionDefaultPerm, setSessionDefaultPerm] = React.useState('read-only');
       const [error, setError] = React.useState('');
@@ -2002,8 +2307,9 @@ window.__ModuleLoader__.load({
       const [leaderId, setLeaderId] = React.useState('');
       const [workspaceId, setWorkspaceId] = React.useState('');
       const [workspaces, setWorkspaces] = React.useState([]);
+      const [rosters, setRosters] = React.useState({});
       const selectedLeader = catalog?.leaders.find(item => item.id === leaderId);
-      const workspace = selectedLeader?.workspaceId ?? workspaceId;
+      const workspace = workspaceId || (selectedLeader && !selectedLeader.global ? selectedLeader.workspaceId : '');
       const [choice, setChoice] = React.useState('leader');
       const [templateId, setTemplateId] = React.useState('pr-review');
       const [prUrl, setPrUrl] = React.useState('');
@@ -2015,7 +2321,7 @@ window.__ModuleLoader__.load({
       const recommendedTemplate = selectedTemplate === 'none' ? catalog?.plainTemplate : catalog?.templates.find(item => item.id === selectedTemplate);
       const codeWork = selectedTemplate === 'development' || (selectedTemplate !== 'pr-review' && (plan?.codeWork ?? explicitCode));
       const roleChoices = codeWork ? recommendedTemplate?.codingRoles : recommendedTemplate?.roles;
-      const candidates = catalog?.leaders.filter(item => item.workspaceId === workspace && item.id !== leaderId) ?? [];
+      const candidates = catalog?.leaders.filter(item => (item.global || item.workspaceId === workspace) && item.id !== leaderId) ?? [];
       const groupId = codeWork && selectedTemplate ? 'delivery' : recommendedTemplate?.groupTemplate;
       const group = catalog?.groupTemplates?.find(item => item.id === groupId);
       const template = catalog?.templates.find(item => item.id === templateId);
@@ -2081,8 +2387,12 @@ window.__ModuleLoader__.load({
         void fetchJson('marshal/tasks/orchestration', undefined, true)
           .then(setCatalog).catch(() => setCatalogError('编排配置暂不可用。'));
         void fetchJson('marshal/task-rooms/workspaces', undefined, true).then(data => {
-          setWorkspaces(data.workspaces);
-          if (data.workspaces.length === 1) setWorkspaceId(data.workspaces[0].id);
+          const realWs = (data.workspaces || []).filter(item => !isPseudoAgentWorkspace(item));
+          setWorkspaces(realWs);
+          if (realWs.length === 1) setWorkspaceId(realWs[0].id);
+        }).catch(() => {});
+        void fetchJson('marshal/rosters/state').then(data => {
+          setRosters(data?.rosters || {});
         }).catch(() => {});
         void fetch('api/task-board/model-catalog', { credentials: 'same-origin' })
           .then(r => r.ok ? r.json() : null)
@@ -2202,6 +2512,7 @@ window.__ModuleLoader__.load({
 
       const choiceBody = () => ({
         leaderId, choice, codeWork: explicitCode || undefined,
+        ...(workspace ? { workspaceId: workspace } : {}),
         ...(choice === 'template' ? { templateId } : {}),
         ...(choice !== 'none' && prUrl.trim() ? { prUrl: prUrl.trim() } : {}),
       });
@@ -2293,6 +2604,16 @@ window.__ModuleLoader__.load({
         if (orchestrationMode !== 'plain') {
           setLeaderId(id);
           setPlan(null);
+        }
+      };
+      const handleSelectWorkspace = nextWsId => {
+        setWorkspaceId(nextWsId);
+        setPlan(null);
+        const roster = nextWsId ? rosters[nextWsId] : undefined;
+        if (roster?.leaderId && catalog?.leaders?.some(item => item.id === roster.leaderId)) {
+          setAssignedAgent(roster.leaderId);
+          if (orchestrationMode !== 'plain') setLeaderId(roster.leaderId);
+          setNotice('已套用该工作区默认班底 Leader');
         }
       };
       const toggleFormTag = name => {
@@ -2401,6 +2722,7 @@ window.__ModuleLoader__.load({
         try {
           const result = await fetchJson('marshal/tasks/run', { taskId: task.id }, Boolean(task.workflow || task.taskRoom));
           setTasks(result.tasks || []);
+          if (result.permissionBlocked && result.message) setNotice(result.message);
         }
         catch (e) { setError('运行失败：' + (e.message || e)); }
         finally { setBusy(false); }
@@ -2589,6 +2911,7 @@ window.__ModuleLoader__.load({
       const card = (task, column) => {
         const workflow = task.workflow;
         const step = workflow?.state === 'handed-off' ? '已交给 Leader'
+          : workflow?.state === 'permission-blocked' ? '权限受阻 · 待确认'
           : workflow?.state === 'interrupted' ? '运行中断'
           : taskPhases[workflow?.phase];
         const isRunning = task.status === 'running' || task.openExecution === true || workflow?.state === 'running';
@@ -2719,6 +3042,7 @@ window.__ModuleLoader__.load({
         const modeLabel = execution === 'none' || workflow?.choice === 'none' ? '普通任务'
           : templateName ?? (workflow?.choice === 'leader' ? '由 Leader 决定' : '编排任务');
         const step = workflow?.state === 'handed-off' ? '已交给 Leader'
+          : workflow?.state === 'permission-blocked' ? '权限受阻 · 待确认'
           : workflow?.state === 'interrupted' ? '运行中断，可重试'
           : taskPhases[workflow?.phase];
         const isRunning = task.status === 'running' || task.openExecution === true || workflow?.state === 'running';
@@ -3111,9 +3435,9 @@ window.__ModuleLoader__.load({
               h('select', { value: formParentId, style: uiInput, onChange: event => setFormParentId(event.target.value) },
                 h('option', { value: '' }, '独立任务（无父任务）'),
                 topLevelParents.map(item => h('option', { key: item.id, value: item.id }, item.title)))),
-            orchestrationMode === 'plain' && workspaces.length > 0 && h(Field, { label: '工作区（可选）' },
-              h('select', { value: workspaceId, style: uiInput, onChange: event => setWorkspaceId(event.target.value) },
-                h('option', { value: '' }, '不绑定工作区'),
+            workspaces.length > 0 && h(Field, { label: orchestrationMode === 'plain' ? '目标工作区（可选）' : '目标项目工作区（必填）' },
+              h('select', { value: workspaceId, style: uiInput, onChange: event => handleSelectWorkspace(event.target.value) },
+                h('option', { value: '' }, orchestrationMode === 'plain' ? '不绑定工作区' : '请选择项目工作区'),
                 workspaces.map(item => h('option', { key: item.id, value: item.id }, item.name))))),
 
           !editing && h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 10 } },
@@ -3162,7 +3486,7 @@ window.__ModuleLoader__.load({
               }, '仅派给 Leader（无模板）')),
             orchestrationMode === 'template' && template && h('span', { style: uiMuted }, '阶段：' + template.stages.join(' → ')),
             catalogError && h('div', { style: uiMuted }, catalogError),
-            catalog && !canOrchestrate && h('div', { style: uiMuted }, '提示：需开启工作区记忆并至少有一个已绑定工作区的智能体作为 Leader，方可启用编排模板。')),
+            catalog && !canOrchestrate && h('div', { style: uiMuted }, '提示：需开启工作区记忆并至少有一个智能体作为 Leader，方可启用编排模板。')),
 
           orchestrationMode !== 'plain' && leaderId && (requiresPr || choice === 'leader') && h(Field, { label: requiresPr ? 'PR 链接' : 'PR 链接（可选）' },
             h('input', { type: 'url', value: prUrl, onChange: event => { setPrUrl(event.target.value); setPlan(null); }, placeholder: 'GitHub 或 Gitee PR 链接', style: uiInput })),
@@ -3448,8 +3772,18 @@ window.__ModuleLoader__.load({
               button('发送', () => { void act('send', { text: draft }); }, controlsLocked || !draft.trim(), true)))));
     }
 
-    function AgentsPage({ onOpenGroups, openSession, workspaceService }) {
+    function AgentsPage({ onOpenChats, onOpenMemory, openSession, workspaceService, initialSubTab = 'pool' }) {
+      const [subTab, setSubTab] = React.useState(initialSubTab === 'rosters' ? 'rosters' : 'pool');
       const [library, setLibrary] = React.useState(null);
+      const [extraWorkspaces, setExtraWorkspaces] = React.useState([]);
+      const [sessions, setSessions] = React.useState([]);
+      const [rosters, setRosters] = React.useState({});
+      const [selectedAgentId, setSelectedAgentId] = React.useState('');
+      const [selectedWsId, setSelectedWsId] = React.useState('');
+      const [chatSearch, setChatSearch] = React.useState('');
+      const [dispatchWsId, setDispatchWsId] = React.useState('');
+      const [rosterDraft, setRosterDraft] = React.useState({ leaderId: '', coderId: '', reviewerId: '', members: [] });
+      const [rosterNotice, setRosterNotice] = React.useState('');
       const [error, setError] = React.useState('');
       const [formOpen, setFormOpen] = React.useState(false);
       const [editingId, setEditingId] = React.useState('');
@@ -3460,26 +3794,87 @@ window.__ModuleLoader__.load({
       const [permission, setPermission] = React.useState('workspace-write');
       const [model, setModel] = React.useState('');
       const [brief, setBrief] = React.useState('');
-      const [workspaceId, setWorkspaceId] = React.useState('');
       const [workspacePath, setWorkspacePath] = React.useState('');
-      const [agentPath, setAgentPath] = React.useState('');
       const [creatingWorkspace, setCreatingWorkspace] = React.useState(false);
       const [quick, setQuick] = React.useState('');
       const [quickBusy, setQuickBusy] = React.useState(false);
+      const [chatBusy, setChatBusy] = React.useState(false);
+
+      React.useEffect(() => {
+        if (initialSubTab === 'rosters' || initialSubTab === 'pool') setSubTab(initialSubTab);
+      }, [initialSubTab]);
+
       const agents = library && Array.isArray(library.agents) ? library.agents : [];
       const presets = (library && library.presets) || [];
       const models = (library && library.models) || [];
-      const workspaces = (library && library.workspaces) || [];
+      const realWorkspaces = React.useMemo(() => {
+        const map = new Map();
+        for (const ws of [...((library && library.workspaces) || []), ...extraWorkspaces]) {
+          if (!ws || !ws.id || isPseudoAgentWorkspace(ws)) continue;
+          if (!map.has(ws.id)) {
+            map.set(ws.id, {
+              id: ws.id,
+              title: ws.title || ws.name || (ws.path ? String(ws.path).split('/').pop() : ws.id),
+              path: ws.path || '',
+            });
+          }
+        }
+        return [...map.values()];
+      }, [library, extraWorkspaces]);
 
       const load = async () => {
-        try { setLibrary(await loadAgentLibrary()); setError(''); }
+        try {
+          const [lib, sessData, wsData, rosterData] = await Promise.all([
+            loadAgentLibrary(),
+            fetchJson('marshal/agents/sessions').catch(() => ({ sessions: [] })),
+            fetchJson('marshal/task-rooms/workspaces', undefined, true).catch(() => ({ workspaces: [] })),
+            fetchJson('marshal/rosters/state').catch(() => ({ rosters: {} })),
+          ]);
+          setLibrary(lib);
+          setSessions(Array.isArray(sessData?.sessions) ? sessData.sessions : []);
+          setExtraWorkspaces(Array.isArray(wsData?.workspaces) ? wsData.workspaces : []);
+          setRosters(rosterData?.rosters || {});
+          setSelectedAgentId(cur => (cur && (lib.agents || []).some(a => a.id === cur)) ? cur : (lib.agents?.[0]?.id || ''));
+          const mergedReal = [...(lib.workspaces || []), ...(wsData?.workspaces || [])].filter(ws => ws && ws.id && !isPseudoAgentWorkspace(ws));
+          if (mergedReal.length > 0) {
+            setSelectedWsId(cur => (cur && mergedReal.some(w => w.id === cur)) ? cur : mergedReal[0].id);
+            setDispatchWsId(cur => cur || mergedReal[0].id);
+          }
+          setError('');
+        }
         catch (e) { setError(friendlyError(e, '智能体')); }
       };
       React.useEffect(() => { void load(); }, []);
 
+      React.useEffect(() => {
+        if (!selectedWsId) return;
+        const r = rosters[selectedWsId] || {};
+        setRosterDraft({
+          leaderId: r.leaderId || '',
+          coderId: r.coderId || '',
+          reviewerId: r.reviewerId || '',
+          members: Array.isArray(r.members) ? r.members : [],
+        });
+        setRosterNotice('');
+      }, [selectedWsId, rosters]);
+
+      const selectedAgent = agents.find(a => a.id === selectedAgentId) || agents[0] || null;
+      const agentFullId = agent => agent.squadId + '/' + agent.id;
+
+      const agentSessions = React.useMemo(() => {
+        if (!selectedAgent) return [];
+        const q = chatSearch.trim().toLowerCase();
+        return sessions.filter(item => {
+          const match = item.memberId === selectedAgent.id || (item.teamId === selectedAgent.squadId && item.agentName === selectedAgent.name);
+          if (!match) return false;
+          if (q && !String(item.title || '').toLowerCase().includes(q) && !String(item.sessionId || '').toLowerCase().includes(q)) return false;
+          return true;
+        });
+      }, [sessions, selectedAgent, chatSearch]);
+
       const createWorkspace = async () => {
         const path = workspacePath.trim();
-        if (!path.startsWith('/')) { setError('工作区路径必须是绝对路径'); return; }
+        if (!path.startsWith('/')) { setError('项目工作区路径必须是绝对路径'); return; }
         const service = typeof workspaceService === 'function' ? workspaceService() : workspaceService;
         if (!service || typeof service.create !== 'function') { setError('当前 DSH 版本不支持从插件新建工作区'); return; }
         setCreatingWorkspace(true);
@@ -3489,9 +3884,9 @@ window.__ModuleLoader__.load({
           const created = await service.create({ path });
           setWorkspacePath('');
           await load();
-          if (created && created.workspaceId) setWorkspaceId(created.workspaceId);
+          if (created && created.workspaceId) setSelectedWsId(created.workspaceId);
         }
-        catch (e) { setError('新建工作区失败：' + (e.message || e)); }
+        catch (e) { setError('新建项目工作区失败：' + (e.message || e)); }
         finally { setCreatingWorkspace(false); }
       };
 
@@ -3502,8 +3897,6 @@ window.__ModuleLoader__.load({
         setPermission('workspace-write');
         setModel('');
         setBrief('');
-        setWorkspaceId('');
-        setAgentPath('');
         setFormOpen(false);
       };
 
@@ -3514,17 +3907,7 @@ window.__ModuleLoader__.load({
         setPermission(agent.permission || 'workspace-write');
         setModel(agent.model || '');
         setBrief(agent.brief || '');
-        setWorkspaceId(agent.workspaceId || '');
         setFormOpen(true);
-      };
-
-      const agentGroupName = async (agent) => {
-        const state = await fetchJson('marshal/groups/state');
-        for (const item of state.groups || []) {
-          const data = await fetchJson('marshal/groups/get?id=' + encodeURIComponent(item.id));
-          if ((data.group.members || []).some(member => member.squadId === agent.squadId && member.memberId === agent.id)) return item.name;
-        }
-        return undefined;
       };
 
       const saveAgent = async () => {
@@ -3539,39 +3922,20 @@ window.__ModuleLoader__.load({
           if (permission) member.permission = permission;
           if (model) member.model = model;
           if (brief.trim()) member.brief = brief.trim();
-          if (current !== undefined && current.legacy && workspaceId) {
-            const usedIn = await agentGroupName(current);
-            if (usedIn !== undefined) {
-              throw new Error('该智能体已在群聊「' + usedIn + '」中，请先在群里移除再改工作区');
-            }
-            const team = await createAgentTeam(name.trim(), workspaceId);
-            const saved = await fetchJson('dsh-agents/api/member', { teamId: team.id, member });
-            const created = ((saved.team && saved.team.members) || []).find(item => item.name === name.trim());
-            if (created) await fetchJson('dsh-agents/api/run', { teamId: team.id, memberId: created.id });
-            await fetchJson('dsh-agents/api/member/delete', { teamId: current.squadId, memberId: current.id });
-            resetForm();
-            await load();
-            return;
-          }
           let teamId;
           if (current !== undefined) {
-            await updateAgentTeam(current, workspaceId);
             teamId = current.squadId;
             member.id = current.id;
           }
           else {
-            const service = typeof workspaceService === 'function' ? workspaceService() : workspaceService;
-            const agentWorkspaceId = await ensureAgentWorkspace(name.trim(), agentPath.trim(), service);
-            const team = await createAgentTeam(name.trim(), agentWorkspaceId);
+            const team = await createAgentTeam(name.trim());
             teamId = team.id;
           }
           const saved = await fetchJson('dsh-agents/api/member', { teamId, member });
-          if (current === undefined) {
-            const created = ((saved.team && saved.team.members) || []).find(item => item.name === name.trim());
-            if (created) await fetchJson('dsh-agents/api/run', { teamId, memberId: created.id });
-          }
+          const created = ((saved.team && saved.team.members) || []).find(item => item.name === name.trim());
           resetForm();
           await load();
+          if (created) setSelectedAgentId(created.id);
         }
         catch (e) { setError((editingId ? '保存失败：' : '创建失败：') + (e.message || e)); }
         finally { setSaving(false); }
@@ -3592,9 +3956,7 @@ window.__ModuleLoader__.load({
           });
           const draft = (data && data.draft) || {};
           const agentName = (draft.name || quick.trim().slice(0, 12)).slice(0, 40);
-          const service = typeof workspaceService === 'function' ? workspaceService() : workspaceService;
-          const agentWorkspaceId = await ensureAgentWorkspace(agentName, agentPath.trim(), service);
-          const team = await createAgentTeam(agentName, agentWorkspaceId);
+          const team = await createAgentTeam(agentName);
           const member = {
             name: agentName,
             permission: draft.permission || 'workspace-write',
@@ -3602,52 +3964,37 @@ window.__ModuleLoader__.load({
           if (draft.brief) member.brief = draft.brief;
           const saved = await fetchJson('dsh-agents/api/member', { teamId: team.id, member });
           const created = ((saved.team && saved.team.members) || []).find(item => item.name === agentName);
-          if (created) await fetchJson('dsh-agents/api/run', { teamId: team.id, memberId: created.id });
           setQuick('');
           await load();
+          if (created) setSelectedAgentId(created.id);
         }
         catch (e) { setError('一句话创建失败：' + (e.message || e)); }
         finally { setQuickBusy(false); }
       };
 
-      const chat = async (agent) => {
-        if (!library) return;
+      const startCasualChat = async (agent) => {
+        if (!agent || chatBusy) return;
+        setChatBusy(true);
         setError('');
         try {
-          const run = (library.runs || []).find(item => item.memberId === agent.id && item.teamId === agent.squadId && item.sessionId);
-          if (run && run.sessionId) { openSession && openSession(run.sessionId); return; }
           const data = await fetchJson('dsh-agents/api/run', { teamId: agent.squadId, memberId: agent.id });
           const sessionId = data && data.run && data.run.sessionId;
           if (!sessionId) throw new Error('no-session');
           await load();
           openSession && openSession(sessionId);
         }
-        catch (e) { setError('打开会话失败：' + (e.message || e)); }
+        catch (e) { setError('新建闲聊失败：' + (e.message || e)); }
+        finally { setChatBusy(false); }
       };
 
-      const promoteWorkspace = async (agent) => {
-        const service = typeof workspaceService === 'function' ? workspaceService() : workspaceService;
-        if (!service || typeof service.create !== 'function') { setError('当前 DSH 不支持创建 Agent 工作区'); return; }
+      const workIn = async (agent, targetWsId) => {
+        if (!agent || !targetWsId) return;
         setError('');
         try {
-          const workspaceId = await ensureAgentWorkspace(agent.name, '', service);
-          await updateAgentTeam(agent, workspaceId);
-          const data = await fetchJson('dsh-agents/api/run', { teamId: agent.squadId, memberId: agent.id });
-          const sessionId = data && data.run && data.run.sessionId;
-          await load();
-          if (sessionId) openSession && openSession(sessionId);
-        }
-        catch (e) { setError('创建 Agent 工作区失败：' + (e.message || e)); }
-      };
-
-      const workIn = async (agent, workspaceId) => {
-        if (!workspaceId) return;
-        setError('');
-        try {
-          const team = await createTaskTeam(agent.name, workspaceId);
-          const member = { name: agent.name };
+          const team = await createTaskTeam(agent.name, targetWsId);
+          const cappedPerm = agent.permission === 'read-only' ? 'read-only' : 'workspace-write';
+          const member = { name: agent.name, permission: cappedPerm };
           if (agent.preset) member.preset = agent.preset;
-          if (agent.permission) member.permission = agent.permission;
           if (agent.model) member.model = agent.model;
           if (agent.brief) member.brief = agent.brief;
           const saved = await fetchJson('dsh-agents/api/member', { teamId: team.id, member });
@@ -3659,7 +4006,7 @@ window.__ModuleLoader__.load({
           await load();
           openSession && openSession(sessionId);
         }
-        catch (e) { setError('打开工作区会话失败：' + (e.message || e)); }
+        catch (e) { setError('派驻到工作区失败：' + (e.message || e)); }
       };
 
       const remove = async (agent) => {
@@ -3668,92 +4015,203 @@ window.__ModuleLoader__.load({
         try {
           if (agent.legacy) await fetchJson('dsh-agents/api/member/delete', { teamId: agent.squadId, memberId: agent.id });
           else await fetchJson('dsh-agents/api/team/delete', { teamId: agent.squadId });
-          const label = agent.workspace ? (agent.workspace.title || String(agent.workspace.path || '').split('/').pop()) : '';
-          if (!agent.legacy && label.startsWith('Agent · ')) {
-            const service = typeof workspaceService === 'function' ? workspaceService() : workspaceService;
-            if (service && typeof service.delete === 'function' && agent.workspaceId) {
-              try { await service.delete(agent.workspaceId); } catch { /* the folder and sessions stay */ }
-            }
-          }
           setConfirmId('');
           await load();
         }
         catch (e) { setError('删除失败：' + (e.message || e)); }
       };
 
-      const agentCard = agent => h('div', { key: agent.id, style: { display: 'flex', gap: 12, alignItems: 'flex-start', padding: 14, border: '1px solid ' + dswTheme.border, borderRadius: 12, background: dswTheme.layer } },
-        h(Avatar, { name: agent.name, size: 34 }),
-        h('div', { style: { flex: 1, minWidth: 0 } },
-          h('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
-            h('div', { style: { fontSize: 14, fontWeight: 600 } }, agent.name),
-            h('span', { style: { fontSize: 10, color: dswTheme.faint, border: '1px solid ' + dswTheme.border2, borderRadius: 999, padding: '1px 7px' } }, agent.permission || '默认权限')),
-          h('div', { style: { fontSize: 11, color: dswTheme.faint, marginTop: 4 } }, [agent.workspace ? (agent.workspace.title || agent.workspace.path) : 'Host 默认工作区', agent.preset, agent.model].filter(Boolean).join(' · ')),
-          agent.brief && h('div', { style: { fontSize: 12, color: dswTheme.dim, marginTop: 8, lineHeight: 1.6, whiteSpace: 'pre-wrap' } }, agent.brief.length > 160 ? agent.brief.slice(0, 160) + '…' : agent.brief)),
-        h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
-          (() => { const label = agent.workspace ? (agent.workspace.title || String(agent.workspace.path || '').split('/').pop()) : ''; return label.startsWith('Agent · ') ? null : h('button', { type: 'button', style: { ...uiButton(false), padding: '4px 10px' }, onClick: () => { void promoteWorkspace(agent); } }, '建 Agent 工作区'); })(),
-          h('select', { value: '', onChange: event => { const value = event.target.value; event.target.value = ''; void workIn(agent, value); }, style: { ...uiInput, padding: '4px 6px', fontSize: 12 }, title: '去其它工作区开会话' },
-            h('option', { value: '' }, '去工作区…'),
-            workspaces.filter(workspace => workspace.id !== agent.workspaceId).map(workspace => h('option', { key: workspace.id, value: workspace.id }, workspace.title || workspace.path))),
-          h('button', { type: 'button', style: { ...uiButton(false), padding: '4px 10px' }, onClick: () => { void chat(agent); } }, '私聊'),
-          h('button', { type: 'button', style: { ...uiButton(false), padding: '4px 10px' }, onClick: () => openEdit(agent) }, '编辑'),
-          h('button', { type: 'button', style: { ...uiButton(false), padding: '4px 10px', color: confirmId === agent.id ? dswTheme.danger : dswTheme.text }, onClick: () => { void remove(agent); } }, confirmId === agent.id ? '确认删除' : '删除')));
+      const saveRoster = async () => {
+        if (!selectedWsId) return;
+        setSaving(true);
+        setError('');
+        setRosterNotice('');
+        try {
+          const res = await fetchJson('marshal/rosters/save', {
+            workspaceId: selectedWsId,
+            leaderId: rosterDraft.leaderId || undefined,
+            coderId: rosterDraft.coderId || undefined,
+            reviewerId: rosterDraft.reviewerId || undefined,
+            members: rosterDraft.members,
+          });
+          setRosters(res?.rosters || {});
+          setRosterNotice('已保存该工作区默认班底');
+        }
+        catch (e) { setError('保存班底失败：' + (e.message || e)); }
+        finally { setSaving(false); }
+      };
+
+      const toggleRosterMember = fullId => {
+        setRosterDraft(cur => {
+          const exists = cur.members.includes(fullId);
+          return { ...cur, members: exists ? cur.members.filter(x => x !== fullId) : [...cur.members, fullId] };
+        });
+      };
+
+      const agentSessionCount = agent => sessions.filter(s => s.memberId === agent.id || (s.teamId === agent.squadId && s.agentName === agent.name)).length;
+      const agentNameByFullId = fullId => {
+        if (!fullId) return '';
+        const found = agents.find(a => agentFullId(a) === fullId || a.id === fullId);
+        return found ? found.name : fullId;
+      };
 
       return h('section', { style: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', background: dswTheme.bg, color: dswTheme.text } },
-        h('header', { style: { padding: '14px 20px', borderBottom: '1px solid ' + dswTheme.border, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexShrink: 0 } },
-          h('div', null,
-            h('div', { style: { fontSize: 15, fontWeight: 600 } }, '智能体'),
-            h('div', { style: uiMuted }, agents.length + ' 个定义 · 名称 + 预设 + 权限 + 模型 + 简报')),
+        h('header', { style: { padding: '12px 20px', borderBottom: '1px solid ' + dswTheme.border, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexShrink: 0, flexWrap: 'wrap' } },
+          h('div', { style: { display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' } },
+            h('div', { role: 'tablist', 'aria-label': '智能体视图', style: { display: 'flex', gap: 4, padding: 3, borderRadius: 10, border: '1px solid ' + dswTheme.border, background: dswTheme.layer } },
+              h('button', { type: 'button', role: 'tab', 'aria-selected': subTab === 'pool', style: tabStyle(subTab === 'pool'), onClick: () => setSubTab('pool') }, '全部智能体（人才库 · ' + agents.length + '）'),
+              h('button', { type: 'button', role: 'tab', 'aria-selected': subTab === 'rosters', style: tabStyle(subTab === 'rosters'), onClick: () => setSubTab('rosters') }, '工作区班底（' + realWorkspaces.length + '）'))),
           h('div', { style: { display: 'flex', gap: 8 } },
-            h('button', { type: 'button', style: uiButton(false), onClick: onOpenGroups }, '去群聊'),
-            h('button', { type: 'button', style: uiButton(true), onClick: () => { if (formOpen) resetForm(); else { setEditingId(''); setFormOpen(true); } } }, formOpen ? '收起' : '＋ 新建智能体'))),
+            onOpenChats && h('button', { type: 'button', style: uiButton(false), onClick: onOpenChats }, '去会话'),
+            subTab === 'pool' && h('button', { type: 'button', style: uiButton(true), onClick: () => { if (formOpen) resetForm(); else { setEditingId(''); setFormOpen(true); } } }, formOpen ? '收起' : '＋ 新建智能体'))),
         error && h('div', { style: { padding: '8px 20px', fontSize: 12, color: dswTheme.danger } }, error),
-        h('div', { style: { margin: '14px 20px 0', padding: 14, border: '1px solid ' + dswTheme.border, borderRadius: 12, background: dswTheme.layer, display: 'grid', gap: 8 } },
-          h('div', { style: { fontSize: 12, color: dswTheme.dim } }, '一句话创建 · 由模型补全名称、性格、简报和权限'),
-          h('div', { style: { display: 'flex', gap: 8 } },
-            h('input', { value: quick, onChange: event => setQuick(event.target.value), placeholder: '例如：一个严谨的代码审查员，先看边界条件，语气直接', style: { ...uiInput, flex: 1 } }),
-            h('button', { type: 'button', disabled: quickBusy, style: { ...uiButton(true), opacity: quickBusy ? .6 : 1 }, onClick: () => { void quickCreate(); } }, quickBusy ? '生成中…' : '生成并创建'))),
-        formOpen && h('div', { style: { margin: '14px 20px 0', padding: 16, border: '1px solid ' + dswTheme.border, borderRadius: 12, background: dswTheme.layer, display: 'grid', gap: 12 } },
-          h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between' } },
-            h('div', { style: { fontSize: 13, fontWeight: 600 } }, editingId ? '编辑智能体' : '新建智能体'),
-            editingId ? h('div', { style: uiMuted }, '修改会替换该定义；清空的字段恢复默认') : null),
-          h(Field, { label: '名称' }, h('input', { value: name, onChange: event => setName(event.target.value), placeholder: '例如：寻冬', style: uiInput })),
-          h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 10 } },
-            editingId
-              ? h(Field, { label: '工作区' }, h('select', { value: workspaceId, onChange: event => setWorkspaceId(event.target.value), style: uiInput },
-                  h('option', { value: '' }, 'Host 默认工作区'),
-                  workspaces.map(workspace => h('option', { key: workspace.id, value: workspace.id }, workspace.title || workspace.path))))
-              : h(Field, { label: 'Agent 工作区' }, h('div', { style: { display: 'grid', gap: 6 } },
-                  h('div', { style: { ...uiMuted } }, '自动创建「Agent · ' + (name.trim() || '名字') + '」工作区'),
-                  h('input', { value: agentPath, onChange: event => setAgentPath(event.target.value), placeholder: '可选：自定义绝对路径', style: uiInput }))),
-            h(Field, { label: '预设' }, h('select', { value: preset, onChange: event => setPreset(event.target.value), style: uiInput },
-              h('option', { value: '' }, '默认预设'),
-              presets.map(item => {
-                const id = typeof item === 'string' ? item : item.id;
-                const label = typeof item === 'string' ? item : (item.name || item.id);
-                return h('option', { key: id, value: id }, label);
-              }))),
-            h(Field, { label: '权限' }, h('select', { value: permission, onChange: event => setPermission(event.target.value), style: uiInput },
-              h('option', { value: 'read-only' }, '只读'),
-              h('option', { value: 'workspace-write' }, '可写工作区'),
-              h('option', { value: 'danger-full-access' }, '完全访问'))),
-            h(Field, { label: '模型' }, h('select', { value: model, onChange: event => setModel(event.target.value), style: uiInput },
-              h('option', { value: '' }, '默认模型'),
-              models.map(item => {
-                const value = item.provider && item.model ? item.provider + '/' + item.model : (item.id || '');
-                return h('option', { key: value, value }, item.label || value);
-              })))),
-          h(Field, { label: '新建工作区（绝对路径，目录不存在会自动创建）' },
-            h('div', { style: { display: 'flex', gap: 8, alignItems: 'center' } },
-              h('input', { value: workspacePath, onChange: event => setWorkspacePath(event.target.value), placeholder: '/Users/you/projects/new-repo', style: { ...uiInput, flex: 1 } }),
-              h('button', { type: 'button', disabled: creatingWorkspace, style: { ...uiButton(false), opacity: creatingWorkspace ? .6 : 1, whiteSpace: 'nowrap' }, onClick: () => { void createWorkspace(); } }, creatingWorkspace ? '创建中…' : '新建工作区'))),
-          h(Field, { label: '简报（进入该智能体会话的系统提示）' }, h('textarea', { value: brief, onChange: event => setBrief(event.target.value), rows: 4, placeholder: '它擅长什么、用什么语气、注意什么…', style: { ...uiInput, resize: 'vertical', lineHeight: 1.6 } })),
-          h('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8 } },
-            h('button', { type: 'button', style: uiButton(false), onClick: () => resetForm() }, '取消'),
-            h('button', { type: 'button', disabled: saving, style: { ...uiButton(true), opacity: saving ? .6 : 1 }, onClick: () => { void saveAgent(); } }, saving ? '保存中…' : editingId ? '保存修改' : '创建智能体'))),
-        h('div', { style: { flex: 1, minHeight: 0, overflow: 'auto', padding: 20, display: 'flex', flexDirection: 'column', gap: 10 } },
+
+        subTab === 'pool' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' } },
+          h('div', { style: { margin: '12px 20px 0', padding: '10px 14px', border: '1px solid ' + dswTheme.border, borderRadius: 12, background: dswTheme.layer, display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 } },
+            h('input', { value: quick, onChange: event => setQuick(event.target.value), onKeyDown: event => { if (event.key === 'Enter') void quickCreate(); }, placeholder: '一句话新建全局智能体（不创建假工作区），如：严谨的代码审查员，先查边界条件', style: { ...uiInput, flex: 1 } }),
+            h('button', { type: 'button', disabled: quickBusy, style: { ...uiButton(true), opacity: quickBusy ? .6 : 1, whiteSpace: 'nowrap' }, onClick: () => { void quickCreate(); } }, quickBusy ? '生成中…' : '一句话创建')),
+          formOpen && h('div', { style: { margin: '12px 20px 0', padding: 16, border: '1px solid ' + dswTheme.border, borderRadius: 12, background: dswTheme.layer, display: 'grid', gap: 10, flexShrink: 0 } },
+            h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between' } },
+              h('div', { style: { fontSize: 13, fontWeight: 600 } }, editingId ? '编辑智能体' : '新建全局智能体'),
+              h('div', { style: uiMuted }, '全局独立实体 · 不创建假工作区，可自由派驻任意项目')),
+            h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: 10 } },
+              h(Field, { label: '名称' }, h('input', { value: name, onChange: event => setName(event.target.value), placeholder: '例如：工部尚书', style: uiInput })),
+              h(Field, { label: '预设' }, h('select', { value: preset, onChange: event => setPreset(event.target.value), style: uiInput },
+                h('option', { value: '' }, '默认预设'),
+                presets.map(item => {
+                  const id = typeof item === 'string' ? item : item.id;
+                  const label = typeof item === 'string' ? item : (item.name || item.id);
+                  return h('option', { key: id, value: id }, label);
+                }))),
+              h(Field, { label: '单聊默认权限' }, h('select', { value: permission, onChange: event => setPermission(event.target.value), style: uiInput },
+                h('option', { value: 'read-only' }, '只读'),
+                h('option', { value: 'workspace-write' }, '可写工作区（推荐）'),
+                h('option', { value: 'danger-full-access' }, '完全访问（派驻工作区自动收紧为工作区可写）'))),
+              h(Field, { label: '模型' }, h('select', { value: model, onChange: event => setModel(event.target.value), style: uiInput },
+                h('option', { value: '' }, '默认模型'),
+                models.map(item => {
+                  const value = item.provider && item.model ? item.provider + '/' + item.model : (item.id || '');
+                  return h('option', { key: value, value }, item.label || value);
+                })))),
+            h(Field, { label: '简报（人设与职责说明）' }, h('textarea', { value: brief, onChange: event => setBrief(event.target.value), rows: 3, placeholder: '它擅长什么、用什么语气、注意什么…', style: { ...uiInput, resize: 'vertical', lineHeight: 1.6 } })),
+            h('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8 } },
+              h('button', { type: 'button', style: uiButton(false), onClick: () => resetForm() }, '取消'),
+              h('button', { type: 'button', disabled: saving, style: { ...uiButton(true), opacity: saving ? .6 : 1 }, onClick: () => { void saveAgent(); } }, saving ? '保存中…' : editingId ? '保存修改' : '创建智能体'))),
           agents.length === 0
-            ? h(EmptyState, { title: '还没有智能体', hint: '智能体 = 名称 + 预设 + 权限 + 模型 + 简报。\n创建后就能在群聊里 @ 它。', action: '新建智能体', onAction: () => setFormOpen(true) })
-            : agents.map(agentCard)));
+            ? h('div', { style: { flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 } },
+                h(EmptyState, { title: '还没有智能体', hint: '智能体独立于项目工作区存在，可单聊、拉群，也可派驻到任意真实项目工作区。', action: '新建智能体', onAction: () => setFormOpen(true) }))
+            : h('div', { style: { flex: 1, minHeight: 0, display: 'flex', marginTop: 12, borderTop: '1px solid ' + dswTheme.border, overflow: 'hidden' } },
+                h('aside', { style: { width: 250, flexShrink: 0, borderRight: '1px solid ' + dswTheme.border, overflow: 'auto', padding: 12, display: 'flex', flexDirection: 'column', gap: 6 } },
+                  agents.map(agent => {
+                    const active = selectedAgent && selectedAgent.id === agent.id;
+                    const count = agentSessionCount(agent);
+                    return h('button', {
+                      key: agent.id, type: 'button',
+                      style: { ...tabStyle(active), textAlign: 'left', padding: '9px 10px', display: 'flex', alignItems: 'center', gap: 10 },
+                      onClick: () => { setSelectedAgentId(agent.id); setConfirmId(''); },
+                    },
+                      h(Avatar, { name: agent.name, size: 28 }),
+                      h('div', { style: { flex: 1, minWidth: 0 } },
+                        h('div', { style: { fontSize: 13, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, agent.name),
+                        h('div', { style: { fontSize: 10, opacity: .65, marginTop: 2 } }, (agent.model || '默认模型') + ' · ' + count + ' 次闲聊')));
+                  })),
+                selectedAgent && h('div', { style: { flex: 1, minWidth: 0, overflow: 'auto', padding: 20, display: 'grid', gap: 16, alignContent: 'start' } },
+                  h('div', { style: { padding: 16, borderRadius: 12, border: '1px solid ' + dswTheme.border, background: dswTheme.layer, display: 'grid', gap: 10 } },
+                    h('div', { style: { display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' } },
+                      h(Avatar, { name: selectedAgent.name, size: 40 }),
+                      h('div', { style: { flex: 1, minWidth: 0 } },
+                        h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
+                          h('span', { style: { fontSize: 16, fontWeight: 600 } }, selectedAgent.name),
+                          h('span', { style: { fontSize: 10, color: dswTheme.faint, border: '1px solid ' + dswTheme.border2, borderRadius: 999, padding: '2px 8px' } }, '全局智能体'),
+                          h('span', { style: { fontSize: 10, color: dswTheme.faint, border: '1px solid ' + dswTheme.border2, borderRadius: 999, padding: '2px 8px' } }, selectedAgent.permission || 'workspace-write')),
+                        h('div', { style: { fontSize: 11, color: dswTheme.faint, marginTop: 4 } }, [selectedAgent.preset || '默认预设', selectedAgent.model || '默认模型'].join(' · '))),
+                      h('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap' } },
+                        onOpenMemory && h('button', { type: 'button', style: uiButton(false), onClick: () => onOpenMemory(selectedAgent.id) }, '私有记忆'),
+                        h('button', { type: 'button', style: uiButton(false), onClick: () => openEdit(selectedAgent) }, '编辑'),
+                        h('button', { type: 'button', style: { ...uiButton(false), color: confirmId === selectedAgent.id ? dswTheme.danger : undefined }, onClick: () => { void remove(selectedAgent); } }, confirmId === selectedAgent.id ? '确认删除' : '删除'))),
+                    selectedAgent.brief && h('div', { style: { fontSize: 12, color: dswTheme.dim, lineHeight: 1.65, whiteSpace: 'pre-wrap' } }, selectedAgent.brief)),
+
+                  h('div', { style: { padding: 14, borderRadius: 12, border: '1px solid ' + dswTheme.border, background: dswTheme.layer, display: 'grid', gap: 8 } },
+                    h('div', { style: { fontSize: 13, fontWeight: 600 } }, '派驻到真实项目工作区'),
+                    h('div', { style: { fontSize: 11, color: dswTheme.faint } }, '被派驻到工作区时自动限制为「工作区可写」权限；如需在看板按模板协同，可在「工作区班底」配置默认班底。'),
+                    realWorkspaces.length === 0
+                      ? h('div', { style: { fontSize: 12, color: dswTheme.dim } }, '还没有真实项目工作区，请切到上方「工作区班底」新建一个项目工作区。')
+                      : h('div', { style: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' } },
+                          h('select', { value: dispatchWsId, onChange: event => setDispatchWsId(event.target.value), style: { ...uiInput, flex: 1, minWidth: 200 } },
+                            realWorkspaces.map(ws => h('option', { key: ws.id, value: ws.id }, ws.title + (ws.path ? ' · ' + ws.path : '')))),
+                          h('button', { type: 'button', style: uiButton(false), onClick: () => { void workIn(selectedAgent, dispatchWsId); } }, '派驻并开启会话'))),
+
+                  h('div', { style: { padding: 14, borderRadius: 12, border: '1px solid ' + dswTheme.border, background: dswTheme.layer, display: 'grid', gap: 10 } },
+                    h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
+                      h('div', { style: { fontSize: 13, fontWeight: 600 } }, '闲聊会话历史（' + agentSessions.length + '）'),
+                      h('input', { value: chatSearch, onChange: event => setChatSearch(event.target.value), placeholder: '搜索历史闲聊…', style: { ...uiInput, width: 190, marginLeft: 'auto' } }),
+                      h('button', { type: 'button', disabled: chatBusy, style: uiButton(true), onClick: () => { void startCasualChat(selectedAgent); } }, chatBusy ? '创建中…' : '＋ 新建闲聊')),
+                    agentSessions.length === 0
+                      ? h('div', { style: { fontSize: 12, color: dswTheme.faint, padding: '8px 0' } }, '还没有与「' + selectedAgent.name + '」的闲聊历史，点“＋ 新建闲聊”立即开始。')
+                      : h('div', { style: { display: 'grid', gap: 6, maxHeight: 320, overflow: 'auto' } },
+                          agentSessions.map(item => h('div', {
+                            key: item.sessionId,
+                            style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, padding: '8px 10px', borderRadius: 8, border: '1px solid ' + dswTheme.border, cursor: 'pointer' },
+                            onClick: () => openSession && openSession(item.sessionId),
+                          },
+                            h('div', { style: { minWidth: 0 } },
+                              h('div', { style: { fontSize: 12, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, item.title || '历史闲聊'),
+                              h('div', { style: { fontSize: 10, color: dswTheme.faint, marginTop: 2 } }, [formatSessionTime(item.updatedAt || item.createdAt), item.sessionId.slice(0, 8)].filter(Boolean).join(' · '))),
+                            h('button', { type: 'button', style: uiButton(false), onClick: event => { event.stopPropagation(); openSession && openSession(item.sessionId); } }, '打开')))))))),
+
+        subTab === 'rosters' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' } },
+          h('div', { style: { margin: '12px 20px 0', padding: '10px 14px', border: '1px solid ' + dswTheme.border, borderRadius: 12, background: dswTheme.layer, display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 } },
+            h('input', { value: workspacePath, onChange: event => setWorkspacePath(event.target.value), placeholder: '新建真实项目工作区（输入绝对路径，例如 /Users/you/projects/app）', style: { ...uiInput, flex: 1 } }),
+            h('button', { type: 'button', disabled: creatingWorkspace, style: { ...uiButton(false), whiteSpace: 'nowrap' }, onClick: () => { void createWorkspace(); } }, creatingWorkspace ? '创建中…' : '＋ 新建项目工作区')),
+          realWorkspaces.length === 0
+            ? h('div', { style: { flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 } },
+                h(EmptyState, { title: '还没有项目工作区', hint: '在上方输入项目目录绝对路径，即可创建真实项目工作区并配置默认班底。' }))
+            : h('div', { style: { flex: 1, minHeight: 0, display: 'flex', marginTop: 12, borderTop: '1px solid ' + dswTheme.border, overflow: 'hidden' } },
+                h('aside', { style: { width: 250, flexShrink: 0, borderRight: '1px solid ' + dswTheme.border, overflow: 'auto', padding: 12, display: 'flex', flexDirection: 'column', gap: 6 } },
+                  realWorkspaces.map(ws => {
+                    const active = selectedWsId === ws.id;
+                    const r = rosters[ws.id];
+                    return h('button', {
+                      key: ws.id, type: 'button',
+                      style: { ...tabStyle(active), textAlign: 'left', padding: '9px 10px', display: 'grid', gap: 3 },
+                      onClick: () => setSelectedWsId(ws.id),
+                    },
+                      h('div', { style: { fontSize: 13, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, ws.title),
+                      h('div', { style: { fontSize: 10, opacity: .65, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, r?.leaderId ? 'Leader: ' + agentNameByFullId(r.leaderId) : (ws.path || '尚未配置默认班底')));
+                  })),
+                selectedWsId && h('div', { style: { flex: 1, minWidth: 0, overflow: 'auto', padding: 20, display: 'grid', gap: 14, alignContent: 'start' } },
+                  h('div', null,
+                    h('div', { style: { fontSize: 15, fontWeight: 600 } }, (realWorkspaces.find(w => w.id === selectedWsId)?.title || selectedWsId) + ' · 工作区班底'),
+                    h('div', { style: { fontSize: 11, color: dswTheme.faint, marginTop: 4 } }, realWorkspaces.find(w => w.id === selectedWsId)?.path || '')),
+                  h('div', { style: { padding: 12, borderRadius: 10, border: '1px solid ' + dswTheme.border, background: dswTheme.layer, fontSize: 12, color: dswTheme.dim, lineHeight: 1.6 } },
+                    '在任务看板选择该工作区时，将自动套用这里的默认 Leader。派驻到工作区执行时默认授予「工作区可写」权限并开启 Leader 自动审核；如遇权限受阻，工单会自动转入「待确认」列等待确认。'),
+                  h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 12 } },
+                    h(Field, { label: '默认 Leader（统筹与自动审核）' },
+                      h('select', { value: rosterDraft.leaderId, style: uiInput, onChange: event => setRosterDraft(cur => ({ ...cur, leaderId: event.target.value })) },
+                        h('option', { value: '' }, '不预设'),
+                        agents.map(a => h('option', { key: a.id, value: agentFullId(a) }, a.name)))),
+                    h(Field, { label: '默认 Coder（主力开发）' },
+                      h('select', { value: rosterDraft.coderId, style: uiInput, onChange: event => setRosterDraft(cur => ({ ...cur, coderId: event.target.value })) },
+                        h('option', { value: '' }, '不预设'),
+                        agents.map(a => h('option', { key: a.id, value: agentFullId(a) }, a.name)))),
+                    h(Field, { label: '默认 Reviewer（独立审查）' },
+                      h('select', { value: rosterDraft.reviewerId, style: uiInput, onChange: event => setRosterDraft(cur => ({ ...cur, reviewerId: event.target.value })) },
+                        h('option', { value: '' }, '不预设'),
+                        agents.map(a => h('option', { key: a.id, value: agentFullId(a) }, a.name))))),
+                  h(Field, { label: '常驻协作班底成员（点击切换）' },
+                    h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 8 } },
+                      agents.map(a => {
+                        const fid = agentFullId(a);
+                        const on = rosterDraft.members.includes(fid);
+                        return h('button', {
+                          key: a.id, type: 'button',
+                          style: { ...tabStyle(on), border: '1px solid ' + (on ? dswTheme.brand : dswTheme.border), padding: '6px 12px' },
+                          onClick: () => toggleRosterMember(fid),
+                        }, (on ? '✓ ' : '＋ ') + a.name);
+                      }))),
+                  h('div', { style: { display: 'flex', alignItems: 'center', gap: 12 } },
+                    h('button', { type: 'button', disabled: saving, style: uiButton(true), onClick: () => { void saveRoster(); } }, saving ? '保存中…' : '保存工作区班底'),
+                    rosterNotice && h('span', { style: { fontSize: 12, color: '#10b981' } }, rosterNotice))))));
     }
     return {
       inject: ['slots', 'sessions', 'uiSession', 'uiConversation'],
@@ -3791,7 +4249,7 @@ window.__ModuleLoader__.load({
             name: 'conversation.session.header.actions',
             id: 'marshal-quick-nav',
             order: 40,
-          }, () => h(MarshalNav, { active: 'session', onTab: goTab, compact: true })));
+          }, () => h(MarshalNav, { active: 'chats', onTab: goTab, compact: true })));
         } catch (error) { /* older host without the conversation header action slot */ }
         const ensureTaskboardHeader = () => {
           const root = document.querySelector('[data-dsh-taskboard-view]');
@@ -3815,13 +4273,10 @@ window.__ModuleLoader__.load({
             };
             nav.appendChild(button);
           };
-          add('会话', 'session');
-          add('群聊', 'groups');
-          add('智能体', 'agents');
-          add('跨设备', 'cross');
-          add('记忆', 'memory');
-          add('工单群', 'taskRooms');
           add('任务看板', 'tasks');
+          add('会话', 'chats');
+          add('智能体', 'agents');
+          add('记忆', 'memory');
           bar.append(title, nav);
           root.prepend(bar);
         };

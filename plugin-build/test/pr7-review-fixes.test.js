@@ -9,7 +9,8 @@ import { createMemoryBridge } from '../lib/src/superagent/memory.js';
 import { findMember, resolveAgentForTask } from '../lib/src/superagent/agents.js';
 import { defaultSettings } from '../lib/src/superagent/settings.js';
 import { parseModelJson, VerdictSchema } from '../lib/src/groups/task-plans.js';
-import { createTaskOrchestration } from '../lib/src/groups/task-orchestration.js';
+import { createTaskOrchestration, isPermissionBlockedError } from '../lib/src/groups/task-orchestration.js';
+import { createWorkspaceRosters } from '../lib/src/groups/workspace-rosters.js';
 import { createLocalBoard } from '../lib/src/groups/local-board.js';
 import { detectAmbiguousTask } from '../lib/src/groups/mount.js';
 import { mountSuperagent } from '../lib/src/superagent/mount.js';
@@ -261,4 +262,113 @@ test('detectAmbiguousTask routes vague or underspecified tickets to review while
     assert.ok(detectAmbiguousTask({ title: '看板改进', description: '细节待定' }));
     assert.equal(detectAmbiguousTask({ title: '修复 PR #7 看板左下角对比度', description: '把 .mtb-result 改为高对比主文本色并验证暗色/亮色主题。' }), undefined);
     assert.equal(detectAmbiguousTask({ title: '看看截图', description: '', hasAttachments: true }), undefined);
+});
+
+
+// --- .19 unified architecture & bundling tests ---
+test('embedded dsh-agents runtime includes process-wide deduplication guard', () => {
+    const embedded = readFileSync(new URL('../lib/src/dsh-agents/index.js', import.meta.url), 'utf8');
+    assert.ok(embedded.includes('DSH_AGENTS_MOUNT_KEY'), 'embedded dsh-agents must guard against double mount');
+    const hostEntry = readFileSync(new URL('../lib/src/index.js', import.meta.url), 'utf8');
+    assert.ok(hostEntry.includes('./dsh-agents/index.js'), 'host index should lazily load embedded dsh-agents');
+});
+
+test('workspace rosters persist per-workspace default leader, coder, reviewer and members', (t) => {
+    const dir = tempRoot();
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const file = join(dir, 'workspace-rosters.json');
+    const rosters = createWorkspaceRosters(file);
+    const saved = rosters.set('ws-alpha', {
+        leaderId: 'team-1/cx',
+        coderId: 'team-2/gb',
+        reviewerId: 'team-3/sz',
+        members: ['team-1/cx', 'team-2/gb', 'team-3/sz', 'team-2/gb'],
+    });
+    assert.equal(saved.leaderId, 'team-1/cx');
+    assert.equal(saved.coderId, 'team-2/gb');
+    assert.equal(saved.reviewerId, 'team-3/sz');
+    assert.deepEqual(saved.members, ['team-1/cx', 'team-2/gb', 'team-3/sz']);
+
+    const reloaded = createWorkspaceRosters(file);
+    assert.deepEqual(reloaded.get('ws-alpha')?.members, ['team-1/cx', 'team-2/gb', 'team-3/sz']);
+    assert.equal(Object.keys(reloaded.list()).length, 1);
+    assert.equal(reloaded.remove('ws-alpha'), true);
+    assert.equal(reloaded.get('ws-alpha'), undefined);
+});
+
+test('global agents can orchestrate in any target project workspace while permission blocks auto-route to review', async (t) => {
+    const dir = tempRoot();
+    const memory = createAgentMemoryService({ root: join(dir, 'mem') });
+    t.after(() => { memory.store.close(); rmSync(dir, { recursive: true, force: true }); });
+
+    assert.equal(isPermissionBlockedError(new Error('EACCES: permission denied')), true);
+    assert.equal(isPermissionBlockedError({ code: 'confirmation-required', message: 'needs approval' }), true);
+    assert.equal(isPermissionBlockedError(new Error('ordinary syntax error')), false);
+
+    const blockedEvents = [];
+    const flow = createTaskOrchestration({
+        file: join(dir, 'orch.json'),
+        memory,
+        leaderAutoReview: true,
+        onPermissionBlocked: (source, taskId, reason) => { blockedEvents.push({ source, taskId, reason }); },
+        inventory: () => ({
+            teams: [
+                { id: 't-global-1', name: 'marshal-agent:丞相-abc', members: [{ id: 'cx', name: '丞相', permission: 'danger-full-access', model: 'deepseek-chat' }] },
+                { id: 't-global-2', name: 'marshal-agent:工部-def', members: [{ id: 'gb', name: '工部', permission: 'workspace-write', model: 'deepseek-chat' }] },
+                { id: 't-foreign', name: 'project-other', workspaceId: 'ws-other', members: [{ id: 'other', name: '外人', model: 'deepseek-chat' }] },
+            ],
+        }),
+        port: {
+            catalog: () => [{ id: 'dsh/deepseek-chat', agent: 'dsh', provider: 'deepseek', model: 'deepseek-chat' }],
+            run: async () => {
+                const err = new Error('sandbox permission denied outside workspace');
+                err.code = 'permission-denied';
+                throw err;
+            },
+        },
+    });
+
+    // Global agent can be prepared for any target workspaceId
+    const prepared = flow.prepare({
+        leaderId: 't-global-1/cx',
+        workspaceId: 'ws-target',
+        choice: 'leader',
+    });
+    assert.equal(prepared.workspaceId, 'ws-target');
+
+    // Project-scoped foreign agent stays isolated from ws-target
+    assert.throws(() => flow.prepare({
+        leaderId: 't-global-1/cx',
+        workspaceId: 'ws-target',
+        choice: 'template',
+        templateId: 'development',
+        plan: { templateId: 'development', codeWork: true, members: { coder: 't-foreign/other', reviewer: 't-global-2/gb' } },
+    }), /工作区/);
+
+    // Permission-blocked run transitions to permission-blocked and fires onPermissionBlocked callback
+    flow.attach('local', 'card-perm-1', prepared);
+    flow.start('local', { id: 'card-perm-1', title: '需权限确认的任务', description: '测试权限受阻' });
+    for (let i = 0; i < 40 && flow.view('local', 'card-perm-1')?.state === 'running'; i++) {
+        await new Promise(resolve => setTimeout(resolve, 15));
+    }
+    const view = flow.view('local', 'card-perm-1');
+    assert.equal(view?.state, 'permission-blocked');
+    assert.equal(blockedEvents.length, 1);
+    assert.equal(blockedEvents[0].taskId, 'card-perm-1');
+});
+
+test('shipped client .19 delivers 4-tab nav, default tasks landing, dual casual-chat entry, rosters and 3-layer memory', () => {
+    const source = readFileSync(new URL('../client/index.js', import.meta.url), 'utf8');
+    assert.ok(source.includes("['tasks', '任务看板']"), 'MarshalNav should list tasks tab');
+    assert.ok(source.includes("['chats', '会话']"), 'MarshalNav should list chats tab');
+    assert.ok(source.includes("['agents', '智能体']"), 'MarshalNav should list agents tab');
+    assert.ok(source.includes("['memory', '记忆']"), 'MarshalNav should list memory tab');
+    assert.ok(source.includes("return { tab: 'tasks' };"), 'default landing tab should be tasks');
+    assert.ok(source.includes('function AgentDirectChatsView'), 'chats tab should include direct casual chat history view');
+    assert.ok(source.includes("fetchJson('marshal/agents/sessions')"), 'client should load agent casual chat history');
+    assert.ok(source.includes("fetchJson('marshal/rosters/save'"), 'client should save workspace default rosters');
+    assert.ok(source.includes("fetchJson('marshal/devices/status')"), 'client should poll device status capsule');
+    assert.ok(source.includes('全局记忆与审批') && source.includes('智能体私有记忆') && source.includes('工作区共享记忆'), 'MemoryPage should render 3 orthogonal layers');
+    assert.ok(source.includes('isPseudoAgentWorkspace'), 'client should hide pseudo Agent · workspaces');
+    assert.ok(!source.includes('自动创建「Agent · '), 'creating a new agent must no longer create pseudo Agent · workspaces');
 });

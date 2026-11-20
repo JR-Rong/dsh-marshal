@@ -451,6 +451,28 @@ function applyNode(ctx, config) {
     }
     if (config.groups) {
         try {
+            ctx.inject(['systemPrompt', 'typertGateway', 'webServer'], (scoped) => {
+                const origin = typeof scoped.webServer?.getOrigin === 'function'
+                    ? scoped.webServer.getOrigin()
+                    : typeof scoped.webServer?.port === 'number' ? 'http://127.0.0.1:' + scoped.webServer.port : '';
+                const probe = origin
+                    ? fetch(origin + '/dsh-agents/api/state', { signal: AbortSignal.timeout(600) })
+                        .then(res => res.status !== 404).catch(() => false)
+                    : Promise.resolve(false);
+                void probe.then(async (alreadyMounted) => {
+                    if (alreadyMounted) return;
+                    const mod = await import('./dsh-agents/index.js');
+                    try { mod.apply(scoped, {}); }
+                    catch (error) { ctx.logger.warn(`marshal: embedded dsh-agents skipped: ${errorName(error)}`); }
+                }).catch((error) => {
+                    ctx.logger.warn(`marshal: embedded dsh-agents unavailable: ${errorName(error)}`);
+                });
+            });
+        }
+        catch (error) {
+            ctx.logger.warn(`marshal: embedded dsh-agents inject skipped: ${errorName(error)}`);
+        }
+        try {
             ctx.inject(['systemPrompt', 'typertGateway', 'workspaceRegistry', 'webServer', 'agents', 'commands'], (scoped) => {
                 if (lookupService(ctx, 'taskBoard') !== undefined || lookupService(scoped, 'taskBoard') !== undefined) return;
                 void import('./task-board/index.js').then((tb) => {
