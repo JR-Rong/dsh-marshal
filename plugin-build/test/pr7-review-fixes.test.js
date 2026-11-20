@@ -10,6 +10,7 @@ import { findMember, resolveAgentForTask } from '../lib/src/superagent/agents.js
 import { defaultSettings } from '../lib/src/superagent/settings.js';
 import { parseModelJson, VerdictSchema } from '../lib/src/groups/task-plans.js';
 import { createTaskOrchestration } from '../lib/src/groups/task-orchestration.js';
+import { createLocalBoard } from '../lib/src/groups/local-board.js';
 import { mountSuperagent } from '../lib/src/superagent/mount.js';
 import { createFakeBoard, createFakeContext, createFakeMemory, loggerFixture } from './superagent-support.js';
 
@@ -172,8 +173,13 @@ test('shipped client keeps plain card create/run working and sends auth for task
     const source = readFileSync(new URL('../client/index.js', import.meta.url), 'utf8');
     assert.ok(source.includes('if (leaderId && !workspace)'));
     assert.ok(source.includes("fetchJson('marshal/tasks/run', { taskId: task.id }, Boolean(task.workflow || task.taskRoom))"));
+    assert.ok(source.includes("fetchJson('marshal/tasks/move', { taskId: task.id, status }, Boolean(task.workflow || task.taskRoom))"));
     assert.ok(source.includes("fetchJson('marshal/tasks/delete', { taskId: task.id }, Boolean(task.workflow || task.taskRoom))"));
     assert.ok(source.includes("!task.taskRoom?.closed && task.status !== 'running' && (!workflow || workflow.state !== 'done')"));
+    for (const [key, label] of [['backlog', '待规划'], ['todo', '待办'], ['running', '进行中'], ['review', '待确认'], ['done', '已完成'], ['failed', '已失败']]) {
+        assert.ok(source.includes("key: '" + key + "', label: '" + label + "'"), 'missing board column ' + key);
+    }
+    assert.ok(source.includes('--mtb-accent'), 'board should apply per-column theme accents');
 });
 
 test('mountSuperagent adopts connection trust with only the real connection service (no connection.authentication)', async () => {
@@ -204,4 +210,18 @@ test('mountSuperagent adopts connection trust with only the real connection serv
     finally {
         context.close();
     }
+});
+
+test('local board supports moving tasks across all six columns including review', async (t) => {
+    const dir = tempRoot();
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const board = createLocalBoard(join(dir, 'board.json'));
+    const created = await board.apply('r1', { kind: 'create', id: 'task-1', input: { title: '验证待确认列' } });
+    assert.equal(created.tasks[0].status, 'todo');
+    const inReview = await board.apply('r2', { kind: 'move', taskId: 'task-1', status: 'review' });
+    assert.equal(inReview.tasks[0].status, 'review');
+    const confirmed = await board.apply('r3', { kind: 'move', taskId: 'task-1', status: 'done' });
+    assert.equal(confirmed.tasks[0].status, 'done');
+    const ignored = await board.apply('r4', { kind: 'move', taskId: 'task-1', status: 'bogus' });
+    assert.equal(ignored.tasks[0].status, 'done');
 });

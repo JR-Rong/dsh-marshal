@@ -855,7 +855,7 @@ window.__ModuleLoader__.load({
         tab === 'agents' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex' } }, h(AgentsPage, { onOpenGroups: () => chooseTab('groups'), openSession, workspaceService })),
         tab === 'cross' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex' } }, h(CrossGroupsPage)),
         tab === 'memory' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex' } }, h(MemoryPage)),
-        tab === 'tasks' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex' } }, h(TaskBoardPage, { openSession, openTaskRoom, focusedTask })),
+        tab === 'tasks' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex' } }, h(TaskBoardPage, { openSession, openTaskRoom, focusedTask, openNativeBoard: openPanel ? () => openPanel('task-board') : undefined })),
         tab === 'taskRooms' && h(TaskRoomsPage, { key: roomTask?.id ?? 'archive', task: roomTask, openBoard }),
         tab === 'session' && h('div', { style: { display: 'flex', flex: 1, minHeight: 0 } },
           address && h('iframe', { ref: iframe, onLoad: connect, title: '调度官设备与群聊', src: address,
@@ -1713,7 +1713,83 @@ window.__ModuleLoader__.load({
         report && h('pre', { style: { margin: '8px 0 0', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontSize: 12 } }, report));
     }
 
-    function TaskBoardPage({ openSession, openTaskRoom, focusedTask }) {
+    function ensureTaskBoardStyles() {
+      if (typeof document === 'undefined' || document.getElementById('marshal-taskboard-styles')) return;
+      const style = document.createElement('style');
+      style.id = 'marshal-taskboard-styles';
+      style.textContent = [
+        '@keyframes mtb-pulse{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--mtb-accent) 55%,transparent)}70%{box-shadow:0 0 0 6px transparent}100%{box-shadow:0 0 0 0 transparent}}',
+        '.mtb-page{flex:1;min-height:0;display:flex;flex-direction:column;background:var(--dsw-alias-bg-base,transparent);color:var(--dsw-alias-label-primary,inherit)}',
+        '.mtb-head{padding:12px 20px;border-bottom:1px solid var(--dsw-alias-border-l1,color-mix(in srgb,currentColor 10%,transparent));display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;flex-shrink:0}',
+        '.mtb-head-left{display:flex;align-items:center;gap:14px;flex-wrap:wrap;min-width:0}',
+        '.mtb-head-right{display:flex;align-items:center;gap:8px;flex-shrink:0}',
+        '.mtb-summary{display:flex;align-items:center;gap:6px;flex-wrap:wrap}',
+        '.mtb-summary-chip{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:999px;border:1px solid color-mix(in srgb,var(--mtb-accent) 26%,transparent);background:color-mix(in srgb,var(--mtb-accent) 9%,transparent);color:var(--dsw-alias-label-secondary,inherit);font-size:11px;line-height:1.4;cursor:pointer;font-family:inherit;transition:background .15s,border-color .15s,transform .12s}',
+        '.mtb-summary-chip:hover{background:color-mix(in srgb,var(--mtb-accent) 16%,transparent);border-color:color-mix(in srgb,var(--mtb-accent) 48%,transparent);transform:translateY(-1px)}',
+        '.mtb-summary-chip strong{font-variant-numeric:tabular-nums;font-weight:600;color:color-mix(in srgb,var(--mtb-accent) 82%,var(--dsw-alias-label-primary,currentColor))}',
+        '.mtb-grid{flex:1;min-height:0;overflow-x:auto;overflow-y:hidden;padding:14px 18px 16px;display:grid;grid-auto-flow:column;grid-auto-columns:minmax(254px,1fr);gap:12px;align-items:stretch;scrollbar-width:thin;scrollbar-color:var(--dsw-alias-border-l3,color-mix(in srgb,currentColor 24%,transparent)) transparent}',
+        '.mtb-grid::-webkit-scrollbar{height:9px}',
+        '.mtb-grid::-webkit-scrollbar-track{background:transparent}',
+        '.mtb-grid::-webkit-scrollbar-thumb{background:var(--dsw-alias-border-l3,color-mix(in srgb,currentColor 22%,transparent));border-radius:999px;border:2px solid transparent;background-clip:content-box}',
+        '.mtb-col{display:flex;flex-direction:column;min-height:0;max-height:100%;border-radius:14px;overflow:hidden;background:var(--dsw-alias-bg-layer-2,color-mix(in srgb,currentColor 4%,transparent));border:1px solid color-mix(in srgb,var(--mtb-accent) 20%,var(--dsw-alias-border-l1,color-mix(in srgb,currentColor 10%,transparent)));border-top:3px solid var(--mtb-accent);transition:border-color .15s,box-shadow .15s,background .15s}',
+        '.mtb-col[data-drop="true"]{border-color:var(--mtb-accent);box-shadow:0 0 0 2px color-mix(in srgb,var(--mtb-accent) 28%,transparent);background:color-mix(in srgb,var(--mtb-accent) 7%,var(--dsw-alias-bg-layer-2,transparent))}',
+        '.mtb-col-head{padding:10px 12px;display:flex;align-items:center;gap:8px;flex-shrink:0;background:color-mix(in srgb,var(--mtb-accent) 8%,transparent);border-bottom:1px solid color-mix(in srgb,var(--mtb-accent) 15%,transparent)}',
+        '.mtb-dot{width:8px;height:8px;border-radius:999px;background:var(--mtb-accent);flex-shrink:0}',
+        '.mtb-dot[data-pulse="true"]{animation:mtb-pulse 2s cubic-bezier(.4,0,.6,1) infinite}',
+        '.mtb-col-title{flex:1;min-width:0;font-size:13px;font-weight:600;letter-spacing:.01em;color:var(--dsw-alias-label-primary,inherit);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+        '.mtb-count{font-size:11px;font-weight:600;font-variant-numeric:tabular-nums;padding:1px 8px;border-radius:999px;flex-shrink:0;background:color-mix(in srgb,var(--mtb-accent) 16%,transparent);color:color-mix(in srgb,var(--mtb-accent) 82%,var(--dsw-alias-label-primary,currentColor))}',
+        '.mtb-col-body{flex:1;min-height:80px;overflow-y:auto;padding:10px;display:flex;flex-direction:column;gap:9px;scrollbar-width:thin}',
+        '.mtb-empty{padding:26px 12px;text-align:center;font-size:12px;color:var(--dsw-alias-label-tertiary,color-mix(in srgb,currentColor 45%,transparent));border:1px dashed color-mix(in srgb,var(--mtb-accent) 24%,transparent);border-radius:10px;background:color-mix(in srgb,var(--mtb-accent) 3%,transparent)}',
+        '.mtb-card{position:relative;overflow:hidden;border-radius:11px;padding:11px 12px 10px 15px;display:flex;flex-direction:column;gap:7px;background:var(--dsw-alias-bg-base,color-mix(in srgb,currentColor 3%,transparent));border:1px solid color-mix(in srgb,var(--mtb-accent) 18%,var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 12%,transparent)));transition:transform .14s ease,box-shadow .14s ease,border-color .14s ease,opacity .14s ease}',
+        '.mtb-card::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3.5px;background:var(--mtb-accent);opacity:.92;pointer-events:none}',
+        '.mtb-card:hover{transform:translateY(-1px);border-color:color-mix(in srgb,var(--mtb-accent) 50%,transparent);box-shadow:0 6px 18px -8px color-mix(in srgb,var(--mtb-accent) 34%,rgba(0,0,0,.25))}',
+        '.mtb-card[data-status="running"]{background:color-mix(in srgb,var(--mtb-accent) 5%,var(--dsw-alias-bg-base,transparent));border-color:color-mix(in srgb,var(--mtb-accent) 42%,transparent)}',
+        '.mtb-card[data-focused="true"]{box-shadow:0 0 0 2px var(--mtb-accent)}',
+        '.mtb-card[data-dragging="true"]{opacity:.48;transform:none}',
+        '.mtb-card[draggable="true"]{cursor:grab}',
+        '.mtb-card[draggable="true"]:active{cursor:grabbing}',
+        '.mtb-card-top{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}',
+        '.mtb-card-title{font-size:13px;font-weight:600;line-height:1.42;color:var(--dsw-alias-label-primary,inherit);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word;flex:1}',
+        '.mtb-card-time{font-size:11px;line-height:1.4;color:var(--dsw-alias-label-tertiary,color-mix(in srgb,currentColor 48%,transparent));white-space:nowrap;flex-shrink:0;font-variant-numeric:tabular-nums}',
+        '.mtb-card-desc{font-size:12px;line-height:1.55;color:var(--dsw-alias-label-secondary,color-mix(in srgb,currentColor 62%,transparent));display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word}',
+        '.mtb-pills{display:flex;flex-wrap:wrap;gap:5px;align-items:center}',
+        '.mtb-pill{display:inline-flex;align-items:center;gap:4px;padding:1.5px 7px;border-radius:999px;font-size:11px;line-height:1.45;font-weight:500;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;background:color-mix(in srgb,currentColor 7%,transparent);color:var(--dsw-alias-label-secondary,inherit)}',
+        '.mtb-pill-accent{background:color-mix(in srgb,var(--mtb-accent) 15%,transparent);color:color-mix(in srgb,var(--mtb-accent) 84%,var(--dsw-alias-label-primary,currentColor));font-weight:600}',
+        '.mtb-actions{display:flex;flex-wrap:wrap;gap:5px;align-items:center;padding-top:7px;margin-top:2px;border-top:1px solid color-mix(in srgb,currentColor 8%,transparent)}',
+        '.mtb-btn{border:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 16%,transparent));background:transparent;color:var(--dsw-alias-label-primary,inherit);border-radius:7px;padding:3.5px 8px;font-size:11px;line-height:1.25;font-weight:500;cursor:pointer;font-family:inherit;transition:background .12s,border-color .12s,color .12s}',
+        '.mtb-btn:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover,color-mix(in srgb,currentColor 8%,transparent));border-color:var(--dsw-alias-border-l3,color-mix(in srgb,currentColor 26%,transparent))}',
+        '.mtb-btn:disabled{opacity:.5;cursor:not-allowed}',
+        '.mtb-btn-accent{border-color:color-mix(in srgb,var(--mtb-accent) 36%,transparent);background:color-mix(in srgb,var(--mtb-accent) 14%,transparent);color:color-mix(in srgb,var(--mtb-accent) 86%,var(--dsw-alias-label-primary,currentColor));font-weight:600}',
+        '.mtb-btn-accent:hover:not(:disabled){background:color-mix(in srgb,var(--mtb-accent) 24%,transparent);border-color:color-mix(in srgb,var(--mtb-accent) 60%,transparent)}',
+        '.mtb-btn-confirm{border-color:color-mix(in srgb,var(--dsw-alias-state-success-primary,#10b981) 42%,transparent);background:color-mix(in srgb,var(--dsw-alias-state-success-primary,#10b981) 16%,transparent);color:color-mix(in srgb,var(--dsw-alias-state-success-primary,#10b981) 86%,var(--dsw-alias-label-primary,currentColor));font-weight:600}',
+        '.mtb-btn-confirm:hover:not(:disabled){background:color-mix(in srgb,var(--dsw-alias-state-success-primary,#10b981) 26%,transparent)}',
+        '.mtb-btn-danger{color:var(--dsw-alias-state-error-primary,#ef4444);border-color:color-mix(in srgb,var(--dsw-alias-state-error-primary,#ef4444) 45%,transparent);background:color-mix(in srgb,var(--dsw-alias-state-error-primary,#ef4444) 12%,transparent)}',
+        '.mtb-move{border:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 15%,transparent));background:transparent;color:var(--dsw-alias-label-secondary,inherit);border-radius:7px;padding:3px 6px;font-size:11px;line-height:1.25;cursor:pointer;font-family:inherit;outline:none;max-width:86px}',
+        '.mtb-move:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover,color-mix(in srgb,currentColor 8%,transparent))}',
+        '.mtb-form{margin:14px 20px 0;padding:16px;min-width:0;max-height:58vh;overflow-y:auto;border:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 14%,transparent));border-radius:14px;background:var(--dsw-alias-bg-layer-2,color-mix(in srgb,currentColor 5%,transparent));display:grid;gap:12px;box-shadow:0 8px 24px -12px rgba(0,0,0,.24)}',
+      ].join('\n');
+      document.head.appendChild(style);
+    }
+
+    function formatTaskTime(ts) {
+      if (typeof ts !== 'number' || !Number.isFinite(ts)) return '';
+      const diff = Math.max(0, Date.now() - ts);
+      const min = Math.floor(diff / 60000);
+      if (min < 1) return '刚刚';
+      if (min < 60) return min + ' 分钟前';
+      const hr = Math.floor(min / 60);
+      if (hr < 24) return hr + ' 小时前';
+      const d = new Date(ts);
+      return (d.getMonth() + 1) + '/' + d.getDate();
+    }
+
+    const TASK_PERMISSION_LABELS = {
+      'read-only': '只读',
+      'workspace-write': '工作区可写',
+      'danger-full-access': '完全权限',
+    };
+
+    function TaskBoardPage({ openSession, openTaskRoom, focusedTask, openNativeBoard }) {
       const [tasks, setTasks] = React.useState(null);
       const [error, setError] = React.useState('');
       const [busy, setBusy] = React.useState(false);
@@ -1721,6 +1797,9 @@ window.__ModuleLoader__.load({
       const [title, setTitle] = React.useState('');
       const [description, setDescription] = React.useState('');
       const [confirmId, setConfirmId] = React.useState('');
+      const [dragTaskId, setDragTaskId] = React.useState('');
+      const [dropCol, setDropCol] = React.useState('');
+      const [compactCards, setCompactCards] = React.useState(false);
       const [catalog, setCatalog] = React.useState(null);
       const [catalogError, setCatalogError] = React.useState('');
       const [leaderId, setLeaderId] = React.useState('');
@@ -1746,18 +1825,21 @@ window.__ModuleLoader__.load({
       const requiresPr = leaderId !== '' && choice === 'template' && templateId === 'pr-review';
       const list = Array.isArray(tasks) ? tasks : [];
       const columns = [
-        { key: 'backlog', label: '待规划' },
-        { key: 'todo', label: '待办' },
-        { key: 'running', label: '进行中' },
-        { key: 'done', label: '完成' },
-        { key: 'failed', label: '失败' },
+        { key: 'backlog', label: '待规划', accent: '#7c8798', empty: '暂无待规划任务' },
+        { key: 'todo', label: '待办', accent: 'var(--dsw-alias-state-business-primary, #3b82f6)', empty: '暂无待办任务' },
+        { key: 'running', label: '进行中', accent: 'var(--dsw-alias-state-warn-primary, #f59e0b)', empty: '暂无进行中任务', pulse: true },
+        { key: 'review', label: '待确认', accent: '#8b5cf6', empty: '暂无待确认任务' },
+        { key: 'done', label: '已完成', accent: 'var(--dsw-alias-state-success-primary, #10b981)', empty: '暂无已完成任务' },
+        { key: 'failed', label: '已失败', accent: 'var(--dsw-alias-state-error-primary, #ef4444)', empty: '暂无失败任务' },
       ];
+      const knownStatuses = new Set(columns.map(c => c.key));
 
       const load = async () => {
         try { const data = await fetchJson('marshal/tasks/state', undefined, true); setTasks(data.tasks || []); setError(''); }
         catch (e) { setError(friendlyError(e, '任务看板')); }
       };
       React.useEffect(() => {
+        ensureTaskBoardStyles();
         void load();
         void fetchJson('marshal/tasks/orchestration', undefined, true)
           .then(setCatalog).catch(() => setCatalogError('编排配置暂不可用。'));
@@ -1888,6 +1970,18 @@ window.__ModuleLoader__.load({
         finally { setBusy(false); }
       };
 
+      const move = async (task, status) => {
+        if (busy || !task || task.status === status) return;
+        setBusy(true);
+        setError('');
+        try {
+          const result = await fetchJson('marshal/tasks/move', { taskId: task.id, status }, Boolean(task.workflow || task.taskRoom));
+          setTasks(result.tasks || []);
+        }
+        catch (e) { setError('移动状态失败：' + (e.message || e)); }
+        finally { setBusy(false); setDragTaskId(''); setDropCol(''); }
+      };
+
       const remove = async (task) => {
         if (confirmId !== task.id) { setConfirmId(task.id); return; }
         setBusy(true);
@@ -1901,7 +1995,7 @@ window.__ModuleLoader__.load({
         finally { setBusy(false); }
       };
 
-      const card = task => {
+      const card = (task, column) => {
         const workflow = task.workflow;
         const execution = workflow?.selected ?? workflow?.templateId;
         const templateName = catalog?.templates.find(item => item.id === execution)?.name;
@@ -1910,38 +2004,92 @@ window.__ModuleLoader__.load({
         const step = workflow?.state === 'handed-off' ? '已交给 Leader'
           : workflow?.state === 'interrupted' ? '运行中断，可重试'
           : taskPhases[workflow?.phase];
-        return h('div', { key: task.id, id: 'marshal-ticket-' + task.id, style: { border: '1px solid ' + dswTheme.border, borderRadius: 10, background: dswTheme.layer, padding: 10, display: 'grid', gap: 8 } },
-          h('div', { style: { fontSize: 13, fontWeight: 500, lineHeight: 1.45 } }, task.title),
-          task.description && h('div', { style: { fontSize: 11, color: dswTheme.faint, lineHeight: 1.55, display: '-webkit-box', WebkitLineClamp: 3, WebkitBoxOrient: 'vertical', overflow: 'hidden' } }, task.description),
-          workflow && h('div', { style: uiMuted }, [workflow.leaderName, modeLabel,
-            catalog?.groupTemplates?.find(item => item.id === workflow.plan?.groupTemplate)?.name].filter(Boolean).join(' · ')),
-          step && h('span', { role: 'status', style: uiMuted }, step),
-          workflow?.error && h('span', { role: 'alert', style: { color: dswTheme.danger, fontSize: 12 } }, workflow.error),
-          workflow?.pr && h('div', { style: uiMuted, title: workflow.pr.head },
-            h('a', { href: workflow.pr.url, target: '_blank', rel: 'noreferrer' }, 'PR'), ' · ' + workflow.pr.head.slice(0, 10),
-            workflow.pr.omitted.length > 0 ? ' · ' + workflow.pr.omitted.length + ' 个文件缺少完整文本补丁' : ''),
-          workflow?.reviewers?.length > 0 && h('div', { style: uiMuted },
+        const canMove = !busy && task.status !== 'running' && !task.taskRoom?.closed && (!workflow || workflow.state !== 'running');
+        const timeLabel = formatTaskTime(task.updatedAt ?? task.createdAt);
+        const permLabel = task.permission ? (TASK_PERMISSION_LABELS[task.permission] ?? task.permission) : '';
+        const workflowSummary = workflow ? [workflow.leaderName, modeLabel,
+          catalog?.groupTemplates?.find(item => item.id === workflow.plan?.groupTemplate)?.name].filter(Boolean).join(' · ') : '';
+        const hasPills = Boolean(workflowSummary || step || permLabel || workflow?.pr);
+        return h('article', {
+          key: task.id,
+          id: 'marshal-ticket-' + task.id,
+          className: 'mtb-card',
+          'data-status': task.status,
+          'data-focused': focusedTask === task.id ? 'true' : undefined,
+          'data-dragging': dragTaskId === task.id ? 'true' : undefined,
+          draggable: canMove,
+          onDragStart: event => {
+            if (!canMove) { event.preventDefault(); return; }
+            setDragTaskId(task.id);
+            try { event.dataTransfer.setData('text/plain', task.id); event.dataTransfer.effectAllowed = 'move'; } catch {}
+          },
+          onDragEnd: () => { setDragTaskId(''); setDropCol(''); },
+          style: { '--mtb-accent': column.accent },
+        },
+          h('div', { className: 'mtb-card-top' },
+            h('div', { className: 'mtb-card-title', title: task.title }, task.title),
+            timeLabel && h('span', { className: 'mtb-card-time' }, timeLabel)),
+          !compactCards && task.description && h('div', { className: 'mtb-card-desc' }, task.description),
+          hasPills && h('div', { className: 'mtb-pills' },
+            step && h('span', { role: 'status', className: 'mtb-pill mtb-pill-accent' }, step),
+            workflowSummary && h('span', { className: 'mtb-pill', title: workflowSummary }, workflowSummary),
+            permLabel && h('span', { className: 'mtb-pill' }, permLabel),
+            workflow?.pr && h('a', { className: 'mtb-pill mtb-pill-accent', href: workflow.pr.url, target: '_blank', rel: 'noreferrer', title: workflow.pr.head, style: { textDecoration: 'none' } },
+              'PR · ' + workflow.pr.head.slice(0, 8) + (workflow.pr.omitted.length > 0 ? ' · 缺 ' + workflow.pr.omitted.length + ' 补丁' : ''))),
+          workflow?.error && h('span', { role: 'alert', style: { color: dswTheme.danger, fontSize: 11, lineHeight: 1.45 } }, workflow.error),
+          !compactCards && workflow?.reviewers?.length > 0 && h('div', { style: { fontSize: 11, color: dswTheme.faint } },
             workflow.reviewers.map(reviewer => reviewer.name + ' · ' + reviewer.model).join(' / ')),
           workflow?.reportId && h(TaskReviewReport, { key: workflow.reportId, taskId: task.id, development: Boolean(workflow.development) }),
-          h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' } },
-            h('button', { type: 'button', style: uiButton(false), onClick: () => openTaskRoom?.(task) }, '工单群'),
+          h('div', { className: 'mtb-actions' },
+            task.status === 'review' && canMove && h('button', { type: 'button', className: 'mtb-btn mtb-btn-confirm', disabled: busy, onClick: () => { void move(task, 'done'); } }, '确认完成'),
+            !task.taskRoom?.closed && task.status !== 'running' && (!workflow || workflow.state !== 'done') && h('button', { type: 'button', disabled: busy, className: 'mtb-btn mtb-btn-accent', onClick: () => { void run(task); } }, workflow?.state === 'failed' || workflow?.state === 'interrupted' ? '重试' : '运行'),
+            h('button', { type: 'button', className: 'mtb-btn', onClick: () => openTaskRoom?.(task) }, '工单群'),
             workflow && workflow.state !== 'running' && h('button', {
-              type: 'button', style: uiButton(false), onClick: () => edit(task), disabled: busy,
+              type: 'button', className: 'mtb-btn', onClick: () => edit(task), disabled: busy,
             }, '编辑分工'),
-            task.sessionId && h('button', { type: 'button', style: { ...uiButton(false), padding: '3px 8px', fontSize: 11 }, onClick: () => openSession && openSession(task.sessionId) }, '打开会话'),
-            !task.taskRoom?.closed && task.status !== 'running' && (!workflow || workflow.state !== 'done') && h('button', { type: 'button', disabled: busy, style: { ...uiButton(true), padding: '3px 8px', fontSize: 11 }, onClick: () => { void run(task); } }, workflow?.state === 'failed' || workflow?.state === 'interrupted' ? '重试' : '运行'),
-            !task.taskRoom && h('button', { type: 'button', style: { ...uiButton(false), padding: '3px 8px', fontSize: 11, color: confirmId === task.id ? dswTheme.danger : dswTheme.text }, onClick: () => { void remove(task); } }, confirmId === task.id ? '确认删除' : '删除')));
+            task.sessionId && h('button', { type: 'button', className: 'mtb-btn', onClick: () => openSession && openSession(task.sessionId) }, '会话'),
+            canMove && h('select', {
+              'aria-label': '切换状态',
+              className: 'mtb-move',
+              value: knownStatuses.has(task.status) ? task.status : 'todo',
+              disabled: busy,
+              onChange: event => { void move(task, event.target.value); },
+            }, columns.map(col => h('option', { key: col.key, value: col.key }, col.label))),
+            !task.taskRoom && h('button', { type: 'button', className: confirmId === task.id ? 'mtb-btn mtb-btn-danger' : 'mtb-btn', style: { marginLeft: 'auto' }, onClick: () => { void remove(task); } }, confirmId === task.id ? '确认删除' : '删除')));
       };
 
-      return h('section', { style: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', background: dswTheme.bg, color: dswTheme.text } },
-        h('header', { style: { padding: '14px 20px', borderBottom: '1px solid ' + dswTheme.border, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexShrink: 0 } },
-          h('div', null,
-            h('div', { style: { fontSize: 15, fontWeight: 600 } }, '任务看板'),
-            h('div', { style: uiMuted }, list.length + ' 张卡片')),
-          h('button', { type: 'button', disabled: busy, style: uiButton(true), onClick: () => formOpen ? cancelForm() : setFormOpen(true) }, formOpen ? '收起' : '＋ 新建卡片')),
+      const scrollToColumn = key => {
+        document.getElementById('marshal-col-' + key)?.scrollIntoView({ behavior: 'smooth', inline: 'nearest', block: 'nearest' });
+      };
+
+      return h('section', { className: 'mtb-page' },
+        h('header', { className: 'mtb-head' },
+          h('div', { className: 'mtb-head-left' },
+            h('div', null,
+              h('div', { style: { fontSize: 15, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 8 } },
+                '任务看板',
+                h('span', { style: { fontSize: 11, fontWeight: 500, color: dswTheme.faint, fontVariantNumeric: 'tabular-nums' } }, list.length + ' 张卡片'))),
+            h('div', { className: 'mtb-summary', 'aria-label': '状态总览' },
+              columns.map(column => {
+                const count = list.filter(task => (knownStatuses.has(task.status) ? task.status : 'todo') === column.key).length;
+                return h('button', {
+                  key: column.key,
+                  type: 'button',
+                  className: 'mtb-summary-chip',
+                  style: { '--mtb-accent': column.accent },
+                  onClick: () => scrollToColumn(column.key),
+                  title: '定位到「' + column.label + '」列',
+                },
+                  h('span', { className: 'mtb-dot', 'data-pulse': column.pulse && count > 0 ? 'true' : undefined }),
+                  column.label,
+                  h('strong', null, count));
+              }))),
+          h('div', { className: 'mtb-head-right' },
+            h('button', { type: 'button', style: uiButton(false), onClick: () => setCompactCards(v => !v) }, compactCards ? '展开详情' : '紧凑视图'),
+            openNativeBoard && h('button', { type: 'button', style: uiButton(false), onClick: () => openNativeBoard(), title: '切换到 DSH 原版任务看板（含定时 Cron 与附件）' }, '原版看板'),
+            h('button', { type: 'button', disabled: busy, style: uiButton(true), onClick: () => formOpen ? cancelForm() : setFormOpen(true) }, formOpen ? '收起' : '＋ 新建卡片'))),
         error && h('div', { style: { padding: '8px 20px', fontSize: 12, color: dswTheme.danger } }, error),
-        formOpen && h('fieldset', { disabled: busy, 'aria-label': editing ? '编辑工单分工' : '创建工单',
-          style: { margin: '14px 20px 0', padding: 14, minWidth: 0, minHeight: 0, overflowY: 'auto', border: '1px solid ' + dswTheme.border, borderRadius: 12, background: dswTheme.layer, display: 'grid', gap: 10 } },
+        formOpen && h('fieldset', { disabled: busy, 'aria-label': editing ? '编辑工单分工' : '创建工单', className: 'mtb-form' },
           h(Field, { label: '标题' }, h('input', { value: title, readOnly: Boolean(editing), onChange: event => { setTitle(event.target.value); setPlan(null); }, placeholder: '这张卡片要做什么', style: uiInput })),
           h(Field, { label: '描述（可选）' }, h('textarea', { value: description, readOnly: Boolean(editing), onChange: event => { setDescription(event.target.value); setPlan(null); }, rows: 3, placeholder: '背景、验收标准、约束…', style: { ...uiInput, resize: 'vertical', lineHeight: 1.6 } })),
           !leaderId && !editing && h(Field, { label: '工作区' }, h('select', { value: workspaceId, style: uiInput,
@@ -1999,13 +2147,41 @@ window.__ModuleLoader__.load({
               busy ? '处理中…' : leaderId && !plan ? 'Leader 推荐分工' : editing ? '保存分工' : '创建'))),
         list.length === 0 && !formOpen
           ? h(EmptyState, { title: '还没有卡片', hint: '新建一张卡片，每张卡片都有一个工单群。', action: '新建卡片', onAction: () => setFormOpen(true) })
-          : h('div', { style: { flex: 1, minHeight: 0, overflow: 'auto', padding: 16, display: 'flex', gap: 12, alignItems: 'flex-start' } },
+          : h('div', { className: 'mtb-grid' },
               columns.map(column => {
-                const items = list.filter(task => task.status === column.key);
-                return h('div', { key: column.key, style: { width: 250, flexShrink: 0, display: 'flex', flexDirection: 'column', gap: 8 } },
-                  h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 2px', fontSize: 12, color: dswTheme.dim } },
-                    column.label, h('span', { style: { color: dswTheme.faint } }, items.length)),
-                  h('div', { style: { display: 'grid', gap: 8 } }, items.map(card)));
+                const items = list.filter(task => (knownStatuses.has(task.status) ? task.status : 'todo') === column.key);
+                return h('section', {
+                  key: column.key,
+                  id: 'marshal-col-' + column.key,
+                  className: 'mtb-col',
+                  'data-status': column.key,
+                  'data-drop': dropCol === column.key ? 'true' : undefined,
+                  style: { '--mtb-accent': column.accent },
+                  onDragOver: event => {
+                    if (!dragTaskId) return;
+                    event.preventDefault();
+                    if (dropCol !== column.key) setDropCol(column.key);
+                  },
+                  onDragLeave: event => {
+                    if (dropCol === column.key && !event.currentTarget.contains(event.relatedTarget)) setDropCol('');
+                  },
+                  onDrop: event => {
+                    event.preventDefault();
+                    const droppedId = dragTaskId || event.dataTransfer?.getData('text/plain') || '';
+                    setDropCol('');
+                    setDragTaskId('');
+                    const target = list.find(item => item.id === droppedId);
+                    if (target && target.status !== column.key) void move(target, column.key);
+                  },
+                },
+                  h('div', { className: 'mtb-col-head' },
+                    h('span', { className: 'mtb-dot', 'data-pulse': column.pulse && items.length > 0 ? 'true' : undefined }),
+                    h('h2', { className: 'mtb-col-title', style: { margin: 0 } }, column.label),
+                    h('span', { className: 'mtb-count' }, items.length)),
+                  h('div', { className: 'mtb-col-body' },
+                    items.length === 0
+                      ? h('div', { className: 'mtb-empty' }, column.empty)
+                      : items.map(task => card(task, column))));
               })));
     }
 
@@ -2566,7 +2742,6 @@ window.__ModuleLoader__.load({
             button.setAttribute('aria-pressed', key === 'tasks' ? 'true' : 'false');
             button.style.cssText = 'border:0;border-radius:999px;cursor:pointer;white-space:nowrap;font:11px/1 inherit;padding:6px 9px;color:inherit;background:' + (key === 'tasks' ? 'color-mix(in srgb, currentColor 16%, transparent)' : 'transparent') + ';font-weight:' + (key === 'tasks' ? '600' : '400');
             button.onclick = () => {
-              if (key === 'tasks') return;
               goTab(key);
             };
             nav.appendChild(button);
@@ -2576,6 +2751,7 @@ window.__ModuleLoader__.load({
           add('智能体', 'agents');
           add('跨设备', 'cross');
           add('记忆', 'memory');
+          add('工单群', 'taskRooms');
           add('任务看板', 'tasks');
           bar.append(title, nav);
           root.prepend(bar);

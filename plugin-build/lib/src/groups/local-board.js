@@ -32,6 +32,10 @@ export function createLocalBoard(file) {
             save(tasks.map(task => task.id === action.taskId ? { ...task, status: 'running', updatedAt: at } : task));
             return snapshot();
         }
+        if (action?.kind === 'move' && ['backlog', 'todo', 'running', 'review', 'done', 'failed'].includes(action.status)) {
+            save(tasks.map(task => task.id === action.taskId ? { ...task, status: action.status, updatedAt: at } : task));
+            return snapshot();
+        }
         return snapshot();
     };
     return { snapshot, apply, file };

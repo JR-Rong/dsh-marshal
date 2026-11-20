@@ -160,7 +160,7 @@ function taskView(task, workflow, room) {
         title: task.title,
         status: room?.closed ? 'done' : workflow === undefined || workflow.state === 'ready' ? task.status
             : workflow.state === 'running' || workflow.state === 'handed-off' ? 'running'
-            : workflow.state === 'done' ? (room ? 'todo' : 'done') : 'failed',
+            : workflow.state === 'done' ? (room ? 'review' : 'done') : 'failed',
         ...(workflow === undefined ? {} : { workflow }),
         ...(room === undefined ? {} : { taskRoom: visibleTaskRoom(room) }),
         ...(task.description === undefined ? {} : { description: task.description }),
@@ -410,6 +410,36 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
                 return;
             }
             const snapshot = await board.apply(randomUUID(), { kind: 'run', taskId: body.taskId }, initiator);
+            write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
+        }),
+        exact('POST', '/marshal/tasks/move', async (req, res) => {
+            const board = getBoard();
+            if (board === undefined) {
+                write(res, 503, { ok: false, code: 'no-task-board' });
+                return;
+            }
+            const body = await readBody(req);
+            if (typeof body.taskId !== 'string' || body.taskId === '') {
+                write(res, 400, { ok: false, code: 'invalid-task' });
+                return;
+            }
+            if (!['backlog', 'todo', 'running', 'review', 'done', 'failed'].includes(body.status)) {
+                write(res, 400, { ok: false, code: 'invalid-status' });
+                return;
+            }
+            const source = boardSource();
+            const workflow = orchestration?.target(source, body.taskId);
+            const boundRoom = rooms?.find(source, body.taskId);
+            if (boundRoom) {
+                const access = authenticate(req, true);
+                if (!taskRoomAccess(access, boundRoom, allowed)) {
+                    write(res, 403, { ok: false, code: 'workspace-forbidden' });
+                    return;
+                }
+            }
+            if (workflow && !authorize(req, res, workflow)) return;
+            orchestration?.assertIdle(source, body.taskId);
+            const snapshot = await board.apply(randomUUID(), { kind: 'move', taskId: body.taskId, status: body.status }, initiator);
             write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
         }),
         exact('POST', '/marshal/tasks/delete', async (req, res) => {
