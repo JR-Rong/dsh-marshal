@@ -3,10 +3,55 @@ import { z } from 'zod';
 import { TaskRoomKey } from './task-room-store.js';
 import { taskError } from './pr-material.js';
 import { withTicketPrefix } from './ticket-numbers.js';
+import { applyDevelopmentPatch } from './task-development.js';
 
 const remoteChoice = z.object({ deviceId: TaskRoomKey, modelId: TaskRoomKey }).strict();
 const ROOM_ID = z.uuid();
 const textBody = z.string().trim().min(1).refine(text => Buffer.byteLength(text) <= 16_384);
+
+function extractAgentTag(card) {
+    for (const tag of Array.isArray(card?.tags) ? card.tags : []) {
+        const name = typeof tag?.name === 'string' ? tag.name.trim() : '';
+        if (name.startsWith('智能体:') && name.length > 4) return name.slice(4).trim();
+        if (name.startsWith('@') && name.length > 1) return name.slice(1).trim();
+    }
+    return undefined;
+}
+
+export function parseRoomMentions(text) {
+    const out = [];
+    const re = /@([^\s@,，。！!？?：:;；()（）\[\]【】]{1,32})/g;
+    let match;
+    while ((match = re.exec(String(text ?? ''))) !== null) {
+        const name = match[1].trim();
+        if (name && !out.includes(name)) out.push(name);
+    }
+    return out;
+}
+
+export async function readOperatorNotes(rooms, roomId) {
+    if (!rooms || !roomId) return '';
+    try {
+        const page = await rooms.page(roomId, { limit: 80 });
+        const items = (page.records ?? []).filter(r => r.kind === 'user' && r.phase !== 'brief');
+        if (items.length === 0) return '';
+        return items.slice(-12).map(r => '- [' + new Date(r.at).toISOString() + '] ' + r.text.trim()).join('\n').slice(-6000);
+    } catch {
+        return '';
+    }
+}
+
+async function findLatestPatch(rooms, roomId, expectedDigest) {
+    const page = await rooms.page(roomId, { limit: 100 });
+    const patches = (page.records ?? []).filter(r => r.phase === 'development-patch' && typeof r.text === 'string' && r.text.trim() !== '');
+    if (patches.length === 0) return undefined;
+    if (expectedDigest) {
+        const exactMatch = [...patches].reverse().find(r => r.ref === expectedDigest);
+        if (exactMatch) return { text: exactMatch.text, digest: exactMatch.ref };
+    }
+    const latest = patches.at(-1);
+    return { text: latest.text, digest: latest.ref };
+}
 
 export function visibleTaskRoom(room, ticketNumbers) {
     if (!room) return undefined;
@@ -23,23 +68,27 @@ export function taskRoomAccess(access, room, allowed, ledger) {
 }
 
 export function taskRoomAudit(rooms, room, reason, leader, remoteTarget, allowMember) {
+    const runLabels = { start: '负责人 ', retry: '重试 · 负责人 ', reassign: '改派 · 负责人 ', revise: '按群内意见修正 · 负责人 ', 'auto-dispatch': '自动派单 · 负责人 ' };
+    const prefix = runLabels[reason] ?? '负责人 ';
     return {
         actor: '工单操作者', reason, leader, remoteTarget, allowMember,
         begin: (runId, why, assignee) => rooms.begin(room.id, runId, 'Marshal', why ?? 'start',
-            typeof assignee === 'string' ? '负责人 ' + assignee : '改派到 ' + assignee.deviceId + ' · ' + assignee.modelId),
+            typeof assignee === 'string' ? prefix + assignee : '改派到 ' + assignee.deviceId + ' · ' + assignee.modelId),
         record: event => rooms.append(room.id, event),
         invokeRemote: (runId, target, text, phase) => rooms.remote(room.id, { runId, target, text, phase }),
+        operatorNotes: () => readOperatorNotes(rooms, room.id),
     };
 }
 
 export function createTaskRoomRoutes({
-    exact, write, readBody, authenticate, allowed, auth, rooms, orchestration, getBoard, boardSource, getInitiator, ticketNumbers,
+    exact, write, readBody, authenticate, allowed, auth, rooms, orchestration, getBoard, boardSource, getInitiator, ticketNumbers, workspacePath,
 }) {
     const viewRoom = room => visibleTaskRoom(room, ticketNumbers);
     const operations = new Set();
+    const chatOperations = new Set();
     const unavailable = () => taskError('task-rooms-unavailable', '工单群归档服务不可用。');
     const assertIdle = room => {
-        if (operations.has(room.id)) throw taskError('task-room-busy', '群聊正在处理消息或状态变更。');
+        if (operations.has(room.id)) throw taskError('task-room-busy', '群聊正在处理状态变更。');
         orchestration?.assertIdle(room.source, room.taskId);
     };
     const workspaceCheck = (access, workspaceId, ledger) => {
@@ -92,44 +141,198 @@ export function createTaskRoomRoutes({
         finally { operations.delete(room.id); }
     };
     const send = async (room, body, access) => {
-        assertIdle(room);
-        operations.add(room.id);
+        if (chatOperations.has(room.id)) throw taskError('task-room-busy', '正在等待上一条消息回复，请稍候。');
+        chatOperations.add(room.id);
         try {
             const workflow = orchestration?.target(room.source, room.taskId);
             if (workflow && !allowed(access, workflow)) throw hidden();
             const target = safeTarget(body.remote) ?? workflow?.remoteTarget;
             const text = textBody.parse(body.text);
-            let view = await rooms.page(room.id, { limit: 12 });
+            let view = await rooms.page(room.id, { limit: 24 });
             if (view.room.closed) throw taskError('task-room-closed', '工单已归档，重开后可继续发言。');
             if (target) await rooms.promote(room.id, target);
             const runId = view.room.runId ?? randomUUID();
             if (!view.room.runId) await rooms.begin(room.id, runId, 'Marshal', 'conversation', '群聊开始');
-            await rooms.append(room.id, { kind: 'user', runId, actor: '工单操作者', text });
-            const messages = view.records.filter(record => record.kind === 'user' || record.kind === 'agent')
-                .map(({ actor, text }) => ({ actor, text }));
-            messages.push({ actor: '工单操作者', text });
-            // Bound the context for this turn. The archive retains each full message.
-            while (messages.length > 1 && Buffer.byteLength(JSON.stringify(messages)) > 44 * 1024) messages.shift();
-            const context = JSON.stringify(messages);
+            const workflowView = orchestration?.view(room.source, room.taskId);
+            const isRunning = workflowView?.state === 'running';
+            await rooms.append(room.id, {
+                kind: 'user', runId, actor: '工单操作者', text,
+                ...(isRunning ? { phase: 'steering' } : {}),
+            });
+            const board = getBoard();
+            const card = board?.snapshot().tasks?.find(task => task.id === room.taskId);
+            const messages = view.records
+                .filter(record => record.kind === 'user' || record.kind === 'agent' || record.kind === 'status')
+                .map(record => ({
+                    actor: record.actor,
+                    kind: record.kind,
+                    ...(record.phase ? { phase: record.phase } : {}),
+                    text: record.phase === 'development-patch'
+                        ? '[固定开发补丁 SHA-256: ' + (record.ref ?? 'unknown') + '，共 ' + record.text.length + ' 字符]'
+                        : record.text,
+                }));
+            messages.push({ actor: '工单操作者', kind: 'user', text });
+            while (messages.length > 1 && Buffer.byteLength(JSON.stringify(messages)) > 40 * 1024) messages.shift();
+            const contextPayload = {
+                ticket: {
+                    title: card?.title ?? room.title,
+                    ...(card?.description ? { description: String(card.description).slice(0, 3000) } : {}),
+                    status: card?.status,
+                    ...(workflowView ? { workflowState: workflowView.state, workflowPhase: workflowView.phase, reviewSummary: workflowView.reviewSummary } : {}),
+                },
+                messages,
+            };
+            const context = JSON.stringify(contextPayload);
             try {
                 if (target) {
                     await rooms.remote(room.id, { runId, target, phase: 'conversation',
-                        text: '在授权工作区的工单群里回复最新发言。以下是近期群消息。\n' + context });
+                        text: '在授权工作区的工单群里回复最新发言。以下是工单背景与近期群消息。\n' + context });
                 } else {
                     if (!orchestration) throw unavailable();
-                    const result = await orchestration.respond(room.source, room.taskId, context, AbortSignal.timeout(125_000));
-                    await rooms.append(room.id, { kind: 'agent', runId, ...result, phase: 'conversation' });
+                    const result = await orchestration.respond(room.source, room.taskId, context, AbortSignal.timeout(125_000), {
+                        leaderId: body.leaderId,
+                        mentions: parseRoomMentions(text),
+                        workspaceId: room.workspaceId,
+                        fallbackAgentName: extractAgentTag(card),
+                        allowMember: member => allowed(access, member),
+                    });
+                    const replies = Array.isArray(result.replies) && result.replies.length > 0 ? result.replies : [{ actor: result.actor, text: result.text }];
+                    for (const reply of replies) {
+                        await rooms.append(room.id, { kind: 'agent', runId, actor: reply.actor, text: reply.text, phase: 'conversation' });
+                    }
                 }
             }
             catch (error) {
                 if (!target) await rooms.append(room.id, { kind: 'status', runId, actor: 'Marshal',
-                    text: 'Agent 未能完成本次回复。', phase: 'failed' });
+                    text: 'Agent 未能完成本次回复（您的发言已记录在群内，后续编排仍会读取）。', phase: 'failed' });
                 throw error;
             }
             view = await rooms.page(room.id, { limit: 12 });
             return { room: viewRoom(view.room) };
         }
-        finally { operations.delete(room.id); }
+        finally { chatOperations.delete(room.id); }
+    };
+
+    const confirmReview = async ({ room, card, body, access, initiatorTag }) => {
+        const source = room?.source ?? boardSource();
+        if (room) assertIdle(room);
+        else orchestration?.assertIdle(source, card.id);
+        if (room) operations.add(room.id);
+        try {
+            const workflow = orchestration?.target(source, card.id);
+            let patchApplied = false;
+            let patchAlreadyApplied = false;
+            if (body?.applyPatch === true) {
+                if (!room) throw taskError('development-no-changes', '未找到绑定工单群中的开发补丁。');
+                if (typeof workspacePath !== 'function') throw taskError('development-workspace-unavailable', '工作区路径解析服务不可用。');
+                const patch = await findLatestPatch(rooms, room.id, workflow?.development?.digest);
+                if (!patch) throw taskError('development-no-changes', '当前工单群中没有可应用的开发补丁。');
+                const wsDir = await workspacePath(workflow?.workspaceId ?? room.workspaceId, AbortSignal.timeout(10_000));
+                const applied = await applyDevelopmentPatch(wsDir, patch.text, AbortSignal.timeout(30_000));
+                patchApplied = applied.applied === true;
+                patchAlreadyApplied = applied.alreadyApplied === true;
+                orchestration?.markPatchApplied?.(source, card.id, Date.now());
+                const latestRoom = (await rooms.page(room.id, { limit: 1 })).room;
+                if (!latestRoom.closed) {
+                    await rooms.append(room.id, {
+                        kind: 'status', runId: latestRoom.runId, actor: 'Marshal', phase: 'confirmed',
+                        text: patchAlreadyApplied ? '检查确认：本批次隔离开发补丁此前已在工作区生效。' : '已将本批次隔离开发补丁应用到工作区目录。',
+                    });
+                }
+            }
+            const note = typeof body?.note === 'string' ? body.note.trim() : '';
+            if (room) {
+                let current = (await rooms.page(room.id, { limit: 1 })).room;
+                if (note && !current.closed) {
+                    await rooms.append(room.id, { kind: 'user', runId: current.runId, actor: '工单操作者', text: textBody.parse(note), phase: 'confirm' });
+                    current = (await rooms.page(room.id, { limit: 1 })).room;
+                }
+                if (!current.closed) {
+                    await rooms.append(room.id, {
+                        kind: 'closed', runId: current.runId, actor: '工单操作者', phase: 'confirmed',
+                        text: body?.applyPatch === true ? '已确认验收通过（补丁已落盘），工单归档完成。' : '已确认验收通过，工单归档完成。',
+                    });
+                }
+            }
+            const board = getBoard();
+            let snapshot = board?.snapshot();
+            if (board && card.status !== 'done') {
+                snapshot = await board.apply(randomUUID(), { kind: 'move', taskId: card.id, status: 'done' }, initiatorTag ?? ('marshal:' + getInitiator()));
+            }
+            return {
+                snapshot,
+                patchApplied,
+                patchAlreadyApplied,
+                room: room ? viewRoom((await rooms.page(room.id, { limit: 1 })).room) : undefined,
+            };
+        }
+        finally {
+            if (room) operations.delete(room.id);
+        }
+    };
+
+    const reviseTask = async ({ room: initialRoom, card, body, access, initiatorTag }) => {
+        const source = initialRoom?.source ?? boardSource();
+        const workflow = orchestration?.target(source, card.id);
+        let room = initialRoom;
+        if (!room && rooms && (workflow?.workspaceId || card.workspaceId)) {
+            const wsId = workflow?.workspaceId ?? card.workspaceId;
+            if (allowed(access, { workspaceId: wsId })) {
+                const ticketNo = ticketNumbers?.ensure?.(card.id);
+                room = rooms.ensure(source, ticketNo ? { ...card, title: withTicketPrefix(ticketNo, card.title) } : card, wsId, access.session.ownerId);
+            }
+        }
+        if (room && operations.has(room.id)) throw taskError('task-room-busy', '群聊正在处理状态变更。');
+        if (room) operations.add(room.id);
+        try {
+            const feedbackText = typeof body?.text === 'string' && body.text.trim() !== '' ? textBody.parse(body.text) : '';
+            if (room) {
+                let current = (await rooms.page(room.id, { limit: 1 })).room;
+                if (current.closed) {
+                    await rooms.append(room.id, {
+                        kind: 'reopened', runId: current.runId, actor: '工单操作者',
+                        text: '工单已重开，准备按最新讨论意见继续执行。',
+                    });
+                    current = (await rooms.page(room.id, { limit: 1 })).room;
+                }
+                if (feedbackText) {
+                    const runId = current.runId ?? randomUUID();
+                    if (!current.runId) await rooms.begin(room.id, runId, 'Marshal', 'conversation', '补充修正意见');
+                    await rooms.append(room.id, { kind: 'user', runId, actor: '工单操作者', text: feedbackText, phase: 'revision' });
+                }
+            }
+            const board = getBoard();
+            let snapshot = board?.snapshot();
+            if (workflow) {
+                if (!orchestration) throw unavailable();
+                orchestration.cancel?.(source, card.id);
+                const audit = room ? taskRoomAudit(rooms, room, 'revise', undefined, workflow.remoteTarget, member => allowed(access, member)) : undefined;
+                orchestration.start(source, card, audit);
+                if (board && card.status !== 'running') {
+                    try {
+                        snapshot = await board.apply(randomUUID(), { kind: 'move', taskId: card.id, status: 'running' }, initiatorTag ?? ('marshal:' + getInitiator()));
+                    } catch { snapshot = board.snapshot(); }
+                }
+            } else if (board) {
+                const notes = room ? await readOperatorNotes(rooms, room.id) : (feedbackText ? '- ' + feedbackText : '');
+                if (notes) {
+                    const basePrompt = String(card.prompt || card.description || card.title || '').replace(/\n\n【机主补充修正意见】[\s\S]*$/, '');
+                    const nextPrompt = (basePrompt + '\n\n【机主补充修正意见】\n' + notes).slice(0, 15_000);
+                    snapshot = await board.apply(randomUUID(), { kind: 'update', taskId: card.id, patch: { prompt: nextPrompt } }, initiatorTag ?? ('marshal:' + getInitiator()));
+                }
+                if (room) {
+                    await rooms.begin(room.id, randomUUID(), 'Marshal', 'revise', '按群内修正意见重新启动工单执行');
+                }
+                snapshot = await board.apply(randomUUID(), { kind: 'run', taskId: card.id }, initiatorTag ?? ('marshal:' + getInitiator()));
+            }
+            return {
+                snapshot,
+                room: room ? viewRoom((await rooms.page(room.id, { limit: 1 })).room) : undefined,
+            };
+        }
+        finally {
+            if (room) operations.delete(room.id);
+        }
     };
     const routes = [
         route('GET', 'workspaces', async (_req, access) => {
@@ -172,9 +375,30 @@ export function createTaskRoomRoutes({
             });
             if (page.room.workspaceId !== workspaceId || !taskRoomAccess(access, page.room, allowed)) throw hidden();
             const origin = page.room.deviceId === getInitiator();
-            const runState = origin ? orchestration?.view(page.room.source, page.room.taskId)?.state : undefined;
-            return { ...page, room: viewRoom(page.room), origin, runState,
-                busy: origin && (operations.has(id) || runState === 'running') };
+            const workflowView = origin ? orchestration?.view(page.room.source, page.room.taskId) : undefined;
+            const runState = workflowView?.state;
+            const card = origin ? getBoard()?.snapshot().tasks?.find(task => task.id === page.room.taskId) : undefined;
+            const cardStatus = page.room.closed ? 'done'
+                : !workflowView || workflowView.state === 'ready' ? (card?.status ?? 'todo')
+                : workflowView.state === 'running' || workflowView.state === 'handed-off' ? 'running'
+                : workflowView.state === 'permission-blocked' || workflowView.state === 'review-blocked' ? 'review'
+                : workflowView.state === 'done' ? (card?.status === 'done' ? 'done' : 'review') : 'failed';
+            const patchAvailable = Boolean(origin && !workflowView?.development?.appliedAt && (
+                workflowView?.development?.digest
+                || (page.records ?? []).some(r => r.phase === 'development-patch')
+            ));
+            const participants = origin
+                ? (orchestration?.participants?.(page.room.source, page.room.taskId, page.room.workspaceId, extractAgentTag(card), member => allowed(access, member)) ?? [])
+                : [];
+            return {
+                ...page, room: viewRoom(page.room), origin, runState,
+                busy: origin && (operations.has(id) || runState === 'running'),
+                chatBusy: origin && chatOperations.has(id),
+                cardStatus,
+                ...(workflowView ? { workflow: workflowView } : {}),
+                patchAvailable,
+                participants,
+            };
         }),
         route('GET', 'peers', async (req, access) => {
             const id = new URL(req.url, 'http://localhost').searchParams.get('roomId');
@@ -196,7 +420,7 @@ export function createTaskRoomRoutes({
             const workspaceId = workspaceCheck(access, workflow?.workspaceId ?? card.workspaceId ?? TaskRoomKey.parse(input.workspaceId));
             const ticketNo = ticketNumbers?.ensure?.(card.id);
             const room = rooms.ensure(source, ticketNo ? { ...card, title: withTicketPrefix(ticketNo, card.title) } : card, workspaceId, access.session.ownerId);
-            if (card.status === 'done' || workflow?.state === 'done') {
+            if (card.status === 'done') {
                 await rooms.append(room.id, { kind: 'closed', actor: 'Marshal', text: '工单已归档。' });
             }
             return { room: viewRoom(rooms.local(room.id)) };
@@ -205,6 +429,14 @@ export function createTaskRoomRoutes({
             const body = await readBody(req);
             const room = readLocal(body.roomId, access);
             if (body.action === 'send') return send(room, body, access);
+            if (body.action === 'confirm') {
+                const card = getCard(getBoard(), room.taskId);
+                return confirmReview({ room, card, body, access });
+            }
+            if (body.action === 'revise') {
+                const card = getCard(getBoard(), room.taskId);
+                return reviseTask({ room, card, body, access });
+            }
             if (body.action === 'retry' || body.action === 'reassign') return activeWorkflow(room, body, access, body.action);
             if (!['close', 'reopen'].includes(body.action)) throw taskError('invalid-task-room', '工单群操作无效。');
             assertIdle(room);
@@ -218,10 +450,19 @@ export function createTaskRoomRoutes({
                         text: closing ? '工单已关闭。群聊记录已归档。' : '工单已重开。',
                     });
                 }
+                const board = getBoard();
+                if (board) {
+                    const card = board.snapshot().tasks?.find(task => task.id === room.taskId);
+                    if (closing && card && card.status !== 'done') {
+                        try { await board.apply(randomUUID(), { kind: 'move', taskId: card.id, status: 'done' }, 'marshal:' + getInitiator()); } catch {}
+                    } else if (!closing && card && card.status === 'done') {
+                        try { await board.apply(randomUUID(), { kind: 'move', taskId: card.id, status: 'review' }, 'marshal:' + getInitiator()); } catch {}
+                    }
+                }
                 return { room: viewRoom((await rooms.page(room.id, { limit: 1 })).room) };
             }
             finally { operations.delete(room.id); }
         }),
     ];
-    return { routes, assertIdle };
+    return { routes, assertIdle, confirmReview, reviseTask };
 }

@@ -167,13 +167,15 @@ export function createTaskOrchestration({
         catalog = undefined;
         throw error;
     }));
-    const modelFor = (models, leader) => {
+    const modelFor = (models, leader, allowFallback = false) => {
         const fallback = defaultModel?.();
         const dsh = models.filter(model => model.agent === 'dsh');
-        return leader?.model
-            ? dsh.find(model => model.provider + '/' + model.model === leader.model || model.model === leader.model || model.id === leader.model)
-            : dsh.find(model => model.provider === fallback?.provider && model.model === fallback?.model) ?? dsh[0];
+        const defaultEntry = dsh.find(model => model.provider === fallback?.provider && model.model === fallback?.model) ?? dsh[0];
+        if (!leader?.model) return defaultEntry;
+        const matched = dsh.find(model => model.provider + '/' + model.model === leader.model || model.model === leader.model || model.id === leader.model);
+        return matched ?? (allowFallback ? defaultEntry : undefined);
     };
+    const safeReasoning = (model, effort) => effort && model?.reasoningEfforts?.includes(effort) ? effort : undefined;
     const resolveRole = (task, role, allowed) => {
         const id = task.plan?.members[role];
         const member = scopeCandidates(task.workspaceId, allowed).find(item => item.id === id);
@@ -307,7 +309,8 @@ export function createTaskOrchestration({
                     return await read(task, ref);
                 },
                 manual: async text => {
-                    const request = [card.title, card.description, text].filter(Boolean).join('\n\n').slice(0, 7800);
+                    const extraNotes = await audit?.operatorNotes?.();
+                    const request = [card.title, card.description, text, extraNotes ? '【机主群内指示】\n' + extraNotes : ''].filter(Boolean).join('\n\n').slice(0, 7800);
                     const ref = await publish(task, '编码交接', request, 'handoff');
                     const sessionId = await startLeader(coder, await read(task, ref), runSignal(signal));
                     await record('status', 'Marshal', '编码交给 ' + coder.name + ' 的常驻会话。', 'handoff', ref);
@@ -315,8 +318,22 @@ export function createTaskOrchestration({
                     return undefined;
                 },
                 leaderAutoReview,
+                operatorNotes: () => audit?.operatorNotes?.(),
             });
             if (!result) return;
+            const summarySnippet = String(result.reviewFindings ?? '').slice(0, 1200);
+            if (result.status === 'review-blocked') {
+                const blockedActor = result.blockedBy === 'leader' ? leader.name : reviewer.name;
+                const reportId = await output('审查待裁决报告', blockedActor, result.report, 'summarizing', 'handoff');
+                await record('status', 'Marshal', '审查阶段存在待裁决分歧，工单已转入「待确认」。可在工单群讨论或补充意见后继续执行，亦可直接确认完成。', 'review', reportId);
+                update(key, {
+                    state: 'review-blocked', reviewReason: 'review-blocked', reviewSummary: summarySnippet.slice(0, 600),
+                    phase: undefined, error: undefined, reportId, handoffs: [...task.handoffs, reportId],
+                    development: { base: result.base, digest: result.digest },
+                });
+                await notifyState(task, 'review');
+                return;
+            }
             const participants = [['coder', coder], ['reviewer', reviewer]];
             if (!remote) participants.push(['leader', leader]);
             for (const [role, member] of participants.filter(([, item]) => memory.usesMnemon?.(item.memberId))) {
@@ -328,7 +345,7 @@ export function createTaskOrchestration({
                     item = await memory.rememberEntry('agent', member.memberId, {
                         title: '开发验收 · ' + card.title,
                         content: '角色 ' + role +
-                            '\n验收结论 ' + result.reviewFindings.slice(0, 1200) + '\n补丁 SHA-256 ' + result.digest,
+                            '\n验收结论 ' + summarySnippet + '\n补丁 SHA-256 ' + result.digest,
                         kind: 'episode', importance: 0.72, visibility: 'group-safe',
                         tags: ['task:' + task.taskId, 'run:' + task.runId],
                     }, { signal, workspaceId: task.workspaceId });
@@ -338,16 +355,21 @@ export function createTaskOrchestration({
                     'private-memory');
             }
             const reportId = await output('开发交付报告', reviewer.name, result.report, 'summarizing', 'handoff');
-            await record('closed', 'Marshal', '开发审查完成，工单群已归档。', 'completed', reportId);
-            update(key, { state: 'done', phase: undefined, reportId, handoffs: [...task.handoffs, reportId],
-                development: { base: result.base, digest: result.digest } });
+            await record('status', 'Marshal', '开发审查完成，工单已进入「待确认」，请验收交付报告或提出修改意见。', 'review', reportId);
+            update(key, {
+                state: 'done', reviewReason: 'delivery-review', reviewSummary: summarySnippet.slice(0, 600),
+                phase: undefined, error: undefined, reportId, handoffs: [...task.handoffs, reportId],
+                development: { base: result.base, digest: result.digest },
+            });
             await notifyState(task, 'review');
             return;
         }
         if (selected !== 'pr-review') {
             const template = templateById(selected);
+            const extraNotes = await audit?.operatorNotes?.();
             const note = JSON.stringify({ task: card.title, description: card.description, prUrl: task.prUrl,
-                execution: template?.name ?? '普通任务', stages: template?.stages ?? [], groupTemplate: plan.groupTemplate, roles: names });
+                execution: template?.name ?? '普通任务', stages: template?.stages ?? [], groupTemplate: plan.groupTemplate, roles: names,
+                ...(extraNotes ? { operatorGuidance: extraNotes } : {}) });
             const id = await publish(task, '任务说明', note);
             signal.throwIfAborted();
             const handoffText = await read(task, id);
@@ -402,14 +424,16 @@ export function createTaskOrchestration({
         const [dshReview, codexReview, dshCrossCheck, codexCrossCheck] = await Promise.all([
             read(task, findings[0]), read(task, findings[1]), read(task, critiques[0]), read(task, critiques[1]),
         ]);
+        const extraPrNotes = await audit?.operatorNotes?.();
         const report = await asLeader(leaderPrompt(
             '根据两份独立审查与两份复核合并报告。保留文件位置、证据、严重程度和未决分歧。明确列出未提供补丁的文件。' +
             '结论的范围限于提供的材料。输出不超过 7000 字符的中文 Markdown。\n' +
-            JSON.stringify({ pr, dshReview, codexReview, dshCrossCheck, codexCrossCheck, extraReview: extraReview?.slice(0, 4000) })), 'summarizing');
+            JSON.stringify({ pr, dshReview, codexReview, dshCrossCheck, codexCrossCheck, extraReview: extraReview?.slice(0, 4000),
+                ...(extraPrNotes ? { operatorGuidance: extraPrNotes } : {}) })), 'summarizing');
         signal.throwIfAborted();
         const reportId = await output('PR 审查报告', leader.name, report, 'summarizing', 'handoff', Boolean(remote));
-        await record('closed', 'Marshal', '审查完成，工单群已归档。', 'completed', reportId);
-        update(key, { state: 'done', phase: undefined, reportId, handoffs: [...ids, reportId] });
+        await record('status', 'Marshal', 'PR 审查报告已生成，工单已进入「待确认」，请审阅或继续讨论。', 'review', reportId);
+        update(key, { state: 'done', reviewReason: 'delivery-review', phase: undefined, error: undefined, reportId, handoffs: [...ids, reportId] });
         await notifyState(task, 'review');
     };
     function rolePrompt(member, prompt) {
@@ -496,17 +520,114 @@ export function createTaskOrchestration({
                 : memory?.store.get('workspace', task.workspaceId, task.reportId);
             return result && typeof result.then === 'function' ? result.then(unwrap) : unwrap(result);
         },
-        async respond(source, taskId, history, signal, leaderId) {
+        participants(source, taskId, workspaceId, fallbackAgentName, allowMember) {
             const task = tasks.get(keyFor(source, taskId));
-            const leader = task ? boundLeader(task) : leaders().find(item => item.id === leaderId);
-            const model = modelFor(await getModels(), leader);
-            if (!model) throw taskError('leader-model-unavailable', '当前节点没有可用的 DSH 模型。');
+            const ws = task?.workspaceId ?? workspaceId ?? '';
+            const pool = ws ? scopeCandidates(ws, allowMember) : leaders().filter(item => !allowMember || allowMember(item));
+            const roster = [];
+            const pushRole = (member, role) => {
+                if (!member) return;
+                const existing = roster.find(entry => entry.id === member.id);
+                if (existing) {
+                    if (role && !existing.roles.includes(role)) existing.roles.push(role);
+                    return;
+                }
+                roster.push({ id: member.id, agentId: member.memberId, name: member.name, role: role || '成员', roles: role ? [role] : [] });
+            };
+            if (task) {
+                const lead = pool.find(item => item.id === task.leaderId);
+                pushRole(lead, 'Leader');
+                for (const [slot, id] of Object.entries(task.plan?.members ?? {})) {
+                    const member = pool.find(item => item.id === id);
+                    pushRole(member, ROLE_LABELS[slot] ?? slot);
+                }
+            } else if (fallbackAgentName) {
+                const matched = pool.find(item => item.name === fallbackAgentName);
+                pushRole(matched, '负责人');
+            }
+            if (roster.length === 0 && pool[0]) pushRole(pool[0], 'Leader');
+            for (const extra of pool) pushRole(extra, '');
+            return roster.map(({ id, agentId, name, role, roles }) => ({
+                id, agentId, name, role: roles.length > 0 ? roles.join('/') : role, primary: roles.length > 0,
+            }));
+        },
+        async respond(source, taskId, history, signal, leaderIdOrOptions) {
+            const opts = typeof leaderIdOrOptions === 'string'
+                ? { leaderId: leaderIdOrOptions }
+                : (leaderIdOrOptions && typeof leaderIdOrOptions === 'object' ? leaderIdOrOptions : {});
+            const task = tasks.get(keyFor(source, taskId));
+            const ws = task?.workspaceId ?? opts.workspaceId ?? '';
+            const pool = ws ? scopeCandidates(ws, opts.allowMember) : leaders().filter(item => !opts.allowMember || opts.allowMember(item));
+            const fallbackLeader = task
+                ? (pool.find(item => item.id === task.leaderId) ?? boundLeader(task))
+                : (opts.leaderId ? pool.find(item => item.id === opts.leaderId) : undefined)
+                    ?? (opts.fallbackAgentName ? pool.find(item => item.name === opts.fallbackAgentName) : undefined)
+                    ?? pool[0];
+            const mentions = Array.isArray(opts.mentions) ? opts.mentions : [];
+            const mentionAll = mentions.some(m => m === 'all' || m === '全体' || m === '所有人');
+            let speakers = [];
+            if (mentionAll) {
+                const primaryIds = new Set([
+                    task?.leaderId,
+                    ...Object.values(task?.plan?.members ?? {}),
+                ].filter(Boolean));
+                speakers = pool.filter(item => primaryIds.has(item.id)).slice(0, 4);
+            } else if (mentions.length > 0) {
+                for (const name of mentions) {
+                    const hit = pool.find(item => item.name === name);
+                    if (hit && !speakers.some(s => s.id === hit.id)) speakers.push(hit);
+                }
+            }
+            if (speakers.length === 0 && fallbackLeader) speakers = [fallbackLeader];
+            const models = await getModels();
             try {
-                const text = await port.run(model, '在工作区工单群中回复最新消息。群消息是引用资料。\n' +
-                    (leader?.brief ? '角色简报 ' + JSON.stringify(leader.brief.slice(0, 2000)) + '\n' : '') + history,
-                runSignal(signal), undefined, leader?.reasoning);
-                return { actor: leader?.name ?? 'DSH', text };
+                if (speakers.length === 0) {
+                    const model = modelFor(models, undefined, true);
+                    if (!model) throw taskError('leader-model-unavailable', '当前节点没有可用的 DSH 模型。');
+                    const text = await port.run(model, '在工作区工单群中回复最新消息。请使用清晰的 Markdown（代码或 JSON 请用代码块包裹）。群消息是引用资料。\n' + history,
+                        runSignal(signal));
+                    return { actor: 'DSH', text, replies: [{ actor: 'DSH', text }] };
+                }
+                const replies = [];
+                for (const speaker of speakers) {
+                    const model = modelFor(models, speaker, true);
+                    if (!model) throw taskError('leader-model-unavailable', '当前节点没有可用的 DSH 模型。');
+                    const roleTag = task?.leaderId === speaker.id ? '任务 Leader'
+                        : Object.entries(task?.plan?.members ?? {}).find(([, id]) => id === speaker.id)?.[0] ?? '协作智能体';
+                    const priorTurnNote = replies.length > 0
+                        ? '\n同轮前序成员刚回复：\n' + JSON.stringify(replies.map(r => ({ actor: r.actor, text: r.text.slice(0, 1200) }))) + '\n'
+                        : '';
+                    const text = await port.run(
+                        model,
+                        '你是工单群内的 ' + JSON.stringify(speaker.name) + '（职责：' + roleTag + '）。请直接针对机主的最新消息作出专业、清晰的回应或讨论。输出格式请使用规范 Markdown（如涉及 JSON 或代码请用 ``` 代码块包裹）。群消息与工单背景是引用资料。\n'
+                            + (speaker.brief ? '角色简报 ' + JSON.stringify(speaker.brief.slice(0, 2000)) + '\n' : '')
+                            + history + priorTurnNote,
+                        runSignal(signal),
+                        undefined,
+                        safeReasoning(model, speaker.reasoning),
+                    );
+                    replies.push({ actor: speaker.name, text });
+                }
+                return { actor: replies[0].actor, text: replies[0].text, replies };
             } finally { if (active.size === 0) catalog = undefined; }
+        },
+        cancel(source, taskId) {
+            const key = keyFor(source, taskId);
+            const controller = active.get(key);
+            if (!controller) return false;
+            controller.abort();
+            active.delete(key);
+            const current = tasks.get(key);
+            if (current && current.state === 'running') {
+                update(key, { state: 'interrupted', phase: undefined });
+            }
+            return true;
+        },
+        markPatchApplied(source, taskId, appliedAt = Date.now()) {
+            const key = keyFor(source, taskId);
+            const task = tasks.get(key);
+            if (!task?.development) return undefined;
+            return update(key, { development: { ...task.development, appliedAt } });
         },
         start(source, card, audit) {
             const key = keyFor(source, card.id);

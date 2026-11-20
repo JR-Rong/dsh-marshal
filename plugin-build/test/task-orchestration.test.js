@@ -6,6 +6,9 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { Readable } from 'node:stream';
 import { mountGroups } from '../lib/src/groups/mount.js';
+import { createTaskRoomStore } from '../lib/src/groups/task-room-store.js';
+import { createTaskRooms } from '../lib/src/groups/task-rooms.js';
+import { createTaskRoomRoutes, taskRoomAudit } from '../lib/src/groups/task-room-routes.js';
 import { DSH_ACCOUNT_ORIGIN } from '../lib/src/hub/account.js';
 import { setImmediate } from 'node:timers/promises';
 import { createTaskOrchestration } from '../lib/src/groups/task-orchestration.js';
@@ -335,4 +338,82 @@ test('desktop board routes enforce workspace authorization and launch the select
     const secondPage = await request('/marshal/task-rooms/page?roomId=' + secondRoomId + '&workspaceId=workspace-a', undefined, headers);
     assert.equal(secondPage.data.records.filter(item => item.kind === 'batch').length, 1, 'one dispatch opens one room batch');
     assert.equal((await request('/marshal/tasks/delete', { taskId: task.id }, headers)).data.code, 'task-room-archive');
+
+    // Confirm-review closes the room and moves the card to done; revise reopens and reruns.
+    const confirmed = await request('/marshal/tasks/confirm-review', { taskId: secondId, applyPatch: false, note: '验收通过' }, headers);
+    assert.equal(confirmed.code, 200, JSON.stringify(confirmed.data));
+    assert.equal(confirmed.data.tasks.find(t => t.id === secondId).status, 'done');
+    const afterConfirmPage = await request('/marshal/task-rooms/page?roomId=' + secondRoomId + '&workspaceId=workspace-a', undefined, headers);
+    assert.equal(afterConfirmPage.data.room.closed, true);
+
+    const revised = await request('/marshal/tasks/revise', { taskId: secondId, text: '补充一个小调整后重跑' }, headers);
+    assert.equal(revised.code, 200, JSON.stringify(revised.data));
+    const afterRevisePage = await request('/marshal/task-rooms/page?roomId=' + secondRoomId + '&workspaceId=workspace-a', undefined, headers);
+    assert.equal(afterRevisePage.data.room.closed, false);
+    assert.ok(afterRevisePage.data.records.some(r => r.kind === 'user' && r.text.includes('补充一个小调整后重跑')));
+});
+
+test('operator can send live discussion messages inside task room while workflow is actively running', async t => {
+    const gate = Promise.withResolvers();
+    const entered = Promise.withResolvers();
+    const f = fixture(t, {
+        run: async (model, prompt) => {
+            if (prompt.includes('在工作区工单群中回复最新消息') || prompt.includes('针对机主的最新消息')) {
+                return '收到皇上指示，臣立刻把权限边界纳入重点核查。';
+            }
+            entered.resolve();
+            await gate.promise;
+            return model.agent + '-review-result';
+        },
+    });
+    const dir = mkdtempSync(join(tmpdir(), 'marshal-live-room-chat-'));
+    const rooms = createTaskRooms({ store: createTaskRoomStore(join(dir, 'rooms.sqlite')), deviceId: 'desktop' });
+    t.after(() => { rooms.close(); rmSync(dir, { recursive: true, force: true }); });
+
+    const card = await f.create({ choice: 'template', templateId: 'pr-review', prUrl: pr }, 'live-chat-card');
+    const room = rooms.ensure('local', card, 'workspace-a', 'owner-1');
+    const routeMap = new Map();
+    const roomRoutes = createTaskRoomRoutes({
+        exact: (method, path, handler) => ({ method, path, handler }),
+        write: (res, status, payload) => { res.status = status; res.body = payload; },
+        readBody: async req => req.jsonBody,
+        authenticate: () => ({ ok: true, session: { ownerId: 'owner-1', owner: true } }),
+        allowed: () => true,
+        auth: { loadLedger: () => ({ teams: [f.team] }), loadWorkspaces: () => [] },
+        rooms,
+        orchestration: f.orchestration,
+        getBoard: () => f.board,
+        boardSource: () => 'local',
+        getInitiator: () => 'desktop',
+    });
+    for (const r of roomRoutes.routes) routeMap.set(r.method + ' ' + r.path, r.handler);
+
+    f.orchestration.start('local', card, taskRoomAudit(rooms, room, 'start'));
+    await entered.promise;
+    assert.equal(f.orchestration.view('local', card.id).state, 'running');
+
+    // Page shows workflow busy=true, but chatBusy=false so live chat stays unlocked!
+    const pageRes = {};
+    await routeMap.get('GET /marshal/task-rooms/page')({
+        url: '/marshal/task-rooms/page?roomId=' + room.id + '&workspaceId=workspace-a',
+    }, pageRes);
+    assert.equal(pageRes.status, 200);
+    assert.equal(pageRes.body.busy, true);
+    assert.equal(pageRes.body.chatBusy, false);
+
+    // Send a live message while the workflow is still running!
+    const sendRes = {};
+    await routeMap.get('POST /marshal/task-rooms/action')({
+        jsonBody: { roomId: room.id, action: 'send', text: '@负责人 请重点检查权限边界' },
+    }, sendRes);
+    assert.equal(sendRes.status, 200, JSON.stringify(sendRes.body));
+
+    const updatedPage = await rooms.page(room.id, { limit: 20 });
+    assert.ok(updatedPage.records.some(r => r.kind === 'user' && r.phase === 'steering' && r.text.includes('请重点检查权限边界')));
+    assert.ok(updatedPage.records.some(r => r.kind === 'agent' && r.phase === 'conversation' && r.text.includes('收到皇上指示')));
+
+    gate.resolve();
+    const doneView = await f.complete(card, 'done');
+    assert.equal(doneView.reviewReason, 'delivery-review');
+    assert.equal((await rooms.page(room.id, { limit: 1 })).room.closed, false);
 });

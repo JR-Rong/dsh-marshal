@@ -743,3 +743,15 @@ test('groups/mount.js persists workspaceId on board create and task-development.
     const devSrc = readFileSync(new URL('../lib/src/groups/task-development.js', import.meta.url), 'utf8');
     assert.ok(devSrc.includes('不是 Git 仓库根目录'), 'task-development.js should clearly explain non-Git workspace errors');
 });
+
+test('task room client renders chat bubbles, smart Markdown/JSON code blocks, live sendChat, and dual-surface review controls', () => {
+    const clientSrc = readFileSync(new URL('../client/index.js', import.meta.url), 'utf8');
+    assert.ok(clientSrc.includes('function normalizeMessageMarkdown'), 'client should normalize raw JSON/diff/code into Markdown');
+    assert.ok(clientSrc.includes('function RichMarkdown'), 'client should render safe React GFM Markdown');
+    assert.ok(clientSrc.includes('mtr-bubble-agent') && clientSrc.includes('mtr-bubble-user'), 'task room should render left agent bubbles and right user bubbles');
+    assert.ok(clientSrc.includes('buildRoomColorMap'), 'task room should assign distinct per-agent bubble colors');
+    assert.ok(clientSrc.includes("fetchJson('marshal/tasks/confirm-review'"), 'board drawer should call unified confirm-review endpoint');
+    assert.ok(clientSrc.includes("fetchJson('marshal/tasks/revise'"), 'board drawer should call unified revise endpoint');
+    assert.ok(clientSrc.includes('const sendChat = async () =>'), 'task room should provide non-blocking live sendChat independent of workflow busy state');
+    assert.ok(clientSrc.includes('item.global || item.workspaceId === workspace'), 'task room leader picker should include global agents');
+});

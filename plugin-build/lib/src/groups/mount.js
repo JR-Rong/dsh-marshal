@@ -230,15 +230,19 @@ function taskView(task, workflow, room, ticketNumbers) {
     const tags = normalizeCardTags(task.tags);
     const attachments = normalizeAttachmentsPayload(task.attachments);
     const ticketNo = ticketNumbers?.get?.(task.id) ?? ticketNumbers?.ensure?.(task.id);
+    const patchAvailable = Boolean(workflow?.development?.digest && !workflow?.development?.appliedAt);
     return {
         id: task.id,
         ...(ticketNo ? { ticketNo } : {}),
         title: task.title,
         status: room?.closed ? 'done' : workflow === undefined || workflow.state === 'ready' ? task.status
             : workflow.state === 'running' || workflow.state === 'handed-off' ? 'running'
-            : workflow.state === 'permission-blocked' ? 'review'
-            : workflow.state === 'done' ? (room ? 'review' : 'done') : 'failed',
+            : workflow.state === 'permission-blocked' || workflow.state === 'review-blocked' ? 'review'
+            : workflow.state === 'done' ? (task.status === 'done' ? 'done' : (room ? 'review' : 'done')) : 'failed',
         ...(workflow === undefined ? {} : { workflow }),
+        ...(patchAvailable ? { patchAvailable: true } : {}),
+        ...(workflow?.reviewReason ? { reviewReason: workflow.reviewReason } : {}),
+        ...(workflow?.reviewSummary ? { reviewSummary: workflow.reviewSummary } : {}),
         ...(room === undefined ? {} : { taskRoom: visibleTaskRoom(room, ticketNumbers) }),
         ...(task.description === undefined ? {} : { description: task.description }),
         ...(task.prompt === undefined ? {} : { prompt: task.prompt }),
@@ -279,7 +283,7 @@ function taskView(task, workflow, room, ticketNumbers) {
 }
 
 function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, memory, auth, allowedOrigins, orchestration, rooms, extras = {}) {
-    const { root: groupsRootDir, rosters, ticketNumbers, sessionTitles, sessionController, config, llm, readDefaultModel } = extras;
+    const { root: groupsRootDir, rosters, ticketNumbers, sessionTitles, sessionController, config, llm, readDefaultModel, workspacePath } = extras;
     const authenticate = (req, write = false) => auth.authenticate(req, { write, origins: allowedOrigins() });
     const allowed = (access, target, ledger) => access.ok && auth.allows(access.session, {
         agentId: target.agentId, workspaceId: target.workspaceId,
@@ -306,7 +310,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
         });
     };
     const roomRoutes = createTaskRoomRoutes({ exact, write, readBody, authenticate, allowed, auth, rooms,
-        orchestration, getBoard, boardSource, getInitiator: () => initiator.replace(/^marshal:/, ''), ticketNumbers });
+        orchestration, getBoard, boardSource, getInitiator: () => initiator.replace(/^marshal:/, ''), ticketNumbers, workspacePath });
     return [
         ...roomRoutes.routes,
         exact('GET', '/marshal/health', async (req, res) => {
@@ -544,7 +548,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
                     write(res, 409, { ok: false, code: 'task-room-closed', message: '工单已归档，请从工单群重开或重试。' });
                     return;
                 }
-                orchestration.start(source, task, taskRoomAudit(rooms, room, undefined, undefined, undefined,
+                orchestration.start(source, task, taskRoomAudit(rooms, room, workflow.state === 'done' || workflow.state === 'review-blocked' ? 'retry' : undefined, undefined, undefined,
                     member => allowed(access, member)));
                 write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
                 return;
@@ -616,7 +620,63 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             if (workflow && !authorize(req, res, workflow)) return;
             orchestration?.assertIdle(source, body.taskId);
             const snapshot = await board.apply(randomUUID(), { kind: 'move', taskId: body.taskId, status: body.status }, initiator);
+            if (boundRoom) {
+                try {
+                    const current = (await rooms.page(boundRoom.id, { limit: 1 })).room;
+                    if (body.status === 'done' && !current.closed) {
+                        await rooms.append(boundRoom.id, { kind: 'closed', runId: current.runId, actor: '工单操作者', phase: 'confirmed', text: '工单已在看板确认完成并归档。' });
+                    } else if (body.status !== 'done' && current.closed) {
+                        await rooms.append(boundRoom.id, { kind: 'reopened', runId: current.runId, actor: '工单操作者', text: '工单已从看板移回「' + body.status + '」并重开。' });
+                    }
+                } catch { /* room sync is best-effort */ }
+            }
             write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
+        }),
+        exact('POST', '/marshal/tasks/confirm-review', async (req, res) => {
+            const board = getBoard();
+            if (board === undefined) { write(res, 503, { ok: false, code: 'no-task-board' }); return; }
+            const body = await readBody(req);
+            if (typeof body.taskId !== 'string' || body.taskId === '') { write(res, 400, { ok: false, code: 'invalid-task' }); return; }
+            const source = boardSource();
+            const card = (board.snapshot().tasks ?? []).find(item => item.id === body.taskId);
+            if (!card) { write(res, 404, { ok: false, code: 'task-not-found' }); return; }
+            const workflow = orchestration?.target(source, body.taskId);
+            const boundRoom = rooms?.find(source, body.taskId);
+            const access = authenticate(req, true);
+            if (boundRoom) {
+                if (!taskRoomAccess(access, boundRoom, allowed)) { write(res, 403, { ok: false, code: 'workspace-forbidden' }); return; }
+            }
+            if (workflow && !authorize(req, res, workflow)) return;
+            const result = await roomRoutes.confirmReview({ room: boundRoom, card, body, access, initiatorTag: initiator });
+            write(res, 200, {
+                ok: true,
+                patchApplied: result.patchApplied,
+                patchAlreadyApplied: result.patchAlreadyApplied,
+                tasks: taskList(result.snapshot ?? board.snapshot(), req, source),
+            });
+        }),
+        exact('POST', '/marshal/tasks/revise', async (req, res) => {
+            const board = getBoard();
+            if (board === undefined) { write(res, 503, { ok: false, code: 'no-task-board' }); return; }
+            const body = await readBody(req);
+            if (typeof body.taskId !== 'string' || body.taskId === '') { write(res, 400, { ok: false, code: 'invalid-task' }); return; }
+            const source = boardSource();
+            const card = (board.snapshot().tasks ?? []).find(item => item.id === body.taskId);
+            if (!card) { write(res, 404, { ok: false, code: 'task-not-found' }); return; }
+            const workflow = orchestration?.target(source, body.taskId);
+            const boundRoom = rooms?.find(source, body.taskId);
+            const access = authenticate(req, true);
+            if (boundRoom) {
+                if (!taskRoomAccess(access, boundRoom, allowed)) { write(res, 403, { ok: false, code: 'workspace-forbidden' }); return; }
+            } else if (workflow || card.workspaceId) {
+                if (!access.ok || !allowed(access, workflow ?? { workspaceId: card.workspaceId })) {
+                    write(res, access.ok ? 403 : access.status, { ok: false, code: access.ok ? 'workspace-forbidden' : access.code });
+                    return;
+                }
+            }
+            if (workflow && !authorize(req, res, workflow)) return;
+            const result = await roomRoutes.reviseTask({ room: boundRoom, card, body, access, initiatorTag: initiator });
+            write(res, 200, { ok: true, tasks: taskList(result.snapshot ?? board.snapshot(), req, source) });
         }),
         exact('POST', '/marshal/tasks/update', async (req, res) => {
             const board = getBoard();
@@ -1432,7 +1492,7 @@ export function mountGroups(ctx, config, options = {}) {
                 }
                 catch { /* desktop origin is enough when the host has no public origin */ }
                 return origins;
-            }, orchestration, rooms, { root, rosters, ticketNumbers, sessionTitles, sessionController: ctx.sessionController, config, llm, readDefaultModel }).map((route) => scoped.webServer.register(route));
+            }, orchestration, rooms, { root, rosters, ticketNumbers, sessionTitles, sessionController: ctx.sessionController, config, llm, readDefaultModel, workspacePath: agents.workspace }).map((route) => scoped.webServer.register(route));
             return () => {
                 for (const dispose of disposers) dispose();
             };

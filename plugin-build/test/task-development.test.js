@@ -8,8 +8,9 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { createAgentMemoryService } from '../lib/src/memory/agent-memory.js';
 import { createTaskRoomStore } from '../lib/src/groups/task-room-store.js';
 import { createTaskRooms } from '../lib/src/groups/task-rooms.js';
-import { taskRoomAudit } from '../lib/src/groups/task-room-routes.js';
+import { parseRoomMentions, taskRoomAudit } from '../lib/src/groups/task-room-routes.js';
 import { createTaskOrchestration } from '../lib/src/groups/task-orchestration.js';
+import { applyDevelopmentPatch } from '../lib/src/groups/task-development.js';
 import { GROUP_TEMPLATES, TEMPLATES, taskPlan } from '../lib/src/groups/task-plans.js';
 
 const members = [
@@ -164,6 +165,91 @@ for (const run of [{ reviewerDelegates: true }, { reviewerDelegates: false }, { 
                 .some(item => item.backend === 'mnemon' && item.tags.includes('run:' + state.runId)));
             assert.deepEqual(await memory.listFor({ agentId: 'reviewer', scope: 'agent' }), []);
         }
-        assert.equal((await rooms.page(room.id, { limit: 1 })).room.closed, true);
+        assert.equal((await rooms.page(room.id, { limit: 1 })).room.closed, false, 'finished workflow stays open in review until human confirmation');
+        const applyRes = await applyDevelopmentPatch(repo, patch.text);
+        assert.equal(applyRes.applied, true);
+        assert.match(readFileSync(join(repo, 'sum.mjs'), 'utf8'), /\+/);
+        const secondApply = await applyDevelopmentPatch(repo, patch.text);
+        assert.equal(secondApply.alreadyApplied, true);
     });
 }
+
+test('reviewer blocked verdict enters review-blocked instead of failed, and revision injects room operator notes', async t => {
+    const root = mkdtempSync(join(tmpdir(), 'marshal-dev-review-blocked-'));
+    const repo = join(root, 'repo');
+    mkdirSync(repo);
+    const git = (args, input) => execFileSync('git', args, { cwd: repo, encoding: 'utf8', input, stdio: ['pipe', 'pipe', 'pipe'] });
+    git(['init', '-q']);
+    writeFileSync(join(repo, 'app.mjs'), 'export const mode = "phone";\n');
+    git(['add', '.']);
+    git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'init']);
+
+    const memory = createAgentMemoryService({ root: join(root, 'memory') });
+    const rooms = createTaskRooms({ store: createTaskRoomStore(join(root, 'rooms.sqlite')), deviceId: 'node-1' });
+    let shouldBlock = true;
+    const seenPrompts = [];
+    const port = {
+        catalog: async () => [dsh, codex],
+        dispose() {},
+        async run(model, prompt, _signal, work) {
+            seenPrompts.push(prompt);
+            if (work) {
+                writeFileSync(join(work.workspace, 'app.mjs'), shouldBlock ? 'export const mode = "phone-v1";\n' : 'export const mode = "node-v2";\n');
+                return 'implemented change';
+            }
+            if (prompt.includes('设计和拆分开发任务')) return 'Design plan';
+            if (prompt.includes('你是 Coder')) return JSON.stringify({ action: 'codex', instruction: 'implement' });
+            if (prompt.includes('需要 Codex 只读协助')) return JSON.stringify({ action: 'continue', instruction: 'direct verdict' });
+            if (shouldBlock) {
+                return JSON.stringify({
+                    verdict: 'blocked',
+                    findings: [{ file: 'app.mjs', conclusion: '请确认手机端是作为 controller 还是独立 node 运行。' }],
+                });
+            }
+            return JSON.stringify({ verdict: 'pass', findings: '已按机主裁决改为 node-v2。' });
+        },
+    };
+    const states = [];
+    const flow = createTaskOrchestration({
+        file: join(root, 'workflow.json'),
+        memory,
+        port,
+        workspacePath: async () => repo,
+        inventory: () => ({ teams: [{ id: 'team', workspaceId: 'fixture-workspace', members }] }),
+        onState: async (_src, taskId, status) => { states.push({ taskId, status }); },
+    });
+    t.after(() => { flow.dispose(); rooms.close(); memory.store.close(); rmSync(root, { recursive: true, force: true }); });
+
+    const card = { id: 'card-rb', title: '移动端模式确认' };
+    flow.attach('host', card.id, flow.prepare({
+        ...selected,
+        plan: { templateId: 'development', members: { coder: 'team/coder', reviewer: 'team/reviewer' } },
+    }));
+    const room = rooms.ensure('host', card, 'fixture-workspace', 'owner');
+    flow.start('host', card, taskRoomAudit(rooms, room, 'start'));
+    const until = AbortSignal.timeout(5500);
+    let state;
+    while ((state = flow.view('host', card.id)).state === 'running') await sleep(10, undefined, { signal: until });
+    assert.equal(state.state, 'review-blocked');
+    assert.equal(state.reviewReason, 'review-blocked');
+    assert.doesNotMatch(state.reviewSummary, /\[object Object\]/);
+    assert.match(state.reviewSummary, /app\.mjs/);
+    assert.equal(states.at(-1).status, 'review');
+
+    // Operator discusses in room with @Reviewer and @Coder, then triggers revision
+    assert.deepEqual(parseRoomMentions('@Reviewer @Coder 请统一按独立 node-v2 实现'), ['Reviewer', 'Coder']);
+    const chatReply = await flow.respond('host', card.id, '群消息上下文', AbortSignal.timeout(3000), {
+        mentions: ['Reviewer', 'Coder'],
+        workspaceId: 'fixture-workspace',
+    });
+    assert.equal(chatReply.replies.length, 2);
+    assert.deepEqual(chatReply.replies.map(r => r.actor), ['Reviewer', 'Coder']);
+
+    await rooms.append(room.id, { kind: 'user', runId: state.runId, actor: '工单操作者', text: '机主拍板：统一按 node-v2 实现', phase: 'revision' });
+    shouldBlock = false;
+    seenPrompts.length = 0;
+    flow.start('host', card, taskRoomAudit(rooms, room, 'revise'));
+    while ((state = flow.view('host', card.id)).state === 'running') await sleep(10, undefined, { signal: until });
+    assert.equal(state.state, 'done');
+    assert.ok(seenPrompts.some(p => p.includes('机主拍板：统一按 node-v2 实现')), 'operator guidance from room is injected into workflow prompts');
+});

@@ -2066,12 +2066,452 @@ window.__ModuleLoader__.load({
       'review-assistant': '审查 Codex 子 Agent',
       'development-patch': '固定开发补丁',
       'private-memory': '私有记忆回执',
+      conversation: '群内讨论',
+      steering: '运行中插话',
+      revision: '补充修正',
+      review: '待确认',
+      confirmed: '验收确认',
+      dispatch: '自动派单',
     };
+
+    const AGENT_BUBBLE_PALETTE = [
+      '#8b5cf6', // 靛紫
+      '#10b981', // 翠绿
+      '#f59e0b', // 琥珀
+      '#0ea5e9', // 晴蓝
+      '#ec4899', // 玫红
+      '#06b6d4', // 青色
+      '#f97316', // 珊瑚橙
+      '#84cc16', // 青柠
+    ];
+
+    const NAMED_AGENT_COLORS = {
+      '丞相': '#8b5cf6',
+      '工部尚书': '#10b981',
+      '刑部尚书': '#f59e0b',
+      '侍中': '#ec4899',
+      '中书令': '#0ea5e9',
+      '吏部尚书': '#f97316',
+      '兵部尚书': '#ef4444',
+      '户部尚书': '#eab308',
+      '礼部尚书': '#a855f7',
+    };
+
+    function agentBubbleAccent(actorName, colorMap) {
+      const clean = String(actorName || '').trim();
+      if (!clean) return AGENT_BUBBLE_PALETTE[0];
+      if (colorMap && colorMap.has(clean)) return colorMap.get(clean);
+      if (clean.startsWith('Codex')) return '#06b6d4';
+      if (NAMED_AGENT_COLORS[clean]) return NAMED_AGENT_COLORS[clean];
+      let hash = 2166136261;
+      for (let i = 0; i < clean.length; i++) {
+        hash ^= clean.charCodeAt(i);
+        hash = Math.imul(hash, 16777619);
+      }
+      return AGENT_BUBBLE_PALETTE[(hash >>> 0) % AGENT_BUBBLE_PALETTE.length];
+    }
+
+    function buildRoomColorMap(records, participants) {
+      const map = new Map();
+      const used = new Set();
+      const assign = name => {
+        const clean = String(name || '').trim();
+        if (!clean || clean === 'Marshal' || clean === '工单操作者' || map.has(clean)) return;
+        const preferred = clean.startsWith('Codex') ? '#06b6d4' : NAMED_AGENT_COLORS[clean];
+        if (preferred && !used.has(preferred)) {
+          map.set(clean, preferred);
+          used.add(preferred);
+          return;
+        }
+        const free = AGENT_BUBBLE_PALETTE.find(c => !used.has(c));
+        if (free) {
+          map.set(clean, free);
+          used.add(free);
+          return;
+        }
+        map.set(clean, agentBubbleAccent(clean));
+      };
+      for (const p of Array.isArray(participants) ? participants : []) assign(p?.name);
+      for (const r of Array.isArray(records) ? records : []) {
+        if (r?.kind === 'agent') assign(r.actor);
+      }
+      return map;
+    }
+
+    function ensureTaskRoomStyles() {
+      if (typeof document === 'undefined' || document.getElementById('marshal-taskroom-styles')) return;
+      const style = document.createElement('style');
+      style.id = 'marshal-taskroom-styles';
+      style.textContent = [
+        '.mtr-shell{display:flex;flex:1;min-height:0;width:100%;background:var(--dsw-alias-bg-base,transparent);color:var(--dsw-alias-label-primary,inherit)}',
+        '.mtr-side{width:min(29%,276px);flex-shrink:0;padding:14px 12px;overflow-y:auto;border-right:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.16));background:var(--dsw-alias-bg-layer-1,rgba(128,128,128,.03));display:flex;flex-direction:column;gap:8px}',
+        '.mtr-room-item{display:flex;flex-direction:column;gap:4px;width:100%;padding:9px 11px;border-radius:10px;border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.14));background:transparent;color:inherit;text-align:left;cursor:pointer;font:inherit;transition:background .14s,border-color .14s}',
+        '.mtr-room-item:hover{background:color-mix(in srgb,currentColor 6%,transparent)}',
+        '.mtr-room-item[data-active="true"]{background:color-mix(in srgb,var(--dsw-alias-brand-primary,#6366f1) 14%,transparent);border-color:color-mix(in srgb,var(--dsw-alias-brand-primary,#6366f1) 48%,transparent)}',
+        '.mtr-main{display:flex;flex-direction:column;flex:1;min-width:0;min-height:0}',
+        '.mtr-header{padding:11px 18px;border-bottom:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.16));display:flex;gap:10px;flex-wrap:wrap;align-items:center;background:var(--dsw-alias-bg-layer-1,rgba(128,128,128,.02))}',
+        '.mtr-review-bar{margin:10px 18px 0;padding:11px 14px;border-radius:12px;border:1px solid color-mix(in srgb,#8b5cf6 42%,transparent);background:color-mix(in srgb,#8b5cf6 10%,var(--dsw-alias-bg-layer-2,rgba(128,128,128,.06)));display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px}',
+        '.mtr-stream{flex:1;min-height:0;overflow-y:auto;padding:16px 20px;display:flex;flex-direction:column;gap:14px}',
+        '.mtr-sys-row{display:flex;justify-content:center;margin:2px 0}',
+        '.mtr-sys-pill{max-width:86%;padding:4px 12px;border-radius:999px;font-size:11.5px;line-height:1.45;color:var(--dsw-alias-label-secondary,rgba(140,145,158,.92));background:color-mix(in srgb,currentColor 7%,transparent);border:1px solid color-mix(in srgb,currentColor 10%,transparent);text-align:center;overflow-wrap:anywhere}',
+        '.mtr-sys-pill[data-tone="danger"]{color:#ef4444;background:color-mix(in srgb,#ef4444 10%,transparent);border-color:color-mix(in srgb,#ef4444 28%,transparent)}',
+        '.mtr-sys-pill[data-tone="review"]{color:#a78bfa;background:color-mix(in srgb,#8b5cf6 12%,transparent);border-color:color-mix(in srgb,#8b5cf6 32%,transparent)}',
+        '.mtr-brief-card{align-self:stretch;padding:10px 14px;border-radius:12px;border:1px dashed var(--dsw-alias-border-l2,rgba(128,128,128,.24));background:color-mix(in srgb,currentColor 4%,transparent);font-size:12.5px}',
+        '.mtr-msg-row{display:flex;gap:10px;align-items:flex-start;max-width:100%}',
+        '.mtr-msg-row[data-side="right"]{flex-direction:row-reverse}',
+        '.mtr-avatar{width:32px;height:32px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;flex-shrink:0;margin-top:2px;box-shadow:0 2px 6px rgba(0,0,0,.12)}',
+        '.mtr-msg-col{display:flex;flex-direction:column;max-width:min(80%,760px);min-width:0}',
+        '.mtr-msg-row[data-side="right"] .mtr-msg-col{align-items:flex-end;max-width:min(76%,660px)}',
+        '.mtr-msg-meta{display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:11.5px;margin-bottom:4px;color:var(--dsw-alias-label-secondary,rgba(140,145,158,.9))}',
+        '.mtr-msg-row[data-side="right"] .mtr-msg-meta{flex-direction:row-reverse}',
+        '.mtr-role-badge{font-size:10.5px;padding:1px 7px;border-radius:999px;background:color-mix(in srgb,var(--mtr-agent-c,#6366f1) 15%,transparent);color:var(--mtr-agent-c,#6366f1);border:1px solid color-mix(in srgb,var(--mtr-agent-c,#6366f1) 30%,transparent)}',
+        '.mtr-bubble{padding:10px 14px;font-size:13px;line-height:1.65;overflow-wrap:anywhere;word-break:break-word;box-shadow:0 2px 8px -3px rgba(0,0,0,.14)}',
+        '.mtr-bubble-agent{border-radius:4px 16px 16px 16px;background:color-mix(in srgb,var(--mtr-agent-c,#6366f1) 9%,var(--dsw-alias-bg-layer-2,rgba(128,128,140,.08)));border:1px solid color-mix(in srgb,var(--mtr-agent-c,#6366f1) 26%,var(--dsw-alias-border-l1,rgba(128,128,128,.16)));border-left:3px solid var(--mtr-agent-c,#6366f1)}',
+        '.mtr-bubble-user{border-radius:16px 4px 16px 16px;background:color-mix(in srgb,var(--dsw-alias-brand-primary,#4f46e5) 22%,var(--dsw-alias-bg-layer-3,rgba(79,70,229,.14)));border:1px solid color-mix(in srgb,var(--dsw-alias-brand-primary,#6366f1) 44%,transparent)}',
+        '.mtr-patch-card{align-self:flex-start;width:min(84%,760px);padding:11px 14px;border-radius:12px;border:1px solid color-mix(in srgb,#06b6d4 34%,var(--dsw-alias-border-l2,rgba(128,128,128,.2)));background:color-mix(in srgb,#06b6d4 7%,var(--dsw-alias-bg-layer-2,rgba(128,128,128,.06)))}',
+        '.mtr-md{font-size:13px;line-height:1.68;overflow-wrap:anywhere}',
+        '.mtr-md > *:first-child{margin-top:0!important}',
+        '.mtr-md > *:last-child{margin-bottom:0!important}',
+        '.mtr-md p{margin:0 0 8px;white-space:pre-wrap}',
+        '.mtr-md h1,.mtr-md h2,.mtr-md h3,.mtr-md h4,.mtr-md h5,.mtr-md h6{margin:12px 0 6px;line-height:1.35;font-weight:650}',
+        '.mtr-md h1{font-size:16px}.mtr-md h2{font-size:15px}.mtr-md h3{font-size:14px}.mtr-md h4,.mtr-md h5,.mtr-md h6{font-size:13px}',
+        '.mtr-md ul,.mtr-md ol{margin:6px 0 10px;padding-left:20px}',
+        '.mtr-md li{margin:3px 0}',
+        '.mtr-md blockquote{margin:8px 0;padding:5px 12px;border-left:3px solid var(--mtr-agent-c,var(--dsw-alias-brand-primary,#6366f1));background:color-mix(in srgb,currentColor 5%,transparent);border-radius:0 8px 8px 0;opacity:.92}',
+        '.mtr-md hr{border:0;border-top:1px solid color-mix(in srgb,currentColor 14%,transparent);margin:10px 0}',
+        '.mtr-md a{color:var(--dsw-alias-brand-primary,#6366f1);text-decoration:underline;text-underline-offset:2px}',
+        '.mtr-inline-code{font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;padding:1.5px 5px;border-radius:5px;background:color-mix(in srgb,currentColor 10%,transparent);border:1px solid color-mix(in srgb,currentColor 12%,transparent)}',
+        '.mtr-mention{display:inline-block;padding:0 5px;border-radius:5px;font-weight:600;color:var(--dsw-alias-brand-primary,#6366f1);background:color-mix(in srgb,var(--dsw-alias-brand-primary,#6366f1) 14%,transparent)}',
+        '.mtr-code-box{margin:8px 0;border-radius:9px;overflow:hidden;border:1px solid color-mix(in srgb,currentColor 16%,transparent);background:color-mix(in srgb,#000 22%,var(--dsw-alias-bg-base,rgba(0,0,0,.18)))}',
+        '.mtr-code-bar{display:flex;align-items:center;justify-content:space-between;padding:4px 10px;font-size:11px;color:var(--dsw-alias-label-secondary,rgba(150,155,168,.95));border-bottom:1px solid color-mix(in srgb,currentColor 12%,transparent);background:color-mix(in srgb,currentColor 5%,transparent)}',
+        '.mtr-code-copy{border:0;background:transparent;color:inherit;font:11px/1.2 inherit;padding:2px 6px;border-radius:5px;cursor:pointer}',
+        '.mtr-code-copy:hover{background:color-mix(in srgb,currentColor 10%,transparent)}',
+        '.mtr-code-pre{margin:0;padding:10px 12px;overflow-x:auto;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;white-space:pre;tab-size:2}',
+        '.mtr-table-wrap{margin:8px 0;overflow-x:auto;border-radius:8px;border:1px solid color-mix(in srgb,currentColor 15%,transparent)}',
+        '.mtr-table{width:100%;border-collapse:collapse;font-size:12px}',
+        '.mtr-table th,.mtr-table td{padding:6px 10px;border-bottom:1px solid color-mix(in srgb,currentColor 12%,transparent);text-align:left}',
+        '.mtr-table th{font-weight:600;background:color-mix(in srgb,currentColor 6%,transparent)}',
+        '.mtr-raw-json{margin-top:8px;font-size:11.5px}',
+        '.mtr-raw-json > summary{cursor:pointer;user-select:none;opacity:.72;font-size:11px}',
+        '.mtr-composer{padding:10px 16px 12px;border-top:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.16));background:var(--dsw-alias-bg-layer-1,rgba(128,128,128,.03));display:grid;gap:8px}',
+        '.mtr-chip-row{display:flex;flex-wrap:wrap;align-items:center;gap:6px}',
+        '.mtr-mention-chip{border:1px solid color-mix(in srgb,var(--mtr-chip-c,currentColor) 32%,transparent);background:color-mix(in srgb,var(--mtr-chip-c,currentColor) 10%,transparent);color:inherit;border-radius:999px;padding:2px 9px;font-size:11px;cursor:pointer;font-family:inherit;display:inline-flex;align-items:center;gap:4px}',
+        '.mtr-mention-chip:hover{background:color-mix(in srgb,var(--mtr-chip-c,currentColor) 18%,transparent)}',
+      ].join('\n');
+      document.head.appendChild(style);
+    }
+
+    function tryParseJsonPayload(str) {
+      const trimmed = String(str || '').trim();
+      if (!trimmed) return undefined;
+      if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+        try {
+          const parsed = JSON.parse(trimmed);
+          if (parsed && typeof parsed === 'object') return parsed;
+        } catch { /* not pure JSON */ }
+      }
+      return undefined;
+    }
+
+    function normalizeMessageMarkdown(rawText, phase) {
+      const source = String(rawText ?? '');
+      const trimmed = source.trim();
+      if (!trimmed) return { markdown: '', rawJson: '' };
+
+      // 1) Pure JSON object / array: convert known agent protocol schemas into readable Markdown + collapsible raw JSON,
+      //    or wrap arbitrary JSON into a formatted ```json code block!
+      const parsed = tryParseJsonPayload(trimmed);
+      if (parsed !== undefined) {
+        const pretty = JSON.stringify(parsed, null, 2);
+        if (!Array.isArray(parsed)) {
+          if ((parsed.action === 'codex' || parsed.action === 'continue') && typeof parsed.instruction === 'string') {
+            const actionTitle = parsed.action === 'codex' ? '🔧 **委派 Codex 子 Agent 执行**' : '➡️ **阶段判断：继续下一步**';
+            return { markdown: actionTitle + '\n\n' + parsed.instruction.trim(), rawJson: pretty };
+          }
+          if (['pass', 'revise', 'blocked'].includes(parsed.verdict) && parsed.findings !== undefined) {
+            const verdictMap = {
+              pass: '✅ **审查结论：通过（pass）**',
+              revise: '↩ **审查结论：需返工调整（revise）**',
+              blocked: '⚖️ **审查结论：待裁决 / 阻塞（blocked）**',
+            };
+            const body = Array.isArray(parsed.findings)
+              ? parsed.findings.map(f => (f && typeof f === 'object'
+                ? '- **`' + String(f.file || '文件') + '`**：' + String(f.conclusion || '')
+                : '- ' + String(f))).join('\n')
+              : String(parsed.findings || '');
+            return { markdown: verdictMap[parsed.verdict] + '\n\n' + body, rawJson: pretty };
+          }
+          if (phase === 'assignment' || (parsed.roles && (parsed.template || parsed.leader))) {
+            const roleLines = Object.entries(parsed.roles || {}).map(([role, who]) => '- **' + role + '**：' + who);
+            const codexLine = parsed.codex
+              ? '- **Codex 槽位**：编码 `' + (parsed.codex.coding ?? '关闭') + '` / 审查 `' + (parsed.codex.review ?? '关闭') + '`'
+              : '';
+            const head = '📋 **编排分工配置** · `' + (parsed.template || '普通任务') + '`'
+              + (parsed.group ? '（' + parsed.group + '）' : '')
+              + (parsed.leader ? ' · Leader：**' + parsed.leader + '**' : '');
+            return { markdown: [head, '', ...roleLines, codexLine].filter(Boolean).join('\n'), rawJson: pretty };
+          }
+        }
+        return { markdown: '```json\n' + pretty + '\n```', rawJson: '' };
+      }
+
+      // 2) If raw unified diff without code fences, wrap in ```diff
+      if (!trimmed.includes('```') && /^(diff --git |--- a\/|\+\+\+ b\/|@@ -\d+)/m.test(trimmed) && /^diff --git /m.test(trimmed)) {
+        return { markdown: '```diff\n' + trimmed + '\n```', rawJson: '' };
+      }
+
+      // 3) Auto-wrap standalone single-line or trailing raw JSON objects outside existing code fences
+      if (!trimmed.includes('```')) {
+        const lines = source.split('\n');
+        const converted = [];
+        let codeCandidateLines = 0;
+        for (const line of lines) {
+          const t = line.trim();
+          const lineJson = (t.startsWith('{') && t.endsWith('}') && t.length > 12) ? tryParseJsonPayload(t) : undefined;
+          if (lineJson !== undefined) {
+            converted.push('```json\n' + JSON.stringify(lineJson, null, 2) + '\n```');
+            continue;
+          }
+          if (/^(import\s+.+\s+from\s+|export\s+(async\s+)?(function|const|class)\s+|function\s+\w+\s*\(|const\s+\w+\s*=\s*|def\s+\w+\s*\(|class\s+\w+)/.test(t)) {
+            codeCandidateLines += 1;
+          }
+          converted.push(line);
+        }
+        const joined = converted.join('\n');
+        const hasMarkdownMarkers = /(^#{1,6}\s|^\s*[-*+]\s|^\s*\d+\.\s|\*\*[^*]+\*\*|^>\s)/m.test(joined);
+        if (!hasMarkdownMarkers && codeCandidateLines >= 2 && lines.length >= 3) {
+          return { markdown: '```code\n' + trimmed + '\n```', rawJson: '' };
+        }
+        return { markdown: joined, rawJson: '' };
+      }
+
+      return { markdown: source, rawJson: '' };
+    }
+
+    function CopyCodeButton({ code }) {
+      const [copied, setCopied] = React.useState(false);
+      const copy = async () => {
+        try {
+          await navigator.clipboard.writeText(code);
+          setCopied(true);
+          setTimeout(() => setCopied(false), 1600);
+        } catch { /* clipboard unavailable */ }
+      };
+      return h('button', { type: 'button', className: 'mtr-code-copy', onClick: () => { void copy(); } }, copied ? '✓ 已复制' : '复制代码');
+    }
+
+    function CodeFenceBlock({ language, code }) {
+      return h('div', { className: 'mtr-code-box' },
+        h('div', { className: 'mtr-code-bar' },
+          h('span', { style: { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontWeight: 600 } }, language || 'code'),
+          h(CopyCodeButton, { code })),
+        h('pre', { className: 'mtr-code-pre' }, h('code', null, code)));
+    }
+
+    function safeExternalUrl(raw) {
+      try {
+        const u = new URL(raw);
+        if ((u.protocol === 'https:' || u.protocol === 'http:') && !u.username && !u.password) return u.href;
+      } catch { /* ignore */ }
+      return '';
+    }
+
+    function renderInlineMarkdown(text, keyPrefix = 'in') {
+      const str = String(text ?? '');
+      if (!str) return null;
+      const tokenRe = /(`[^`\n]+`)|(\[([^\]]+)\]\((https?:\/\/[^\s)]+)\))|(\*\*([^*]+)\*\*)|(~~([^~]+)~~)|(\*([^*\s][^*]*?)\*)|((?:^|(?<=\s))@([^\s@,，。！!？?：:;；()（）\[\]【】]{1,24}))/g;
+      const out = [];
+      let last = 0;
+      let match;
+      let idx = 0;
+      while ((match = tokenRe.exec(str)) !== null) {
+        if (match.index > last) out.push(str.slice(last, match.index));
+        const k = keyPrefix + '-' + (idx++);
+        if (match[1]) {
+          out.push(h('code', { key: k, className: 'mtr-inline-code' }, match[1].slice(1, -1)));
+        } else if (match[2]) {
+          const href = safeExternalUrl(match[4]);
+          out.push(href
+            ? h('a', { key: k, href, target: '_blank', rel: 'noopener noreferrer' }, match[3])
+            : match[0]);
+        } else if (match[5]) {
+          out.push(h('strong', { key: k }, renderInlineMarkdown(match[6], k + 'b')));
+        } else if (match[7]) {
+          out.push(h('del', { key: k }, renderInlineMarkdown(match[8], k + 'd')));
+        } else if (match[9]) {
+          out.push(h('em', { key: k }, renderInlineMarkdown(match[10], k + 'i')));
+        } else if (match[11]) {
+          out.push(h('span', { key: k, className: 'mtr-mention' }, '@' + match[12]));
+        }
+        last = tokenRe.lastIndex;
+      }
+      if (last < str.length) out.push(str.slice(last));
+      return out.length === 1 ? out[0] : out;
+    }
+
+    function parseMarkdownBlocks(markdown) {
+      const lines = String(markdown ?? '').replace(/\r\n/g, '\n').split('\n');
+      const blocks = [];
+      let i = 0;
+      while (i < lines.length) {
+        const line = lines[i];
+        // Fenced code block
+        const fenceMatch = /^\s*(`{3,}|~{3,})\s*([^\s`~]*)\s*$/.exec(line);
+        if (fenceMatch) {
+          const marker = fenceMatch[1];
+          const lang = fenceMatch[2] || '';
+          const buf = [];
+          i += 1;
+          while (i < lines.length && !new RegExp('^\\s*' + marker[0] + '{' + marker.length + ',}\\s*$').test(lines[i])) {
+            buf.push(lines[i]);
+            i += 1;
+          }
+          if (i < lines.length) i += 1;
+          blocks.push({ type: 'code', lang, code: buf.join('\n') });
+          continue;
+        }
+        if (line.trim() === '') {
+          i += 1;
+          continue;
+        }
+        // Horizontal rule
+        if (/^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/.test(line)) {
+          blocks.push({ type: 'hr' });
+          i += 1;
+          continue;
+        }
+        // Heading
+        const headMatch = /^\s*(#{1,6})\s+(.+?)\s*$/.exec(line);
+        if (headMatch) {
+          blocks.push({ type: 'heading', level: headMatch[1].length, text: headMatch[2] });
+          i += 1;
+          continue;
+        }
+        // GFM Table
+        if (line.includes('|') && i + 1 < lines.length && /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$/.test(lines[i + 1])) {
+          const splitRow = raw => raw.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim());
+          const header = splitRow(line);
+          i += 2;
+          const rows = [];
+          while (i < lines.length && lines[i].includes('|') && lines[i].trim() !== '') {
+            rows.push(splitRow(lines[i]));
+            i += 1;
+          }
+          blocks.push({ type: 'table', header, rows });
+          continue;
+        }
+        // Blockquote
+        if (/^\s*>\s?/.test(line)) {
+          const qLines = [];
+          while (i < lines.length && /^\s*>\s?/.test(lines[i])) {
+            qLines.push(lines[i].replace(/^\s*>\s?/, ''));
+            i += 1;
+          }
+          blocks.push({ type: 'quote', text: qLines.join('\n') });
+          continue;
+        }
+        // List (unordered or ordered)
+        const listMatch = /^(\s*)(?:([-*+])|(\d+)\.)\s+(.*)$/.exec(line);
+        if (listMatch) {
+          const ordered = Boolean(listMatch[3]);
+          const start = ordered ? Number(listMatch[3]) : 1;
+          const items = [];
+          while (i < lines.length) {
+            const m = /^(\s*)(?:([-*+])|(\d+)\.)\s+(.*)$/.exec(lines[i]);
+            if (!m || Boolean(m[3]) !== ordered) break;
+            let itemText = m[4];
+            let taskCheck = null;
+            const taskMatch = /^\[([ xX])\]\s+(.*)$/.exec(itemText);
+            if (taskMatch) {
+              taskCheck = taskMatch[1].toLowerCase() === 'x';
+              itemText = taskMatch[2];
+            }
+            items.push({ text: itemText, checked: taskCheck });
+            i += 1;
+          }
+          blocks.push({ type: 'list', ordered, start, items });
+          continue;
+        }
+        // Paragraph
+        const pLines = [line];
+        i += 1;
+        while (
+          i < lines.length
+          && lines[i].trim() !== ''
+          && !/^\s*(`{3,}|~{3,})/.test(lines[i])
+          && !/^\s*#{1,6}\s+/.test(lines[i])
+          && !/^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/.test(lines[i])
+          && !/^\s*>\s?/.test(lines[i])
+          && !/^(\s*)(?:[-*+]|\d+\.)\s+/.test(lines[i])
+        ) {
+          pLines.push(lines[i]);
+          i += 1;
+        }
+        blocks.push({ type: 'paragraph', text: pLines.join('\n') });
+      }
+      return blocks;
+    }
+
+    function RichMarkdown({ text, phase }) {
+      const normalized = React.useMemo(() => normalizeMessageMarkdown(text, phase), [text, phase]);
+      const blocks = React.useMemo(() => parseMarkdownBlocks(normalized.markdown), [normalized.markdown]);
+      return h('div', { className: 'mtr-md' },
+        blocks.map((b, idx) => {
+          const key = 'b-' + idx;
+          if (b.type === 'code') return h(CodeFenceBlock, { key, language: b.lang, code: b.code });
+          if (b.type === 'hr') return h('hr', { key });
+          if (b.type === 'heading') return h('h' + b.level, { key }, renderInlineMarkdown(b.text, key));
+          if (b.type === 'quote') return h('blockquote', { key }, renderInlineMarkdown(b.text, key));
+          if (b.type === 'table') {
+            return h('div', { key, className: 'mtr-table-wrap' },
+              h('table', { className: 'mtr-table' },
+                h('thead', null, h('tr', null, b.header.map((cell, ci) => h('th', { key: ci }, renderInlineMarkdown(cell, key + 'th' + ci))))),
+                h('tbody', null, b.rows.map((row, ri) => h('tr', { key: ri }, row.map((cell, ci) => h('td', { key: ci }, renderInlineMarkdown(cell, key + 'td' + ri + '-' + ci))))))));
+          }
+          if (b.type === 'list') {
+            const tag = b.ordered ? 'ol' : 'ul';
+            return h(tag, { key, ...(b.ordered && b.start > 1 ? { start: b.start } : {}) },
+              b.items.map((item, li) => h('li', { key: li },
+                item.checked !== null && h('input', { type: 'checkbox', checked: item.checked, disabled: true, readOnly: true, style: { marginRight: 6 } }),
+                renderInlineMarkdown(item.text, key + 'li' + li))));
+          }
+          return h('p', { key }, renderInlineMarkdown(b.text, key));
+        }),
+        normalized.rawJson && h('details', { className: 'mtr-raw-json' },
+          h('summary', null, '查看原始 JSON'),
+          h(CodeFenceBlock, { language: 'json', code: normalized.rawJson })));
+    }
+
+    function describeReviewState(task, workflow, ambiguityHint, needsPermConfirm) {
+      if (needsPermConfirm || workflow?.state === 'permission-blocked') {
+        return {
+          badge: '🔒 权限待确认',
+          summary: workflow?.error || '当前工单需要更高执行权限，请确认授权后继续运行。',
+        };
+      }
+      if (ambiguityHint) {
+        return {
+          badge: '📝 需求待明确',
+          summary: ambiguityHint,
+        };
+      }
+      if (workflow?.state === 'review-blocked' || task?.reviewReason === 'review-blocked' || workflow?.reviewReason === 'review-blocked') {
+        return {
+          badge: '⚖️ 审查待裁决',
+          summary: workflow?.reviewSummary || task?.reviewSummary || '审查阶段发现需求边界或实现分歧，请给出裁决意见后继续执行，或直接拍板通过。',
+        };
+      }
+      return {
+        badge: '✅ 交付待验收',
+        summary: workflow?.reviewSummary || task?.reviewSummary || '当前批次已执行完毕，请查阅交付报告或工单群记录后确认完成，或输入补充意见继续修正。',
+      };
+    }
 
     function TaskReviewReport({ taskId, development }) {
       const [report, setReport] = React.useState('');
       const [error, setError] = React.useState('');
       const [loading, setLoading] = React.useState(false);
+      React.useEffect(() => { ensureTaskRoomStyles(); }, []);
       const load = async event => {
         if (!event.currentTarget.open || report || loading) return;
         setLoading(true);
@@ -2084,10 +2524,11 @@ window.__ModuleLoader__.load({
         finally { setLoading(false); }
       };
       return h('details', { onToggle: load },
-        h('summary', { style: { cursor: 'pointer' } }, development ? '开发交付报告' : '审查报告'),
+        h('summary', { style: { cursor: 'pointer', fontWeight: 600, fontSize: 12 } }, development ? '📄 查看开发交付报告' : '📄 查看审查报告'),
         loading && h('p', { style: uiMuted }, '读取中…'),
         error && h('p', { role: 'alert' }, error),
-        report && h('pre', { style: { margin: '8px 0 0', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontSize: 12 } }, report));
+        report && h('div', { style: { marginTop: 8, padding: '10px 12px', borderRadius: 10, border: '1px solid ' + dswTheme.border, background: dswTheme.layer } },
+          h(RichMarkdown, { text: report })));
     }
 
     function ensureTaskBoardStyles() {
@@ -2218,6 +2659,7 @@ window.__ModuleLoader__.load({
         '.mtb-att-card{display:inline-flex;align-items:center;gap:8px;padding:5px 9px;border-radius:9px;border:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 16%,transparent));background:var(--dsw-alias-bg-base,transparent);font-size:11.5px;max-width:240px}',
         '.mtb-att-thumb{width:34px;height:34px;border-radius:6px;object-fit:cover;flex-shrink:0;border:1px solid var(--dsw-alias-border-l1,transparent)}',
         '.mtb-exec-row{display:grid;gap:4px;padding:8px 10px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1,color-mix(in srgb,currentColor 10%,transparent));background:var(--dsw-alias-bg-base,transparent);font-size:11.5px}',
+        '.mtb-review-panel{display:grid;gap:9px;padding:12px 14px;border-radius:12px;border:1px solid color-mix(in srgb,#8b5cf6 42%,transparent);background:color-mix(in srgb,#8b5cf6 9%,var(--dsw-alias-bg-layer-2,transparent))}',
         '.mtb-archive-grid{flex:1;min-height:0;overflow:auto;padding:16px 20px;display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:10px;align-content:start}',
       ].join('\n');
       document.head.appendChild(style);
@@ -2362,6 +2804,8 @@ window.__ModuleLoader__.load({
       const [orchestrationMode, setOrchestrationMode] = React.useState('plain');
 
       const [confirmId, setConfirmId] = React.useState('');
+      const [drawerReviseNote, setDrawerReviseNote] = React.useState('');
+      React.useEffect(() => { ensureTaskRoomStyles(); }, []);
       const [dragTaskId, setDragTaskId] = React.useState('');
       const [dropCol, setDropCol] = React.useState('');
       const [compactCards, setCompactCards] = React.useState(false);
@@ -2927,6 +3371,47 @@ window.__ModuleLoader__.load({
         finally { setBusy(false); setDragTaskId(''); setDropCol(''); }
       };
 
+      const confirmReview = async (task, applyPatch = false, noteText = '') => {
+        if (busy || !task) return;
+        setBusy(true);
+        setError('');
+        setNotice('');
+        try {
+          const result = await fetchJson('marshal/tasks/confirm-review', {
+            taskId: task.id,
+            applyPatch,
+            ...(noteText.trim() ? { note: noteText.trim() } : {}),
+          }, Boolean(task.workflow || task.taskRoom));
+          setTasks(result.tasks || []);
+          setDrawerReviseNote('');
+          setNotice(result.patchApplied
+            ? '已将隔离开发补丁应用到工作区并确认工单完成。'
+            : result.patchAlreadyApplied
+              ? '补丁已在工作区生效，工单已确认完成。'
+              : '工单已确认验收完成并归档。');
+        }
+        catch (e) { setError('确认完成失败：' + (e.message || e)); }
+        finally { setBusy(false); }
+      };
+
+      const reviseTaskFromBoard = async (task, noteText = '') => {
+        if (busy || !task) return;
+        setBusy(true);
+        setError('');
+        setNotice('');
+        try {
+          const result = await fetchJson('marshal/tasks/revise', {
+            taskId: task.id,
+            ...(noteText.trim() ? { text: noteText.trim() } : {}),
+          }, Boolean(task.workflow || task.taskRoom || task.workspaceId));
+          setTasks(result.tasks || []);
+          setDrawerReviseNote('');
+          setNotice('已将补充意见同步至工单群并启动继续执行。');
+        }
+        catch (e) { setError('继续执行失败：' + (e.message || e)); }
+        finally { setBusy(false); }
+      };
+
       const updateTask = async (task, patch) => {
         if (busy || !task) return false;
         setBusy(true);
@@ -3099,6 +3584,7 @@ window.__ModuleLoader__.load({
         const workflow = task.workflow;
         const step = workflow?.state === 'handed-off' ? '已交给 Leader'
           : workflow?.state === 'permission-blocked' ? '权限受阻 · 待确认'
+          : workflow?.state === 'review-blocked' ? '审查待裁决 · 待确认'
           : workflow?.state === 'interrupted' ? '运行中断'
           : taskPhases[workflow?.phase];
         const isRunning = task.status === 'running' || task.openExecution === true || workflow?.state === 'running';
@@ -3177,8 +3663,16 @@ window.__ModuleLoader__.load({
                 type: 'button',
                 className: 'mtb-icon-pill mtb-icon-pill-confirm',
                 disabled: busy,
-                title: '确认验收完成并移入已完成',
-                onClick: event => { event.stopPropagation(); void move(task, 'done'); },
+                title: task.patchAvailable ? '打开确认面板选择是否将补丁应用到工作区' : '确认验收完成并移入已完成',
+                onClick: event => {
+                  event.stopPropagation();
+                  if (task.patchAvailable) {
+                    setSelectedId(task.id);
+                    setNotice('此工单包含隔离开发补丁，请在右侧详情面板选择「应用补丁并完成」或「仅确认完成」。');
+                  } else {
+                    void confirmReview(task, false);
+                  }
+                },
               }, '✓ 确认'),
               h('button', {
                 type: 'button',
@@ -3243,6 +3737,7 @@ window.__ModuleLoader__.load({
           : templateName ?? (workflow?.choice === 'leader' ? '由 Leader 决定' : '编排任务');
         const step = workflow?.state === 'handed-off' ? '已交给 Leader'
           : workflow?.state === 'permission-blocked' ? '权限受阻 · 待确认'
+          : workflow?.state === 'review-blocked' ? '审查待裁决 · 待确认'
           : workflow?.state === 'interrupted' ? '运行中断，可重试'
           : taskPhases[workflow?.phase];
         const isRunning = task.status === 'running' || task.openExecution === true || workflow?.state === 'running';
@@ -3309,7 +3804,39 @@ window.__ModuleLoader__.load({
               !archived && !isRunning && h('button', { type: 'button', className: 'mtb-btn', onClick: () => setDrawerEditing(v => !v) }, drawerEditing ? '取消编辑' : '编辑'),
               h('button', { type: 'button', className: 'mtb-icon-btn', 'aria-label': '关闭详情', onClick: () => { setSelectedId(''); setConfirmId(''); setDrawerEditing(false); } }, '✕')),
             h('div', { className: 'mtb-drawer-body' },
-              drawerAmbiguity && h('div', { className: 'mtb-warn-hint' },
+              !archived && task.status === 'review' && (() => {
+                const reviewMeta = describeReviewState(task, workflow, drawerAmbiguity, needsPermConfirm);
+                return h('div', { className: 'mtb-review-panel' },
+                  h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' } },
+                    h('strong', { style: { fontSize: 12.5, color: '#a78bfa' } }, reviewMeta.badge),
+                    task.patchAvailable && h('span', { style: { fontSize: 11, padding: '2px 8px', borderRadius: 999, background: 'color-mix(in srgb, #06b6d4 16%, transparent)', color: '#06b6d4' } }, '含待落盘代码补丁')),
+                  h('div', { style: { fontSize: 12, color: dswTheme.dim } }, h(RichMarkdown, { text: reviewMeta.summary })),
+                  h('textarea', {
+                    value: drawerReviseNote,
+                    onChange: e => setDrawerReviseNote(e.target.value),
+                    rows: 2,
+                    placeholder: '可选：填写裁决结论、调整方向或验收备注（点「继续修正」会写入工单群并驱动智能体按此意见执行）…',
+                    style: { ...uiInput, resize: 'vertical', lineHeight: 1.5 },
+                  }),
+                  h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 8 } },
+                    task.patchAvailable && h('button', {
+                      type: 'button', className: 'mtb-btn mtb-btn-confirm', disabled: busy,
+                      onClick: () => { void confirmReview(task, true, drawerReviseNote); },
+                    }, '✓ 应用补丁到工作区并完成'),
+                    h('button', {
+                      type: 'button', className: task.patchAvailable ? 'mtb-btn' : 'mtb-btn mtb-btn-confirm', disabled: busy,
+                      onClick: () => { void confirmReview(task, false, drawerReviseNote); },
+                    }, task.patchAvailable ? '仅确认完成（不写工作区）' : '✓ 确认验收完成'),
+                    h('button', {
+                      type: 'button', className: 'mtb-btn mtb-btn-accent', disabled: busy,
+                      onClick: () => { void reviseTaskFromBoard(task, drawerReviseNote); },
+                    }, '↻ 按意见继续执行'),
+                    h('button', {
+                      type: 'button', className: 'mtb-btn',
+                      onClick: () => { setSelectedId(''); openTaskRoom?.(task); },
+                    }, '去工单群讨论')));
+              })(),
+              drawerAmbiguity && task.status !== 'review' && h('div', { className: 'mtb-warn-hint' },
                 '⚠ ' + drawerAmbiguity + ' 点右上角「编辑」补充后可点击下方「移回待办」继续执行。'),
               needsPermConfirm && h('div', { className: 'mtb-warn-hint', style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 } },
                 h('span', null, '此卡片权限（' + permLabel + '）高于默认基线，运行前需人工确认。'),
@@ -3495,7 +4022,7 @@ window.__ModuleLoader__.load({
                 workflow.reportId && h(TaskReviewReport, { key: workflow.reportId, taskId: task.id, development: Boolean(workflow.development) }))),
 
             h('div', { className: 'mtb-drawer-foot' },
-              !archived && task.status === 'review' && canMove && h('button', { type: 'button', className: 'mtb-btn mtb-btn-confirm', disabled: busy, onClick: () => { void move(task, 'done'); } }, '确认完成'),
+              !archived && task.status === 'review' && canMove && h('button', { type: 'button', className: 'mtb-btn mtb-btn-confirm', disabled: busy, onClick: () => { void confirmReview(task, Boolean(task.patchAvailable), drawerReviseNote); } }, task.patchAvailable ? '应用补丁并完成' : '确认完成'),
               !archived && task.status === 'review' && canMove && h('button', { type: 'button', className: 'mtb-btn', disabled: busy, onClick: () => { void move(task, 'todo'); } }, '移回待办'),
               !archived && !task.taskRoom?.closed && task.status !== 'running' && (!workflow || workflow.state !== 'done') && h('button', { type: 'button', disabled: busy, className: 'mtb-btn mtb-btn-accent', onClick: () => { void run(task); } }, workflow?.state === 'failed' || workflow?.state === 'interrupted' ? '重试' : '运行'),
               !archived && isRunning && !workflow && h('button', { type: 'button', className: 'mtb-btn', disabled: busy, onClick: () => { void settleTask(task); } }, '终止运行'),
@@ -3858,11 +4385,16 @@ window.__ModuleLoader__.load({
       const [notice, setNotice] = React.useState('');
       const [error, setError] = React.useState('');
       const [busy, setBusy] = React.useState(false);
+      const [sendingChat, setSendingChat] = React.useState(false);
       const [leader, setLeader] = React.useState('');
       const [remote, setRemote] = React.useState('');
       const [draft, setDraft] = React.useState('');
       const cursor = React.useRef(0);
       const selection = React.useRef('');
+      const streamRef = React.useRef(null);
+      const inputRef = React.useRef(null);
+      const stickBottomRef = React.useRef(true);
+      const prevLastSeqRef = React.useRef(0);
       const viewKey = workspace + '/' + id;
       selection.current = viewKey;
       const prefix = 'marshal/task-rooms/';
@@ -3871,6 +4403,7 @@ window.__ModuleLoader__.load({
       const loadList = () => workspace ? fetchJson(prefix + 'list' + query({ workspaceId: workspace }), undefined, true) : Promise.resolve({ rooms: [] });
 
       React.useEffect(() => {
+        ensureTaskRoomStyles();
         let alive = true;
         void fetchJson(prefix + 'workspaces', undefined, true).then(data => {
           if (!alive) return;
@@ -3882,6 +4415,7 @@ window.__ModuleLoader__.load({
           .then(data => { if (alive) setLeaders(data.leaders ?? []); }).catch(() => {});
         return () => { alive = false; };
       }, []);
+
       React.useEffect(() => {
         let alive = true;
         setRooms([]);
@@ -3889,10 +4423,12 @@ window.__ModuleLoader__.load({
         void loadList().then(data => {
           if (!alive) return;
           setRooms(data.rooms);
+          if (!id && data.rooms?.length > 0 && !task) setId(data.rooms[0].id);
           setNotice(data.hubError ? 'Hub 群聊暂不可读取。' : '');
         }).catch(e => { if (alive) setError(e.message); });
         return () => { alive = false; };
       }, [workspace]);
+
       const mergePage = (data, key) => {
         if (selection.current !== key) return;
         cursor.current = Math.max(cursor.current, data.records.at(-1)?.seq ?? 0);
@@ -3902,6 +4438,7 @@ window.__ModuleLoader__.load({
           return { ...data, key, records: [...records.values()].sort((a, b) => a.seq - b.seq) };
         });
       };
+
       const failedRead = (e, key) => {
         if (selection.current !== key) return;
         if (['forbidden', 'workspace-forbidden', 'unauthorized', 'task-room-not-found'].includes(e.code)) {
@@ -3910,8 +4447,11 @@ window.__ModuleLoader__.load({
         }
         setError(e.message);
       };
+
       React.useEffect(() => {
         cursor.current = 0;
+        prevLastSeqRef.current = 0;
+        stickBottomRef.current = true;
         setView(null);
         setPeers([]);
         setDraft('');
@@ -3930,11 +4470,25 @@ window.__ModuleLoader__.load({
           finally { inFlight = false; }
         };
         void load();
-        const timer = setInterval(load, 2500);
+        const timer = setInterval(load, 2200);
         return () => { alive = false; clearInterval(timer); };
       }, [id, workspace]);
+
       const visible = view?.key === viewKey ? view : null;
       const room = visible?.room;
+      const lastSeq = visible?.records?.at(-1)?.seq ?? 0;
+
+      React.useEffect(() => {
+        const el = streamRef.current;
+        if (!el || !lastSeq) return;
+        if (stickBottomRef.current || prevLastSeqRef.current === 0) {
+          requestAnimationFrame(() => {
+            if (streamRef.current) streamRef.current.scrollTop = streamRef.current.scrollHeight;
+          });
+        }
+        prevLastSeqRef.current = lastSeq;
+      }, [lastSeq, sendingChat]);
+
       React.useEffect(() => {
         if (!visible?.origin) return;
         let alive = true;
@@ -3955,90 +4509,316 @@ window.__ModuleLoader__.load({
         catch (e) { setError(e.message); }
         finally { setBusy(false); }
       };
+
+      // Lifecycle actions (confirm, revise, close, reopen, retry, reassign)
       const act = async (action, data = {}) => {
         if (!room || busy) return;
         setBusy(true);
         setError('');
+        setNotice('');
         const key = viewKey;
         try {
-          await fetchJson(prefix + 'action', { roomId: room.id, action, ...data }, true);
-          if (action === 'send' && selection.current === key) setDraft('');
+          const res = await fetchJson(prefix + 'action', { roomId: room.id, action, ...data }, true);
+          if (action === 'revise' && selection.current === key) {
+            setDraft('');
+            setNotice('已按群内最新讨论启动继续执行。');
+          } else if (action === 'confirm' && selection.current === key) {
+            setDraft('');
+            setNotice(res.patchApplied ? '已将补丁应用到工作区并确认工单完成。' : '已确认验收完成并归档。');
+          }
+          stickBottomRef.current = true;
           mergePage(await fetchJson(url + '&after=' + cursor.current, undefined, true), key);
         }
         catch (e) { failedRead(e, key); }
         finally { setBusy(false); }
       };
+
+      // Non-blocking live chat send: works at ANY time (even while workflow is running or room was closed!)
+      const sendChat = async () => {
+        const messageText = draft.trim();
+        if (!room || !messageText || sendingChat) return;
+        setSendingChat(true);
+        setError('');
+        const key = viewKey;
+        try {
+          if (room.closed) {
+            await fetchJson(prefix + 'action', { roomId: room.id, action: 'reopen' }, true);
+          }
+          setDraft('');
+          stickBottomRef.current = true;
+          await fetchJson(prefix + 'action', { roomId: room.id, action: 'send', text: messageText }, true);
+          mergePage(await fetchJson(url + '&after=' + cursor.current, undefined, true), key);
+        }
+        catch (e) {
+          if (selection.current === key) setDraft(prev => prev || messageText);
+          failedRead(e, key);
+        }
+        finally { setSendingChat(false); }
+      };
+
+      const insertMention = name => {
+        const token = '@' + name + ' ';
+        setDraft(cur => (cur.includes('@' + name) ? cur : (cur ? cur.replace(/\s*$/, ' ') + token : token)));
+        requestAnimationFrame(() => inputRef.current?.focus());
+      };
+
       const older = async () => {
         if (!visible?.records[0] || busy) return;
         setBusy(true);
+        stickBottomRef.current = false;
         try { mergePage(await fetchJson(url + '&before=' + visible.records[0].seq, undefined, true), viewKey); }
         catch (e) { failedRead(e, viewKey); }
         finally { setBusy(false); }
       };
+
       const button = (label, onClick, disabled = false, primary = false) =>
-        h('button', { type: 'button', style: uiButton(primary), onClick, disabled }, label);
+        h('button', { type: 'button', style: { ...uiButton(primary), opacity: disabled ? .52 : 1 }, onClick, disabled }, label);
+
       const downloadPatch = record => {
-        const url = URL.createObjectURL(new Blob([record.text], { type: 'text/x-diff' }));
+        const blobUrl = URL.createObjectURL(new Blob([record.text], { type: 'text/x-diff' }));
         const link = document.createElement('a');
-        link.href = url;
+        link.href = blobUrl;
         link.download = 'development-' + (record.ref?.slice(0, 12) ?? record.seq) + '.patch';
         link.click();
-        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
       };
-      const runLabel = { start: '首次运行', retry: '重试', reassign: '改派', conversation: '群聊开始' };
+
+      const runLabel = { start: '首次运行', retry: '重试运行', reassign: '改派执行', revise: '按意见修正', conversation: '群聊讨论', 'auto-dispatch': '自动派单', backfill: '历史补记' };
       const controlsLocked = busy || visible?.busy === true;
-      return h('section', { 'aria-label': '工单群', style: { display: 'flex', flex: 1, minHeight: 0, width: '100%', background: dswTheme.bg } },
-        h('aside', { style: { width: 'min(30%, 260px)', flexShrink: 0, padding: 14, overflowY: 'auto', borderRight: '1px solid ' + dswTheme.border } },
-          h('h2', { style: { fontSize: 15, margin: '0 0 12px' } }, '工单群'),
+      const chatLocked = sendingChat || visible?.chatBusy === true;
+      const participants = Array.isArray(visible?.participants) ? visible.participants : [];
+      const colorMap = React.useMemo(() => buildRoomColorMap(visible?.records, participants), [visible?.records, participants]);
+      const roleOfActor = actorName => participants.find(p => p.name === actorName)?.role || '';
+      const isInReview = Boolean(visible?.origin && !room?.closed && (visible?.cardStatus === 'review' || visible?.runState === 'review-blocked'));
+      const isWorkflowRunning = visible?.runState === 'running' || visible?.cardStatus === 'running';
+
+      const renderRecord = record => {
+        const timeStr = new Date(record.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        // 1) Batch / Closed / Reopened -> compact centered timeline pill
+        if (record.kind === 'batch' || record.kind === 'closed' || record.kind === 'reopened') {
+          const badge = record.kind === 'batch'
+            ? '── 批次 ' + (record.runId?.slice(0, 8) ?? '') + ' · ' + (runLabel[record.phase] ?? record.phase ?? '运行') + (record.text ? ' · ' + record.text : '') + ' ──'
+            : (record.kind === 'closed' ? '✓ ' : '↻ ') + record.text;
+          return h('div', { key: record.seq, className: 'mtr-sys-row' },
+            h('span', { className: 'mtr-sys-pill', title: new Date(record.at).toLocaleString() }, badge));
+        }
+
+        // 2) Initial auto-injected ticket brief -> clean collapsible summary card
+        if (record.kind === 'user' && record.phase === 'brief') {
+          return h('details', { key: record.seq, className: 'mtr-brief-card', open: (visible?.records?.length ?? 0) <= 6 },
+            h('summary', { style: { cursor: 'pointer', fontWeight: 600, fontSize: 12, color: dswTheme.dim } },
+              '📋 工单原始需求说明 · ' + timeStr),
+            h('div', { style: { marginTop: 8 } }, h(RichMarkdown, { text: record.text, phase: record.phase })));
+        }
+
+        // 3) Human operator message -> right-aligned bubble
+        if (record.kind === 'user') {
+          const phaseHint = record.phase === 'steering' ? '运行中插话'
+            : record.phase === 'revision' ? '补充修正意见'
+              : record.phase === 'confirm' ? '验收备注' : '';
+          return h('div', { key: record.seq, className: 'mtr-msg-row', 'data-side': 'right' },
+            h('span', {
+              className: 'mtr-avatar',
+              style: {
+                background: 'color-mix(in srgb, var(--dsw-alias-brand-primary, #4f46e5) 24%, transparent)',
+                color: 'var(--dsw-alias-brand-primary, #6366f1)',
+                border: '1px solid color-mix(in srgb, var(--dsw-alias-brand-primary, #6366f1) 42%, transparent)',
+              },
+            }, '我'),
+            h('div', { className: 'mtr-msg-col' },
+              h('div', { className: 'mtr-msg-meta' },
+                h('strong', { style: { color: dswTheme.text } }, '我'),
+                phaseHint && h('span', { className: 'mtr-role-badge' }, phaseHint),
+                h('span', null, timeStr)),
+              h('div', { className: 'mtr-bubble mtr-bubble-user' },
+                h(RichMarkdown, { text: record.text, phase: record.phase }))));
+        }
+
+        // 4) Development patch card
+        if (record.phase === 'development-patch') {
+          const fileCount = (record.text.match(/^diff --git /gm) || []).length;
+          return h('div', { key: record.seq, className: 'mtr-patch-card' },
+            h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' } },
+              h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 12.5, fontWeight: 600 } },
+                '📦 隔离工作树代码补丁',
+                fileCount > 0 && h('span', { style: uiMuted }, fileCount + ' 个文件变更'),
+                record.ref && h('code', { className: 'mtr-inline-code' }, record.ref.slice(0, 10))),
+              h('div', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
+                h('span', { style: uiMuted }, timeStr),
+                button('下载 .patch', () => downloadPatch(record)))),
+            h('details', { style: { marginTop: 8 } },
+              h('summary', { style: { cursor: 'pointer', fontSize: 12, color: dswTheme.dim } }, '展开查看 Git Diff 补丁明细'),
+              h(CodeFenceBlock, { language: 'diff', code: record.text })));
+        }
+
+        // 5) Assignment configuration card or short Marshal status pill
+        if (record.kind === 'status') {
+          if (record.phase === 'assignment') {
+            return h('div', { key: record.seq, className: 'mtr-brief-card' },
+              h(RichMarkdown, { text: record.text, phase: 'assignment' }));
+          }
+          const tone = record.phase === 'failed' ? 'danger' : record.phase === 'review' ? 'review' : undefined;
+          const prefixActor = record.actor && record.actor !== 'Marshal' ? record.actor + '：' : '';
+          return h('div', { key: record.seq, className: 'mtr-sys-row' },
+            h('span', { className: 'mtr-sys-pill', 'data-tone': tone, title: new Date(record.at).toLocaleString() },
+              prefixActor + record.text));
+        }
+
+        // 6) Agent speech bubble -> left-aligned with distinct per-agent color!
+        const accent = agentBubbleAccent(record.actor, colorMap);
+        const roleTag = roleOfActor(record.actor);
+        const stageLabel = taskPhases[record.phase] || '';
+        const badgeText = [roleTag, stageLabel].filter(Boolean).join(' · ');
+        return h('div', { key: record.seq, className: 'mtr-msg-row', 'data-side': 'left', style: { '--mtr-agent-c': accent } },
+          h('span', {
+            className: 'mtr-avatar',
+            style: {
+              background: 'color-mix(in srgb, ' + accent + ' 20%, var(--dsw-alias-bg-layer-2, #1f2430))',
+              color: accent,
+              border: '1px solid color-mix(in srgb, ' + accent + ' 40%, transparent)',
+            },
+          }, agentInitial(record.actor)),
+          h('div', { className: 'mtr-msg-col' },
+            h('div', { className: 'mtr-msg-meta' },
+              h('strong', { style: { color: accent, fontSize: 12.5 } }, record.actor),
+              badgeText && h('span', { className: 'mtr-role-badge' }, badgeText),
+              h('span', null, timeStr)),
+            h('div', { className: 'mtr-bubble mtr-bubble-agent' },
+              h(RichMarkdown, { text: record.text, phase: record.phase }))));
+      };
+
+      const localLeaderChoices = leaders.filter(item => item.global || item.workspaceId === workspace);
+      const primaryParticipants = participants.filter(p => p.primary);
+      const mentionTargets = primaryParticipants.length > 0 ? primaryParticipants : participants.slice(0, 6);
+
+      return h('section', { 'aria-label': '工单群', className: 'mtr-shell' },
+        h('aside', { className: 'mtr-side' },
+          h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between' } },
+            h('h2', { style: { fontSize: 15, margin: 0 } }, '工单群'),
+            h('span', { style: uiMuted }, rooms.length + ' 个群')),
           h(Field, { label: '工作区' }, h('select', { value: workspace, style: uiInput,
             onChange: event => { setWorkspace(event.target.value); setId(''); setError(''); } },
             h('option', { value: '' }, '选择工作区'),
             workspaces.map(item => h('option', { key: item.id, value: item.id }, item.name)))),
-          notice && h('p', { style: uiMuted }, notice),
-          rooms.map(item => h('button', { key: item.id, type: 'button', 'aria-pressed': id === item.id,
-            style: { ...uiButton(id === item.id), display: 'block', width: '100%', marginTop: 8, textAlign: 'left', overflowWrap: 'anywhere' },
-            onClick: () => { setError(''); setId(item.id); } }, item.title))),
-        h('main', { style: { display: 'flex', flexDirection: 'column', flex: 1, minWidth: 0, minHeight: 0 } },
-          h('header', { style: { padding: 14, borderBottom: '1px solid ' + dswTheme.border, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' } },
-            button('回任务看板', () => openBoard(visible?.origin ? room?.taskId : task?.id)),
-            h('strong', null, room?.title ?? task?.title ?? '工单群聊'),
-            room && h('span', { style: uiMuted }, (room.storage === 'hub' ? 'Hub 归档' : room.storage === 'moving' ? '转存中' : '原设备归档') + (room.closed ? ' · 已关单' : '')),
-            visible?.origin && button(room.closed ? '重开工单' : '关单归档', () => { void act(room.closed ? 'reopen' : 'close'); }, controlsLocked),
-            visible?.runState === 'interrupted' && h('span', { style: uiMuted }, '上一批次在节点重启时中断'),
-            visible?.origin && button('重试', () => { void act('retry'); }, controlsLocked)),
-          error && h('div', { role: 'alert', style: { padding: '8px 14px', color: dswTheme.danger } }, error),
-          !id && task && h('div', { style: { padding: 14 } }, button('绑定工单群', () => { void bind(); }, !workspace || busy, true)),
-          !room && !task && h('div', { style: { ...uiMuted, padding: 14 } }, '选择工作区和工单可以查看历史。'),
-          room && h('section', { 'aria-label': '群聊记录', style: { padding: 14, flex: 1, minHeight: 0, overflowY: 'auto' } },
-            visible.records[0]?.seq > 1 && button('加载更早消息', () => { void older(); }, busy),
-            visible.records.map(record => h('article', { key: record.seq,
-              style: { borderTop: '1px solid ' + dswTheme.border, padding: '10px 0', marginTop: 6 } },
-              h('div', { style: uiMuted }, [
-                record.kind === 'batch' ? '批次 ' + (record.runId?.slice(0, 8) ?? '') + ' · ' + (runLabel[record.phase] ?? record.phase) : record.actor,
-                record.kind !== 'batch' ? taskPhases[record.phase] : undefined,
-                new Date(record.at).toLocaleString(),
-              ].filter(Boolean).join(' · ')),
-              record.phase === 'development-patch'
-                ? h('details', null, h('summary', null, '查看固定补丁'), button('下载补丁', () => downloadPatch(record)),
-                    h('pre', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' } }, record.text))
-                : h('div', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', marginTop: 4 } }, record.text)))),
-          visible?.origin && h('footer', { style: { padding: 12, borderTop: '1px solid ' + dswTheme.border, display: 'grid', gap: 8 } },
-            h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6 } },
-              h('select', { 'aria-label': '改派 Leader', value: leader, style: uiInput, onChange: event => { setLeader(event.target.value); setRemote(''); } },
-                h('option', { value: '' }, '选择本机 Leader'),
-                leaders.filter(item => item.workspaceId === workspace).map(item => h('option', { key: item.id, value: item.id }, item.name))),
-              peers.length > 0 && h('select', { 'aria-label': '改派到其它设备', value: remote, style: uiInput,
-                onChange: event => { setRemote(event.target.value); setLeader(''); } },
-                h('option', { value: '' }, '选择跨设备 Agent'),
-                peers.flatMap(peer => peer.models.map(model => h('option',
-                  { key: peer.id + '/' + model.id, value: JSON.stringify({ deviceId: peer.id, modelId: model.id }) },
-                  peer.name + ' · ' + model.agent + ' · ' + model.model)))),
-              button('改派并运行', () => { void act('reassign', remote ? { remote: JSON.parse(remote) } : { leaderId: leader }); },
-                controlsLocked || (!leader && !remote))),
-            !room.closed && h('div', { style: { display: 'flex', alignItems: 'flex-end', gap: 8 } },
-              h('textarea', { 'aria-label': '工单群消息', value: draft, onChange: event => setDraft(event.target.value), rows: 2,
-                placeholder: '发给当前负责人', style: { ...uiInput, flex: 1, resize: 'vertical' } }),
-              button('发送', () => { void act('send', { text: draft }); }, controlsLocked || !draft.trim(), true)))));
+          notice && !room && h('p', { style: uiMuted }, notice),
+          rooms.length === 0 && workspace && h('p', { style: { ...uiMuted, margin: '8px 2px' } }, '该工作区暂无工单群记录。'),
+          rooms.map(item => h('button', {
+            key: item.id,
+            type: 'button',
+            className: 'mtr-room-item',
+            'aria-pressed': id === item.id,
+            'data-active': id === item.id ? 'true' : undefined,
+            onClick: () => { setError(''); setNotice(''); setId(item.id); },
+          },
+            h('span', { style: { fontSize: 12.5, fontWeight: id === item.id ? 600 : 500, overflowWrap: 'anywhere', lineHeight: 1.4 } }, item.title),
+            h('span', { style: { fontSize: 11, color: dswTheme.faint } }, (item.closed ? '已归档' : '活跃中') + ' · ' + (item.lastSeq || 0) + ' 条记录')))),
+
+        h('main', { className: 'mtr-main' },
+          h('header', { className: 'mtr-header' },
+            button('← 回任务看板', () => openBoard(visible?.origin ? room?.taskId : task?.id)),
+            h('strong', { style: { fontSize: 14, flex: 1, minWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
+              room?.title ?? task?.title ?? '工单群聊'),
+            isWorkflowRunning && h('span', { style: { fontSize: 11.5, color: '#3b82f6', fontWeight: 600 } }, '● 编排执行中（可随时发言参与讨论）'),
+            isInReview && h('span', { style: { fontSize: 11.5, color: '#a78bfa', fontWeight: 600 } }, '● 待确认'),
+            room && h('span', { style: uiMuted }, (room.storage === 'hub' ? 'Hub 归档' : room.storage === 'moving' ? '转存中' : '本机归档') + (room.closed ? ' · 已关单' : '')),
+            visible?.runState === 'interrupted' && h('span', { style: { fontSize: 11.5, color: '#f59e0b' } }, '上次运行已中断'),
+            visible?.origin && room && button(room.closed ? '重开工单' : '关单归档', () => { void act(room.closed ? 'reopen' : 'close'); }, controlsLocked),
+            visible?.origin && room && !isWorkflowRunning && button('重跑编排', () => { void act('retry'); }, controlsLocked)),
+
+          error && h('div', { role: 'alert', style: { padding: '8px 18px', fontSize: 12, color: dswTheme.danger, borderBottom: '1px solid ' + dswTheme.border } }, error),
+          notice && room && h('div', { role: 'status', style: { padding: '7px 18px', fontSize: 12, color: '#10b981', borderBottom: '1px solid ' + dswTheme.border } }, notice),
+
+          isInReview && (() => {
+            const reviewMeta = describeReviewState(task, visible?.workflow, '', false);
+            return h('div', { className: 'mtr-review-bar' },
+              h('div', { style: { display: 'grid', gap: 3, flex: '1 1 260px', minWidth: 0 } },
+                h('strong', { style: { fontSize: 12.5, color: '#a78bfa' } }, reviewMeta.badge),
+                h('span', { style: { fontSize: 12, color: dswTheme.dim, overflowWrap: 'anywhere' } }, reviewMeta.summary)),
+              h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' } },
+                visible?.patchAvailable && button('✓ 应用补丁到工作区并完成', () => { void act('confirm', { applyPatch: true, ...(draft.trim() ? { note: draft.trim() } : {}) }); }, busy, true),
+                button(visible?.patchAvailable ? '仅确认完成' : '✓ 确认验收完成', () => { void act('confirm', { applyPatch: false, ...(draft.trim() ? { note: draft.trim() } : {}) }); }, busy, !visible?.patchAvailable),
+                button('↻ 按群内意见继续执行', () => { void act('revise', draft.trim() ? { text: draft.trim() } : {}); }, busy)));
+          })(),
+
+          !id && task && h('div', { style: { padding: 18 } }, button('开启此工单群聊', () => { void bind(); }, !workspace || busy, true)),
+          !room && !task && h('div', { style: { ...uiMuted, padding: 24, margin: 'auto', textAlign: 'center' } }, '从左侧选择一个工单群，即可查看智能体协作过程并随时参与讨论。'),
+
+          room && h('section', {
+            ref: streamRef,
+            'aria-label': '群聊记录',
+            className: 'mtr-stream',
+            onScroll: event => {
+              const el = event.currentTarget;
+              stickBottomRef.current = (el.scrollHeight - el.scrollTop - el.clientHeight) < 80;
+            },
+          },
+            visible.records[0]?.seq > 1 && h('div', { className: 'mtr-sys-row' }, button('↑ 加载更早消息', () => { void older(); }, busy)),
+            visible.records.length === 0 && h('div', { style: { ...uiMuted, margin: 'auto', textAlign: 'center', lineHeight: 1.8 } },
+              '工单群已就绪，还没有消息。', h('br'), '您可以直接在下方输入要求、@指定角色讨论，或点击「按意见继续执行」启动编排。'),
+            visible.records.map(renderRecord),
+            sendingChat && h('div', { className: 'mtr-msg-row', 'data-side': 'left' },
+              h('span', { className: 'mtr-avatar', style: { background: 'color-mix(in srgb, currentColor 12%, transparent)', fontSize: 12 } }, '…'),
+              h('div', { className: 'mtr-msg-col' },
+                h('div', { className: 'mtr-bubble mtr-bubble-agent', style: { opacity: .75, fontSize: 12 } }, '正在结合工单上下文生成回复…')))),
+
+          visible?.origin && room && h('footer', { className: 'mtr-composer' },
+            h('div', { className: 'mtr-chip-row' },
+              h('span', { style: { fontSize: 11, color: dswTheme.faint } }, '点按 @角色讨论：'),
+              mentionTargets.map(member => {
+                const c = agentBubbleAccent(member.name, colorMap);
+                return h('button', {
+                  key: member.id,
+                  type: 'button',
+                  className: 'mtr-mention-chip',
+                  style: { '--mtr-chip-c': c },
+                  onClick: () => insertMention(member.name),
+                },
+                  h('span', { style: { color: c, fontWeight: 600 } }, '@' + member.name),
+                  member.role && h('span', { style: { opacity: .72 } }, '· ' + member.role));
+              }),
+              mentionTargets.length > 1 && h('button', {
+                type: 'button',
+                className: 'mtr-mention-chip',
+                onClick: () => insertMention('全体'),
+              }, '@全体'),
+              room.closed && h('span', { style: { fontSize: 11, color: '#f59e0b', marginLeft: 'auto' } }, '工单已归档，发送消息将自动重开讨论')),
+
+            h('div', { style: { display: 'flex', alignItems: 'flex-end', gap: 8 } },
+              h('textarea', {
+                ref: inputRef,
+                'aria-label': '工单群消息',
+                value: draft,
+                onChange: event => setDraft(event.target.value),
+                onKeyDown: event => {
+                  if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+                    event.preventDefault();
+                    void sendChat();
+                  }
+                },
+                rows: 2,
+                placeholder: isWorkflowRunning
+                  ? '编排运行中也可随时发言讨论或补充指示（⌘/Ctrl+Enter 发送讨论；点「按意见继续执行」立即中断并按新意见重跑）…'
+                  : '输入问题或修正意见（不 @ 默认由 Leader 回复；⌘/Ctrl+Enter 发送讨论）…',
+                style: { ...uiInput, flex: 1, resize: 'vertical', lineHeight: 1.55, minHeight: 46 },
+              }),
+              h('div', { style: { display: 'flex', gap: 6, flexShrink: 0 } },
+                button(chatLocked ? '发送中…' : '发送讨论', () => { void sendChat(); }, chatLocked || !draft.trim(), true),
+                button(isWorkflowRunning ? '↻ 中断并按意见重跑' : '↻ 按意见继续执行', () => { void act('revise', draft.trim() ? { text: draft.trim() } : {}); }, busy))),
+
+            (localLeaderChoices.length > 0 || peers.length > 0) && h('details', { style: { fontSize: 11.5 } },
+              h('summary', { style: { cursor: 'pointer', color: dswTheme.faint, userSelect: 'none' } }, '高级操作：改派负责 Leader 或跨设备调度'),
+              h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 6 } },
+                h('select', { 'aria-label': '改派 Leader', value: leader, style: { ...uiInput, width: 'auto', minWidth: 160 }, onChange: event => { setLeader(event.target.value); setRemote(''); } },
+                  h('option', { value: '' }, '选择本机 Leader'),
+                  localLeaderChoices.map(item => h('option', { key: item.id, value: item.id }, item.name + (item.global ? '（全局）' : '')))),
+                peers.length > 0 && h('select', { 'aria-label': '改派到其它设备', value: remote, style: { ...uiInput, width: 'auto', minWidth: 200 },
+                  onChange: event => { setRemote(event.target.value); setLeader(''); } },
+                  h('option', { value: '' }, '选择跨设备 Agent'),
+                  peers.flatMap(peer => peer.models.map(model => h('option',
+                    { key: peer.id + '/' + model.id, value: JSON.stringify({ deviceId: peer.id, modelId: model.id }) },
+                    peer.name + ' · ' + model.agent + ' · ' + model.model)))),
+                button('改派并运行', () => { void act('reassign', remote ? { remote: JSON.parse(remote) } : { leaderId: leader }); },
+                  controlsLocked || (!leader && !remote)))))));
     }
 
     function AgentsPage({ onOpenChats, onOpenMemory, openSession, workspaceService, initialSubTab = 'pool' }) {

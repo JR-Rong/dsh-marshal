@@ -232,7 +232,7 @@ export function createDispatcher(options) {
             // and the bridge only records the hand-off.
             const bound = workflowTarget(task.id);
             if (bound !== undefined && typeof workflow?.start === 'function') {
-                if (bound.state === 'done' || bound.state === 'permission-blocked') {
+                if (bound.state === 'done' || bound.state === 'permission-blocked' || bound.state === 'review-blocked') {
                     // A finished workflow is a human decision, not a dispatch failure:
                     // write no record, so moving the card back to todo can retry it.
                     return { ok: false, code: 'workflow-' + bound.state, agentId: bound.agentId, agentName: bound.leaderName };
@@ -530,9 +530,9 @@ export function createDispatcher(options) {
                 try { view = workflow?.view?.(record.taskId) ?? workflowTarget(record.taskId); }
                 catch { view = undefined; }
                 const terminal = task.status === 'review' || task.status === 'done' || task.status === 'failed'
-                    || view?.state === 'done' || view?.state === 'failed' || view?.state === 'permission-blocked';
+                    || view?.state === 'done' || view?.state === 'failed' || view?.state === 'permission-blocked' || view?.state === 'review-blocked';
                 if (terminal) {
-                    const outcome = view?.state === 'permission-blocked' ? 'blocked'
+                    const outcome = view?.state === 'permission-blocked' || view?.state === 'review-blocked' ? 'blocked'
                     : task.status === 'failed' || view?.state === 'failed' ? 'failed' : 'succeeded';
                     stateStore.put(record.taskId, { status: 'settled', delegated: true, outcome, memoryWritten: false });
                     try {

@@ -65,17 +65,17 @@ export function createDiscussionPort(options) {
     let stopped = false;
     const originalCodexHome = process.env.CODEX_HOME ?? join(homedir(), '.codex');
     const binary = resolveCodexBinary({ ...(options.codexExecutable === undefined ? {} : { explicitPath: options.codexExecutable }) });
-    const add = (agent, provider, model, native, efforts) => {
+    const buildEntry = (target, agent, provider, model, native, efforts) => {
         const id = `${agent}:${provider}:${model}`;
-        if (id.length > 128 || catalogModels.size >= 32)
+        if (id.length > 128 || target.size >= 32)
             return;
         const reasoningEfforts = [...new Set((efforts ?? []).filter((v) => typeof v === 'string' && v.length > 0 && v.length <= 32))].slice(0, 12);
-        catalogModels.set(id, { public: { id, agent, provider, model, ...(reasoningEfforts.length ? { reasoningEfforts } : {}), ...(agent === 'codex' ? { work: true } : {}) }, ...(native === undefined ? {} : { native }) });
+        target.set(id, { public: { id, agent, provider, model, ...(reasoningEfforts.length ? { reasoningEfforts } : {}), ...(agent === 'codex' ? { work: true } : {}) }, ...(native === undefined ? {} : { native }) });
     };
     const catalog = async () => {
         if (stopped)
             return [];
-        catalogModels.clear();
+        const next = new Map();
         if (options.llm !== undefined && (options.agents ?? ['dsh']).includes('dsh')) {
             for (const { id: provider } of options.llm.listProviders()) {
                 try {
@@ -85,7 +85,7 @@ export function createDiscussionPort(options) {
                             efforts = (await options.llm.resolveModelInfo?.(provider, m.id))?.reasoning?.efforts.map(e => e.id) ?? [];
                         }
                         catch { /* no verified levels */ }
-                        add('dsh', provider, m.id, undefined, efforts);
+                        buildEntry(next, 'dsh', provider, m.id, undefined, efforts);
                     }
                 }
                 catch { /* unavailable route is omitted */ }
@@ -96,11 +96,16 @@ export function createDiscussionPort(options) {
                 const data = JSON.parse(readFileSync(join(originalCodexHome, 'models_cache.json'), 'utf8'));
                 for (const m of (Array.isArray(data.models) ? data.models : []).filter((m) => m.visibility === 'list').slice(0, 8)) {
                     if (typeof m.slug === 'string')
-                        add('codex', 'openai', m.slug, m, Array.isArray(m.supported_reasoning_levels) ? m.supported_reasoning_levels.map((e) => e.effort) : []);
+                        buildEntry(next, 'codex', 'openai', m.slug, m, Array.isArray(m.supported_reasoning_levels) ? m.supported_reasoning_levels.map((e) => e.effort) : []);
                 }
             }
             catch { /* no verified model catalog */ }
         }
+        if (stopped)
+            return [];
+        catalogModels.clear();
+        for (const [k, v] of next)
+            catalogModels.set(k, v);
         // Claude's default model is not a verified exact selection. Its dedicated
         // admission remains unavailable until an authenticated model catalog exists.
         return [...catalogModels.values()].map(item => item.public);
