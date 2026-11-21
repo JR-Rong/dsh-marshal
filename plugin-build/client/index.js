@@ -3118,6 +3118,7 @@ window.__ModuleLoader__.load({
       const [editEffort, setEditEffort] = React.useState('');
       const [editReuseSession, setEditReuseSession] = React.useState(false);
       const [editFreezeGoal, setEditFreezeGoal] = React.useState('');
+      const [editSteerNow, setEditSteerNow] = React.useState(true);
       const [drawerTagDraft, setDrawerTagDraft] = React.useState('');
       const [newSubtaskTitle, setNewSubtaskTitle] = React.useState('');
       const [linkChildId, setLinkChildId] = React.useState('');
@@ -3264,6 +3265,7 @@ window.__ModuleLoader__.load({
           setEditEffort(selectedTask.reasoningEffort || '');
           setEditReuseSession(selectedTask.reuseSession === true);
           setEditFreezeGoal(selectedTask.freeze?.goal || '');
+          setEditSteerNow(true);
           setCronDraft(selectedTask.schedule?.cron || '');
           setCronMode(selectedTask.schedule?.mode === 'once' ? 'once' : 'cron');
           setOnceDraft(selectedTask.schedule?.at ? new Date(selectedTask.schedule.at - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 16) : '');
@@ -3494,7 +3496,7 @@ window.__ModuleLoader__.load({
         setTitle(task.title);
         setDescription(task.description ?? '');
         setFormPrompt(task.prompt ?? '');
-        setFormTags((task.tags ?? []).map(t => t.name));
+        setFormTags((task.tags ?? []).map(t => t.name).filter(n => !n.startsWith('智能体:')));
         setNewTagDraft('');
         setFormParentId(task.parentId ?? '');
         setFormPermission(task.permission ?? '');
@@ -3502,18 +3504,35 @@ window.__ModuleLoader__.load({
         setFormEffort(task.reasoningEffort ?? '');
         setFormReuseSession(task.reuseSession === true);
         setFormAttachments(Array.isArray(task.attachments) ? task.attachments : []);
-        setWorkspaceId(workflow.workspaceId);
-        setLeaderId(workflow.leaderId);
-        setAssignedAgent(workflow.leaderId);
-        setOrchestrationMode(workflow.choice === 'template' ? 'template' : workflow.choice === 'none' ? 'none' : 'leader');
-        setChoice(workflow.choice);
-        const effTpl = workflow.templateId ?? workflow.plan?.templateId ?? 'pr-review';
-        setTemplateId(effTpl);
-        setPrUrl(workflow.prUrl ?? '');
-        const mergedCfg = { ...(workflow.agentConfigs ?? {}), ...(workflow.plan?.agentConfigs ?? {}) };
-        setFormAgentConfigs(mergedCfg);
-        setPlan(workflow.planConfirmed && workflow.plan ? workflow.plan : (workflow.choice !== 'leader' ? buildLocalPlanFor(workflow.choice === 'none' ? 'none' : effTpl, workflow.plan?.codeWork, workflow.leaderId, workflow.workspaceId) : null));
-        setExplicitCode(Boolean(workflow.plan?.codeWork && workflow.plan?.templateId !== 'development'));
+        if (workflow) {
+          setWorkspaceId(workflow.workspaceId);
+          setLeaderId(workflow.leaderId);
+          setAssignedAgent(workflow.leaderId);
+          setOrchestrationMode(workflow.choice === 'template' ? 'template' : workflow.choice === 'none' ? 'none' : 'leader');
+          setChoice(workflow.choice);
+          const effTpl = workflow.templateId ?? workflow.plan?.templateId ?? 'pr-review';
+          setTemplateId(effTpl);
+          setPrUrl(workflow.prUrl ?? '');
+          const mergedCfg = { ...(workflow.agentConfigs ?? {}), ...(workflow.plan?.agentConfigs ?? {}) };
+          setFormAgentConfigs(mergedCfg);
+          setPlan(workflow.planConfirmed && workflow.plan ? workflow.plan : (workflow.choice !== 'leader' ? buildLocalPlanFor(workflow.choice === 'none' ? 'none' : effTpl, workflow.plan?.codeWork, workflow.leaderId, workflow.workspaceId) : null));
+          setExplicitCode(Boolean(workflow.plan?.codeWork && workflow.plan?.templateId !== 'development'));
+        } else {
+          const fallbackWs = task.taskRoom?.workspaceId || (workspaces.length === 1 ? workspaces[0].id : '');
+          const tagAgentName = ((task.tags ?? []).map(t => t.name).find(n => n.startsWith('智能体:')) || '').slice(4);
+          const matchedLeader = (catalog?.leaders ?? []).find(l => l.name === tagAgentName) ?? (catalog?.leaders ?? [])[0];
+          const initWs = fallbackWs || (matchedLeader && !matchedLeader.global ? matchedLeader.workspaceId : '');
+          setWorkspaceId(initWs);
+          setLeaderId(matchedLeader?.id ?? '');
+          setAssignedAgent(matchedLeader?.id ?? '');
+          setOrchestrationMode(matchedLeader ? 'leader' : 'plain');
+          setChoice('leader');
+          setTemplateId('development');
+          setPrUrl('');
+          setFormAgentConfigs({});
+          setPlan(null);
+          setExplicitCode(false);
+        }
         setError('');
         setFormOpen(true);
       };
@@ -3633,9 +3652,41 @@ window.__ModuleLoader__.load({
         setError('');
         setNotice('');
         try {
-          const result = editing
-            ? await fetchJson('marshal/tasks/plan', { taskId: editing, orchestration }, true)
-            : await fetchJson('marshal/tasks/create', {
+          let result;
+          if (editing) {
+            const orig = allTasks.find(item => item.id === editing);
+            const cardPatch = {};
+            if (!orig || title.trim() !== orig.title) cardPatch.title = title.trim();
+            if (!orig || description.trim() !== (orig.description ?? '')) cardPatch.description = description.trim();
+            if (orig && formPrompt.trim() !== (orig.prompt ?? '') && !(formPrompt.trim() === '' && orig.prompt === orig.description)) {
+              cardPatch.prompt = formPrompt.trim() || description.trim() || title.trim();
+            }
+            const origAttSig = (orig?.attachments ?? []).map(a => a.attachmentId).join('|');
+            const nextAttSig = formAttachments.map(a => a.attachmentId).join('|');
+            if (origAttSig !== nextAttSig) {
+              cardPatch.attachments = formAttachments.length > 0 ? formAttachments.map(serializeAttachmentForWire) : null;
+            }
+            if (formPermission && formPermission !== (orig?.permission ?? '')) cardPatch.permission = formPermission;
+            if (formModel !== (orig?.model ?? '')) cardPatch.model = formModel;
+            if (formEffort !== (orig?.reasoningEffort ?? '')) cardPatch.reasoningEffort = formEffort;
+            if (formReuseSession !== (orig?.reuseSession === true)) cardPatch.reuseSession = formReuseSession;
+            const origTagsSig = (orig?.tags ?? []).map(t => t.name).join('|');
+            const nextTagsSig = parsedTags.map(t => t.name).join('|');
+            if (origTagsSig !== nextTagsSig) cardPatch.tags = parsedTags.length > 0 ? parsedTags : null;
+            if (effectiveWorkspace && !orig?.workflow && !orig?.taskRoom) cardPatch.workspaceId = effectiveWorkspace;
+
+            if (Object.keys(cardPatch).length > 0) {
+              result = await fetchJson('marshal/tasks/update', {
+                taskId: editing,
+                ...cardPatch,
+              }, Boolean(orig?.workflow || orig?.taskRoom || effectiveWorkspace));
+            }
+            if (useOrch && orchestration) {
+              result = await fetchJson('marshal/tasks/plan', { taskId: editing, orchestration }, true);
+            }
+            if (!result) result = { tasks: allTasks };
+          } else {
+            result = await fetchJson('marshal/tasks/create', {
               title: title.trim(),
               description: description.trim(),
               ...(formPrompt.trim() ? { prompt: formPrompt.trim() } : {}),
@@ -3649,9 +3700,14 @@ window.__ModuleLoader__.load({
               ...(effectiveWorkspace ? { workspaceId: effectiveWorkspace } : {}),
               ...(orchestration === undefined ? {} : { orchestration }),
             }, Boolean(effectiveWorkspace || orchestration));
+          }
           setTasks(result.tasks || []);
           if (result.movedToReview) {
             setNotice('任务描述较模糊（' + (result.ambiguityReason || '信息尚不明确') + '），已自动转入「待确认」列等待确认。');
+          } else if (editing) {
+            setNotice(result.steered
+              ? '工单修改已保存，并已将更新内容作为插话立即发送给正在运行的 Agent。'
+              : (result.notice || result.configNotice || '工单与编排分工已保存，模型与思考强度变更将在下一轮对话生效。'));
           }
           setTitle('');
           setDescription('');
@@ -3687,7 +3743,7 @@ window.__ModuleLoader__.load({
         try {
           const result = await fetchJson('marshal/tasks/agent-configs', { taskId: task.id, ...patch }, true);
           setTasks(result.tasks || []);
-          setNotice('已保存「' + labelHint + '」的模型与思考模式设置（后续执行与工单群回复立即生效）。');
+          setNotice(result.notice || ('已更新「' + labelHint + '」，工单群已发送变更提示，将在下一轮对话生效。'));
           return true;
         } catch (e) {
           setError('更新智能体配置失败：' + (e.message || e));
@@ -3769,6 +3825,13 @@ window.__ModuleLoader__.load({
         try {
           const result = await fetchJson('marshal/tasks/update', { taskId: task.id, ...patch }, Boolean(task.workflow || task.taskRoom));
           setTasks(result.tasks || []);
+          if (result.steered && result.configNotice) {
+            setNotice('内容已作为实时插话立刻发给运行中的 Agent；' + result.configNotice);
+          } else if (result.steered) {
+            setNotice('工单修改已保存，并已作为实时插话立即发送给正在运行的 Agent。');
+          } else if (result.configNotice) {
+            setNotice(result.configNotice);
+          }
           return true;
         }
         catch (e) { setError('更新卡片失败：' + (e.message || e)); return false; }
@@ -3962,7 +4025,7 @@ window.__ModuleLoader__.load({
           : workflow?.state === 'interrupted' ? '运行中断'
           : taskPhases[workflow?.phase];
         const isRunning = task.status === 'running' || task.openExecution === true || workflow?.state === 'running';
-        const canMove = !busy && !isRunning && !task.taskRoom?.closed;
+        const canMove = !busy && !isRunning;
         const parsedTitle = splitCardTitleKind(task.title);
         const timeAt = task.status === 'running' ? (task.startedAt ?? task.updatedAt ?? task.createdAt)
           : (task.status === 'done' || task.status === 'failed' || task.status === 'review') ? (task.endedAt ?? task.updatedAt ?? task.createdAt)
@@ -4115,7 +4178,7 @@ window.__ModuleLoader__.load({
           : workflow?.state === 'interrupted' ? '运行中断，可重试'
           : taskPhases[workflow?.phase];
         const isRunning = task.status === 'running' || task.openExecution === true || workflow?.state === 'running';
-        const canMove = !busy && !archived && !isRunning && !task.taskRoom?.closed;
+        const canMove = !busy && !archived && !isRunning;
         const permLabel = task.permission ? (TASK_PERMISSION_LABELS[task.permission] ?? task.permission) : '';
         const needsPermConfirm = Boolean(!archived && task.permission && (PERMISSION_RANK[task.permission] ?? 0) > (PERMISSION_RANK[sessionDefaultPerm] ?? 0) && !task.permissionConfirmedAt);
         const currentTagNames = (task.tags ?? []).map(t => t.name);
@@ -4145,17 +4208,42 @@ window.__ModuleLoader__.load({
           const ok = await updateTask(task, { tags: nextNames.map(n => ({ name: n })) });
           if (ok) setDrawerTagDraft('');
         };
+        const openDrawerEditor = () => {
+          if (!drawerEditing) {
+            setEditTitle(task.title || '');
+            setEditDesc(task.description || '');
+            setEditPrompt(task.prompt || '');
+            setEditPerm(task.permission || '');
+            setEditModel(task.model || '');
+            setEditEffort(task.reasoningEffort || '');
+            setEditReuseSession(task.reuseSession === true);
+            setEditFreezeGoal(task.freeze?.goal || '');
+            setEditSteerNow(true);
+          }
+          setDrawerEditing(v => !v);
+        };
         const saveDrawerEdit = async () => {
-          const ok = await updateTask(task, {
-            title: editTitle.trim(),
-            description: editDesc,
-            prompt: editPrompt,
-            ...(editPerm ? { permission: editPerm } : {}),
-            model: editModel,
-            reasoningEffort: editEffort,
-            reuseSession: editReuseSession,
-            freeze: editFreezeGoal.trim() ? { goal: editFreezeGoal.trim() } : null,
-          });
+          const patch = {};
+          const trimmedTitle = editTitle.trim();
+          if (!trimmedTitle) return;
+          if (trimmedTitle !== (task.title || '')) patch.title = trimmedTitle;
+          if (editDesc !== (task.description || '')) patch.description = editDesc;
+          if (editPrompt !== (task.prompt || '')) patch.prompt = editPrompt;
+          if (editPerm && editPerm !== (task.permission || '')) patch.permission = editPerm;
+          if (editModel !== (task.model || '')) patch.model = editModel;
+          if (editEffort !== (task.reasoningEffort || '')) patch.reasoningEffort = editEffort;
+          if (editReuseSession !== (task.reuseSession === true)) patch.reuseSession = editReuseSession;
+          const prevGoal = task.freeze?.goal || '';
+          const nextGoal = editFreezeGoal.trim();
+          if (nextGoal !== prevGoal) patch.freeze = nextGoal ? { goal: nextGoal } : null;
+          if (Object.keys(patch).length === 0) {
+            setDrawerEditing(false);
+            return;
+          }
+          if ('title' in patch || 'description' in patch || 'prompt' in patch) {
+            patch.steerNow = isRunning ? editSteerNow : false;
+          }
+          const ok = await updateTask(task, patch);
           if (ok) setDrawerEditing(false);
         };
 
@@ -4175,7 +4263,7 @@ window.__ModuleLoader__.load({
                 disabled: busy,
                 onChange: event => { void move(task, event.target.value); },
               }, columns.map(col => h('option', { key: col.key, value: col.key }, col.label))),
-              !archived && !isRunning && h('button', { type: 'button', className: 'mtb-btn', onClick: () => setDrawerEditing(v => !v) }, drawerEditing ? '取消编辑' : '编辑'),
+              !archived && h('button', { type: 'button', className: 'mtb-btn', onClick: openDrawerEditor }, drawerEditing ? '取消编辑' : (isRunning ? '实时编辑' : '编辑')),
               h('button', { type: 'button', className: 'mtb-icon-btn', 'aria-label': '关闭详情', onClick: () => { setSelectedId(''); setConfirmId(''); setDrawerEditing(false); } }, '✕')),
             h('div', { className: 'mtb-drawer-body' },
               error && h('div', { role: 'alert', style: { padding: '8px 12px', borderRadius: 9, fontSize: 12, color: dswTheme.danger, background: 'color-mix(in srgb, #ef4444 10%, transparent)', border: '1px solid color-mix(in srgb, #ef4444 30%, transparent)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 } },
@@ -4242,9 +4330,19 @@ window.__ModuleLoader__.load({
                     h('label', { style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 } },
                       h('input', { type: 'checkbox', checked: editReuseSession, onChange: e => setEditReuseSession(e.target.checked) }),
                       '复用上次执行会话（保留上下文）'),
+                    isRunning && h('label', {
+                      style: {
+                        display: 'flex', alignItems: 'flex-start', gap: 7, fontSize: 12, lineHeight: 1.5,
+                        padding: '8px 10px', borderRadius: 8,
+                        background: 'color-mix(in srgb, #3b82f6 10%, transparent)',
+                        border: '1px solid color-mix(in srgb, #3b82f6 28%, transparent)',
+                      },
+                    },
+                      h('input', { type: 'checkbox', style: { marginTop: 2 }, checked: editSteerNow, onChange: e => setEditSteerNow(e.target.checked) }),
+                      h('span', null, '立即以插话形式将修改后的内容发送给正在运行的 Agent（模型与思考强度变更自动在下一轮对话生效并通知工单群）')),
                     h('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 6 } },
                       h('button', { type: 'button', className: 'mtb-btn', onClick: () => setDrawerEditing(false) }, '取消'),
-                      h('button', { type: 'button', className: 'mtb-btn mtb-btn-accent', disabled: busy || !editTitle.trim(), onClick: () => { void saveDrawerEdit(); } }, '保存修改')))
+                      h('button', { type: 'button', className: 'mtb-btn mtb-btn-accent', disabled: busy || !editTitle.trim(), onClick: () => { void saveDrawerEdit(); } }, isRunning && editSteerNow ? '保存并立即插话发送' : '保存修改')))
                 : h(React.Fragment, null,
                     h('h3', { style: { margin: 0, fontSize: 16, fontWeight: 600, lineHeight: 1.45, wordBreak: 'break-word' } }, task.title),
                     h('div', { className: 'mtb-card-meta' },
@@ -4273,11 +4371,12 @@ window.__ModuleLoader__.load({
                   const wfCodeWork = Boolean(workflow.plan?.codeWork || activeTplId === 'development');
                   const wfSlots = workflow.plan ? ((wfCodeWork ? activeTplMeta?.codingRoles : activeTplMeta?.roles) ?? Object.keys(workflow.plan.members ?? {}).map(id => ({ id, name: id }))) : [];
                   const codexSlots = workflow.plan ? (wfCodeWork ? ['coding', 'review'] : (activeTplId === 'pr-review' ? ['review'] : [])) : [];
-                  const controlsDisabled = busy || isRunning;
+                  const controlsDisabled = busy;
                   return h('div', { className: 'mtb-drawer-sec', 'aria-label': '参战 Agent 模型与思考模式' },
                     h('div', { className: 'mtb-drawer-sec-title' },
                       '🤖 参战 Agent 模型与思考模式',
-                      isRunning && h('span', { style: { fontSize: 10.5, fontWeight: 500, color: '#f59e0b' } }, '运行中只读')),
+                      h('span', { style: { fontSize: 10.5, fontWeight: 500, color: isRunning ? '#3b82f6' : dswTheme.faint } },
+                        isRunning ? '● 运行中可随时切换 · 下一轮生效并通知工单群' : '切换后通知工单群 · 下一轮生效')),
                     h('div', { className: 'mtb-agent-cfg-list' },
                       // 1) Leader Row
                       h('div', { className: 'mtb-agent-cfg-row' },
@@ -4386,13 +4485,16 @@ window.__ModuleLoader__.load({
                 const boundAgentName = currentAgentTag ? currentAgentTag.slice(4) : '';
                 const boundAgentMeta = (catalog?.leaders ?? []).find(item => item.name === boundAgentName);
                 return h('div', { className: 'mtb-drawer-sec', 'aria-label': '执行智能体模型与思考模式' },
-                  h('div', { className: 'mtb-drawer-sec-title' }, '🤖 执行 Agent 模型与思考模式'),
+                  h('div', { className: 'mtb-drawer-sec-title' },
+                    '🤖 执行 Agent 模型与思考模式',
+                    h('span', { style: { fontSize: 10.5, fontWeight: 500, color: isRunning ? '#3b82f6' : dswTheme.faint } },
+                      isRunning ? '● 运行中可改 · 下一轮生效并通知工单群' : '切换后下一轮生效')),
                   h('div', { className: 'mtb-agent-cfg-row' },
                     h('div', { className: 'mtb-agent-cfg-grid' },
                       (catalog?.leaders?.length ?? 0) > 0 && h('select', {
                         'aria-label': '指派智能体',
                         style: uiInput,
-                        disabled: busy || isRunning,
+                        disabled: busy,
                         value: boundAgentName,
                         onChange: e => { void assignDrawerAgentLeader(e.target.value); },
                       },
@@ -4401,7 +4503,7 @@ window.__ModuleLoader__.load({
                       h('select', {
                         'aria-label': '工单模型',
                         style: uiInput,
-                        disabled: busy || isRunning,
+                        disabled: busy,
                         value: task.model || '',
                         onChange: e => {
                           const v = e.target.value;
@@ -4412,7 +4514,7 @@ window.__ModuleLoader__.load({
                       h('select', {
                         'aria-label': '工单思考模式',
                         style: uiInput,
-                        disabled: busy || isRunning,
+                        disabled: busy,
                         value: task.reasoningEffort || '',
                         onChange: e => {
                           const v = e.target.value;
@@ -4462,7 +4564,7 @@ window.__ModuleLoader__.load({
                             ...drawerAttachments.map(serializeAttachmentForWire),
                             ...added.filter(a => !existingIds.has(a.attachmentId)),
                           ].slice(0, 8);
-                          void updateTask(task, { attachments: merged });
+                          void updateTask(task, { attachments: merged, ...(isRunning ? { steerNow: true } : {}) });
                         });
                       },
                     }))),
@@ -4470,7 +4572,7 @@ window.__ModuleLoader__.load({
                   ? h('span', { style: uiMuted }, '暂无附件')
                   : renderAttachments(drawerAttachments, archived ? undefined : attId => {
                       const remaining = drawerAttachments.filter(a => a.attachmentId !== attId).map(serializeAttachmentForWire);
-                      void updateTask(task, { attachments: remaining.length > 0 ? remaining : null });
+                      void updateTask(task, { attachments: remaining.length > 0 ? remaining : null, ...(isRunning ? { steerNow: true } : {}) });
                     }, task.id)),
 
               h('div', { className: 'mtb-drawer-sec' },
@@ -4480,7 +4582,7 @@ window.__ModuleLoader__.load({
                 parentCard && h('div', { className: 'mtb-sub-row' },
                   h('span', { style: { fontSize: 11, color: dswTheme.faint } }, '父任务'),
                   h('button', { type: 'button', style: { border: 0, background: 'transparent', color: 'inherit', fontWeight: 600, fontSize: 12, cursor: 'pointer', textAlign: 'left', flex: 1 }, onClick: () => setSelectedId(parentCard.id) }, parentCard.title),
-                  !archived && !isRunning && h('button', { type: 'button', className: 'mtb-btn', disabled: busy, onClick: () => { void setParent(task, null); } }, '解除')),
+                  !archived && h('button', { type: 'button', className: 'mtb-btn', disabled: busy, onClick: () => { void setParent(task, null); } }, '解除')),
                 !parentCard && h(React.Fragment, null,
                   childCards.map(child => {
                     const cCol = columns.find(c => c.key === child.status) ?? columns[1];
@@ -4488,7 +4590,7 @@ window.__ModuleLoader__.load({
                       h('span', { className: 'mtb-dot' }),
                       h('button', { type: 'button', style: { border: 0, background: 'transparent', color: 'inherit', fontSize: 12, cursor: 'pointer', textAlign: 'left', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, onClick: () => setSelectedId(child.id) }, child.title),
                       h('span', { style: { fontSize: 11, color: dswTheme.dim } }, cCol.label),
-                      !archived && child.status !== 'running' && h('button', { type: 'button', className: 'mtb-icon-btn', title: '解除子任务关联', disabled: busy, onClick: () => { void setParent(child, null); } }, '×'));
+                      !archived && h('button', { type: 'button', className: 'mtb-icon-btn', title: '解除子任务关联', disabled: busy, onClick: () => { void setParent(child, null); } }, '×'));
                   }),
                   !archived && h('div', { style: { display: 'flex', gap: 6 } },
                     h('input', {
@@ -4558,7 +4660,7 @@ window.__ModuleLoader__.load({
               !archived && !task.taskRoom?.closed && task.status !== 'running' && (!workflow || workflow.state !== 'done') && h('button', { type: 'button', disabled: busy, className: 'mtb-btn mtb-btn-accent', onClick: () => { void run(task); } }, workflow?.state === 'failed' || workflow?.state === 'interrupted' ? '重试' : '运行'),
               !archived && isRunning && !workflow && h('button', { type: 'button', className: 'mtb-btn', disabled: busy, onClick: () => { void settleTask(task); } }, '终止运行'),
               h('button', { type: 'button', className: 'mtb-btn', onClick: () => { setSelectedId(''); openTaskRoom?.(task); } }, '进入工单群'),
-              workflow && workflow.state !== 'running' && h('button', { type: 'button', className: 'mtb-btn', disabled: busy, onClick: () => edit(task) }, '编辑分工'),
+              !archived && (workflow || canOrchestrate) && h('button', { type: 'button', className: 'mtb-btn', disabled: busy, onClick: () => edit(task) }, workflow ? '编辑分工' : '启用编排'),
               task.sessionId && h('button', { type: 'button', className: 'mtb-btn', onClick: () => openSession && openSession(task.sessionId) }, '打开会话'),
               !archived && h('button', { type: 'button', className: 'mtb-btn', disabled: busy, onClick: () => { void duplicateTask(task); } }, '复制'),
               !archived && !isRunning && h('button', { type: 'button', className: 'mtb-btn', disabled: busy, onClick: () => { void archiveTask(task); } }, '归档'),
@@ -4675,13 +4777,12 @@ window.__ModuleLoader__.load({
           h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 } },
             h('strong', { style: { fontSize: 13 } }, editing ? '编辑工单分工' : '新建任务卡片'),
             !editing && h('button', { type: 'button', className: 'mtb-btn mtb-btn-ai', onClick: () => { setParseError(''); setParseOpen(true); } }, '✨ 从文本 AI 自动解析')),
-          h(Field, { label: '标题' }, h('input', { value: title, readOnly: Boolean(editing), onChange: event => { setTitle(event.target.value); setPlan(null); }, placeholder: '这张卡片要做什么', style: uiInput })),
+          h(Field, { label: '标题' }, h('input', { value: title, onChange: event => { setTitle(event.target.value); if (!editing) setPlan(null); }, placeholder: '这张卡片要做什么', style: uiInput })),
           h(Field, { label: '描述（建议写清目标与验收标准；可直接粘贴截图或文件；若模糊将自动转入「待确认」）' }, h('textarea', {
             value: description,
-            readOnly: Boolean(editing),
-            onChange: event => { setDescription(event.target.value); setPlan(null); },
+            onChange: event => { setDescription(event.target.value); if (!editing) setPlan(null); },
             onPaste: event => {
-              if (editing || uploading || busy) return;
+              if (uploading || busy) return;
               const pasted = Array.from(event.clipboardData?.files || []);
               if (pasted.length > 0) {
                 event.preventDefault();
@@ -4697,7 +4798,7 @@ window.__ModuleLoader__.load({
           })),
           liveAmbiguityHint && h('div', { className: 'mtb-warn-hint' }, '⚠ ' + liveAmbiguityHint),
 
-          !editing && h('details', { style: { fontSize: 12 } },
+          h('details', { style: { fontSize: 12 } },
             h('summary', { style: { cursor: 'pointer', color: dswTheme.dim, fontWeight: 500 } }, '执行指令 Prompt（可选，留空自动沿用描述）'),
             h('textarea', { value: formPrompt, onChange: event => setFormPrompt(event.target.value), rows: 3, placeholder: '下发给执行智能体的具体指令…', style: { ...uiInput, marginTop: 6, resize: 'vertical', lineHeight: 1.55 } })),
 
@@ -5216,7 +5317,7 @@ window.__ModuleLoader__.load({
           }
           setDraft('');
           stickBottomRef.current = true;
-          await fetchJson(prefix + 'action', { roomId: room.id, action: 'send', text: messageText }, true);
+          await fetchJson(prefix + 'action', { roomId: room.id, action: 'send', text: messageText, ...(room.closed ? { autoReopen: true } : {}) }, true);
           mergePage(await fetchJson(url + '&after=' + cursor.current, undefined, true), key);
         }
         catch (e) {
@@ -5442,12 +5543,12 @@ window.__ModuleLoader__.load({
             ...roomAttachments.map(serializeAttachmentForWire),
             ...uploaded.filter(a => !existingIds.has(a.attachmentId)),
           ].slice(0, 8);
-          await fetchJson('marshal/tasks/update', { taskId: roomTaskId, attachments: merged }, true);
+          await fetchJson('marshal/tasks/update', { taskId: roomTaskId, attachments: merged, ...(isWorkflowRunning ? { steerNow: true } : {}) }, true);
           if (id && workspace) {
             mergePage(await fetchJson(url + (cursor.current ? '&after=' + cursor.current : ''), undefined, true), key);
           }
           if (selection.current === key) {
-            setNotice('已上传 ' + uploaded.length + ' 个工单附件：' + uploaded.map(item => item.name).join('、'));
+            setNotice('已上传 ' + uploaded.length + ' 个工单附件：' + uploaded.map(item => item.name).join('、') + (isWorkflowRunning ? '（已作为实时插话同步给运行中的 Agent）' : ''));
           }
         } catch (e) {
           if (selection.current === key) setError('上传附件失败：' + (e.message || e));
@@ -5571,7 +5672,7 @@ window.__ModuleLoader__.load({
                 className: 'mtr-mention-chip',
                 onClick: () => insertMention('全体'),
               }, '@全体'),
-              roomTaskId && !isWorkflowRunning && roomAttachments.length < 8 && h('label', {
+              roomTaskId && roomAttachments.length < 8 && h('label', {
                 className: 'mtr-mention-chip',
                 style: { cursor: uploadingAtt ? 'wait' : 'pointer' },
               },

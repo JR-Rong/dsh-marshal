@@ -2760,7 +2760,7 @@ function hasContentPatch(patch) {
 * parked in 'running' by hand has nothing recorded yet and stays editable.
 */
 function canEditTaskContent(task) {
-	return task.archivedAt === void 0 && task.executions.length === 0;
+	return task.archivedAt === void 0;
 }
 /** Keep an unknown permission string from entering the ledger. */
 function normalizePermission(current, value) {

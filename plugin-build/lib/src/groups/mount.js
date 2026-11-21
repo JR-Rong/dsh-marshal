@@ -15,6 +15,7 @@ import { createTaskRooms } from './task-rooms.js';
 import { createTaskRoomStore, TaskRoomKey } from './task-room-store.js';
 import { createTaskRoomRoutes, taskRoomAccess, taskRoomAudit, visibleTaskRoom } from './task-room-routes.js';
 import { createTaskOrchestration, isPermissionBlockedError } from './task-orchestration.js';
+import { createTaskOverrides, describeContentSteeringMessage, describePlainConfigChanges } from './task-overrides.js';
 import { createWorkspaceRosters } from './workspace-rosters.js';
 import { createTicketNumbers, withTicketPrefix } from './ticket-numbers.js';
 import { createSessionTitles, readProjcacheSession, readWorkspaceRegistry, summarizeFirstMessage } from './session-titles.js';
@@ -365,7 +366,10 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
     const {
         root: groupsRootDir, rosters, ticketNumbers, sessionTitles, sessionController, config, llm, readDefaultModel,
         workspacePath, webOrigin, getAttachmentStore, resolveAttachments, surface: dshSurface, moveCardStatus,
+        taskOverrides: injectedTaskOverrides,
     } = extras;
+    const taskOverrides = injectedTaskOverrides ?? createTaskOverrides(groupsRootDir ? join(groupsRootDir, 'task-overrides.json') : undefined);
+    const effectiveCard = (source, task) => task ? taskOverrides.applyTo(source, task) : undefined;
     const applyBoardAction = async (req, board, source, action, actionInitiator = initiator) => {
         const requestId = randomUUID();
         if (source === 'host' && actionCarriesAttachments(action)) {
@@ -391,6 +395,163 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
         });
         return false;
     };
+    const latestSessionIdOf = (rawTask, workflow) => {
+        if (typeof workflow?.sessionId === 'string' && workflow.sessionId !== '') return workflow.sessionId;
+        const execs = Array.isArray(rawTask?.executions) ? rawTask.executions : [];
+        for (let i = execs.length - 1; i >= 0; i -= 1) {
+            if (typeof execs[i]?.sessionId === 'string' && execs[i].sessionId !== '') return execs[i].sessionId;
+        }
+        return typeof rawTask?.sessionId === 'string' && rawTask.sessionId !== '' ? rawTask.sessionId : undefined;
+    };
+    const selectResidentSessionModel = async (sessionId, modelSpec, effortSpec) => {
+        if (!sessionId || typeof sessionController?.selectModel !== 'function') return false;
+        let route = typeof modelSpec === 'string' ? modelSpec.trim() : '';
+        if (!route) {
+            try {
+                const ctrl = await dshSurface?.controls?.(sessionId, AbortSignal.timeout(3000));
+                if (typeof ctrl?.current?.model === 'string' && ctrl.current.model !== '') route = ctrl.current.model;
+            } catch { /* fallback to defaultModel */ }
+        }
+        if (!route && typeof readDefaultModel === 'function') {
+            try {
+                const dm = readDefaultModel();
+                if (dm?.provider && dm?.model) route = `${dm.provider}/${dm.model}`;
+                else if (typeof dm?.model === 'string') route = dm.model;
+            } catch { /* ignore */ }
+        }
+        if (!route) return false;
+        const slash = route.indexOf('/');
+        const provider = slash > 0 ? route.slice(0, slash) : undefined;
+        const model = slash > 0 ? route.slice(slash + 1) : route;
+        if (!model) return false;
+        const rawEffort = typeof effortSpec === 'string' ? effortSpec.trim() : '';
+        const effort = rawEffort && rawEffort !== 'off' && rawEffort !== 'none' ? rawEffort : undefined;
+        try {
+            await sessionController.selectModel({
+                sessionId,
+                ...(provider ? { provider } : {}),
+                model,
+                ...(effort ? { reasoningEffort: effort } : {}),
+            });
+            return true;
+        } catch {
+            if (effort) {
+                try {
+                    await sessionController.selectModel({ sessionId, ...(provider ? { provider } : {}), model });
+                    return true;
+                } catch { /* ignore */ }
+            }
+            return false;
+        }
+    };
+    const steerResidentSession = async (sessionId, text) => {
+        if (!sessionId || !text || typeof sessionController?.prompt !== 'function') return false;
+        try {
+            await sessionController.prompt({
+                requestId: 'marshal-steer-' + randomUUID(),
+                sessionId,
+                mode: 'queue',
+                content: [{ type: 'text', text }],
+            }, AbortSignal.timeout(10_000));
+            return true;
+        } catch {
+            return false;
+        }
+    };
+    const ensureRoomForNotice = (source, card, workflow, access, ledger) => {
+        if (!rooms || !card?.id) return undefined;
+        const existing = rooms.find(source, card.id);
+        if (existing) return existing;
+        const wsId = workflow?.workspaceId ?? card?.workspaceId;
+        if (!wsId || !access?.ok) return undefined;
+        if (!allowed(access, { workspaceId: wsId }, ledger)) return undefined;
+        try {
+            const tNo = ticketNumbers?.ensure?.(card.id);
+            return rooms.ensure(source, tNo ? { ...card, title: withTicketPrefix(tNo, card.title) } : card, wsId, access.session.ownerId);
+        } catch {
+            return undefined;
+        }
+    };
+    const appendRoomEventSafe = async ({ source, card, workflow, access, ledger, kind, phase, actor = 'Marshal', text, reopenIfClosed = false }) => {
+        if (!text) return false;
+        const room = ensureRoomForNotice(source, card, workflow, access, ledger);
+        if (!room) return false;
+        try {
+            let current = (await rooms.page(room.id, { limit: 1 })).room;
+            if (reopenIfClosed && current.closed) {
+                await rooms.append(room.id, {
+                    kind: 'reopened', runId: current.runId, actor: '工单操作者',
+                    text: '工单因内容修订自动重开。',
+                });
+                current = (await rooms.page(room.id, { limit: 1 })).room;
+            }
+            let runId = current.runId;
+            if (kind === 'user' && !runId) {
+                runId = randomUUID();
+                await rooms.begin(room.id, runId, 'Marshal', 'conversation', '工单实时插话');
+            }
+            await rooms.append(room.id, {
+                kind,
+                ...(runId ? { runId } : {}),
+                actor,
+                text,
+                ...(phase ? { phase } : {}),
+            });
+            return true;
+        } catch {
+            return false;
+        }
+    };
+    const saveCardPromptOverride = async (source, card, nextPrompt, actionInitiator = initiator) => {
+        const board = getBoard();
+        if (!board) return undefined;
+        const raw = (board.snapshot().tasks ?? []).find(item => item.id === card.id) ?? card;
+        const canNativeEdit = raw.archivedAt === undefined && (Array.isArray(raw.executions) ? raw.executions.length : 0) === 0;
+        if (canNativeEdit) {
+            try {
+                const snap = await board.apply(randomUUID(), { kind: 'update', taskId: card.id, patch: { prompt: nextPrompt } }, actionInitiator);
+                taskOverrides.set(source, card.id, { prompt: nextPrompt });
+                return snap;
+            } catch { /* fall through to Marshal override */ }
+        }
+        taskOverrides.set(source, card.id, { prompt: nextPrompt });
+        return board.snapshot();
+    };
+    const launchPlainCardWithOverrides = async (source, taskId, actionInitiator = initiator, explicitPrompt = undefined) => {
+        const board = getBoard();
+        const raw = (board.snapshot().tasks ?? []).find(item => item.id === taskId);
+        const ov = taskOverrides.get(source, taskId);
+        if (raw && (Array.isArray(raw.executions) && raw.executions.length > 0) && (ov || explicitPrompt !== undefined)) {
+            const eff = effectiveCard(source, raw);
+            const finalPrompt = explicitPrompt ?? eff?.prompt ?? eff?.description ?? eff?.title ?? '';
+            const instructions = [
+                '【工单最新修订内容（请严格以此最新版本执行）】',
+                eff?.title ? '标题：' + eff.title : '',
+                eff?.description ? '描述：\n' + eff.description : '',
+                finalPrompt ? '执行指令：\n' + finalPrompt : '',
+            ].filter(Boolean).join('\n\n').slice(0, 15_000);
+            const settledSession = [...raw.executions].reverse().find(ex => ex?.endedAt !== undefined && typeof ex?.sessionId === 'string' && ex.sessionId !== '');
+            if (settledSession) {
+                try {
+                    return await board.apply(randomUUID(), { kind: 'rework', taskId, instructions }, actionInitiator);
+                } catch { /* fall back to standard run + session queue */ }
+            }
+            const snap = await board.apply(randomUUID(), { kind: 'run', taskId }, actionInitiator);
+            void (async () => {
+                for (let attempt = 0; attempt < 15; attempt += 1) {
+                    const cur = (board.snapshot().tasks ?? []).find(item => item.id === taskId);
+                    const openEx = Array.isArray(cur?.executions) ? [...cur.executions].reverse().find(ex => ex?.endedAt === undefined && ex?.sessionId) : undefined;
+                    if (openEx?.sessionId) {
+                        await steerResidentSession(openEx.sessionId, instructions);
+                        return;
+                    }
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                }
+            })();
+            return snap;
+        }
+        return board.apply(randomUUID(), { kind: 'run', taskId }, actionInitiator);
+    };
     const taskList = (snapshot, req, source) => {
         const access = authenticate(req);
         const ledger = access.ok ? auth.loadLedger() : undefined;
@@ -401,7 +562,8 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             const room = rooms?.find(source, task.id);
             if (room && !taskRoomAccess(access, room, allowed, ledger)) return [];
             if (target && !allowed(access, { workspaceId: target.workspaceId }, ledger)) return [];
-            return [taskView(task, target ? orchestration.view(source, task.id) : undefined, room, ticketNumbers)];
+            const eff = effectiveCard(source, task);
+            return [taskView(eff, target ? orchestration.view(source, task.id) : undefined, room, ticketNumbers)];
         });
     };
     const roomRoutes = createTaskRoomRoutes({
@@ -409,6 +571,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
         orchestration, getBoard, boardSource, getInitiator: () => initiator.replace(/^marshal:/, ''),
         ticketNumbers, workspacePath, normalizeAttachments: normalizeAttachmentsPayload, resolveAttachments,
         surface: dshSurface, moveCardStatus,
+        getEffectiveCard: effectiveCard, saveCardPromptOverride, launchPlainCardWithOverrides,
     });
     return [
         ...roomRoutes.routes,
@@ -448,49 +611,107 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             const access = authenticate(req, true);
             if (!access.ok) { write(res, access.status, { ok: false, code: access.code }); return; }
             if (!orchestration) { write(res, 503, { ok: false, code: 'orchestration-unavailable' }); return; }
+            const board = getBoard();
+            if (!board) { write(res, 503, { ok: false, code: 'no-task-board' }); return; }
             const body = await readBody(req);
             const source = boardSource();
+            const rawCard = (board.snapshot().tasks ?? []).find(item => item.id === body.taskId);
+            const card = effectiveCard(source, rawCard);
             const room = rooms?.find(source, body.taskId);
             const workflow = orchestration.target(source, body.taskId);
             const ledger = auth.loadLedger();
-            if (!workflow || (room ? !taskRoomAccess(access, room, allowed, ledger) : !allowed(access, workflow, ledger))) {
+            if (!workflow && !card) {
                 write(res, 404, { ok: false, code: 'task-not-found' });
                 return;
             }
-            if (room) roomRoutes.assertIdle(room);
-            else orchestration.assertIdle(source, body.taskId);
-            const prepared = orchestration.prepare({
-                ...body.orchestration,
-                workspaceId: body.orchestration?.workspaceId ?? workflow.workspaceId,
-            }, member => allowed(access, member, ledger));
-            if (prepared.workspaceId !== workflow.workspaceId) {
+            if (room && !taskRoomAccess(access, room, allowed, ledger)) {
                 write(res, 403, { ok: false, code: 'workspace-forbidden' });
                 return;
             }
-            orchestration.configure(source, body.taskId, prepared);
-            write(res, 200, { ok: true, tasks: taskList(getBoard().snapshot(), req, source) });
+            if (workflow && !room && !allowed(access, workflow, ledger)) {
+                write(res, 403, { ok: false, code: 'workspace-forbidden' });
+                return;
+            }
+            const prepared = orchestration.prepare({
+                ...body.orchestration,
+                workspaceId: body.orchestration?.workspaceId ?? workflow?.workspaceId ?? room?.workspaceId ?? card?.workspaceId,
+            }, member => allowed(access, member, ledger));
+            if ((workflow && prepared.workspaceId !== workflow.workspaceId) || (room && prepared.workspaceId !== room.workspaceId)) {
+                write(res, 403, { ok: false, code: 'workspace-forbidden' });
+                return;
+            }
+            if (!allowed(access, prepared, ledger)) {
+                write(res, 403, { ok: false, code: 'workspace-forbidden' });
+                return;
+            }
+            const configured = orchestration.configure(source, body.taskId, prepared);
+            const noticeText = configured?._notice || '';
+            if (noticeText && card) {
+                await appendRoomEventSafe({
+                    source, card, workflow: configured, access, ledger,
+                    kind: 'status', phase: 'config-change', actor: 'Marshal', text: noticeText,
+                });
+            }
+            const sid = latestSessionIdOf(rawCard, configured);
+            if (sid) {
+                const lCfg = configured?.agentConfigs?.leader ?? configured?.plan?.agentConfigs?.leader;
+                await selectResidentSessionModel(sid, lCfg?.model, lCfg?.reasoningEffort);
+            }
+            write(res, 200, {
+                ok: true,
+                ...(noticeText ? { notice: noticeText } : {}),
+                tasks: taskList(board.snapshot(), req, source),
+            });
         }),
         exact('POST', '/marshal/tasks/agent-configs', async (req, res) => {
             const access = authenticate(req, true);
             if (!access.ok) { write(res, access.status, { ok: false, code: access.code }); return; }
             if (!orchestration) { write(res, 503, { ok: false, code: 'orchestration-unavailable' }); return; }
+            const board = getBoard();
             const body = await readBody(req);
             if (typeof body.taskId !== 'string' || body.taskId === '') {
                 write(res, 400, { ok: false, code: 'invalid-task' });
                 return;
             }
             const source = boardSource();
+            const rawCard = (board?.snapshot().tasks ?? []).find(item => item.id === body.taskId);
+            const card = effectiveCard(source, rawCard);
             const room = rooms?.find(source, body.taskId);
             const workflow = orchestration.target(source, body.taskId);
             const ledger = auth.loadLedger();
-            if (!workflow || (room ? !taskRoomAccess(access, room, allowed, ledger) : !allowed(access, workflow, ledger))) {
+            if (!workflow && !card) {
                 write(res, 404, { ok: false, code: 'task-not-found' });
                 return;
             }
-            if (room) roomRoutes.assertIdle(room);
-            else orchestration.assertIdle(source, body.taskId);
-            orchestration.updateAgentConfigs(source, body.taskId, body, member => allowed(access, member, ledger));
-            write(res, 200, { ok: true, tasks: taskList(getBoard().snapshot(), req, source) });
+            if (room && !taskRoomAccess(access, room, allowed, ledger)) {
+                write(res, 403, { ok: false, code: 'workspace-forbidden' });
+                return;
+            }
+            if (workflow && !room && !allowed(access, workflow, ledger)) {
+                write(res, 403, { ok: false, code: 'workspace-forbidden' });
+                return;
+            }
+            const updatedWf = orchestration.updateAgentConfigs(source, body.taskId, {
+                ...body,
+                ...(!workflow && !body.workspaceId && (room?.workspaceId || card?.workspaceId) ? { workspaceId: room?.workspaceId ?? card?.workspaceId } : {}),
+            }, member => allowed(access, member, ledger));
+            const noticeText = updatedWf?._notice || '';
+            if (noticeText && card) {
+                await appendRoomEventSafe({
+                    source, card, workflow: updatedWf, access, ledger,
+                    kind: 'status', phase: 'config-change', actor: 'Marshal', text: noticeText,
+                });
+            }
+            const sid = latestSessionIdOf(rawCard, updatedWf);
+            if (sid && (body.agentConfigs?.leader || body.leaderId)) {
+                const lCfg = updatedWf?.agentConfigs?.leader ?? updatedWf?.plan?.agentConfigs?.leader;
+                await selectResidentSessionModel(sid, lCfg?.model, lCfg?.reasoningEffort);
+            }
+            write(res, 200, {
+                ok: true,
+                ...(noticeText ? { notice: noticeText } : {}),
+                tasks: taskList(board ? board.snapshot() : { tasks: [] }, req, source),
+            });
         }),
         exact('GET', '/marshal/tasks/report', async (req, res) => {
             const id = new URL(req.url ?? '', 'http://localhost').searchParams.get('taskId');
@@ -539,7 +760,8 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
                 write(res, access.ok ? 403 : access.status, { ok: false, code: access.ok ? 'workspace-forbidden' : access.code });
                 return;
             }
-            const att = (normalizeAttachmentsPayload(task.attachments) ?? []).find(item => item.attachmentId === attachmentId);
+            const effTask = effectiveCard(source, task);
+            const att = (normalizeAttachmentsPayload(effTask?.attachments) ?? []).find(item => item.attachmentId === attachmentId);
             if (!att) {
                 write(res, 404, { ok: false, code: 'not-found', message: '未在该工单上找到对应附件。' });
                 return;
@@ -730,11 +952,12 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             if (workflow) {
                 if (!authorize(req, res, workflow)) return;
                 const snapshot = board.snapshot();
-                const task = (snapshot.tasks ?? []).find(item => item.id === body.taskId);
-                if (!task) {
+                const rawTask = (snapshot.tasks ?? []).find(item => item.id === body.taskId);
+                if (!rawTask) {
                     write(res, 404, { ok: false, code: 'task-not-found' });
                     return;
                 }
+                const task = effectiveCard(source, rawTask);
                 const access = authenticate(req, true);
                 const runTicketNo = ticketNumbers?.ensure?.(task.id);
                 const room = boundRoom ?? rooms?.ensure(source, runTicketNo ? { ...task, title: withTicketPrefix(runTicketNo, task.title) } : task, workflow.workspaceId, access.session.ownerId);
@@ -744,8 +967,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
                 }
                 roomRoutes.assertIdle(room);
                 if (room.closed) {
-                    write(res, 409, { ok: false, code: 'task-room-closed', message: '工单已归档，请从工单群重开或重试。' });
-                    return;
+                    await rooms.append(room.id, { kind: 'reopened', runId: room.runId, actor: '工单操作者', text: '工单重新运行，自动重开工单群。' });
                 }
                 orchestration.start(source, task, taskRoomAudit(rooms, room, workflow.state === 'done' || workflow.state === 'review-blocked' ? 'retry' : undefined, undefined, undefined,
                     member => allowed(access, member)));
@@ -761,14 +983,11 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
                 roomRoutes.assertIdle(boundRoom);
                 const current = await rooms.page(boundRoom.id, { limit: 1 });
                 if (current.room.closed) {
-                    write(res, 409, { ok: false, code: 'task-room-closed' });
-                    return;
+                    await rooms.append(boundRoom.id, { kind: 'reopened', runId: current.room.runId, actor: '工单操作者', text: '工单重新运行，自动重开工单群。' });
                 }
-                write(res, 409, { ok: false, code: 'invalid-leader', message: '请打开工单群，选择该工作区的 Leader 后运行。' });
-                return;
             }
             try {
-                const snapshot = await board.apply(randomUUID(), { kind: 'run', taskId: body.taskId }, initiator);
+                const snapshot = await launchPlainCardWithOverrides(source, body.taskId, initiator);
                 write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
             }
             catch (error) {
@@ -848,8 +1067,9 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             const body = await readBody(req);
             if (typeof body.taskId !== 'string' || body.taskId === '') { write(res, 400, { ok: false, code: 'invalid-task' }); return; }
             const source = boardSource();
-            const card = (board.snapshot().tasks ?? []).find(item => item.id === body.taskId);
-            if (!card) { write(res, 404, { ok: false, code: 'task-not-found' }); return; }
+            const rawCard = (board.snapshot().tasks ?? []).find(item => item.id === body.taskId);
+            if (!rawCard) { write(res, 404, { ok: false, code: 'task-not-found' }); return; }
+            const card = effectiveCard(source, rawCard);
             const workflow = orchestration?.target(source, body.taskId);
             const boundRoom = rooms?.find(source, body.taskId);
             const access = authenticate(req, true);
@@ -871,8 +1091,9 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             const body = await readBody(req);
             if (typeof body.taskId !== 'string' || body.taskId === '') { write(res, 400, { ok: false, code: 'invalid-task' }); return; }
             const source = boardSource();
-            const card = (board.snapshot().tasks ?? []).find(item => item.id === body.taskId);
-            if (!card) { write(res, 404, { ok: false, code: 'task-not-found' }); return; }
+            const rawCard = (board.snapshot().tasks ?? []).find(item => item.id === body.taskId);
+            if (!rawCard) { write(res, 404, { ok: false, code: 'task-not-found' }); return; }
+            const card = effectiveCard(source, rawCard);
             const workflow = orchestration?.target(source, body.taskId);
             const boundRoom = rooms?.find(source, body.taskId);
             const access = authenticate(req, true);
@@ -894,33 +1115,28 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             const body = await readBody(req);
             if (typeof body.taskId !== 'string' || body.taskId === '') { write(res, 400, { ok: false, code: 'invalid-task' }); return; }
             const source = boardSource();
+            const rawBefore = (board.snapshot().tasks ?? []).find(item => item.id === body.taskId);
+            if (!rawBefore) { write(res, 404, { ok: false, code: 'task-not-found' }); return; }
+            const prevCard = effectiveCard(source, rawBefore);
             const workflow = orchestration?.target(source, body.taskId);
             const boundRoom = rooms?.find(source, body.taskId);
+            const access = authenticate(req, Boolean(boundRoom || workflow));
+            const ledger = access.ok ? auth.loadLedger() : undefined;
             if (boundRoom) {
-                const access = authenticate(req, true);
-                if (!taskRoomAccess(access, boundRoom, allowed)) { write(res, 403, { ok: false, code: 'workspace-forbidden' }); return; }
+                if (!taskRoomAccess(access, boundRoom, allowed, ledger)) { write(res, 403, { ok: false, code: 'workspace-forbidden' }); return; }
             }
             if (workflow && !authorize(req, res, workflow)) return;
-            orchestration?.assertIdle(source, body.taskId);
-            const patch = {};
-            if (typeof body.title === 'string' && body.title.trim() !== '') patch.title = body.title.trim();
-            if (typeof body.description === 'string') patch.description = body.description;
-            if (typeof body.prompt === 'string') patch.prompt = body.prompt;
-            if (['read-only', 'workspace-write', 'danger-full-access'].includes(body.permission)) patch.permission = body.permission;
-            if (typeof body.model === 'string') patch.model = body.model.trim();
-            if (typeof body.reasoningEffort === 'string') patch.reasoningEffort = body.reasoningEffort.trim();
-            if (body.reuseSession === null || typeof body.reuseSession === 'boolean') patch.reuseSession = body.reuseSession;
-            if (body.freeze === null) patch.freeze = null;
-            else if (body.freeze && typeof body.freeze === 'object' && typeof body.freeze.goal === 'string') {
-                patch.freeze = body.freeze.goal.trim() !== '' ? { goal: body.freeze.goal.trim() } : null;
+
+            const contentPatch = {};
+            const metaPatch = {};
+            if (typeof body.title === 'string') {
+                if (body.title.trim() === '') { write(res, 400, { ok: false, code: 'invalid-title', message: '标题不能为空。' }); return; }
+                contentPatch.title = body.title.trim();
             }
-            if (body.tags === null) patch.tags = null;
-            else if (Array.isArray(body.tags)) {
-                const tags = normalizeCardTags(body.tags);
-                patch.tags = tags ?? null;
-            }
+            if (typeof body.description === 'string') contentPatch.description = body.description;
+            if (typeof body.prompt === 'string') contentPatch.prompt = body.prompt;
             if (body.attachments === null || (Array.isArray(body.attachments) && body.attachments.length === 0)) {
-                patch.attachments = null;
+                contentPatch.attachments = null;
             }
             else if (Array.isArray(body.attachments)) {
                 const normalized = normalizeAttachmentsPayload(body.attachments);
@@ -928,11 +1144,113 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
                     write(res, 400, { ok: false, code: 'invalid-attachments', message: '附件元数据无效或超过限制（最多 8 个，单文件 ≤ 10MB）。' });
                     return;
                 }
-                patch.attachments = normalized;
+                contentPatch.attachments = normalized;
             }
-            if (Object.keys(patch).length === 0) { write(res, 400, { ok: false, code: 'empty-patch' }); return; }
-            const snapshot = await applyBoardAction(req, board, source, { kind: 'update', taskId: body.taskId, patch }, initiator);
-            write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
+
+            if (['read-only', 'workspace-write', 'danger-full-access'].includes(body.permission)) metaPatch.permission = body.permission;
+            if (typeof body.model === 'string') metaPatch.model = body.model.trim();
+            if (typeof body.reasoningEffort === 'string') metaPatch.reasoningEffort = body.reasoningEffort.trim();
+            if (body.reuseSession === null || typeof body.reuseSession === 'boolean') metaPatch.reuseSession = body.reuseSession;
+            if (typeof body.workspaceId === 'string') metaPatch.workspaceId = body.workspaceId.trim();
+            if (body.freeze === null) metaPatch.freeze = null;
+            else if (body.freeze && typeof body.freeze === 'object' && typeof body.freeze.goal === 'string') {
+                metaPatch.freeze = body.freeze.goal.trim() !== '' ? { goal: body.freeze.goal.trim() } : null;
+            }
+            if (body.tags === null) metaPatch.tags = null;
+            else if (Array.isArray(body.tags)) {
+                const tags = normalizeCardTags(body.tags);
+                metaPatch.tags = tags ?? null;
+            }
+
+            if (Object.keys(contentPatch).length === 0 && Object.keys(metaPatch).length === 0) {
+                write(res, 400, { ok: false, code: 'empty-patch' });
+                return;
+            }
+
+            let snapshot = board.snapshot();
+            const canNativeContentEdit = rawBefore.archivedAt === undefined && (Array.isArray(rawBefore.executions) ? rawBefore.executions.length : 0) === 0;
+            if (canNativeContentEdit && rawBefore.archivedAt === undefined) {
+                const combinedPatch = { ...metaPatch, ...contentPatch };
+                try {
+                    snapshot = await applyBoardAction(req, board, source, { kind: 'update', taskId: body.taskId, patch: combinedPatch }, initiator);
+                    if (Object.keys(contentPatch).length > 0 && taskOverrides.get(source, body.taskId)) {
+                        taskOverrides.set(source, body.taskId, contentPatch);
+                    }
+                } catch (err) {
+                    const msg = err instanceof Error ? err.message : String(err);
+                    if (!/already been executed|read-only/i.test(msg)) throw err;
+                    if (Object.keys(metaPatch).length > 0) {
+                        snapshot = await applyBoardAction(req, board, source, { kind: 'update', taskId: body.taskId, patch: metaPatch }, initiator);
+                    }
+                    if (Object.keys(contentPatch).length > 0) {
+                        taskOverrides.set(source, body.taskId, contentPatch);
+                    }
+                }
+            } else {
+                if (Object.keys(metaPatch).length > 0 && rawBefore.archivedAt === undefined) {
+                    snapshot = await applyBoardAction(req, board, source, { kind: 'update', taskId: body.taskId, patch: metaPatch }, initiator);
+                }
+                if (Object.keys(contentPatch).length > 0) {
+                    taskOverrides.set(source, body.taskId, contentPatch);
+                }
+            }
+
+            const rawAfter = (snapshot.tasks ?? []).find(item => item.id === body.taskId) ?? rawBefore;
+            const nextCard = effectiveCard(source, rawAfter);
+            const writeAccess = access.ok ? access : authenticate(req, true);
+            const writeLedger = writeAccess.ok ? (ledger ?? auth.loadLedger()) : undefined;
+
+            // 1) Plain-card model / thinking mode / assigned agent change -> notify room + update resident session for next turn
+            const { summary: plainConfigNotice } = describePlainConfigChanges(prevCard, nextCard);
+            if (plainConfigNotice) {
+                await appendRoomEventSafe({
+                    source, card: nextCard, workflow, access: writeAccess, ledger: writeLedger,
+                    kind: 'status', phase: 'config-change', actor: 'Marshal', text: plainConfigNotice,
+                });
+                const sid = latestSessionIdOf(rawAfter, workflow);
+                if (sid && ('model' in metaPatch || 'reasoningEffort' in metaPatch)) {
+                    await selectResidentSessionModel(sid, nextCard.model, nextCard.reasoningEffort);
+                }
+            }
+
+            // 2) Content change -> live steering injection if running (and steerNow !== false), or room update record if idle
+            const openExecution = Array.isArray(rawAfter?.executions) && rawAfter.executions.some(ex => ex && ex.endedAt === undefined);
+            const isTicketRunning = Boolean(
+                orchestration?.isRunning?.(source, body.taskId)
+                || workflow?.state === 'running'
+                || workflow?.state === 'handed-off'
+                || openExecution
+                || rawAfter?.status === 'running'
+            );
+            const shouldSteer = body.steerNow === true || (isTicketRunning && body.steerNow !== false);
+            const steerMessage = Object.keys(contentPatch).length > 0
+                ? describeContentSteeringMessage(prevCard, nextCard, contentPatch)
+                : '';
+            let steered = false;
+            if (steerMessage) {
+                if (shouldSteer) {
+                    const roomWrote = await appendRoomEventSafe({
+                        source, card: nextCard, workflow, access: writeAccess, ledger: writeLedger,
+                        kind: 'user', phase: 'steering', actor: '工单操作者', text: steerMessage, reopenIfClosed: true,
+                    });
+                    const sid = latestSessionIdOf(rawAfter, workflow);
+                    const sessionSteered = sid ? await steerResidentSession(sid, steerMessage) : false;
+                    steered = Boolean(roomWrote || sessionSteered || orchestration?.isRunning?.(source, body.taskId));
+                } else if (boundRoom) {
+                    await appendRoomEventSafe({
+                        source, card: nextCard, workflow, access: writeAccess, ledger: writeLedger,
+                        kind: 'status', phase: 'content-updated', actor: 'Marshal',
+                        text: '📝 工单内容已修改，将在下次运行或继续执行时生效。',
+                    });
+                }
+            }
+
+            write(res, 200, {
+                ok: true,
+                ...(steered ? { steered: true } : {}),
+                ...(plainConfigNotice ? { configNotice: plainConfigNotice } : {}),
+                tasks: taskList(snapshot, req, source),
+            });
         }),
         exact('POST', '/marshal/tasks/set-parent', async (req, res) => {
             const board = getBoard();
@@ -950,7 +1268,6 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
                 if (!taskRoomAccess(access, boundRoom, allowed)) { write(res, 403, { ok: false, code: 'workspace-forbidden' }); return; }
             }
             if (workflow && !authorize(req, res, workflow)) return;
-            orchestration?.assertIdle(source, body.taskId);
             const snapshot = await board.apply(randomUUID(), { kind: 'set-parent', taskId: body.taskId, parentId }, initiator);
             write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
         }),
@@ -1067,8 +1384,9 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             if (workflow && !authorize(req, res, workflow)) return;
             orchestration?.assertIdle(source, body.taskId);
             const snapshot = await board.apply(randomUUID(), { kind: 'delete', taskId: body.taskId }, initiator);
-            if (workflow && !(snapshot.tasks ?? []).some(task => task.id === body.taskId)) {
-                orchestration.remove(source, body.taskId);
+            if (!(snapshot.tasks ?? []).some(task => task.id === body.taskId)) {
+                if (workflow) orchestration.remove(source, body.taskId);
+                taskOverrides.remove(source, body.taskId);
             }
             write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
         }),
@@ -1599,9 +1917,11 @@ export function mountGroups(ctx, config, options = {}) {
         }
         catch { return undefined; }
     };
+    const taskOverrides = createTaskOverrides(join(root, 'task-overrides.json'));
     const attachmentCacheDir = join(root, 'ticket-attachments');
     const resolveTicketAttachments = async card => {
-        const list = normalizeAttachmentsPayload(card?.attachments);
+        const effCard = card?.id ? taskOverrides.applyTo(taskBoard === undefined ? 'local' : 'host', card) : card;
+        const list = normalizeAttachmentsPayload(effCard?.attachments);
         if (!list || list.length === 0) return [];
         const store = getAttachmentStore();
         const resolved = [];
@@ -1684,6 +2004,10 @@ export function mountGroups(ctx, config, options = {}) {
             port: createDiscussionPort({ agents: config.agents, llm, codexExecutable: config.codexExecutable, maxModels: 256, maxPerProvider: 64 }),
             defaultModel: readDefaultModel, logger: options.logger, workspacePath: agents.workspace,
             resolveAttachments: resolveTicketAttachments,
+            readCard: (src, id) => {
+                const raw = (getBoard()?.snapshot()?.tasks ?? []).find(item => item.id === id);
+                return raw ? taskOverrides.applyTo(src, raw) : undefined;
+            },
             leaderAutoReview: true,
             onState: moveCardStatus,
             onPermissionBlocked: async (_source, taskId) => {
@@ -1763,7 +2087,7 @@ export function mountGroups(ctx, config, options = {}) {
                 // posts its dispatch note through `begin` first); skip the second
                 // batch so one dispatch produces exactly one ticket-group run.
                 if (audit && settings.skipBegin === true) audit.begin = async () => {};
-                const started = orchestration.start(source, card, audit);
+                const started = orchestration.start(source, taskOverrides.applyTo(source, card), audit);
                 return { ok: true, started, state: orchestration.view(source, taskId)?.state };
             },
             move: moveCardStatus,
@@ -1808,7 +2132,7 @@ export function mountGroups(ctx, config, options = {}) {
                 root, rosters, ticketNumbers, sessionTitles, sessionController: ctx.sessionController,
                 config, llm, readDefaultModel, workspacePath: agents.workspace,
                 webOrigin: resolveWebOrigin, getAttachmentStore, resolveAttachments: resolveTicketAttachments,
-                surface, moveCardStatus,
+                surface, moveCardStatus, taskOverrides,
             }).map((route) => scoped.webServer.register(route));
             return () => {
                 for (const dispose of disposers) dispose();

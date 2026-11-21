@@ -85,6 +85,7 @@ export function taskRoomAudit(rooms, room, reason, leader, remoteTarget, allowMe
 export function createTaskRoomRoutes({
     exact, write, readBody, authenticate, allowed, auth, rooms, orchestration, getBoard, boardSource, getInitiator,
     ticketNumbers, workspacePath, normalizeAttachments, resolveAttachments, surface, moveCardStatus,
+    getEffectiveCard, saveCardPromptOverride, launchPlainCardWithOverrides,
 }) {
     const viewRoom = room => visibleTaskRoom(room, ticketNumbers);
     const operations = new Set();
@@ -112,9 +113,9 @@ export function createTaskRoomRoutes({
         return room;
     };
     const getCard = (board, id) => {
-        const card = board?.snapshot().tasks?.find(task => task.id === id);
-        if (!card) throw taskError('task-not-found', '工单不存在。');
-        return card;
+        const raw = board?.snapshot().tasks?.find(task => task.id === id);
+        if (!raw) throw taskError('task-not-found', '工单不存在。');
+        return typeof getEffectiveCard === 'function' ? getEffectiveCard(boardSource(), raw) : raw;
     };
     const safeTarget = input => input === undefined ? undefined : remoteChoice.parse(input);
     const activeWorkflow = async (room, body, access, action) => {
@@ -152,7 +153,21 @@ export function createTaskRoomRoutes({
             const target = safeTarget(body.remote) ?? workflow?.remoteTarget;
             const text = textBody.parse(body.text);
             let view = await rooms.page(room.id, { limit: 24 });
-            if (view.room.closed) throw taskError('task-room-closed', '工单已归档，重开后可继续发言。');
+            if (view.room.closed) {
+                if (body.autoReopen !== true) {
+                    throw taskError('task-room-closed', '工单已归档，重开后可继续发言。');
+                }
+                await rooms.append(room.id, {
+                    kind: 'reopened', runId: view.room.runId, actor: '工单操作者',
+                    text: '工单因新发言自动重开讨论。',
+                });
+                const b = getBoard();
+                const rawC = b?.snapshot().tasks?.find(t => t.id === room.taskId);
+                if (b && rawC && rawC.status === 'done') {
+                    try { await b.apply(randomUUID(), { kind: 'move', taskId: room.taskId, status: 'review' }, 'marshal:' + getInitiator()); } catch {}
+                }
+                view = await rooms.page(room.id, { limit: 24 });
+            }
             if (target) await rooms.promote(room.id, target);
             const runId = view.room.runId ?? randomUUID();
             if (!view.room.runId) await rooms.begin(room.id, runId, 'Marshal', 'conversation', '群聊开始');
@@ -163,7 +178,8 @@ export function createTaskRoomRoutes({
                 ...(isRunning ? { phase: 'steering' } : {}),
             });
             const board = getBoard();
-            const card = board?.snapshot().tasks?.find(task => task.id === room.taskId);
+            const rawCard = board?.snapshot().tasks?.find(task => task.id === room.taskId);
+            const card = rawCard && typeof getEffectiveCard === 'function' ? getEffectiveCard(room.source, rawCard) : rawCard;
             const messages = view.records
                 .filter(record => record.kind === 'user' || record.kind === 'agent' || record.kind === 'status')
                 .map(record => ({
@@ -325,15 +341,24 @@ export function createTaskRoomRoutes({
                 }
             } else if (board) {
                 const notes = room ? await readOperatorNotes(rooms, room.id) : (feedbackText ? '- ' + feedbackText : '');
+                let nextPrompt;
                 if (notes) {
                     const basePrompt = String(card.prompt || card.description || card.title || '').replace(/\n\n【机主补充修正意见】[\s\S]*$/, '');
-                    const nextPrompt = (basePrompt + '\n\n【机主补充修正意见】\n' + notes).slice(0, 15_000);
-                    snapshot = await board.apply(randomUUID(), { kind: 'update', taskId: card.id, patch: { prompt: nextPrompt } }, initiatorTag ?? ('marshal:' + getInitiator()));
+                    nextPrompt = (basePrompt + '\n\n【机主补充修正意见】\n' + notes).slice(0, 15_000);
+                    if (typeof saveCardPromptOverride === 'function') {
+                        snapshot = await saveCardPromptOverride(source, card, nextPrompt, initiatorTag ?? ('marshal:' + getInitiator()));
+                    } else {
+                        snapshot = await board.apply(randomUUID(), { kind: 'update', taskId: card.id, patch: { prompt: nextPrompt } }, initiatorTag ?? ('marshal:' + getInitiator()));
+                    }
                 }
                 if (room) {
                     await rooms.begin(room.id, randomUUID(), 'Marshal', 'revise', '按群内修正意见重新启动工单执行');
                 }
-                snapshot = await board.apply(randomUUID(), { kind: 'run', taskId: card.id }, initiatorTag ?? ('marshal:' + getInitiator()));
+                if (typeof launchPlainCardWithOverrides === 'function') {
+                    snapshot = await launchPlainCardWithOverrides(source, card.id, initiatorTag ?? ('marshal:' + getInitiator()), nextPrompt);
+                } else {
+                    snapshot = await board.apply(randomUUID(), { kind: 'run', taskId: card.id }, initiatorTag ?? ('marshal:' + getInitiator()));
+                }
             }
             return {
                 snapshot,
@@ -387,10 +412,14 @@ export function createTaskRoomRoutes({
             if (page.room.workspaceId !== workspaceId || !taskRoomAccess(access, page.room, allowed)) throw hidden();
             const origin = page.room.deviceId === getInitiator();
             let workflowView = origin ? orchestration?.view(page.room.source, page.room.taskId) : undefined;
-            const card = origin ? getBoard()?.snapshot().tasks?.find(task => task.id === page.room.taskId) : undefined;
+            const rawCard = origin ? getBoard()?.snapshot().tasks?.find(task => task.id === page.room.taskId) : undefined;
+            const card = rawCard && typeof getEffectiveCard === 'function' ? getEffectiveCard(page.room.source, rawCard) : rawCard;
             const liveBubbles = origin ? [...(orchestration?.live?.(page.room.source, page.room.taskId) ?? [])] : [];
+            const cardExecSessionId = Array.isArray(card?.executions)
+                ? [...card.executions].reverse().find(ex => typeof ex?.sessionId === 'string' && ex.sessionId !== '')?.sessionId
+                : undefined;
             const residentSessionId = origin
-                ? (workflowView?.sessionId || (!workflowView ? card?.sessionId : undefined))
+                ? (workflowView?.sessionId || (!workflowView ? (card?.sessionId || cardExecSessionId) : undefined))
                 : undefined;
             if (residentSessionId && surface && !page.room.closed) {
                 const prevSeq = page.room.lastSeq;

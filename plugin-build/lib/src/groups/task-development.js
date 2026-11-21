@@ -205,7 +205,7 @@ export async function applyDevelopmentPatch(workspacePathStr, patchText, signal 
 }
 
 export async function runTaskDevelopment({
-    card, path, plan, signal, asLeader, asRole, runChild, record, handoff, phase, manual, leaderAutoReview = false, operatorNotes,
+    card, getCard, path, plan, getPlan, signal, asLeader, asRole, runChild, record, handoff, phase, manual, leaderAutoReview = false, operatorNotes,
 }) {
     const readGuidance = async () => {
         try {
@@ -213,20 +213,23 @@ export async function runTaskDevelopment({
             return typeof note === 'string' && note.trim() ? note.trim().slice(0, 6000) : '';
         } catch { return ''; }
     };
-    const attachments = Array.isArray(card.resolvedAttachments) && card.resolvedAttachments.length > 0 ? card.resolvedAttachments : undefined;
+    const resolveCard = async () => (await getCard?.()) ?? card;
+    const resolvePlan = () => getPlan?.() ?? plan;
+    const initialCard = await resolveCard();
+    const initialAttachments = Array.isArray(initialCard.resolvedAttachments) && initialCard.resolvedAttachments.length > 0 ? initialCard.resolvedAttachments : undefined;
     phase('designing');
     const designGuidance = await readGuidance();
     const design = await asLeader(withGuidance(
         '你负责设计和拆分开发任务。给出要修改的模块、边界、验收条件和可运行的测试。限制为 2500 字符。\n'
-        + brief(card.title, card.description, plan, {
-            ...(attachments ? { attachments } : {}),
+        + brief(initialCard.title, initialCard.description, resolvePlan(), {
+            ...(initialAttachments ? { attachments: initialAttachments } : {}),
             ...(designGuidance ? { operatorGuidance: designGuidance } : {}),
         }),
         designGuidance), 'designing');
     signal.throwIfAborted();
     await record('agent', 'Leader', design, 'designing');
     const implementationPlan = await handoff('开发设计交接', design, 'designing');
-    if (plan.codex.coding === null) return manual(implementationPlan);
+    if (resolvePlan().codex?.coding === null) return manual(implementationPlan);
 
     return isolatedCheckout(path, signal, async (worktree, base, mountDeps) => {
         const invokeVerdict = async (callFn, actorName, phaseName, fullPrompt, compactPrompt) => {
@@ -249,10 +252,16 @@ export async function runTaskDevelopment({
         let feedback;
         for (const round of [1, 2]) {
             phase('coding');
+            const codingCard = await resolveCard();
+            const codingPlan = resolvePlan();
+            if (codingPlan.codex?.coding === null) return manual(implementationPlan);
+            const codingAttachments = Array.isArray(codingCard.resolvedAttachments) && codingCard.resolvedAttachments.length > 0
+                ? codingCard.resolvedAttachments
+                : initialAttachments;
             const codingGuidance = await readGuidance();
-            const context = brief(card.title, card.description, implementationPlan, {
+            const context = brief(codingCard.title, codingCard.description, implementationPlan, {
                 base, round, feedback,
-                ...(attachments ? { attachments } : {}),
+                ...(codingAttachments ? { attachments: codingAttachments } : {}),
                 ...(codingGuidance ? { operatorGuidance: codingGuidance } : {}),
             });
             const choiceText = await asRole('coder', withGuidance(
@@ -277,12 +286,16 @@ export async function runTaskDevelopment({
             await record('status', 'Marshal', patch, 'development-patch', digest);
 
             phase('dev-reviewing');
+            const reviewCard = await resolveCard();
+            const reviewAttachments = Array.isArray(reviewCard.resolvedAttachments) && reviewCard.resolvedAttachments.length > 0
+                ? reviewCard.resolvedAttachments
+                : codingAttachments;
             const reviewGuidance = await readGuidance();
             const reviewEvidence = await handoff('编码交付与审查交接',
                 JSON.stringify({ base, digest, implementationEvidence: String(coding).slice(0, 5000) }), 'dev-reviewing');
-            const reviewHead = brief(card.title, card.description, implementationPlan, {
+            const reviewHead = brief(reviewCard.title, reviewCard.description, implementationPlan, {
                 base, digest,
-                ...(attachments ? { attachments } : {}),
+                ...(reviewAttachments ? { attachments: reviewAttachments } : {}),
                 ...(reviewGuidance ? { operatorGuidance: reviewGuidance } : {}),
             });
             const reviewMaterial = reviewHead + '\n固定补丁\n' + patch + '\n编码交接（引用资料）\n' + reviewEvidence;
