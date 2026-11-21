@@ -29,6 +29,7 @@ import { attachFileProposals, mountMemory } from "./memory/mount.js";
 import { mountAgentMemory } from "./memory/agent-memory.js";
 import { mountGroups } from "./groups/mount.js";
 import { mountWorkspaceIdentity } from "./groups/workspace-identity.js";
+import { mountSuperagent } from "./superagent/mount.js";
 export const name = 'marshal';
 export function apply(ctx, raw) {
     mountSetup(ctx, raw, applyConfigured);
@@ -294,6 +295,42 @@ function applyNode(ctx, config) {
             nodeEpoch, seq: 0, ts: Date.now(), kind, payload,
         };
     };
+    let lastInventory;
+    const publishInventory = () => {
+        try {
+            const ledger = readAgentsLedger();
+            const handshake = link.handshake;
+            if (handshake !== undefined) {
+                const inventory = {
+                    v: 2, type: 'device.inventory',
+                    connectionId: handshake.connectionId, nodeEpoch: handshake.nodeEpoch,
+                    deviceName: config.deviceName,
+                    squads: ledger.teams.map(team => ({
+                        id: team.id,
+                        name: team.name,
+                        ...(team.workspaceId ? { workspaceId: team.workspaceId } : {}),
+                        members: team.members.map(member => ({
+                            id: member.id,
+                            name: member.name,
+                            ...(member.preset === undefined ? {} : { preset: member.preset }),
+                            ...(member.permission === undefined ? {} : { permission: member.permission }),
+                            ...(member.model === undefined ? {} : { model: member.model }),
+                            ...(member.reasoningEffort === undefined ? {} : { reasoningEffort: member.reasoningEffort }),
+                            ...(member.brief === undefined ? {} : { brief: member.brief }),
+                            ...(member.sessionId === undefined ? {} : { sessionId: member.sessionId }),
+                        })),
+                    })),
+                    codex: config.agents.includes('codex'),
+                };
+                const serialized = encodeFrame(inventory);
+                if (serialized !== lastInventory) {
+                    link.sendControl(serialized);
+                    lastInventory = serialized;
+                }
+            }
+        }
+        catch { /* inventory is optional metadata */ }
+    };
     const link = new NodeLink({
         ...(hubCa === undefined ? {} : { ca: hubCa }),
         url: config.hubUrl, token: config.token, deviceId: config.deviceId,
@@ -321,33 +358,8 @@ function applyNode(ctx, config) {
         onHandshake: (binding, previous) => {
             discussions?.invalidate();
             void discussions?.announce().catch(() => { });
-            try {
-                const ledger = readAgentsLedger();
-                const handshake = link.handshake;
-                if (handshake !== undefined) {
-                    link.sendControl(encodeFrame({
-                        v: 2, type: 'device.inventory',
-                        connectionId: handshake.connectionId, nodeEpoch: handshake.nodeEpoch,
-                        deviceName: config.deviceName,
-                        squads: ledger.teams.map(team => ({
-                            id: team.id,
-                            name: team.name,
-                            members: team.members.map(member => ({
-                                id: member.id,
-                                name: member.name,
-                                ...(member.preset === undefined ? {} : { preset: member.preset }),
-                                ...(member.permission === undefined ? {} : { permission: member.permission }),
-                                ...(member.model === undefined ? {} : { model: member.model }),
-                                ...(member.reasoningEffort === undefined ? {} : { reasoningEffort: member.reasoningEffort }),
-                                ...(member.brief === undefined ? {} : { brief: member.brief }),
-                                ...(member.sessionId === undefined ? {} : { sessionId: member.sessionId }),
-                            })),
-                        })),
-                        codex: config.agents.includes('codex'),
-                    }));
-                }
-            }
-            catch { /* inventory is optional metadata */ }
+            lastInventory = undefined;
+            publishInventory();
             const tightened = (previous?.policies.allowContent === true && binding.policies.allowContent !== true)
                 || (previous?.policies.allowInteractions === true && binding.policies.allowInteractions !== true);
             // 每个 relay 都先按新协商复核旧卡：授权变化（含仅 revision 变化）立即结算，
@@ -374,9 +386,14 @@ function applyNode(ctx, config) {
         },
         onError: error => ctx.logger.warn(`marshal: link error: ${errorName(error)}`),
     });
+    const inventoryTimer = config.groups ? setInterval(() => {
+        if (link.online) publishInventory();
+    }, 5_000) : undefined;
+    inventoryTimer?.unref();
     if (config.allowDiscussion)
         discussions = createNodeDiscussions({
             enabled: true, journal, link: () => link,
+            allowsTaskWorkspace: workspaceId => config.groups && readAgentsLedger().teams.some(team => team.workspaceId === workspaceId),
             port: createDiscussionPort({ agents: config.agents, ...(ctx.llm === undefined ? {} : { llm: ctx.llm }),
                 ...(config.codexExecutable === undefined ? {} : { codexExecutable: config.codexExecutable }),
                 ...(config.claudeExecutable === undefined ? {} : { claudeExecutable: config.claudeExecutable }),
@@ -432,9 +449,48 @@ function applyNode(ctx, config) {
             ctx.logger.warn(`marshal: dispatch unavailable: ${errorName(error)}`);
         }
     }
+    // Shared seam between the group workflow service and the superagent bridge:
+    // the bridge can only honour a card's preset orchestration if it can see it.
+    const groupsRuntime = {};
     if (config.groups) {
         try {
-            mountGroups(ctx, config, { logger: ctx.logger, memory: agentMemoryService });
+            ctx.inject(['systemPrompt', 'typertGateway', 'webServer'], (scoped) => {
+                const origin = typeof scoped.webServer?.getOrigin === 'function'
+                    ? scoped.webServer.getOrigin()
+                    : typeof scoped.webServer?.port === 'number' ? 'http://127.0.0.1:' + scoped.webServer.port : '';
+                const probe = origin
+                    ? fetch(origin + '/dsh-agents/api/state', { signal: AbortSignal.timeout(600) })
+                        .then(res => res.status !== 404).catch(() => false)
+                    : Promise.resolve(false);
+                void probe.then(async (alreadyMounted) => {
+                    if (alreadyMounted) return;
+                    const mod = await import('./dsh-agents/index.js');
+                    try { mod.apply(scoped, {}); }
+                    catch (error) { ctx.logger.warn(`marshal: embedded dsh-agents skipped: ${errorName(error)}`); }
+                }).catch((error) => {
+                    ctx.logger.warn(`marshal: embedded dsh-agents unavailable: ${errorName(error)}`);
+                });
+            });
+        }
+        catch (error) {
+            ctx.logger.warn(`marshal: embedded dsh-agents inject skipped: ${errorName(error)}`);
+        }
+        try {
+            ctx.inject(['systemPrompt', 'typertGateway', 'workspaceRegistry', 'webServer', 'agents', 'commands'], (scoped) => {
+                if (lookupService(ctx, 'taskBoard') !== undefined || lookupService(scoped, 'taskBoard') !== undefined) return;
+                void import('./task-board/index.js').then((tb) => {
+                    if (lookupService(ctx, 'taskBoard') !== undefined || lookupService(scoped, 'taskBoard') !== undefined) return;
+                    tb.apply(scoped, {});
+                }).catch((error) => {
+                    ctx.logger.warn(`marshal: embedded task-board unavailable: ${errorName(error)}`);
+                });
+            });
+        }
+        catch (error) {
+            ctx.logger.warn(`marshal: embedded task-board inject skipped: ${errorName(error)}`);
+        }
+        try {
+            mountGroups(ctx, config, { logger: ctx.logger, memory: agentMemoryService, runtime: groupsRuntime });
         }
         catch (error) {
             ctx.logger.warn(`marshal: groups unavailable: ${errorName(error)}`);
@@ -446,10 +502,24 @@ function applyNode(ctx, config) {
             ctx.logger.warn(`marshal: workspace identity unavailable: ${errorName(error)}`);
         }
     }
+    try {
+        mountSuperagent(ctx, config, { logger: ctx.logger, memory: agentMemoryService, workflow: groupsRuntime });
+    }
+    catch (error) {
+        ctx.logger.warn(`marshal: superagent unavailable: ${errorName(error)}`);
+    }
     const phoneHost = () => {
         const board = lookupService(ctx, 'taskBoard');
-        const memory = lookupService(ctx, 'memory');
-        const roster = lookupService(ctx, 'roster');
+        const hostMemory = lookupService(ctx, 'memory');
+        const memory = typeof hostMemory?.readPhone === 'function' ? hostMemory : agentMemoryService;
+        const hostRoster = lookupService(ctx, 'roster');
+        const roster = typeof hostRoster?.list === 'function' ? hostRoster : config.groups ? { list() {
+            const ledger = readAgentsLedger();
+            if (!ledger.available) return { code: 'unavailable' };
+            return { agents: ledger.teams.flatMap(team => team.members.map(member => ({
+                id: team.id + '/' + member.id, name: member.name,
+            }))) };
+        } } : undefined;
         return {
             ...(board === undefined ? {} : { board }),
             ...(memory === undefined ? {} : { memory }),
@@ -459,7 +529,13 @@ function applyNode(ctx, config) {
     const stopRelay = config.hubUrl !== undefined && config.token !== undefined && config.deviceId !== undefined
         ? startPhoneRelay({
             host: phoneHost,
-            allowContent: config.privacy === 'content',
+            contentGrant: () => {
+                const handshake = link.handshake;
+                const binding = link.binding;
+                if (!link.online || !handshake || binding?.policies.allowContent !== true)
+                    return undefined;
+                return { connectionId: handshake.connectionId, policyRevision: binding.policyRevision };
+            },
             origin: hubHttpOrigin(config.hubUrl),
             token: config.token,
             deviceId: config.deviceId,
@@ -467,6 +543,7 @@ function applyNode(ctx, config) {
         })
         : undefined;
     ctx.effect(() => () => {
+        clearInterval(inventoryTimer);
         stopRelay?.();
         discussions?.dispose();
         nodeSync?.dispose();

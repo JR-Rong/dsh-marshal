@@ -5,7 +5,9 @@
 - 应用身份：`com.rongjunrui.marshal.mobile`
 - 技术栈：Capacitor 8（原生壳）+ TypeScript/Vite（自绘界面）+ 本地插件 `plugins/marshal-stream`（原生 SSE）
 - 两端同码：Android 与 iOS 共用 `src/`，各自只承载壳工程
-- 版本：0.6.0（一个码：Hub + DSH 工作台一次配好；扫码配对；默认 DeepSeek 蓝 / Codex 紫 / 灰）
+- 版本：0.7.6（Apple 风格界面；一个码：Hub + DSH 工作台一次配好；扫码配对）
+- 设计：Apple HIG（iOS 26/27）双层材质 + 分组列表 + 4 栏 Tab；浅色 / 深色跟随系统
+- 图标：唯一来源 `../plugin-build/icon.svg`（Marshal 蓝），脚本生成 iOS AppIcon、Android 自适应/传统图标、启动图与通知图标
 
 ---
 
@@ -74,7 +76,8 @@
 | 持久可调项 | 只读 | Hub 把 model/reasoning 标为 `editable:false`（v0-field-only） |
 | 应用锁 | 可用 | 6 位 PIN，启动/切回解锁 |
 | DSH 工作台 | 可用 | 配对 DSH remote-bridge `/ios/v1`：智能体首页、会话内容、任务看板；协议 P-256 配对，设备令牌存本机 |
-| 主题色 | 可用 | 设置/首次启动可选 DeepSeek 蓝（默认）、Codex 紫、灰；立即生效并记住 |
+| 外观 | 跟随系统 | 浅色 / 深色随 iOS、Android 自动切换；强调色固定为仓库图标的 Marshal 蓝，不提供应用内换肤（HIG） |
+| 底部 Tab | 可用 | 设备 / 会话 / 看板 / 设置 四栏；群聊与记忆从设备页进入 |
 | 群聊（工作台内） | 待接 | 远程桥 v1 没有群聊消息面；工作台「群聊」页给回 Hub 群聊的入口 |
 | 记忆（工作台内） | 只读 | 电脑通过 Hub 上报；没有读到时不显示空列表 |
 | 推送 | 无 | Hub 无 push 通道 |
@@ -86,8 +89,13 @@
 ### 环境
 
 - Node.js ≥ 22、npm
-- Android：JDK 21+、Android SDK（platform 36）
-- iOS：Xcode 16+，先同意许可 `sudo xcodebuild -license accept`
+- Android：JDK 21+、Android SDK（platform 36 + build-tools 36）
+- iOS：Xcode 16+（本机 Xcode 27.2）
+- 图标生成：`rsvg-convert`（librsvg）+ Python Pillow
+
+> 本机若没有系统级 JDK 21 / platform 36，可把工具链放进工作区（不入库）：
+> `.toolchain/jdk`（Temurin 21）与 `.toolchain/android-sdk`（platform 36，其余目录软链到系统 SDK），
+> 构建时设置 `JAVA_HOME`、`ANDROID_HOME`、`GRADLE_USER_HOME` 指向工作区即可，无需改动系统。
 
 ### 命令
 
@@ -97,10 +105,14 @@ npm run dev            # 浏览器预览（接口需 mock）
 npm test               # 51 项单元测试
 npm run typecheck
 npm run build
+python3 scripts/make-assets.py  # 从 ../plugin-build/icon.svg 重新生成全部图标/启动图
 
 bash scripts/build-android.sh   # 出调试 APK
 bash scripts/build-ios.sh       # 出模拟器 .app
 bash scripts/verify.sh          # 类型 + 单测 + 构建 + 双端同步 + UI 冒烟
+
+# 真机（Android，已验证）：adb install -r android/app/build/outputs/apk/debug/app-debug.apk
+# 界面截图（浅/深色）：先 npm run preview，再 node scripts/ui-shot.mjs / ui-states.mjs
 ```
 
 真 Hub 只读联调（不发送 prompt）：
@@ -146,12 +158,15 @@ npm run ticket -- --hub https://hub.example.com
 - 扫码是首选；「手动粘贴」收在配对页的「高级」折叠里，不占主屏。
 - 相机权限：安卓已加 `CAMERA` 并用 Capacitor WebView 的权限回调；iOS Info.plist 已加 `NSCameraUsageDescription`。
 
-### 主题色
+### 外观与设计（Apple 风格）
 
-- 默认 **DeepSeek 蓝**；设置页或首次启动页可选 **Codex 紫** / **灰**，立即生效并记住。
-- 主题只改强调色，界面仍是深色；所有旧绿色（`#83c7b0`）已移除。
-- 应用图标与启动图固定为蓝色，不随主题切换；已从绿色改为蓝。
-- 工作台（DSH 工作台）继承同一主题变量，切换后同样生效。
+- **双层材质**：内容层一律不透明语义色（浅色 `#F2F2F7/#FFFFFF`，深色 `#000/#1C1C1E`）；磨砂半透明只用于底部 Tab 栏与输入区浮层（`backdrop-filter`）。
+- **系统外观**：`prefers-color-scheme` 自动浅/深；不提供应用内换肤，避免与系统设置冲突（HIG）。
+- **排版**：SF Pro / PingFang SC 系统字体栈；大标题 30pt、正文 17pt、辅助 13pt，最小 12pt；数字等宽。
+- **触控**：可点区域 ≥44pt；列表行高 ≥52pt；Tab 栏 4 项、单项 48pt。
+- **品牌**：强调色取自仓库图标 `plugin-build/icon.svg` 的 Marshal 蓝（浅色 `#1F6FEB`，深色 `#409CFF`）；应用内 logo 与 App Icon 同源。
+- **图标流水线**：`scripts/make-assets.py` 解析 icon.svg 的路径与顶灯，经 `rsvg-convert` 渲染出 1024 AppIcon（无 alpha）、Android 自适应前景/传统图标/圆形图标、启动图与通知小图标；不再自绘「调」字或绿色渐变。
+- 浅色 / 深色首屏、首页与会话页截图见 `docs/screenshots/apple-*.png`、`home-*.png`、`sessions-*.png`。
 
 ---
 
@@ -179,8 +194,9 @@ npm run ticket -- --hub https://hub.example.com
 5. **不实现 wire v2 node 执行协议**：手机无 DSH 运行时，纯协议接入只会是「没有会话的空设备」；按甲案走管理接口直连。
 6. **新建会话/分支/中断未开放**：Hub 能力文档明确 `not-exposed-in-v0` / `no-atomic-turn-binding`。
 7. **模拟器跑不起**：本机 CoreSimulator 1051.55.0 低于 Xcode 27.2 要求，只能编译不能启动。
-8. **真机未安装**：本机无 AVD、无 adb 设备；iOS 模拟器运行时版本不匹配。
-9. **iOS 全量重编译仍受 SwiftPM 缓存限制**；本版未改原生代码，复用已编译壳 + 新 Web 资源。
+8. **Android 真机已安装验证**：HUAWEI ALT-AL10（Android 12 / SDK 31）USB 连接，已安装 0.7.6 并启动截图。
+9. **iOS 真机需皇上两步授权**：① 在「设置 → 隐私与安全性 → 开发者模式」打开并重启；② 在 Xcode 登录 Apple ID（免费 Personal Team）用于签名。当前本机无签名身份、且真机开发者模式关闭，只能编译不能安装。
+10. **iOS 模拟器不可用**：本机 CoreSimulator 运行时列表为空（低于 Xcode 27.2 要求），`simctl` 无可用设备；模拟器安装验收需另装 runtime。
 
 ---
 

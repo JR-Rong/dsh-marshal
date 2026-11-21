@@ -17,6 +17,7 @@ export const DiscussionTurnSchema = z.object({
     text: z.string().min(1).refine(text => Buffer.byteLength(text) <= DISCUSSION_INPUT_BYTES),
     expiresAt: z.number().int().positive(), policyRevision: z.number().int().nonnegative(),
     work: WorkScopeSchema.optional(),
+    taskWorkspaceId: z.string().min(1).max(256).optional(),
     reasoning: z.string().min(1).max(32).optional(),
 }).strict();
 export const DiscussionStopSchema = z.object({ roomId: id, memberId: id, turnId: id }).strict();

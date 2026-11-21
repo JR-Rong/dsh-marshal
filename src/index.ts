@@ -418,7 +418,12 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
   const stopRelay = config.hubUrl !== undefined && config.token !== undefined && config.deviceId !== undefined
     ? startPhoneRelay({
         host: phoneHost,
-        allowContent: config.privacy === 'content',
+        contentGrant: () => {
+          const handshake = link.handshake
+          const binding = link.binding
+          if (!link.online || !handshake || binding?.policies.allowContent !== true) return undefined
+          return { connectionId: handshake.connectionId, policyRevision: binding.policyRevision }
+        },
         origin: hubHttpOrigin(config.hubUrl),
         token: config.token,
         deviceId: config.deviceId,

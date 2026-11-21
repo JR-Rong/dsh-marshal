@@ -20,6 +20,7 @@ export const DiscussionTurnSchema = z.object({
   text: z.string().min(1).refine(text => Buffer.byteLength(text) <= DISCUSSION_INPUT_BYTES),
   expiresAt: z.number().int().positive(), policyRevision: z.number().int().nonnegative(),
   work: WorkScopeSchema.optional(),
+  taskWorkspaceId: z.string().min(1).max(256).optional(),
   reasoning: z.string().min(1).max(32).optional(),
 }).strict()
 export type DiscussionTurn = z.infer<typeof DiscussionTurnSchema>
@@ -44,11 +45,21 @@ export const DiscussionProgressSchema = z.object({
   usage: DiscussionUsageSchema.optional(),
 }).strict()
 export type DiscussionProgress = z.infer<typeof DiscussionProgressSchema>
+export interface DiscussionProgressStep {
+  readonly label: string
+  readonly status?: 'running' | 'done' | 'failed'
+  readonly detail?: string
+}
+export type DiscussionLiveProgress = DiscussionProgress & {
+  readonly thinking?: string
+  readonly steps?: readonly DiscussionProgressStep[]
+  readonly model?: string
+}
 export interface DiscussionPort {
   catalog(): Promise<readonly DiscussionModel[]>
   /** Reports the final observed usage even if the model call subsequently rejects. */
   run(model: DiscussionModel, text: string, signal: AbortSignal, work?: WorkScope, reasoning?: string,
-    onUsage?: (usage: DiscussionUsage) => void, onProgress?: (progress: DiscussionProgress) => void): Promise<string>
+    onUsage?: (usage: DiscussionUsage) => void, onProgress?: (progress: DiscussionLiveProgress) => void): Promise<string>
   dispose(): void
 }
 export class DiscussionError extends Error {

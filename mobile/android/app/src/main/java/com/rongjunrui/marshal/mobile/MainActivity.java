@@ -3,14 +3,19 @@ package com.rongjunrui.marshal.mobile;
 import android.Manifest;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
-import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.content.res.Configuration;
 import android.os.Build;
 import android.os.Bundle;
+import android.view.View;
+import android.view.Window;
+import android.view.WindowManager;
 
 import androidx.core.app.ActivityCompat;
 import androidx.core.app.NotificationCompat;
 import androidx.core.content.ContextCompat;
+import androidx.core.view.WindowCompat;
+import androidx.core.view.WindowInsetsControllerCompat;
 
 import com.getcapacitor.BridgeActivity;
 import com.huawei.hms.aaid.HmsInstanceId;
@@ -23,11 +28,13 @@ import java.nio.charset.StandardCharsets;
 public class MainActivity extends BridgeActivity {
     private static final int POST_NOTIFICATIONS = 41;
     private static final int ONGOING_ID = 42;
-    private static final String PREFS = "marshal-push";
+    private static final int COLOR_LIGHT_BG = 0xFFF2F2F7;
+    private static final int COLOR_DARK_BG = 0xFF000000;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        applySystemBars();
         if (Build.VERSION.SDK_INT >= 33
                 && ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.POST_NOTIFICATIONS}, POST_NOTIFICATIONS);
@@ -39,6 +46,49 @@ public class MainActivity extends BridgeActivity {
         };
         PushBootstrap.readFirebase(this);
         new Thread(this::readHuaweiToken).start();
+    }
+
+    @Override
+    public void onResume() {
+        super.onResume();
+        applySystemBars();
+    }
+
+    @Override
+    public void onConfigurationChanged(Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        applySystemBars();
+    }
+
+    /** 同步状态栏与导航栏明暗图标，兼容 Android 12/EMUI 与 Android 15+。 */
+    @SuppressWarnings("deprecation")
+    private void applySystemBars() {
+        int nightMask = getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK;
+        boolean dark = nightMask == Configuration.UI_MODE_NIGHT_YES;
+        Window window = getWindow();
+        if (window == null) return;
+        View decor = window.getDecorView();
+        if (Build.VERSION.SDK_INT < 35) {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_TRANSLUCENT_STATUS);
+            window.addFlags(WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS);
+            int bg = dark ? COLOR_DARK_BG : COLOR_LIGHT_BG;
+            window.setStatusBarColor(bg);
+            window.setNavigationBarColor(bg);
+            int flags = decor.getSystemUiVisibility();
+            if (dark) {
+                flags &= ~View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+                if (Build.VERSION.SDK_INT >= 26) flags &= ~View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+            } else {
+                flags |= View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+                if (Build.VERSION.SDK_INT >= 26) flags |= View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+            }
+            decor.setSystemUiVisibility(flags);
+        }
+        WindowInsetsControllerCompat controller = WindowCompat.getInsetsController(window, decor);
+        if (controller != null) {
+            controller.setAppearanceLightStatusBars(!dark);
+            controller.setAppearanceLightNavigationBars(!dark);
+        }
     }
 
     /** 需要 app/agconnect-services.json，并让 AGConnect 自动初始化。没有这份配置就不编造令牌。 */
