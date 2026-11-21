@@ -2216,6 +2216,8 @@ window.__ModuleLoader__.load({
         '.mtr-trace-step[data-st="running"]{color:#60a5fa;background:color-mix(in srgb,#3b82f6 11%,transparent)}',
         '.mtr-trace-step[data-st="failed"]{color:#f87171;background:color-mix(in srgb,#ef4444 11%,transparent)}',
         '.mtr-trace-think{margin:0;padding:8px 10px;max-height:220px;overflow-y:auto;border-radius:7px;font:11.5px/1.55 inherit;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--dsw-alias-label-secondary,rgba(155,160,175,.95));background:color-mix(in srgb,#000 14%,transparent);border-left:2.5px solid color-mix(in srgb,var(--mtr-agent-c,#6366f1) 55%,transparent)}',
+        '.mtr-tok-badge{display:inline-flex;align-items:center;gap:4px;font:10.5px/1.35 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;padding:1.5px 7px;border-radius:999px;color:var(--dsw-alias-label-secondary,rgba(150,156,170,.95));background:color-mix(in srgb,currentColor 8%,transparent);border:1px solid color-mix(in srgb,currentColor 14%,transparent);white-space:nowrap}',
+        '.mtr-trace-usage{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:4px 8px;border-radius:6px;font:11px/1.4 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;color:var(--dsw-alias-label-secondary,rgba(150,156,170,.95));background:color-mix(in srgb,currentColor 6%,transparent)}',
       ].join('\n');
       if (!existing) document.head.appendChild(style);
     }
@@ -2236,10 +2238,42 @@ window.__ModuleLoader__.load({
       }
     }
 
+    function formatTokenCount(value) {
+      if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return '';
+      if (value >= 1_000_000) return (value / 1_000_000).toFixed(2).replace(/\.?0+$/, '') + 'M';
+      if (value >= 1000) return (value / 1000).toFixed(1).replace(/\.0$/, '') + 'k';
+      return String(Math.round(value));
+    }
+
+    function formatUsageTitle(usage) {
+      if (!usage || typeof usage !== 'object') return '';
+      const total = Number(usage.totalTokens || ((usage.inputTokens || 0) + (usage.outputTokens || 0)));
+      if (!total) return '';
+      const parts = [
+        '总计 ' + total.toLocaleString() + ' tokens',
+        '输入 ' + Number(usage.inputTokens || 0).toLocaleString(),
+        '输出 ' + Number(usage.outputTokens || 0).toLocaleString(),
+      ];
+      if (usage.reasoningTokens) parts.push('思考 ' + Number(usage.reasoningTokens).toLocaleString());
+      return parts.join(' · ');
+    }
+
+    function AgentUsageBadge({ usage }) {
+      if (!usage || typeof usage !== 'object') return null;
+      const total = Number(usage.totalTokens || ((usage.inputTokens || 0) + (usage.outputTokens || 0)));
+      if (!total || total <= 0) return null;
+      const inShort = formatTokenCount(Number(usage.inputTokens || 0)) || '0';
+      const outShort = formatTokenCount(Number(usage.outputTokens || 0)) || '0';
+      return h('span', { className: 'mtr-tok-badge', title: formatUsageTitle(usage) },
+        '🪙 ' + formatTokenCount(total) + ' tok (入 ' + inShort + ' · 出 ' + outShort + ')');
+    }
+
     function AgentTracePanel({ trace, live = false, hasBody = true }) {
       if (!trace || typeof trace !== 'object') return null;
       const steps = Array.isArray(trace.steps) ? trace.steps.filter(s => s && s.label) : [];
       const thinking = typeof trace.thinking === 'string' ? trace.thinking.trim() : '';
+      const usage = trace.usage && typeof trace.usage === 'object' && (trace.usage.totalTokens > 0 || trace.usage.inputTokens > 0 || trace.usage.outputTokens > 0)
+        ? trace.usage : null;
       if (!thinking && steps.length === 0 && !live) return null;
       const stepCount = typeof trace.stepCount === 'number' && trace.stepCount > steps.length ? trace.stepCount : steps.length;
       const durSec = typeof trace.durationMs === 'number' && trace.durationMs > 0
@@ -2248,6 +2282,7 @@ window.__ModuleLoader__.load({
       const metaParts = [];
       if (thinking) metaParts.push('含思考链');
       if (stepCount > 0) metaParts.push(stepCount + ' 步处理');
+      if (usage) metaParts.push('消耗 ' + formatTokenCount(usage.totalTokens || (usage.inputTokens + usage.outputTokens)) + ' tok');
       if (trace.model) metaParts.push(trace.model);
       if (durSec && !live) metaParts.push('耗时 ' + durSec);
       const summaryLabel = live
@@ -2256,6 +2291,7 @@ window.__ModuleLoader__.load({
       return h('details', { className: 'mtr-trace', open: live || !hasBody ? true : undefined },
         h('summary', { className: 'mtr-trace-sum' }, summaryLabel),
         h('div', { className: 'mtr-trace-body' },
+          usage && h('div', { className: 'mtr-trace-usage' }, '🪙 ' + formatUsageTitle(usage)),
           steps.length > 0 && h('div', { className: 'mtr-trace-steps' },
             steps.map((st, idx) => {
               const icon = st.status === 'running' ? '⟳' : st.status === 'failed' ? '✕' : '✓';
@@ -2731,6 +2767,10 @@ window.__ModuleLoader__.load({
         '.mtb-att-thumb{width:34px;height:34px;border-radius:6px;object-fit:cover;flex-shrink:0;border:1px solid var(--dsw-alias-border-l1,transparent)}',
         '.mtb-exec-row{display:grid;gap:4px;padding:8px 10px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1,color-mix(in srgb,currentColor 10%,transparent));background:var(--dsw-alias-bg-base,transparent);font-size:11.5px}',
         '.mtb-review-panel{display:grid;gap:9px;padding:12px 14px;border-radius:12px;border:1px solid color-mix(in srgb,#8b5cf6 42%,transparent);background:color-mix(in srgb,#8b5cf6 9%,var(--dsw-alias-bg-layer-2,transparent))}',
+        '.mtb-agent-cfg-list{display:grid;gap:8px}',
+        '.mtb-agent-cfg-row{display:grid;gap:6px;padding:9px 11px;border-radius:10px;border:1px solid var(--dsw-alias-border-l1,color-mix(in srgb,currentColor 13%,transparent));background:color-mix(in srgb,currentColor 3.5%,transparent)}',
+        '.mtb-agent-cfg-head{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;font-size:12px;font-weight:600}',
+        '.mtb-agent-cfg-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:7px}',
         '.mtb-archive-grid{flex:1;min-height:0;overflow:auto;padding:16px 20px;display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:10px;align-content:start}',
       ].join('\n');
       if (!existing) document.head.appendChild(style);
@@ -3101,6 +3141,7 @@ window.__ModuleLoader__.load({
       const [plan, setPlan] = React.useState(null);
       const [codexModels, setCodexModels] = React.useState([]);
       const [explicitCode, setExplicitCode] = React.useState(false);
+      const [formAgentConfigs, setFormAgentConfigs] = React.useState({});
       const selectedTemplate = plan?.templateId ?? (choice === 'template' ? templateId : choice === 'none' ? 'none' : '');
       const recommendedTemplate = selectedTemplate === 'none' ? catalog?.plainTemplate : catalog?.templates.find(item => item.id === selectedTemplate);
       const codeWork = selectedTemplate === 'development' || (selectedTemplate !== 'pr-review' && (plan?.codeWork ?? explicitCode));
@@ -3169,7 +3210,12 @@ window.__ModuleLoader__.load({
         ensureTaskBoardStyles();
         void load();
         void fetchJson('marshal/tasks/orchestration', undefined, true)
-          .then(setCatalog).catch(() => setCatalogError('编排配置暂不可用。'));
+          .then(data => {
+            setCatalog(data);
+            if (Array.isArray(data?.codexModels) && data.codexModels.length > 0) {
+              setCodexModels(data.codexModels);
+            }
+          }).catch(() => setCatalogError('编排配置暂不可用。'));
         void fetchJson('marshal/task-rooms/workspaces', undefined, true).then(data => {
           const realWs = (data.workspaces || []).filter(item => !isPseudoAgentWorkspace(item));
           setWorkspaces(realWs);
@@ -3231,11 +3277,109 @@ window.__ModuleLoader__.load({
       }, [focusedTask, focusAvailable]);
 
       const effortsForModel = route => {
-        const hit = modelOptions.find(m => m.route === route);
+        const hit = modelOptions.find(m => m.route === route || m.id === route);
         if (hit && hit.efforts.length > 0) {
           return hit.efforts.map(id => DEFAULT_REASONING_EFFORTS.find(d => d.id === id) ?? { id, label: id });
         }
         return DEFAULT_REASONING_EFFORTS;
+      };
+
+      const thinkingModeOptions = (route, defaultEffort = '', currentVal = '') => {
+        const base = [
+          { id: '', label: '思考：跟随默认' + (defaultEffort ? ' (' + defaultEffort + ')' : '') },
+          { id: 'off', label: '思考：关闭 (直出)' },
+          ...effortsForModel(route).map(opt => ({ id: opt.id, label: '思考：' + opt.label })),
+        ];
+        if (currentVal && !base.some(o => o.id === currentVal)) {
+          base.push({ id: currentVal, label: '思考：' + currentVal });
+        }
+        return base;
+      };
+
+      const codexThinkingOptions = (codexSlotValue, currentVal = '') => {
+        const matched = codexModels.find(m => m.id === codexSlotValue || m.model === codexSlotValue) ?? codexModels[0];
+        const declared = Array.isArray(matched?.reasoningEfforts) && matched.reasoningEfforts.length > 0
+          ? matched.reasoningEfforts.map(id => DEFAULT_REASONING_EFFORTS.find(d => d.id === id) ?? { id, label: id })
+          : DEFAULT_REASONING_EFFORTS;
+        const base = [
+          { id: '', label: '思考：跟随默认' },
+          { id: 'off', label: '思考：关闭 (直出)' },
+          ...declared.map(opt => ({ id: opt.id, label: '思考：' + opt.label })),
+        ];
+        if (currentVal && !base.some(o => o.id === currentVal)) {
+          base.push({ id: currentVal, label: '思考：' + currentVal });
+        }
+        return base;
+      };
+
+      const modelSelectOptions = (defaultModelHint = '', currentVal = '') => {
+        const opts = [
+          { route: '', label: defaultModelHint ? '默认 (' + defaultModelHint + ')' : '跟随智能体默认模型' },
+          ...modelOptions,
+        ];
+        if (currentVal && !opts.some(o => o.route === currentVal)) {
+          opts.push({ route: currentVal, label: currentVal + ' (已指定)' });
+        }
+        return opts;
+      };
+
+      const cleanClientAgentConfigs = raw => {
+        if (!raw || typeof raw !== 'object') return undefined;
+        const out = {};
+        for (const [slot, cfg] of Object.entries(raw)) {
+          if (!cfg || typeof cfg !== 'object') continue;
+          const m = typeof cfg.model === 'string' ? cfg.model.trim() : '';
+          const r = typeof cfg.reasoningEffort === 'string' ? cfg.reasoningEffort.trim() : '';
+          if (m || r) out[slot] = { ...(m ? { model: m } : {}), ...(r ? { reasoningEffort: r } : {}) };
+        }
+        return Object.keys(out).length > 0 ? out : undefined;
+      };
+
+      const setSlotConfig = (slot, patch) => {
+        setFormAgentConfigs(prev => {
+          const cur = prev?.[slot] ?? {};
+          const nextSlot = { ...cur, ...patch };
+          if (!nextSlot.model) delete nextSlot.model;
+          if (!nextSlot.reasoningEffort) delete nextSlot.reasoningEffort;
+          const next = { ...(prev ?? {}) };
+          if (Object.keys(nextSlot).length === 0) delete next[slot];
+          else next[slot] = nextSlot;
+          return next;
+        });
+      };
+
+      const buildLocalPlanFor = (tplId, useCodeWork, activeLeaderId, wsId) => {
+        if (!catalog || !tplId) return null;
+        const tplMeta = tplId === 'none' ? catalog.plainTemplate : catalog.templates?.find(t => t.id === tplId);
+        if (!tplMeta) return null;
+        const isCode = tplId === 'development' || (tplId !== 'pr-review' && Boolean(useCodeWork));
+        const slots = (isCode ? tplMeta.codingRoles : tplMeta.roles) ?? [];
+        const pool = (catalog.leaders ?? []).filter(item => (item.global || !wsId || item.workspaceId === wsId) && item.id !== activeLeaderId);
+        const used = new Set([activeLeaderId]);
+        const members = {};
+        for (const slot of slots) {
+          if (slot.id === 'codexCritic') {
+            members[slot.id] = '@codex';
+            continue;
+          }
+          const avail = pool.filter(m => !used.has(m.id) && (slot.id !== 'coder' || ['workspace-write', 'danger-full-access'].includes(m.permission)));
+          if (avail[0]) {
+            members[slot.id] = avail[0].id;
+            used.add(avail[0].id);
+          } else if (slot.id === 'critic') {
+            members[slot.id] = '@dsh';
+          }
+        }
+        return {
+          templateId: tplId,
+          groupTemplate: isCode ? 'delivery' : (tplMeta.groupTemplate ?? 'free'),
+          codeWork: isCode,
+          members,
+          codex: {
+            coding: isCode ? 'auto' : null,
+            review: (isCode || tplId === 'pr-review') ? 'auto' : null,
+          },
+        };
       };
 
       const previewUrlsRef = React.useRef(new Map());
@@ -3291,12 +3435,16 @@ window.__ModuleLoader__.load({
         finally { setParseBusy(false); }
       };
 
-      const choiceBody = () => ({
-        leaderId, choice, codeWork: explicitCode || undefined,
-        ...(workspace ? { workspaceId: workspace } : {}),
-        ...(choice === 'template' ? { templateId } : {}),
-        ...(choice !== 'none' && prUrl.trim() ? { prUrl: prUrl.trim() } : {}),
-      });
+      const choiceBody = () => {
+        const cleanedConfigs = cleanClientAgentConfigs(formAgentConfigs);
+        return {
+          leaderId, choice, codeWork: explicitCode || undefined,
+          ...(workspace ? { workspaceId: workspace } : {}),
+          ...(choice === 'template' ? { templateId } : {}),
+          ...(choice !== 'none' && prUrl.trim() ? { prUrl: prUrl.trim() } : {}),
+          ...(cleanedConfigs ? { agentConfigs: cleanedConfigs } : {}),
+        };
+      };
       const recommend = async () => {
         if (busy || !leaderId || !title.trim()) return;
         if (requiresPr && !prUrl.trim()) { setError('请填写要审查的 PR 链接'); return; }
@@ -3307,7 +3455,8 @@ window.__ModuleLoader__.load({
             title: title.trim(), description: description.trim(), orchestration: choiceBody(),
           }, true);
           setPlan(result.plan);
-          setCodexModels(result.codexModels ?? []);
+          if (result.plan?.agentConfigs) setFormAgentConfigs(result.plan.agentConfigs);
+          if (Array.isArray(result.codexModels) && result.codexModels.length > 0) setCodexModels(result.codexModels);
           setExplicitCode(result.plan.codeWork && result.plan.templateId !== 'development');
         }
         catch (e) { setError('推荐分工失败，' + (e.message || e)); }
@@ -3332,6 +3481,7 @@ window.__ModuleLoader__.load({
           setOrchestrationMode('plain');
           setLeaderId('');
           setPlan(null);
+          setFormAgentConfigs({});
           setChoice('leader');
           setPrUrl('');
           setExplicitCode(false);
@@ -3357,18 +3507,21 @@ window.__ModuleLoader__.load({
         setAssignedAgent(workflow.leaderId);
         setOrchestrationMode(workflow.choice === 'template' ? 'template' : workflow.choice === 'none' ? 'none' : 'leader');
         setChoice(workflow.choice);
-        setTemplateId(workflow.templateId ?? 'pr-review');
+        const effTpl = workflow.templateId ?? workflow.plan?.templateId ?? 'pr-review';
+        setTemplateId(effTpl);
         setPrUrl(workflow.prUrl ?? '');
-        setPlan(workflow.planConfirmed ? workflow.plan : null);
+        const mergedCfg = { ...(workflow.agentConfigs ?? {}), ...(workflow.plan?.agentConfigs ?? {}) };
+        setFormAgentConfigs(mergedCfg);
+        setPlan(workflow.planConfirmed && workflow.plan ? workflow.plan : (workflow.choice !== 'leader' ? buildLocalPlanFor(workflow.choice === 'none' ? 'none' : effTpl, workflow.plan?.codeWork, workflow.leaderId, workflow.workspaceId) : null));
         setExplicitCode(Boolean(workflow.plan?.codeWork && workflow.plan?.templateId !== 'development'));
         setError('');
         setFormOpen(true);
       };
       const pickOrchestrationMode = (mode, tplId) => {
-        setPlan(null);
         setExplicitCode(false);
         setOrchestrationMode(mode);
         if (mode === 'plain') {
+          setPlan(null);
           setLeaderId('');
           setChoice('leader');
           return;
@@ -3376,26 +3529,41 @@ window.__ModuleLoader__.load({
         const availLeaders = catalog?.leaders ?? [];
         const picked = assignedAgent || leaderId || availLeaders[0]?.id || '';
         if (picked) { setLeaderId(picked); setAssignedAgent(picked); }
-        if (mode === 'leader') setChoice('leader');
-        else if (mode === 'template') { setChoice('template'); if (tplId) setTemplateId(tplId); }
-        else if (mode === 'none') setChoice('none');
+        if (mode === 'leader') {
+          setChoice('leader');
+          setPlan(null);
+        } else if (mode === 'template') {
+          const targetTpl = tplId || templateId;
+          setChoice('template');
+          if (tplId) setTemplateId(tplId);
+          setPlan(picked ? buildLocalPlanFor(targetTpl, false, picked, workspaceId) : null);
+        } else if (mode === 'none') {
+          setChoice('none');
+          setPlan(picked ? buildLocalPlanFor('none', false, picked, workspaceId) : null);
+        }
       };
       const handleAssignAgent = id => {
         setAssignedAgent(id);
         if (orchestrationMode !== 'plain') {
           setLeaderId(id);
-          setPlan(null);
+          if (orchestrationMode === 'template') setPlan(id ? buildLocalPlanFor(templateId, explicitCode, id, workspaceId) : null);
+          else if (orchestrationMode === 'none') setPlan(id ? buildLocalPlanFor('none', explicitCode, id, workspaceId) : null);
+          else setPlan(null);
         }
       };
       const handleSelectWorkspace = nextWsId => {
         setWorkspaceId(nextWsId);
-        setPlan(null);
         const roster = nextWsId ? rosters[nextWsId] : undefined;
+        let effLeader = leaderId;
         if (roster?.leaderId && catalog?.leaders?.some(item => item.id === roster.leaderId)) {
+          effLeader = roster.leaderId;
           setAssignedAgent(roster.leaderId);
           if (orchestrationMode !== 'plain') setLeaderId(roster.leaderId);
           setNotice('已套用该工作区默认班底 Leader');
         }
+        if (orchestrationMode === 'template' && effLeader) setPlan(buildLocalPlanFor(templateId, explicitCode, effLeader, nextWsId));
+        else if (orchestrationMode === 'none' && effLeader) setPlan(buildLocalPlanFor('none', explicitCode, effLeader, nextWsId));
+        else setPlan(null);
       };
       const toggleFormTag = name => {
         const clean = String(name || '').trim();
@@ -3423,10 +3591,16 @@ window.__ModuleLoader__.load({
       };
       const changeCodeWork = enabled => {
         setExplicitCode(enabled);
-        setPlan(current => current && ({
-          ...current, codeWork: enabled,
-          codex: enabled ? { coding: 'auto', review: 'auto' } : { coding: null, review: null },
-        }));
+        setPlan(current => {
+          if (current) {
+            return {
+              ...current, codeWork: enabled,
+              codex: enabled ? { coding: 'auto', review: 'auto' } : { coding: null, review: null },
+            };
+          }
+          const tpl = choice === 'template' ? templateId : choice === 'none' ? 'none' : '';
+          return tpl && leaderId ? buildLocalPlanFor(tpl, enabled, leaderId, workspace) : null;
+        });
       };
       const create = async () => {
         if (!title.trim()) { setError('请填写标题'); return; }
@@ -3438,8 +3612,16 @@ window.__ModuleLoader__.load({
           setError('请指派所有必需角色。');
           return;
         }
+        const cleanedConfigs = cleanClientAgentConfigs(formAgentConfigs);
         const orchestration = useOrch ? {
-          ...choiceBody(), plan: { templateId: plan.templateId, codeWork: plan.codeWork, members: plan.members, codex: plan.codex },
+          ...choiceBody(),
+          plan: {
+            templateId: plan.templateId,
+            codeWork: plan.codeWork,
+            members: plan.members,
+            codex: plan.codex,
+            ...(cleanedConfigs ? { agentConfigs: cleanedConfigs } : {}),
+          },
         } : undefined;
         const pendingDraftTags = newTagDraft.split(/[,，]/).map(s => s.trim()).filter(Boolean);
         const assignedObj = assignedAgent ? catalog?.leaders.find(item => item.id === assignedAgent) : undefined;
@@ -3489,12 +3671,30 @@ window.__ModuleLoader__.load({
           setTemplateId('pr-review');
           setPrUrl('');
           setPlan(null);
+          setFormAgentConfigs({});
           setExplicitCode(false);
           setEditing('');
           setFormOpen(false);
         }
         catch (e) { setError((editing ? '保存分工失败，' : '创建失败，') + (e.message || e)); }
         finally { setBusy(false); }
+      };
+
+      const saveWorkflowAgentConfigs = async (task, patch, labelHint = '智能体配置') => {
+        if (busy || !task) return false;
+        setBusy(true);
+        setError('');
+        try {
+          const result = await fetchJson('marshal/tasks/agent-configs', { taskId: task.id, ...patch }, true);
+          setTasks(result.tasks || []);
+          setNotice('已保存「' + labelHint + '」的模型与思考模式设置（后续执行与工单群回复立即生效）。');
+          return true;
+        } catch (e) {
+          setError('更新智能体配置失败：' + (e.message || e));
+          return false;
+        } finally {
+          setBusy(false);
+        }
       };
 
       const run = async (task) => {
@@ -4029,11 +4229,9 @@ window.__ModuleLoader__.load({
                     h(Field, { label: '执行指令 Prompt' }, h('textarea', { style: { ...uiInput, resize: 'vertical', lineHeight: 1.55 }, rows: 3, value: editPrompt, onChange: e => setEditPrompt(e.target.value) })),
                     h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 } },
                       h(Field, { label: '模型' }, h('select', { style: uiInput, value: editModel, onChange: e => setEditModel(e.target.value) },
-                        h('option', { value: '' }, '跟随默认模型'),
-                        modelOptions.map(opt => h('option', { key: opt.route, value: opt.route }, opt.label)))),
-                      h(Field, { label: '思考强度' }, h('select', { style: uiInput, value: editEffort, onChange: e => setEditEffort(e.target.value) },
-                        h('option', { value: '' }, '跟随默认'),
-                        effortsForModel(editModel).map(opt => h('option', { key: opt.id, value: opt.id }, opt.label))))),
+                        modelSelectOptions('', editModel).map(opt => h('option', { key: opt.route || '__default', value: opt.route }, opt.label)))),
+                      h(Field, { label: '思考模式' }, h('select', { style: uiInput, value: editEffort, onChange: e => setEditEffort(e.target.value) },
+                        thinkingModeOptions(editModel, '', editEffort).map(opt => h('option', { key: opt.id || '__default', value: opt.id }, opt.label))))),
                     h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 } },
                       h(Field, { label: '权限预设' }, h('select', { style: uiInput, value: editPerm, onChange: e => setEditPerm(e.target.value) },
                         h('option', { value: '' }, '跟随默认'),
@@ -4064,16 +4262,165 @@ window.__ModuleLoader__.load({
                       h('summary', { style: { cursor: 'pointer', fontSize: 12, fontWeight: 600, color: dswTheme.dim } }, '执行指令 Prompt'),
                       h('pre', { style: { margin: '6px 0 0', whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 12, lineHeight: 1.55, fontFamily: 'inherit' } }, task.prompt))),
 
-              !archived && (catalog?.leaders?.length ?? 0) > 0 && h('div', { className: 'mtb-drawer-sec' },
-                h('div', { className: 'mtb-drawer-sec-title' }, '指派 Agent Leader'),
-                h('select', {
-                  style: uiInput,
-                  disabled: busy,
-                  value: currentAgentTag ? currentAgentTag.slice(4) : '',
-                  onChange: e => { void assignDrawerAgentLeader(e.target.value); },
-                },
-                  h('option', { value: '' }, '未指派'),
-                  catalog.leaders.map(item => h('option', { key: item.id, value: item.name }, item.name)))),
+              !archived && (() => {
+                if (workflow) {
+                  const wfConfigs = { ...(workflow.agentConfigs ?? {}), ...(workflow.plan?.agentConfigs ?? {}) };
+                  const wfPool = (catalog?.leaders ?? []).filter(item => item.global || item.workspaceId === workflow.workspaceId);
+                  const leaderMeta = wfPool.find(item => item.id === workflow.leaderId) ?? (catalog?.leaders ?? []).find(item => item.id === workflow.leaderId);
+                  const leaderCfg = wfConfigs.leader ?? {};
+                  const activeTplId = workflow.plan?.templateId ?? workflow.selected ?? workflow.templateId ?? (workflow.choice === 'none' ? 'none' : '');
+                  const activeTplMeta = activeTplId === 'none' ? catalog?.plainTemplate : catalog?.templates?.find(t => t.id === activeTplId);
+                  const wfCodeWork = Boolean(workflow.plan?.codeWork || activeTplId === 'development');
+                  const wfSlots = workflow.plan ? ((wfCodeWork ? activeTplMeta?.codingRoles : activeTplMeta?.roles) ?? Object.keys(workflow.plan.members ?? {}).map(id => ({ id, name: id }))) : [];
+                  const codexSlots = workflow.plan ? (wfCodeWork ? ['coding', 'review'] : (activeTplId === 'pr-review' ? ['review'] : [])) : [];
+                  const controlsDisabled = busy || isRunning;
+                  return h('div', { className: 'mtb-drawer-sec', 'aria-label': '参战 Agent 模型与思考模式' },
+                    h('div', { className: 'mtb-drawer-sec-title' },
+                      '🤖 参战 Agent 模型与思考模式',
+                      isRunning && h('span', { style: { fontSize: 10.5, fontWeight: 500, color: '#f59e0b' } }, '运行中只读')),
+                    h('div', { className: 'mtb-agent-cfg-list' },
+                      // 1) Leader Row
+                      h('div', { className: 'mtb-agent-cfg-row' },
+                        h('div', { className: 'mtb-agent-cfg-head' },
+                          h('span', null, '👑 Leader · ' + (leaderMeta?.name || workflow.leaderName || '未绑定')),
+                          h('span', { style: { fontSize: 10.5, fontWeight: 500, color: dswTheme.faint } }, modeLabel)),
+                        h('div', { className: 'mtb-agent-cfg-grid' },
+                          wfPool.length > 0 && h('select', {
+                            'aria-label': 'Leader 人选',
+                            style: uiInput,
+                            disabled: controlsDisabled,
+                            value: workflow.leaderId || '',
+                            onChange: e => {
+                              const picked = wfPool.find(item => item.id === e.target.value);
+                              if (picked) void saveWorkflowAgentConfigs(task, { leaderId: picked.id }, 'Leader → ' + picked.name);
+                            },
+                          }, wfPool.map(item => h('option', { key: item.id, value: item.id }, 'Leader: ' + item.name))),
+                          h('select', {
+                            'aria-label': 'Leader 模型',
+                            style: uiInput,
+                            disabled: controlsDisabled,
+                            value: leaderCfg.model || '',
+                            onChange: e => { void saveWorkflowAgentConfigs(task, { agentConfigs: { leader: { ...leaderCfg, model: e.target.value } } }, (leaderMeta?.name || 'Leader') + ' 模型'); },
+                          }, modelSelectOptions(leaderMeta?.model || '', leaderCfg.model || '').map(opt => h('option', { key: opt.route || '__def', value: opt.route }, opt.label))),
+                          h('select', {
+                            'aria-label': 'Leader 思考模式',
+                            style: uiInput,
+                            disabled: controlsDisabled,
+                            value: leaderCfg.reasoningEffort || '',
+                            onChange: e => { void saveWorkflowAgentConfigs(task, { agentConfigs: { leader: { ...leaderCfg, reasoningEffort: e.target.value } } }, (leaderMeta?.name || 'Leader') + ' 思考模式'); },
+                          }, thinkingModeOptions(leaderCfg.model || leaderMeta?.model || '', leaderMeta?.reasoningEffort || '', leaderCfg.reasoningEffort || '').map(opt => h('option', { key: opt.id || '__def', value: opt.id }, opt.label))))),
+                      // 2) Role Slot Rows
+                      wfSlots.filter(slot => slot.id !== 'codexCritic').map(slot => {
+                        const memberIdVal = workflow.plan?.members?.[slot.id] ?? '';
+                        const memberMeta = wfPool.find(m => m.id === memberIdVal);
+                        const slotCfg = wfConfigs[slot.id] ?? {};
+                        const rolePool = wfPool.filter(m => m.id !== workflow.leaderId && (slot.id !== 'coder' || ['workspace-write', 'danger-full-access'].includes(m.permission)));
+                        return h('div', { key: slot.id, className: 'mtb-agent-cfg-row' },
+                          h('div', { className: 'mtb-agent-cfg-head' },
+                            h('span', null, '🧩 ' + slot.name + ' · ' + (memberIdVal === '@dsh' ? '独立 DSH 席位' : (memberMeta?.name || '待指派')))),
+                          h('div', { className: 'mtb-agent-cfg-grid' },
+                            h('select', {
+                              'aria-label': slot.name + ' 人选',
+                              style: uiInput,
+                              disabled: controlsDisabled,
+                              value: memberIdVal,
+                              onChange: e => { void saveWorkflowAgentConfigs(task, { members: { [slot.id]: e.target.value } }, slot.name + ' 指派'); },
+                            },
+                              !slot.required && h('option', { value: '' }, '暂不指派'),
+                              slot.id === 'critic' && h('option', { value: '@dsh' }, '独立 DSH 审查席位'),
+                              rolePool.map(m => h('option', {
+                                key: m.id, value: m.id,
+                                disabled: Object.entries(workflow.plan?.members ?? {}).some(([k, v]) => k !== slot.id && v === m.id),
+                              }, slot.name + ': ' + m.name))),
+                            h('select', {
+                              'aria-label': slot.name + ' 模型',
+                              style: uiInput,
+                              disabled: controlsDisabled || !memberIdVal,
+                              value: slotCfg.model || '',
+                              onChange: e => { void saveWorkflowAgentConfigs(task, { agentConfigs: { [slot.id]: { ...slotCfg, model: e.target.value } } }, (memberMeta?.name || slot.name) + ' 模型'); },
+                            }, modelSelectOptions(memberMeta?.model || '', slotCfg.model || '').map(opt => h('option', { key: opt.route || '__def', value: opt.route }, opt.label))),
+                            h('select', {
+                              'aria-label': slot.name + ' 思考模式',
+                              style: uiInput,
+                              disabled: controlsDisabled || !memberIdVal,
+                              value: slotCfg.reasoningEffort || '',
+                              onChange: e => { void saveWorkflowAgentConfigs(task, { agentConfigs: { [slot.id]: { ...slotCfg, reasoningEffort: e.target.value } } }, (memberMeta?.name || slot.name) + ' 思考模式'); },
+                            }, thinkingModeOptions(slotCfg.model || memberMeta?.model || '', memberMeta?.reasoningEffort || '', slotCfg.reasoningEffort || '').map(opt => h('option', { key: opt.id || '__def', value: opt.id }, opt.label)))));
+                      }),
+                      // 3) Codex Sub-Agent Rows
+                      codexSlots.map(slot => {
+                        const cfgKey = slot === 'coding' ? 'codexCoding' : 'codexReview';
+                        const slotTitle = slot === 'coding' ? '⚙️ Codex · 编码执行子 Agent' : '🔍 Codex · 审查复核子 Agent';
+                        const codexVal = workflow.plan?.codex?.[slot] === null ? 'off' : (workflow.plan?.codex?.[slot] || 'auto');
+                        const slotCfg = wfConfigs[cfgKey] ?? {};
+                        return h('div', { key: cfgKey, className: 'mtb-agent-cfg-row' },
+                          h('div', { className: 'mtb-agent-cfg-head' }, h('span', null, slotTitle)),
+                          h('div', { className: 'mtb-agent-cfg-grid' },
+                            h('select', {
+                              'aria-label': slotTitle + ' 模型',
+                              style: uiInput,
+                              disabled: controlsDisabled,
+                              value: codexVal,
+                              onChange: e => {
+                                const nextVal = e.target.value === 'off' ? null : e.target.value;
+                                void saveWorkflowAgentConfigs(task, {
+                                  codex: { [slot]: nextVal },
+                                  agentConfigs: { [cfgKey]: { ...slotCfg, model: nextVal && nextVal !== 'auto' ? nextVal : '' } },
+                                }, slotTitle + ' 模型');
+                              },
+                            },
+                              h('option', { value: 'auto' }, '模型：自动选择 Codex'),
+                              h('option', { value: 'off' }, '关闭此阶段 Codex 子调用'),
+                              codexVal !== 'auto' && codexVal !== 'off' && !codexModels.some(m => m.id === codexVal) && h('option', { value: codexVal }, codexVal),
+                              codexModels.filter(m => slot !== 'coding' || m.work).map(m => h('option', { key: m.id, value: m.id }, 'Codex: ' + m.model))),
+                            h('select', {
+                              'aria-label': slotTitle + ' 思考模式',
+                              style: uiInput,
+                              disabled: controlsDisabled || codexVal === 'off',
+                              value: slotCfg.reasoningEffort || '',
+                              onChange: e => { void saveWorkflowAgentConfigs(task, { agentConfigs: { [cfgKey]: { ...slotCfg, reasoningEffort: e.target.value } } }, slotTitle + ' 思考模式'); },
+                            }, codexThinkingOptions(codexVal, slotCfg.reasoningEffort || '').map(opt => h('option', { key: opt.id || '__def', value: opt.id }, opt.label)))));
+                      })));
+                }
+                // Plain / Single-Agent Card quick switcher
+                const boundAgentName = currentAgentTag ? currentAgentTag.slice(4) : '';
+                const boundAgentMeta = (catalog?.leaders ?? []).find(item => item.name === boundAgentName);
+                return h('div', { className: 'mtb-drawer-sec', 'aria-label': '执行智能体模型与思考模式' },
+                  h('div', { className: 'mtb-drawer-sec-title' }, '🤖 执行 Agent 模型与思考模式'),
+                  h('div', { className: 'mtb-agent-cfg-row' },
+                    h('div', { className: 'mtb-agent-cfg-grid' },
+                      (catalog?.leaders?.length ?? 0) > 0 && h('select', {
+                        'aria-label': '指派智能体',
+                        style: uiInput,
+                        disabled: busy || isRunning,
+                        value: boundAgentName,
+                        onChange: e => { void assignDrawerAgentLeader(e.target.value); },
+                      },
+                        h('option', { value: '' }, '指派 Agent：未指派'),
+                        catalog.leaders.map(item => h('option', { key: item.id, value: item.name }, 'Agent: ' + item.name))),
+                      h('select', {
+                        'aria-label': '工单模型',
+                        style: uiInput,
+                        disabled: busy || isRunning,
+                        value: task.model || '',
+                        onChange: e => {
+                          const v = e.target.value;
+                          setEditModel(v);
+                          void updateTask(task, { model: v });
+                        },
+                      }, modelSelectOptions(boundAgentMeta?.model || '', task.model || '').map(opt => h('option', { key: opt.route || '__def', value: opt.route }, opt.label))),
+                      h('select', {
+                        'aria-label': '工单思考模式',
+                        style: uiInput,
+                        disabled: busy || isRunning,
+                        value: task.reasoningEffort || '',
+                        onChange: e => {
+                          const v = e.target.value;
+                          setEditEffort(v);
+                          void updateTask(task, { reasoningEffort: v });
+                        },
+                      }, thinkingModeOptions(task.model || boundAgentMeta?.model || '', boundAgentMeta?.reasoningEffort || '', task.reasoningEffort || '').map(opt => h('option', { key: opt.id || '__def', value: opt.id }, opt.label))))));
+              })(),
 
               h('div', { className: 'mtb-drawer-sec' },
                 h('div', { className: 'mtb-drawer-sec-title' }, '标签与优先级'),
@@ -4385,12 +4732,11 @@ window.__ModuleLoader__.load({
                 catalog.leaders.map(item => h('option', { key: item.id, value: item.id }, item.name)))),
             h(Field, { label: '模型（可选）' },
               h('select', { value: formModel, style: uiInput, onChange: event => setFormModel(event.target.value) },
-                h('option', { value: '' }, '跟随默认模型'),
-                modelOptions.map(opt => h('option', { key: opt.route, value: opt.route }, opt.label)))),
-            h(Field, { label: '思考强度（可选）' },
+                modelSelectOptions((catalog?.leaders ?? []).find(l => l.id === assignedAgent)?.model || '', formModel).map(opt => h('option', { key: opt.route || '__def', value: opt.route }, opt.label)))),
+            h(Field, { label: '思考模式（可选）' },
               h('select', { value: formEffort, style: uiInput, onChange: event => setFormEffort(event.target.value) },
-                h('option', { value: '' }, '跟随默认'),
-                effortsForModel(formModel).map(opt => h('option', { key: opt.id, value: opt.id }, opt.label)))),
+                thinkingModeOptions(formModel || (catalog?.leaders ?? []).find(l => l.id === assignedAgent)?.model || '', (catalog?.leaders ?? []).find(l => l.id === assignedAgent)?.reasoningEffort || '', formEffort)
+                  .map(opt => h('option', { key: opt.id || '__def', value: opt.id }, opt.label)))),
             h(Field, { label: '权限预设（可选）' },
               h('select', { value: formPermission, style: uiInput, onChange: event => setFormPermission(event.target.value) },
                 h('option', { value: '' }, '跟随默认权限'),
@@ -4460,31 +4806,139 @@ window.__ModuleLoader__.load({
           orchestrationMode !== 'plain' && leaderId && (requiresPr || choice === 'leader') && h(Field, { label: requiresPr ? 'PR 链接' : 'PR 链接（可选）' },
             h('input', { type: 'url', value: prUrl, onChange: event => { setPrUrl(event.target.value); setPlan(null); }, placeholder: 'GitHub 或 Gitee PR 链接', style: uiInput })),
 
-          orchestrationMode !== 'plain' && leaderId && h('section', { 'aria-label': '运行分工', style: { display: 'grid', gap: 8, borderTop: '1px solid ' + dswTheme.border, paddingTop: 10 } },
-            h('strong', null, group ? group.name : 'Leader 推荐后预填角色'),
+          orchestrationMode !== 'plain' && leaderId && h('section', { 'aria-label': '运行分工', style: { display: 'grid', gap: 9, borderTop: '1px solid ' + dswTheme.border, paddingTop: 10 } },
+            h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' } },
+              h('strong', { style: { fontSize: 13 } }, '🤖 各参战 Agent 模型与思考模式（' + (group ? group.name : '按模板协作') + '）'),
+              title.trim() && h('button', { type: 'button', className: 'mtb-btn', disabled: busy, onClick: () => { void recommend(); } }, '✨ Leader 智能推荐分工')),
             plan && recommendedTemplate && h('span', { style: uiMuted }, recommendedTemplate.name + ' · Leader ' + selectedLeader?.name),
-            selectedTemplate !== 'development' && selectedTemplate !== 'pr-review' && h('label', null,
+            selectedTemplate !== 'development' && selectedTemplate !== 'pr-review' && h('label', { style: { display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 12 } },
               h('input', { type: 'checkbox', checked: explicitCode, onChange: event => changeCodeWork(event.target.checked) }),
-              ' 包含编码与代码审查'),
-            (roleChoices ?? []).map(role => h(Field, { key: role.id, label: role.name },
-              role.id === 'codexCritic' ? h('span', { style: uiMuted }, 'Codex 独立审查席位') :
-                h('select', { style: uiInput, disabled: busy || !plan, value: plan?.members[role.id] ?? '',
-                  onChange: event => changeMember(role.id, event.target.value) },
-                  h('option', { value: '' }, role.required ? '待指派（必需）' : '待指派'),
-                  role.id === 'critic' && h('option', { value: '@dsh' }, '独立 DSH 审查席位'),
-                  candidates.filter(member => role.id !== 'coder' || ['workspace-write', 'danger-full-access'].includes(member.permission))
-                    .map(member => h('option', { key: member.id, value: member.id,
-                      disabled: Object.entries(plan?.members ?? {}).some(([slot, id]) => slot !== role.id && id === member.id) }, member.name))))),
-            (codeWork || selectedTemplate === 'pr-review') && (codeWork ? ['coding', 'review'] : ['review']).map(slot => h(Field, {
-              key: slot, label: slot === 'coding' ? '编码 Codex 子 Agent' : '审查 Codex 子 Agent',
-            }, h('select', { style: uiInput, disabled: busy || !plan, value: plan ? (plan.codex[slot] ?? 'off') : 'auto',
-              onChange: event => setPlan(current => ({ ...current, codex: { ...current.codex, [slot]: event.target.value === 'off' ? null : event.target.value } })) },
-              h('option', { value: 'auto' }, '自动选择 · 按需调用'),
-              h('option', { value: 'off' }, '关闭子调用'),
-              plan?.codex[slot] && plan.codex[slot] !== 'auto' && !codexModels.some(model => model.id === plan.codex[slot]) &&
-                h('option', { value: plan.codex[slot] }, plan.codex[slot]),
-              codexModels.filter(model => slot !== 'coding' || model.work).map(model =>
-                h('option', { key: model.id, value: model.id }, model.model)))))),
+              '包含编码与代码审查角色（Coder + Reviewer + Codex）'),
+            h('div', { className: 'mtb-agent-cfg-list' },
+              // Leader row with model & thinking mode switcher
+              (() => {
+                const lCfg = formAgentConfigs.leader ?? {};
+                return h('div', { className: 'mtb-agent-cfg-row' },
+                  h('div', { className: 'mtb-agent-cfg-head' },
+                    h('span', null, '👑 Leader · ' + (selectedLeader?.name || '负责智能体'))),
+                  h('div', { className: 'mtb-agent-cfg-grid' },
+                    h('select', {
+                      'aria-label': '选择负责 Leader',
+                      style: uiInput,
+                      disabled: busy,
+                      value: leaderId,
+                      onChange: e => handleAssignAgent(e.target.value),
+                    }, (catalog?.leaders ?? []).filter(item => item.global || !workspace || item.workspaceId === workspace)
+                      .map(item => h('option', { key: item.id, value: item.id }, 'Leader: ' + item.name))),
+                    h('select', {
+                      'aria-label': 'Leader 使用模型',
+                      style: uiInput,
+                      disabled: busy,
+                      value: lCfg.model || '',
+                      onChange: e => setSlotConfig('leader', { model: e.target.value }),
+                    }, modelSelectOptions(selectedLeader?.model || '', lCfg.model || '').map(opt => h('option', { key: opt.route || '__def', value: opt.route }, opt.label))),
+                    h('select', {
+                      'aria-label': 'Leader 思考模式',
+                      style: uiInput,
+                      disabled: busy,
+                      value: lCfg.reasoningEffort || '',
+                      onChange: e => setSlotConfig('leader', { reasoningEffort: e.target.value }),
+                    }, thinkingModeOptions(lCfg.model || selectedLeader?.model || '', selectedLeader?.reasoningEffort || '', lCfg.reasoningEffort || '').map(opt => h('option', { key: opt.id || '__def', value: opt.id }, opt.label)))));
+              })(),
+              // Role rows (Coder, Reviewer, Critic, Collaborator, etc.)
+              (roleChoices ?? []).map(role => {
+                if (role.id === 'codexCritic') {
+                  const cxCfg = formAgentConfigs.codexCritic ?? {};
+                  return h('div', { key: role.id, className: 'mtb-agent-cfg-row' },
+                    h('div', { className: 'mtb-agent-cfg-head' }, h('span', null, '🔍 ' + role.name + '（Codex 独立审查席位）')),
+                    h('div', { className: 'mtb-agent-cfg-grid' },
+                      h('select', {
+                        'aria-label': 'Codex 审查席位模型',
+                        style: uiInput,
+                        disabled: busy,
+                        value: cxCfg.model || 'auto',
+                        onChange: e => setSlotConfig('codexCritic', { model: e.target.value === 'auto' ? '' : e.target.value }),
+                      },
+                        h('option', { value: 'auto' }, '模型：自动选择 Codex'),
+                        codexModels.map(m => h('option', { key: m.id, value: m.id }, 'Codex: ' + m.model))),
+                      h('select', {
+                        'aria-label': 'Codex 审查席位思考模式',
+                        style: uiInput,
+                        disabled: busy,
+                        value: cxCfg.reasoningEffort || '',
+                        onChange: e => setSlotConfig('codexCritic', { reasoningEffort: e.target.value }),
+                      }, codexThinkingOptions(cxCfg.model || 'auto', cxCfg.reasoningEffort || '').map(opt => h('option', { key: opt.id || '__def', value: opt.id }, opt.label)))));
+                }
+                const assignedId = plan?.members[role.id] ?? '';
+                const memberMeta = candidates.find(m => m.id === assignedId);
+                const rCfg = formAgentConfigs[role.id] ?? {};
+                return h('div', { key: role.id, className: 'mtb-agent-cfg-row' },
+                  h('div', { className: 'mtb-agent-cfg-head' },
+                    h('span', null, '🧩 ' + role.name + (memberMeta ? ' · ' + memberMeta.name : ''))),
+                  h('div', { className: 'mtb-agent-cfg-grid' },
+                    h('select', {
+                      'aria-label': role.name + ' 指派智能体',
+                      style: uiInput,
+                      disabled: busy || !plan,
+                      value: assignedId,
+                      onChange: event => changeMember(role.id, event.target.value),
+                    },
+                      h('option', { value: '' }, role.required ? '待指派（必需）' : '待指派（可选）'),
+                      role.id === 'critic' && h('option', { value: '@dsh' }, '独立 DSH 审查席位'),
+                      candidates.filter(member => role.id !== 'coder' || ['workspace-write', 'danger-full-access'].includes(member.permission))
+                        .map(member => h('option', {
+                          key: member.id, value: member.id,
+                          disabled: Object.entries(plan?.members ?? {}).some(([slot, id]) => slot !== role.id && id === member.id),
+                        }, role.name + ': ' + member.name))),
+                    h('select', {
+                      'aria-label': role.name + ' 使用模型',
+                      style: uiInput,
+                      disabled: busy || !plan || !assignedId,
+                      value: rCfg.model || '',
+                      onChange: e => setSlotConfig(role.id, { model: e.target.value }),
+                    }, modelSelectOptions(memberMeta?.model || '', rCfg.model || '').map(opt => h('option', { key: opt.route || '__def', value: opt.route }, opt.label))),
+                    h('select', {
+                      'aria-label': role.name + ' 思考模式',
+                      style: uiInput,
+                      disabled: busy || !plan || !assignedId,
+                      value: rCfg.reasoningEffort || '',
+                      onChange: e => setSlotConfig(role.id, { reasoningEffort: e.target.value }),
+                    }, thinkingModeOptions(rCfg.model || memberMeta?.model || '', memberMeta?.reasoningEffort || '', rCfg.reasoningEffort || '').map(opt => h('option', { key: opt.id || '__def', value: opt.id }, opt.label)))));
+              }),
+              // Codex coding / review sub-agent rows
+              (codeWork || selectedTemplate === 'pr-review') && (codeWork ? ['coding', 'review'] : ['review']).map(slot => {
+                const cfgKey = slot === 'coding' ? 'codexCoding' : 'codexReview';
+                const slotLabel = slot === 'coding' ? '⚙️ 编码 Codex 子 Agent' : '🔍 审查 Codex 子 Agent';
+                const codexVal = plan ? (plan.codex[slot] ?? 'off') : 'auto';
+                const cCfg = formAgentConfigs[cfgKey] ?? {};
+                return h('div', { key: slot, className: 'mtb-agent-cfg-row' },
+                  h('div', { className: 'mtb-agent-cfg-head' }, h('span', null, slotLabel)),
+                  h('div', { className: 'mtb-agent-cfg-grid' },
+                    h('select', {
+                      'aria-label': slotLabel + ' 模型',
+                      style: uiInput,
+                      disabled: busy || !plan,
+                      value: codexVal,
+                      onChange: event => {
+                        const nextVal = event.target.value === 'off' ? null : event.target.value;
+                        setPlan(current => ({ ...current, codex: { ...current.codex, [slot]: nextVal } }));
+                        setSlotConfig(cfgKey, { model: nextVal && nextVal !== 'auto' ? nextVal : '' });
+                      },
+                    },
+                      h('option', { value: 'auto' }, '自动选择 · 按需调用'),
+                      h('option', { value: 'off' }, '关闭子调用'),
+                      plan?.codex[slot] && plan.codex[slot] !== 'auto' && !codexModels.some(model => model.id === plan.codex[slot]) &&
+                        h('option', { value: plan.codex[slot] }, plan.codex[slot]),
+                      codexModels.filter(model => slot !== 'coding' || model.work).map(model =>
+                        h('option', { key: model.id, value: model.id }, 'Codex: ' + model.model))),
+                    h('select', {
+                      'aria-label': slotLabel + ' 思考模式',
+                      style: uiInput,
+                      disabled: busy || !plan || codexVal === 'off',
+                      value: cCfg.reasoningEffort || '',
+                      onChange: e => setSlotConfig(cfgKey, { reasoningEffort: e.target.value }),
+                    }, codexThinkingOptions(codexVal, cCfg.reasoningEffort || '').map(opt => h('option', { key: opt.id || '__def', value: opt.id }, opt.label)))));
+              }))),
 
           error && h('div', { role: 'alert', style: { padding: '7px 10px', borderRadius: 8, fontSize: 12, color: dswTheme.danger, background: 'color-mix(in srgb, #ef4444 10%, transparent)', border: '1px solid color-mix(in srgb, #ef4444 28%, transparent)' } }, error),
           h('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8 } },
@@ -4804,6 +5258,39 @@ window.__ModuleLoader__.load({
       const chatLocked = sendingChat || visible?.chatBusy === true;
       const participants = Array.isArray(visible?.participants) ? visible.participants : [];
       const colorMap = React.useMemo(() => buildRoomColorMap(visible?.records, participants), [visible?.records, participants]);
+      const roomTokenStats = React.useMemo(() => {
+        const byActor = new Map();
+        let totalTokens = 0;
+        let inputTokens = 0;
+        let outputTokens = 0;
+        const addUsage = (actor, u) => {
+          if (!actor || !u || typeof u !== 'object') return;
+          const inT = Number(u.inputTokens || 0);
+          const outT = Number(u.outputTokens || 0);
+          const tot = Number(u.totalTokens || (inT + outT));
+          if (tot <= 0) return;
+          totalTokens += tot;
+          inputTokens += inT;
+          outputTokens += outT;
+          const cur = byActor.get(actor) ?? { totalTokens: 0, inputTokens: 0, outputTokens: 0 };
+          cur.totalTokens += tot;
+          cur.inputTokens += inT;
+          cur.outputTokens += outT;
+          byActor.set(actor, cur);
+        };
+        for (const rec of visible?.records ?? []) {
+          if (rec?.kind !== 'agent') continue;
+          const dec = decodeAgentTraceClient(rec.text);
+          if (dec.trace?.usage) addUsage(rec.actor, dec.trace.usage);
+        }
+        for (const live of visible?.liveBubbles ?? []) {
+          if (live?.usage) addUsage(live.actor, live.usage);
+        }
+        const breakdownTitle = [...byActor.entries()]
+          .map(([actor, st]) => actor + ': ' + st.totalTokens.toLocaleString() + ' (入 ' + st.inputTokens.toLocaleString() + ' / 出 ' + st.outputTokens.toLocaleString() + ')')
+          .join(' ｜ ');
+        return { totalTokens, inputTokens, outputTokens, byActor, breakdownTitle };
+      }, [visible?.records, visible?.liveBubbles]);
       const roleOfActor = actorName => participants.find(p => p.name === actorName)?.role || '';
       const isInReview = Boolean(visible?.origin && !room?.closed && (visible?.cardStatus === 'review' || visible?.runState === 'review-blocked'));
       const isWorkflowRunning = visible?.runState === 'running' || visible?.cardStatus === 'running';
@@ -4900,6 +5387,7 @@ window.__ModuleLoader__.load({
             h('div', { className: 'mtr-msg-meta' },
               h('strong', { style: { color: accent, fontSize: 12.5 } }, record.actor),
               badgeText && h('span', { className: 'mtr-role-badge' }, badgeText),
+              decoded.trace?.usage && h(AgentUsageBadge, { usage: decoded.trace.usage }),
               h('span', null, timeStr)),
             h('div', { className: 'mtr-bubble mtr-bubble-agent' },
               decoded.trace && h(AgentTracePanel, { trace: decoded.trace, live: false, hasBody: hasCleanBody }),
@@ -4926,6 +5414,7 @@ window.__ModuleLoader__.load({
             h('div', { className: 'mtr-msg-meta' },
               h('strong', { style: { color: accent, fontSize: 12.5 } }, live.actor),
               badgeText && h('span', { className: 'mtr-role-badge' }, badgeText),
+              live.usage && h(AgentUsageBadge, { usage: live.usage }),
               h('span', { className: 'mtr-live-badge' },
                 h('span', { className: 'mtr-live-dot', 'aria-hidden': 'true' }),
                 '思考/处理中 · ' + elapsedSec + 's')),
@@ -4996,6 +5485,10 @@ window.__ModuleLoader__.load({
               room?.title ?? task?.title ?? '工单群聊'),
             isWorkflowRunning && h('span', { style: { fontSize: 11.5, color: '#3b82f6', fontWeight: 600 } }, '● 编排执行中（可随时发言参与讨论）'),
             isInReview && h('span', { style: { fontSize: 11.5, color: '#a78bfa', fontWeight: 600 } }, '● 待确认'),
+            roomTokenStats.totalTokens > 0 && h('span', {
+              className: 'mtr-tok-badge',
+              title: '各 Agent 累计消耗 — ' + roomTokenStats.breakdownTitle,
+            }, '🪙 累计 ' + formatTokenCount(roomTokenStats.totalTokens) + ' tok'),
             room && h('span', { style: uiMuted }, (room.storage === 'hub' ? 'Hub 归档' : room.storage === 'moving' ? '转存中' : '本机归档') + (room.closed ? ' · 已关单' : '')),
             visible?.runState === 'interrupted' && h('span', { style: { fontSize: 11.5, color: '#f59e0b' } }, '上次运行已中断'),
             visible?.origin && room && button(room.closed ? '重开工单' : '关单归档', () => { void act(room.closed ? 'reopen' : 'close'); }, controlsLocked),
@@ -5060,15 +5553,18 @@ window.__ModuleLoader__.load({
               h('span', { style: { fontSize: 11, color: dswTheme.faint } }, '点按 @角色讨论：'),
               mentionTargets.map(member => {
                 const c = agentBubbleAccent(member.name, colorMap);
+                const actorStat = roomTokenStats.byActor.get(member.name);
                 return h('button', {
                   key: member.id,
                   type: 'button',
                   className: 'mtr-mention-chip',
                   style: { '--mtr-chip-c': c },
+                  title: actorStat ? formatUsageTitle(actorStat) : undefined,
                   onClick: () => insertMention(member.name),
                 },
                   h('span', { style: { color: c, fontWeight: 600 } }, '@' + member.name),
-                  member.role && h('span', { style: { opacity: .72 } }, '· ' + member.role));
+                  member.role && h('span', { style: { opacity: .72 } }, '· ' + member.role),
+                  actorStat && actorStat.totalTokens > 0 && h('span', { style: { opacity: .82, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 10 } }, '· 🪙' + formatTokenCount(actorStat.totalTokens)));
               }),
               mentionTargets.length > 1 && h('button', {
                 type: 'button',

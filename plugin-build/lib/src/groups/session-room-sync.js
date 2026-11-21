@@ -1,4 +1,4 @@
-import { encodeAgentTrace } from './agent-trace.js';
+import { encodeAgentTrace, sanitizeUsage } from './agent-trace.js';
 
 function joinTail(parts, maxChars = 9000) {
     if (!Array.isArray(parts) || parts.length === 0) return '';
@@ -18,11 +18,35 @@ function summarizeToolArgs(name, rawArgs) {
     return compact ? `${name}: ${compact}` : String(name || 'tool');
 }
 
+function addEventUsage(acc, rawUsage) {
+    if (!rawUsage || typeof rawUsage !== 'object') return acc;
+    const rawIn = typeof rawUsage.inputTokens === 'number' && Number.isFinite(rawUsage.inputTokens) ? rawUsage.inputTokens : 0;
+    const rawOut = typeof rawUsage.outputTokens === 'number' && Number.isFinite(rawUsage.outputTokens) ? rawUsage.outputTokens : 0;
+    const cacheRead = typeof rawUsage.cacheReadTokens === 'number' && Number.isFinite(rawUsage.cacheReadTokens) ? rawUsage.cacheReadTokens : 0;
+    const cacheWrite = typeof rawUsage.cacheWriteTokens === 'number' && Number.isFinite(rawUsage.cacheWriteTokens) ? rawUsage.cacheWriteTokens : 0;
+    const reasoning = typeof rawUsage.reasoningTokens === 'number' && Number.isFinite(rawUsage.reasoningTokens) ? rawUsage.reasoningTokens : 0;
+    const stepIn = typeof rawUsage.totalTokens === 'number' && rawUsage.totalTokens === rawIn + rawOut
+        ? rawIn
+        : rawIn + cacheRead + cacheWrite;
+    const stepOut = rawOut;
+    const stepTotal = typeof rawUsage.totalTokens === 'number' && rawUsage.totalTokens >= stepIn + stepOut
+        ? rawUsage.totalTokens
+        : stepIn + stepOut;
+    if (stepTotal <= 0 && stepIn <= 0 && stepOut <= 0) return acc;
+    const prev = acc ?? { inputTokens: 0, outputTokens: 0, totalTokens: 0, reasoningTokens: 0 };
+    return {
+        inputTokens: prev.inputTokens + stepIn,
+        outputTokens: prev.outputTokens + stepOut,
+        totalTokens: prev.totalTokens + stepTotal,
+        reasoningTokens: prev.reasoningTokens + reasoning,
+    };
+}
+
 /**
  * Inspects a resident DSH session (e.g. `handed-off` ordinary ticket or plain
- * superagent session), persists completed assistant replies with full thinking &
- * tool-step traces into the ticket room, settles `handed-off` workflows when the
- * turn completes, and returns a live in-flight bubble while the session is active.
+ * superagent session), persists completed assistant replies with full thinking,
+ * tool-step, and token-usage traces into the ticket room, settles `handed-off`
+ * workflows when the turn completes, and returns a live in-flight bubble while active.
  */
 export async function syncResidentSessionToRoom({
     surface, rooms, room, sessionId, actor, runId, workflowState, onTurnCompleted,
@@ -47,7 +71,6 @@ export async function syncResidentSessionToRoom({
         : [];
     if (events.length === 0) return undefined;
 
-    // Locate the latest turn boundary in the window
     let maxTurn = 0;
     let lastUserIdx = -1;
     for (let i = 0; i < events.length; i++) {
@@ -63,6 +86,7 @@ export async function syncResidentSessionToRoom({
     let currentStep = 0;
     let turnStartedAt;
     let turnEnd;
+    let cumulativeUsage;
     const thinkingParts = [];
     const steps = [];
     const stepByCallId = new Map();
@@ -79,6 +103,7 @@ export async function syncResidentSessionToRoom({
             if (typeof data.step === 'number') currentStep = Math.max(currentStep, data.step);
         }
         if (ev.type === 'assistant/message') {
+            cumulativeUsage = addEventUsage(cumulativeUsage, data.usage ?? data.message?.usage);
             const content = Array.isArray(data.message?.content) ? data.message.content : [];
             const rText = content
                 .filter(p => p && (p.type === 'reasoning' || p.type === 'thinking') && typeof p.text === 'string' && p.text.trim())
@@ -98,6 +123,7 @@ export async function syncResidentSessionToRoom({
                     thinking: joinTail(thinkingParts, 9000),
                     steps: steps.map(s => ({ ...s })).slice(-20),
                     stepCount: currentStep,
+                    usage: sanitizeUsage(cumulativeUsage),
                 });
             }
         } else if (ev.type === 'tool/ptc-dispatch-start') {
@@ -153,6 +179,7 @@ export async function syncResidentSessionToRoom({
 
     const speaker = actor || '执行智能体';
     const shortSess = String(sessionId).slice(-12);
+    const cleanUsage = sanitizeUsage(cumulativeUsage);
 
     if (!room.closed) {
         for (const msg of assistantMessages) {
@@ -169,12 +196,13 @@ export async function syncResidentSessionToRoom({
                         thinking: msg.thinking,
                         steps: msg.steps,
                         stepCount: msg.stepCount,
+                        usage: msg.usage ?? cleanUsage,
                         model: '常驻会话',
                     }),
                 });
             } catch { /* ignore concurrent duplicate append */ }
         }
-        if (turnEnd && assistantMessages.length === 0 && (thinkingParts.length > 0 || steps.length > 0) && Number.isSafeInteger(turnEnd.seq)) {
+        if (turnEnd && assistantMessages.length === 0 && (thinkingParts.length > 0 || steps.length > 0 || cleanUsage) && Number.isSafeInteger(turnEnd.seq)) {
             const detEndId = `sess-end:${shortSess}:${turnEnd.seq}`;
             if (!rooms.hasEvent?.(room.id, detEndId)) {
                 try {
@@ -192,6 +220,7 @@ export async function syncResidentSessionToRoom({
                                 thinking: joinTail(thinkingParts, 9000),
                                 steps: steps.slice(-20),
                                 stepCount: currentStep,
+                                usage: cleanUsage,
                                 model: '常驻会话',
                             },
                         ),
@@ -224,6 +253,7 @@ export async function syncResidentSessionToRoom({
         updatedAt: Date.now(),
         thinking: latestThinking,
         steps: recentSteps,
+        ...(cleanUsage ? { usage: cleanUsage } : {}),
         text: runningStep
             ? `正在执行 ${runningStep.label}…`
             : (currentStep > 0

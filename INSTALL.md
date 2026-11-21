@@ -6,7 +6,7 @@
 
 当前可安装产物只有：
 
-- `plugin-build/dsh-marshal-0.2.0-agent-groups.29.tgz`（推荐，依赖会由 pnpm 安装）
+- `plugin-build/dsh-marshal-0.2.0-agent-groups.30.tgz`（推荐，依赖会由 pnpm 安装）
 - 或 `plugin-build/` 目录（需要先在那里执行 `pnpm install --prod`）
 
 ## 依赖（务必先看）
@@ -38,7 +38,7 @@ Desktop 没有 `dsh` 命令时：打开 **Plugins → Add plugin**，搜索并�
 
 1. 打开 DeepSeek Harness；
 2. 左侧 **Plugins** → **Add plugin / 添加插件**；
-3. 选择本仓库的 `plugin-build/dsh-marshal-0.2.0-agent-groups.29.tgz`；
+3. 选择本仓库的 `plugin-build/dsh-marshal-0.2.0-agent-groups.30.tgz`；
 4. 启用后重启 DSH；打开侧边栏 **调度官**。
 
 Desktop 的插件管理器会做安装和链接；不需要也不保证有全局 `dsh` 命令。
@@ -48,7 +48,7 @@ Desktop 的插件管理器会做安装和链接；不需要也不保证有全局
 如果当前环境有 `dsh`：
 
 ```bash
-dsh plugin --profile desktop add "$(pwd)/plugin-build/dsh-marshal-0.2.0-agent-groups.29.tgz"
+dsh plugin --profile desktop add "$(pwd)/plugin-build/dsh-marshal-0.2.0-agent-groups.30.tgz"
 ```
 
 tarball 会由 pnpm 正常安装依赖（zod / ws / marked / entities）。不要用 `link:` 指到工作区目录：工作区一移动插件就坏，而且链接安装不会自动安装依赖。
@@ -77,7 +77,7 @@ GET /marshal/health
 {
   "ok": true,
   "name": "dsh-marshal",
-  "version": "0.2.0-agent-groups.29",
+  "version": "0.2.0-agent-groups.30",
   "capabilities": {
     "groups": true,
     "agents": true,

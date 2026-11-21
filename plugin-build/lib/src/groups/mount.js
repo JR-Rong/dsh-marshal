@@ -428,8 +428,9 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             const access = authenticate(req);
             if (!access.ok) { write(res, access.status, { ok: false, code: access.code }); return; }
             const catalog = orchestration?.catalog() ?? { templates: [], groupTemplates: [], leaders: [], memoryAvailable: false };
+            const codexModels = orchestration?.codexCatalog ? await orchestration.codexCatalog().catch(() => []) : [];
             const ledger = auth.loadLedger();
-            write(res, 200, { ok: true, ...catalog, leaders: catalog.leaders.filter(leader => allowed(access, leader, ledger)) });
+            write(res, 200, { ok: true, ...catalog, codexModels, leaders: catalog.leaders.filter(leader => allowed(access, leader, ledger)) });
         }),
         exact('POST', '/marshal/tasks/preview', async (req, res) => {
             const access = authenticate(req, true);
@@ -452,17 +453,43 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             const room = rooms?.find(source, body.taskId);
             const workflow = orchestration.target(source, body.taskId);
             const ledger = auth.loadLedger();
-            if (!workflow || !taskRoomAccess(access, room, allowed, ledger)) {
+            if (!workflow || (room ? !taskRoomAccess(access, room, allowed, ledger) : !allowed(access, workflow, ledger))) {
                 write(res, 404, { ok: false, code: 'task-not-found' });
                 return;
             }
-            roomRoutes.assertIdle(room);
-            const prepared = orchestration.prepare(body.orchestration, member => allowed(access, member, ledger));
-            if (prepared.workspaceId !== room.workspaceId) {
+            if (room) roomRoutes.assertIdle(room);
+            else orchestration.assertIdle(source, body.taskId);
+            const prepared = orchestration.prepare({
+                ...body.orchestration,
+                workspaceId: body.orchestration?.workspaceId ?? workflow.workspaceId,
+            }, member => allowed(access, member, ledger));
+            if (prepared.workspaceId !== workflow.workspaceId) {
                 write(res, 403, { ok: false, code: 'workspace-forbidden' });
                 return;
             }
             orchestration.configure(source, body.taskId, prepared);
+            write(res, 200, { ok: true, tasks: taskList(getBoard().snapshot(), req, source) });
+        }),
+        exact('POST', '/marshal/tasks/agent-configs', async (req, res) => {
+            const access = authenticate(req, true);
+            if (!access.ok) { write(res, access.status, { ok: false, code: access.code }); return; }
+            if (!orchestration) { write(res, 503, { ok: false, code: 'orchestration-unavailable' }); return; }
+            const body = await readBody(req);
+            if (typeof body.taskId !== 'string' || body.taskId === '') {
+                write(res, 400, { ok: false, code: 'invalid-task' });
+                return;
+            }
+            const source = boardSource();
+            const room = rooms?.find(source, body.taskId);
+            const workflow = orchestration.target(source, body.taskId);
+            const ledger = auth.loadLedger();
+            if (!workflow || (room ? !taskRoomAccess(access, room, allowed, ledger) : !allowed(access, workflow, ledger))) {
+                write(res, 404, { ok: false, code: 'task-not-found' });
+                return;
+            }
+            if (room) roomRoutes.assertIdle(room);
+            else orchestration.assertIdle(source, body.taskId);
+            orchestration.updateAgentConfigs(source, body.taskId, body, member => allowed(access, member, ledger));
             write(res, 200, { ok: true, tasks: taskList(getBoard().snapshot(), req, source) });
         }),
         exact('GET', '/marshal/tasks/report', async (req, res) => {
@@ -1654,7 +1681,7 @@ export function mountGroups(ctx, config, options = {}) {
     try {
         orchestration = createTaskOrchestration({
             file: join(root, 'task-orchestration.json'), inventory: readAgentsLedger, memory: options.memory,
-            port: createDiscussionPort({ agents: config.agents, llm, codexExecutable: config.codexExecutable }),
+            port: createDiscussionPort({ agents: config.agents, llm, codexExecutable: config.codexExecutable, maxModels: 256, maxPerProvider: 64 }),
             defaultModel: readDefaultModel, logger: options.logger, workspacePath: agents.workspace,
             resolveAttachments: resolveTicketAttachments,
             leaderAutoReview: true,
@@ -1664,10 +1691,32 @@ export function mountGroups(ctx, config, options = {}) {
                 if (!board) return;
                 await board.apply(randomUUID(), { kind: 'move', taskId, status: 'review' }, `marshal:${config.deviceId}`);
             },
-            startLeader: async (leader, text, signal) => {
+            startLeader: async (leader, text, signal, slotOverride) => {
                 const { sessionId } = await agents.chatMember(leader.teamId, leader.memberId, signal) ?? {};
                 if (typeof sessionId !== 'string' || sessionId === '') throw new Error('Leader session unavailable');
                 signal.throwIfAborted();
+                const desiredModel = (typeof slotOverride?.model === 'string' && slotOverride.model.trim() !== '')
+                    ? slotOverride.model.trim()
+                    : (typeof leader?.model === 'string' && leader.model.trim() !== '' ? leader.model.trim() : '');
+                const rawEffort = (typeof slotOverride?.reasoningEffort === 'string' && slotOverride.reasoningEffort.trim() !== '')
+                    ? slotOverride.reasoningEffort.trim()
+                    : (typeof leader?.reasoning === 'string' && leader.reasoning.trim() !== '' ? leader.reasoning.trim() : '');
+                if (desiredModel && desiredModel.includes('/') && typeof ctx.sessionController?.selectModel === 'function') {
+                    const slash = desiredModel.indexOf('/');
+                    const provider = desiredModel.slice(0, slash);
+                    const modelId = desiredModel.slice(slash + 1);
+                    const effort = rawEffort && rawEffort !== 'off' && rawEffort !== 'none' ? rawEffort : undefined;
+                    try {
+                        await ctx.sessionController.selectModel({
+                            sessionId, provider, model: modelId,
+                            ...(effort ? { reasoningEffort: effort } : {}),
+                        });
+                    } catch {
+                        if (effort) {
+                            try { await ctx.sessionController.selectModel({ sessionId, provider, model: modelId }); } catch { /* ignore */ }
+                        }
+                    }
+                }
                 await ctx.sessionController.prompt({
                     requestId: randomUUID(), sessionId, content: [{ type: 'text', text }],
                 }, signal);

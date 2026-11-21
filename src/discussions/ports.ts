@@ -75,16 +75,18 @@ export function codexTextOnlyModel(model: Record<string, unknown>): Record<strin
     include_skills_usage_instructions: false, include_plugin_usage_instructions: false, include_apps_usage_instructions: false }
 }
 
-export function createDiscussionPort(options: { llm?: DiscussionLlm; agents?: readonly string[]; codexExecutable?: string; claudeExecutable?: string }): DiscussionPort {
+export function createDiscussionPort(options: { llm?: DiscussionLlm; agents?: readonly string[]; codexExecutable?: string; claudeExecutable?: string; maxModels?: number; maxPerProvider?: number }): DiscussionPort {
   const controllers = new Set<AbortController>()
   const leases = createWorkspaceLeases()
   const catalogModels = new Map<string, { public: DiscussionModel; native?: Record<string, unknown> }>()
   let stopped = false
+  const maxCatalogModels = Math.max(8, options.maxModels ?? 32)
+  const maxPerProvider = Math.max(4, options.maxPerProvider ?? 8)
   const originalCodexHome = process.env.CODEX_HOME ?? join(homedir(), '.codex')
   const binary = resolveCodexBinary({ ...(options.codexExecutable === undefined ? {} : { explicitPath: options.codexExecutable }) })
   const add = (agent: DiscussionModel['agent'], provider: string, model: string, native?: Record<string, unknown>, efforts?: unknown[]): void => {
     const id = `${agent}:${provider}:${model}`
-    if (id.length > 128 || catalogModels.size >= 32) return
+    if (id.length > 128 || catalogModels.size >= maxCatalogModels) return
     const reasoningEfforts = [...new Set((efforts ?? []).filter((v): v is string => typeof v === 'string' && v.length > 0 && v.length <= 32))].slice(0, 12)
     catalogModels.set(id, { public: { id, agent, provider, model, ...(reasoningEfforts.length ? { reasoningEfforts } : {}), ...(agent === 'codex' ? { work: true } : {}) }, ...(native === undefined ? {} : { native }) })
   }
@@ -93,7 +95,7 @@ export function createDiscussionPort(options: { llm?: DiscussionLlm; agents?: re
     catalogModels.clear()
     if (options.llm !== undefined && (options.agents ?? ['dsh']).includes('dsh')) {
       for (const { id: provider } of options.llm.listProviders()) {
-        try { for (const m of (await options.llm.listModels(provider)).slice(0, 8)) {
+        try { for (const m of (await options.llm.listModels(provider)).slice(0, maxPerProvider)) {
           let efforts: string[] = []
           try { efforts = (await options.llm.resolveModelInfo?.(provider, m.id))?.reasoning?.efforts.map(e => e.id) ?? [] } catch { /* no verified levels */ }
           add('dsh', provider, m.id, undefined, efforts)

@@ -70,11 +70,13 @@ export function createDiscussionPort(options) {
     const leases = createWorkspaceLeases();
     const catalogModels = new Map();
     let stopped = false;
+    const maxCatalogModels = Math.max(8, options.maxModels ?? 32);
+    const maxPerProvider = Math.max(4, options.maxPerProvider ?? 8);
     const originalCodexHome = process.env.CODEX_HOME ?? join(homedir(), '.codex');
     const binary = resolveCodexBinary({ ...(options.codexExecutable === undefined ? {} : { explicitPath: options.codexExecutable }) });
     const buildEntry = (target, agent, provider, model, native, efforts) => {
         const id = `${agent}:${provider}:${model}`;
-        if (id.length > 128 || target.size >= 32)
+        if (id.length > 128 || target.size >= maxCatalogModels)
             return;
         const reasoningEfforts = [...new Set((efforts ?? []).filter((v) => typeof v === 'string' && v.length > 0 && v.length <= 32))].slice(0, 12);
         target.set(id, { public: { id, agent, provider, model, ...(reasoningEfforts.length ? { reasoningEfforts } : {}), ...(agent === 'codex' ? { work: true } : {}) }, ...(native === undefined ? {} : { native }) });
@@ -86,7 +88,7 @@ export function createDiscussionPort(options) {
         if (options.llm !== undefined && (options.agents ?? ['dsh']).includes('dsh')) {
             for (const { id: provider } of options.llm.listProviders()) {
                 try {
-                    for (const m of (await options.llm.listModels(provider)).slice(0, 8)) {
+                    for (const m of (await options.llm.listModels(provider)).slice(0, maxPerProvider)) {
                         let efforts = [];
                         try {
                             efforts = (await options.llm.resolveModelInfo?.(provider, m.id))?.reasoning?.efforts.map(e => e.id) ?? [];
@@ -343,6 +345,17 @@ export function createDiscussionPort(options) {
                 catch { /* keep 16384 default */ }
                 let dshThinking = '';
                 const dshSteps = [];
+                let priorUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+                const mergeDshUsage = chunkUsage => {
+                    if (!chunkUsage || typeof chunkUsage !== 'object') return usageSample;
+                    return {
+                        ...chunkUsage,
+                        inputTokens: (chunkUsage.inputTokens ?? 0) + priorUsage.inputTokens,
+                        outputTokens: (chunkUsage.outputTokens ?? 0) + priorUsage.outputTokens,
+                        cacheReadTokens: (chunkUsage.cacheReadTokens ?? 0) + priorUsage.cacheReadTokens,
+                        cacheWriteTokens: (chunkUsage.cacheWriteTokens ?? 0) + priorUsage.cacheWriteTokens,
+                    };
+                };
                 const runDshTurn = async (promptText, tokenBudget, effort) => {
                     let prepared;
                     try {
@@ -368,12 +381,16 @@ export function createDiscussionPort(options) {
                         throw new DiscussionError('revision-conflict');
                     let result = '';
                     let completed = false;
-                    callStarted = performance.now();
+                    let turnUsage;
+                    if (callStarted === undefined)
+                        callStarted = performance.now();
                     for await (const value of prepared.stream({ ...prepared.config, signal: abort.signal,
                         tools: [], messages: [{ role: 'user', content: [{ type: 'text', text: promptText }] }] })) {
                         const chunk = record(value);
-                        if (chunk.type === 'usage')
-                            usageSample = chunk.usage;
+                        if (chunk.type === 'usage') {
+                            turnUsage = chunk.usage;
+                            usageSample = mergeDshUsage(turnUsage);
+                        }
                         if ((chunk.type === 'reasoning-delta' || chunk.type === 'thinking-delta') && typeof chunk.text === 'string') {
                             dshThinking += chunk.text;
                             if (dshThinking.length > 26000)
@@ -393,8 +410,17 @@ export function createDiscussionPort(options) {
                         }
                         if (chunk.type === 'finish') {
                             completed = chunk.reason?.kind === 'stop';
-                            if (!completed)
+                            if (!completed) {
+                                if (turnUsage && typeof turnUsage === 'object') {
+                                    priorUsage = {
+                                        inputTokens: priorUsage.inputTokens + (turnUsage.inputTokens ?? 0),
+                                        outputTokens: priorUsage.outputTokens + (turnUsage.outputTokens ?? 0),
+                                        cacheReadTokens: priorUsage.cacheReadTokens + (turnUsage.cacheReadTokens ?? 0),
+                                        cacheWriteTokens: priorUsage.cacheWriteTokens + (turnUsage.cacheWriteTokens ?? 0),
+                                    };
+                                }
                                 throw new DiscussionError(abort.signal.aborted ? 'cancelled' : 'response-incomplete');
+                            }
                         }
                     }
                     if (!completed)

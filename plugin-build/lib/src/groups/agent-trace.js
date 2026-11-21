@@ -23,23 +23,48 @@ function sanitizeSteps(steps, maxItems = 24) {
         .filter(Boolean);
 }
 
+export function sanitizeUsage(rawUsage) {
+    if (!rawUsage || typeof rawUsage !== 'object') return undefined;
+    const inTok = typeof rawUsage.inputTokens === 'number' && Number.isFinite(rawUsage.inputTokens)
+        ? Math.max(0, Math.round(rawUsage.inputTokens)) : undefined;
+    const outTok = typeof rawUsage.outputTokens === 'number' && Number.isFinite(rawUsage.outputTokens)
+        ? Math.max(0, Math.round(rawUsage.outputTokens)) : undefined;
+    if (inTok === undefined && outTok === undefined) return undefined;
+    const inputTokens = inTok ?? 0;
+    const outputTokens = outTok ?? 0;
+    const totalTokens = typeof rawUsage.totalTokens === 'number' && Number.isFinite(rawUsage.totalTokens) && rawUsage.totalTokens >= inputTokens + outputTokens
+        ? Math.round(rawUsage.totalTokens)
+        : inputTokens + outputTokens;
+    if (totalTokens <= 0 && inputTokens <= 0 && outputTokens <= 0) return undefined;
+    const reasoningTokens = typeof rawUsage.reasoningTokens === 'number' && Number.isFinite(rawUsage.reasoningTokens) && rawUsage.reasoningTokens > 0
+        ? Math.round(rawUsage.reasoningTokens) : undefined;
+    return {
+        inputTokens,
+        outputTokens,
+        totalTokens,
+        ...(reasoningTokens !== undefined ? { reasoningTokens } : {}),
+    };
+}
+
 /**
  * Prepend a compact HTML-comment trace header onto an agent bubble's text when
- * thinking or processing steps were captured. Returns `text` unchanged when no
- * thinking or steps exist, keeping plain/mock outputs byte-identical.
+ * thinking, processing steps, or token usage were captured. Returns `text`
+ * unchanged when none exist, keeping plain/mock outputs byte-identical.
  */
 export function encodeAgentTrace(text, rawTrace) {
     const body = String(text ?? '');
     if (!rawTrace || typeof rawTrace !== 'object') return body;
     const steps = sanitizeSteps(rawTrace.steps);
+    const usage = sanitizeUsage(rawTrace.usage);
     let thinking = clampTail(rawTrace.thinking, 9500);
-    if (!thinking && steps.length === 0) return body;
+    if (!thinking && steps.length === 0 && !usage) return body;
 
     const buildHeader = thinkStr => {
         const payload = {
             v: 1,
             ...(thinkStr ? { thinking: thinkStr } : {}),
             ...(steps.length > 0 ? { steps } : {}),
+            ...(usage ? { usage } : {}),
             ...(typeof rawTrace.durationMs === 'number' && Number.isFinite(rawTrace.durationMs)
                 ? { durationMs: Math.max(0, Math.round(rawTrace.durationMs)) } : {}),
             ...(typeof rawTrace.model === 'string' && rawTrace.model.trim()

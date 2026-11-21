@@ -25,16 +25,23 @@ const ROLE_NAMES = {
     incident: ['collaborator'],
     none: ['collaborator'],
 };
+export const AGENT_CONFIG_SLOTS = ['leader', ...Object.keys(ROLE_LABELS), 'codexCoding', 'codexReview'];
 export const TEMPLATE_VERSION = 2;
 export const templateById = id => TEMPLATES.find(template => template.id === id);
 export const codeWriter = member => ['workspace-write', 'danger-full-access'].includes(member?.permission);
 const memberId = z.string().min(1).max(256);
 const codexModel = z.string().min(1).max(128).nullable();
+export const AgentSlotConfigSchema = z.object({
+    model: z.string().trim().max(160).optional(),
+    reasoningEffort: z.string().trim().max(32).optional(),
+}).strict();
+export const AgentConfigsSchema = z.partialRecord(z.enum(AGENT_CONFIG_SLOTS), AgentSlotConfigSchema);
 export const PlanSchema = z.object({
     templateId: z.enum(['none', ...TEMPLATES.map(template => template.id)]),
     codeWork: z.boolean().optional(),
     members: z.partialRecord(z.enum(Object.keys(ROLE_LABELS)), memberId).optional(),
     codex: z.object({ coding: codexModel.optional(), review: codexModel.optional() }).strict().optional(),
+    agentConfigs: AgentConfigsSchema.optional(),
 }).strict();
 export const DelegationSchema = z.object({
     action: z.enum(['codex', 'continue']),
@@ -50,6 +57,22 @@ export const VerdictSchema = z.object({
     verdict: z.enum(['pass', 'revise', 'blocked']),
     findings: z.union([findingsText, findingsList]).pipe(findingsText),
 }).strict();
+
+export function sanitizeAgentConfigs(raw) {
+    if (!raw || typeof raw !== 'object') return undefined;
+    const parsed = AgentConfigsSchema.safeParse(raw);
+    if (!parsed.success) throw taskError('invalid-agent-configs', '智能体模型或思考模式配置格式无效。');
+    const out = {};
+    for (const [slot, cfg] of Object.entries(parsed.data)) {
+        if (!cfg || typeof cfg !== 'object') continue;
+        const model = typeof cfg.model === 'string' && cfg.model.trim() !== '' ? cfg.model.trim() : undefined;
+        const reasoningEffort = typeof cfg.reasoningEffort === 'string' && cfg.reasoningEffort.trim() !== '' ? cfg.reasoningEffort.trim() : undefined;
+        if (model !== undefined || reasoningEffort !== undefined) {
+            out[slot] = { ...(model !== undefined ? { model } : {}), ...(reasoningEffort !== undefined ? { reasoningEffort } : {}) };
+        }
+    }
+    return Object.keys(out).length > 0 ? out : undefined;
+}
 
 export function parseModelJson(text, schema) {
     const raw = String(text).trim();
@@ -110,16 +133,20 @@ export function taskPlan({ raw, task, candidates, recommend = false }) {
     }
     const codexDefault = (name, enabled) => enabled
         ? (parsed.codex && Object.hasOwn(parsed.codex, name) ? parsed.codex[name] : 'auto') : null;
+    const agentConfigs = sanitizeAgentConfigs(parsed.agentConfigs ?? task.agentConfigs);
     return {
         templateId, groupTemplate: codeWork ? 'delivery' : templateById(templateId)?.groupTemplate ?? 'free', codeWork, members,
         codex: { coding: codexDefault('coding', codeWork), review: codexDefault('review', codeWork || templateId === 'pr-review') },
+        ...(agentConfigs ? { agentConfigs } : {}),
     };
 }
 
 export function pickCodex(models, slot, write = false) {
     if (slot === null) return undefined;
     const options = models.filter(model => model.agent === 'codex' && (!write || model.work === true));
-    const model = slot === 'auto' || slot === undefined ? options[0] : options.find(model => model.id === slot);
+    const model = slot === 'auto' || slot === undefined
+        ? options[0]
+        : options.find(model => model.id === slot || model.model === slot || (model.provider + '/' + model.model) === slot);
     if (!model) throw taskError('codex-slot-unavailable', '配置的 Codex 子 Agent 当前不可用。请检查节点或修改分工。');
     return model;
 }
