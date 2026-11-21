@@ -364,7 +364,7 @@ function taskView(task, workflow, room, ticketNumbers) {
 function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, memory, auth, allowedOrigins, orchestration, rooms, extras = {}) {
     const {
         root: groupsRootDir, rosters, ticketNumbers, sessionTitles, sessionController, config, llm, readDefaultModel,
-        workspacePath, webOrigin, getAttachmentStore, resolveAttachments,
+        workspacePath, webOrigin, getAttachmentStore, resolveAttachments, surface: dshSurface, moveCardStatus,
     } = extras;
     const applyBoardAction = async (req, board, source, action, actionInitiator = initiator) => {
         const requestId = randomUUID();
@@ -408,6 +408,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
         exact, write, readBody, authenticate, allowed, auth, rooms,
         orchestration, getBoard, boardSource, getInitiator: () => initiator.replace(/^marshal:/, ''),
         ticketNumbers, workspacePath, normalizeAttachments: normalizeAttachmentsPayload, resolveAttachments,
+        surface: dshSurface, moveCardStatus,
     });
     return [
         ...roomRoutes.routes,
@@ -791,6 +792,17 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             if (workflow && !authorize(req, res, workflow)) return;
             orchestration?.assertIdle(source, body.taskId);
             const snapshot = await board.apply(randomUUID(), { kind: 'move', taskId: body.taskId, status: body.status }, initiator);
+            if (workflow) {
+                let recoveredDev;
+                if (body.status === 'review' && !workflow.development && boundRoom) {
+                    try {
+                        const page = await rooms.page(boundRoom.id, { limit: 100 });
+                        const latestPatch = [...(page.records ?? [])].reverse().find(r => r.phase === 'development-patch' && r.ref);
+                        if (latestPatch) recoveredDev = { development: { base: 'HEAD', digest: latestPatch.ref }, reviewReason: workflow.reviewReason ?? 'review-blocked' };
+                    } catch { /* ignore */ }
+                }
+                orchestration.syncStatus?.(source, body.taskId, body.status, recoveredDev);
+            }
             if (boundRoom) {
                 try {
                     const current = (await rooms.page(boundRoom.id, { limit: 1 })).room;
@@ -1747,6 +1759,7 @@ export function mountGroups(ctx, config, options = {}) {
                 root, rosters, ticketNumbers, sessionTitles, sessionController: ctx.sessionController,
                 config, llm, readDefaultModel, workspacePath: agents.workspace,
                 webOrigin: resolveWebOrigin, getAttachmentStore, resolveAttachments: resolveTicketAttachments,
+                surface, moveCardStatus,
             }).map((route) => scoped.webServer.register(route));
             return () => {
                 for (const dispose of disposers) dispose();

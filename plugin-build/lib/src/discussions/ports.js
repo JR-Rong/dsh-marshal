@@ -35,13 +35,20 @@ export function createDiscussionText() {
         return text;
     };
 }
-function reportProgress(callback, text, agent, sample, started) {
+function reportProgress(callback, text, agent, sample, started, extras) {
     if (!callback || started === undefined)
         return;
     const durationMs = Math.max(0, Math.round(performance.now() - started));
     const usage = discussionUsage(agent, sample, durationMs);
     try {
-        callback({ text, durationMs, ...(usage ? { usage } : {}) });
+        callback({
+            text,
+            durationMs,
+            ...(usage ? { usage } : {}),
+            ...(extras?.thinking ? { thinking: extras.thinking } : {}),
+            ...(Array.isArray(extras?.steps) && extras.steps.length > 0 ? { steps: extras.steps } : {}),
+            ...(extras?.model ? { model: extras.model } : {}),
+        });
     }
     catch { /* Rendering cannot interrupt native cleanup. */ }
 }
@@ -141,6 +148,14 @@ export function createDiscussionPort(options) {
         const collectText = createDiscussionText();
         const executions = [];
         const changedFiles = new Set();
+        let codexThinking = '';
+        const codexSteps = [{ label: work ? '已挂载隔离 Git 工作树并启动 Codex 执行器' : '已启动只读 Codex 审查器', status: 'done' }];
+        const codexStepById = new Map();
+        const emitCodexProgress = () => reportProgress(onProgress, result, 'codex', usageSample, callStarted, {
+            thinking: codexThinking,
+            steps: codexSteps.slice(-24),
+            model: selected.public.model,
+        });
         const supervisor = createSupervisor({ command: binary.entry.command, args, cwd: dir,
             env: { ...process.env, CODEX_HOME: dir }, classify: () => 'terminal',
             onExit: () => done.reject(new DiscussionError('agent-crashed')), maxStartsPerWindow: 1,
@@ -172,21 +187,66 @@ export function createDiscussionPort(options) {
                         turnId = p.turn?.id;
                     if (method === 'thread/tokenUsage/updated') {
                         usageSample = p.tokenUsage;
-                        reportProgress(onProgress, result, 'codex', usageSample, callStarted);
+                        emitCodexProgress();
+                    }
+                    if ((method === 'item/reasoning/summaryTextDelta' || method === 'item/reasoning/textDelta') && typeof p.delta === 'string') {
+                        codexThinking += p.delta;
+                        if (codexThinking.length > 26000) codexThinking = '…' + codexThinking.slice(-22000);
+                        emitCodexProgress();
+                    }
+                    if (method === 'item/completed' && p.item?.type === 'reasoning') {
+                        const summaryText = (Array.isArray(p.item.summary) ? p.item.summary : [])
+                            .map(s => typeof s === 'string' ? s : (s?.text ?? ''))
+                            .filter(Boolean).join('\n');
+                        if (summaryText && !codexThinking.includes(summaryText)) {
+                            codexThinking = (codexThinking ? codexThinking + '\n' : '') + summaryText;
+                            if (codexThinking.length > 26000) codexThinking = '…' + codexThinking.slice(-22000);
+                            emitCodexProgress();
+                        }
+                    }
+                    if (work && method === 'item/started' && p.item?.type === 'commandExecution') {
+                        const cmdLabel = '执行命令: ' + String(p.item.command ?? '').replace(/\s+/g, ' ').trim().slice(0, 180);
+                        const stepEntry = { label: cmdLabel, status: 'running' };
+                        codexSteps.push(stepEntry);
+                        if (p.item.id) codexStepById.set(p.item.id, stepEntry);
+                        emitCodexProgress();
                     }
                     if (work && method === 'item/completed' && p.item?.type === 'commandExecution' && executions.length < 30) {
                         executions.push({ command: String(p.item.command ?? '').slice(0, 400), exitCode: p.item.exitCode ?? null, status: String(p.item.status) });
+                        const existing = p.item.id ? codexStepById.get(p.item.id) : undefined;
+                        const okExit = (p.item.exitCode === 0 || p.item.exitCode === null || p.item.exitCode === undefined) && p.item.status !== 'failed';
+                        const detail = p.item.exitCode !== null && p.item.exitCode !== undefined ? 'exit ' + p.item.exitCode : undefined;
+                        if (existing) {
+                            existing.status = okExit ? 'done' : 'failed';
+                            if (detail) existing.detail = detail;
+                        }
+                        else {
+                            codexSteps.push({
+                                label: '执行命令: ' + String(p.item.command ?? '').replace(/\s+/g, ' ').trim().slice(0, 180),
+                                status: okExit ? 'done' : 'failed',
+                                ...(detail ? { detail } : {}),
+                            });
+                        }
+                        emitCodexProgress();
                     }
                     if (work && method === 'item/completed' && p.item?.type === 'fileChange') {
-                        for (const change of p.item.changes ?? [])
+                        const touched = [];
+                        for (const change of p.item.changes ?? []) {
+                            const fpath = String(change.path).slice(0, 400);
+                            touched.push(fpath);
                             if (changedFiles.size < 50)
-                                changedFiles.add(String(change.path).slice(0, 400));
+                                changedFiles.add(fpath);
+                        }
+                        if (touched.length > 0) {
+                            codexSteps.push({ label: '变更文件 (' + touched.length + '): ' + touched.join(', ').slice(0, 180), status: 'done' });
+                            emitCodexProgress();
+                        }
                     }
                     try {
                         const snapshot = collectText(method, p);
                         if (snapshot !== undefined) {
                             result = snapshot;
-                            reportProgress(onProgress, result, 'codex', usageSample, callStarted);
+                            emitCodexProgress();
                         }
                     }
                     catch (error) {
@@ -270,42 +330,95 @@ export function createDiscussionPort(options) {
                     return await runCodex(selected, text, abort.signal, lease ? { workspace: lease.workspace } : undefined, reasoning, onUsage, onProgress);
                 if (model.agent !== 'dsh' || options.llm === undefined)
                     throw new DiscussionError('unsupported');
-                // Reasoning models share the output budget with reasoning tokens. The
-                // former 2048 cap could end a synthesis before any visible answer.
-                const prepared = await options.llm.prepareCall({ provider: model.provider, model: model.model, maxTokens: 8192, ...(reasoning === undefined ? {} : { reasoningEffort: reasoning }) }, abort.signal);
-                if (prepared.config.provider !== model.provider || prepared.config.model !== model.model)
-                    throw new DiscussionError('revision-conflict');
-                if (reasoning !== undefined && prepared.config.reasoningEffort !== reasoning)
-                    throw new DiscussionError('revision-conflict');
-                let result = '';
-                let completed = false;
-                callStarted = performance.now();
-                for await (const value of prepared.stream({ ...prepared.config, signal: abort.signal,
-                    tools: [], messages: [{ role: 'user', content: [{ type: 'text', text }] }] })) {
-                    const chunk = record(value);
-                    if (chunk.type === 'usage')
-                        usageSample = chunk.usage;
-                    if (chunk.type === 'text-delta')
-                        result += chunk.text;
-                    if (Buffer.byteLength(result) > DISCUSSION_OUTPUT_BYTES) {
-                        abort.abort();
-                        throw new DiscussionError('size-limit');
-                    }
-                    if (chunk.type === 'text-delta' || chunk.type === 'usage')
-                        reportProgress(onProgress, result, 'dsh', usageSample, callStarted);
-                    if (chunk.type === 'block-start' && chunk.block?.type === 'tool-call') {
-                        abort.abort();
-                        throw new DiscussionError('isolation-violation');
-                    }
-                    if (chunk.type === 'finish') {
-                        completed = chunk.reason?.kind === 'stop';
-                        if (!completed)
-                            throw new DiscussionError(abort.signal.aborted ? 'cancelled' : 'response-incomplete');
+                // Reasoning models share the output budget with reasoning tokens: an 8192 cap
+                // can be exhausted by internal CoT on large patches before emitting final JSON.
+                let baseMaxTokens = 16384;
+                try {
+                    const info = await options.llm.resolveModelInfo?.(model.provider, model.model);
+                    const cap = info?.maxOutputTokens ?? info?.limits?.output ?? info?.outputTokenLimit;
+                    if (typeof cap === 'number' && Number.isFinite(cap) && cap > 0) {
+                        baseMaxTokens = Math.max(4096, Math.min(32768, cap));
                     }
                 }
-                if (!completed)
-                    throw new DiscussionError('outcome-unknown');
-                return output(result);
+                catch { /* keep 16384 default */ }
+                let dshThinking = '';
+                const dshSteps = [];
+                const runDshTurn = async (promptText, tokenBudget, effort) => {
+                    let prepared;
+                    try {
+                        prepared = await options.llm.prepareCall({
+                            provider: model.provider, model: model.model, maxTokens: tokenBudget,
+                            ...(effort === undefined ? {} : { reasoningEffort: effort }),
+                        }, abort.signal);
+                    }
+                    catch (prepError) {
+                        if (tokenBudget !== 8192 && !abort.signal.aborted) {
+                            prepared = await options.llm.prepareCall({
+                                provider: model.provider, model: model.model, maxTokens: 8192,
+                                ...(effort === undefined ? {} : { reasoningEffort: effort }),
+                            }, abort.signal);
+                        }
+                        else {
+                            throw prepError;
+                        }
+                    }
+                    if (prepared.config.provider !== model.provider || prepared.config.model !== model.model)
+                        throw new DiscussionError('revision-conflict');
+                    if (effort !== undefined && prepared.config.reasoningEffort !== effort)
+                        throw new DiscussionError('revision-conflict');
+                    let result = '';
+                    let completed = false;
+                    callStarted = performance.now();
+                    for await (const value of prepared.stream({ ...prepared.config, signal: abort.signal,
+                        tools: [], messages: [{ role: 'user', content: [{ type: 'text', text: promptText }] }] })) {
+                        const chunk = record(value);
+                        if (chunk.type === 'usage')
+                            usageSample = chunk.usage;
+                        if ((chunk.type === 'reasoning-delta' || chunk.type === 'thinking-delta') && typeof chunk.text === 'string') {
+                            dshThinking += chunk.text;
+                            if (dshThinking.length > 26000)
+                                dshThinking = '…' + dshThinking.slice(-22000);
+                        }
+                        if (chunk.type === 'text-delta')
+                            result += chunk.text;
+                        if (Buffer.byteLength(result) > DISCUSSION_OUTPUT_BYTES) {
+                            abort.abort();
+                            throw new DiscussionError('size-limit');
+                        }
+                        if (chunk.type === 'text-delta' || chunk.type === 'reasoning-delta' || chunk.type === 'thinking-delta' || chunk.type === 'usage')
+                            reportProgress(onProgress, result, 'dsh', usageSample, callStarted, { thinking: dshThinking, steps: dshSteps, model: model.model });
+                        if (chunk.type === 'block-start' && chunk.block?.type === 'tool-call') {
+                            abort.abort();
+                            throw new DiscussionError('isolation-violation');
+                        }
+                        if (chunk.type === 'finish') {
+                            completed = chunk.reason?.kind === 'stop';
+                            if (!completed)
+                                throw new DiscussionError(abort.signal.aborted ? 'cancelled' : 'response-incomplete');
+                        }
+                    }
+                    if (!completed)
+                        throw new DiscussionError('outcome-unknown');
+                    return output(result);
+                };
+                try {
+                    return await runDshTurn(text, baseMaxTokens, reasoning);
+                }
+                catch (firstError) {
+                    const retryable = (firstError?.code === 'response-incomplete' || firstError?.code === 'outcome-unknown') && !abort.signal.aborted;
+                    if (!retryable)
+                        throw firstError;
+                    const steppedEffort = (reasoning === 'xhigh' || reasoning === 'high')
+                        && selected.public.reasoningEfforts?.includes('medium')
+                        ? 'medium'
+                        : reasoning;
+                    const retryBudget = Math.min(32768, Math.max(baseMaxTokens, 24576));
+                    dshSteps.push({ label: '首轮输出触及上限，自动扩容预算至 ' + retryBudget + ' 并切换精简重试', status: 'done' });
+                    if (dshThinking) dshThinking += '\n\n── [自动精简重试] ──\n';
+                    reportProgress(onProgress, '', 'dsh', usageSample, callStarted, { thinking: dshThinking, steps: dshSteps, model: model.model });
+                    const retryPrompt = '【系统重要提示：上一轮回复因内部思考链或篇幅过长触及输出上限被截断。本轮请精简内部推演，直接输出最终结论；若要求严格 JSON，请立即输出紧凑合法的 JSON 对象，每条结论控制在 120 字以内。】\n\n' + text;
+                    return await runDshTurn(retryPrompt, retryBudget, steppedEffort);
+                }
             }
             finally {
                 const usage = callStarted === undefined ? undefined : discussionUsage('dsh', usageSample, performance.now() - callStarted);

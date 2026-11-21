@@ -77,7 +77,11 @@ export function createNodeDiscussions(options: { port: DiscussionPort; journal: 
             const parsed = DiscussionUsageSchema.safeParse(value)
             if (parsed.success) usage = parsed.data
           }, value => {
-            const parsed = DiscussionProgressSchema.safeParse(value)
+            const parsed = DiscussionProgressSchema.safeParse({
+              text: value?.text,
+              durationMs: value?.durationMs,
+              ...(value?.usage === undefined ? {} : { usage: value.usage }),
+            })
             if (!parsed.success) return
             progress = parsed.data
             if (progress.usage) usage = progress.usage

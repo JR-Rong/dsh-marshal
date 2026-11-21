@@ -2202,8 +2202,71 @@ window.__ModuleLoader__.load({
         '.mtr-chip-row{display:flex;flex-wrap:wrap;align-items:center;gap:6px}',
         '.mtr-mention-chip{border:1px solid color-mix(in srgb,var(--mtr-chip-c,currentColor) 32%,transparent);background:color-mix(in srgb,var(--mtr-chip-c,currentColor) 10%,transparent);color:inherit;border-radius:999px;padding:2px 9px;font-size:11px;cursor:pointer;font-family:inherit;display:inline-flex;align-items:center;gap:4px}',
         '.mtr-mention-chip:hover{background:color-mix(in srgb,var(--mtr-chip-c,currentColor) 18%,transparent)}',
+        '@keyframes mtrPulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.38;transform:scale(.85)}}',
+        '.mtr-live-badge{display:inline-flex;align-items:center;gap:5px;font-size:10.5px;font-weight:600;padding:1.5px 8px;border-radius:999px;color:#3b82f6;background:color-mix(in srgb,#3b82f6 13%,transparent);border:1px solid color-mix(in srgb,#3b82f6 34%,transparent)}',
+        '.mtr-live-dot{width:6px;height:6px;border-radius:50%;background:#3b82f6;animation:mtrPulse 1.35s ease-in-out infinite}',
+        '.mtr-bubble-live{box-shadow:0 0 0 1px color-mix(in srgb,var(--mtr-agent-c,#6366f1) 28%,transparent),0 6px 18px rgba(0,0,0,.08)}',
+        '.mtr-trace{margin:0 0 8px;border-radius:10px;border:1px solid color-mix(in srgb,var(--mtr-agent-c,#6366f1) 24%,var(--dsw-alias-border-l1,rgba(128,128,128,.18)));background:color-mix(in srgb,var(--mtr-agent-c,#6366f1) 6%,var(--dsw-alias-bg-base,rgba(0,0,0,.14)));overflow:hidden}',
+        '.mtr-trace:last-child{margin-bottom:0}',
+        '.mtr-trace-sum{cursor:pointer;user-select:none;padding:6px 10px;font-size:11.5px;font-weight:600;color:var(--dsw-alias-label-secondary,rgba(148,154,168,.95));display:flex;align-items:center;gap:7px;flex-wrap:wrap}',
+        '.mtr-trace-sum:hover{background:color-mix(in srgb,currentColor 5%,transparent)}',
+        '.mtr-trace-body{padding:8px 10px 10px;border-top:1px solid color-mix(in srgb,currentColor 10%,transparent);display:grid;gap:8px;font-size:12px}',
+        '.mtr-trace-steps{display:grid;gap:4px}',
+        '.mtr-trace-step{display:flex;align-items:flex-start;gap:6px;font:11.5px/1.45 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;padding:3px 7px;border-radius:6px;background:color-mix(in srgb,currentColor 5%,transparent);overflow-wrap:anywhere}',
+        '.mtr-trace-step[data-st="running"]{color:#60a5fa;background:color-mix(in srgb,#3b82f6 11%,transparent)}',
+        '.mtr-trace-step[data-st="failed"]{color:#f87171;background:color-mix(in srgb,#ef4444 11%,transparent)}',
+        '.mtr-trace-think{margin:0;padding:8px 10px;max-height:220px;overflow-y:auto;border-radius:7px;font:11.5px/1.55 inherit;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--dsw-alias-label-secondary,rgba(155,160,175,.95));background:color-mix(in srgb,#000 14%,transparent);border-left:2.5px solid color-mix(in srgb,var(--mtr-agent-c,#6366f1) 55%,transparent)}',
       ].join('\n');
       if (!existing) document.head.appendChild(style);
+    }
+
+    const MARSHAL_TRACE_PREFIX = '<!--marshal-trace:';
+    const MARSHAL_TRACE_SUFFIX = '-->\n';
+    function decodeAgentTraceClient(rawText) {
+      const raw = String(rawText ?? '');
+      if (!raw.startsWith(MARSHAL_TRACE_PREFIX)) return { text: raw, trace: null };
+      const endIdx = raw.indexOf(MARSHAL_TRACE_SUFFIX, MARSHAL_TRACE_PREFIX.length);
+      if (endIdx === -1 || endIdx > 48 * 1024) return { text: raw, trace: null };
+      try {
+        const parsed = JSON.parse(raw.slice(MARSHAL_TRACE_PREFIX.length, endIdx));
+        const rest = raw.slice(endIdx + MARSHAL_TRACE_SUFFIX.length);
+        return parsed && typeof parsed === 'object' ? { text: rest, trace: parsed } : { text: raw, trace: null };
+      } catch {
+        return { text: raw, trace: null };
+      }
+    }
+
+    function AgentTracePanel({ trace, live = false, hasBody = true }) {
+      if (!trace || typeof trace !== 'object') return null;
+      const steps = Array.isArray(trace.steps) ? trace.steps.filter(s => s && s.label) : [];
+      const thinking = typeof trace.thinking === 'string' ? trace.thinking.trim() : '';
+      if (!thinking && steps.length === 0 && !live) return null;
+      const stepCount = typeof trace.stepCount === 'number' && trace.stepCount > steps.length ? trace.stepCount : steps.length;
+      const durSec = typeof trace.durationMs === 'number' && trace.durationMs > 0
+        ? (trace.durationMs >= 1000 ? (trace.durationMs / 1000).toFixed(1) + 's' : trace.durationMs + 'ms')
+        : '';
+      const metaParts = [];
+      if (thinking) metaParts.push('含思考链');
+      if (stepCount > 0) metaParts.push(stepCount + ' 步处理');
+      if (trace.model) metaParts.push(trace.model);
+      if (durSec && !live) metaParts.push('耗时 ' + durSec);
+      const summaryLabel = live
+        ? ('💭 实时思考与处理追踪' + (metaParts.length ? ' · ' + metaParts.join(' · ') : ''))
+        : ('💭 思考与处理过程' + (metaParts.length ? '（' + metaParts.join(' · ') + '）' : ''));
+      return h('details', { className: 'mtr-trace', open: live || !hasBody ? true : undefined },
+        h('summary', { className: 'mtr-trace-sum' }, summaryLabel),
+        h('div', { className: 'mtr-trace-body' },
+          steps.length > 0 && h('div', { className: 'mtr-trace-steps' },
+            steps.map((st, idx) => {
+              const icon = st.status === 'running' ? '⟳' : st.status === 'failed' ? '✕' : '✓';
+              return h('div', { key: idx, className: 'mtr-trace-step', 'data-st': st.status || 'done' },
+                h('span', { style: { flexShrink: 0, fontWeight: 700 } }, icon),
+                h('span', { style: { flex: 1, minWidth: 0 } }, st.label),
+                st.detail && h('span', { style: { opacity: .72, fontSize: 10.5, flexShrink: 0 } }, st.detail));
+            })),
+          thinking
+            ? h('div', { className: 'mtr-trace-think' }, thinking)
+            : (live && steps.length === 0 && h('div', { style: { ...uiMuted, fontSize: 11.5 } }, '已发起请求，等待模型首包与推演流返回…'))));
     }
 
     function tryParseJsonPayload(str) {
@@ -4622,24 +4685,25 @@ window.__ModuleLoader__.load({
           finally { inFlight = false; }
         };
         void load();
-        const timer = setInterval(load, 2200);
+        const timer = setInterval(load, 1600);
         return () => { alive = false; clearInterval(timer); };
       }, [id, workspace]);
 
       const visible = view?.key === viewKey ? view : null;
       const room = visible?.room;
       const lastSeq = visible?.records?.at(-1)?.seq ?? 0;
+      const liveSig = (visible?.liveBubbles ?? []).map(b => b.id + ':' + (b.updatedAt || 0) + ':' + (b.thinking?.length || 0) + ':' + (b.text?.length || 0) + ':' + (b.steps?.length || 0)).join('|');
 
       React.useEffect(() => {
         const el = streamRef.current;
-        if (!el || !lastSeq) return;
+        if (!el || (!lastSeq && !liveSig)) return;
         if (stickBottomRef.current || prevLastSeqRef.current === 0) {
           requestAnimationFrame(() => {
             if (streamRef.current) streamRef.current.scrollTop = streamRef.current.scrollHeight;
           });
         }
-        prevLastSeqRef.current = lastSeq;
-      }, [lastSeq, sendingChat]);
+        if (lastSeq) prevLastSeqRef.current = lastSeq;
+      }, [lastSeq, liveSig, sendingChat]);
 
       React.useEffect(() => {
         if (!visible?.origin) return;
@@ -4816,11 +4880,13 @@ window.__ModuleLoader__.load({
               prefixActor + record.text));
         }
 
-        // 6) Agent speech bubble -> left-aligned with distinct per-agent color!
+        // 6) Agent speech bubble -> left-aligned with distinct per-agent color + embedded thinking/processing trace!
         const accent = agentBubbleAccent(record.actor, colorMap);
         const roleTag = roleOfActor(record.actor);
         const stageLabel = taskPhases[record.phase] || '';
         const badgeText = [roleTag, stageLabel].filter(Boolean).join(' · ');
+        const decoded = decodeAgentTraceClient(record.text);
+        const hasCleanBody = Boolean(decoded.text && decoded.text.trim());
         return h('div', { key: record.seq, className: 'mtr-msg-row', 'data-side': 'left', style: { '--mtr-agent-c': accent } },
           h('span', {
             className: 'mtr-avatar',
@@ -4836,7 +4902,36 @@ window.__ModuleLoader__.load({
               badgeText && h('span', { className: 'mtr-role-badge' }, badgeText),
               h('span', null, timeStr)),
             h('div', { className: 'mtr-bubble mtr-bubble-agent' },
-              h(RichMarkdown, { text: record.text, phase: record.phase }))));
+              decoded.trace && h(AgentTracePanel, { trace: decoded.trace, live: false, hasBody: hasCleanBody }),
+              hasCleanBody && h(RichMarkdown, { text: decoded.text, phase: record.phase }))));
+      };
+
+      const renderLiveBubble = live => {
+        const accent = agentBubbleAccent(live.actor, colorMap);
+        const roleTag = roleOfActor(live.actor);
+        const stageLabel = taskPhases[live.phase] || (live.phase === 'handoff' ? '常驻会话执行' : '');
+        const badgeText = [roleTag, stageLabel].filter(Boolean).join(' · ');
+        const elapsedSec = Math.max(1, Math.round(((live.updatedAt || Date.now()) - (live.startedAt || Date.now())) / 1000));
+        const hasLiveBody = Boolean(live.text && live.text.trim());
+        return h('div', { key: 'live-' + live.id, className: 'mtr-msg-row', 'data-side': 'left', style: { '--mtr-agent-c': accent } },
+          h('span', {
+            className: 'mtr-avatar',
+            style: {
+              background: 'color-mix(in srgb, ' + accent + ' 22%, var(--dsw-alias-bg-layer-2, #1f2430))',
+              color: accent,
+              border: '1px solid color-mix(in srgb, ' + accent + ' 52%, transparent)',
+            },
+          }, agentInitial(live.actor)),
+          h('div', { className: 'mtr-msg-col' },
+            h('div', { className: 'mtr-msg-meta' },
+              h('strong', { style: { color: accent, fontSize: 12.5 } }, live.actor),
+              badgeText && h('span', { className: 'mtr-role-badge' }, badgeText),
+              h('span', { className: 'mtr-live-badge' },
+                h('span', { className: 'mtr-live-dot', 'aria-hidden': 'true' }),
+                '思考/处理中 · ' + elapsedSec + 's')),
+            h('div', { className: 'mtr-bubble mtr-bubble-agent mtr-bubble-live' },
+              h(AgentTracePanel, { trace: live, live: true, hasBody: hasLiveBody }),
+              hasLiveBody && h(RichMarkdown, { text: live.text, phase: live.phase }))));
       };
 
       const localLeaderChoices = leaders.filter(item => item.global || item.workspaceId === workspace);
@@ -4951,10 +5046,11 @@ window.__ModuleLoader__.load({
             },
           },
             visible.records[0]?.seq > 1 && h('div', { className: 'mtr-sys-row' }, button('↑ 加载更早消息', () => { void older(); }, busy)),
-            visible.records.length === 0 && h('div', { style: { ...uiMuted, margin: 'auto', textAlign: 'center', lineHeight: 1.8 } },
+            visible.records.length === 0 && !(visible.liveBubbles?.length > 0) && h('div', { style: { ...uiMuted, margin: 'auto', textAlign: 'center', lineHeight: 1.8 } },
               '工单群已就绪，还没有消息。', h('br'), '您可以直接在下方输入要求、@指定角色讨论，或点击「按意见继续执行」启动编排。'),
             visible.records.map(renderRecord),
-            sendingChat && h('div', { className: 'mtr-msg-row', 'data-side': 'left' },
+            (visible.liveBubbles || []).map(renderLiveBubble),
+            sendingChat && !(visible.liveBubbles?.length > 0) && h('div', { className: 'mtr-msg-row', 'data-side': 'left' },
               h('span', { className: 'mtr-avatar', style: { background: 'color-mix(in srgb, currentColor 12%, transparent)', fontSize: 12 } }, '…'),
               h('div', { className: 'mtr-msg-col' },
                 h('div', { className: 'mtr-bubble mtr-bubble-agent', style: { opacity: .75, fontSize: 12 } }, '正在结合工单上下文生成回复…')))),

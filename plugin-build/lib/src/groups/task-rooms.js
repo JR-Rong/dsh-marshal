@@ -72,6 +72,7 @@ export function createTaskRooms({ store, deviceId, hub, now = Date.now }) {
         },
         find: (source, taskId) => store.find(deviceId, source, taskId),
         local: id => store.get(id),
+        hasEvent: (id, eventId) => Boolean(store.event(id, eventId)),
         async promote(id, target) {
             const room = store.get(id);
             if (!room) throw taskError('task-room-not-found', '跨设备转存由原设备发起。');

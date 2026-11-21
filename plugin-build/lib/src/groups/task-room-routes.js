@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { TaskRoomKey } from './task-room-store.js';
 import { taskError } from './pr-material.js';
+import { stripAgentTrace } from './agent-trace.js';
+import { syncResidentSessionToRoom } from './session-room-sync.js';
 import { withTicketPrefix } from './ticket-numbers.js';
 import { applyDevelopmentPatch } from './task-development.js';
 
@@ -82,7 +84,7 @@ export function taskRoomAudit(rooms, room, reason, leader, remoteTarget, allowMe
 
 export function createTaskRoomRoutes({
     exact, write, readBody, authenticate, allowed, auth, rooms, orchestration, getBoard, boardSource, getInitiator,
-    ticketNumbers, workspacePath, normalizeAttachments, resolveAttachments,
+    ticketNumbers, workspacePath, normalizeAttachments, resolveAttachments, surface, moveCardStatus,
 }) {
     const viewRoom = room => visibleTaskRoom(room, ticketNumbers);
     const operations = new Set();
@@ -170,7 +172,7 @@ export function createTaskRoomRoutes({
                     ...(record.phase ? { phase: record.phase } : {}),
                     text: record.phase === 'development-patch'
                         ? '[固定开发补丁 SHA-256: ' + (record.ref ?? 'unknown') + '，共 ' + record.text.length + ' 字符]'
-                        : record.text,
+                        : stripAgentTrace(record.text),
                 }));
             messages.push({ actor: '工单操作者', kind: 'user', text });
             while (messages.length > 1 && Buffer.byteLength(JSON.stringify(messages)) > 40 * 1024) messages.shift();
@@ -266,6 +268,7 @@ export function createTaskRoomRoutes({
             if (board && card.status !== 'done') {
                 snapshot = await board.apply(randomUUID(), { kind: 'move', taskId: card.id, status: 'done' }, initiatorTag ?? ('marshal:' + getInitiator()));
             }
+            orchestration?.syncStatus?.(source, card.id, 'done');
             return {
                 snapshot,
                 patchApplied,
@@ -375,16 +378,48 @@ export function createTaskRoomRoutes({
             const workspaceId = workspaceCheck(access, TaskRoomKey.parse(params.get('workspaceId')));
             const local = rooms.local(id);
             if (local && (!taskRoomAccess(access, local, allowed) || local.workspaceId !== workspaceId)) throw hidden();
-            const page = await rooms.page(id, {
+            const cursorArgs = {
                 workspaceId,
                 ...(params.has('before') ? { before: z.coerce.number().int().positive().parse(params.get('before')) } : {}),
                 ...(params.has('after') ? { after: z.coerce.number().int().nonnegative().parse(params.get('after')) } : {}),
-            });
+            };
+            let page = await rooms.page(id, cursorArgs);
             if (page.room.workspaceId !== workspaceId || !taskRoomAccess(access, page.room, allowed)) throw hidden();
             const origin = page.room.deviceId === getInitiator();
-            const workflowView = origin ? orchestration?.view(page.room.source, page.room.taskId) : undefined;
-            const runState = workflowView?.state;
+            let workflowView = origin ? orchestration?.view(page.room.source, page.room.taskId) : undefined;
             const card = origin ? getBoard()?.snapshot().tasks?.find(task => task.id === page.room.taskId) : undefined;
+            const liveBubbles = origin ? [...(orchestration?.live?.(page.room.source, page.room.taskId) ?? [])] : [];
+            const residentSessionId = origin
+                ? (workflowView?.sessionId || (!workflowView ? card?.sessionId : undefined))
+                : undefined;
+            if (residentSessionId && surface && !page.room.closed) {
+                const prevSeq = page.room.lastSeq;
+                const residentLive = await syncResidentSessionToRoom({
+                    surface,
+                    rooms,
+                    room: page.room,
+                    sessionId: residentSessionId,
+                    actor: workflowView?.leaderName || extractAgentTag(card) || '执行智能体',
+                    runId: page.room.runId ?? workflowView?.runId,
+                    workflowState: workflowView?.state,
+                    onTurnCompleted: async (reason, lastText) => {
+                        if (reason === 'completed') {
+                            orchestration?.syncStatus?.(page.room.source, page.room.taskId, 'review', {
+                                reviewReason: 'delivery-review',
+                                reviewSummary: String(lastText || '').slice(0, 500),
+                            });
+                            await moveCardStatus?.(page.room.source, page.room.taskId, 'review');
+                        }
+                    },
+                });
+                if (residentLive) liveBubbles.push(residentLive);
+                const refreshedRoom = rooms.local(id);
+                if (refreshedRoom && refreshedRoom.lastSeq > prevSeq) {
+                    page = await rooms.page(id, cursorArgs);
+                }
+                workflowView = origin ? orchestration?.view(page.room.source, page.room.taskId) : undefined;
+            }
+            const runState = workflowView?.state;
             const cardStatus = page.room.closed ? 'done'
                 : !workflowView || workflowView.state === 'ready' ? (card?.status ?? 'todo')
                 : workflowView.state === 'running' || workflowView.state === 'handed-off' ? 'running'
@@ -410,6 +445,7 @@ export function createTaskRoomRoutes({
                 ...(workflowView ? { workflow: workflowView } : {}),
                 patchAvailable,
                 participants,
+                liveBubbles,
             };
         }),
         route('GET', 'peers', async (req, access) => {

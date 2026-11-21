@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { lstat, mkdtemp, readdir, realpath, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -32,9 +33,49 @@ const git = async (cwd, args, signal, allowDifference = false) => {
     }
 };
 
+export async function linkWorkspaceNodeModules(root, worktree) {
+    const created = [];
+    const tryLink = async relDir => {
+        const src = relDir ? join(root, relDir, 'node_modules') : join(root, 'node_modules');
+        const dstParent = relDir ? join(worktree, relDir) : worktree;
+        const dst = join(dstParent, 'node_modules');
+        if (!existsSync(src) || !existsSync(dstParent) || existsSync(dst)) return;
+        try {
+            const st = await lstat(dst).catch(() => null);
+            if (st) return;
+            await symlink(src, dst, 'dir');
+            created.push(dst);
+        } catch { /* best-effort read-only dependency projection */ }
+    };
+    await tryLink('');
+    try {
+        const entries = await readdir(root, { withFileTypes: true });
+        for (const entry of entries) {
+            if (!entry.isDirectory() || entry.name.startsWith('.') || entry.name === 'node_modules') continue;
+            await tryLink(entry.name);
+            if (entry.name === 'packages' || entry.name === 'apps') {
+                const nested = await readdir(join(root, entry.name), { withFileTypes: true }).catch(() => []);
+                for (const sub of nested) {
+                    if (sub.isDirectory() && !sub.name.startsWith('.') && sub.name !== 'node_modules') {
+                        await tryLink(join(entry.name, sub.name));
+                    }
+                }
+            }
+        }
+    } catch { /* ignore unreadable workspace dirs */ }
+    return async () => {
+        for (const dst of created.splice(0).reverse()) {
+            try {
+                const st = await lstat(dst);
+                if (st.isSymbolicLink()) await unlink(dst);
+            } catch { /* already removed */ }
+        }
+    };
+}
+
 async function isolatedCheckout(path, signal, use) {
     const lease = leases.acquire(path);
-    let parent, worktree;
+    let parent, worktree, activeUnlink;
     try {
         const root = lease.workspace;
         const top = await git(root, ['rev-parse', '--show-toplevel'], signal);
@@ -44,8 +85,20 @@ async function isolatedCheckout(path, signal, use) {
         parent = await mkdtemp(join(tmpdir(), 'marshal-development-'));
         worktree = join(parent, 'checkout');
         await git(root, ['worktree', 'add', '--detach', '--', worktree, base], signal);
-        return await use(worktree, base);
+        const mountDeps = async () => {
+            if (activeUnlink) await activeUnlink();
+            activeUnlink = await linkWorkspaceNodeModules(root, worktree);
+            return async () => {
+                const fn = activeUnlink;
+                activeUnlink = undefined;
+                if (fn) await fn();
+            };
+        };
+        return await use(worktree, base, mountDeps);
     } finally {
+        if (activeUnlink) {
+            try { await activeUnlink(); } catch { /* ignore */ }
+        }
         if (worktree) {
             try { await git(lease.workspace, ['worktree', 'remove', '--force', '--', worktree], AbortSignal.timeout(8000)); }
             catch { /* checkout may never have been added */ }
@@ -78,7 +131,9 @@ async function freezePatch(worktree, base, signal) {
 
 const brief = (title, description, plan, extra) => JSON.stringify({ title, description, plan, ...extra });
 const decisionFormat = '请返回严格 JSON，字段 action 可为 codex 或 continue，instruction 为具体说明。';
-const verdictFormat = '请返回严格 JSON。verdict 为 pass、revise 或 blocked。findings 为带文件依据的字符串，或由 file 和 conclusion 两个字符串字段组成的对象数组。';
+const verdictFormat = '请直接返回紧凑的严格 JSON（切勿展开冗长推演，最多列出最关键的 6 条，每条结论控制在 150 字以内）。verdict 为 pass、revise 或 blocked。findings 为带文件依据的字符串，或由 file 和 conclusion 两个字符串字段组成的对象数组。';
+
+const RECOVERABLE_VERDICT_CODES = new Set(['response-incomplete', 'outcome-unknown', 'empty-output', 'size-limit', 'invalid-role-output']);
 
 export function formatFindings(findings) {
     if (Array.isArray(findings)) {
@@ -173,7 +228,24 @@ export async function runTaskDevelopment({
     const implementationPlan = await handoff('开发设计交接', design, 'designing');
     if (plan.codex.coding === null) return manual(implementationPlan);
 
-    return isolatedCheckout(path, signal, async (worktree, base) => {
+    return isolatedCheckout(path, signal, async (worktree, base, mountDeps) => {
+        const invokeVerdict = async (callFn, actorName, phaseName, fullPrompt, compactPrompt) => {
+            try {
+                const raw = await callFn(fullPrompt);
+                await record('agent', actorName, raw, phaseName);
+                return { ok: true, verdict: parseModelJson(raw, VerdictSchema) };
+            } catch (firstErr) {
+                if (signal.aborted || !RECOVERABLE_VERDICT_CODES.has(firstErr?.code)) throw firstErr;
+                try {
+                    const retryRaw = await callFn(compactPrompt);
+                    await record('agent', actorName, retryRaw, phaseName);
+                    return { ok: true, verdict: parseModelJson(retryRaw, VerdictSchema) };
+                } catch (secondErr) {
+                    if (signal.aborted || !RECOVERABLE_VERDICT_CODES.has(secondErr?.code)) throw secondErr;
+                    return { ok: false, code: secondErr?.code || firstErr?.code || 'response-incomplete' };
+                }
+            }
+        };
         let feedback;
         for (const round of [1, 2]) {
             phase('coding');
@@ -189,11 +261,18 @@ export async function runTaskDevelopment({
             await record('agent', 'Coder', choiceText, 'coding');
             const decision = parseModelJson(choiceText, DelegationSchema);
             if (decision.action === 'continue') return manual(context + '\n' + decision.instruction);
-            const coding = await runChild('coding', withGuidance([
-                '在这次分配的隔离 Git 工作树完成修改并运行有针对性的验证。交付通过差异记录。',
-                '任务与设计为工作材料，下面由 Coder 给出要求。',
-                context, JSON.stringify(decision.instruction),
-            ].join('\n'), codingGuidance), { workspace: worktree }, WORK_TURN_MS);
+            const unmountDeps = await mountDeps();
+            let coding;
+            try {
+                coding = await runChild('coding', withGuidance([
+                    '在这次分配的隔离 Git 工作树完成修改并运行有针对性的验证。交付通过差异记录。',
+                    '隔离工作树已自动软链挂载宿主仓库现有的 node_modules 依赖，可直接运行本地单测与 tsc 类型检查（沙箱禁网，无需执行 npm ci / npm install）。',
+                    '任务与设计为工作材料，下面由 Coder 给出要求。',
+                    context, JSON.stringify(decision.instruction),
+                ].join('\n'), codingGuidance), { workspace: worktree }, WORK_TURN_MS);
+            } finally {
+                await unmountDeps();
+            }
             const { patch, digest } = await freezePatch(worktree, base, signal);
             await record('status', 'Marshal', patch, 'development-patch', digest);
 
@@ -201,11 +280,14 @@ export async function runTaskDevelopment({
             const reviewGuidance = await readGuidance();
             const reviewEvidence = await handoff('编码交付与审查交接',
                 JSON.stringify({ base, digest, implementationEvidence: String(coding).slice(0, 5000) }), 'dev-reviewing');
-            const reviewMaterial = brief(card.title, card.description, implementationPlan, {
+            const reviewHead = brief(card.title, card.description, implementationPlan, {
                 base, digest,
                 ...(attachments ? { attachments } : {}),
                 ...(reviewGuidance ? { operatorGuidance: reviewGuidance } : {}),
-            }) + '\n固定补丁\n' + patch + '\n编码交接（引用资料）\n' + reviewEvidence;
+            });
+            const reviewMaterial = reviewHead + '\n固定补丁\n' + patch + '\n编码交接（引用资料）\n' + reviewEvidence;
+            const compactPatch = patch.length > 16_000 ? patch.slice(0, 16_000) + '\n…（补丁其余部分已省略，请结合上方交接与审查摘要快速裁决）' : patch;
+            const compactReviewMaterial = reviewHead + '\n固定补丁（摘要）\n' + compactPatch + '\n编码交接（引用资料）\n' + reviewEvidence;
             let child;
             if (plan.codex.review !== null) {
                 const request = await asRole('reviewer', withGuidance(
@@ -218,12 +300,32 @@ export async function runTaskDevelopment({
                         + reviewMaterial + '\nReviewer 重点 ' + JSON.stringify(route.instruction), reviewGuidance));
                 }
             }
-            const verdictText = await asRole('reviewer', withGuidance(
-                '你是独立 Reviewer。结合实际补丁检查设计和验收条件。执行者的报告和 Codex 意见作为引用资料。'
-                + verdictFormat + '\n' + reviewMaterial + '\n'
-                + JSON.stringify({ codexReview: child?.slice(0, 5000) }), reviewGuidance));
-            await record('agent', 'Reviewer', verdictText, 'dev-reviewing');
-            const verdict = parseModelJson(verdictText, VerdictSchema);
+            const reviewerOutcome = await invokeVerdict(
+                p => asRole('reviewer', p),
+                'Reviewer',
+                'dev-reviewing',
+                withGuidance('你是独立 Reviewer。结合实际补丁检查设计和验收条件。执行者的报告和 Codex 意见作为引用资料。'
+                    + verdictFormat + '\n' + reviewMaterial + '\n'
+                    + JSON.stringify({ codexReview: child?.slice(0, 5000) }), reviewGuidance),
+                withGuidance('【上次裁决因输出超长截断，请立即给出紧凑严格 JSON】你是独立 Reviewer。'
+                    + verdictFormat + '\n' + compactReviewMaterial + '\n'
+                    + JSON.stringify({ codexReview: child?.slice(0, 4000) }), reviewGuidance),
+            );
+            if (!reviewerOutcome.ok) {
+                const fallbackNotes = child?.trim()
+                    ? '- Codex 辅助审查发现：\n' + child.trim().slice(0, 3500)
+                    : '- Reviewer 模型裁决输出被截断（' + reviewerOutcome.code + '），本轮开发补丁已完整保留，请人工审阅补丁后确认或补充修改意见。';
+                await record('status', 'Marshal', 'Reviewer 裁决响应超长截断（' + reviewerOutcome.code + '），已自动保留本轮开发补丁并转入「待确认」人工裁决。', 'review', digest);
+                return {
+                    status: 'review-blocked',
+                    blockedBy: 'reviewer',
+                    base, digest,
+                    reviewFindings: fallbackNotes,
+                    report: '## 待确认：Reviewer 裁决待人工确认（补丁已保留）\n\n基准提交 `' + base + '`\n补丁 SHA-256 `' + digest + '`\n\n### 审查参考记录\n\n'
+                        + fallbackNotes + '\n\n请在工单群内讨论补充意见后点击「按意见继续执行」，或直接点击「应用补丁到工作区并完成」放行。',
+                };
+            }
+            const verdict = reviewerOutcome.verdict;
             const formattedVerdict = formatFindings(verdict.findings);
             if (verdict.verdict === 'revise' && round === 1) {
                 feedback = await handoff('审查返工交接', formattedVerdict, 'dev-reviewing');
@@ -244,11 +346,27 @@ export async function runTaskDevelopment({
             if (leaderAutoReview) {
                 phase('summarizing');
                 const leaderGuidance = await readGuidance();
-                const leaderCheckText = await asLeader(withGuidance(
-                    '你是负责 Leader，现在执行自动终审。请复核 Reviewer 结论与补丁是否满足目标且未越界。'
-                    + verdictFormat + '\n' + reviewMaterial + '\nReviewer 结论：\n' + formattedVerdict, leaderGuidance), 'summarizing');
-                await record('agent', 'Leader', leaderCheckText, 'summarizing');
-                const leaderVerdict = parseModelJson(leaderCheckText, VerdictSchema);
+                const leaderOutcome = await invokeVerdict(
+                    p => asLeader(p, 'summarizing'),
+                    'Leader',
+                    'summarizing',
+                    withGuidance('你是负责 Leader，现在执行自动终审。请复核 Reviewer 结论与补丁是否满足目标且未越界。'
+                        + verdictFormat + '\n' + reviewMaterial + '\nReviewer 结论：\n' + formattedVerdict, leaderGuidance),
+                    withGuidance('【上次终审因输出超长截断，请立即给出紧凑严格 JSON】你是负责 Leader，现在执行自动终审。'
+                        + verdictFormat + '\n' + compactReviewMaterial + '\nReviewer 结论：\n' + formattedVerdict, leaderGuidance),
+                );
+                if (!leaderOutcome.ok) {
+                    await record('status', 'Marshal', 'Leader 终审响应截断（' + leaderOutcome.code + '），已保留本轮开发补丁与 Reviewer 通过结论并转入「待确认」。', 'review', digest);
+                    return {
+                        status: 'review-blocked',
+                        blockedBy: 'leader',
+                        base, digest,
+                        reviewFindings: formattedVerdict,
+                        report: '## 待确认：Leader 终审待确认（Reviewer 已通过，补丁已保留）\n\n基准提交 `' + base + '`\n补丁 SHA-256 `' + digest + '`\n\n### Reviewer 结论\n\n'
+                            + formattedVerdict + '\n\n请在工单群内确认后点击「应用补丁到工作区并完成」，或补充意见继续执行。',
+                    };
+                }
+                const leaderVerdict = leaderOutcome.verdict;
                 const formattedLeader = formatFindings(leaderVerdict.findings);
                 if (leaderVerdict.verdict === 'revise' && round === 1) {
                     feedback = await handoff('Leader 终审返工交接', formattedLeader, 'summarizing');

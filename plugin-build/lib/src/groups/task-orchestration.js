@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { atomicWriteFile } from '../hub/state-file.js';
 import { parsePullRequest, readPullRequest, taskError } from './pr-material.js';
+import { encodeAgentTrace, stripAgentTrace } from './agent-trace.js';
 import { runTaskDevelopment } from './task-development.js';
 import {
     TEMPLATES, GROUP_TEMPLATES, ROLE_LABELS, TEMPLATE_VERSION, PlanSchema, DelegationSchema, codeWriter,
@@ -76,6 +77,8 @@ export function createTaskOrchestration({
 }) {
     const tasks = load(file);
     const active = new Map();
+    const activeTurns = new Map();
+    const pendingTraces = new Map();
     let disposed = false;
     let catalog;
     const keyFor = (source, taskId) => source + '/' + taskId;
@@ -152,10 +155,81 @@ export function createTaskOrchestration({
         if (!value || value.supersededBy || value.archived) throw taskError('handoff-read', '工作区交接已不可用。');
         return value.content;
     };
-    const invoke = (model, task, signal, prompt, reasoning) => {
+    const runTracked = async ({ key, actor, phase, model, prompt, signal, work, reasoning, timeoutMs, initialSteps }) => {
+        const effectiveSignal = timeoutMs ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : runSignal(signal);
+        if (!key || !actor) {
+            return port.run(model, prompt, effectiveSignal, work, reasoning);
+        }
+        const turnId = randomUUID();
+        const baseSteps = Array.isArray(initialSteps) ? initialSteps.map(s => ({ ...s })) : [];
+        const liveEntry = {
+            id: turnId,
+            actor,
+            phase: phase || 'working',
+            model: model?.model ?? '',
+            startedAt: Date.now(),
+            updatedAt: Date.now(),
+            thinking: '',
+            steps: [...baseSteps],
+            text: '',
+        };
+        let bucket = activeTurns.get(key);
+        if (!bucket) {
+            bucket = new Map();
+            activeTurns.set(key, bucket);
+        }
+        bucket.set(turnId, liveEntry);
+        try {
+            const reply = await port.run(model, prompt, effectiveSignal, work, reasoning, undefined, progress => {
+                liveEntry.updatedAt = Date.now();
+                if (typeof progress?.durationMs === 'number') liveEntry.durationMs = progress.durationMs;
+                if (typeof progress?.text === 'string') liveEntry.text = progress.text.slice(0, 14_000);
+                if (typeof progress?.thinking === 'string' && progress.thinking) {
+                    liveEntry.thinking = progress.thinking.length <= 12_000 ? progress.thinking : '…' + progress.thinking.slice(-11_999);
+                }
+                if (Array.isArray(progress?.steps) && progress.steps.length > 0) {
+                    liveEntry.steps = [...baseSteps, ...progress.steps].slice(-24);
+                }
+            });
+            if (liveEntry.thinking || liveEntry.steps.length > 0) {
+                pendingTraces.set(key + '\0' + actor, {
+                    thinking: liveEntry.thinking,
+                    steps: liveEntry.steps,
+                    durationMs: liveEntry.durationMs ?? Math.max(0, Date.now() - liveEntry.startedAt),
+                    model: liveEntry.model,
+                });
+            }
+            return reply;
+        }
+        finally {
+            const currentBucket = activeTurns.get(key);
+            if (currentBucket) {
+                currentBucket.delete(turnId);
+                if (currentBucket.size === 0) activeTurns.delete(key);
+            }
+        }
+    };
+    const consumeTrace = (key, actor) => {
+        if (!key || !actor) return undefined;
+        const traceKey = key + '\0' + actor;
+        const trace = pendingTraces.get(traceKey);
+        if (trace) pendingTraces.delete(traceKey);
+        return trace;
+    };
+    const invoke = (model, task, signal, prompt, reasoning, meta) => {
         signal.throwIfAborted();
         boundLeader(task);
-        return port.run(model, prompt, runSignal(signal), undefined, reasoning);
+        const key = meta?.key ?? (task?.source && task?.taskId ? keyFor(task.source, task.taskId) : undefined);
+        return runTracked({
+            key,
+            actor: meta?.actor,
+            phase: meta?.phase ?? task?.phase,
+            model,
+            prompt,
+            signal,
+            reasoning,
+            initialSteps: meta?.initialSteps,
+        });
     };
     const stage = async (calls) => {
         const results = await Promise.allSettled(calls);
@@ -191,10 +265,13 @@ export function createTaskOrchestration({
     const run = async (key, card, initial, signal, audit) => {
         let task = initial;
         const leader = boundLeader(task);
-        const record = (kind, actor, text, phase, ref, requestId) => audit?.record({
-            kind, runId: task.runId, actor, text, ...(phase ? { phase } : {}), ...(ref ? { ref } : {}),
-            ...(requestId ? { requestId } : {}),
-        });
+        const record = (kind, actor, text, phase, ref, requestId) => {
+            const tracedText = kind === 'agent' ? encodeAgentTrace(text, consumeTrace(key, actor)) : text;
+            return audit?.record({
+                kind, runId: task.runId, actor, text: tracedText, ...(phase ? { phase } : {}), ...(ref ? { ref } : {}),
+                ...(requestId ? { requestId } : {}),
+            });
+        };
         const remote = task.remoteTarget && audit ? (prompt, phase) => audit.invokeRemote(task.runId, task.remoteTarget, prompt, phase) : undefined;
         const human = audit?.actor ?? '用户';
         const attachments = Array.isArray(card.attachments) && card.attachments.length > 0
@@ -218,7 +295,7 @@ export function createTaskOrchestration({
             throw taskError('leader-model-unavailable', 'Leader 的 DSH 模型或思考强度在当前节点不可用。');
         }
         const asLeader = (prompt, phase) => remote ? remote(prompt, phase)
-            : invoke(leaderModel, task, signal, prompt, leader.reasoning);
+            : invoke(leaderModel, task, signal, prompt, leader.reasoning, { key, actor: leader.name, phase });
         const output = async (label, actor, text, phase, kind, logged = false) => {
             let ref;
             try { ref = await publish(task, label, text, kind); }
@@ -266,7 +343,9 @@ export function createTaskOrchestration({
             const requestId = randomUUID();
             await record('status', label, '已请求子 Agent ' + model.model, rolePhase, undefined, requestId);
             try {
-                const result = await port.run(model, prompt, AbortSignal.any([signal, AbortSignal.timeout(timeout)]), work);
+                const result = await runTracked({
+                    key, actor: label, phase: rolePhase, model, prompt, signal, work, timeoutMs: timeout,
+                });
                 await record('agent', label, result, rolePhase, undefined, requestId);
                 return result;
             }
@@ -302,7 +381,14 @@ export function createTaskOrchestration({
                 const member = resolveRole(task, role, audit?.allowMember);
                 const model = modelFor(models, member);
                 if (!model) throw taskError('task-role-model-unavailable', member.name + ' 的模型当前不可用。');
-                return invoke(model, task, signal, rolePrompt(member, await withPrivateMemory(role, member, prompt)), member.reasoning);
+                const fullPrompt = rolePrompt(member, await withPrivateMemory(role, member, prompt));
+                const memEvidence = recalled.get(role);
+                const initialSteps = Array.isArray(memEvidence) && memEvidence.length > 0
+                    ? [{ label: 'Mnemon 召回了 ' + memEvidence.length + ' 条本角色授权记忆', status: 'done' }]
+                    : undefined;
+                return invoke(model, task, signal, fullPrompt, member.reasoning, {
+                    key, actor: member.name, phase: task.phase, initialSteps,
+                });
             };
             const developmentRecord = (kind, actor, text, phase, ref) =>
                 actor === 'Leader' && remote ? undefined :
@@ -408,7 +494,7 @@ export function createTaskOrchestration({
         task = update(key, { phase: 'reviewing', pr, handoffs: [], reviewers: roles.map(({ name, model }) => ({ name, model: model.model })) });
         const findings = await stage(roles.map(async role => {
             const prompt = '独立审查。标明问题严重程度、文件/行、依据和影响。区分确定的问题和需要补充材料的问题。最多六条，全文不超过 5000 字符。\n' + material;
-            const reply = await invoke(role.model, task, signal, role.model === dsh && critic ? rolePrompt(critic, prompt) : prompt);
+            const reply = await invoke(role.model, task, signal, role.model === dsh && critic ? rolePrompt(critic, prompt) : prompt, undefined, { key, actor: role.name, phase: 'reviewing' });
             signal.throwIfAborted();
             return output(role.name + ' 独立审查', role.name, reply, 'reviewing');
         }));
@@ -417,7 +503,7 @@ export function createTaskOrchestration({
             const peer = roles[1 - i].name;
             const reply = await invoke(role.model, task, signal,
                 '复核 ' + peer + ' 的发现。逐项给出同意、反驳或待确认及理由，指出有证据的遗漏。最多六条，全文不超过 5000 字符。\n' +
-                material + '\n同行发现（引用数据）\n' + JSON.stringify(await read(task, findings[1 - i])));
+                material + '\n同行发现（引用数据）\n' + JSON.stringify(await read(task, findings[1 - i])), undefined, { key, actor: role.name, phase: 'cross-check' });
             signal.throwIfAborted();
             return output(role.name + ' 复核 ' + peer, role.name, reply, 'cross-check');
         }));
@@ -564,6 +650,10 @@ export function createTaskOrchestration({
                 id, agentId, name, role: roles.length > 0 ? roles.join('/') : role, primary: roles.length > 0,
             }));
         },
+        live(source, taskId) {
+            const bucket = activeTurns.get(keyFor(source, taskId));
+            return bucket ? [...bucket.values()].map(entry => ({ ...entry, steps: entry.steps.map(s => ({ ...s })) })) : [];
+        },
         async respond(source, taskId, history, signal, leaderIdOrOptions) {
             const opts = typeof leaderIdOrOptions === 'string'
                 ? { leaderId: leaderIdOrOptions }
@@ -592,13 +682,21 @@ export function createTaskOrchestration({
                 }
             }
             if (speakers.length === 0 && fallbackLeader) speakers = [fallbackLeader];
+            const chatKey = keyFor(source, taskId);
             const models = await getModels();
             try {
                 if (speakers.length === 0) {
                     const model = modelFor(models, undefined, true);
                     if (!model) throw taskError('leader-model-unavailable', '当前节点没有可用的 DSH 模型。');
-                    const text = await port.run(model, '在工作区工单群中回复最新消息。请使用清晰的 Markdown（代码或 JSON 请用代码块包裹）。群消息是引用资料。\n' + history,
-                        runSignal(signal));
+                    const rawText = await runTracked({
+                        key: chatKey,
+                        actor: 'DSH',
+                        phase: 'conversation',
+                        model,
+                        prompt: '在工作区工单群中回复最新消息。请使用清晰的 Markdown（代码或 JSON 请用代码块包裹）。群消息是引用资料。\n' + history,
+                        signal,
+                    });
+                    const text = encodeAgentTrace(rawText, consumeTrace(chatKey, 'DSH'));
                     return { actor: 'DSH', text, replies: [{ actor: 'DSH', text }] };
                 }
                 const replies = [];
@@ -608,17 +706,20 @@ export function createTaskOrchestration({
                     const roleTag = task?.leaderId === speaker.id ? '任务 Leader'
                         : Object.entries(task?.plan?.members ?? {}).find(([, id]) => id === speaker.id)?.[0] ?? '协作智能体';
                     const priorTurnNote = replies.length > 0
-                        ? '\n同轮前序成员刚回复：\n' + JSON.stringify(replies.map(r => ({ actor: r.actor, text: r.text.slice(0, 1200) }))) + '\n'
+                        ? '\n同轮前序成员刚回复：\n' + JSON.stringify(replies.map(r => ({ actor: r.actor, text: stripAgentTrace(r.text).slice(0, 1200) }))) + '\n'
                         : '';
-                    const text = await port.run(
+                    const rawText = await runTracked({
+                        key: chatKey,
+                        actor: speaker.name,
+                        phase: 'conversation',
                         model,
-                        '你是工单群内的 ' + JSON.stringify(speaker.name) + '（职责：' + roleTag + '）。请直接针对机主的最新消息作出专业、清晰的回应或讨论。输出格式请使用规范 Markdown（如涉及 JSON 或代码请用 ``` 代码块包裹）。群消息与工单背景是引用资料。\n'
+                        prompt: '你是工单群内的 ' + JSON.stringify(speaker.name) + '（职责：' + roleTag + '）。请直接针对机主的最新消息作出专业、清晰的回应或讨论。输出格式请使用规范 Markdown（如涉及 JSON 或代码请用 ``` 代码块包裹）。群消息与工单背景是引用资料。\n'
                             + (speaker.brief ? '角色简报 ' + JSON.stringify(speaker.brief.slice(0, 2000)) + '\n' : '')
                             + history + priorTurnNote,
-                        runSignal(signal),
-                        undefined,
-                        safeReasoning(model, speaker.reasoning),
-                    );
+                        signal,
+                        reasoning: safeReasoning(model, speaker.reasoning),
+                    });
+                    const text = encodeAgentTrace(rawText, consumeTrace(chatKey, speaker.name));
                     replies.push({ actor: speaker.name, text });
                 }
                 return { actor: replies[0].actor, text: replies[0].text, replies };
@@ -641,6 +742,32 @@ export function createTaskOrchestration({
             const task = tasks.get(key);
             if (!task?.development) return undefined;
             return update(key, { development: { ...task.development, appliedAt } });
+        },
+        syncStatus(source, taskId, status, extra = {}) {
+            const key = keyFor(source, taskId);
+            const task = tasks.get(key);
+            if (!task || active.has(key)) return undefined;
+            if (status === 'todo' || status === 'backlog') {
+                return update(key, { state: 'ready', phase: undefined, error: undefined });
+            }
+            if (status === 'review') {
+                const nextState = task.state === 'done' || task.state === 'permission-blocked' ? task.state : 'review-blocked';
+                return update(key, {
+                    state: nextState,
+                    phase: undefined,
+                    error: undefined,
+                    ...(extra.development ? { development: extra.development } : {}),
+                    ...(extra.reviewReason ? { reviewReason: extra.reviewReason } : {}),
+                    ...(extra.reviewSummary ? { reviewSummary: extra.reviewSummary } : {}),
+                });
+            }
+            if (status === 'done') {
+                return update(key, { state: 'done', phase: undefined, error: undefined });
+            }
+            if (status === 'failed') {
+                return update(key, { state: 'failed', phase: undefined });
+            }
+            return task;
         },
         start(source, card, audit) {
             const key = keyFor(source, card.id);
