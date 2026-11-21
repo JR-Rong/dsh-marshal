@@ -1233,7 +1233,7 @@ window.__ModuleLoader__.load({
       ];
 
       if (setup) return h(Setup, { initial: setup, onReady: () => retry(value => value + 1) });
-      return h('section', { 'aria-label': '调度官', style: { height: '100%', minHeight: 0, width: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden' } },
+      return h('section', { 'aria-label': '调度官', style: { flex: 1, height: '100%', minHeight: 0, width: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden', background: 'var(--dsw-alias-bg-base, transparent)', color: 'var(--dsw-alias-label-primary, inherit)' } },
         h('header', { style: { padding: '10px 18px', minHeight: 52, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, borderBottom: '1px solid #8883', flexShrink: 0 } },
           h('div', { style: { display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 } },
             h(MarshalIcon),
@@ -1264,15 +1264,18 @@ window.__ModuleLoader__.load({
               h('span', { style: { fontSize: 13, fontWeight: chatSection === key ? 600 : 500 } }, label),
               h('span', { style: { fontSize: 10, opacity: .6 } }, hint)))),
           h('div', { style: { flex: 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' } },
-            chatSection === 'groups' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' } },
-              h('div', { style: { padding: '8px 16px', borderBottom: '1px solid ' + dswTheme.border, display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 } },
-                h('button', { type: 'button', style: tabStyle(groupSub === 'local'), onClick: () => setGroupSub('local') }, '本机常驻群'),
-                h('button', { type: 'button', style: tabStyle(groupSub === 'cross'), onClick: () => setGroupSub('cross') }, '跨设备群聊')),
-              groupSub === 'local'
-                ? h(GroupsPage, { openSession, onOpenAgents: () => chooseTab('agents') })
-                : h(CrossGroupsPage)),
-            chatSection === 'taskRooms' && h(TaskRoomsPage, { key: roomTask?.id ?? 'archive', task: roomTask, openBoard }),
-            chatSection === 'direct' && h(AgentDirectChatsView, { openSession, onOpenAgents: () => chooseTab('agents') }),
+            chatSection === 'groups' && h(MarshalErrorBoundary, { resetKey: 'groups-' + groupSub },
+              h('div', { style: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' } },
+                h('div', { style: { padding: '8px 16px', borderBottom: '1px solid ' + dswTheme.border, display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 } },
+                  h('button', { type: 'button', style: tabStyle(groupSub === 'local'), onClick: () => setGroupSub('local') }, '本机常驻群'),
+                  h('button', { type: 'button', style: tabStyle(groupSub === 'cross'), onClick: () => setGroupSub('cross') }, '跨设备群聊')),
+                groupSub === 'local'
+                  ? h(GroupsPage, { openSession, onOpenAgents: () => chooseTab('agents') })
+                  : h(CrossGroupsPage))),
+            chatSection === 'taskRooms' && h(MarshalErrorBoundary, { resetKey: 'taskRooms-' + (roomTask?.id ?? 'archive') },
+              h(TaskRoomsPage, { key: roomTask?.id ?? 'archive', task: roomTask, openBoard })),
+            chatSection === 'direct' && h(MarshalErrorBoundary, { resetKey: 'direct' },
+              h(AgentDirectChatsView, { openSession, onOpenAgents: () => chooseTab('agents') })),
             chatSection === 'remote' && h('div', { style: { display: 'flex', flex: 1, minHeight: 0 } },
               address && h('iframe', { ref: iframe, onLoad: connect, title: '调度官设备与群聊', src: address,
                 sandbox: 'allow-scripts allow-same-origin allow-forms', allow: 'clipboard-write', referrerPolicy: 'no-referrer',
@@ -2139,8 +2142,9 @@ window.__ModuleLoader__.load({
     }
 
     function ensureTaskRoomStyles() {
-      if (typeof document === 'undefined' || document.getElementById('marshal-taskroom-styles')) return;
-      const style = document.createElement('style');
+      if (typeof document === 'undefined') return;
+      const existing = document.getElementById('marshal-taskroom-styles');
+      const style = existing || document.createElement('style');
       style.id = 'marshal-taskroom-styles';
       style.textContent = [
         '.mtr-shell{display:flex;flex:1;min-height:0;width:100%;background:var(--dsw-alias-bg-base,transparent);color:var(--dsw-alias-label-primary,inherit)}',
@@ -2199,7 +2203,7 @@ window.__ModuleLoader__.load({
         '.mtr-mention-chip{border:1px solid color-mix(in srgb,var(--mtr-chip-c,currentColor) 32%,transparent);background:color-mix(in srgb,var(--mtr-chip-c,currentColor) 10%,transparent);color:inherit;border-radius:999px;padding:2px 9px;font-size:11px;cursor:pointer;font-family:inherit;display:inline-flex;align-items:center;gap:4px}',
         '.mtr-mention-chip:hover{background:color-mix(in srgb,var(--mtr-chip-c,currentColor) 18%,transparent)}',
       ].join('\n');
-      document.head.appendChild(style);
+      if (!existing) document.head.appendChild(style);
     }
 
     function tryParseJsonPayload(str) {
@@ -2533,8 +2537,9 @@ window.__ModuleLoader__.load({
     }
 
     function ensureTaskBoardStyles() {
-      if (typeof document === 'undefined' || document.getElementById('marshal-taskboard-styles')) return;
-      const style = document.createElement('style');
+      if (typeof document === 'undefined') return;
+      const existing = document.getElementById('marshal-taskboard-styles');
+      const style = existing || document.createElement('style');
       style.id = 'marshal-taskboard-styles';
       style.textContent = [
         '@keyframes mtb-pulse{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--mtb-accent) 55%,transparent)}70%{box-shadow:0 0 0 6px transparent}100%{box-shadow:0 0 0 0 transparent}}',
@@ -2665,7 +2670,7 @@ window.__ModuleLoader__.load({
         '.mtb-review-panel{display:grid;gap:9px;padding:12px 14px;border-radius:12px;border:1px solid color-mix(in srgb,#8b5cf6 42%,transparent);background:color-mix(in srgb,#8b5cf6 9%,var(--dsw-alias-bg-layer-2,transparent))}',
         '.mtb-archive-grid{flex:1;min-height:0;overflow:auto;padding:16px 20px;display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:10px;align-content:start}',
       ].join('\n');
-      document.head.appendChild(style);
+      if (!existing) document.head.appendChild(style);
     }
 
     function formatTaskTime(ts) {
@@ -4549,7 +4554,7 @@ window.__ModuleLoader__.load({
       const loadList = () => workspace ? fetchJson(prefix + 'list' + query({ workspaceId: workspace }), undefined, true) : Promise.resolve({ rooms: [] });
 
       React.useEffect(() => {
-        ensureBoardStyles();
+        ensureTaskBoardStyles();
         ensureTaskRoomStyles();
         let alive = true;
         void fetchJson(prefix + 'workspaces', undefined, true).then(data => {
@@ -5512,26 +5517,51 @@ window.__ModuleLoader__.load({
                     h('button', { type: 'button', disabled: saving, style: uiButton(true), onClick: () => { void saveRoster(); } }, saving ? '保存中…' : '保存工作区班底'),
                     rosterNotice && h('span', { style: { fontSize: 12, color: '#10b981' } }, rosterNotice))))));
     }
+    function SafeMarshalPanel(props) {
+      return h(MarshalErrorBoundary, { resetKey: 'marshal-panel-root' }, h(MarshalPanel, props));
+    }
+
     return {
       inject: ['slots', 'sessions', 'uiSession', 'uiConversation'],
       apply(ctx) {
+        const disposers = [];
+        const track = handle => {
+          if (typeof handle === 'function') disposers.push(handle);
+          else if (handle && typeof handle.dispose === 'function') disposers.push(() => handle.dispose());
+        };
         try {
-          if (!document.getElementById('marshal-consolidated-rows')) {
-            const style = document.createElement('style');
-            style.id = 'marshal-consolidated-rows';
-            style.textContent = 'button:has([data-dsh-panel-entry="agents"]),[role="button"]:has([data-dsh-panel-entry="agents"]),li:has([data-dsh-panel-entry="agents"]),button:has([data-dsh-panel-entry="task-board"]),[role="button"]:has([data-dsh-panel-entry="task-board"]),li:has([data-dsh-panel-entry="task-board"]){display:none!important}[data-dsh-taskboard-view]{padding-top:44px!important;box-sizing:border-box!important;position:relative}';
-            document.head.appendChild(style);
-          }
+          const existingStyle = document.getElementById('marshal-consolidated-rows');
+          const style = existingStyle || document.createElement('style');
+          style.id = 'marshal-consolidated-rows';
+          style.textContent = 'button:has([data-dsh-panel-entry="agents"]),[role="button"]:has([data-dsh-panel-entry="agents"]),li:has([data-dsh-panel-entry="agents"]),button:has([data-dsh-panel-entry="task-board"]),[role="button"]:has([data-dsh-panel-entry="task-board"]),li:has([data-dsh-panel-entry="task-board"]){display:none!important}[data-dsh-taskboard-view]{padding-top:44px!important;box-sizing:border-box!important;position:relative}';
+          if (!existingStyle) document.head.appendChild(style);
         } catch (error) { /* a DOM-less host keeps its own panel list */ }
         installSidebarWorkspaceSwitch();
         const openSessionRef = { current: undefined };
-        ctx.inject(['uiWorkspace'], inner => {
-          const workspace = inner.get('uiWorkspace');
-          openSessionRef.current = sessionId => { if (workspace && typeof workspace.openSession === 'function') workspace.openSession(sessionId); };
-        });
+        const layoutRef = { current: undefined };
+        const workspacesRef = { current: undefined };
+        try {
+          track(ctx.inject(['uiWorkspace'], inner => {
+            const workspace = inner.get('uiWorkspace');
+            openSessionRef.current = sessionId => { if (workspace && typeof workspace.openSession === 'function') workspace.openSession(sessionId); };
+            return () => { openSessionRef.current = undefined; };
+          }));
+        } catch {}
+        try {
+          track(ctx.inject(['layout'], inner => {
+            layoutRef.current = inner.get('layout');
+            return () => { layoutRef.current = undefined; };
+          }));
+        } catch {}
+        try {
+          track(ctx.inject(['workspaces'], inner => {
+            workspacesRef.current = inner.get('workspaces');
+            return () => { workspacesRef.current = undefined; };
+          }));
+        } catch {}
         const openPanel = id => {
           try {
-            const layout = ctx.get && ctx.get('layout');
+            const layout = layoutRef.current ?? (ctx.get && ctx.get('layout'));
             if (layout && typeof layout.selectPanel === 'function') { layout.selectPanel(id); return true; }
           } catch (error) { /* layout unavailable */ }
           return false;
@@ -5539,18 +5569,20 @@ window.__ModuleLoader__.load({
         const goTab = tab => {
           pendingTab = tab;
           openPanel(PANEL);
+          try { window.dispatchEvent(new CustomEvent('marshal:tab', { detail: tab })); } catch (error) { /* host without window */ }
           setTimeout(() => {
             try { window.dispatchEvent(new CustomEvent('marshal:tab', { detail: tab })); } catch (error) { /* host without window */ }
           }, 60);
         };
         try {
-          ctx.slots.inject('conversation.session.header.actions', () => ctx.slots.register({
+          track(ctx.slots.inject('conversation.session.header.actions', () => ctx.slots.register({
             name: 'conversation.session.header.actions',
             id: 'marshal-quick-nav',
             order: 40,
-          }, () => h(MarshalNav, { active: 'chats', onTab: goTab, compact: true })));
+          }, () => h(MarshalNav, { active: 'chats', onTab: goTab, compact: true }))));
         } catch (error) { /* older host without the conversation header action slot */ }
         const ensureTaskboardHeader = () => {
+          if (typeof document === 'undefined') return;
           const root = document.querySelector('[data-dsh-taskboard-view]');
           if (root === null || root.querySelector('#marshal-taskboard-head') !== null) return;
           const bar = document.createElement('div');
@@ -5580,13 +5612,29 @@ window.__ModuleLoader__.load({
           root.prepend(bar);
         };
         ensureTaskboardHeader();
-        setInterval(ensureTaskboardHeader, 1000);
-        ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({ name: 'sidebar.panellist', id: PANEL, order: 25, label: () => '调度官' }, MarshalIcon));
-        ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: PANEL,
+        const headerTimer = setInterval(ensureTaskboardHeader, 1000);
+        disposers.push(() => clearInterval(headerTimer));
+        track(ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({ name: 'sidebar.panellist', id: PANEL, order: 25, label: () => '调度官' }, MarshalIcon)));
+        track(ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: PANEL,
           children: { 'marshal.native.body': { kind: 'single', scope: 'session' } },
-          inject: () => ({ marshalContext: ctx, openSession: sessionId => openSessionRef.current?.(sessionId), openPanel, workspaceService: () => ctx.get('workspaces') }),
-        }, MarshalPanel));
-        ctx.slots.inject('marshal.native.body', () => ctx.slots.register({ name: 'marshal.native.body' }, NativeBody));
+          inject: () => ({
+            marshalContext: ctx,
+            openSession: sessionId => openSessionRef.current?.(sessionId),
+            openPanel,
+            workspaceService: () => {
+              if (workspacesRef.current) return workspacesRef.current;
+              try { return ctx.get?.('workspaces'); } catch { return undefined; }
+            },
+          }),
+        }, SafeMarshalPanel)));
+        track(ctx.slots.inject('marshal.native.body', () => ctx.slots.register({ name: 'marshal.native.body' }, NativeBody)));
+        if (typeof ctx.effect === 'function') {
+          ctx.effect(() => () => {
+            for (const dispose of disposers.splice(0).reverse()) {
+              try { dispose(); } catch {}
+            }
+          }, 'marshal: client lifecycle');
+        }
       },
     };
   },

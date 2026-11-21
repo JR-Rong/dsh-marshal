@@ -76,6 +76,13 @@ test('client/index.js snapshots FileList before clearing input.value and uses oc
 
     const safeMatches = source.match(/Array\.from\(\w+\.target\.files\s*\|\|\s*\[\]\);\s*\n\s*\w+\.target\.value\s*=\s*''/g) ?? [];
     assert.ok(safeMatches.length >= 3, 'create form, detail drawer, and task room file inputs snapshot files before clearing value');
+
+    // Guard against black-screen regressions: no ensureBoardStyles typo, root & taskRoom ErrorBoundaries, and proper layout inject
+    assert.equal(source.includes('ensureBoardStyles('), false, 'must call ensureTaskBoardStyles(), never undefined ensureBoardStyles()');
+    assert.ok(source.includes("resetKey: 'taskRooms-'"), 'TaskRoomsPage must be wrapped in MarshalErrorBoundary');
+    assert.ok(source.includes('SafeMarshalPanel'), 'MarshalPanel must be wrapped in SafeMarshalPanel root ErrorBoundary');
+    assert.ok(source.includes("ctx.inject(['layout']"), 'must inject layout service via Cordis ctx.inject');
+    assert.ok(source.includes("'marshal: client lifecycle'"), 'must dispose slots and intervals on client-hmr reload');
 });
 
 test('host taskBoard routes non-empty attachments through verified /api/task-board/action while null clears directly', async (t) => {
