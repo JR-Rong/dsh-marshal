@@ -1,4 +1,4 @@
-    function AgentDirectChatsView({ openSession, onOpenAgents, initialAgentId = '' }) {
+    function AgentDirectChatsView({ openSession, mvOpenDirect, onOpenAgents, initialAgentId = '' }) {
       const [library, setLibrary] = React.useState(null);
       const [sessions, setSessions] = React.useState([]);
       const [selectedAgentId, setSelectedAgentId] = React.useState(initialAgentId || 'all');
@@ -100,6 +100,7 @@
           h('div', { style: { padding: '12px 16px', borderBottom: '1px solid ' + dswTheme.border, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
             h('div', { style: { fontSize: 14, fontWeight: 600 } }, selectedAgent ? selectedAgent.name + ' · 闲聊历史' : '全部智能体单聊历史'),
             h('input', { value: search, onChange: event => setSearch(event.target.value), placeholder: '搜索历史会话标题或智能体…', style: { ...uiInput, width: 220, marginLeft: 'auto' } }),
+            selectedAgent && mvOpenDirect && h(mvDirectLink, { key: selectedAgent.id, agent: selectedAgent, open: mvOpenDirect }),
             selectedAgent && h('button', { type: 'button', disabled: busy, style: uiButton(true), onClick: () => { void startNewChat(selectedAgent); } }, busy ? '创建中…' : '＋ 新建闲聊'),
             h('button', { type: 'button', style: uiButton(false), onClick: () => { void load(); } }, '刷新')),
           error && h('div', { style: { padding: '8px 16px', color: dswTheme.danger, fontSize: 12 } }, error),

@@ -227,6 +227,12 @@
     function MarshalSidebarSections({ sidebar, openRoom, onOpenAgentDirect }) {
       const { rooms, groups, agents, loading, incomplete } = useMvSnapshot(sidebar);
       const [folded, setFolded] = React.useState(readMvFold);
+      const [directError, setDirectError] = React.useState('');
+      const openDirect = async agent => {
+        setDirectError('');
+        const message = await onOpenAgentDirect?.(agent);
+        if (message) setDirectError(message);
+      };
       const toggle = key => {
         const next = { ...folded, [key]: !folded[key] };
         setFolded(next);
@@ -235,7 +241,7 @@
       const sections = [
         ['taskRooms', '工单群', 'room', rooms, room => openRoom('taskRooms', room)],
         ['groups', '群聊', 'chat', groups, group => openRoom(group.kind, group)],
-        ['agents', '智能体', 'agent', agents, agent => onOpenAgentDirect?.(agent)],
+        ['agents', '智能体', 'agent', agents, openDirect],
       ];
       return h('nav', { className: 'mv-scope mv-sections', 'aria-label': '调度官会话快捷入口' },
         ...sections.map(([key, label, icon, rows, open]) => h('section', { key },
@@ -248,7 +254,8 @@
                 h('button', { type: 'button', className: 'mv-row', onClick: () => open(row), title: row.title ?? row.name },
                   h(MvIcon, { name: icon }), h('span', { className: 'mv-copy mv-truncate' }, row.title || row.name || '未命名'),
                   row.incident && h('span', { role: 'img', 'aria-label': '有待处理异常' }, h(MvIcon, { name: 'dot', className: 'mv-danger', size: 12 })))))))),
-        incomplete && h('span', { className: 'mv-muted', role: 'status' }, '部分列表暂不可用'));
+        incomplete && h('span', { className: 'mv-muted', role: 'status' }, '部分列表暂不可用'),
+        directError && h('span', { className: 'mv-danger', role: 'status' }, directError));
     }
 
     function mountSidebarSectionsPortal() {

@@ -1,4 +1,4 @@
-    function MarshalPanel({ marshalContext, openSession, openPanel, workspaceService, SessionProvider, renderSlot }) {
+    function MarshalPanel({ marshalContext, openSession, openPanel, mvOpenDirect, workspaceService, SessionProvider, renderSlot }) {
       const [attempt, retry] = React.useState(0);
       const initialNav = React.useMemo(() => {
         if (pendingTab) {
@@ -313,7 +313,7 @@
             chatSection === 'taskRooms' && h(MarshalErrorBoundary, { resetKey: 'taskRooms-' + (roomTask?.id ?? 'archive') },
               h(TaskRoomsPage, { key: roomTask?.id ?? 'archive', task: roomTask, openBoard })),
             chatSection === 'direct' && h(MarshalErrorBoundary, { resetKey: 'direct' },
-              h(AgentDirectChatsView, { openSession, onOpenAgents: () => chooseTab('agents') })),
+              h(AgentDirectChatsView, { openSession, mvOpenDirect, onOpenAgents: () => chooseTab('agents') })),
             chatSection === 'remote' && h('div', { style: { display: 'flex', flex: 1, minHeight: 0 } },
               address && h('iframe', { ref: iframe, onLoad: connect, title: '调度官设备与群聊', src: address,
                 sandbox: 'allow-scripts allow-same-origin allow-forms', allow: 'clipboard-write', referrerPolicy: 'no-referrer',
@@ -345,10 +345,10 @@
               !address && h('p', { role: 'status', style: { margin: 'auto', padding: 24 } }, notice)))),
         tab === 'agents' && h('div', { style: { flex: 1, minHeight: 0, minWidth: 0, width: '100%', overflow: 'hidden', display: 'flex' } },
           h(MarshalErrorBoundary, { resetKey: 'agents' },
-            h(AgentsPage, { onOpenChats: () => chooseTab('chats'), onOpenMemory: openAgentMemory, openSession, workspaceService, initialSubTab: agentSub }))),
+            h(AgentsPage, { onOpenChats: () => chooseTab('chats'), onOpenMemory: openAgentMemory, openSession, mvOpenDirect, workspaceService, initialSubTab: agentSub }))),
         tab === 'memory' && h('div', { style: { flex: 1, minHeight: 0, minWidth: 0, width: '100%', overflow: 'hidden', display: 'flex' } },
           h(MarshalErrorBoundary, { resetKey: 'memory' },
-            h(MemoryPage, { initialAgentId: memoryTarget.agentId, initialLayer: memoryTarget.layer }))),
+            h(MemoryPage, { initialAgentId: memoryTarget.agentId, initialLayer: memoryTarget.layer, mvOpenDirect }))),
         h(DeviceStatusDrawer, {
           open: deviceDrawerOpen,
           onClose: () => setDeviceDrawerOpen(false),

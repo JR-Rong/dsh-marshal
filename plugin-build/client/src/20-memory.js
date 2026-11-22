@@ -168,7 +168,7 @@
       return h('canvas', { ref: canvasRef, style: { width: '100%', height: '100%', display: 'block', borderRadius: 14, background: '#05070d', cursor: 'grab', touchAction: 'none' } });
     }
 
-    function MemoryPage({ initialAgentId = '', initialLayer = '' } = {}) {
+    function MemoryPage({ initialAgentId = '', initialLayer = '', mvOpenDirect } = {}) {
       const [layer, setLayer] = React.useState(() => (initialLayer === 'agent' || initialLayer === 'workspace' || initialLayer === 'global') ? initialLayer : (initialAgentId ? 'agent' : 'global'));
       const [library, setLibrary] = React.useState(null);
       const [extraWorkspaces, setExtraWorkspaces] = React.useState([]);
@@ -229,6 +229,7 @@
       }, [layer, workspaceId, realWorkspaces]);
 
       const activeAgentId = layer === 'agent' ? agentId : '';
+      const mvDirectAgent = agents.find(row => row.id === activeAgentId);
       const activeWorkspaceId = layer === 'workspace' ? workspaceId : '';
       const view = JSON.stringify([layer, activeAgentId, activeWorkspaceId]);
       const currentView = React.useRef(view);
@@ -409,6 +410,7 @@
           layer !== 'global' && privateBackend === 'mnemon' && h('span', { style: { color: '#10b981', fontSize: 11, padding: '2px 8px', borderRadius: 999, border: '1px solid color-mix(in srgb, #10b981 35%, transparent)', background: 'color-mix(in srgb, #10b981 12%, transparent)' } }, 'Mnemon · 意图图谱 + 推索引引擎'),
           h('input', { value: query, onChange: event => setQuery(event.target.value), onKeyDown: event => { if (event.key === 'Enter') void search(); }, placeholder: '搜索当前层级记忆…', style: { ...uiInput, width: 190 } }),
           h('button', { type: 'button', style: uiButton(false), onClick: () => { void search(); } }, '搜索'),
+          mvOpenDirect && mvDirectAgent && h(mvDirectLink, { key: activeAgentId, agent: mvDirectAgent, open: mvOpenDirect }),
           h('button', { type: 'button', style: uiButton(false), onClick: () => { setScope(layer); setFormOpen(value => !value); } }, '＋ 记忆'),
           h('button', { type: 'button', style: uiButton(false), onClick: () => setSettingsOpen(value => !value) }, '设置'),
           h('span', { style: { marginLeft: 'auto', fontSize: 11, color: dswTheme.dim } }, graph.nodes.length + ' 个节点 · ' + graph.edges.length + ' 条关联' + (health?.health?.length ? ' · 模糊 ' + health.health.reduce((sum, item) => sum + (item.fuzzy || 0), 0) + ' · 档案 ' + health.health.reduce((sum, item) => sum + (item.archived || 0), 0) : '')),

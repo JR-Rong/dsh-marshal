@@ -363,6 +363,18 @@ window.__ModuleLoader__.load({
 .mv-room-fill{display:flex;flex:1;min-height:0;min-width:0}.mv-room-log{flex:1;overflow:auto;min-height:0}
 .mv-routed{flex:1;grid-template-rows:auto minmax(0,1fr);min-height:0}.mv-routed>header{padding:var(--mv-sm) var(--mv-md)}
 .mv-room-message{padding:var(--mv-sm);margin-block-end:var(--mv-sm);background:var(--dsw-alias-marshal-layer);border-radius:var(--mv-radius);white-space:pre-wrap;overflow-wrap:anywhere}
+.mv-task-pane{height:100%;box-sizing:border-box;padding:var(--mv-md);grid-template-rows:auto auto minmax(0,1fr) auto;overflow:auto;overflow-wrap:anywhere}
+.mv-task-scroll{overflow:auto;align-content:start;min-height:calc(2 * var(--mv-control));overscroll-behavior:contain}
+.mv-task-item{padding:var(--mv-sm);border:1px solid var(--dsw-alias-marshal-border);border-radius:var(--mv-radius)}
+.mv-task-item[data-focused="true"],.mv-casual-card[aria-pressed="true"],.mv-chip[aria-pressed="true"],.mv-guidance-action{background:var(--dsw-alias-marshal-tint);border-color:var(--dsw-alias-marshal-accent)}
+.mv-casual-card{font-weight:var(--mv-weight)}
+.mv-chip{border-radius:var(--mv-pill)}
+.mv-compact-field{width:auto;max-width:100%}
+.mv-composer-dock{gap:var(--mv-xs);padding-inline:var(--mv-xs);font-size:var(--mv-font-small)}
+.mv-composer-dock .mv-btn{border:0;min-height:var(--mv-xl)}
+.mv-composer-dock .mv-truncate{max-width:50%}
+.mv-guidance-dialog{box-sizing:border-box;max-width:min(var(--mv-float-width),calc(100vw - 2 * var(--mv-lg)));max-height:calc(100vh - 2 * var(--mv-xl));overscroll-behavior:contain}
+.mv-guidance-dialog::backdrop{background:color-mix(in srgb,currentColor 35%,transparent)}
 `;
 
     const marshalVnextStyleRefs = new WeakMap();
@@ -616,6 +628,12 @@ window.__ModuleLoader__.load({
     function MarshalSidebarSections({ sidebar, openRoom, onOpenAgentDirect }) {
       const { rooms, groups, agents, loading, incomplete } = useMvSnapshot(sidebar);
       const [folded, setFolded] = React.useState(readMvFold);
+      const [directError, setDirectError] = React.useState('');
+      const openDirect = async agent => {
+        setDirectError('');
+        const message = await onOpenAgentDirect?.(agent);
+        if (message) setDirectError(message);
+      };
       const toggle = key => {
         const next = { ...folded, [key]: !folded[key] };
         setFolded(next);
@@ -624,7 +642,7 @@ window.__ModuleLoader__.load({
       const sections = [
         ['taskRooms', '工单群', 'room', rooms, room => openRoom('taskRooms', room)],
         ['groups', '群聊', 'chat', groups, group => openRoom(group.kind, group)],
-        ['agents', '智能体', 'agent', agents, agent => onOpenAgentDirect?.(agent)],
+        ['agents', '智能体', 'agent', agents, openDirect],
       ];
       return h('nav', { className: 'mv-scope mv-sections', 'aria-label': '调度官会话快捷入口' },
         ...sections.map(([key, label, icon, rows, open]) => h('section', { key },
@@ -637,7 +655,8 @@ window.__ModuleLoader__.load({
                 h('button', { type: 'button', className: 'mv-row', onClick: () => open(row), title: row.title ?? row.name },
                   h(MvIcon, { name: icon }), h('span', { className: 'mv-copy mv-truncate' }, row.title || row.name || '未命名'),
                   row.incident && h('span', { role: 'img', 'aria-label': '有待处理异常' }, h(MvIcon, { name: 'dot', className: 'mv-danger', size: 12 })))))))),
-        incomplete && h('span', { className: 'mv-muted', role: 'status' }, '部分列表暂不可用'));
+        incomplete && h('span', { className: 'mv-muted', role: 'status' }, '部分列表暂不可用'),
+        directError && h('span', { className: 'mv-danger', role: 'status' }, directError));
     }
 
     function mountSidebarSectionsPortal() {
@@ -952,7 +971,7 @@ window.__ModuleLoader__.load({
       return h('canvas', { ref: canvasRef, style: { width: '100%', height: '100%', display: 'block', borderRadius: 14, background: '#05070d', cursor: 'grab', touchAction: 'none' } });
     }
 
-    function MemoryPage({ initialAgentId = '', initialLayer = '' } = {}) {
+    function MemoryPage({ initialAgentId = '', initialLayer = '', mvOpenDirect } = {}) {
       const [layer, setLayer] = React.useState(() => (initialLayer === 'agent' || initialLayer === 'workspace' || initialLayer === 'global') ? initialLayer : (initialAgentId ? 'agent' : 'global'));
       const [library, setLibrary] = React.useState(null);
       const [extraWorkspaces, setExtraWorkspaces] = React.useState([]);
@@ -1013,6 +1032,7 @@ window.__ModuleLoader__.load({
       }, [layer, workspaceId, realWorkspaces]);
 
       const activeAgentId = layer === 'agent' ? agentId : '';
+      const mvDirectAgent = agents.find(row => row.id === activeAgentId);
       const activeWorkspaceId = layer === 'workspace' ? workspaceId : '';
       const view = JSON.stringify([layer, activeAgentId, activeWorkspaceId]);
       const currentView = React.useRef(view);
@@ -1193,6 +1213,7 @@ window.__ModuleLoader__.load({
           layer !== 'global' && privateBackend === 'mnemon' && h('span', { style: { color: '#10b981', fontSize: 11, padding: '2px 8px', borderRadius: 999, border: '1px solid color-mix(in srgb, #10b981 35%, transparent)', background: 'color-mix(in srgb, #10b981 12%, transparent)' } }, 'Mnemon · 意图图谱 + 推索引引擎'),
           h('input', { value: query, onChange: event => setQuery(event.target.value), onKeyDown: event => { if (event.key === 'Enter') void search(); }, placeholder: '搜索当前层级记忆…', style: { ...uiInput, width: 190 } }),
           h('button', { type: 'button', style: uiButton(false), onClick: () => { void search(); } }, '搜索'),
+          mvOpenDirect && mvDirectAgent && h(mvDirectLink, { key: activeAgentId, agent: mvDirectAgent, open: mvOpenDirect }),
           h('button', { type: 'button', style: uiButton(false), onClick: () => { setScope(layer); setFormOpen(value => !value); } }, '＋ 记忆'),
           h('button', { type: 'button', style: uiButton(false), onClick: () => setSettingsOpen(value => !value) }, '设置'),
           h('span', { style: { marginLeft: 'auto', fontSize: 11, color: dswTheme.dim } }, graph.nodes.length + ' 个节点 · ' + graph.edges.length + ' 条关联' + (health?.health?.length ? ' · 模糊 ' + health.health.reduce((sum, item) => sum + (item.fuzzy || 0), 0) + ' · 档案 ' + health.health.reduce((sum, item) => sum + (item.archived || 0), 0) : '')),
@@ -1337,7 +1358,7 @@ window.__ModuleLoader__.load({
       };
       const action = async (kind, targetTicketId) => {
         const call = session;
-        const { status, agent, summary, busy, savedId } = get();
+        const { status, agent, summary, busy, savedId, savedTask } = get();
         const text = summary?.trim();
         if (!call || status !== 'summary' || !text || busy ||
           (kind === 'save' ? Boolean(savedId) : get().synced || (!targetTicketId && !savedId))) return;
@@ -1345,17 +1366,18 @@ window.__ModuleLoader__.load({
         patch({ busy: kind, message: '' });
         try {
           if (kind === 'save') {
-            const result = await fetchJson('marshal/agent-tasks/create', {
+            const draft = {
               agentKey: agent.agentKey, type: 'direct', title: ('语音纪要 · ' + agent.name).slice(0, 512),
               lastSummary: text, ...(targetTicketId ? { linkedTicketId: targetTicketId } : {}),
-            }, true, signal);
+            };
+            const result = await fetchJson('marshal/agent-tasks/create', draft, true, signal);
             if (!result.task?.id) throw Error('Missing task id');
-            if (session === call) patch({ savedId: result.task.id, message: '已保存为 1:1 任务。' });
+            if (session === call) patch({ savedId: result.task.id, savedTask: { ...draft, ...result.task }, message: '已保存为 1:1 任务。' });
           } else {
             await fetchJson('marshal/agents/guidance-sync', {
               agentKey: agent.agentKey, guidanceText: text,
               ...(savedId ? { taskIds: [savedId] } : {}),
-              ...(targetTicketId ? { targetTicketId } : {}),
+              ...(targetTicketId ? { targetTicketId, wakeTicket: savedTask?.linkedTicketId === targetTicketId } : {}),
             }, true, signal);
             if (session === call) patch({ synced: true, message: '已同步指导。' });
           }
@@ -1367,11 +1389,11 @@ window.__ModuleLoader__.load({
       };
       return {
         getSnapshot: get, subscribe: store.subscribe, local: adapter.local === true,
-        async start(agent, { targetTicketId } = {}) {
+        async start(agent, { targetTicketId, ticketNo } = {}) {
           if (disposed || get().status !== 'idle' || !agent?.agentKey) return;
           const call = { connection: new AbortController(), ending: new AbortController(), actions: new AbortController() };
           session = call;
-          store.set({ status: 'connecting', agent, targetTicketId, expanded: true, muted: false, notes: '', transcript: [] });
+          store.set({ status: 'connecting', agent, targetTicketId, ticketNo, expanded: true, muted: false, notes: '', transcript: [] });
           if (session !== call) return;
           try {
             await adapter.connect({ agent, signal: call.connection.signal, onTranscript(line) {
@@ -1405,6 +1427,9 @@ window.__ModuleLoader__.load({
         },
         saveSummary() { return action('save', get().targetTicketId); },
         syncGuidance() { return action('sync', get().targetTicketId); },
+        confirmGuidance(snapshot) {
+          if (get() === snapshot && snapshot.status === 'summary') patch({ synced: true, message: '已同步指导。' });
+        },
         close() { if (get().status === 'summary' && !get().busy) reset(); },
         dispose() {
           if (disposed) return;
@@ -1448,7 +1473,20 @@ window.__ModuleLoader__.load({
         lines.length ? lines.map((line, index) => h('div', { key: index }, h('strong', null, line.speaker + '：'), line.text))
           : h('span', { className: 'mv-muted' }, '暂无对话记录'));
     }
-    function MarshalVoiceSummaryCard({ voice, call }) {
+    function mvVoiceGuidanceAction({ voice, call, runtime }) {
+      const state = mvUseAgentTasks(runtime, call.agent.agentKey);
+      const { items } = useMvSnapshot(runtime.tickets);
+      const { tasks: selected, ticket } = mvSelection(state, items);
+      // Keep a saved, unlinked summary usable for direct sync, but never add
+      // an unselected ticket-bound summary or reuse the call's initial target.
+      const saved = state.rows.find(task => task.id === call.savedId) ?? call.savedTask;
+      const tasks = selected.length ? selected : saved && !saved.linkedTicketId ? [saved] : [];
+      return h(MvButton, { icon: 'send', className: 'mv-guidance-action', label: call.synced ? '已同步' : mvGuidanceLabel(ticket),
+        disabled: Boolean(call.busy || call.synced || !call.summary.trim()),
+        onClick: () => runtime.showModal({ agent: call.agent, tasks, ticket,
+          guidanceText: call.summary, onSuccess: () => voice.confirmGuidance(call) }) });
+    }
+    function MarshalVoiceSummaryCard({ voice, call, guidanceRuntime }) {
       const canSync = Boolean(call.targetTicketId || call.savedId);
       return h('section', { id: 'marshal-voice-detail', className: 'mv-summary-card mv-stack', role: 'region', 'aria-label': '语音纪要' },
         h('div', { className: 'mv-line' }, h(MvAvatar, { agent: call.agent }),
@@ -1458,17 +1496,18 @@ window.__ModuleLoader__.load({
           h('textarea', { className: 'mv-field', rows: 4, maxLength: 3000, value: call.summary,
             readOnly: Boolean(call.busy || (call.savedId && call.synced)), onChange: event => voice.editSummary(event.target.value) })),
         call.transcript.length > 0 && h('details', null, h('summary', null, '对话记录'), h(MvVoiceTranscript, { lines: call.transcript })),
-        h('div', { className: 'mv-muted' }, call.targetTicketId ? '同步目标：关联工单群' :
+        !guidanceRuntime && h('div', { className: 'mv-muted' }, call.targetTicketId ? '同步目标：关联工单群' :
           canSync ? '同步目标：智能体 1:1 直连会话' : '先保存为任务，再同步至智能体的 1:1 会话。'),
         h('div', { className: 'mv-actions' },
           h(MvButton, { icon: 'save', label: call.savedId ? '已保存' : '保存为 1:1 任务',
             disabled: Boolean(call.busy || call.savedId || !call.summary.trim()), onClick: () => void voice.saveSummary() }),
-          h(MvButton, { icon: 'send', label: call.synced ? '已同步' : '汇总同步指导',
+          guidanceRuntime ? h(mvVoiceGuidanceAction, { voice, call, runtime: guidanceRuntime }) :
+            h(MvButton, { icon: 'send', label: call.synced ? '已同步' : '汇总同步指导',
             disabled: Boolean(call.busy || call.synced || !canSync || !call.summary.trim()), onClick: () => void voice.syncGuidance() }),
           h(MvButton, { icon: 'close', label: '关闭', disabled: Boolean(call.busy), onClick: () => voice.close() })),
         h('div', { className: 'mv-muted', role: 'status' }, call.busy ? '正在提交…' : call.message));
     }
-    function MarshalVoiceCallOverlay({ voice }) {
+    function MarshalVoiceCallOverlay({ voice, guidanceRuntime }) {
       const call = useMvSnapshot(voice);
       if (call.status === 'idle') return call.message ? h('div', { className: 'mv-scope mv-voice-dock' },
         h('section', { className: 'mv-voice-panel mv-line' },
@@ -1482,7 +1521,7 @@ window.__ModuleLoader__.load({
           'aria-expanded': call.expanded, 'aria-controls': call.expanded ? 'marshal-voice-detail' : undefined,
           onClick: () => voice.setExpanded(!call.expanded) },
           label + ' · ' + call.agent.name, h(MvVoiceTimer, { call })),
-        call.expanded && (summary ? h(MarshalVoiceSummaryCard, { voice, call })
+        call.expanded && (summary ? h(MarshalVoiceSummaryCard, { voice, call, guidanceRuntime })
           : h('section', { id: 'marshal-voice-detail', className: 'mv-voice-panel mv-stack', role: 'region', 'aria-label': '语音小会话' },
             h('div', { className: 'mv-line' },
               h(MvAvatar, { agent: call.agent, breathing: call.status === 'active' && !call.muted }),
@@ -1500,7 +1539,606 @@ window.__ModuleLoader__.load({
                 onClick: () => { if (connecting) voice.cancel(); else void voice.end(); } })),
             call.message && h('div', { className: 'mv-muted', role: 'status' }, call.message))));
     }
-    function AgentDirectChatsView({ openSession, onOpenAgents, initialAgentId = '' }) {
+    const MV_TASK_TAB = 'marshal-agent-tasks';
+    const MV_TASK_TAB_ID = 'dsh-marshal/agent-tasks';
+    const MV_TASK_TAB_RETRY_DELAYS = [50, 150, 400, 1000];
+    const MV_TASK_TAB_UNAVAILABLE = '无法打开任务清单，请在智能体会话中重试。';
+    const mvTaskTypes = { casual: '闲聊记录', direct: '直连任务', ticket: '关联工单' };
+    const mvTaskStatuses = { queued: '待处理', running: '进行中', review: '待验收', done: '已完成', failed: '失败' };
+    const mvRead = (path, signal) => fetchJson('marshal/' + path, undefined, true, signal);
+    const mvAgentQuery = (path, agentKey) => path + '?' + new URLSearchParams({ agentKey });
+    const mvSessionId = row => row?.sessionId ?? row?.id;
+    const mvReadOnlyTask = task => task.id.startsWith('ticket:');
+    const mvTicketLabel = ticket => '#' + String(ticket.ticketNo ?? ticket.id).replace(/^#/, '');
+    const mvGuidanceLabel = ticket => ticket ? '汇总并同步指导至 ' + mvTicketLabel(ticket) : '汇总提交同步指导';
+    const mvTaskError = (error, fallback) => error?.message ? fallback + '：' + error.message : fallback;
+    const mvValidWorkspaceId = value => typeof value === 'string' && value.trim() && value.length <= 256 &&
+      !/[\u0000-\u001f\u007f]/.test(value);
+    async function mvReadTicketWorkspaces(signal) {
+      const { workspaces = [] } = await mvRead('task-rooms/workspaces', signal);
+      return workspaces.filter(ws => mvValidWorkspaceId(ws?.id) && !isPseudoAgentWorkspace(ws));
+    }
+
+    function mvService(ctx, name) {
+      try { return ctx?.get?.(name) ?? ctx?.[name]; } catch {
+        try { return ctx?.[name]; } catch { return undefined; }
+      }
+    }
+    function mvWaitForTasksTab(delay, signal) {
+      return new Promise(resolve => {
+        if (signal?.aborted) { resolve(); return; }
+        const stop = () => {
+          clearTimeout(timer);
+          signal?.removeEventListener('abort', stop);
+          resolve();
+        };
+        const timer = setTimeout(stop, delay);
+        signal?.addEventListener('abort', stop, { once: true });
+      });
+    }
+    async function mvOpenTasksTab(ctx, { sessionId, signal, isCurrent = () => true } = {}) {
+      for (const delay of [0, ...MV_TASK_TAB_RETRY_DELAYS]) {
+        if (signal?.aborted || !isCurrent()) return;
+        if (delay) await mvWaitForTasksTab(delay, signal);
+        if (signal?.aborted || !isCurrent()) return;
+        try {
+          const rightbar = mvService(ctx, 'sidebarRight');
+          // On the official host, openTab acts on the on-screen surface. A
+          // previous session can still be mounted after openSession resolves.
+          if (sessionId && typeof rightbar?.screen === 'function' && rightbar.screen()?.sessionId !== sessionId) continue;
+          if (typeof rightbar?.openTab === 'function' && await rightbar.openTab(MV_TASK_TAB) !== false) return;
+        } catch { /* The destination surface or tab registry may still be mounting. */ }
+      }
+      if (!signal?.aborted && isCurrent()) return MV_TASK_TAB_UNAVAILABLE;
+    }
+    function mvRegisterTasksTab(registry) {
+      return registry?.register?.({ id: MV_TASK_TAB_ID, kind: MV_TASK_TAB, title: () => '智能体任务',
+        priority: 'extension', keepMounted: true });
+    }
+    async function mvOpenAgentDirectSession({ agent, ctx, uiWorkspace, onOpenAgentDirect, sessionBridge,
+      openSessionRef, mvFocusedAgentStore, signal, sessionId, openDrawer }) {
+      try {
+        if (!agent?.agentKey || signal?.aborted) return;
+        try { await mvService(ctx, 'layout')?.selectPanel?.(null); } catch { /* still try native navigation */ }
+        if (signal?.aborted) return;
+        // createSessionBridge creates a synthetic marshal-view binding, not a
+        // resident DSH identity. Only use a bridge if it supplies a native opener.
+        const openSession = async id => {
+          for (const [owner, method] of [[sessionBridge, 'openSession'], [uiWorkspace, 'openSession'], [openSessionRef, 'current']]) {
+            if (signal?.aborted) return false;
+            try { if (typeof owner?.[method] === 'function' && await owner[method](id) !== false) return true; } catch {}
+          }
+          return false;
+        };
+        const resolved = sessionId ?? (onOpenAgentDirect ? await onOpenAgentDirect(agent, signal) :
+          mvSessionId((await mvRead(mvAgentQuery('agent-direct-sessions', agent.agentKey), signal))?.mainSession));
+        const id = typeof resolved === 'string' ? resolved : resolved?.sessionId;
+        if (signal?.aborted) return;
+        if (typeof id !== 'string' || !id.trim()) return '暂无 1:1 直连会话。';
+        if (!await openSession(id)) return signal?.aborted ? undefined : '宿主无法打开 1:1 直连会话。';
+        if (signal?.aborted) return;
+        mvFocusedAgentStore?.set({ ...agent, agentKey: resolved?.agentKey ?? agent.agentKey, navigationSessionId: id });
+        try {
+          if (openDrawer) return await openDrawer(ctx, id, signal);
+          if (mvService(ctx, 'sidebarRight')) return await mvOpenTasksTab(ctx, { sessionId: id, signal });
+        } catch {
+          if (!signal?.aborted) return MV_TASK_TAB_UNAVAILABLE;
+        }
+      } catch {
+        if (!signal?.aborted) return '无法打开 1:1 直连会话，请稍后重试。';
+      }
+    }
+
+    function mvTaskMutation(action, agentKey, fields, signal) {
+      if (action !== 'create' && mvReadOnlyTask(fields)) throw Error('关联工单是只读记录。');
+      return fetchJson('marshal/agent-tasks/' + action, { agentKey, ...fields }, true, signal);
+    }
+    function mvDirectLink({ agent, open, label = '1:1 直连' }) {
+      const [state, setState] = React.useState(null);
+      return h('span', { className: 'mv-scope mv-actions' },
+        h(MvButton, { icon: 'chat', label, disabled: state?.busy, onClick: async () => {
+          setState({ busy: true });
+          const message = await open(agent);
+          setState({ message });
+        } }),
+        state?.message && h('span', { className: 'mv-danger', role: 'status' }, state.message));
+    }
+    const mvRequiresGuidanceTarget = tasks => !tasks.length || tasks.some(task => task.type !== 'direct' || task.linkedTicketId);
+    const mvLinkedTicketIds = tasks => [...new Set(tasks.map(task => task.linkedTicketId).filter(Boolean))];
+    const MV_GUIDANCE_TICKET_CONFLICT = '请选择同一工单下的任务';
+    function mvSubmitGuidance({ agentKey, tasks, targetTicketId, guidanceText }, signal) {
+      const linked = mvLinkedTicketIds(tasks);
+      if (linked.length > 1 || (linked.length && targetTicketId && targetTicketId !== linked[0])) {
+        throw Error(MV_GUIDANCE_TICKET_CONFLICT);
+      }
+      const target = linked[0] ?? targetTicketId;
+      if (!target && mvRequiresGuidanceTarget(tasks)) {
+        throw Error('请选择目标工单，或改选直连任务。');
+      }
+      // The server resolves direct destinations from the stored tasks' sessionId.
+      return fetchJson('marshal/agents/guidance-sync', { agentKey, taskIds: tasks.map(task => task.id),
+        guidanceText: guidanceText.trim(), ...(target ? { targetTicketId: target, wakeTicket: true } : {}) }, true, signal);
+    }
+
+    function mvCreateAgentTasks() {
+      const lifetime = new AbortController();
+      const { signal } = lifetime;
+      const directory = createMvStore({ agents: [], marshalAgents: [], rosters: {}, loading: true });
+      const tickets = createMvStore({ items: [] });
+      const focus = createMvStore(null);
+      const modal = createMvStore(null);
+      const drawer = createMvStore(null);
+      const empty = { rows: [], selected: [], focusedId: '', loading: true };
+      const noAgent = createMvStore(empty);
+      const entries = new Map();
+      const stops = [];
+      const entryFor = key => {
+        if (!key) return { store: noAgent };
+        if (!entries.has(key)) entries.set(key, { store: createMvStore(empty), users: 0 });
+        return entries.get(key);
+      };
+      function refreshTasks(key) {
+        if (!key || signal.aborted) return;
+        const entry = entryFor(key);
+        if (entry.reading) { entry.pending = true; return entry.reading; }
+        const load = async () => {
+          do {
+            entry.pending = false;
+            try {
+              const result = await mvRead(mvAgentQuery('agent-tasks', key), signal);
+              if (signal.aborted) return;
+              const rows = result.tasks ?? [];
+              const ids = new Set(rows.map(task => task.id));
+              const previous = entry.store.getSnapshot();
+              entry.store.set({ rows, selected: previous.selected.filter(id => ids.has(id)),
+                focusedId: ids.has(previous.focusedId) ? previous.focusedId : '', loading: false });
+            } catch (error) {
+              if (!signal.aborted) entry.store.set({ ...entry.store.getSnapshot(), loading: false,
+                error: mvTaskError(error, '读取智能体任务失败') });
+            }
+          } while (entry.pending && !signal.aborted);
+        };
+        entry.reading = load().finally(() => { entry.reading = undefined; });
+        return entry.reading;
+      }
+      async function refreshDirectory() {
+        const [overview, rosterState, library] = await Promise.allSettled([
+          mvRead('desktop/overview', signal), mvRead('rosters/state', signal),
+          fetchJson('dsh-agents/api/state', undefined, false, signal),
+        ]);
+        if (signal.aborted) return;
+        const previous = directory.getSnapshot();
+        const agents = overview.value?.agents?.items ?? previous.agents;
+        const teams = library.value?.teams ?? [];
+        const marshalTeams = new Set(teams.filter(team => typeof team?.name === 'string' && isAgentTeam(team)).map(team => team.id));
+        directory.set({ agents, marshalAgents: agents.filter(row => marshalTeams.has(row.teamId)),
+          rosters: rosterState.value?.rosters ?? previous.rosters,
+          loading: false, error: [overview, library].some(result => result.status === 'rejected') ?
+            mvTaskError(overview.reason ?? library.reason, '读取智能体失败') : '' });
+      }
+      async function refreshTasksAndTickets() {
+        if (signal.aborted) return;
+        const refreshTickets = async () => {
+          try {
+            const result = await mvRead('tasks/state', signal);
+            if (!signal.aborted) tickets.set({ items: (result.tasks ?? []).filter(ticket => ticket.archivedAt == null) });
+          } catch (error) {
+            if (!signal.aborted) tickets.set({ ...tickets.getSnapshot(), error: mvTaskError(error, '读取工单失败') });
+          }
+        };
+        await Promise.all([
+          refreshTickets(),
+          ...[...entries].filter(([, entry]) => entry.users).map(([key]) => refreshTasks(key)),
+        ]);
+      }
+      function activate() {
+        if (stops.length || signal.aborted) return;
+        const listen = (topics, refresh) => {
+          try { stops.push(subscribeMarshalEvents(topics, refresh, { initial: true, debounceMs: 100 })); }
+          catch { stops.push(() => {}); void refresh(); }
+        };
+        // The shared dispatcher coalesces to the latest topic. Keep directory
+        // invalidations independent of high-frequency room messages.
+        listen(['ready', 'agents.changed'], refreshDirectory);
+        listen(['ready', 'room.message', 'tasks.changed', 'agents.changed'], refreshTasksAndTickets);
+      }
+      return { signal, directory, tickets, focus, drawer, modal, activate, refreshTasks,
+        tasks: key => entryFor(key).store,
+        setSelection(key, change) {
+          if (signal.aborted) return;
+          const { store } = entryFor(key);
+          const value = store.getSnapshot();
+          store.set({ ...value, ...change(value) });
+        },
+        retain(key) {
+          if (!key || signal.aborted) return;
+          const entry = entryFor(key);
+          if (entry.users++ === 0) void refreshTasks(key);
+          return () => { entry.users--; };
+        },
+        showModal(data) { if (!signal.aborted) { activate(); modal.set(data); } },
+        dispose() {
+          lifetime.abort();
+          for (const stop of stops.splice(0)) stop();
+          for (const store of [directory, tickets, focus, drawer, modal, noAgent, ...[...entries.values()].map(entry => entry.store)]) store.clear();
+          focus.set(null); drawer.set(null); modal.set(null);
+          entries.clear();
+        },
+      };
+    }
+
+    function mvUseTabInfo(props) {
+      // The host supplies one stable hook shape for the lifetime of the seat.
+      try { return props?.hooks?.tabInfo?.() || props?.useTabInfo?.(); } catch { return undefined; }
+    }
+    function mvUseSessionAgent(runtime, sessionId, allowFocused) {
+      const focus = useMvSnapshot(runtime.focus);
+      const { marshalAgents: agents, loading, error } = useMvSnapshot(runtime.directory);
+      const [found, setFound] = React.useState(null);
+      // A navigation target or overview match can identify the agent, but only
+      // the direct-sessions response can authorize binding a task to the session.
+      const visited = sessionId && focus?.navigationSessionId === sessionId ? focus : undefined;
+      const candidate = sessionId ? (visited ? agents.find(row => row.agentKey === visited.agentKey) ?? visited :
+        agents.find(row => row.sessionId === sessionId)) : undefined;
+      const matchForSession = found && found.sessionId === sessionId &&
+        (!candidate || found.agent.agentKey === candidate.agentKey) ? found.agent : undefined;
+      const verified = matchForSession && found.agents === agents;
+      const agent = candidate || (matchForSession && agents.find(row => row.agentKey === matchForSession.agentKey)) ||
+        (!sessionId && allowFocused ? focus : null);
+      React.useEffect(() => { runtime.activate(); }, [runtime]);
+      React.useEffect(() => {
+        if (!sessionId || verified || (!candidate && !agents.length) || runtime.signal.aborted) return;
+        const controller = new AbortController();
+        const { signal } = controller;
+        const abort = () => controller.abort();
+        runtime.signal.addEventListener('abort', abort, { once: true });
+        const candidates = candidate ? [candidate] : agents;
+        // Bound host lookups per batch when there is no overview candidate.
+        const resolve = async () => {
+          for (let i = 0; i < candidates.length && !signal.aborted; i += 4) {
+            const batch = candidates.slice(i, i + 4);
+            const results = await Promise.allSettled(batch.map(row => mvRead(mvAgentQuery('agent-direct-sessions', row.agentKey), signal)));
+            if (signal.aborted) return;
+            const match = batch.find((_, index) => {
+              const data = results[index].value;
+              return [data?.mainSession, ...(data?.subSessions ?? [])].some(row => mvSessionId(row) === sessionId);
+            });
+            if (match) {
+              setFound({ sessionId, agents, agent: match });
+              return;
+            }
+          }
+          if (!signal.aborted) setFound(null);
+        };
+        void resolve().finally(() => runtime.signal.removeEventListener('abort', abort));
+        return () => { runtime.signal.removeEventListener('abort', abort); abort(); };
+      }, [runtime, sessionId, agents, candidate, verified]);
+      return { agent, loading, error, focus, directSessionId: verified ? sessionId : undefined };
+    }
+    function mvUseAgentTasks(runtime, key) {
+      const state = useMvSnapshot(runtime.tasks(key));
+      React.useEffect(() => runtime.retain(key), [runtime, key]);
+      return state;
+    }
+    function mvSelection(state, tickets) {
+      const { selected, focusedId, rows } = state;
+      const tasks = rows.filter(row => selected.length ? selected.includes(row.id) : row.id === focusedId);
+      const targets = mvLinkedTicketIds(tasks);
+      const id = targets.length === 1 ? targets[0] : undefined;
+      return { tasks, ticket: id ? tickets.find(row => row.id === id) ?? { id } : undefined };
+    }
+    function mvTicketOptions(tickets) {
+      return tickets.map(ticket => h('option', { key: ticket.id, value: ticket.id }, mvTicketLabel(ticket) + ' · ' + (ticket.title ?? '工单')));
+    }
+    function mvStartVoice(voice, call, agent, ticket) {
+      if (call.status === 'idle') void voice.start(agent, { targetTicketId: ticket?.id, ticketNo: ticket?.ticketNo });
+      else voice.setExpanded(true);
+    }
+    const mvIsCalling = call => ['connecting', 'active', 'ending'].includes(call.status);
+    function mvGuidanceButton(runtime, agent, selection, dock = false) {
+      return h(MvButton, { icon: 'send', className: 'mv-guidance-action',
+        label: dock && !selection.ticket ? '同步指导' : mvGuidanceLabel(selection.ticket),
+        onClick: () => runtime.showModal({ agent, ...selection }) });
+    }
+
+    function mvAgentTasksRightbarTab(props) {
+      const { runtime, voiceLayer, idleVoice, navigation } = props;
+      const info = mvUseTabInfo(props);
+      const sessionId = info?.sessionId ?? info?.tab?.sessionId ?? props.sessionId;
+      const { agent, loading, error, focus, directSessionId } = mvUseSessionAgent(runtime, sessionId, true);
+      const voice = useMvSnapshot(voiceLayer);
+      const call = useMvSnapshot(voice ?? idleVoice);
+      const suggested = (mvIsCalling(call) ? call.agent : undefined) ?? focus;
+      if (!agent) return h('div', { className: 'mv-scope mv-task-pane mv-stack' },
+        h('p', { role: 'status' }, loading ? '正在读取智能体…' : '当前会话没有关联的智能体。'),
+        error && h('span', { className: 'mv-danger', role: 'status' }, error),
+        suggested && h(mvDirectLink, { agent: suggested, open: navigation.openAgent, label: '打开该智能体 1:1 会话' }));
+      return h(mvAgentTaskList, { key: agent.agentKey, agent, runtime, voiceLayer, idleVoice, navigation, directSessionId });
+    }
+    function mvAgentTaskList({ agent, runtime, voiceLayer, idleVoice, navigation, directSessionId }) {
+      const key = agent.agentKey;
+      const state = mvUseAgentTasks(runtime, key);
+      const { items: tickets, error: ticketError } = useMvSnapshot(runtime.tickets);
+      const voice = useMvSnapshot(voiceLayer);
+      const call = useMvSnapshot(voice ?? idleVoice);
+      const [filter, setFilter] = React.useState('');
+      const [type, setType] = React.useState('direct');
+      const [title, setTitle] = React.useState('');
+      const [ticketId, setTicketId] = React.useState('');
+      const [busy, setBusy] = React.useState(false);
+      const [error, setError] = React.useState('');
+      const [removeId, setRemoveId] = React.useState('');
+      const [ticketWorkspace, setTicketWorkspace] = React.useState(null);
+      const lock = React.useRef(false);
+      const selection = mvSelection(state, tickets);
+      const choose = change => runtime.setSelection(key, change);
+      const run = async work => {
+        if (lock.current) return;
+        lock.current = true; setBusy(true); setError('');
+        try { await work(); } catch (e) { if (!runtime.signal.aborted) setError(mvTaskError(e, '操作失败')); }
+        finally { lock.current = false; if (!runtime.signal.aborted) setBusy(false); }
+      };
+      const write = (action, fields, after) => run(async () => {
+        await mvTaskMutation(action, key, fields, runtime.signal);
+        if (runtime.signal.aborted) return;
+        after?.();
+        await runtime.refreshTasks(key);
+      });
+      const openTicket = (id, workspaceId) => run(async () => {
+        if (!workspaceId) setTicketWorkspace(null);
+        const card = tickets.find(row => row.id === id);
+        const options = await navigation.openTicket(id, card, agent, workspaceId);
+        if (!runtime.signal.aborted) setTicketWorkspace(options ? { id, card, options } : null);
+      });
+      const rows = state.rows.filter(task => !filter || task.status === filter);
+      return h('section', { className: 'mv-scope mv-task-pane mv-stack', 'aria-label': '智能体任务' },
+        h('header', { className: 'mv-stack' },
+          h(MvButton, { icon: 'chat', label: '自由闲聊（不绑定任务）', className: 'mv-casual-card',
+            'aria-pressed': !state.focusedId && !state.selected.length,
+            onClick: () => { choose(() => ({ focusedId: '', selected: [] })); setType('casual'); } }),
+          h('div', { className: 'mv-line' }, h(MvAvatar, { agent }),
+            h('div', { className: 'mv-copy' }, h('strong', null, agent.name),
+              h('div', { className: 'mv-muted' }, state.rows.find(row => row.id === state.focusedId)?.title ?? '自由闲聊')),
+            voice && h(MvButton, { icon: 'phone', iconOnly: true, label: '语音通话', onClick: () => mvStartVoice(voice, call, agent, selection.ticket) })),
+          mvGuidanceButton(runtime, agent, selection),
+          !directSessionId && h('div', { className: 'mv-stack' },
+            h('span', { className: 'mv-muted', role: 'status' }, '当前会话非 1:1 直连会话。新建直连任务将归入该智能体的主会话。'),
+            h(mvDirectLink, { agent, open: navigation.openAgent, label: '打开该智能体 1:1 会话' })),
+          h('form', { className: 'mv-stack', onSubmit: event => {
+            event.preventDefault();
+            if (!title.trim() || (type === 'ticket' && !ticketId)) return;
+            return write('create', { type, title: title.trim(), ...(type === 'ticket' ? { linkedTicketId: ticketId } : {}),
+              ...(directSessionId && type === 'direct' ? { sessionId: directSessionId } : {}) }, () => setTitle(''));
+          } },
+          h('input', { className: 'mv-field', 'aria-label': '新任务标题', placeholder: '新任务标题', value: title,
+            maxLength: 512, required: true, onChange: event => setTitle(event.target.value) }),
+          h('div', { className: 'mv-actions' },
+            h('select', { className: 'mv-field mv-compact-field', 'aria-label': '新任务类型', value: type, onChange: event => setType(event.target.value) },
+              Object.entries(mvTaskTypes).map(([value, label]) => h('option', { key: value, value }, label))),
+            h(MvButton, { type: 'submit', label: '新建 1:1 任务', disabled: busy || !title.trim() || (type === 'ticket' && !ticketId) })),
+          type === 'ticket' && h('select', { className: 'mv-field', 'aria-label': '关联工单', required: true, value: ticketId,
+            onChange: event => setTicketId(event.target.value) }, h('option', { value: '' }, '请选择关联工单'), mvTicketOptions(tickets)),
+          type === 'ticket' && ticketError && h('span', { className: 'mv-danger', role: 'status' }, ticketError))),
+        h('div', { className: 'mv-stack' },
+          h('div', { className: 'mv-actions', role: 'group', 'aria-label': '任务状态筛选' },
+            ['', 'running', 'review', 'done'].map(value => h(MvButton, { key: value, className: 'mv-chip',
+              label: mvTaskStatuses[value] ?? '全部', 'aria-pressed': filter === value, onClick: () => setFilter(value) }))),
+          (error || state.error) && h('div', { className: 'mv-line mv-danger', role: 'status' }, error || state.error,
+            state.error && h(MvButton, { icon: 'refresh', label: '重试', onClick: () => runtime.refreshTasks(key) })),
+          ticketWorkspace && h('label', { className: 'mv-stack' },
+            '为 ' + mvTicketLabel(ticketWorkspace.card ?? ticketWorkspace) + ' 选择工单工作区',
+            h('select', { className: 'mv-field', 'aria-label': '选择目标工单工作区', value: '', disabled: busy,
+              onChange: event => {
+                const workspaceId = event.target.value;
+                if (ticketWorkspace.options.some(ws => ws.id === workspaceId)) return openTicket(ticketWorkspace.id, workspaceId);
+              },
+            }, h('option', { value: '' }, '请选择工作区'),
+            ticketWorkspace.options.map(ws => h('option', { key: ws.id, value: ws.id }, ws.title || ws.name || ws.id))))),
+        h('div', { className: 'mv-stack mv-task-scroll' },
+          state.loading ? h('p', { className: 'mv-muted', role: 'status' }, '正在读取任务…') :
+          !rows.length ? h('p', { className: 'mv-muted' }, '暂无符合条件的任务') : rows.map(task => {
+            const readOnly = mvReadOnlyTask(task);
+            const active = state.focusedId === task.id;
+            const picked = state.selected.includes(task.id);
+            const ticket = task.linkedTicketId && (tickets.find(row => row.id === task.linkedTicketId) ?? { id: task.linkedTicketId });
+            const ticketButton = ticket && h(MvButton, { icon: 'room', label: '打开工单群 ' + mvTicketLabel(ticket), onClick: () => openTicket(ticket.id) });
+            return h('article', { key: task.id, className: 'mv-stack mv-task-item', 'data-focused': active },
+              h('div', { className: 'mv-line' }, h('input', { type: 'checkbox', checked: picked,
+                disabled: !picked && state.selected.length >= 32, 'aria-label': '选入同步指导：' + task.title,
+                onChange: () => choose(prev => ({ selected: picked ? prev.selected.filter(id => id !== task.id) : [...prev.selected, task.id] })) }),
+                readOnly ? h('strong', { className: 'mv-copy' }, task.title) : h(MvButton, { className: 'mv-row mv-copy', label: task.title,
+                  'aria-pressed': active, onClick: () => choose(() => ({ focusedId: active ? '' : task.id, selected: [] })) }),
+                h('span', { className: 'mv-model' }, mvTaskStatuses[task.status] ?? task.status)),
+              h('span', { className: 'mv-muted' }, mvTaskTypes[task.type], ticket && !readOnly ? ' · 状态跟随工单' : '',
+                task.lastSyncAt ? ' · 已同步指导' : ''),
+              readOnly ? ticketButton : h('details', null, h('summary', null, '任务详情'),
+                h('div', { className: 'mv-stack' },
+                  task.subSessions?.map(sub => h(MvButton, { key: sub.id, icon: 'chat', label: sub.title || sub.role || sub.id,
+                    onClick: () => run(() => navigation.openSubSession(agent, sub.id, task.id)) })),
+                  ticketButton,
+                  h('div', { className: 'mv-actions' },
+                    !ticket && h('select', { className: 'mv-field mv-compact-field', 'aria-label': '任务状态：' + task.title,
+                      value: task.status, disabled: busy, onChange: event => write('update', { id: task.id, patch: { status: event.target.value } }) },
+                      Object.entries(mvTaskStatuses).map(([value, label]) => h('option', { key: value, value }, label))),
+                    h(MvButton, { className: 'mv-danger', label: removeId === task.id ? '确认删除' : '删除任务', disabled: busy,
+                      onClick: () => removeId === task.id ? write('delete', { id: task.id }, () => setRemoveId('')) : setRemoveId(task.id) }),
+                    removeId === task.id && h(MvButton, { label: '取消', onClick: () => setRemoveId('') })))));
+          })),
+        h('footer', { className: 'mv-actions' }, h('span', { className: 'mv-muted' }, '已选 ' + selection.tasks.length + ' 项'),
+          mvGuidanceButton(runtime, agent, selection)));
+    }
+
+    function mvAgentComposerDockBar({ runtime, voiceLayer, idleVoice, navigation, sessionId }) {
+      const { agent: owner } = mvUseSessionAgent(runtime, sessionId, false);
+      const voice = useMvSnapshot(voiceLayer);
+      const call = useMvSnapshot(voice ?? idleVoice);
+      const pendingDrawer = useMvSnapshot(runtime.drawer);
+      const [drawerError, setDrawerError] = React.useState(null);
+      const calling = mvIsCalling(call);
+      const agent = owner ?? (calling ? call.agent : undefined);
+      const state = mvUseAgentTasks(runtime, agent?.agentKey);
+      const { items: tickets } = useMvSnapshot(runtime.tickets);
+      const selection = mvSelection(state, tickets);
+      const pending = state.rows.filter(row => row.status !== 'done').length;
+      React.useEffect(() => {
+        if (!sessionId || sessionId !== pendingDrawer) return;
+        const controller = new AbortController();
+        const isCurrent = () => !runtime.signal.aborted && runtime.drawer.getSnapshot() === sessionId;
+        setDrawerError(null);
+        // For hosts without a screen query, wait for the destination Composer
+        // to commit before trying to open the tab on its surface.
+        const id = setTimeout(async () => {
+          const message = await navigation.openDrawer({ sessionId, signal: controller.signal, isCurrent });
+          if (!controller.signal.aborted && isCurrent()) {
+            if (message) setDrawerError({ sessionId, message });
+            runtime.drawer.set(null);
+          }
+        }, 0);
+        return () => { clearTimeout(id); controller.abort(); };
+      }, [sessionId, pendingDrawer, runtime, navigation]);
+      if (!agent) return null;
+      return h('div', { className: 'mv-scope mv-actions mv-composer-dock', 'aria-label': '智能体会话快捷操作' },
+        h(MvIcon, { name: 'agent' }), h('strong', { className: 'mv-truncate' }, agent.name),
+        h(MvButton, { icon: 'room', 'aria-label': '任务清单 · ' + pending + ' 待处理',
+          onClick: async () => {
+            if (owner) { runtime.drawer.set(sessionId); return; }
+            const message = await navigation.openAgent(agent);
+            if (message && !runtime.signal.aborted) setDrawerError({ sessionId, message });
+          } },
+          '任务清单', h('span', { className: 'mv-model' }, pending)),
+        mvGuidanceButton(runtime, agent, selection, true),
+        voice && h(MvButton, { icon: 'phone', iconOnly: true, label: calling ? '查看语音通话' : '语音通话',
+          onClick: () => mvStartVoice(voice, call, agent, selection.ticket) }),
+        h('span', { className: 'mv-muted' }, 'SenseVoice 听写仍在输入框'),
+        drawerError && drawerError.sessionId === sessionId && h('span', { className: 'mv-danger', role: 'status' }, drawerError.message));
+    }
+
+    function mvSyncGuidanceModal({ runtime, data }) {
+      const { agent, tasks = [], ticket, onSuccess } = data;
+      const { items, error: ticketError } = useMvSnapshot(runtime.tickets);
+      const { agents, rosters } = useMvSnapshot(runtime.directory);
+      const linked = mvLinkedTicketIds(tasks);
+      const boundTarget = linked[0];
+      const conflict = linked.length > 1;
+      const [chosenTarget, setTarget] = React.useState('');
+      const target = conflict ? '' : boundTarget ?? chosenTarget;
+      const [guidance, setGuidance] = React.useState(() => (data.guidanceText ?? tasks.map(task => task.lastSummary).filter(Boolean).join('\n\n')).slice(0, 3000));
+      const [instructions, setInstructions] = React.useState({});
+      const [busy, setBusy] = React.useState(false);
+      const [status, setStatus] = React.useState(null);
+      const [workspaceResult, setWorkspaceResult] = React.useState(null);
+      const [chosenWorkspace, setChosenWorkspace] = React.useState('');
+      const dialogRef = React.useRef(null);
+      const lock = React.useRef(false);
+      const currentTicket = target ? items.find(row => row.id === target) ?? (target === ticket?.id ? ticket : { id: target }) : undefined;
+      const ticketOptions = boundTarget ? (currentTicket ? [currentTicket] : []) : items;
+      const needsRoom = Boolean(target) && !Boolean(currentTicket?.taskRoom?.id || currentTicket?.workflow?.workspaceId || currentTicket?.workspaceId);
+      const agentWorkspace = mvValidWorkspaceId(agent?.workspaceId) ? agent.workspaceId : undefined;
+      const lookupTarget = needsRoom && !agentWorkspace ? target : '';
+      const workspaceLookup = lookupTarget && workspaceResult?.target === lookupTarget ? workspaceResult : null;
+      const workspaceOptions = workspaceLookup?.options;
+      const roomWorkspaceId = agentWorkspace ?? (workspaceOptions?.length === 1 ? workspaceOptions[0].id :
+        workspaceOptions?.find(ws => ws.id === chosenWorkspace)?.id);
+      const workspaceId = currentTicket?.workflow?.workspaceId ?? currentTicket?.taskRoom?.workspaceId ?? currentTicket?.workspaceId ?? roomWorkspaceId;
+      const roster = rosters[workspaceId];
+      const rosterKeys = [roster?.leaderId, roster?.coderId, roster?.reviewerId, ...(roster?.members ?? []),
+        ...Object.values(currentTicket?.workflow?.plan?.members ?? {})];
+      const names = [...new Set([agent.name, ...agents.filter(row => (workspaceId && row.workspaceId === workspaceId) ||
+        rosterKeys.some(key => typeof key === 'string' && (row.agentKey === key || row.agentKey.endsWith('/' + key)))).map(row => row.name)].filter(Boolean))];
+      const requiresTarget = mvRequiresGuidanceTarget(tasks);
+      // The endpoint accepts text, so send @member instructions as explicit lines.
+      const text = [guidance.trim(), ...Object.entries(instructions).filter(([, value]) => value.trim())
+        .map(([name, value]) => '@' + name + ' ' + value.trim())].filter(Boolean).join('\n\n');
+      const close = () => { if (!lock.current) runtime.modal.set(null); };
+      React.useEffect(() => {
+        const dialog = dialogRef.current;
+        try { dialog?.showModal?.(); } catch {}
+        return () => { if (dialog?.open) dialog.close(); };
+      }, []);
+      React.useEffect(() => {
+        if (!lookupTarget || runtime.signal.aborted) return;
+        let active = true;
+        setWorkspaceResult(null);
+        void mvReadTicketWorkspaces(runtime.signal).then(options => {
+          if (active && !runtime.signal.aborted) setWorkspaceResult({ target: lookupTarget, options });
+        }, error => {
+          if (active && !runtime.signal.aborted) setWorkspaceResult({ target: lookupTarget, error: mvTaskError(error, '读取工单工作区失败') });
+        });
+        return () => { active = false; };
+      }, [lookupTarget, runtime.signal]);
+      const cannotSubmit = conflict || !text || text.length > 3000 || (!target && requiresTarget) || (needsRoom && !roomWorkspaceId);
+      const submit = async event => {
+        event.preventDefault();
+        if (lock.current || status?.ok || cannotSubmit) return;
+        // Keep the confirmed task IDs, but reject a link change observed while
+        // the dialog was open rather than applying its old target to those IDs.
+        const currentRows = runtime.tasks(agent.agentKey).getSnapshot().rows;
+        const currentById = new Map(currentRows.map(task => [task.id, task]));
+        if (tasks.some(task => currentById.has(task.id) &&
+          (currentById.get(task.id).linkedTicketId || '') !== (task.linkedTicketId || ''))) {
+          setStatus({ text: '任务关联已变更，请关闭弹窗后重新选择。' });
+          return;
+        }
+        lock.current = true; setBusy(true); setStatus(null);
+        let openingRoom = needsRoom;
+        try {
+          if (openingRoom) {
+            const result = await fetchJson('marshal/task-rooms/open', { taskId: target, workspaceId: roomWorkspaceId }, true, runtime.signal);
+            if (runtime.signal.aborted) return;
+            if (!result?.room?.id) throw Error('未确认工单群已绑定。');
+            openingRoom = false;
+          }
+          await mvSubmitGuidance({ agentKey: agent.agentKey, tasks, targetTicketId: target, guidanceText: text }, runtime.signal);
+          if (runtime.signal.aborted) return;
+          setStatus({ ok: true, text: target ? '已同步指导至 ' + mvTicketLabel(currentTicket) + '，已唤醒工单。' :
+            '已同步指导至 1:1 直连会话。' });
+          onSuccess?.();
+          void runtime.refreshTasks(agent.agentKey);
+        } catch (error) {
+          if (!runtime.signal.aborted) setStatus({ text: openingRoom ? mvTaskError(error, '打开目标工单群失败') :
+            error?.code === 'direct-session-not-found' ? '请先建立智能体的 1:1 直连会话。' : mvTaskError(error, '未确认同步，请先核对目标会话') });
+        } finally { lock.current = false; if (!runtime.signal.aborted) setBusy(false); }
+      };
+      return h('dialog', { ref: dialogRef, className: 'mv-scope mv-dialog mv-guidance-dialog', 'aria-labelledby': 'mv-guidance-title',
+        onCancel: event => { event.preventDefault(); close(); } },
+        h('form', { className: 'mv-stack', onSubmit: submit },
+          h('div', { className: 'mv-line' }, h('h2', { id: 'mv-guidance-title', className: 'mv-copy mv-voice-title' }, mvGuidanceLabel(currentTicket)),
+            h(MvButton, { icon: 'close', iconOnly: true, label: '关闭同步指导', disabled: busy, onClick: close })),
+          h('span', { className: 'mv-muted' }, '智能体：' + agent.name),
+          h('div', { className: 'mv-actions' }, tasks.map(task => h('span', { key: task.id, className: 'mv-model' }, task.title)),
+            !tasks.length && h('span', { className: 'mv-muted' }, '未绑定任务')),
+          h('label', { className: 'mv-stack' }, '同步目标',
+            h('select', { className: 'mv-field', value: target, required: requiresTarget, disabled: busy || status?.ok || Boolean(boundTarget),
+              onChange: event => { setTarget(event.target.value); setChosenWorkspace(''); setInstructions({}); setStatus(null); } },
+              h('option', { value: '' }, requiresTarget ? '请选择目标工单' : '智能体 1:1 直连会话'), mvTicketOptions(ticketOptions))),
+          conflict ? h('p', { className: 'mv-danger', role: 'alert' }, MV_GUIDANCE_TICKET_CONFLICT) :
+            !target && requiresTarget && h('p', { className: 'mv-muted' }, '请先选择工单，或返回任务清单改选直连任务。'),
+          lookupTarget && (workspaceLookup?.error ? h('p', { className: 'mv-danger', role: 'alert' }, workspaceLookup.error) :
+            !workspaceOptions ? h('p', { className: 'mv-muted', role: 'status' }, '正在读取工单工作区…') :
+            !workspaceOptions.length ? h('p', { className: 'mv-danger', role: 'alert' }, '没有可用的工单工作区。') :
+            workspaceOptions.length > 1 && h('label', { className: 'mv-stack' }, '工单群工作区',
+              h('select', { className: 'mv-field', 'aria-label': '选择目标工单工作区', value: roomWorkspaceId ?? '',
+                disabled: busy || status?.ok, onChange: event => { setChosenWorkspace(event.target.value); setStatus(null); } },
+                h('option', { value: '' }, '请选择工单群工作区'),
+                workspaceOptions.map(ws => h('option', { key: ws.id, value: ws.id }, ws.title || ws.name || ws.id))),
+              !roomWorkspaceId && h('span', { className: 'mv-muted' }, '请先选择工单群工作区，再确认同步指导。'))),
+          ticketError && h('span', { className: 'mv-muted', role: 'status' }, ticketError),
+          h('label', { className: 'mv-stack' }, '决策要点', h('textarea', { className: 'mv-field', rows: 4, value: guidance,
+            disabled: busy || status?.ok, maxLength: 3000, onChange: event => setGuidance(event.target.value) })),
+          h('div', { className: 'mv-actions', role: 'group', 'aria-label': '@成员指令' }, names.map(name => h(MvButton, {
+            key: name, label: '@' + name, className: 'mv-chip', disabled: busy || status?.ok, 'aria-pressed': Object.hasOwn(instructions, name),
+            onClick: () => setInstructions(prev => { const next = { ...prev }; if (Object.hasOwn(next, name)) delete next[name]; else return { ...next, [name]: '' }; return next; }),
+          }))),
+          Object.entries(instructions).map(([name, value]) => h('label', { key: name, className: 'mv-stack' }, '@' + name + ' 的指令',
+            h('input', { className: 'mv-field', value, maxLength: 512, disabled: busy || status?.ok,
+              onChange: event => setInstructions(prev => ({ ...prev, [name]: event.target.value })) }))),
+          text.length > 3000 && h('span', { className: 'mv-danger', role: 'status' }, '决策要点和成员指令合计不能超过 3000 字。'),
+          status && h('div', { className: status.ok ? 'mv-online' : 'mv-danger', role: 'status' }, status.text),
+          h('div', { className: 'mv-actions' }, status?.ok ? h(MvButton, { label: '完成', onClick: close }) :
+            h(MvButton, { type: 'submit', icon: 'send', className: 'mv-guidance-action', label: busy ? '正在同步…' : '确认同步指导',
+              disabled: busy || cannotSubmit }))));
+    }
+    function AgentDirectChatsView({ openSession, mvOpenDirect, onOpenAgents, initialAgentId = '' }) {
       const [library, setLibrary] = React.useState(null);
       const [sessions, setSessions] = React.useState([]);
       const [selectedAgentId, setSelectedAgentId] = React.useState(initialAgentId || 'all');
@@ -1602,6 +2240,7 @@ window.__ModuleLoader__.load({
           h('div', { style: { padding: '12px 16px', borderBottom: '1px solid ' + dswTheme.border, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
             h('div', { style: { fontSize: 14, fontWeight: 600 } }, selectedAgent ? selectedAgent.name + ' · 闲聊历史' : '全部智能体单聊历史'),
             h('input', { value: search, onChange: event => setSearch(event.target.value), placeholder: '搜索历史会话标题或智能体…', style: { ...uiInput, width: 220, marginLeft: 'auto' } }),
+            selectedAgent && mvOpenDirect && h(mvDirectLink, { key: selectedAgent.id, agent: selectedAgent, open: mvOpenDirect }),
             selectedAgent && h('button', { type: 'button', disabled: busy, style: uiButton(true), onClick: () => { void startNewChat(selectedAgent); } }, busy ? '创建中…' : '＋ 新建闲聊'),
             h('button', { type: 'button', style: uiButton(false), onClick: () => { void load(); } }, '刷新')),
           error && h('div', { style: { padding: '8px 16px', color: dswTheme.danger, fontSize: 12 } }, error),
@@ -1709,7 +2348,7 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function MarshalPanel({ marshalContext, openSession, openPanel, workspaceService, SessionProvider, renderSlot }) {
+    function MarshalPanel({ marshalContext, openSession, openPanel, mvOpenDirect, workspaceService, SessionProvider, renderSlot }) {
       const [attempt, retry] = React.useState(0);
       const initialNav = React.useMemo(() => {
         if (pendingTab) {
@@ -2024,7 +2663,7 @@ window.__ModuleLoader__.load({
             chatSection === 'taskRooms' && h(MarshalErrorBoundary, { resetKey: 'taskRooms-' + (roomTask?.id ?? 'archive') },
               h(TaskRoomsPage, { key: roomTask?.id ?? 'archive', task: roomTask, openBoard })),
             chatSection === 'direct' && h(MarshalErrorBoundary, { resetKey: 'direct' },
-              h(AgentDirectChatsView, { openSession, onOpenAgents: () => chooseTab('agents') })),
+              h(AgentDirectChatsView, { openSession, mvOpenDirect, onOpenAgents: () => chooseTab('agents') })),
             chatSection === 'remote' && h('div', { style: { display: 'flex', flex: 1, minHeight: 0 } },
               address && h('iframe', { ref: iframe, onLoad: connect, title: '调度官设备与群聊', src: address,
                 sandbox: 'allow-scripts allow-same-origin allow-forms', allow: 'clipboard-write', referrerPolicy: 'no-referrer',
@@ -2056,10 +2695,10 @@ window.__ModuleLoader__.load({
               !address && h('p', { role: 'status', style: { margin: 'auto', padding: 24 } }, notice)))),
         tab === 'agents' && h('div', { style: { flex: 1, minHeight: 0, minWidth: 0, width: '100%', overflow: 'hidden', display: 'flex' } },
           h(MarshalErrorBoundary, { resetKey: 'agents' },
-            h(AgentsPage, { onOpenChats: () => chooseTab('chats'), onOpenMemory: openAgentMemory, openSession, workspaceService, initialSubTab: agentSub }))),
+            h(AgentsPage, { onOpenChats: () => chooseTab('chats'), onOpenMemory: openAgentMemory, openSession, mvOpenDirect, workspaceService, initialSubTab: agentSub }))),
         tab === 'memory' && h('div', { style: { flex: 1, minHeight: 0, minWidth: 0, width: '100%', overflow: 'hidden', display: 'flex' } },
           h(MarshalErrorBoundary, { resetKey: 'memory' },
-            h(MemoryPage, { initialAgentId: memoryTarget.agentId, initialLayer: memoryTarget.layer }))),
+            h(MemoryPage, { initialAgentId: memoryTarget.agentId, initialLayer: memoryTarget.layer, mvOpenDirect }))),
         h(DeviceStatusDrawer, {
           open: deviceDrawerOpen,
           onClose: () => setDeviceDrawerOpen(false),
@@ -6835,7 +7474,7 @@ window.__ModuleLoader__.load({
                   controlsLocked || (!leader && !remote)))))));
     }
 
-    function AgentsPage({ onOpenChats, onOpenMemory, openSession, workspaceService, initialSubTab = 'pool' }) {
+    function AgentsPage({ onOpenChats, onOpenMemory, openSession, mvOpenDirect, workspaceService, initialSubTab = 'pool' }) {
       const [subTab, setSubTab] = React.useState(initialSubTab === 'rosters' ? 'rosters' : 'pool');
       const [library, setLibrary] = React.useState(null);
       const [extraWorkspaces, setExtraWorkspaces] = React.useState([]);
@@ -7214,6 +7853,7 @@ window.__ModuleLoader__.load({
                           h('span', { style: { fontSize: 10, color: dswTheme.faint, border: '1px solid ' + dswTheme.border2, borderRadius: 999, padding: '2px 8px' } }, selectedAgent.permission || 'workspace-write')),
                         h('div', { style: { fontSize: 11, color: dswTheme.faint, marginTop: 4 } }, [selectedAgent.preset || '默认预设', selectedAgent.model || '默认模型'].join(' · '))),
                       h('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap' } },
+                        mvOpenDirect && h(mvDirectLink, { key: selectedAgent.id, agent: selectedAgent, open: mvOpenDirect }),
                         onOpenMemory && h('button', { type: 'button', style: uiButton(false), onClick: () => onOpenMemory(selectedAgent.id) }, '私有记忆'),
                         h('button', { type: 'button', style: uiButton(false), onClick: () => openEdit(selectedAgent) }, '编辑'),
                         h('button', { type: 'button', style: { ...uiButton(false), color: confirmId === selectedAgent.id ? dswTheme.danger : undefined }, onClick: () => { void remove(selectedAgent); } }, confirmId === selectedAgent.id ? '确认删除' : '删除'))),
@@ -7337,21 +7977,20 @@ window.__ModuleLoader__.load({
             try { void Promise.resolve(dispose()).catch(() => {}); } catch {}
           }
         };
-        const service = (owner, name) => {
-          let value;
-          try { value = owner?.get?.(name); } catch {}
-          try { return value ?? owner?.[name]; } catch { return undefined; }
-        };
-        const register = (options, Comp, list) => {
-          const slots = service(ctx, 'slots');
-          try { track(slots?.inject?.(options.name, () => slots.register(options, Comp)), list); }
+        const service = mvService;
+        const register = (options, Comp, list, slots = service(ctx, 'slots')) => {
+          try {
+            if (typeof slots?.register !== 'function') return;
+            track(typeof slots.inject === 'function'
+              ? slots.inject(options.name, () => slots.register(options, Comp)) : slots.register(options, Comp), list);
+          }
           catch {} // Optional slots are not declared in all host versions.
         };
         const routes = createMvStore(null);
         const routeLifetime = new AbortController();
         const openSessionRef = { current: undefined };
         const layoutRef = { current: undefined };
-        let desktopContext, nativeContext, tabTimer;
+        let desktopContext, nativeContext, tabTimer, mvCancelNative;
         const workspacesRef = { current: undefined };
         try {
           track(ctx.inject(['uiWorkspace'], inner => {
@@ -7380,6 +8019,7 @@ window.__ModuleLoader__.load({
           return false;
         };
         const goTab = tab => {
+          mvCancelNative?.();
           pendingTab = tab;
           routes.set(null);
           openPanel(PANEL);
@@ -7390,6 +8030,7 @@ window.__ModuleLoader__.load({
           }, 60);
         };
         const openRoom = (kind, item) => {
+          mvCancelNative?.();
           clearTimeout(tabTimer);
           pendingTab = null;
           const route = { kind, item };
@@ -7397,35 +8038,26 @@ window.__ModuleLoader__.load({
           openPanel(PANEL);
           try { window.dispatchEvent(new CustomEvent('marshal:room', { detail: route })); } catch {}
         };
-        const onOpenAgentDirect = async (agent, preferNative = false) => {
-          if (!preferNative) {
-            openRoom('direct', agent);
-            return;
-          }
+        const mvDirectLookups = new Map();
+        const onOpenAgentDirect = (agent, canOpen) => {
+          const key = agent.agentKey;
+          if (mvDirectLookups.has(key)) return mvDirectLookups.get(key);
           const { signal } = routeLifetime;
-          try {
-            // Only the direct-session endpoint excludes ticket and other non-direct runs.
-            const result = await fetchJson('marshal/agent-direct-sessions?' + new URLSearchParams({ agentKey: agent.agentKey }),
-              undefined, true, signal);
-            if (signal.aborted) return;
-            let id = result?.mainSession?.sessionId ?? result?.mainSession?.id;
-            const open = openSessionRef.current;
-            if (result?.mainSession === null && agent.teamId && agent.agentId) {
-              if (!open) return '宿主无法打开 1:1 直连会话。';
-              // Ordinary member runs are not eligible for direct sessions or guidance sync.
-              const created = await fetchJson('dsh-agents/api/run', {
-                teamId: agent.teamId, memberId: agent.agentId, purpose: 'direct',
-              }, false, signal);
-              if (signal.aborted) return;
-              id = created?.run?.sessionId;
-              if (typeof id !== 'string' || !id.trim()) return '未能创建 1:1 直连会话。';
-            }
-            if (typeof id !== 'string' || !id.trim()) return '暂无 1:1 直连会话。';
-            if (!open || await open(id) === false) return '宿主无法打开 1:1 直连会话。';
-          } catch {
-            if (!signal.aborted) return '无法打开 1:1 直连会话，请稍后重试。';
-          }
+          const resolve = async () => {
+            // Overview may point at a ticket run; only the direct endpoint proves ownership.
+            const result = await mvRead(mvAgentQuery('agent-direct-sessions', key), signal);
+            if (result?.mainSession !== null || !agent.teamId || !agent.agentId || !canOpen()) return result?.mainSession &&
+              { sessionId: mvSessionId(result.mainSession), agentKey: result.agentKey };
+            const created = await fetchJson('dsh-agents/api/run', {
+              teamId: agent.teamId, memberId: agent.agentId, purpose: 'direct',
+            }, false, signal);
+            return { sessionId: created?.run?.sessionId, agentKey: result.agentKey };
+          };
+          const request = resolve().finally(() => mvDirectLookups.delete(key));
+          mvDirectLookups.set(key, request);
+          return request;
         };
+        let mvNativeDirect;
         const MarshalDesktopPanel = props => {
           // The default panel still works on hosts without the vNext sidebar slots.
           const route = typeof React.useSyncExternalStore === 'function' ? useMvSnapshot(routes) : null;
@@ -7437,7 +8069,8 @@ window.__ModuleLoader__.load({
             h(MarshalErrorBoundary, { resetKey: key },
               h('div', { className: 'mv-room-fill' },
                 kind === 'taskRooms' ? h(TaskRoomsPage, { key, task: { id: item.taskId, title: item.title, taskRoom: item }, openBoard: () => goTab('tasks') })
-                  : kind === 'direct' ? h(AgentDirectChatsView, { key, initialAgentId: item.agentId, openSession: props.openSession, onOpenAgents: () => goTab('agents') })
+                  : kind === 'direct' ? h(AgentDirectChatsView, { key, initialAgentId: item.agentId, openSession: props.openSession,
+                    mvOpenDirect: props.mvOpenDirect, onOpenAgents: () => goTab('agents') })
                     : h(MarshalSidebarGroupRoom, { key, route, ownerSignal: routeLifetime.signal }))));
         };
         register({
@@ -7450,6 +8083,7 @@ window.__ModuleLoader__.load({
           inject: () => ({
             marshalContext: desktopContext ?? nativeContext ?? ctx,
             openSession: sessionId => openSessionRef.current?.(sessionId),
+            mvOpenDirect: agent => mvNativeDirect?.(agent),
             openPanel,
             workspaceService: () => {
               if (workspacesRef.current) return workspacesRef.current;
@@ -7493,9 +8127,115 @@ window.__ModuleLoader__.load({
             track(target, lifetime);
             const voiceLayer = createMvStore(null);
             const idleVoice = createMvStore(mvVoiceIdle);
+            const runtime = mvCreateAgentTasks();
+            track(runtime, lifetime);
+            const rightbar = () => service(ctx, 'sidebarRight') ?? service(desktopContext, 'sidebarRight');
+            const navCtx = { layout: { selectPanel: openPanel }, get sidebarRight() { return rightbar(); } };
+            let mvNavigationAttempt;
+            let mvDockMounted = false;
+            let mvTasksTabRegistered = false;
+            mvCancelNative = () => {
+              mvNavigationAttempt?.abort();
+              runtime.drawer.set(null);
+            };
+            const canOpenNative = () => Boolean(openSessionRef.current || typeof service(ctx, 'uiWorkspace')?.openSession === 'function');
+            const openNative = (agent, sessionId) => {
+              if (routeLifetime.signal.aborted) return;
+              mvCancelNative();
+              mvNavigationAttempt = new AbortController();
+              const { signal } = mvNavigationAttempt;
+              return mvOpenAgentDirectSession({
+                agent, sessionId, ctx: navCtx, onOpenAgentDirect: row => onOpenAgentDirect(row, canOpenNative),
+                openSessionRef, uiWorkspace: service(ctx, 'uiWorkspace'),
+                mvFocusedAgentStore: runtime.focus, signal,
+                openDrawer: (owner, id, signal) => {
+                  routes.set(null);
+                  const service = rightbar();
+                  if (!service && !mvTasksTabRegistered) return; // Slim host with no rightbar.
+                  if (mvDockMounted && typeof service?.active === 'function' && typeof service?.screen !== 'function') {
+                    runtime.drawer.set(id);
+                    return;
+                  }
+                  return mvOpenTasksTab(owner, { sessionId: id, signal });
+                },
+              });
+            };
+            mvNativeDirect = agent => openNative({
+              ...agent, agentKey: agent.agentKey ?? `${agent.teamId ?? agent.squadId}/${agent.agentId ?? agent.id}`,
+              teamId: agent.teamId ?? agent.squadId, agentId: agent.agentId ?? agent.id,
+            });
+            const openSidebarAgent = (agent, fromPrimary) => {
+              if (!canOpenNative() && !fromPrimary) { openRoom('direct', agent); return; }
+              return mvNativeDirect(agent);
+            };
+            const navigation = {
+              openAgent: agent => mvNativeDirect?.(agent),
+              openDrawer: options => mvOpenTasksTab(navCtx, options),
+              async openSubSession(agent, id, taskId) {
+                const message = await openNative(agent, id);
+                if (message) throw Error(message);
+                if (!runtime.signal.aborted && runtime.focus.getSnapshot()?.navigationSessionId === id) {
+                  runtime.setSelection(agent.agentKey, () => ({ focusedId: taskId, selected: [] }));
+                }
+              },
+              async openTicket(id, card, agent, chosenWorkspaceId) {
+                if (runtime.signal.aborted) return;
+                const ticket = runtime.tickets.getSnapshot().items.find(row => row.id === id);
+                let room = [card?.taskRoom, sidebar.getSnapshot().rooms.find(row => row.taskId === id && row.id),
+                  ticket?.taskRoom].find(row => row?.id);
+                if (!room) {
+                  card ??= ticket;
+                  let workspaceId = [card?.workflow?.workspaceId, card?.workspaceId, agent?.workspaceId, chosenWorkspaceId].find(mvValidWorkspaceId);
+                  if (!workspaceId) {
+                    const options = await mvReadTicketWorkspaces(runtime.signal);
+                    if (runtime.signal.aborted) return;
+                    if (options.length > 1) return options;
+                    if (!options.length) throw Error('没有可用的工单工作区。');
+                    workspaceId = options[0].id;
+                  }
+                  room = (await fetchJson('marshal/task-rooms/open', { taskId: id, workspaceId }, true, runtime.signal))?.room;
+                  if (!runtime.signal.aborted && !room?.id) throw Error('未确认工单群已绑定。');
+                }
+                if (!runtime.signal.aborted && room?.id) openRoom('taskRooms', room);
+              },
+            };
+            const agentSlots = { runtime, voiceLayer, idleVoice, navigation };
+            const AgentTasksRightbarTab = props => h(mvAgentTasksRightbarTab, { ...props, ...agentSlots });
+            const AgentComposerDockBar = props => h(mvAgentComposerDockBar, { ...props, ...agentSlots });
+            const installTasksTab = registry => {
+              const resources = [];
+              try {
+                const slots = service(ctx, 'slots');
+                if (!slots?.register || !registry?.register) return;
+                track(mvRegisterTasksTab(registry), resources);
+                register({ name: 'sidebar.right.pane.tab', key: MV_TASK_TAB_ID }, AgentTasksRightbarTab, resources, slots);
+                mvTasksTabRegistered = true;
+              } catch { clean(resources); }
+              return () => { mvTasksTabRegistered = false; clean(resources); };
+            };
+            try {
+              const registry = service(ctx, 'sidebarRightTabs');
+              if (registry) track(installTasksTab(registry), lifetime);
+              else track(ctx.inject?.(['sidebarRightTabs'], inner => installTasksTab(service(inner, 'sidebarRightTabs'))), lifetime);
+            } catch {}
+            try {
+              const slots = service(ctx, 'slots');
+              const options = { name: 'conversation.input.dock', id: MV_TASK_TAB_ID, order: 30 };
+              const mountDock = () => {
+                const handle = slots.register(options, AgentComposerDockBar);
+                mvDockMounted = true;
+                return handle;
+              };
+              if (typeof slots?.register === 'function') track(typeof slots.inject === 'function'
+                ? slots.inject(options.name, mountDock) : mountDock(), lifetime);
+            } catch {}
             let closed = false;
             track(() => {
               closed = true;
+              mvDockMounted = false;
+              mvNativeDirect = undefined;
+              mvCancelNative?.();
+              mvCancelNative = undefined;
               voiceLayer.getSnapshot()?.dispose();
               voiceLayer.set(null);
               voiceLayer.clear();
@@ -7503,6 +8243,7 @@ window.__ModuleLoader__.load({
             const PanelItem = props => h(MarshalSidebarPanelItem, { ...props, sidebar, openPanel });
             const MountedVoiceLayer = () => {
               const voice = useMvSnapshot(voiceLayer);
+              const guidance = useMvSnapshot(runtime.modal);
               React.useEffect(() => {
                 if (closed) return;
                 const provider = createLocalVoiceSessionProvider();
@@ -7512,12 +8253,14 @@ window.__ModuleLoader__.load({
                   if (voiceLayer.getSnapshot() === provider) voiceLayer.set(null);
                 };
               }, []);
-              return h(React.Fragment, null, voice && h(MarshalVoiceCallOverlay, { voice }),
-                h(MarshalSidebarPortal, { target, sidebar, openRoom, onOpenAgentDirect }));
+              return h(React.Fragment, null, voice && h(MarshalVoiceCallOverlay, { voice,
+                guidanceRuntime: mvTasksTabRegistered || guidance ? runtime : undefined }),
+                guidance && h(mvSyncGuidanceModal, { runtime, data: guidance }),
+                h(MarshalSidebarPortal, { target, sidebar, openRoom, onOpenAgentDirect: openSidebarAgent }));
             };
             const SessionAction = props => {
               const voice = useMvSnapshot(voiceLayer);
-              return h(MarshalSessionActionHoc, { ...props, sidebar, voice: voice ?? idleVoice, onOpenAgentDirect,
+              return h(MarshalSessionActionHoc, { ...props, sidebar, voice: voice ?? idleVoice, onOpenAgentDirect: openSidebarAgent,
                 voiceAvailable: Boolean(voice) });
             };
             register({ name: 'sidebar.panellist', id: PANEL, order: 25, label: () => '调度官' }, PanelItem, lifetime);

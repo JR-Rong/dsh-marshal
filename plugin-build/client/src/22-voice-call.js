@@ -61,7 +61,7 @@
       };
       const action = async (kind, targetTicketId) => {
         const call = session;
-        const { status, agent, summary, busy, savedId } = get();
+        const { status, agent, summary, busy, savedId, savedTask } = get();
         const text = summary?.trim();
         if (!call || status !== 'summary' || !text || busy ||
           (kind === 'save' ? Boolean(savedId) : get().synced || (!targetTicketId && !savedId))) return;
@@ -69,17 +69,18 @@
         patch({ busy: kind, message: '' });
         try {
           if (kind === 'save') {
-            const result = await fetchJson('marshal/agent-tasks/create', {
+            const draft = {
               agentKey: agent.agentKey, type: 'direct', title: ('语音纪要 · ' + agent.name).slice(0, 512),
               lastSummary: text, ...(targetTicketId ? { linkedTicketId: targetTicketId } : {}),
-            }, true, signal);
+            };
+            const result = await fetchJson('marshal/agent-tasks/create', draft, true, signal);
             if (!result.task?.id) throw Error('Missing task id');
-            if (session === call) patch({ savedId: result.task.id, message: '已保存为 1:1 任务。' });
+            if (session === call) patch({ savedId: result.task.id, savedTask: { ...draft, ...result.task }, message: '已保存为 1:1 任务。' });
           } else {
             await fetchJson('marshal/agents/guidance-sync', {
               agentKey: agent.agentKey, guidanceText: text,
               ...(savedId ? { taskIds: [savedId] } : {}),
-              ...(targetTicketId ? { targetTicketId } : {}),
+              ...(targetTicketId ? { targetTicketId, wakeTicket: savedTask?.linkedTicketId === targetTicketId } : {}),
             }, true, signal);
             if (session === call) patch({ synced: true, message: '已同步指导。' });
           }
@@ -91,11 +92,11 @@
       };
       return {
         getSnapshot: get, subscribe: store.subscribe, local: adapter.local === true,
-        async start(agent, { targetTicketId } = {}) {
+        async start(agent, { targetTicketId, ticketNo } = {}) {
           if (disposed || get().status !== 'idle' || !agent?.agentKey) return;
           const call = { connection: new AbortController(), ending: new AbortController(), actions: new AbortController() };
           session = call;
-          store.set({ status: 'connecting', agent, targetTicketId, expanded: true, muted: false, notes: '', transcript: [] });
+          store.set({ status: 'connecting', agent, targetTicketId, ticketNo, expanded: true, muted: false, notes: '', transcript: [] });
           if (session !== call) return;
           try {
             await adapter.connect({ agent, signal: call.connection.signal, onTranscript(line) {
@@ -129,6 +130,9 @@
         },
         saveSummary() { return action('save', get().targetTicketId); },
         syncGuidance() { return action('sync', get().targetTicketId); },
+        confirmGuidance(snapshot) {
+          if (get() === snapshot && snapshot.status === 'summary') patch({ synced: true, message: '已同步指导。' });
+        },
         close() { if (get().status === 'summary' && !get().busy) reset(); },
         dispose() {
           if (disposed) return;
@@ -172,7 +176,20 @@
         lines.length ? lines.map((line, index) => h('div', { key: index }, h('strong', null, line.speaker + '：'), line.text))
           : h('span', { className: 'mv-muted' }, '暂无对话记录'));
     }
-    function MarshalVoiceSummaryCard({ voice, call }) {
+    function mvVoiceGuidanceAction({ voice, call, runtime }) {
+      const state = mvUseAgentTasks(runtime, call.agent.agentKey);
+      const { items } = useMvSnapshot(runtime.tickets);
+      const { tasks: selected, ticket } = mvSelection(state, items);
+      // Keep a saved, unlinked summary usable for direct sync, but never add
+      // an unselected ticket-bound summary or reuse the call's initial target.
+      const saved = state.rows.find(task => task.id === call.savedId) ?? call.savedTask;
+      const tasks = selected.length ? selected : saved && !saved.linkedTicketId ? [saved] : [];
+      return h(MvButton, { icon: 'send', className: 'mv-guidance-action', label: call.synced ? '已同步' : mvGuidanceLabel(ticket),
+        disabled: Boolean(call.busy || call.synced || !call.summary.trim()),
+        onClick: () => runtime.showModal({ agent: call.agent, tasks, ticket,
+          guidanceText: call.summary, onSuccess: () => voice.confirmGuidance(call) }) });
+    }
+    function MarshalVoiceSummaryCard({ voice, call, guidanceRuntime }) {
       const canSync = Boolean(call.targetTicketId || call.savedId);
       return h('section', { id: 'marshal-voice-detail', className: 'mv-summary-card mv-stack', role: 'region', 'aria-label': '语音纪要' },
         h('div', { className: 'mv-line' }, h(MvAvatar, { agent: call.agent }),
@@ -182,17 +199,18 @@
           h('textarea', { className: 'mv-field', rows: 4, maxLength: 3000, value: call.summary,
             readOnly: Boolean(call.busy || (call.savedId && call.synced)), onChange: event => voice.editSummary(event.target.value) })),
         call.transcript.length > 0 && h('details', null, h('summary', null, '对话记录'), h(MvVoiceTranscript, { lines: call.transcript })),
-        h('div', { className: 'mv-muted' }, call.targetTicketId ? '同步目标：关联工单群' :
+        !guidanceRuntime && h('div', { className: 'mv-muted' }, call.targetTicketId ? '同步目标：关联工单群' :
           canSync ? '同步目标：智能体 1:1 直连会话' : '先保存为任务，再同步至智能体的 1:1 会话。'),
         h('div', { className: 'mv-actions' },
           h(MvButton, { icon: 'save', label: call.savedId ? '已保存' : '保存为 1:1 任务',
             disabled: Boolean(call.busy || call.savedId || !call.summary.trim()), onClick: () => void voice.saveSummary() }),
-          h(MvButton, { icon: 'send', label: call.synced ? '已同步' : '汇总同步指导',
+          guidanceRuntime ? h(mvVoiceGuidanceAction, { voice, call, runtime: guidanceRuntime }) :
+            h(MvButton, { icon: 'send', label: call.synced ? '已同步' : '汇总同步指导',
             disabled: Boolean(call.busy || call.synced || !canSync || !call.summary.trim()), onClick: () => void voice.syncGuidance() }),
           h(MvButton, { icon: 'close', label: '关闭', disabled: Boolean(call.busy), onClick: () => voice.close() })),
         h('div', { className: 'mv-muted', role: 'status' }, call.busy ? '正在提交…' : call.message));
     }
-    function MarshalVoiceCallOverlay({ voice }) {
+    function MarshalVoiceCallOverlay({ voice, guidanceRuntime }) {
       const call = useMvSnapshot(voice);
       if (call.status === 'idle') return call.message ? h('div', { className: 'mv-scope mv-voice-dock' },
         h('section', { className: 'mv-voice-panel mv-line' },
@@ -206,7 +224,7 @@
           'aria-expanded': call.expanded, 'aria-controls': call.expanded ? 'marshal-voice-detail' : undefined,
           onClick: () => voice.setExpanded(!call.expanded) },
           label + ' · ' + call.agent.name, h(MvVoiceTimer, { call })),
-        call.expanded && (summary ? h(MarshalVoiceSummaryCard, { voice, call })
+        call.expanded && (summary ? h(MarshalVoiceSummaryCard, { voice, call, guidanceRuntime })
           : h('section', { id: 'marshal-voice-detail', className: 'mv-voice-panel mv-stack', role: 'region', 'aria-label': '语音小会话' },
             h('div', { className: 'mv-line' },
               h(MvAvatar, { agent: call.agent, breathing: call.status === 'active' && !call.muted }),
