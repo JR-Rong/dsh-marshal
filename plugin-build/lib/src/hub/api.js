@@ -1,8 +1,9 @@
 import { ControlsSchema } from "../agents/controls.js";
 import { AccountLoginError } from "./account.js";
+import { controllerCommandAllowed, createPhoneHub, onceDecisionIds, parseBearer } from "./phone.js";
 import { DeviceStateError } from "./devices.js";
 import { DiscussionError } from "../discussions/types.js";
-import { handleMemorySyncMigrate, handleMemorySyncPull, handleMemorySyncPush } from "./memory-sync.js";
+import { accountOwnerForDevice, handleMemorySyncMigrate, handleMemorySyncPull, handleMemorySyncPush } from "./memory-sync.js";
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { COMMAND_OPS } from "../wire/frames.js";
 import { parseCommandArgs } from "../wire/commands.js";
@@ -383,6 +384,27 @@ export function registerMarshalRoutes(options) {
     const csrfCookieName = desktopEmbed ? DESKTOP_CSRF_COOKIE : CSRF_COOKIE;
     const now = options.now ?? Date.now;
     const publicOrigin = options.publicOrigin ?? '';
+    const phone = options.phone ?? (options.deviceStore
+        ? createPhoneHub({
+            now,
+            store: options.deviceStore,
+            nodeConnection: id => registry.get(id)?.connectionId,
+            accountOwnerForNode: accountOwnerForDevice,
+            findNode: (tokenDigest) => {
+                const row = options.deviceStore?.findByTokenDigest(tokenDigest);
+                return row !== undefined && row.role !== 'phone' ? row : undefined;
+            },
+        })
+        : undefined);
+    const phoneFrom = (req) => {
+        if (phone === undefined)
+            return undefined;
+        const parsed = parseBearer(headerValue(req, 'authorization'));
+        if (parsed?.kind !== 'phone')
+            return undefined;
+        const auth = phone.authenticate(parsed.token);
+        return auth.ok ? auth : undefined;
+    };
     const operatorId = options.operatorId ?? 'operator-unbound';
     // 游标 epoch 以中继历史缓冲为准，保证 hello.ack、reset 与 id 行走同一个代次。
     const hubEpoch = relay.historyEpoch();
@@ -390,6 +412,18 @@ export function registerMarshalRoutes(options) {
     const idleMs = options.sessionIdleMs ?? SESSION_IDLE_MS;
     const failureDelayMs = options.loginFailureDelayMs ?? 250;
     const disposers = [];
+    disposers.push(relay.subscribe((event) => {
+        if (phone === undefined) return;
+        const payload = typeof event.payload === 'object' && event.payload !== null ? event.payload : {};
+        const requestId = typeof payload.requestId === 'string' ? payload.requestId : '';
+        if (!requestId) return;
+        if (event.kind === 'input.resolved') phone.forgetCard(requestId);
+        if (event.kind === 'input.requested') {
+            const card = onceDecisionIds(payload);
+            const expiresAt = typeof payload.expiresAt === 'number' && Number.isFinite(payload.expiresAt) ? payload.expiresAt : undefined;
+            if (card) phone.rememberCard(requestId, card, expiresAt);
+        }
+    }));
     // 每条 SSE 流一个清理函数：取消订阅、清心跳，并把自己从集合里移除。
     const streams = new Set();
     const sessionStreams = new Map();
@@ -415,7 +449,7 @@ export function registerMarshalRoutes(options) {
         const token = header.slice(7).trim();
         if (token === '' || options.deviceStore === undefined) return undefined;
         const device = options.deviceStore.findByTokenDigest(digest(token).toString('hex'));
-        if (device === undefined || device.revoked) return undefined;
+        if (device === undefined || device.revoked || device.role === 'phone') return undefined;
         return device;
     };
     const sessionAlive = (session, at) => at - session.createdAt < absoluteMs && at - session.lastSeenAt < idleMs;
@@ -782,9 +816,14 @@ export function registerMarshalRoutes(options) {
             methodNotAllowed(res, 'GET');
             return;
         }
-        if (authorize(req, res, readAccess) === undefined)
+        if (parseBearer(headerValue(req, 'authorization'))?.kind === 'node') {
+            deny(res, 401, 'unauthorized');
             return;
-        json(res, 200, { devices: registry.list(now()).map(row => publicDevice({ ...row, name: options.deviceStore?.findById(row.id)?.name ?? row.name }, relay, sync, options.inventories?.get(row.id))) });
+        }
+        if (phoneFrom(req) === undefined && authorize(req, res, readAccess) === undefined)
+            return;
+        const phones = phone?.listPhones() ?? [];
+        json(res, 200, { devices: registry.list(now()).map(row => publicDevice({ ...row, name: options.deviceStore?.findById(row.id)?.name ?? row.name }, relay, sync, options.inventories?.get(row.id))), phones });
     }));
     const crossGroups = options.crossGroups;
     const crossAuth = (req, res, write) => {
@@ -843,6 +882,20 @@ export function registerMarshalRoutes(options) {
             json(res, 400, { ok: false, code: error instanceof Error ? error.message : 'send-failed' });
         }
     }));
+    register('/marshal/api/task-rooms', guard(async (req, res) => {
+        if (req.method !== 'POST') { methodNotAllowed(res, 'POST'); return; }
+        const device = deviceFromBearer(req);
+        if (!device) { deny(res, 401, 'unauthorized'); return; }
+        if (!options.taskRooms) { deny(res, 503, 'task-rooms-unavailable'); return; }
+        const read = await readJsonBody(req, res, 512 * 1024);
+        if (!read.ok) return;
+        try { json(res, 200, { ok: true, ...await options.taskRooms.handle(device, read.value) }); }
+        catch (error) {
+            const code = typeof error?.code === 'string' && /^[a-z-]{2,64}$/.test(error.code) ? error.code : 'invalid-task-room';
+            const httpStatus = code === 'workspace-forbidden' ? 403 : code === 'task-room-not-found' ? 404 : 400;
+            json(res, httpStatus, { ok: false, code, message: code === 'invalid-task-room' ? '工单群请求或存储不可用。' : error.message });
+        }
+    }));
     register('/marshal/api/memory-sync/push', guard(async (req, res) => {
         await handleMemorySyncPush(req, res, { memorySync, deviceFromRequest: deviceFromBearer, operatorId });
     }));
@@ -875,12 +928,287 @@ export function registerMarshalRoutes(options) {
             json(res, error instanceof DeviceStateError && error.code === 'unknown-device' ? 404 : 400, { ok: false, code: 'invalid-args' });
         }
     }));
+    register('/marshal/pair', guard((req, res) => {
+        if (req.method !== 'GET' || phone === undefined) {
+            methodNotAllowed(res, 'GET');
+            return;
+        }
+        const auth = authorize(req, res, { allowToken: false, refresh: false, write: false });
+        if (auth?.kind !== 'session' || auth.session.account === undefined) {
+            json(res, 403, { ok: false, code: 'account-required' });
+            return;
+        }
+        const issued = phone.issuePairing(auth.session.account.accountHash, publicOrigin || 'https://hub.local');
+        res.writeHead(200, {
+            'content-type': 'text/html; charset=utf-8',
+            'cache-control': 'no-store',
+            'x-frame-options': 'DENY',
+            'content-security-policy': "frame-ancestors 'none'",
+            'referrer-policy': 'no-referrer',
+        });
+        res.end(pairingPage(issued.url, issued.code, issued.expiresAt, csrfCookieName));
+    }));
+    register('/marshal/api/pairing', guard(async (req, res) => {
+        if (req.method !== 'POST' || phone === undefined) {
+            methodNotAllowed(res, 'POST');
+            return;
+        }
+        if (parseBearer(headerValue(req, 'authorization'))) {
+            deny(res, 403, 'forbidden');
+            return;
+        }
+        const auth = authorize(req, res, { allowToken: false, refresh: true, write: true });
+        if (auth?.kind !== 'session' || auth.session.account === undefined) {
+            json(res, 403, { ok: false, code: 'account-required' });
+            return;
+        }
+        const accountHash = auth.session.account.accountHash;
+        const read = await readJsonBody(req, res, SMALL_BODY_LIMIT);
+        if (!read.ok)
+            return;
+        const body = asRecord(read.value) ?? {};
+        const replace = typeof body.replace === 'string' && body.replace !== '' ? body.replace : undefined;
+        json(res, 200, { ok: true, ...phone.issuePairing(accountHash, publicOrigin || 'https://hub.local', replace) });
+    }));
+    register('/marshal/api/pairing/redeem', guard(async (req, res) => {
+        if (req.method !== 'POST' || phone === undefined) {
+            methodNotAllowed(res, 'POST');
+            return;
+        }
+        const read = await readJsonBody(req, res, SMALL_BODY_LIMIT);
+        if (!read.ok)
+            return;
+        const body = asRecord(read.value);
+        if (!body || typeof body.code !== 'string' || typeof body.name !== 'string' || typeof body.installationId !== 'string') {
+            json(res, 400, { ok: false, code: 'invalid-args' });
+            return;
+        }
+        try {
+            const created = phone.redeem(body.code, body.name, body.installationId);
+            json(res, 200, { ok: true, deviceId: created.record.id, credential: created.credential });
+        }
+        catch {
+            json(res, 410, { ok: false, code: 'unknown' });
+        }
+    }));
+    register('/marshal/api/phones/revoke', guard(async (req, res) => {
+        if (req.method !== 'POST' || phone === undefined) {
+            methodNotAllowed(res, 'POST');
+            return;
+        }
+        if (authorize(req, res, { allowToken: false, refresh: true, write: true }) === undefined)
+            return;
+        const read = await readJsonBody(req, res, SMALL_BODY_LIMIT);
+        if (!read.ok)
+            return;
+        const body = asRecord(read.value);
+        if (!body || typeof body.deviceId !== 'string') {
+            json(res, 400, { ok: false, code: 'invalid-args' });
+            return;
+        }
+        try {
+            phone.revoke(body.deviceId);
+            json(res, 200, { ok: true });
+        }
+        catch {
+            json(res, 404, { ok: false, code: 'unknown-device' });
+        }
+    }));
+    register('/marshal/api/board', guard(async (req, res) => {
+        if (phone === undefined) {
+            json(res, 503, { ok: false, code: 'unsupported' });
+            return;
+        }
+        const parsed = parseBearer(headerValue(req, 'authorization'));
+        if (parsed === undefined) {
+            deny(res, 401, 'unauthorized');
+            return;
+        }
+        if (req.method === 'GET') {
+            const auth = parsed.kind === 'phone' ? phone.authenticate(parsed.token) : { ok: false, code: 'unauthorized' };
+            if (!auth.ok) {
+                deny(res, 401, 'unauthorized');
+                return;
+            }
+            json(res, 200, { ok: true, tasks: phone.tasksFor(), revisions: phone.revisions(), receipts: phone.receiptsFor(auth) });
+            return;
+        }
+        if (req.method !== 'POST') {
+            methodNotAllowed(res, 'GET, POST');
+            return;
+        }
+        const read = await readJsonBody(req, res, 65_536);
+        if (!read.ok)
+            return;
+        const body = asRecord(read.value) ?? {};
+        if (parsed.kind === 'node') {
+            const auth = phone.authenticateNode(parsed.token);
+            if (!auth.ok) {
+                deny(res, 401, 'unauthorized');
+                return;
+            }
+            const result = phone.writeTasks(auth, body);
+            json(res, 200, { ok: true, tasks: result.tasks, commands: phone.commandsFor(auth.device.id) });
+            return;
+        }
+        const auth = phone.authenticate(parsed.token);
+        if (!auth.ok) {
+            deny(res, 401, 'unauthorized');
+            return;
+        }
+        try {
+            const result = phone.writeTasks(auth, body);
+            json(res, result.conflict ? 409 : 202, {
+                ok: !result.conflict, code: result.conflict ? 'conflict' : 'queued',
+                tasks: result.tasks, revisions: phone.revisions(), commandId: result.commandId,
+            });
+        }
+        catch (error) {
+            const code = typeof error === 'object' && error !== null && error.code;
+            json(res, code === 'size-limit' ? 429 : 400, { ok: false, code: code === 'size-limit' ? 'size-limit' : 'invalid-args' });
+        }
+    }));
+    register('/marshal/api/memory', guard(async (req, res) => {
+        if (phone === undefined) {
+            json(res, 503, { ok: false, code: 'unsupported' });
+            return;
+        }
+        const parsed = parseBearer(headerValue(req, 'authorization'));
+        if (parsed === undefined) {
+            deny(res, 401, 'unauthorized');
+            return;
+        }
+        if (req.method === 'GET') {
+            const auth = parsed.kind === 'phone' ? phone.authenticate(parsed.token) : undefined;
+            if (!auth?.ok) {
+                deny(res, 401, 'unauthorized');
+                return;
+            }
+            json(res, 200, { ok: true, entries: phone.readMemory(auth) });
+            return;
+        }
+        if (req.method !== 'POST' || parsed.kind !== 'node') {
+            deny(res, 403, 'forbidden');
+            return;
+        }
+        const auth = phone.authenticateNode(parsed.token);
+        if (!auth.ok) {
+            deny(res, 401, 'unauthorized');
+            return;
+        }
+        const read = await readJsonBody(req, res, 65_536);
+        if (!read.ok)
+            return;
+        phone.writeMemory(auth, asRecord(read.value) ?? {});
+        json(res, 200, { ok: true });
+    }));
+    register('/marshal/api/roster', guard(async (req, res) => {
+        if (phone === undefined) {
+            json(res, 503, { ok: false, code: 'unsupported' });
+            return;
+        }
+        const parsed = parseBearer(headerValue(req, 'authorization'));
+        if (parsed === undefined) {
+            deny(res, 401, 'unauthorized');
+            return;
+        }
+        if (req.method === 'GET') {
+            if (parsed.kind !== 'phone' || !phone.authenticate(parsed.token).ok) {
+                deny(res, 401, 'unauthorized');
+                return;
+            }
+            json(res, 200, { ok: true, agents: phone.readRoster() });
+            return;
+        }
+        if (req.method !== 'POST' || parsed.kind !== 'node') {
+            deny(res, 403, 'forbidden');
+            return;
+        }
+        const auth = phone.authenticateNode(parsed.token);
+        if (!auth.ok) {
+            deny(res, 401, 'unauthorized');
+            return;
+        }
+        const read = await readJsonBody(req, res, 65_536);
+        if (!read.ok)
+            return;
+        json(res, 200, { ok: true, agents: phone.writeRoster(auth, asRecord(read.value)?.agents) });
+    }));
+    register('/marshal/api/push-token', guard(async (req, res) => {
+        if (req.method !== 'POST' || phone === undefined) {
+            methodNotAllowed(res, 'POST');
+            return;
+        }
+        const parsed = parseBearer(headerValue(req, 'authorization'));
+        const auth = parsed?.kind === 'phone' ? phone.authenticate(parsed.token) : undefined;
+        if (auth === undefined || !auth.ok) {
+            deny(res, 401, 'unauthorized');
+            return;
+        }
+        const read = await readJsonBody(req, res, SMALL_BODY_LIMIT);
+        if (!read.ok)
+            return;
+        const body = asRecord(read.value);
+        const provider = body?.provider;
+        if (!body || (provider !== 'apns' && provider !== 'fcm' && provider !== 'huawei') || typeof body.token !== 'string' || body.token === '') {
+            json(res, 400, { ok: false, code: 'invalid-args' });
+            return;
+        }
+        const liveTokens = body.liveTokens;
+        phone.registerPush(auth, {
+            provider,
+            token: body.token,
+            ...(typeof body.liveToken === 'string' ? { liveToken: body.liveToken } : {}),
+            ...(typeof liveTokens === 'object' && liveTokens !== null && !Array.isArray(liveTokens) ? { liveTokens } : {}),
+        });
+        json(res, 200, { ok: true });
+    }));
+    register('/marshal/api/watch', guard(async (req, res) => {
+        if (req.method !== 'POST' || phone === undefined) {
+            methodNotAllowed(res, 'POST');
+            return;
+        }
+        const parsed = parseBearer(headerValue(req, 'authorization'));
+        const auth = parsed?.kind === 'phone' ? phone.authenticate(parsed.token) : undefined;
+        if (auth === undefined || !auth.ok) {
+            deny(res, 401, 'unauthorized');
+            return;
+        }
+        const read = await readJsonBody(req, res, SMALL_BODY_LIMIT);
+        if (!read.ok)
+            return;
+        const body = asRecord(read.value);
+        if (!body || typeof body.deviceId !== 'string' || typeof body.agent !== 'string' || typeof body.sessionId !== 'string') {
+            json(res, 400, { ok: false, code: 'invalid-args' });
+            return;
+        }
+        phone.watch(auth, body.deviceId + '|' + body.agent + '|' + body.sessionId);
+        json(res, 200, { ok: true });
+    }));
+    register('/marshal/api/unwatch', guard(async (req, res) => {
+        if (req.method !== 'POST' || phone === undefined) { methodNotAllowed(res, 'POST'); return; }
+        const parsed = parseBearer(headerValue(req, 'authorization'));
+        const auth = parsed?.kind === 'phone' ? phone.authenticate(parsed.token) : undefined;
+        if (auth === undefined || !auth.ok) { deny(res, 401, 'unauthorized'); return; }
+        const read = await readJsonBody(req, res, SMALL_BODY_LIMIT);
+        if (!read.ok) return;
+        const body = asRecord(read.value);
+        if (!body || typeof body.deviceId !== 'string' || typeof body.agent !== 'string' || typeof body.sessionId !== 'string') {
+            json(res, 400, { ok: false, code: 'invalid-args' }); return;
+        }
+        phone.unwatch(auth, body.deviceId + '|' + body.agent + '|' + body.sessionId);
+        json(res, 200, { ok: true });
+    }));
     register('/marshal/api/sessions', guard((req, res) => {
         if (req.method !== 'GET') {
             methodNotAllowed(res, 'GET');
             return;
         }
-        if (authorize(req, res, readAccess) === undefined)
+        if (parseBearer(headerValue(req, 'authorization'))?.kind === 'node') {
+            deny(res, 401, 'unauthorized');
+            return;
+        }
+        if (phoneFrom(req) === undefined && authorize(req, res, readAccess) === undefined)
             return;
         const query = new URL(req.url ?? '/', 'http://localhost').searchParams;
         // 空串 `?device=` 与缺参等价。
@@ -892,8 +1220,11 @@ export function registerMarshalRoutes(options) {
             methodNotAllowed(res, 'GET, POST');
             return;
         }
-        const auth = authorize(req, res, { allowToken: false, refresh: true, write: req.method === 'POST' });
-        if (auth?.kind !== 'session')
+        const asPhone = phoneFrom(req);
+        const auth = asPhone === undefined
+            ? authorize(req, res, { allowToken: false, refresh: true, write: req.method === 'POST' })
+            : undefined;
+        if (asPhone === undefined && auth?.kind !== 'session')
             return;
         const groups = options.discussions;
         if (!groups) {
@@ -910,11 +1241,15 @@ export function registerMarshalRoutes(options) {
             if (!body.ok)
                 return;
             const data = asRecord(body.value);
-            if (!data || typeof data.action !== 'string') {
-                json(res, 400, { code: 'invalid-args' });
-                return;
-            }
-            let value;
+        if (!data || typeof data.action !== 'string') {
+            json(res, 400, { code: 'invalid-args' });
+            return;
+        }
+        if (asPhone !== undefined && (data.action === 'configure' || data.action === 'preset')) {
+            json(res, 403, { ok: false, code: 'forbidden' });
+            return;
+        }
+        let value;
             if (data.action === 'preview')
                 value = { preview: groups.preview(data.input) };
             else if (data.action === 'preset')
@@ -945,8 +1280,11 @@ export function registerMarshalRoutes(options) {
             methodNotAllowed(res, 'GET');
             return;
         }
-        const auth = authorize(req, res, { allowToken: false, refresh: false, write: false });
-        if (auth?.kind !== 'session')
+        const asPhone = phoneFrom(req);
+        const auth = asPhone === undefined
+            ? authorize(req, res, { allowToken: false, refresh: false, write: false })
+            : undefined;
+        if (asPhone === undefined && auth?.kind !== 'session')
             return;
         const groups = options.discussions;
         if (!groups) {
@@ -959,9 +1297,10 @@ export function registerMarshalRoutes(options) {
             cleanup(); };
         const unsubscribe = groups.subscribe(send);
         const timer = setInterval(() => {
-            if (!authenticate(req, { allowToken: false, refresh: false, write: false }))
-                cleanup();
-            else if (!res.write(': keepalive\n\n'))
+            const still = asPhone === undefined
+                ? authenticate(req, { allowToken: false, refresh: false, write: false }) !== undefined
+                : phoneFrom(req) !== undefined;
+            if (!still || !res.write(': keepalive\n\n'))
                 cleanup();
         }, 5000);
         timer.unref();
@@ -972,17 +1311,19 @@ export function registerMarshalRoutes(options) {
             clearInterval(timer);
             unsubscribe();
             streams.delete(cleanup);
-            sessionStreams.get(auth.session.id)?.delete(cleanup);
+            if (auth?.kind === 'session')
+                sessionStreams.get(auth.session.id)?.delete(cleanup);
             res.end();
         };
         streams.add(cleanup);
+        if (auth?.kind === 'session') {
         let set = sessionStreams.get(auth.session.id);
         if (!set) {
             set = new Set();
             sessionStreams.set(auth.session.id, set);
         }
-        ;
         set.add(cleanup);
+        }
         res.on('close', cleanup);
         res.on('error', cleanup);
         send();
@@ -992,7 +1333,8 @@ export function registerMarshalRoutes(options) {
             methodNotAllowed(res, 'POST');
             return;
         }
-        if (authorize(req, res, { allowToken: true, refresh: true, write: true }) === undefined)
+        const asPhone = phoneFrom(req);
+        if (asPhone === undefined && authorize(req, res, { allowToken: true, refresh: true, write: true }) === undefined)
             return;
         const read = await readJsonBody(req, res, MAX_FRAME_BYTES - 4096);
         if (!read.ok)
@@ -1010,6 +1352,12 @@ export function registerMarshalRoutes(options) {
         }
         if (op.startsWith('discussion.') || !COMMAND_OPS.includes(op)) {
             json(res, 400, { ok: false, code: 'invalid-args' });
+            return;
+        }
+        const requestId = typeof body.args === 'object' && body.args !== null ? body.args.requestId : undefined;
+        const pending = phone !== undefined && typeof requestId === 'string' ? phone.cardFor(requestId) : undefined;
+        if (asPhone !== undefined && !controllerCommandAllowed(op, body.args, pending)) {
+            json(res, 403, { ok: false, code: 'forbidden' });
             return;
         }
         // 每次 subscribe 都由 hub 签发新的不透明 id；页面在 HTTP 结果里取回并按 tab
@@ -1043,7 +1391,11 @@ export function registerMarshalRoutes(options) {
             methodNotAllowed(res, 'GET');
             return;
         }
-        if (authorize(req, res, readAccess) === undefined)
+        if (parseBearer(headerValue(req, 'authorization'))?.kind === 'node') {
+            deny(res, 401, 'unauthorized');
+            return;
+        }
+        if (phoneFrom(req) === undefined && authorize(req, res, readAccess) === undefined)
             return;
         const query = new URL(req.url ?? '/', 'http://localhost').searchParams;
         const deviceId = query.get('deviceId') ?? '';
@@ -1111,11 +1463,15 @@ export function registerMarshalRoutes(options) {
     }));
     // 历史补看用不透明 cursor 与有界 limit；每次随机幂等键，node 对 observe 不落 journal。
     register('/marshal/api/history', guard(async (req, res) => {
+        if (parseBearer(headerValue(req, 'authorization'))?.kind === 'node') {
+            deny(res, 401, 'unauthorized');
+            return;
+        }
         if (req.method !== 'POST') {
             methodNotAllowed(res, 'POST');
             return;
         }
-        if (authorize(req, res, { allowToken: true, refresh: true, write: true }) === undefined)
+        if (phoneFrom(req) === undefined && authorize(req, res, { allowToken: true, refresh: true, write: true }) === undefined)
             return;
         const read = await readJsonBody(req, res, SMALL_BODY_LIMIT);
         if (!read.ok)
@@ -1160,11 +1516,17 @@ export function registerMarshalRoutes(options) {
             methodNotAllowed(res, 'GET');
             return;
         }
-        // SSE 心跳不刷新空闲期，登录态只由普通 API 请求续期。
-        const auth = authorize(req, res, { allowToken: true, refresh: false, write: false });
-        if (auth === undefined)
+        if (parseBearer(headerValue(req, 'authorization'))?.kind === 'node') {
+            deny(res, 401, 'unauthorized');
             return;
-        const sessionId = auth.kind === 'session' ? auth.session.id : undefined;
+        }
+        const asPhone = phoneFrom(req);
+        // SSE 心跳不刷新空闲期，登录态只由普通 API 请求续期。
+        const auth = asPhone === undefined ? authorize(req, res, { allowToken: true, refresh: false, write: false }) : undefined;
+        if (asPhone === undefined && auth === undefined)
+            return;
+        const sessionId = auth?.kind === 'session' ? auth.session.id : undefined;
+        const detachPhone = asPhone === undefined || phone === undefined ? undefined : phone.attachStream(asPhone.phone.id, () => cleanup());
         // 游标解析：query 优先于 Last-Event-ID；空串视为没带。超长游标不报 400，
         // 统一按未知游标产生 gap，避免客户端被一个坏 id 永久钉死在错误码上。
         const query = new URL(req.url ?? '/', 'http://localhost').searchParams;
@@ -1276,6 +1638,12 @@ export function registerMarshalRoutes(options) {
             // 背压时跳过：缓冲还没排空，继续写只会无限堆内存；轮询会重新对齐状态。
             if (blocked || res.writableEnded || res.destroyed)
                 return;
+            if (asPhone !== undefined && phoneFrom(req) === undefined) {
+                cleanup();
+                return;
+            }
+            if (asPhone !== undefined)
+                phone?.seen(asPhone.phone.id);
             res.write(': ping\n\n');
         }, 15_000);
         let cleaned = false;
@@ -1290,6 +1658,7 @@ export function registerMarshalRoutes(options) {
             }
             clearInterval(heartbeat);
             streams.delete(cleanup);
+            detachPhone?.();
             if (sessionId !== undefined) {
                 const set = sessionStreams.get(sessionId);
                 set?.delete(cleanup);

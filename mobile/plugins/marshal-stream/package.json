@@ -1,0 +1,26 @@
+{
+  "name": "marshal-stream",
+  "version": "0.1.0",
+  "description": "原生 SSE 通道：让 WebView 之外直接消费 hub 的 text/event-stream",
+  "main": "dist/plugin.cjs.js",
+  "module": "dist/esm/index.js",
+  "types": "dist/esm/index.d.ts",
+  "files": [
+    "android/src/main/",
+    "android/build.gradle",
+    "dist/",
+    "ios/Sources",
+    "Package.swift",
+    "MarshalStream.podspec"
+  ],
+  "author": "Rong Dynasty",
+  "license": "MIT",
+  "capacitor": {
+    "ios": {
+      "src": "ios"
+    },
+    "android": {
+      "src": "android"
+    }
+  }
+}

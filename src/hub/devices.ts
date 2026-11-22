@@ -16,6 +16,17 @@ export interface DeviceRecord {
   /** 每设备持久单调修订号，从 1 开始，每次策略/撤销变更 +1。 */
   readonly policyRevision: number
   readonly revokedAt?: number
+  /** 手机控制器。节点记录没有这个字段。 */
+  readonly role?: 'phone'
+  readonly accountHash?: string
+  readonly installationId?: string
+  readonly pushProvider?: 'apns' | 'fcm' | 'huawei'
+  /** 推送令牌是厂商发送所必需的，设备文件权限 0600。控制器凭证仍然只存摘要。 */
+  readonly pushToken?: string
+  readonly liveToken?: string
+  /** Live Activity 更新令牌，按会话存放。空对象表示手机已经清掉全部活动。 */
+  readonly liveTokens?: Readonly<Record<string, string>>
+  readonly lastSeen?: number
 }
 
 export interface DevicesState {
@@ -59,6 +70,11 @@ export class DeviceStateError extends Error {
 
 export function sha256Hex(value: string): string {
   return createHash('sha256').update(value, 'utf8').digest('hex')
+}
+
+/** 手机凭证和节点凭证分开摘要，避免去掉 mph1. 前缀后被当成节点令牌。 */
+export function phoneTokenDigest(secret: string): string {
+  return sha256Hex('marshal-phone-v1\0' + secret)
 }
 
 export function emptyDevicesState(): DevicesState {
@@ -118,6 +134,7 @@ function validateRecord(value: unknown, index: number): ValidatedRecord {
   if (revokedAt !== undefined && (typeof revokedAt !== 'number' || !Number.isInteger(revokedAt) || revokedAt < 0)) {
     throw new DeviceStateError('invalid', `devices[${index}].revokedAt must be an integer >= 0`)
   }
+  const phone = parsePhoneFields(value, index)
   return {
     record: {
       id, name, tokenDigest, revoked,
@@ -127,8 +144,74 @@ function validateRecord(value: unknown, index: number): ValidatedRecord {
       // 占位值只用于内存；任何写盘都会因 unconfirmed 而被拒绝，不会把 0 持久化。
       policyRevision: revisionUnconfirmed ? 0 : policyRevision,
       ...(revokedAt === undefined ? {} : { revokedAt }),
+      ...phone,
     },
     revisionUnconfirmed,
+  }
+}
+
+function sanitizeLiveTokens(value: unknown): Record<string, string> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return {}
+  const out: Record<string, string> = {}
+  for (const [session, token] of Object.entries(value)) {
+    if (Object.keys(out).length >= 32) break
+    if (session.length === 0 || session.length > 128 || /[\x00-\x1f\x7f]/.test(session)) continue
+    if (typeof token !== 'string' || token.length === 0 || token.length > 512) continue
+    out[session] = token
+  }
+  return out
+}
+
+function withoutActivityTokens(record: DeviceRecord): DeviceRecord {
+  const copy: DeviceRecord = { ...record }
+  delete (copy as { liveToken?: string }).liveToken
+  delete (copy as { liveTokens?: Readonly<Record<string, string>> }).liveTokens
+  return copy
+}
+
+function parsePhoneFields(value: Record<string, unknown>, index: number): {
+  role?: 'phone'
+  accountHash?: string
+  installationId?: string
+  pushProvider?: 'apns' | 'fcm' | 'huawei'
+  pushToken?: string
+  liveToken?: string
+  liveTokens?: Readonly<Record<string, string>>
+  lastSeen?: number
+} {
+  if (value.role !== undefined && value.role !== 'phone') {
+    throw new DeviceStateError('invalid', `devices[${index}].role must be phone`)
+  }
+  const text = (key: 'accountHash' | 'installationId' | 'pushToken' | 'liveToken'): string | undefined => {
+    const field = value[key]
+    if (field === undefined) return undefined
+    if (typeof field !== 'string' || field.length === 0 || field.length > 512) {
+      throw new DeviceStateError('invalid', `devices[${index}].${key} must be a short string`)
+    }
+    return field
+  }
+  const accountHash = text('accountHash')
+  const installationId = text('installationId')
+  const pushToken = text('pushToken')
+  const liveToken = text('liveToken')
+  const liveTokens = sanitizeLiveTokens(value.liveTokens)
+  if (value.pushProvider !== undefined && value.pushProvider !== 'apns' && value.pushProvider !== 'fcm' && value.pushProvider !== 'huawei') {
+    throw new DeviceStateError('invalid', `devices[${index}].pushProvider is unknown`)
+  }
+  if (value.lastSeen !== undefined && (typeof value.lastSeen !== 'number' || !Number.isInteger(value.lastSeen) || value.lastSeen < 0)) {
+    throw new DeviceStateError('invalid', `devices[${index}].lastSeen must be an integer >= 0`)
+  }
+  return {
+    ...(value.role === 'phone' ? { role: 'phone' as const } : {}),
+    ...(accountHash === undefined ? {} : { accountHash }),
+    ...(installationId === undefined ? {} : { installationId }),
+    ...(pushToken === undefined ? {} : { pushToken }),
+    ...(liveToken === undefined ? {} : { liveToken }),
+    ...(Object.keys(liveTokens).length > 0 ? { liveTokens } : {}),
+    ...(value.pushProvider === 'apns' || value.pushProvider === 'fcm' || value.pushProvider === 'huawei'
+      ? { pushProvider: value.pushProvider }
+      : {}),
+    ...(typeof value.lastSeen === 'number' ? { lastSeen: value.lastSeen } : {}),
   }
 }
 
@@ -380,6 +463,83 @@ export class DeviceStore {
       const devices = [...state.devices]
       devices[index] = entry
       return { state: { version: DEVICES_FILE_VERSION, devices }, result: { entry, revision: entry.policyRevision } }
+    })
+  }
+
+  phones(): readonly DeviceRecord[] {
+    return this.state.devices.filter(device => device.role === 'phone' && !device.revoked)
+  }
+
+  /** 同一安装再次配对会换掉旧摘要，旧凭证立刻失效。 */
+  enrollPhone(input: { name: string; accountHash: string; installationId: string }): { record: DeviceRecord; credential: string } {
+    const name = input.name.trim()
+    if (!name || name.length > 80 || /[\x00-\x1f\x7f]/.test(name)) throw new DeviceStateError('invalid', 'invalid phone name')
+    if (!input.installationId || input.installationId.length > 128) throw new DeviceStateError('invalid', 'invalid installation')
+    if (!input.accountHash || input.accountHash.length > 128) throw new DeviceStateError('invalid', 'invalid account')
+    const credential = 'mph1.' + randomBytes(32).toString('base64url')
+    const tokenDigest = phoneTokenDigest(credential.slice('mph1.'.length))
+    const id = 'phone-' + sha256Hex(input.installationId).slice(0, 32)
+    return this.mutate(state => {
+      const current = state.devices.find(device => device.id === id)
+      if (current?.revoked) throw new DeviceStateError('revoked', 'phone enrollment revoked')
+      const entry: DeviceRecord = {
+        id,
+        name,
+        tokenDigest,
+        revoked: false,
+        allowContent: false,
+        allowInteractions: true,
+        allowDiscussion: true,
+        policyRevision: current === undefined ? 1 : current.policyRevision + 1,
+        role: 'phone',
+        accountHash: input.accountHash,
+        installationId: input.installationId,
+      }
+      const devices = current === undefined
+        ? [...state.devices, entry]
+        : state.devices.map(device => device.id === id ? entry : device)
+      return { state: { ...state, devices }, result: { record: entry, credential } }
+    })
+  }
+
+  touchPhone(id: string, at: number): void {
+    const current = this.findById(id)
+    if (current?.role !== 'phone' || current.revoked) return
+    if (typeof current.lastSeen === 'number' && at - current.lastSeen < 60_000) return
+    this.mutate(state => {
+      const devices = state.devices.map(device => device.id === id ? { ...device, lastSeen: at } : device)
+      return { state: { ...state, devices }, result: undefined }
+    })
+  }
+
+  setPhonePush(id: string, target: {
+    provider: 'apns' | 'fcm' | 'huawei'
+    token: string
+    liveToken?: string
+    liveTokens?: Readonly<Record<string, string>>
+  }): void {
+    this.mutate(state => {
+      const current = state.devices.find(device => device.id === id)
+      if (current?.role !== 'phone' || current.revoked) throw new DeviceStateError('unknown-device', 'phone not found')
+      const replacingActivities = target.liveTokens !== undefined
+      const liveTokens = replacingActivities ? sanitizeLiveTokens(target.liveTokens) : undefined
+      const entry: DeviceRecord = replacingActivities
+        ? {
+            ...withoutActivityTokens(current),
+            pushProvider: target.provider,
+            pushToken: target.token,
+            ...(liveTokens !== undefined && Object.keys(liveTokens).length > 0 ? { liveTokens } : {}),
+          }
+        : {
+            ...current,
+            pushProvider: target.provider,
+            pushToken: target.token,
+            ...(target.liveToken === undefined ? {} : { liveToken: target.liveToken }),
+          }
+      return {
+        state: { ...state, devices: state.devices.map(device => device.id === id ? entry : device) },
+        result: undefined,
+      }
     })
   }
 

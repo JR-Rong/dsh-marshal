@@ -1,0 +1,141 @@
+/**
+ * SSE 通道。
+ *
+ * 原生端走本地插件 marshal-stream（iOS URLSession / Android HttpURLConnection），
+ * 绕开 WebView 的同源限制；浏览器预览退化为 EventSource（仅用于开发调试）。
+ */
+import { Capacitor } from '@capacitor/core'
+import { MarshalStream } from 'marshal-stream'
+import { nextResumeCursor, noteStreamDrop, noteStreamOpen, shouldReconnectStream } from './stream.ts'
+
+export interface StreamFrame {
+  /** SSE 事件名：message（默认）/ reset / error */
+  event: string
+  data: unknown
+  id?: string
+}
+
+export interface StreamHandle {
+  close(): void
+}
+
+export interface StreamOptions {
+  url: string
+  token: string
+  onFrame: (frame: StreamFrame) => void
+  onOpen?: () => void
+  onError?: (message: string) => void
+  /** 断开后是否自动重连，默认 true。 */
+  reconnect?: boolean
+  /** 多路流各自的 id。缺省时自动分配，互不影响。 */
+  id?: string
+}
+
+let streamSerial = 0
+
+function isNative(): boolean {
+  try {
+    return Capacitor.isNativePlatform()
+  } catch {
+    return false
+  }
+}
+
+function parseData(raw: string): unknown {
+  try {
+    return JSON.parse(raw)
+  } catch {
+    return raw
+  }
+}
+
+export async function openEventStream(options: StreamOptions): Promise<StreamHandle> {
+  const { url, token, onFrame, onOpen, onError, reconnect = true } = options
+  const id = options.id ?? 's' + String(++streamSerial)
+
+  if (!isNative()) {
+    const source = new EventSource(url)
+    const forward = (event: string) => (message: MessageEvent) => {
+      onFrame({ event, data: parseData(String(message.data)) })
+    }
+    source.onmessage = forward('message')
+    source.onopen = () => onOpen?.()
+    source.addEventListener('reset', forward('reset'))
+    source.onerror = () => onError?.('SSE 断开')
+    return { close: () => source.close() }
+  }
+
+  let closed = false
+  let handle: { remove: () => Promise<void> } | null = null
+  let retryTimer: ReturnType<typeof setTimeout> | null = null
+  let attempt = 0
+  let lastEventId: string | null = null
+
+  const start = async (): Promise<void> => {
+    if (closed) return
+    const listener = await MarshalStream.addListener('message', (message) => {
+      if (closed || (message.streamId && message.streamId !== id)) return
+      if (message.event === 'open') {
+        attempt = noteStreamOpen()
+        onOpen?.()
+        return
+      }
+      if (message.event === 'end' || message.event === 'error') {
+        onError?.(message.event === 'error' && message.data ? message.data : 'SSE 断开')
+        if (shouldReconnectStream({ event: message.event, closed, reconnect })) scheduleReconnect()
+        return
+      }
+      const frame: StreamFrame = {
+        event: message.event || 'message',
+        data: parseData(message.data),
+        ...(message.id ? { id: message.id } : {}),
+      }
+      lastEventId = nextResumeCursor(lastEventId, frame)
+      onFrame(frame)
+    })
+    if (closed) { await listener.remove(); return }
+    handle = listener
+    await MarshalStream.open({
+      url,
+      token,
+      id,
+      ...(lastEventId ? { lastEventId } : {}),
+    })
+  }
+
+  const scheduleReconnect = (): void => {
+    if (!shouldReconnectStream({ event: 'end', closed, reconnect }) || retryTimer) return
+    const next = noteStreamDrop(attempt)
+    attempt = next.attempt
+    retryTimer = setTimeout(() => {
+      retryTimer = null
+      void (async () => {
+        try {
+          await handle?.remove()
+          await MarshalStream.close({ id })
+        } catch {
+          /* 清干净即可 */
+        }
+        try { await start() } catch {
+          if (closed) return
+          onError?.('未能重连事件流')
+          scheduleReconnect()
+        }
+      })()
+    }, next.delayMs)
+  }
+
+  const connection = {
+    close() {
+      closed = true
+      if (retryTimer) clearTimeout(retryTimer)
+      void handle?.remove()
+      void MarshalStream.close({ id })
+    },
+  }
+  try { await start() } catch (error) {
+    connection.close()
+    throw error
+  }
+  return connection
+}

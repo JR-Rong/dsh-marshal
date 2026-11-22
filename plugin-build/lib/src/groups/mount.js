@@ -1,16 +1,33 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir } from 'node:fs/promises';
+import { existsSync, readFileSync } from 'node:fs';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { request as httpRequest } from 'node:http';
+import { request as httpsRequest } from 'node:https';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import pluginPackage from '../../../package.json' with { type: 'json' };
 import { createGroupService } from './service.js';
-import { readAgentsLedger } from './inventory.js';
+import { agentsLedgerPath, readAgentsLedger } from './inventory.js';
 import { createAgentDrafter } from './draft.js';
 import { createCrossClient } from './cross-client.js';
 import { createLocalBoard } from './local-board.js';
+import { createTaskRooms } from './task-rooms.js';
+import { createTaskRoomStore, TaskRoomKey } from './task-room-store.js';
+import { createTaskRoomRoutes, taskRoomAccess, taskRoomAudit, visibleTaskRoom } from './task-room-routes.js';
+import { createTaskOrchestration, isPermissionBlockedError } from './task-orchestration.js';
+import { createPatchStore } from './patch-store.js';
+import { createTaskToolController } from './task-tool-controller.js';
+import { syncResidentSessionToRoom } from './session-room-sync.js';
+import { createTaskOverrides, describeContentSteeringMessage, describePlainConfigChanges } from './task-overrides.js';
+import { createWorkspaceRosters } from './workspace-rosters.js';
+import { createTicketNumbers, withTicketPrefix } from './ticket-numbers.js';
+import { createSessionTitles, readProjcacheSession, readWorkspaceRegistry, summarizeFirstMessage } from './session-titles.js';
+import { dashboardAddress } from '../sidebar.js';
+import { createDiscussionPort } from '../discussions/ports.js';
 import { createAgentsHttpClient, agentToolDefinitions } from './agent-tools.js';
 import { createDshSurface } from '../adapters/dsh/surface.js';
 import { createMemoryRoutes } from '../memory/http.js';
-import { createMemoryHttpAuth, resolveDesktopOwner } from '../memory/http-auth.js';
+import { createMemoryHttpAuth, hostIsLoopback, resolveDesktopOwner } from '../memory/http-auth.js';
 import { dshAccountHash, DSH_ACCOUNT_ORIGIN } from '../hub/account.js';
 
 const BODY_LIMIT = 64 * 1024;
@@ -58,6 +75,7 @@ function isLoopback(req) {
 
 function trusted(req) {
     if (req.headers['sec-fetch-site'] === 'cross-site') return false;
+    if (req.headers?.host !== undefined && !hostIsLoopback(req.headers.host)) return false;
     return isLoopback(req);
 }
 
@@ -114,7 +132,10 @@ function exact(method, path, handler, open = false) {
             }
             catch (error) {
                 const code = errorCode(error);
-                write(res, code === 'group-not-found' ? 404 : 400, {
+                const explicitStatus = typeof error?.status === 'number' && error.status >= 400 && error.status < 600 ? error.status : undefined;
+                const status = explicitStatus ?? (['group-not-found', 'task-room-not-found', 'task-not-found', 'not-found'].includes(code) ? 404
+                    : code === 'unauthorized' ? 401 : ['forbidden', 'workspace-forbidden'].includes(code) ? 403 : 400);
+                write(res, status, {
                     ok: false,
                     code,
                     message: error instanceof Error ? error.message : String(error),
@@ -128,7 +149,7 @@ export function buildHealthBody(req, info) {
     return {
         ok: true,
         name: 'dsh-marshal',
-        version: '0.2.0-agent-groups.2',
+        version: pluginPackage.version,
         deviceId: info.deviceId,
         capabilities: {
             groups: true,
@@ -142,26 +163,423 @@ export function buildHealthBody(req, info) {
     };
 }
 
-function taskView(task) {
+function normalizeCardTags(raw) {
+    if (!Array.isArray(raw)) return undefined;
+    const seen = new Set();
+    const out = [];
+    for (const item of raw) {
+        const name = (typeof item === 'string' ? item : typeof item?.name === 'string' ? item.name : '').trim().slice(0, 32);
+        if (name === '' || seen.has(name)) continue;
+        seen.add(name);
+        const promptPrefix = typeof item === 'object' && item !== null && typeof item.promptPrefix === 'string' && item.promptPrefix.trim() !== ''
+            ? item.promptPrefix.trim() : undefined;
+        out.push(promptPrefix === undefined ? { name } : { name, promptPrefix });
+        if (out.length >= 16) break;
+    }
+    return out.length > 0 ? out : undefined;
+}
+
+const VAGUE_TASK_PATTERNS = [
+    /(?:^|[\s，,。！？!?])(帮我|请)?(看下|看看|弄一下|搞一下|处理一下|优化一下|改一下|修一下|研究一下|完善一下|整理一下|查一下|调整一下|跟进一下|想想办法)(?:$|[\s，,。！？!?])/,
+    /(看着办|随便|待定|待确认|不确定|再议|模糊|\bTBD\b|\bTODO\b|\?{2,}|？{2,})/i,
+];
+const SPECIFIC_TASK_SIGNAL = /(https?:\/\/|#[0-9]+|PR\s*#?[0-9]+|\/[\w.-]+\/|\.[a-z]{1,5}\b|验收|步骤|目标|需求|修复|实现|新增|删除|接口|测试|指标|≥|<=|->|→)/i;
+
+export function detectAmbiguousTask({ title = '', description = '', prompt = '', hasAttachments = false, hasPr = false } = {}) {
+    const cleanTitle = String(title).trim();
+    const cleanDesc = String(description).trim();
+    const cleanPrompt = String(prompt).trim();
+    const body = cleanDesc || (cleanPrompt !== cleanTitle ? cleanPrompt : '');
+    const combined = (cleanTitle + ' ' + body).trim();
+    if (hasAttachments || hasPr) return undefined;
+    if (VAGUE_TASK_PATTERNS[1].test(combined)) {
+        return '任务描述包含「待定/不确定/看着办」等未明确内容';
+    }
+    if (body.length === 0 && cleanTitle.replace(/\s+/g, '').length < 14 && !SPECIFIC_TASK_SIGNAL.test(cleanTitle)) {
+        return '缺少任务描述且标题较简略，目标与验收标准尚不明确';
+    }
+    if (body.length < 16 && VAGUE_TASK_PATTERNS[0].test(combined) && !SPECIFIC_TASK_SIGNAL.test(combined)) {
+        return '任务描述偏向宽泛指令，缺少具体对象或验收标准';
+    }
+    return undefined;
+}
+
+const ATTACHMENT_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
+const ATTACHMENT_MEDIA_TYPE_RE = /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/;
+const ATTACHMENT_SHA256_RE = /^[0-9a-f]{64}$/;
+const ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024;
+const ATTACHMENT_TOTAL_MAX_BYTES = 32 * 1024 * 1024;
+
+export function canonicalAttachmentName(raw) {
+    const cleaned = String(raw ?? '')
+        .replace(/[\u0000-\u001f\u007f/\\]+/g, '_')
+        .trim()
+        .slice(0, 180);
+    return cleaned === '' || cleaned === '.' || cleaned === '..' ? 'attachment' : cleaned;
+}
+
+export function normalizeAttachmentsPayload(raw) {
+    if (!Array.isArray(raw)) return undefined;
+    const out = [];
+    const seen = new Set();
+    let totalBytes = 0;
+    for (const item of raw) {
+        if (out.length >= 8) break;
+        if (!item || typeof item !== 'object') continue;
+        if (item.kind !== 'image' && item.kind !== 'file') continue;
+        if (typeof item.attachmentId !== 'string') continue;
+        const attachmentId = item.attachmentId.trim();
+        if (!attachmentId || attachmentId.length > 128 || attachmentId.includes('/') || attachmentId.includes('\\') || attachmentId.includes('..') || seen.has(attachmentId)) continue;
+        if (typeof item.bytes !== 'number' || !Number.isInteger(item.bytes) || item.bytes < 0 || item.bytes > ATTACHMENT_MAX_BYTES) continue;
+        if (totalBytes + item.bytes > ATTACHMENT_TOTAL_MAX_BYTES) continue;
+        const mediaType = typeof item.mediaType === 'string' ? item.mediaType.trim().toLowerCase() : '';
+        if (!mediaType || mediaType.length > 128 || !ATTACHMENT_MEDIA_TYPE_RE.test(mediaType)) continue;
+        const sha256 = typeof item.sha256 === 'string' ? item.sha256.trim().toLowerCase() : '';
+        if (!ATTACHMENT_SHA256_RE.test(sha256)) continue;
+        const name = canonicalAttachmentName(item.name);
+        if (item.kind === 'image') {
+            if (!ATTACHMENT_IMAGE_TYPES.has(mediaType)) continue;
+            if (typeof item.width !== 'number' || !Number.isInteger(item.width) || item.width < 1 || item.width > 32768) continue;
+            if (typeof item.height !== 'number' || !Number.isInteger(item.height) || item.height < 1 || item.height > 32768) continue;
+            seen.add(attachmentId);
+            totalBytes += item.bytes;
+            out.push({ kind: 'image', attachmentId, name, bytes: item.bytes, mediaType, sha256, width: item.width, height: item.height });
+        }
+        else {
+            seen.add(attachmentId);
+            totalBytes += item.bytes;
+            out.push({ kind: 'file', attachmentId, name, bytes: item.bytes, mediaType, sha256 });
+        }
+    }
+    return out.length > 0 ? out : undefined;
+}
+
+function actionCarriesAttachments(action) {
+    if (!action || typeof action !== 'object') return false;
+    if (action.kind === 'create') return Array.isArray(action.input?.attachments) && action.input.attachments.length > 0;
+    if (action.kind === 'update') return Array.isArray(action.patch?.attachments) && action.patch.attachments.length > 0;
+    return false;
+}
+
+export function postVerifiedBoardAction(origin, req, requestId, action, initiator) {
+    const url = new URL('/api/task-board/action', origin);
+    const body = JSON.stringify({
+        requestId,
+        action,
+        ...(typeof initiator === 'string' && initiator.trim() !== '' ? { initiator } : {}),
+    });
+    const headers = {
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(body)),
+        connection: 'close',
+        origin: url.origin,
+        'sec-fetch-site': 'same-origin',
+        ...(typeof req?.headers?.cookie === 'string' && req.headers.cookie !== '' ? { cookie: req.headers.cookie } : {}),
+        ...(typeof req?.headers?.authorization === 'string' && req.headers.authorization !== '' ? { authorization: req.headers.authorization } : {}),
+    };
+    const transport = url.protocol === 'https:' ? httpsRequest : httpRequest;
+    return new Promise((resolve, reject) => {
+        const upstream = transport(url, { method: 'POST', headers, timeout: 15_000 }, response => {
+            const chunks = [];
+            response.on('data', chunk => chunks.push(Buffer.from(chunk)));
+            response.on('end', () => {
+                const raw = Buffer.concat(chunks).toString('utf8');
+                let parsed;
+                try { parsed = raw ? JSON.parse(raw) : {}; }
+                catch { parsed = {}; }
+                const status = response.statusCode ?? 500;
+                if (status >= 200 && status < 300 && parsed && typeof parsed === 'object') {
+                    resolve(parsed);
+                    return;
+                }
+                const err = new Error(typeof parsed?.error === 'string' && parsed.error
+                    ? parsed.error
+                    : '任务看板拒绝了附件操作（HTTP ' + status + '）');
+                err.code = typeof parsed?.code === 'string' && parsed.code ? parsed.code : 'attachment-action-failed';
+                err.status = status >= 400 && status < 600 ? status : 400;
+                reject(err);
+            });
+        });
+        upstream.on('timeout', () => upstream.destroy(Object.assign(new Error('附件校验请求超时'), { code: 'attachment-timeout', status: 504 })));
+        upstream.on('error', err => reject(err));
+        upstream.end(body);
+    });
+}
+
+function taskView(task, workflow, room, ticketNumbers) {
     const executions = Array.isArray(task.executions) ? task.executions : [];
     const latest = executions.length > 0 ? executions[executions.length - 1] : undefined;
+    const openExecution = executions.some(item => item && item.endedAt === undefined);
+    const tags = normalizeCardTags(task.tags);
+    const attachments = normalizeAttachmentsPayload(task.attachments);
+    const ticketNo = ticketNumbers?.get?.(task.id) ?? ticketNumbers?.ensure?.(task.id);
+    const patchAvailable = Boolean(workflow?.development?.digest && !workflow?.development?.appliedAt);
     return {
         id: task.id,
+        ...(ticketNo ? { ticketNo } : {}),
         title: task.title,
-        status: task.status,
+        status: room?.closed ? 'done' : workflow === undefined || workflow.state === 'ready' ? task.status
+            : workflow.state === 'running' || workflow.state === 'handed-off' ? 'running'
+            : workflow.state === 'permission-blocked' || workflow.state === 'review-blocked' ? 'review'
+            : workflow.state === 'done' ? (task.status === 'done' ? 'done' : (room ? 'review' : 'done')) : 'failed',
+        ...(workflow === undefined ? {} : { workflow }),
+        ...(patchAvailable ? { patchAvailable: true } : {}),
+        ...(workflow?.reviewReason ? { reviewReason: workflow.reviewReason } : {}),
+        ...(workflow?.reviewSummary ? { reviewSummary: workflow.reviewSummary } : {}),
+        ...(room === undefined ? {} : { taskRoom: visibleTaskRoom(room, ticketNumbers) }),
         ...(task.description === undefined ? {} : { description: task.description }),
+        ...(task.prompt === undefined ? {} : { prompt: task.prompt }),
         ...(task.parentId === undefined ? {} : { parentId: task.parentId }),
         ...(task.permission === undefined ? {} : { permission: task.permission }),
+        ...(task.permissionConfirmedAt === undefined ? {} : { permissionConfirmedAt: task.permissionConfirmedAt }),
         ...(task.mode === undefined ? {} : { mode: task.mode }),
+        ...(typeof task.model === 'string' && task.model !== '' ? { model: task.model } : {}),
+        ...(typeof task.reasoningEffort === 'string' && task.reasoningEffort !== '' ? { reasoningEffort: task.reasoningEffort } : {}),
+        ...(typeof task.reuseSession === 'boolean' ? { reuseSession: task.reuseSession } : {}),
+        ...(tags === undefined ? {} : { tags }),
+        ...(attachments === undefined ? {} : { attachments }),
+        ...(executions.length > 0 ? {
+            runCount: executions.length,
+            executions: executions.slice(-10).map(item => ({
+                id: item.id,
+                ...(item.sessionId ? { sessionId: item.sessionId } : {}),
+                ...(typeof item.startedAt === 'number' ? { startedAt: item.startedAt } : {}),
+                ...(typeof item.endedAt === 'number' ? { endedAt: item.endedAt } : {}),
+                ...(item.result ? { result: item.result } : {}),
+                ...(item.error ? { error: String(item.error).slice(0, 400) } : {}),
+                ...(item.external ? { external: true } : {}),
+                ...(item.initiatedBy ? { initiatedBy: item.initiatedBy } : {}),
+            })),
+        } : {}),
+        ...(openExecution ? { openExecution: true } : {}),
+        ...(latest?.startedAt === undefined ? {} : { startedAt: latest.startedAt }),
+        ...(latest?.endedAt === undefined ? {} : { endedAt: latest.endedAt }),
+        ...(task.schedule !== undefined ? { schedule: { enabled: task.schedule.enabled === true, mode: task.schedule.mode, ...(typeof task.schedule.cron === 'string' ? { cron: task.schedule.cron } : {}), ...(typeof task.schedule.at === 'number' ? { at: task.schedule.at } : {}), ...(task.schedule.nextRunAt === undefined ? {} : { nextRunAt: task.schedule.nextRunAt }) } } : {}),
+        ...(task.freeze !== undefined ? { freeze: { goal: typeof task.freeze.goal === 'string' ? task.freeze.goal : '' } } : {}),
+        ...(task.archivedAt === undefined ? {} : { archivedAt: task.archivedAt }),
         ...(latest === undefined || latest.sessionId === undefined ? {} : { sessionId: latest.sessionId }),
         ...(latest === undefined || latest.result === undefined ? {} : { result: latest.result }),
+        ...(workflow?.sessionId === undefined ? {} : { sessionId: workflow.sessionId }),
         createdAt: task.createdAt,
         updatedAt: task.updatedAt,
     };
 }
 
-function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource = () => 'local', memory, auth, allowedOrigins) {
+function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, memory, auth, allowedOrigins, orchestration, rooms, extras = {}) {
+    const {
+        root: groupsRootDir, rosters, ticketNumbers, sessionTitles, sessionController, config, llm, readDefaultModel,
+        workspacePath, webOrigin, getAttachmentStore, resolveAttachments, surface: dshSurface, moveCardStatus,
+        taskOverrides: injectedTaskOverrides, patchStore: injectedPatchStore,
+    } = extras;
+    const patchStore = injectedPatchStore ?? (groupsRootDir ? createPatchStore(join(groupsRootDir, 'patches')) : undefined);
+    const taskOverrides = injectedTaskOverrides ?? createTaskOverrides(groupsRootDir ? join(groupsRootDir, 'task-overrides.json') : undefined);
+    const effectiveCard = (source, task) => task ? taskOverrides.applyTo(source, task) : undefined;
+    const applyBoardAction = async (req, board, source, action, actionInitiator = initiator) => {
+        const requestId = randomUUID();
+        if (source === 'host' && actionCarriesAttachments(action)) {
+            if (typeof board.applyVerified === 'function') {
+                return board.applyVerified(requestId, action, actionInitiator);
+            }
+            const origin = typeof webOrigin === 'function' ? webOrigin() : undefined;
+            if (typeof origin === 'string' && origin !== '') {
+                return postVerifiedBoardAction(origin, req, requestId, action, actionInitiator);
+            }
+        }
+        return board.apply(requestId, action, actionInitiator);
+    };
+    const authenticate = (req, write = false) => auth.authenticate(req, { write, origins: allowedOrigins() });
+    const allowed = (access, target, ledger) => access.ok && auth.allows(access.session, {
+        agentId: target.agentId, workspaceId: target.workspaceId,
+    }, ledger);
+    const authorize = (req, res, target) => {
+        const access = authenticate(req, true);
+        if (allowed(access, target)) return true;
+        write(res, access.ok ? 403 : access.status, {
+            ok: false, code: access.ok ? 'workspace-forbidden' : access.code, message: '当前桌面会话无权操作该工作区的编排。',
+        });
+        return false;
+    };
+    const latestSessionIdOf = (rawTask, workflow) => {
+        if (typeof workflow?.sessionId === 'string' && workflow.sessionId !== '') return workflow.sessionId;
+        const execs = Array.isArray(rawTask?.executions) ? rawTask.executions : [];
+        for (let i = execs.length - 1; i >= 0; i -= 1) {
+            if (typeof execs[i]?.sessionId === 'string' && execs[i].sessionId !== '') return execs[i].sessionId;
+        }
+        return typeof rawTask?.sessionId === 'string' && rawTask.sessionId !== '' ? rawTask.sessionId : undefined;
+    };
+    const selectResidentSessionModel = async (sessionId, modelSpec, effortSpec) => {
+        if (!sessionId || typeof sessionController?.selectModel !== 'function') return false;
+        let route = typeof modelSpec === 'string' ? modelSpec.trim() : '';
+        if (!route) {
+            try {
+                const ctrl = await dshSurface?.controls?.(sessionId, AbortSignal.timeout(3000));
+                if (typeof ctrl?.current?.model === 'string' && ctrl.current.model !== '') route = ctrl.current.model;
+            } catch { /* fallback to defaultModel */ }
+        }
+        if (!route && typeof readDefaultModel === 'function') {
+            try {
+                const dm = readDefaultModel();
+                if (dm?.provider && dm?.model) route = `${dm.provider}/${dm.model}`;
+                else if (typeof dm?.model === 'string') route = dm.model;
+            } catch { /* ignore */ }
+        }
+        if (!route) return false;
+        const slash = route.indexOf('/');
+        const provider = slash > 0 ? route.slice(0, slash) : undefined;
+        const model = slash > 0 ? route.slice(slash + 1) : route;
+        if (!model) return false;
+        const rawEffort = typeof effortSpec === 'string' ? effortSpec.trim() : '';
+        const effort = rawEffort && rawEffort !== 'off' && rawEffort !== 'none' ? rawEffort : undefined;
+        try {
+            await sessionController.selectModel({
+                sessionId,
+                ...(provider ? { provider } : {}),
+                model,
+                ...(effort ? { reasoningEffort: effort } : {}),
+            });
+            return true;
+        } catch {
+            if (effort) {
+                try {
+                    await sessionController.selectModel({ sessionId, ...(provider ? { provider } : {}), model });
+                    return true;
+                } catch { /* ignore */ }
+            }
+            return false;
+        }
+    };
+    const steerResidentSession = async (sessionId, text) => {
+        if (!sessionId || !text || typeof sessionController?.prompt !== 'function') return false;
+        try {
+            await sessionController.prompt({
+                requestId: 'marshal-steer-' + randomUUID(),
+                sessionId,
+                mode: 'queue',
+                content: [{ type: 'text', text }],
+            }, AbortSignal.timeout(10_000));
+            return true;
+        } catch {
+            return false;
+        }
+    };
+    const ensureRoomForNotice = (source, card, workflow, access, ledger) => {
+        if (!rooms || !card?.id) return undefined;
+        const existing = rooms.find(source, card.id);
+        if (existing) return existing;
+        const wsId = workflow?.workspaceId ?? card?.workspaceId;
+        if (!wsId || !access?.ok) return undefined;
+        if (!allowed(access, { workspaceId: wsId }, ledger)) return undefined;
+        try {
+            const tNo = ticketNumbers?.ensure?.(card.id);
+            return rooms.ensure(source, tNo ? { ...card, title: withTicketPrefix(tNo, card.title) } : card, wsId, access.session.ownerId);
+        } catch {
+            return undefined;
+        }
+    };
+    const appendRoomEventSafe = async ({ source, card, workflow, access, ledger, kind, phase, actor = 'Marshal', text, reopenIfClosed = false }) => {
+        if (!text) return false;
+        const room = ensureRoomForNotice(source, card, workflow, access, ledger);
+        if (!room) return false;
+        try {
+            let current = (await rooms.page(room.id, { limit: 1 })).room;
+            if (reopenIfClosed && current.closed) {
+                await rooms.append(room.id, {
+                    kind: 'reopened', runId: current.runId, actor: '工单操作者',
+                    text: '工单因内容修订自动重开。',
+                });
+                current = (await rooms.page(room.id, { limit: 1 })).room;
+            }
+            let runId = current.runId;
+            if (kind === 'user' && !runId) {
+                runId = randomUUID();
+                await rooms.begin(room.id, runId, 'Marshal', 'conversation', '工单实时插话');
+            }
+            await rooms.append(room.id, {
+                kind,
+                ...(runId ? { runId } : {}),
+                actor,
+                text,
+                ...(phase ? { phase } : {}),
+            });
+            return true;
+        } catch {
+            return false;
+        }
+    };
+    const saveCardPromptOverride = async (source, card, nextPrompt, actionInitiator = initiator) => {
+        const board = getBoard();
+        if (!board) return undefined;
+        const raw = (board.snapshot().tasks ?? []).find(item => item.id === card.id) ?? card;
+        const canNativeEdit = raw.archivedAt === undefined && (Array.isArray(raw.executions) ? raw.executions.length : 0) === 0;
+        if (canNativeEdit) {
+            try {
+                const snap = await board.apply(randomUUID(), { kind: 'update', taskId: card.id, patch: { prompt: nextPrompt } }, actionInitiator);
+                taskOverrides.set(source, card.id, { prompt: nextPrompt });
+                return snap;
+            } catch { /* fall through to Marshal override */ }
+        }
+        taskOverrides.set(source, card.id, { prompt: nextPrompt });
+        return board.snapshot();
+    };
+    const launchPlainCardWithOverrides = async (source, taskId, actionInitiator = initiator, explicitPrompt = undefined) => {
+        const board = getBoard();
+        const raw = (board.snapshot().tasks ?? []).find(item => item.id === taskId);
+        const ov = taskOverrides.get(source, taskId);
+        if (raw && (Array.isArray(raw.executions) && raw.executions.length > 0) && (ov || explicitPrompt !== undefined)) {
+            const eff = effectiveCard(source, raw);
+            const finalPrompt = explicitPrompt ?? eff?.prompt ?? eff?.description ?? eff?.title ?? '';
+            const instructions = [
+                '【工单最新修订内容（请严格以此最新版本执行）】',
+                eff?.title ? '标题：' + eff.title : '',
+                eff?.description ? '描述：\n' + eff.description : '',
+                finalPrompt ? '执行指令：\n' + finalPrompt : '',
+            ].filter(Boolean).join('\n\n').slice(0, 15_000);
+            const settledSession = [...raw.executions].reverse().find(ex => ex?.endedAt !== undefined && typeof ex?.sessionId === 'string' && ex.sessionId !== '');
+            if (settledSession) {
+                try {
+                    return await board.apply(randomUUID(), { kind: 'rework', taskId, instructions }, actionInitiator);
+                } catch { /* fall back to standard run + session queue */ }
+            }
+            const snap = await board.apply(randomUUID(), { kind: 'run', taskId }, actionInitiator);
+            void (async () => {
+                for (let attempt = 0; attempt < 15; attempt += 1) {
+                    const cur = (board.snapshot().tasks ?? []).find(item => item.id === taskId);
+                    const openEx = Array.isArray(cur?.executions) ? [...cur.executions].reverse().find(ex => ex?.endedAt === undefined && ex?.sessionId) : undefined;
+                    if (openEx?.sessionId) {
+                        await steerResidentSession(openEx.sessionId, instructions);
+                        return;
+                    }
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                }
+            })();
+            return snap;
+        }
+        return board.apply(randomUUID(), { kind: 'run', taskId }, actionInitiator);
+    };
+    const taskList = (snapshot, req, source) => {
+        const access = authenticate(req);
+        const ledger = access.ok ? auth.loadLedger() : undefined;
+        const rawTasks = Array.isArray(snapshot.tasks) ? snapshot.tasks : [];
+        ticketNumbers?.ensureAll?.(rawTasks);
+        return rawTasks.flatMap(task => {
+            const target = orchestration?.target(source, task.id);
+            const room = rooms?.find(source, task.id);
+            if (room && !taskRoomAccess(access, room, allowed, ledger)) return [];
+            if (target && !allowed(access, { workspaceId: target.workspaceId }, ledger)) return [];
+            const eff = effectiveCard(source, task);
+            return [taskView(eff, target ? orchestration.view(source, task.id) : undefined, room, ticketNumbers)];
+        });
+    };
+    const roomRoutes = createTaskRoomRoutes({
+        exact, write, readBody, authenticate, allowed, auth, rooms,
+        orchestration, getBoard, boardSource, getInitiator: () => initiator.replace(/^marshal:/, ''),
+        ticketNumbers, workspacePath, normalizeAttachments: normalizeAttachmentsPayload, resolveAttachments,
+        surface: dshSurface, moveCardStatus,
+        getEffectiveCard: effectiveCard, saveCardPromptOverride, launchPlainCardWithOverrides,
+        patchStore, steerResidentSession,
+    });
     return [
+        ...roomRoutes.routes,
         exact('GET', '/marshal/health', async (req, res) => {
             const ledger = readAgentsLedger();
             write(res, 200, buildHealthBody(req, {
@@ -174,6 +592,218 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource = 
             }));
         }, true),
         ...createMemoryRoutes({ memory, auth, allowedOrigins }).map(route => exact(route.method, route.path, route.handler, true)),
+        exact('GET', '/marshal/tasks/orchestration', async (req, res) => {
+            const access = authenticate(req);
+            if (!access.ok) { write(res, access.status, { ok: false, code: access.code }); return; }
+            const catalog = orchestration?.catalog() ?? { templates: [], groupTemplates: [], leaders: [], memoryAvailable: false };
+            const codexModels = orchestration?.codexCatalog ? await orchestration.codexCatalog().catch(() => []) : [];
+            const ledger = auth.loadLedger();
+            write(res, 200, { ok: true, ...catalog, codexModels, leaders: catalog.leaders.filter(leader => allowed(access, leader, ledger)) });
+        }),
+        exact('POST', '/marshal/tasks/preview', async (req, res) => {
+            const access = authenticate(req, true);
+            if (!access.ok) { write(res, access.status, { ok: false, code: access.code }); return; }
+            if (!orchestration) { write(res, 503, { ok: false, code: 'orchestration-unavailable' }); return; }
+            const body = await readBody(req);
+            const title = typeof body.title === 'string' ? body.title.trim() : '';
+            if (!title) throw taskError('invalid-title', '请填写工单标题。');
+            const ledger = auth.loadLedger();
+            const canUse = member => allowed(access, member, ledger);
+            const result = await orchestration.recommend(body.orchestration, { title, description: body.description }, canUse);
+            write(res, 200, { ok: true, ...result });
+        }),
+        exact('POST', '/marshal/tasks/plan', async (req, res) => {
+            const access = authenticate(req, true);
+            if (!access.ok) { write(res, access.status, { ok: false, code: access.code }); return; }
+            if (!orchestration) { write(res, 503, { ok: false, code: 'orchestration-unavailable' }); return; }
+            const board = getBoard();
+            if (!board) { write(res, 503, { ok: false, code: 'no-task-board' }); return; }
+            const body = await readBody(req);
+            const source = boardSource();
+            const rawCard = (board.snapshot().tasks ?? []).find(item => item.id === body.taskId);
+            const card = effectiveCard(source, rawCard);
+            const room = rooms?.find(source, body.taskId);
+            const workflow = orchestration.target(source, body.taskId);
+            const ledger = auth.loadLedger();
+            if (!workflow && !card) {
+                write(res, 404, { ok: false, code: 'task-not-found' });
+                return;
+            }
+            if (room && !taskRoomAccess(access, room, allowed, ledger)) {
+                write(res, 403, { ok: false, code: 'workspace-forbidden' });
+                return;
+            }
+            if (workflow && !room && !allowed(access, workflow, ledger)) {
+                write(res, 403, { ok: false, code: 'workspace-forbidden' });
+                return;
+            }
+            const prepared = orchestration.prepare({
+                ...body.orchestration,
+                workspaceId: body.orchestration?.workspaceId ?? workflow?.workspaceId ?? room?.workspaceId ?? card?.workspaceId,
+            }, member => allowed(access, member, ledger));
+            if ((workflow && prepared.workspaceId !== workflow.workspaceId) || (room && prepared.workspaceId !== room.workspaceId)) {
+                write(res, 403, { ok: false, code: 'workspace-forbidden' });
+                return;
+            }
+            if (!allowed(access, prepared, ledger)) {
+                write(res, 403, { ok: false, code: 'workspace-forbidden' });
+                return;
+            }
+            const configured = orchestration.configure(source, body.taskId, prepared);
+            const noticeText = configured?._notice || '';
+            if (noticeText && card) {
+                await appendRoomEventSafe({
+                    source, card, workflow: configured, access, ledger,
+                    kind: 'status', phase: 'config-change', actor: 'Marshal', text: noticeText,
+                });
+            }
+            const sid = latestSessionIdOf(rawCard, configured);
+            if (sid) {
+                const lCfg = configured?.agentConfigs?.leader ?? configured?.plan?.agentConfigs?.leader;
+                await selectResidentSessionModel(sid, lCfg?.model, lCfg?.reasoningEffort);
+            }
+            write(res, 200, {
+                ok: true,
+                ...(noticeText ? { notice: noticeText } : {}),
+                tasks: taskList(board.snapshot(), req, source),
+            });
+        }),
+        exact('POST', '/marshal/tasks/agent-configs', async (req, res) => {
+            const access = authenticate(req, true);
+            if (!access.ok) { write(res, access.status, { ok: false, code: access.code }); return; }
+            if (!orchestration) { write(res, 503, { ok: false, code: 'orchestration-unavailable' }); return; }
+            const board = getBoard();
+            const body = await readBody(req);
+            if (typeof body.taskId !== 'string' || body.taskId === '') {
+                write(res, 400, { ok: false, code: 'invalid-task' });
+                return;
+            }
+            const source = boardSource();
+            const rawCard = (board?.snapshot().tasks ?? []).find(item => item.id === body.taskId);
+            const card = effectiveCard(source, rawCard);
+            const room = rooms?.find(source, body.taskId);
+            const workflow = orchestration.target(source, body.taskId);
+            const ledger = auth.loadLedger();
+            if (!workflow && !card) {
+                write(res, 404, { ok: false, code: 'task-not-found' });
+                return;
+            }
+            if (room && !taskRoomAccess(access, room, allowed, ledger)) {
+                write(res, 403, { ok: false, code: 'workspace-forbidden' });
+                return;
+            }
+            if (workflow && !room && !allowed(access, workflow, ledger)) {
+                write(res, 403, { ok: false, code: 'workspace-forbidden' });
+                return;
+            }
+            const updatedWf = orchestration.updateAgentConfigs(source, body.taskId, {
+                ...body,
+                ...(!workflow && !body.workspaceId && (room?.workspaceId || card?.workspaceId) ? { workspaceId: room?.workspaceId ?? card?.workspaceId } : {}),
+            }, member => allowed(access, member, ledger));
+            const noticeText = updatedWf?._notice || '';
+            if (noticeText && card) {
+                await appendRoomEventSafe({
+                    source, card, workflow: updatedWf, access, ledger,
+                    kind: 'status', phase: 'config-change', actor: 'Marshal', text: noticeText,
+                });
+            }
+            const sid = latestSessionIdOf(rawCard, updatedWf);
+            if (sid && (body.agentConfigs?.leader || body.leaderId)) {
+                const lCfg = updatedWf?.agentConfigs?.leader ?? updatedWf?.plan?.agentConfigs?.leader;
+                await selectResidentSessionModel(sid, lCfg?.model, lCfg?.reasoningEffort);
+            }
+            write(res, 200, {
+                ok: true,
+                ...(noticeText ? { notice: noticeText } : {}),
+                tasks: taskList(board ? board.snapshot() : { tasks: [] }, req, source),
+            });
+        }),
+        exact('GET', '/marshal/tasks/report', async (req, res) => {
+            const id = new URL(req.url ?? '', 'http://localhost').searchParams.get('taskId');
+            const source = boardSource();
+            const access = authenticate(req);
+            const target = orchestration?.target(source, id);
+            if (!target || !allowed(access, { workspaceId: target.workspaceId })) {
+                write(res, access.ok ? 404 : access.status, { ok: false, code: access.ok ? 'report-not-found' : access.code });
+                return;
+            }
+            const report = await orchestration.report(source, id);
+            if (report === undefined) {
+                write(res, 404, { ok: false, code: 'report-not-found' });
+                return;
+            }
+            write(res, 200, { ok: true, report });
+        }),
+        exact('GET', '/marshal/tasks/attachment', async (req, res) => {
+            const board = getBoard();
+            if (board === undefined) {
+                write(res, 503, { ok: false, code: 'no-task-board' });
+                return;
+            }
+            const params = new URL(req.url ?? '', 'http://localhost').searchParams;
+            const taskId = params.get('taskId') ?? '';
+            const attachmentId = params.get('id') ?? '';
+            if (!taskId || !attachmentId) {
+                write(res, 400, { ok: false, code: 'invalid-attachment-query' });
+                return;
+            }
+            const source = boardSource();
+            const task = (board.snapshot().tasks ?? []).find(item => item.id === taskId);
+            if (!task) {
+                write(res, 404, { ok: false, code: 'task-not-found' });
+                return;
+            }
+            const access = authenticate(req);
+            const ledger = access.ok ? auth.loadLedger() : undefined;
+            const room = rooms?.find(source, taskId);
+            const target = orchestration?.target(source, taskId);
+            if (room && !taskRoomAccess(access, room, allowed, ledger)) {
+                write(res, access.ok ? 403 : access.status, { ok: false, code: access.ok ? 'workspace-forbidden' : access.code });
+                return;
+            }
+            if (target && !allowed(access, { workspaceId: target.workspaceId }, ledger)) {
+                write(res, access.ok ? 403 : access.status, { ok: false, code: access.ok ? 'workspace-forbidden' : access.code });
+                return;
+            }
+            const effTask = effectiveCard(source, task);
+            const att = (normalizeAttachmentsPayload(effTask?.attachments) ?? []).find(item => item.attachmentId === attachmentId);
+            if (!att) {
+                write(res, 404, { ok: false, code: 'not-found', message: '未在该工单上找到对应附件。' });
+                return;
+            }
+            const store = typeof getAttachmentStore === 'function' ? getAttachmentStore() : undefined;
+            if (!store) {
+                write(res, 503, { ok: false, code: 'storage-unavailable', message: '当前环境未挂载附件存储服务。' });
+                return;
+            }
+            if (att.kind === 'image') {
+                const stored = await store.readImage({
+                    attachmentId: att.attachmentId, mediaType: att.mediaType, bytes: att.bytes,
+                    width: att.width, height: att.height, name: att.name,
+                });
+                const buf = Buffer.from(stored.data);
+                res.writeHead(200, {
+                    'content-type': stored.ref.mediaType,
+                    'content-length': String(buf.byteLength),
+                    'content-disposition': "inline; filename*=UTF-8''" + encodeURIComponent(att.name),
+                    'x-content-type-options': 'nosniff',
+                    'cache-control': 'no-store',
+                });
+                res.end(buf);
+                return;
+            }
+            res.writeHead(200, {
+                'content-type': 'application/octet-stream',
+                'content-length': String(att.bytes),
+                'content-disposition': "attachment; filename*=UTF-8''" + encodeURIComponent(att.name),
+                'x-content-type-options': 'nosniff',
+                'cache-control': 'no-store',
+            });
+            for await (const chunk of store.readFileStream({ attachmentId: att.attachmentId, name: att.name, bytes: att.bytes })) {
+                res.write(Buffer.from(chunk));
+            }
+            res.end();
+        }),
         exact('GET', '/marshal/tasks/state', async (req, res) => {
             const board = getBoard();
             if (board === undefined) {
@@ -183,7 +813,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource = 
             const snapshot = board.snapshot();
             write(res, 200, {
                 ok: true,
-                tasks: (Array.isArray(snapshot.tasks) ? snapshot.tasks : []).map(taskView),
+                tasks: taskList(snapshot, req, boardSource()),
                 ...(snapshot.sessionDefaultPermission === undefined ? {} : { sessionDefaultPermission: snapshot.sessionDefaultPermission }),
             });
         }),
@@ -201,9 +831,146 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource = 
             }
             const description = typeof body.description === 'string' ? body.description.trim() : '';
             const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
-            const input = { title, description, prompt: prompt || description || title };
-            const snapshot = await board.apply(randomUUID(), { kind: 'create', id: randomUUID(), input }, initiator);
-            write(res, 200, { ok: true, tasks: (Array.isArray(snapshot.tasks) ? snapshot.tasks : []).map(taskView) });
+            const tags = normalizeCardTags(body.tags);
+            const attachments = normalizeAttachmentsPayload(body.attachments);
+            if (Array.isArray(body.attachments) && body.attachments.length > 0 && attachments === undefined) {
+                write(res, 400, { ok: false, code: 'invalid-attachments', message: '附件元数据无效或超过限制（最多 8 个，单文件 ≤ 10MB）。' });
+                return;
+            }
+            const parentId = typeof body.parentId === 'string' && body.parentId.trim() !== '' ? body.parentId.trim() : undefined;
+            const explicitPermission = ['read-only', 'workspace-write', 'danger-full-access'].includes(body.permission) ? body.permission : undefined;
+            const permission = explicitPermission ?? ((body.workspaceId || body.orchestration) ? 'workspace-write' : undefined);
+            const model = typeof body.model === 'string' && body.model.trim() !== '' ? body.model.trim() : undefined;
+            const reasoningEffort = typeof body.reasoningEffort === 'string' && body.reasoningEffort.trim() !== '' ? body.reasoningEffort.trim() : undefined;
+            const reuseSession = typeof body.reuseSession === 'boolean' ? body.reuseSession : undefined;
+            const ambiguityReason = body.skipAmbiguityCheck === true ? undefined : detectAmbiguousTask({
+                title, description, prompt,
+                hasAttachments: attachments !== undefined,
+                hasPr: typeof body.orchestration?.prUrl === 'string' && body.orchestration.prUrl.trim() !== '',
+            });
+            const source = boardSource();
+            const id = randomUUID();
+            let prepared;
+            let existing;
+            let scope;
+            if (body.orchestration !== undefined || body.workspaceId !== undefined) {
+                if (body.orchestration !== undefined && !orchestration) {
+                    write(res, 503, { ok: false, code: 'orchestration-unavailable' });
+                    return;
+                }
+                // Authorize before looking up the requested leader, then check the bound workspace.
+                const access = authenticate(req, true);
+                if (!access.ok) { write(res, access.status, { ok: false, code: access.code }); return; }
+                const ledger = auth.loadLedger();
+                prepared = body.orchestration === undefined ? undefined :
+                    orchestration.prepare({
+                        ...body.orchestration,
+                        ...(typeof body.workspaceId === 'string' && body.workspaceId.trim() !== '' ? { workspaceId: body.workspaceId.trim() } : {}),
+                    }, member => allowed(access, member, ledger));
+                const workspaceId = TaskRoomKey.parse(prepared?.workspaceId ?? body.workspaceId);
+                if (body.workspaceId !== undefined && body.workspaceId !== workspaceId) {
+                    write(res, 400, { ok: false, code: 'workspace-conflict' });
+                    return;
+                }
+                if (!allowed(access, prepared ?? { workspaceId })) {
+                    write(res, 403, { ok: false, code: 'workspace-forbidden' });
+                    return;
+                }
+                if (!rooms) {
+                    write(res, 503, { ok: false, code: 'task-rooms-unavailable' });
+                    return;
+                }
+                scope = { workspaceId, ownerId: access.session.ownerId };
+                existing = new Set((board.snapshot().tasks ?? []).map(task => task.id));
+            }
+            const cardWorkspaceId = scope?.workspaceId ?? (typeof body.workspaceId === 'string' && body.workspaceId.trim() !== '' ? body.workspaceId.trim() : undefined);
+            let cardTags = tags;
+            if (prepared?.leaderName) {
+                const hasAgentTag = Array.isArray(cardTags) && cardTags.some(t => typeof t?.name === 'string' && (t.name.startsWith('智能体:') || t.name.startsWith('@')));
+                if (!hasAgentTag) {
+                    const leaderTag = { name: ('智能体:' + prepared.leaderName).slice(0, 32) };
+                    cardTags = Array.isArray(cardTags) ? [...cardTags, leaderTag].slice(0, 8) : [leaderTag];
+                }
+            }
+            const input = {
+                title, description, prompt: prompt || description || title,
+                ...(cardWorkspaceId === undefined ? {} : { workspaceId: cardWorkspaceId }),
+                ...(cardTags === undefined ? {} : { tags: cardTags }),
+                ...(attachments === undefined ? {} : { attachments }),
+                ...(parentId === undefined ? {} : { parentId }),
+                ...(permission === undefined ? {} : { permission }),
+                ...(model === undefined ? {} : { model }),
+                ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+                ...(reuseSession === undefined ? {} : { reuseSession }),
+            };
+            const beforeIds = existing ?? new Set((board.snapshot().tasks ?? []).map(task => task.id));
+            // Attach orchestration BEFORE board.apply('create') so superagent or other
+            // synchronous board-change listeners immediately observe the workflow instead
+            // of racing and falling back to a plain un-orchestrated dispatch.
+            let preAttached = false;
+            if (scope && prepared) {
+                try {
+                    orchestration.attach(source, id, prepared);
+                    preAttached = true;
+                } catch {
+                    write(res, 500, { ok: false, code: 'task-orchestration-not-saved', message: '无法保存任务编排。' });
+                    return;
+                }
+            }
+            let snapshot;
+            try {
+                snapshot = await applyBoardAction(req, board, source, { kind: 'create', id, input }, initiator);
+            } catch (createError) {
+                if (preAttached) {
+                    try { orchestration.remove(source, id); } catch { /* preserve original error */ }
+                }
+                throw createError;
+            }
+            const added = (snapshot.tasks ?? []).filter(task => !beforeIds.has(task.id));
+            const created = (snapshot.tasks ?? []).find(task => task.id === id) ?? (added.length === 1 ? added[0] : undefined);
+            if (scope) {
+                if (!created) {
+                    if (preAttached) {
+                        try { orchestration.remove(source, id); } catch { /* ignore */ }
+                    }
+                    write(res, 409, { ok: false, code: 'task-create-not-observed' });
+                    return;
+                }
+                try {
+                    if (prepared && created.id !== id) {
+                        if (preAttached) {
+                            try { orchestration.remove(source, id); } catch { /* ignore */ }
+                        }
+                        orchestration.attach(source, created.id, prepared);
+                    }
+                    const ticketNo = ticketNumbers?.ensure?.(created.id);
+                    rooms.ensure(source, ticketNo ? { ...created, title: withTicketPrefix(ticketNo, created.title) } : created, scope.workspaceId, scope.ownerId);
+                }
+                catch {
+                    if (prepared) {
+                        try { orchestration.remove(source, created.id); } catch { /* preserve original error */ }
+                        if (preAttached && created.id !== id) {
+                            try { orchestration.remove(source, id); } catch { /* preserve original error */ }
+                        }
+                    }
+                    try { await board.apply(randomUUID(), { kind: 'delete', taskId: created.id }, initiator); }
+                    catch { /* A host without rollback can leave an unconfigured card. */ }
+                    write(res, 500, { ok: false, code: 'task-orchestration-not-saved', message: '无法保存任务编排。' });
+                    return;
+                }
+            }
+            let movedToReview = false;
+            if (ambiguityReason !== undefined && created && created.status !== 'review' && created.status !== 'running') {
+                try {
+                    snapshot = await board.apply(randomUUID(), { kind: 'move', taskId: created.id, status: 'review' }, initiator);
+                    movedToReview = true;
+                } catch { /* keep created status if board refuses move */ }
+            }
+            write(res, 200, {
+                ok: true,
+                tasks: taskList(snapshot, req, source),
+                ...(movedToReview ? { movedToReview: true, ambiguityReason } : {}),
+            });
         }),
         exact('POST', '/marshal/tasks/run', async (req, res) => {
             const board = getBoard();
@@ -216,8 +983,418 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource = 
                 write(res, 400, { ok: false, code: 'invalid-task' });
                 return;
             }
-            const snapshot = await board.apply(randomUUID(), { kind: 'run', taskId: body.taskId }, initiator);
-            write(res, 200, { ok: true, tasks: (Array.isArray(snapshot.tasks) ? snapshot.tasks : []).map(taskView) });
+            const source = boardSource();
+            const workflow = orchestration?.target(source, body.taskId);
+            const boundRoom = rooms?.find(source, body.taskId);
+            if (workflow) {
+                if (!authorize(req, res, workflow)) return;
+                const snapshot = board.snapshot();
+                const rawTask = (snapshot.tasks ?? []).find(item => item.id === body.taskId);
+                if (!rawTask) {
+                    write(res, 404, { ok: false, code: 'task-not-found' });
+                    return;
+                }
+                const task = effectiveCard(source, rawTask);
+                const access = authenticate(req, true);
+                const runTicketNo = ticketNumbers?.ensure?.(task.id);
+                const room = boundRoom ?? rooms?.ensure(source, runTicketNo ? { ...task, title: withTicketPrefix(runTicketNo, task.title) } : task, workflow.workspaceId, access.session.ownerId);
+                if (!room || !taskRoomAccess(access, room, allowed)) {
+                    write(res, 403, { ok: false, code: 'workspace-forbidden' });
+                    return;
+                }
+                roomRoutes.assertIdle(room);
+                if (room.closed) {
+                    await rooms.append(room.id, { kind: 'reopened', runId: room.runId, actor: '工单操作者', text: '工单重新运行，自动重开工单群。' });
+                }
+                orchestration.start(source, task, taskRoomAudit(rooms, room, workflow.state === 'done' || workflow.state === 'review-blocked' ? 'retry' : undefined, undefined, undefined,
+                    member => allowed(access, member)));
+                write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
+                return;
+            }
+            if (boundRoom) {
+                const access = authenticate(req, true);
+                if (!taskRoomAccess(access, boundRoom, allowed)) {
+                    write(res, 403, { ok: false, code: 'workspace-forbidden' });
+                    return;
+                }
+                roomRoutes.assertIdle(boundRoom);
+                const current = await rooms.page(boundRoom.id, { limit: 1 });
+                if (current.room.closed) {
+                    await rooms.append(boundRoom.id, { kind: 'reopened', runId: current.room.runId, actor: '工单操作者', text: '工单重新运行，自动重开工单群。' });
+                }
+            }
+            try {
+                const snapshot = await launchPlainCardWithOverrides(source, body.taskId, initiator);
+                write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
+            }
+            catch (error) {
+                if (isPermissionBlockedError(error)) {
+                    let snapshot = board.snapshot();
+                    let movedToReview = false;
+                    try {
+                        snapshot = await board.apply(randomUUID(), { kind: 'move', taskId: body.taskId, status: 'review' }, initiator);
+                        movedToReview = true;
+                    } catch { /* keep snapshot if move refused */ }
+                    write(res, 200, {
+                        ok: true,
+                        permissionBlocked: true,
+                        movedToReview,
+                        message: '权限受阻：' + (error instanceof Error ? error.message : String(error)) + '，工单已转入「待确认」等待确认。',
+                        tasks: taskList(snapshot, req, source),
+                    });
+                    return;
+                }
+                throw error;
+            }
+        }),
+        exact('POST', '/marshal/tasks/move', async (req, res) => {
+            const board = getBoard();
+            if (board === undefined) {
+                write(res, 503, { ok: false, code: 'no-task-board' });
+                return;
+            }
+            const body = await readBody(req);
+            if (typeof body.taskId !== 'string' || body.taskId === '') {
+                write(res, 400, { ok: false, code: 'invalid-task' });
+                return;
+            }
+            if (!['backlog', 'todo', 'running', 'review', 'done', 'failed'].includes(body.status)) {
+                write(res, 400, { ok: false, code: 'invalid-status' });
+                return;
+            }
+            const source = boardSource();
+            const workflow = orchestration?.target(source, body.taskId);
+            const boundRoom = rooms?.find(source, body.taskId);
+            if (boundRoom) {
+                const access = authenticate(req, true);
+                if (!taskRoomAccess(access, boundRoom, allowed)) {
+                    write(res, 403, { ok: false, code: 'workspace-forbidden' });
+                    return;
+                }
+            }
+            if (workflow && !authorize(req, res, workflow)) return;
+            orchestration?.assertIdle(source, body.taskId);
+            const snapshot = await board.apply(randomUUID(), { kind: 'move', taskId: body.taskId, status: body.status }, initiator);
+            if (workflow) {
+                let recoveredDev;
+                if (body.status === 'review' && !workflow.development && boundRoom) {
+                    try {
+                        const page = await rooms.page(boundRoom.id, { limit: 100 });
+                        const latestPatch = [...(page.records ?? [])].reverse().find(r => r.phase === 'development-patch' && r.ref);
+                        if (latestPatch) recoveredDev = { development: { base: 'HEAD', digest: latestPatch.ref }, reviewReason: workflow.reviewReason ?? 'review-blocked' };
+                    } catch { /* ignore */ }
+                }
+                orchestration.syncStatus?.(source, body.taskId, body.status, recoveredDev);
+            }
+            if (boundRoom) {
+                try {
+                    const current = (await rooms.page(boundRoom.id, { limit: 1 })).room;
+                    if (body.status === 'done' && !current.closed) {
+                        await rooms.append(boundRoom.id, { kind: 'closed', runId: current.runId, actor: '工单操作者', phase: 'confirmed', text: '工单已在看板确认完成并归档。' });
+                    } else if (body.status !== 'done' && current.closed) {
+                        await rooms.append(boundRoom.id, { kind: 'reopened', runId: current.runId, actor: '工单操作者', text: '工单已从看板移回「' + body.status + '」并重开。' });
+                    }
+                } catch { /* room sync is best-effort */ }
+            }
+            write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
+        }),
+        exact('POST', '/marshal/tasks/confirm-review', async (req, res) => {
+            const board = getBoard();
+            if (board === undefined) { write(res, 503, { ok: false, code: 'no-task-board' }); return; }
+            const body = await readBody(req);
+            if (typeof body.taskId !== 'string' || body.taskId === '') { write(res, 400, { ok: false, code: 'invalid-task' }); return; }
+            const source = boardSource();
+            const rawCard = (board.snapshot().tasks ?? []).find(item => item.id === body.taskId);
+            if (!rawCard) { write(res, 404, { ok: false, code: 'task-not-found' }); return; }
+            const card = effectiveCard(source, rawCard);
+            const workflow = orchestration?.target(source, body.taskId);
+            const boundRoom = rooms?.find(source, body.taskId);
+            const access = authenticate(req, true);
+            if (boundRoom) {
+                if (!taskRoomAccess(access, boundRoom, allowed)) { write(res, 403, { ok: false, code: 'workspace-forbidden' }); return; }
+            }
+            if (workflow && !authorize(req, res, workflow)) return;
+            const result = await roomRoutes.confirmReview({ room: boundRoom, card, body, access, initiatorTag: initiator });
+            write(res, 200, {
+                ok: true,
+                patchApplied: result.patchApplied,
+                patchAlreadyApplied: result.patchAlreadyApplied,
+                ...(result.committed ? { committed: true, commitHash: result.commitHash } : {}),
+                tasks: taskList(result.snapshot ?? board.snapshot(), req, source),
+            });
+        }),
+        exact('POST', '/marshal/tasks/revise', async (req, res) => {
+            const board = getBoard();
+            if (board === undefined) { write(res, 503, { ok: false, code: 'no-task-board' }); return; }
+            const body = await readBody(req);
+            if (typeof body.taskId !== 'string' || body.taskId === '') { write(res, 400, { ok: false, code: 'invalid-task' }); return; }
+            const source = boardSource();
+            const rawCard = (board.snapshot().tasks ?? []).find(item => item.id === body.taskId);
+            if (!rawCard) { write(res, 404, { ok: false, code: 'task-not-found' }); return; }
+            const card = effectiveCard(source, rawCard);
+            const workflow = orchestration?.target(source, body.taskId);
+            const boundRoom = rooms?.find(source, body.taskId);
+            const access = authenticate(req, true);
+            if (boundRoom) {
+                if (!taskRoomAccess(access, boundRoom, allowed)) { write(res, 403, { ok: false, code: 'workspace-forbidden' }); return; }
+            } else if (workflow || card.workspaceId) {
+                if (!access.ok || !allowed(access, workflow ?? { workspaceId: card.workspaceId })) {
+                    write(res, access.ok ? 403 : access.status, { ok: false, code: access.ok ? 'workspace-forbidden' : access.code });
+                    return;
+                }
+            }
+            if (workflow && !authorize(req, res, workflow)) return;
+            const result = await roomRoutes.reviseTask({ room: boundRoom, card, body, access, initiatorTag: initiator });
+            write(res, 200, { ok: true, tasks: taskList(result.snapshot ?? board.snapshot(), req, source) });
+        }),
+        exact('POST', '/marshal/tasks/update', async (req, res) => {
+            const board = getBoard();
+            if (board === undefined) { write(res, 503, { ok: false, code: 'no-task-board' }); return; }
+            const body = await readBody(req);
+            if (typeof body.taskId !== 'string' || body.taskId === '') { write(res, 400, { ok: false, code: 'invalid-task' }); return; }
+            const source = boardSource();
+            const rawBefore = (board.snapshot().tasks ?? []).find(item => item.id === body.taskId);
+            if (!rawBefore) { write(res, 404, { ok: false, code: 'task-not-found' }); return; }
+            const prevCard = effectiveCard(source, rawBefore);
+            const workflow = orchestration?.target(source, body.taskId);
+            const boundRoom = rooms?.find(source, body.taskId);
+            const access = authenticate(req, Boolean(boundRoom || workflow));
+            const ledger = access.ok ? auth.loadLedger() : undefined;
+            if (boundRoom) {
+                if (!taskRoomAccess(access, boundRoom, allowed, ledger)) { write(res, 403, { ok: false, code: 'workspace-forbidden' }); return; }
+            }
+            if (workflow && !authorize(req, res, workflow)) return;
+
+            const contentPatch = {};
+            const metaPatch = {};
+            if (typeof body.title === 'string') {
+                if (body.title.trim() === '') { write(res, 400, { ok: false, code: 'invalid-title', message: '标题不能为空。' }); return; }
+                contentPatch.title = body.title.trim();
+            }
+            if (typeof body.description === 'string') contentPatch.description = body.description;
+            if (typeof body.prompt === 'string') contentPatch.prompt = body.prompt;
+            if (body.attachments === null || (Array.isArray(body.attachments) && body.attachments.length === 0)) {
+                contentPatch.attachments = null;
+            }
+            else if (Array.isArray(body.attachments)) {
+                const normalized = normalizeAttachmentsPayload(body.attachments);
+                if (normalized === undefined) {
+                    write(res, 400, { ok: false, code: 'invalid-attachments', message: '附件元数据无效或超过限制（最多 8 个，单文件 ≤ 10MB）。' });
+                    return;
+                }
+                contentPatch.attachments = normalized;
+            }
+
+            if (['read-only', 'workspace-write', 'danger-full-access'].includes(body.permission)) metaPatch.permission = body.permission;
+            if (typeof body.model === 'string') metaPatch.model = body.model.trim();
+            if (typeof body.reasoningEffort === 'string') metaPatch.reasoningEffort = body.reasoningEffort.trim();
+            if (body.reuseSession === null || typeof body.reuseSession === 'boolean') metaPatch.reuseSession = body.reuseSession;
+            if (typeof body.workspaceId === 'string') metaPatch.workspaceId = body.workspaceId.trim();
+            if (body.freeze === null) metaPatch.freeze = null;
+            else if (body.freeze && typeof body.freeze === 'object' && typeof body.freeze.goal === 'string') {
+                metaPatch.freeze = body.freeze.goal.trim() !== '' ? { goal: body.freeze.goal.trim() } : null;
+            }
+            if (body.tags === null) metaPatch.tags = null;
+            else if (Array.isArray(body.tags)) {
+                const tags = normalizeCardTags(body.tags);
+                metaPatch.tags = tags ?? null;
+            }
+
+            if (Object.keys(contentPatch).length === 0 && Object.keys(metaPatch).length === 0) {
+                write(res, 400, { ok: false, code: 'empty-patch' });
+                return;
+            }
+
+            let snapshot = board.snapshot();
+            const canNativeContentEdit = rawBefore.archivedAt === undefined && (Array.isArray(rawBefore.executions) ? rawBefore.executions.length : 0) === 0;
+            if (canNativeContentEdit && rawBefore.archivedAt === undefined) {
+                const combinedPatch = { ...metaPatch, ...contentPatch };
+                try {
+                    snapshot = await applyBoardAction(req, board, source, { kind: 'update', taskId: body.taskId, patch: combinedPatch }, initiator);
+                    if (Object.keys(contentPatch).length > 0 && taskOverrides.get(source, body.taskId)) {
+                        taskOverrides.set(source, body.taskId, contentPatch);
+                    }
+                } catch (err) {
+                    const msg = err instanceof Error ? err.message : String(err);
+                    if (!/already been executed|read-only/i.test(msg)) throw err;
+                    if (Object.keys(metaPatch).length > 0) {
+                        snapshot = await applyBoardAction(req, board, source, { kind: 'update', taskId: body.taskId, patch: metaPatch }, initiator);
+                    }
+                    if (Object.keys(contentPatch).length > 0) {
+                        taskOverrides.set(source, body.taskId, contentPatch);
+                    }
+                }
+            } else {
+                if (Object.keys(metaPatch).length > 0 && rawBefore.archivedAt === undefined) {
+                    snapshot = await applyBoardAction(req, board, source, { kind: 'update', taskId: body.taskId, patch: metaPatch }, initiator);
+                }
+                if (Object.keys(contentPatch).length > 0) {
+                    taskOverrides.set(source, body.taskId, contentPatch);
+                }
+            }
+
+            const rawAfter = (snapshot.tasks ?? []).find(item => item.id === body.taskId) ?? rawBefore;
+            const nextCard = effectiveCard(source, rawAfter);
+            const writeAccess = access.ok ? access : authenticate(req, true);
+            const writeLedger = writeAccess.ok ? (ledger ?? auth.loadLedger()) : undefined;
+
+            // 1) Plain-card model / thinking mode / assigned agent change -> notify room + update resident session for next turn
+            const { summary: plainConfigNotice } = describePlainConfigChanges(prevCard, nextCard);
+            if (plainConfigNotice) {
+                await appendRoomEventSafe({
+                    source, card: nextCard, workflow, access: writeAccess, ledger: writeLedger,
+                    kind: 'status', phase: 'config-change', actor: 'Marshal', text: plainConfigNotice,
+                });
+                const sid = latestSessionIdOf(rawAfter, workflow);
+                if (sid && ('model' in metaPatch || 'reasoningEffort' in metaPatch)) {
+                    await selectResidentSessionModel(sid, nextCard.model, nextCard.reasoningEffort);
+                }
+            }
+
+            // 2) Content change -> live steering injection if running (and steerNow !== false), or room update record if idle
+            const openExecution = Array.isArray(rawAfter?.executions) && rawAfter.executions.some(ex => ex && ex.endedAt === undefined);
+            const isTicketRunning = Boolean(
+                orchestration?.isRunning?.(source, body.taskId)
+                || workflow?.state === 'running'
+                || workflow?.state === 'handed-off'
+                || openExecution
+                || rawAfter?.status === 'running'
+            );
+            const shouldSteer = body.steerNow === true || (isTicketRunning && body.steerNow !== false);
+            const steerMessage = Object.keys(contentPatch).length > 0
+                ? describeContentSteeringMessage(prevCard, nextCard, contentPatch)
+                : '';
+            let steered = false;
+            if (steerMessage) {
+                if (shouldSteer) {
+                    const roomWrote = await appendRoomEventSafe({
+                        source, card: nextCard, workflow, access: writeAccess, ledger: writeLedger,
+                        kind: 'user', phase: 'steering', actor: '工单操作者', text: steerMessage, reopenIfClosed: true,
+                    });
+                    const sid = latestSessionIdOf(rawAfter, workflow);
+                    const sessionSteered = sid ? await steerResidentSession(sid, steerMessage) : false;
+                    steered = Boolean(roomWrote || sessionSteered || orchestration?.isRunning?.(source, body.taskId));
+                } else if (boundRoom) {
+                    await appendRoomEventSafe({
+                        source, card: nextCard, workflow, access: writeAccess, ledger: writeLedger,
+                        kind: 'status', phase: 'content-updated', actor: 'Marshal',
+                        text: '📝 工单内容已修改，将在下次运行或继续执行时生效。',
+                    });
+                }
+            }
+
+            write(res, 200, {
+                ok: true,
+                ...(steered ? { steered: true } : {}),
+                ...(plainConfigNotice ? { configNotice: plainConfigNotice } : {}),
+                tasks: taskList(snapshot, req, source),
+            });
+        }),
+        exact('POST', '/marshal/tasks/set-parent', async (req, res) => {
+            const board = getBoard();
+            if (board === undefined) { write(res, 503, { ok: false, code: 'no-task-board' }); return; }
+            const body = await readBody(req);
+            if (typeof body.taskId !== 'string' || body.taskId === '') { write(res, 400, { ok: false, code: 'invalid-task' }); return; }
+            const parentId = body.parentId === null || body.parentId === '' || body.parentId === undefined ? null
+                : typeof body.parentId === 'string' ? body.parentId.trim() : undefined;
+            if (parentId === undefined || parentId === body.taskId) { write(res, 400, { ok: false, code: 'invalid-parent' }); return; }
+            const source = boardSource();
+            const workflow = orchestration?.target(source, body.taskId);
+            const boundRoom = rooms?.find(source, body.taskId);
+            if (boundRoom) {
+                const access = authenticate(req, true);
+                if (!taskRoomAccess(access, boundRoom, allowed)) { write(res, 403, { ok: false, code: 'workspace-forbidden' }); return; }
+            }
+            if (workflow && !authorize(req, res, workflow)) return;
+            const snapshot = await board.apply(randomUUID(), { kind: 'set-parent', taskId: body.taskId, parentId }, initiator);
+            write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
+        }),
+        exact('POST', '/marshal/tasks/archive', async (req, res) => {
+            const board = getBoard();
+            if (board === undefined) { write(res, 503, { ok: false, code: 'no-task-board' }); return; }
+            const body = await readBody(req);
+            if (typeof body.taskId !== 'string' || body.taskId === '') { write(res, 400, { ok: false, code: 'invalid-task' }); return; }
+            const source = boardSource();
+            const workflow = orchestration?.target(source, body.taskId);
+            const boundRoom = rooms?.find(source, body.taskId);
+            if (boundRoom) {
+                const access = authenticate(req, true);
+                if (!taskRoomAccess(access, boundRoom, allowed)) { write(res, 403, { ok: false, code: 'workspace-forbidden' }); return; }
+            }
+            if (workflow && !authorize(req, res, workflow)) return;
+            orchestration?.assertIdle(source, body.taskId);
+            const snapshot = await board.apply(randomUUID(), { kind: 'archive', taskId: body.taskId }, initiator);
+            write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
+        }),
+        exact('POST', '/marshal/tasks/restore', async (req, res) => {
+            const board = getBoard();
+            if (board === undefined) { write(res, 503, { ok: false, code: 'no-task-board' }); return; }
+            const body = await readBody(req);
+            if (typeof body.taskId !== 'string' || body.taskId === '') { write(res, 400, { ok: false, code: 'invalid-task' }); return; }
+            const source = boardSource();
+            const workflow = orchestration?.target(source, body.taskId);
+            const boundRoom = rooms?.find(source, body.taskId);
+            if (boundRoom) {
+                const access = authenticate(req, true);
+                if (!taskRoomAccess(access, boundRoom, allowed)) { write(res, 403, { ok: false, code: 'workspace-forbidden' }); return; }
+            }
+            if (workflow && !authorize(req, res, workflow)) return;
+            const snapshot = await board.apply(randomUUID(), { kind: 'restore', taskId: body.taskId }, initiator);
+            write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
+        }),
+        exact('POST', '/marshal/tasks/schedule', async (req, res) => {
+            const board = getBoard();
+            if (board === undefined) { write(res, 503, { ok: false, code: 'no-task-board' }); return; }
+            const body = await readBody(req);
+            if (typeof body.taskId !== 'string' || body.taskId === '') { write(res, 400, { ok: false, code: 'invalid-task' }); return; }
+            const source = boardSource();
+            const workflow = orchestration?.target(source, body.taskId);
+            const boundRoom = rooms?.find(source, body.taskId);
+            if (boundRoom) {
+                const access = authenticate(req, true);
+                if (!taskRoomAccess(access, boundRoom, allowed)) { write(res, 403, { ok: false, code: 'workspace-forbidden' }); return; }
+            }
+            if (workflow && !authorize(req, res, workflow)) return;
+            const patch = {};
+            if (typeof body.enabled === 'boolean') patch.enabled = body.enabled;
+            if (body.mode === 'cron' || body.mode === 'once') patch.mode = body.mode;
+            if (typeof body.cron === 'string') patch.cron = body.cron.trim();
+            if (typeof body.at === 'number' && Number.isInteger(body.at)) patch.at = body.at;
+            if (Object.keys(patch).length === 0) { write(res, 400, { ok: false, code: 'invalid-schedule' }); return; }
+            const snapshot = await board.apply(randomUUID(), { kind: 'set-schedule', taskId: body.taskId, patch }, initiator);
+            write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
+        }),
+        exact('POST', '/marshal/tasks/settle', async (req, res) => {
+            const board = getBoard();
+            if (board === undefined) { write(res, 503, { ok: false, code: 'no-task-board' }); return; }
+            const body = await readBody(req);
+            if (typeof body.taskId !== 'string' || body.taskId === '') { write(res, 400, { ok: false, code: 'invalid-task' }); return; }
+            const source = boardSource();
+            const workflow = orchestration?.target(source, body.taskId);
+            const boundRoom = rooms?.find(source, body.taskId);
+            if (boundRoom) {
+                const access = authenticate(req, true);
+                if (!taskRoomAccess(access, boundRoom, allowed)) { write(res, 403, { ok: false, code: 'workspace-forbidden' }); return; }
+            }
+            if (workflow && !authorize(req, res, workflow)) return;
+            const snapshot = await board.apply(randomUUID(), { kind: 'settle', taskId: body.taskId }, initiator);
+            write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
+        }),
+        exact('POST', '/marshal/tasks/confirm-permission', async (req, res) => {
+            const board = getBoard();
+            if (board === undefined) { write(res, 503, { ok: false, code: 'no-task-board' }); return; }
+            const body = await readBody(req);
+            if (typeof body.taskId !== 'string' || body.taskId === '') { write(res, 400, { ok: false, code: 'invalid-task' }); return; }
+            const source = boardSource();
+            const workflow = orchestration?.target(source, body.taskId);
+            const boundRoom = rooms?.find(source, body.taskId);
+            if (boundRoom) {
+                const access = authenticate(req, true);
+                if (!taskRoomAccess(access, boundRoom, allowed)) { write(res, 403, { ok: false, code: 'workspace-forbidden' }); return; }
+            }
+            if (workflow && !authorize(req, res, workflow)) return;
+            const snapshot = await board.apply(randomUUID(), { kind: 'confirm-permission', taskId: body.taskId }, initiator);
+            write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
         }),
         exact('POST', '/marshal/tasks/delete', async (req, res) => {
             const board = getBoard();
@@ -230,8 +1407,26 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource = 
                 write(res, 400, { ok: false, code: 'invalid-task' });
                 return;
             }
+            const source = boardSource();
+            const workflow = orchestration?.target(source, body.taskId);
+            const boundRoom = rooms?.find(source, body.taskId);
+            if (boundRoom) {
+                const access = authenticate(req, true);
+                if (!taskRoomAccess(access, boundRoom, allowed)) {
+                    write(res, 403, { ok: false, code: 'workspace-forbidden' });
+                    return;
+                }
+                write(res, 409, { ok: false, code: 'task-room-archive', message: '此工单已有群聊。请在工单群里关单归档。' });
+                return;
+            }
+            if (workflow && !authorize(req, res, workflow)) return;
+            orchestration?.assertIdle(source, body.taskId);
             const snapshot = await board.apply(randomUUID(), { kind: 'delete', taskId: body.taskId }, initiator);
-            write(res, 200, { ok: true, tasks: (Array.isArray(snapshot.tasks) ? snapshot.tasks : []).map(taskView) });
+            if (!(snapshot.tasks ?? []).some(task => task.id === body.taskId)) {
+                if (workflow) orchestration.remove(source, body.taskId);
+                taskOverrides.remove(source, body.taskId);
+            }
+            write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
         }),
         exact('POST', '/marshal/workspaces/agent', async (req, res) => {
             const body = await readBody(req);
@@ -259,6 +1454,230 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource = 
             }
             catch (error) {
                 write(res, 500, { ok: false, code: 'mkdir-failed', message: error instanceof Error ? error.message : String(error) });
+            }
+        }),
+        exact('GET', '/marshal/rosters/state', async (req, res) => {
+            write(res, 200, { ok: true, rosters: rosters?.list() ?? {} });
+        }),
+        exact('POST', '/marshal/rosters/save', async (req, res) => {
+            if (!rosters) { write(res, 503, { ok: false, code: 'rosters-unavailable' }); return; }
+            const body = await readBody(req);
+            const workspaceId = typeof body.workspaceId === 'string' ? body.workspaceId.trim() : '';
+            if (!workspaceId) { write(res, 400, { ok: false, code: 'invalid-workspace' }); return; }
+            const saved = rosters.set(workspaceId, body);
+            write(res, 200, { ok: true, roster: saved, rosters: rosters.list() });
+        }),
+        exact('GET', '/marshal/agents/sessions', async (req, res) => {
+            const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+            const filterAgentId = url.searchParams.get('agentId') || '';
+            const filterTeamId = url.searchParams.get('teamId') || '';
+            let rawRuns = [];
+            const teamsById = new Map();
+            const agentByName = new Map();
+            const agentByWorkspace = new Map();
+            try {
+                const parsed = JSON.parse(readFileSync(agentsLedgerPath(), 'utf8'));
+                if (Array.isArray(parsed?.runs)) rawRuns = parsed.runs;
+                for (const t of Array.isArray(parsed?.teams) ? parsed.teams : []) {
+                    if (!t?.id) continue;
+                    teamsById.set(t.id, t);
+                    for (const m of Array.isArray(t.members) ? t.members : []) {
+                        if (m?.name && !agentByName.has(m.name)) agentByName.set(m.name, { team: t, member: m });
+                        if (t.workspaceId && !agentByWorkspace.has(t.workspaceId)) agentByWorkspace.set(t.workspaceId, { team: t, member: m });
+                    }
+                }
+            } catch { /* empty ledger */ }
+            const sessionMeta = new Map();
+            try {
+                if (typeof sessionController?.list === 'function') {
+                    let cursor;
+                    for (let page = 0; page < 20; page++) {
+                        const listed = await sessionController.list(cursor === undefined ? {} : { cursor });
+                        const rows = Array.isArray(listed) ? listed : Array.isArray(listed?.items) ? listed.items : Array.isArray(listed?.sessions) ? listed.sessions : [];
+                        for (const s of rows) {
+                            const sid = s?.sessionId ?? s?.id;
+                            if (typeof sid === 'string' && sid) {
+                                sessionMeta.set(sid, {
+                                    title: typeof s.title === 'string' ? s.title : (typeof s?.projections?.values?.title === 'string' ? s.projections.values.title : ''),
+                                    updatedAt: typeof s.updatedAt === 'number' ? s.updatedAt : undefined,
+                                    cwd: typeof s.cwd === 'string' ? s.cwd : undefined,
+                                });
+                            }
+                        }
+                        if (!listed?.nextCursor || listed.nextCursor === cursor) break;
+                        cursor = listed.nextCursor;
+                    }
+                }
+            } catch { /* session listing optional */ }
+            const seen = new Set();
+            const sessions = [];
+            const pushSession = ({ sessionId, teamId, memberId, agentName, workspaceId, createdAt, status, fallbackTitle, archived = false }) => {
+                if (!sessionId || seen.has(sessionId)) return;
+                if (filterAgentId && memberId !== filterAgentId) return;
+                if (filterTeamId && teamId !== filterTeamId) return;
+                seen.add(sessionId);
+                const meta = sessionMeta.get(sessionId);
+                const pc = readProjcacheSession(sessionId);
+                const effectiveCreated = createdAt || pc?.createdAt || 0;
+                const effectiveUpdated = meta?.updatedAt ?? effectiveCreated;
+                const resolved = sessionTitles
+                    ? sessionTitles.resolve({
+                        sessionId,
+                        dshTitle: pc?.title || meta?.title || '',
+                        firstText: pc?.firstText || '',
+                        agentName,
+                        fallbackTitle,
+                        createdAt: effectiveCreated,
+                    })
+                    : { title: pc?.title || meta?.title || fallbackTitle || (agentName ? agentName + ' · 闲聊' : '历史会话'), titleSource: 'dsh' };
+                const sessionCwd = pc?.cwd || meta?.cwd || '';
+                const legacyReadOnly = Boolean(sessionCwd && /\/\.dsh-marshal\/agents\/Agent\s*·\s*/.test(sessionCwd) && !existsSync(sessionCwd));
+                sessions.push({
+                    sessionId,
+                    teamId: teamId || '',
+                    memberId: memberId || '',
+                    agentName: agentName || '',
+                    workspaceId: workspaceId || '',
+                    title: resolved.title,
+                    titleSource: resolved.titleSource,
+                    hasPreview: Boolean(pc?.firstText),
+                    archived,
+                    legacyReadOnly,
+                    createdAt: effectiveCreated,
+                    updatedAt: effectiveUpdated,
+                    status: status || '',
+                });
+            };
+            for (const run of rawRuns) {
+                if (!run || typeof run.sessionId !== 'string' || !run.sessionId) continue;
+                const team = teamsById.get(run.teamId);
+                const member = (team?.members ?? []).find(m => m.id === run.memberId);
+                pushSession({
+                    sessionId: run.sessionId,
+                    teamId: run.teamId,
+                    memberId: run.memberId,
+                    agentName: member?.name ?? run.memberName ?? '',
+                    workspaceId: team?.workspaceId ?? '',
+                    createdAt: typeof run.createdAt === 'number' ? run.createdAt : 0,
+                    status: run.status ?? '',
+                    fallbackTitle: run.title,
+                });
+            }
+            // Merge preserved legacy session archive (survives after legacy "Agent · *" workspaces are cleaned)
+            try {
+                const legacyFile = join(groupsRootDir ?? join(homedir(), '.dsh-marshal', 'groups'), 'legacy-agent-sessions.json');
+                const legacyData = JSON.parse(readFileSync(legacyFile, 'utf8'));
+                for (const item of Array.isArray(legacyData?.sessions) ? legacyData.sessions : []) {
+                    if (!item?.sessionId) continue;
+                    const owner = (item.agentName && agentByName.get(item.agentName)) || undefined;
+                    pushSession({
+                        sessionId: item.sessionId,
+                        teamId: owner?.team?.id || item.teamId || '',
+                        memberId: owner?.member?.id || item.memberId || '',
+                        agentName: owner?.member?.name || item.agentName || '',
+                        workspaceId: item.workspaceId || '',
+                        createdAt: Number(item.createdAt) || 0,
+                        archived: item.archived === true,
+                    });
+                }
+            } catch { /* no legacy archive file */ }
+            // Merge historical sessions stored under legacy "Agent · <name>" workspaces so zero casual chats are lost
+            const wsReg = readWorkspaceRegistry();
+            for (const ws of wsReg.workspaces) {
+                const match = /^Agent\s*·\s*(.+)$/.exec(ws.title.trim());
+                const owner = agentByWorkspace.get(ws.id) ?? (match ? agentByName.get(match[1].trim()) : undefined);
+                if (!owner) continue;
+                for (const sid of ws.sessionIds) {
+                    pushSession({
+                        sessionId: sid,
+                        teamId: owner.team.id,
+                        memberId: owner.member.id,
+                        agentName: owner.member.name,
+                        workspaceId: ws.id,
+                        createdAt: 0,
+                        archived: wsReg.archived.has(sid),
+                    });
+                }
+            }
+            sessions.sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0));
+            write(res, 200, { ok: true, sessions });
+        }),
+        exact('POST', '/marshal/agents/sessions/rename', async (req, res) => {
+            if (!sessionTitles) { write(res, 503, { ok: false, code: 'titles-unavailable' }); return; }
+            const body = await readBody(req);
+            const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';
+            if (!sessionId) { write(res, 400, { ok: false, code: 'invalid-session' }); return; }
+            const title = typeof body.title === 'string' ? body.title.trim() : '';
+            const saved = sessionTitles.setCustom(sessionId, title);
+            write(res, 200, { ok: true, sessionId, title: saved.custom ?? saved.auto ?? '', titleSource: saved.custom ? 'custom' : 'auto' });
+        }),
+        exact('POST', '/marshal/agents/sessions/summarize', async (req, res) => {
+            if (!sessionTitles) { write(res, 503, { ok: false, code: 'titles-unavailable' }); return; }
+            const body = await readBody(req);
+            const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';
+            if (!sessionId) { write(res, 400, { ok: false, code: 'invalid-session' }); return; }
+            const pc = readProjcacheSession(sessionId);
+            let sourceText = pc?.firstText || '';
+            if (!sourceText && typeof sessionController?.follow === 'function') {
+                try {
+                    const it = sessionController.follow({ address: { kind: 'session', sessionId }, maxMessages: 8 }, AbortSignal.timeout(3000))[Symbol.asyncIterator]();
+                    const snap = await it.next();
+                    await it.return?.();
+                    const records = Array.isArray(snap?.value?.records) ? snap.value.records : [];
+                    for (const rec of records) {
+                        const ev = rec?.event;
+                        if (ev?.type === 'user/message') {
+                            const content = ev?.data?.content ?? ev?.data?.message?.content;
+                            if (typeof content === 'string' && content.trim()) { sourceText = content; break; }
+                            if (Array.isArray(content)) {
+                                const joined = content.filter(p => p?.type === 'text' && typeof p.text === 'string').map(p => p.text).join(' ').trim();
+                                if (joined) { sourceText = joined; break; }
+                            }
+                        }
+                    }
+                } catch { /* fallback below */ }
+            }
+            let generated = '';
+            if (sourceText && llm && typeof llm.prepareCall === 'function') {
+                try {
+                    const sel = typeof readDefaultModel === 'function' ? readDefaultModel() : undefined;
+                    if (sel?.provider && sel?.model) {
+                        const call = await llm.prepareCall({
+                            provider: sel.provider,
+                            model: sel.model,
+                            system: '你是会话标题助手。根据用户首句需求，总结一个 8~18 字的简洁中文标题，只输出标题本身，不要引号、编号或解释。',
+                            messages: [{ role: 'user', content: sourceText.slice(0, 1200) }],
+                            maxTokens: 48,
+                        }, AbortSignal.timeout(12000));
+                        const text = typeof call?.text === 'string' ? call.text.trim() : '';
+                        if (text) generated = text.replace(/^["'「『【]+|["'」』】]+$/g, '').replace(/\s+/g, ' ').slice(0, 40);
+                    }
+                } catch { /* fallback to deterministic summarizer */ }
+            }
+            if (!generated) generated = summarizeFirstMessage(sourceText || pc?.title || '');
+            if (!generated) {
+                write(res, 200, { ok: true, sessionId, title: pc?.title || '未命名会话', titleSource: 'fallback' });
+                return;
+            }
+            sessionTitles.setAuto(sessionId, generated);
+            if (body.clearCustom === true) sessionTitles.setCustom(sessionId, '');
+            write(res, 200, { ok: true, sessionId, title: generated, titleSource: 'auto' });
+        }),
+        exact('GET', '/marshal/devices/status', async (req, res) => {
+            const deviceId = initiator.replace(/^marshal:/, '');
+            let dashUrl = '';
+            try { if (config) dashUrl = dashboardAddress(config); } catch {}
+            if (cross === undefined) {
+                write(res, 200, { ok: true, deviceId, hubConfigured: false, hubOnline: false, dashboardUrl: dashUrl, devices: [] });
+                return;
+            }
+            try {
+                const cat = await cross.catalog();
+                const devices = Array.isArray(cat?.devices) ? cat.devices : [];
+                write(res, 200, { ok: true, deviceId, hubConfigured: true, hubOnline: true, dashboardUrl: dashUrl, devices });
+            }
+            catch (error) {
+                write(res, 200, { ok: true, deviceId, hubConfigured: true, hubOnline: false, dashboardUrl: dashUrl, error: error instanceof Error ? error.message : String(error), devices: [] });
             }
         }),
         exact('POST', '/marshal/workspaces/prepare', async (req, res) => {
@@ -390,7 +1809,10 @@ export function mountGroups(ctx, config, options = {}) {
     const getBoard = () => taskBoard ?? localBoard;
     let taskBoard;
     let webServer;
-    const crossClient = createCrossClient({ hubUrl: config.hubUrl, token: config.token });
+    let hubCa;
+    try { hubCa = config.hubCaFile === undefined ? undefined : readFileSync(config.hubCaFile); }
+    catch { options.logger?.warn?.('marshal: groups hubCaFile unreadable'); }
+    const crossClient = createCrossClient({ hubUrl: config.hubUrl, token: config.token, ...(hubCa === undefined ? {} : { ca: hubCa }) });
     const inventory = () => {
         const ledger = readAgentsLedger();
         const result = {
@@ -446,7 +1868,6 @@ export function mountGroups(ctx, config, options = {}) {
         : ctx.llm;
     const drafter = createAgentDrafter({ llm, defaultModel: readDefaultModel });
     const promptAbort = new AbortController();
-    if (typeof ctx.effect === 'function') ctx.effect(() => () => promptAbort.abort(), 'marshal: groups prompt lifetime');
     const platformHash = async () => {
         try {
             const account = typeof ctx.get === 'function' ? ctx.get('deepseekAccount') : undefined;
@@ -458,6 +1879,38 @@ export function mountGroups(ctx, config, options = {}) {
     };
     const ownerFile = join(config.memoryRoot ?? join(homedir(), '.dsh-marshal', 'memory'), 'owner.json');
     const desktopOwner = async () => resolveDesktopOwner({ config, platformHash: await platformHash(), ownerFile });
+    // Require signed DSH connection admission for originless desktop memory sessions.
+    let trustedConnection = () => false;
+    const adoptConnection = connection => {
+        if (connection === undefined || connection === null) {
+            trustedConnection = () => false;
+            return;
+        }
+        trustedConnection = req => {
+            try {
+                if (typeof connection.requestRejection === 'function') {
+                    return connection.requestRejection({ headers: req.headers }) === undefined;
+                }
+                if (typeof connection.admit === 'function') {
+                    const admission = connection.admit({ headers: req.headers });
+                    return admission !== undefined && admission.rejection === undefined && admission.peer !== undefined;
+                }
+                return false;
+            }
+            catch {
+                return false;
+            }
+        };
+    };
+    try {
+        ctx.inject?.(['connection'], scoped => {
+            scoped.effect(() => {
+                adoptConnection(typeof scoped.get === 'function' ? scoped.get('connection') : scoped.connection);
+                return () => adoptConnection(undefined);
+            }, 'marshal: memory connection trust');
+        });
+    }
+    catch { /* connection trust fails closed until injected */ }
     const memoryAuth = createMemoryHttpAuth({
         resolveOwner: async () => {
             const owner = await desktopOwner();
@@ -468,6 +1921,7 @@ export function mountGroups(ctx, config, options = {}) {
         // Unknown install owner stays non-owner. After the first signed-in owner is
         // persisted, a later logged-out local session can present that same hash.
         installOwner: async () => (await desktopOwner()).install,
+        trustedRequest: req => trustedConnection(req),
     });
     const service = createGroupService({
         root,
@@ -481,17 +1935,321 @@ export function mountGroups(ctx, config, options = {}) {
         reader: createReplyReader(surface),
         logger: options.logger ?? ctx.logger,
     });
+    const resolveWebOrigin = () => {
+        try {
+            if (typeof webServer?.getOrigin === 'function') {
+                const origin = webServer.getOrigin();
+                if (typeof origin === 'string' && origin !== '') return origin;
+            }
+        }
+        catch { /* fall back to port */ }
+        if (typeof webServer?.port === 'number') return 'http://127.0.0.1:' + webServer.port;
+        return undefined;
+    };
+    const getAttachmentStore = () => {
+        if (options.attachments !== undefined) return typeof options.attachments === 'function' ? options.attachments() : options.attachments;
+        if (typeof ctx.get !== 'function') return undefined;
+        try {
+            const store = ctx.get('attachments');
+            return store !== undefined && store !== null && typeof store.saveImage === 'function' ? store : undefined;
+        }
+        catch { return undefined; }
+    };
+    const taskOverrides = createTaskOverrides(join(root, 'task-overrides.json'));
+    const attachmentCacheDir = join(root, 'ticket-attachments');
+    const resolveTicketAttachments = async card => {
+        const effCard = card?.id ? taskOverrides.applyTo(taskBoard === undefined ? 'local' : 'host', card) : card;
+        const list = normalizeAttachmentsPayload(effCard?.attachments);
+        if (!list || list.length === 0) return [];
+        const store = getAttachmentStore();
+        const resolved = [];
+        for (const att of list) {
+            const summary = {
+                kind: att.kind,
+                attachmentId: att.attachmentId,
+                name: att.name,
+                bytes: att.bytes,
+                mediaType: att.mediaType,
+                ...(att.kind === 'image' ? { width: att.width, height: att.height } : {}),
+            };
+            if (store) {
+                try {
+                    if (att.kind === 'file' && typeof store.fileHostPath === 'function') {
+                        const filePath = store.fileHostPath({ attachmentId: att.attachmentId, name: att.name, bytes: att.bytes });
+                        if (typeof filePath === 'string' && filePath !== '') summary.path = filePath;
+                    }
+                    else if (att.kind === 'image' && typeof store.readImage === 'function') {
+                        await mkdir(attachmentCacheDir, { recursive: true });
+                        const safeId = att.attachmentId.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 64);
+                        const imagePath = join(attachmentCacheDir, safeId + '-' + att.name);
+                        if (!existsSync(imagePath)) {
+                            const stored = await store.readImage({
+                                attachmentId: att.attachmentId, mediaType: att.mediaType, bytes: att.bytes,
+                                width: att.width, height: att.height, name: att.name,
+                            });
+                            await writeFile(imagePath, Buffer.from(stored.data), { mode: 0o600 });
+                        }
+                        summary.path = imagePath;
+                    }
+                }
+                catch { /* keep metadata even if file projection is unavailable */ }
+            }
+            resolved.push(summary);
+        }
+        return resolved;
+    };
+    const agents = createAgentsHttpClient({
+        baseUrl: () => {
+            const origin = resolveWebOrigin();
+            if (origin) return origin;
+            throw new Error('marshal: agents no-web-server');
+        },
+    });
+    let rooms;
+    try {
+        rooms = createTaskRooms({ store: createTaskRoomStore(join(root, 'task-rooms.sqlite')),
+            deviceId: config.deviceId, hub: crossClient?.taskRoom });
+    } catch { options.logger?.warn?.('marshal: local task room archive unavailable'); }
+    const rosters = createWorkspaceRosters(join(root, 'workspace-rosters.json'));
+    const ticketNumbers = createTicketNumbers(join(root, 'ticket-numbers.json'));
+    const sessionTitles = createSessionTitles(join(root, 'session-titles.json'));
+    const patchStore = createPatchStore(join(root, 'patches'));
+    const boardSourceOf = () => taskBoard === undefined ? 'local' : 'host';
+    // A workflow owns its card's execution, so it also owns the card's column.
+    // Writing the column here keeps the desktop board, the mobile node and the
+    // task tool in step instead of letting the view derive a status the ledger
+    // never received.
+    const moveCardStatus = async (source, taskId, status) => {
+        if (source !== boardSourceOf()) return false;
+        const board = getBoard();
+        if (board === undefined) return false;
+        let task;
+        try { task = (board.snapshot().tasks ?? []).find(item => item.id === taskId); }
+        catch { return false; }
+        if (!task || task.status === status) return false;
+        try {
+            await board.apply(randomUUID(), { kind: 'move', taskId, status }, `marshal:${config.deviceId}`);
+            return true;
+        }
+        catch (error) {
+            options.logger?.warn?.('marshal: task board move to ' + status + ' refused: ' + (error instanceof Error ? error.message : String(error)));
+            return false;
+        }
+    };
+    let orchestration;
+    try {
+        orchestration = createTaskOrchestration({
+            file: join(root, 'task-orchestration.json'), inventory: readAgentsLedger, memory: options.memory,
+            port: createDiscussionPort({ agents: config.agents, llm, codexExecutable: config.codexExecutable, maxModels: 256, maxPerProvider: 64 }),
+            defaultModel: readDefaultModel, logger: options.logger, workspacePath: agents.workspace,
+            resolveAttachments: resolveTicketAttachments,
+            patchStore,
+            readCard: (src, id) => {
+                const raw = (getBoard()?.snapshot()?.tasks ?? []).find(item => item.id === id);
+                return raw ? taskOverrides.applyTo(src, raw) : undefined;
+            },
+            leaderAutoReview: true,
+            onState: moveCardStatus,
+            onPermissionBlocked: async (_source, taskId) => {
+                const board = getBoard();
+                if (!board) return;
+                await board.apply(randomUUID(), { kind: 'move', taskId, status: 'review' }, `marshal:${config.deviceId}`);
+            },
+            startLeader: async (leader, text, signal, slotOverride) => {
+                const { sessionId } = await agents.chatMember(leader.teamId, leader.memberId, signal) ?? {};
+                if (typeof sessionId !== 'string' || sessionId === '') throw new Error('Leader session unavailable');
+                signal.throwIfAborted();
+                const desiredModel = (typeof slotOverride?.model === 'string' && slotOverride.model.trim() !== '')
+                    ? slotOverride.model.trim()
+                    : (typeof leader?.model === 'string' && leader.model.trim() !== '' ? leader.model.trim() : '');
+                const rawEffort = (typeof slotOverride?.reasoningEffort === 'string' && slotOverride.reasoningEffort.trim() !== '')
+                    ? slotOverride.reasoningEffort.trim()
+                    : (typeof leader?.reasoning === 'string' && leader.reasoning.trim() !== '' ? leader.reasoning.trim() : '');
+                if (desiredModel && desiredModel.includes('/') && typeof ctx.sessionController?.selectModel === 'function') {
+                    const slash = desiredModel.indexOf('/');
+                    const provider = desiredModel.slice(0, slash);
+                    const modelId = desiredModel.slice(slash + 1);
+                    const effort = rawEffort && rawEffort !== 'off' && rawEffort !== 'none' ? rawEffort : undefined;
+                    try {
+                        await ctx.sessionController.selectModel({
+                            sessionId, provider, model: modelId,
+                            ...(effort ? { reasoningEffort: effort } : {}),
+                        });
+                    } catch {
+                        if (effort) {
+                            try { await ctx.sessionController.selectModel({ sessionId, provider, model: modelId }); } catch { /* ignore */ }
+                        }
+                    }
+                }
+                await ctx.sessionController.prompt({
+                    requestId: randomUUID(), sessionId, content: [{ type: 'text', text }],
+                }, signal);
+                return sessionId;
+            },
+        });
+    }
+    catch { options.logger?.warn?.('marshal: task orchestration unavailable'); }
+    // The superagent bridge wakes a card; when the card carries a preset
+    // workflow, the bridge must start that workflow instead of opening a plain
+    // board run. This runtime is the narrow seam between the two subsystems.
+    const resolveDesktopOwnerId = async () => {
+        const owner = await desktopOwner();
+        if (typeof owner === 'string' && owner.trim() !== '') return owner.trim();
+        if (typeof owner?.caller === 'string' && owner.caller.trim() !== '') return owner.caller.trim();
+        if (typeof owner?.install === 'string' && owner.install.trim() !== '') return owner.install.trim();
+        if (typeof config.deviceId === 'string' && config.deviceId.trim() !== '') return 'device:' + config.deviceId.trim();
+        return 'local-owner';
+    };
+    let cachedDesktopOwnerId = typeof config.deviceId === 'string' && config.deviceId.trim() !== ''
+        ? 'device:' + config.deviceId.trim()
+        : 'local-owner';
+    void resolveDesktopOwnerId().then(id => { if (id) cachedDesktopOwnerId = id; }).catch(() => {});
+    const ensureRuntimeRoom = (source, taskId, card) => {
+        if (!rooms) return undefined;
+        const existing = rooms.find(source, taskId);
+        if (existing) return existing;
+        const wf = orchestration?.target(source, taskId);
+        const wsId = wf?.workspaceId ?? card?.workspaceId;
+        if (!wsId) return undefined;
+        const resolvedCard = card ?? (getBoard()?.snapshot()?.tasks ?? []).find(item => item.id === taskId);
+        if (!resolvedCard) return undefined;
+        try {
+            const tNo = ticketNumbers?.ensure?.(taskId);
+            return rooms.ensure(
+                source,
+                tNo ? { ...resolvedCard, title: withTicketPrefix(tNo, resolvedCard.title) } : resolvedCard,
+                wsId,
+                cachedDesktopOwnerId,
+            );
+        } catch (error) {
+            options.logger?.warn?.('marshal: runtime room ensure failed: ' + (error instanceof Error ? error.message : String(error)));
+            return undefined;
+        }
+    };
+    const runtime = options.runtime;
+    if (runtime !== undefined && runtime !== null && typeof runtime === 'object') {
+        Object.assign(runtime, {
+            available: () => orchestration !== undefined && rooms !== undefined,
+            source: boardSourceOf,
+            target: taskId => orchestration?.target(boardSourceOf(), taskId),
+            view(taskId) {
+                const source = boardSourceOf();
+                return orchestration?.target(source, taskId) === undefined ? undefined : orchestration.view(source, taskId);
+            },
+            async begin(taskId, runId, text) {
+                const source = boardSourceOf();
+                const ownerId = await resolveDesktopOwnerId().catch(() => cachedDesktopOwnerId);
+                if (ownerId) cachedDesktopOwnerId = ownerId;
+                const room = ensureRuntimeRoom(source, taskId);
+                if (!room || room.closed) return undefined;
+                try { return await rooms.begin(room.id, runId, 'Marshal', 'auto-dispatch', text); }
+                catch { return undefined; }
+            },
+            async note(taskId, event) {
+                const room = ensureRuntimeRoom(boardSourceOf(), taskId);
+                if (!room || room.closed) return undefined;
+                try { return await rooms.append(room.id, event); }
+                catch (error) {
+                    options.logger?.warn?.('marshal: task room message write failed: ' + (error instanceof Error ? error.message : String(error)));
+                    return undefined;
+                }
+            },
+            start(taskId, card, settings = {}) {
+                const source = boardSourceOf();
+                if (!orchestration) return { ok: false, code: 'orchestration-unavailable' };
+                if (orchestration.target(source, taskId) === undefined) return { ok: false, code: 'no-workflow' };
+                const room = ensureRuntimeRoom(source, taskId, card);
+                const audit = room ? taskRoomAudit(rooms, room, settings.reason ?? 'auto-dispatch', undefined, undefined, () => true) : undefined;
+                // The caller may already have opened the room batch (the superagent
+                // posts its dispatch note through `begin` first); skip the second
+                // batch so one dispatch produces exactly one ticket-group run.
+                if (audit && settings.skipBegin === true) audit.begin = async () => {};
+                const started = orchestration.start(source, taskOverrides.applyTo(source, card), audit);
+                return { ok: true, started, state: orchestration.view(source, taskId)?.state };
+            },
+            move: moveCardStatus,
+            ticketNo: taskId => ticketNumbers?.ensure?.(taskId),
+        });
+    }
+    const steerHostResidentSession = async (sessionId, text) => {
+        if (!sessionId || !text || typeof ctx.sessionController?.prompt !== 'function') return false;
+        try {
+            await ctx.sessionController.prompt({
+                requestId: 'marshal-steer-' + randomUUID(),
+                sessionId,
+                mode: 'queue',
+                content: [{ type: 'text', text }],
+            }, AbortSignal.timeout(10_000));
+            return true;
+        } catch {
+            return false;
+        }
+    };
+    const tasksController = createTaskToolController({
+        getBoard,
+        boardSource: boardSourceOf,
+        initiator: `marshal:${config.deviceId}`,
+        resolveOwnerId: resolveDesktopOwnerId,
+        orchestration,
+        rooms,
+        patchStore,
+        ticketNumbers,
+        taskOverrides,
+        workspacePath: agents.workspace,
+        readInventory: readAgentsLedger,
+        readWorkspaces: () => readWorkspaceRegistry().workspaces.map(w => ({ id: w.id, title: w.title, path: w.path })),
+        surface,
+        moveCardStatus,
+        steerResidentSession: steerHostResidentSession,
+    });
+    // Background reconciliation for handed-off resident sessions so completed turns
+    // settle into "review" even when no browser tab is actively polling the room.
+    let handedOffSyncRunning = false;
+    const handedOffSyncTimer = setInterval(() => {
+        if (handedOffSyncRunning || !orchestration || !rooms || !surface) return;
+        const source = boardSourceOf();
+        const activeHandedOff = orchestration.handedOffTasks?.(source) ?? [];
+        if (activeHandedOff.length === 0) return;
+        handedOffSyncRunning = true;
+        void (async () => {
+            try {
+                for (const item of activeHandedOff) {
+                    const room = rooms.find(item.source, item.taskId);
+                    if (!room || room.closed) continue;
+                    await syncResidentSessionToRoom({
+                        surface,
+                        rooms,
+                        room,
+                        sessionId: item.sessionId,
+                        actor: item.leaderName || '执行智能体',
+                        runId: room.runId ?? item.runId,
+                        workflowState: 'handed-off',
+                        onTurnCompleted: async (reason, lastText) => {
+                            if (reason === 'completed') {
+                                orchestration.syncStatus?.(item.source, item.taskId, 'review', {
+                                    reviewReason: 'delivery-review',
+                                    reviewSummary: String(lastText || '').slice(0, 500),
+                                });
+                                await moveCardStatus(item.source, item.taskId, 'review');
+                            }
+                        },
+                    });
+                }
+            } catch { /* best-effort background sync */ }
+            finally { handedOffSyncRunning = false; }
+        })();
+    }, 15_000);
+    handedOffSyncTimer.unref?.();
+    if (typeof ctx.effect === 'function') ctx.effect(() => () => {
+        clearInterval(handedOffSyncTimer);
+        orchestration?.dispose();
+        rooms?.close();
+        promptAbort.abort();
+        service.dispose();
+    }, 'marshal: groups prompt lifetime');
     ctx.inject(['tools'], (scoped) => {
         scoped.effect(() => {
-            const agents = createAgentsHttpClient({
-                baseUrl: () => {
-                    const server = webServer;
-                    if (server !== undefined && typeof server.getOrigin === 'function') return server.getOrigin();
-                    if (server !== undefined && typeof server.port === 'number') return 'http://127.0.0.1:' + server.port;
-                    throw new Error('marshal: agents no-web-server');
-                },
-            });
-            const disposers = agentToolDefinitions({ agents, service })
+            const disposers = agentToolDefinitions({ agents, service, tasks: tasksController })
                 .map((definition) => scoped.tools.register(definition));
             return () => {
                 for (const dispose of disposers) dispose();
@@ -517,6 +2275,11 @@ export function mountGroups(ctx, config, options = {}) {
                 }
                 catch { /* desktop origin is enough when the host has no public origin */ }
                 return origins;
+            }, orchestration, rooms, {
+                root, rosters, ticketNumbers, sessionTitles, sessionController: ctx.sessionController,
+                config, llm, readDefaultModel, workspacePath: agents.workspace,
+                webOrigin: resolveWebOrigin, getAttachmentStore, resolveAttachments: resolveTicketAttachments,
+                surface, moveCardStatus, taskOverrides, patchStore,
             }).map((route) => scoped.webServer.register(route));
             return () => {
                 for (const dispose of disposers) dispose();

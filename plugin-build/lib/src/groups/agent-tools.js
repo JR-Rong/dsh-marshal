@@ -2,6 +2,7 @@ import { specToJsonSchema } from '../tools/schema.js';
 
 const AGENT_ACTIONS = ['list', 'create', 'update', 'delete', 'chat'];
 const GROUP_ACTIONS = ['list', 'get', 'create', 'send'];
+const TASK_ACTIONS = ['catalog', 'list', 'get', 'create', 'plan', 'run', 'room_read', 'room_send', 'patch', 'revise', 'confirm'];
 
 function textOutput(value) {
     return { type: 'string' };
@@ -18,12 +19,12 @@ export function createAgentsHttpClient({ baseUrl, fetchImpl = fetch } = {}) {
         if (typeof value !== 'string' || value === '') throw new Error('marshal: agents no-web-server');
         return value.replace(/\/+$/, '');
     };
-    const request = async (path, body) => {
+    const request = async (path, body, signal) => {
         const root = base();
         const response = await fetchImpl(root + path, body === undefined ? {
-            headers: { origin: root, 'sec-fetch-site': 'same-origin' },
+            signal, headers: { origin: root, 'sec-fetch-site': 'same-origin' },
         } : {
-            method: 'POST',
+            method: 'POST', signal,
             headers: { origin: root, 'sec-fetch-site': 'same-origin', 'content-type': 'application/json' },
             body: JSON.stringify(body),
         });
@@ -49,7 +50,14 @@ export function createAgentsHttpClient({ baseUrl, fetchImpl = fetch } = {}) {
         if (agent === undefined) throw new Error('agent-not-found');
         return agent;
     };
+    const chatMember = async (teamId, memberId, signal) => (await request('/dsh-agents/api/run', { teamId, memberId }, signal)).run;
     return {
+        async workspace(id, signal) {
+            const state = await request('/dsh-agents/api/state', undefined, signal);
+            const workspace = (state.workspaces ?? []).find(item => item.id === id);
+            return typeof workspace?.path === 'string' ? workspace.path : undefined;
+        },
+        chatMember,
         async list() {
             return collect(await request('/dsh-agents/api/state'));
         },
@@ -85,12 +93,12 @@ export function createAgentsHttpClient({ baseUrl, fetchImpl = fetch } = {}) {
         },
         async chat(memberId) {
             const agent = await findAgent(memberId);
-            return (await request('/dsh-agents/api/run', { teamId: agent.squadId, memberId })).run;
+            return chatMember(agent.squadId, memberId);
         },
     };
 }
 
-export function agentToolDefinitions({ agents, service } = {}) {
+export function agentToolDefinitions({ agents, service, tasks } = {}) {
     const agentTool = {
         name: 'marshal_agent',
         description: '管理调度官里的智能体（不是小队）：list 列出；create 创建；update 修改；delete 删除；chat 打开/创建该智能体的常驻会话，返回 sessionId。修改会整条替换定义，清空的字段恢复默认。',
@@ -186,6 +194,59 @@ export function agentToolDefinitions({ agents, service } = {}) {
             throw new Error('unknown group action');
         },
     };
-    for (const tool of [agentTool, groupTool]) tool.parameters = specToJsonSchema(tool.parameters);
-    return [agentTool, groupTool];
+    const tools = [agentTool, groupTool];
+    if (tasks) {
+        const taskTool = {
+            name: 'marshal_task',
+            description: '调度官工单工具：catalog查模板/工作区/智能体；list/get查单；create建单挂编排；plan改分工；run启单；room_read/room_send读写工单群；patch读补丁；revise增量重跑；confirm验收落盘/提交。',
+            parameters: {
+                action: { type: 'string', required: true, enum: TASK_ACTIONS },
+                taskId: { type: 'string', description: '工单 ID' },
+                roomId: { type: 'string', description: '工单群 ID' },
+                status: { type: 'string', enum: ['backlog', 'todo', 'running', 'review', 'done', 'failed'] },
+                query: { type: 'string', description: '搜索词' },
+                includeArchived: { type: 'boolean' },
+                title: { type: 'string', description: '标题' },
+                description: { type: 'string', description: '需求说明' },
+                prompt: { type: 'string', description: '执行指令' },
+                workspaceId: { type: 'string', description: '工作区 ID' },
+                permission: { type: 'string', enum: ['read-only', 'workspace-write', 'danger-full-access'] },
+                parentId: { type: 'string' },
+                tags: { type: 'array', items: { type: 'string' } },
+                skipAmbiguityCheck: { type: 'boolean' },
+                orchestration: { type: 'object', additionalProperties: true, description: '编排配置 {leaderId,choice,templateId,plan,agentConfigs}' },
+                text: { type: 'string', description: '发言或修正意见' },
+                autoReopen: { type: 'boolean' },
+                limit: { type: 'integer' },
+                after: { type: 'integer' },
+                before: { type: 'integer' },
+                digest: { type: 'string' },
+                seq: { type: 'integer' },
+                maxChars: { type: 'integer' },
+                applyPatch: { type: 'boolean', description: 'confirm 应用补丁' },
+                commitMessage: { type: 'string', description: '可选提交信息' },
+                note: { type: 'string', description: '验收备注' },
+            },
+            output: { schema: textOutput(), render },
+            async execute(args) {
+                switch (args.action) {
+                    case 'catalog': return JSON.stringify(await tasks.catalog());
+                    case 'list': return JSON.stringify(await tasks.list(args));
+                    case 'get': return JSON.stringify(await tasks.get(args));
+                    case 'create': return JSON.stringify(await tasks.create(args));
+                    case 'plan': return JSON.stringify(await tasks.plan(args));
+                    case 'run': return JSON.stringify(await tasks.run(args));
+                    case 'room_read': return JSON.stringify(await tasks.roomRead(args));
+                    case 'room_send': return JSON.stringify(await tasks.roomSend(args));
+                    case 'patch': return JSON.stringify(await tasks.patch(args));
+                    case 'revise': return JSON.stringify(await tasks.revise(args));
+                    case 'confirm': return JSON.stringify(await tasks.confirm(args));
+                    default: throw new Error('unknown task action');
+                }
+            },
+        };
+        tools.push(taskTool);
+    }
+    for (const tool of tools) tool.parameters = specToJsonSchema(tool.parameters);
+    return tools;
 }

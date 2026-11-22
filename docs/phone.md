@@ -1,0 +1,27 @@
+# 手机控制器
+
+手机只连 Hub，使用 `Authorization: Bearer mph1.<凭证>`。节点上报看板、记忆和花名册使用 `Authorization: Bearer mnd1.<节点凭证>`。节点凭证不能读会话、历史、事件流或群聊。
+
+配对二维码只有 Hub 地址和一个 128 位、60 秒、一次性的码：`marshal://pair?code=…&hub=…`。重新配对同一安装会作废旧凭证。未兑换的码最多 8 个。
+
+看板修改发给拥有该看板的节点，必须指定 `baseRevision`。Hub 接收时返回 202 和 `commandId`，手机在看板查询该手机的回执。节点确认后显示已应用或已拒绝。两分钟未确认显示「结果未确认」。回执随 Hub 进程保存。节点确实读到看板才上报 `tasks`，Hub 保留缺失或过期上报之前的快照。
+
+## 推送
+
+Hub 从设备表旁边的 `push.json` 读钥匙，文件权限应是 0600。缺文件、占位符或厂商非 2xx 都记为失败，不会标成已送达。只对审批、提问，以及手机点过关注的会话开始/结束各发一次，并做去重和每分钟 8 条的限制。
+
+```json
+{
+  "apns": { "keyId": "PLACEHOLDER", "teamId": "PLACEHOLDER", "bundleId": "com.rongjunrui.marshal.mobile", "keyPath": "/etc/marshal/AuthKey.p8" },
+  "fcm": { "projectId": "PLACEHOLDER", "clientEmail": "PLACEHOLDER", "privateKeyPath": "/etc/marshal/fcm.json" },
+  "huawei": { "appId": "PLACEHOLDER", "clientId": "PLACEHOLDER", "clientSecretPath": "/etc/marshal/huawei-secret" }
+}
+```
+
+把 `PLACEHOLDER` 换成真实值，并把钥匙放到 `keyPath` 指的文件。不要把钥匙提交进仓库。FCM 走 HTTP v1：`https://oauth2.googleapis.com/token` 换访问令牌，再 `POST https://fcm.googleapis.com/v1/projects/{projectId}/messages:send`。华为走 `https://oauth-login.cloud.huawei.com/oauth2/v3/token` 和 `https://push-api.cloud.huawei.com/v1/{appId}/messages:send`。Android 上运行中的任务和待审批用常驻通知，图标是 `ic_stat_notify`。真正的华为 Live View 胶囊是 HarmonyOS 原生能力，不能从 Android 应用里调用，需要单独的 HarmonyOS 应用。华为推送令牌用 `HmsInstanceId.getToken(appId, "HCM")` 在后台线程读取。把 `agconnect-services.json` 放到 `mobile/android/app/src/main/assets/`（或让 AGConnect Gradle 插件自动初始化）之后才会取到 app id；没有这份文件就不编造令牌。局域网工作台在 Android 上必须用 `wss://`，系统不允许明文 WebSocket。
+
+桌面「手机连接」向 `/marshal/api/pairing` 领取二维码。到期前 5 秒用上一张码作为 `replace` 再领一张，Hub 会作废同一账号还没使用的旧码。二维码正文只有 `marshal://pair?code=…&hub=…`。
+
+## 宿主能力
+
+[手机中继接口](dsh-phone-api.md)定义了可用性、修订检查、花名册和记忆的撤回语义。升级手机记忆中继需要 Hub 和节点使用匹配版本。

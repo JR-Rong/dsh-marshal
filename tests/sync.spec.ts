@@ -321,6 +321,59 @@ describe('node sync', () => {
     expect(timedOut.sync.syncing).toBe(false)
   })
 
+  it('全量同步采集超时或发帧抛错不泄漏 unhandledRejection，且可重新发起同步', async () => {
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown): void => { unhandled.push(reason) }
+    process.on('unhandledRejection', onUnhandled)
+    cleanups.push(() => { process.off('unhandledRejection', onUnhandled) })
+
+    let attempts = 0
+    let aborted = false
+    const gatherTimedOut = nodeHarness([], {
+      scanTimeoutMs: 20,
+      sources: [{
+        agent: 'dsh',
+        async syncSnapshot(signal: AbortSignal) {
+          if (++attempts === 1) {
+            signal.addEventListener('abort', () => { aborted = true }, { once: true })
+            return await new Promise<SyncSnapshot>(() => {})
+          }
+          return snapshot([sessionRow('s1', 1)])
+        },
+      }],
+    })
+    gatherTimedOut.sync.begin()
+    await waitFor(() => gatherTimedOut.link.rejected.includes('sync-timeout'), 'gather sync-timeout')
+    await settle(20)
+    expect(aborted).toBe(true)
+    expect(gatherTimedOut.sync.syncing).toBe(false)
+    expect(gatherTimedOut.sync.stale).toBe(true)
+    expect(gatherTimedOut.link.confirmed).toEqual([])
+    expect(unhandled).toEqual([])
+
+    // 超时释放 infight 后，下一次重连同步仍可正常完成。
+    gatherTimedOut.sync.begin()
+    await waitFor(() => gatherTimedOut.link.frames().some(frame => frame.type === 'sync.end'), 'recovery sync.end')
+    const recoveredBegin = gatherTimedOut.link.frames().find(frame => frame.type === 'sync.begin')
+    if (recoveredBegin?.type !== 'sync.begin') throw new Error('expected sync.begin')
+    gatherTimedOut.sync.onFrame(ackFrame(recoveredBegin.syncId, true, recoveredBegin.version))
+    await waitFor(() => gatherTimedOut.link.confirmed.length === 1, 'recovery confirm')
+
+    // waitAck 创建后若 sendControl(sync.end) 同步抛错，clearAck 拒绝 waiter 也不得冒泡 unhandledRejection。
+    const sendEndFailed = nodeHarness([snapshot([sessionRow('s1', 1)])])
+    const originalSend = sendEndFailed.link.sendControl.bind(sendEndFailed.link)
+    sendEndFailed.link.sendControl = (text: string): void => {
+      if (frameOf(text).type === 'sync.end') throw new Error('socket closed')
+      originalSend(text)
+    }
+    sendEndFailed.sync.begin()
+    await waitFor(() => sendEndFailed.link.rejected.includes('sync-failed'), 'sendControl failure')
+    await settle(20)
+    expect(sendEndFailed.sync.syncing).toBe(false)
+    expect(sendEndFailed.sync.stale).toBe(true)
+    expect(unhandled).toEqual([])
+  })
+
   it('更新时间不变时仍修正已完成的运行态', async () => {
     const harness = nodeHarness([snapshot([sessionRow('s1', 1, true)]), snapshot([sessionRow('s1', 1, false)])])
     harness.sync.begin()

@@ -1,0 +1,2757 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>调度官 dsh-marshal Mobile · PR7 全功能交互原型 (iOS / Android)</title>
+  <style>
+    /* Self-contained Offline Layout & Utility System (Zero External Dependency) */
+    *, *::before, *::after { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body { margin: 0; padding: 0; min-height: 100vh; font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif; background: #ECEFF4; color: #1E293B; }
+    button, input, select, textarea { font: inherit; color: inherit; border: none; background: none; }
+    button { cursor: pointer; }
+    select, input, textarea { outline: none; }
+
+    :root, .theme-deepseek {
+      --ios-bg: #F6F8FF;
+      --ios-card: #FFFFFF;
+      --ios-card-secondary: #EEF3FF;
+      --ios-user-bubble: #E5ECFF;
+      --ios-send-bg: #4D6BFE;
+      --ios-send-fg: #FFFFFF;
+      --ios-text: #0F172A;
+      --ios-subtext: #475569;
+      --ios-muted: #64748B;
+      --ios-sep: rgba(77, 107, 254, 0.15);
+      --ios-glass: rgba(246, 248, 255, 0.88);
+      --ios-blue: #4D6BFE;
+      --ios-green: #10B981;
+      --ios-orange: #F59E0B;
+      --ios-red: #EF4444;
+      --ios-seg-bg: rgba(77, 107, 254, 0.09);
+      --ios-seg-active: #FFFFFF;
+      --ios-pill-bg: rgba(77, 107, 254, 0.13);
+    }
+
+    .theme-white {
+      --ios-bg: #FFFFFF;
+      --ios-card: #FFFFFF;
+      --ios-card-secondary: #F4F4F6;
+      --ios-user-bubble: #EFEFF4;
+      --ios-send-bg: #1D1D1F;
+      --ios-send-fg: #FFFFFF;
+      --ios-text: #1D1D1F;
+      --ios-subtext: #6E6E73;
+      --ios-muted: #86868B;
+      --ios-sep: rgba(60, 60, 67, 0.12);
+      --ios-glass: rgba(255, 255, 255, 0.88);
+      --ios-blue: #1D1D1F;
+      --ios-green: #28CD41;
+      --ios-orange: #FF9500;
+      --ios-red: #FF3B30;
+      --ios-seg-bg: rgba(118, 118, 128, 0.10);
+      --ios-seg-active: #FFFFFF;
+      --ios-pill-bg: rgba(29, 29, 31, 0.08);
+    }
+
+    .theme-dark, .theme-black {
+      --ios-bg: #000000;
+      --ios-card: #161618;
+      --ios-card-secondary: #242428;
+      --ios-user-bubble: #26262A;
+      --ios-send-bg: #F5F5F7;
+      --ios-send-fg: #000000;
+      --ios-text: #F5F5F7;
+      --ios-subtext: #AEAEB2;
+      --ios-muted: #8E8E93;
+      --ios-sep: rgba(84, 84, 88, 0.52);
+      --ios-glass: rgba(18, 18, 20, 0.86);
+      --ios-blue: #0A84FF;
+      --ios-green: #30D158;
+      --ios-orange: #FF9F0A;
+      --ios-red: #FF453A;
+      --ios-seg-bg: rgba(118, 118, 128, 0.24);
+      --ios-seg-active: #3A3A3C;
+      --ios-pill-bg: rgba(10, 132, 255, 0.18);
+    }
+
+    .theme-codex {
+      --ios-bg: #F8F5FF;
+      --ios-card: #FFFFFF;
+      --ios-card-secondary: #F2ECFF;
+      --ios-user-bubble: #EBE2FF;
+      --ios-send-bg: #7C3AED;
+      --ios-send-fg: #FFFFFF;
+      --ios-text: #1E1338;
+      --ios-subtext: #5B4B7A;
+      --ios-muted: #7E6F9E;
+      --ios-sep: rgba(124, 58, 237, 0.15);
+      --ios-glass: rgba(248, 245, 255, 0.88);
+      --ios-blue: #7C3AED;
+      --ios-green: #10B981;
+      --ios-orange: #F59E0B;
+      --ios-red: #EF4444;
+      --ios-seg-bg: rgba(124, 58, 237, 0.09);
+      --ios-seg-active: #FFFFFF;
+      --ios-pill-bg: rgba(124, 58, 237, 0.13);
+    }
+
+    .mode-wireframe {
+      --ios-bg: #F7F9FC;
+      --ios-card: #FFFFFF;
+      --ios-card-secondary: #EEF3FA;
+      --ios-user-bubble: #E2E8F0;
+      --ios-send-bg: #2563EB;
+      --ios-send-fg: #FFFFFF;
+      --ios-text: #1E293B;
+      --ios-subtext: #475569;
+      --ios-muted: #64748B;
+      --ios-sep: #94A3B8;
+      --ios-glass: rgba(247, 249, 252, 0.94);
+      --ios-blue: #2563EB;
+      --ios-seg-bg: #E2E8F0;
+      --ios-seg-active: #FFFFFF;
+      --ios-pill-bg: rgba(37, 99, 235, 0.12);
+    }
+
+    /* Layout Shell */
+    .wb-header { position: sticky; top: 0; z-index: 50; background: rgba(255,255,255,0.92); backdrop-filter: blur(14px); border-bottom: 1px solid #E2E8F0; }
+    .wb-header-inner { max-width: 1260px; margin: 0 auto; padding: 10px 18px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
+    .wb-brand { display: flex; align-items: center; gap: 10px; }
+    .wb-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+    .wb-pill-group { display: inline-flex; align-items: center; background: #F1F5F9; border: 1px solid #E2E8F0; border-radius: 9px; padding: 2px; gap: 2px; }
+    .wb-btn { padding: 5px 10px; border-radius: 7px; font-size: 12px; font-weight: 500; color: #475569; display: inline-flex; align-items: center; gap: 5px; transition: all 0.16s; }
+    .wb-btn.active { background: #FFFFFF; color: #0F172A; font-weight: 600; box-shadow: 0 1px 2px rgba(0,0,0,0.08); }
+    .wb-btn.wire-active { background: #2563EB; color: #FFFFFF; font-weight: 600; }
+    .wb-select { padding: 5px 10px; border-radius: 9px; background: #F1F5F9; border: 1px solid #E2E8F0; font-size: 12px; font-weight: 500; color: #334155; }
+
+    .wb-main { max-width: 1260px; margin: 0 auto; padding: 20px 18px 36px; display: grid; grid-template-columns: 410px 1fr; gap: 24px; align-items: start; }
+    @media (max-width: 960px) { .wb-main { grid-template-columns: 1fr; } }
+
+    .wb-panel { background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 18px; padding: 16px; box-shadow: 0 1px 3px rgba(15,23,42,0.04); }
+    .wb-grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+    .wb-grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+    @media (max-width: 640px) { .wb-grid-4 { grid-template-columns: repeat(2, 1fr); } .wb-grid-3 { grid-template-columns: 1fr; } }
+    .wb-jump-card { padding: 10px; border-radius: 12px; border: 1px solid #E2E8F0; text-align: left; transition: all 0.15s; }
+    .wb-jump-card:hover { border-color: #60A5FA; background: rgba(239,246,255,0.5); }
+    .wb-demo-chip { display: inline-flex; align-items: center; gap: 6px; padding: 6px 11px; border-radius: 9px; font-size: 12px; font-weight: 500; border: 1px solid transparent; transition: opacity 0.15s; }
+    .wb-demo-chip:hover { opacity: 0.88; }
+
+    /* Phone Hardware Shell */
+    .phone-bezel { width: 393px; max-width: 100%; height: 822px; border-radius: 50px; padding: 11px; background: linear-gradient(145deg, #2B2E36, #14161B); box-shadow: 0 26px 65px -15px rgba(15, 23, 42, 0.38), 0 0 0 1px rgba(255,255,255,0.12) inset; margin: 0 auto; }
+    .phone-inner { width: 100%; height: 100%; border-radius: 40px; overflow: hidden; position: relative; display: flex; flex-direction: column; background: var(--ios-bg); color: var(--ios-text); transition: background-color 0.22s, color 0.22s; }
+
+    .status-bar { padding: 10px 22px 6px; display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; z-index: 30; user-select: none; }
+    .dynamic-island { width: 124px; height: 30px; background: #000000; border-radius: 999px; color: #FFFFFF; display: flex; align-items: center; justify-content: center; gap: 6px; font-size: 11px; font-weight: 500; transition: all 0.28s cubic-bezier(0.32, 0.72, 0, 1); cursor: pointer; padding: 0 10px; overflow: hidden; white-space: nowrap; }
+    .dynamic-island.expanded { width: 252px; height: 35px; }
+
+    .ios-glass { background-color: var(--ios-glass); backdrop-filter: saturate(180%) blur(20px); -webkit-backdrop-filter: saturate(180%) blur(20px); }
+    .ios-card { background-color: var(--ios-card); border: 0.5px solid var(--ios-sep); border-radius: 16px; transition: transform 0.14s ease, background-color 0.2s ease; position: relative; }
+    .mode-wireframe .ios-card { border: 1.5px dashed var(--ios-sep); background-image: radial-gradient(rgba(148, 163, 184, 0.18) 1px, transparent 0); background-size: 12px 12px; }
+    .ios-pressable { cursor: pointer; }
+    .ios-pressable:active { transform: scale(0.985); }
+    .ios-hairline-b { border-bottom: 0.5px solid var(--ios-sep); }
+    .ios-hairline-t { border-top: 0.5px solid var(--ios-sep); }
+
+    .ios-segmented { background-color: var(--ios-seg-bg); border-radius: 10px; padding: 2px; display: flex; gap: 2px; }
+    .ios-seg-btn { flex: 1; font-size: 12px; font-weight: 500; padding: 6px 4px; border-radius: 8px; color: var(--ios-subtext); text-align: center; white-space: nowrap; transition: all 0.16s; }
+    .ios-seg-btn.active { background-color: var(--ios-seg-active); color: var(--ios-text); font-weight: 600; box-shadow: 0 1px 3px rgba(0,0,0,0.10); }
+
+    .viewport { flex: 1; overflow-y: auto; overflow-x: hidden; position: relative; }
+    .tab-bar { padding: 6px 8px 14px; flex-shrink: 0; z-index: 30; user-select: none; }
+    .tab-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; }
+    .tab-item { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 4px 0; font-size: 10px; font-weight: 500; gap: 2px; position: relative; }
+    .tab-badge { position: absolute; top: -5px; right: -10px; min-width: 16px; height: 16px; padding: 0 4px; border-radius: 999px; background: #F59E0B; color: #FFFFFF; font-size: 10px; font-weight: 700; display: flex; align-items: center; justify-content: center; }
+    .home-indicator { width: 126px; height: 4px; border-radius: 999px; background: rgba(148,163,184,0.48); margin: 8px auto 0; }
+
+    .sheet-backdrop { position: absolute; inset: 0; z-index: 50; background: rgba(0, 0, 0, 0.42); backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px); display: flex; flex-direction: column; justify-content: flex-end; }
+    .sheet-backdrop.hidden, .hidden { display: none !important; }
+    .sheet-panel { background-color: var(--ios-card); color: var(--ios-text); border-top-left-radius: 24px; border-top-right-radius: 24px; border-top: 0.5px solid var(--ios-sep); box-shadow: 0 -12px 38px rgba(0, 0, 0, 0.24); max-height: 84%; display: flex; flex-direction: column; overflow: hidden; }
+    .sheet-handle { width: 38px; height: 4px; border-radius: 999px; background: rgba(148,163,184,0.45); margin: 0 auto 8px; }
+
+    .ue-pin { display: none; }
+    .mode-wireframe .ue-pin { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; border-radius: 999px; background: #2563EB; color: #FFFFFF; font-size: 11px; font-weight: 700; box-shadow: 0 2px 6px rgba(37,99,235,0.35); flex-shrink: 0; }
+
+    .tabular-nums { font-variant-numeric: tabular-nums; font-family: "SF Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .row-between { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .stack-sm > * + * { margin-top: 8px; }
+    .stack-md > * + * { margin-top: 12px; }
+
+    @keyframes iosSpin { to { transform: rotate(360deg); } }
+    .ios-spinner { width: 13px; height: 13px; border: 1.8px solid var(--ios-sep); border-top-color: var(--ios-blue); border-radius: 999px; animation: iosSpin 0.7s linear infinite; display: inline-block; }
+
+    ::-webkit-scrollbar { width: 4px; height: 4px; }
+    ::-webkit-scrollbar-thumb { background: rgba(142, 142, 147, 0.28); border-radius: 999px; }
+  </style>
+</head>
+<body>
+
+  <header class="wb-header">
+    <div class="wb-header-inner">
+      <div class="wb-brand">
+        <svg width="32" height="32" viewBox="0 0 64 64" style="border-radius:9px;flex-shrink:0;" aria-label="调度官官方图标">
+          <rect width="64" height="64" rx="14" fill="#1F6FEB"/>
+          <path d="M16 42h32M20 34h24M24 26h16" stroke="#FFFFFF" stroke-width="4" stroke-linecap="round"/>
+          <circle cx="32" cy="17" r="4" fill="#FFFFFF"/>
+        </svg>
+        <div>
+          <div style="font-size:14px;font-weight:700;color:#0F172A;">调度官 dsh-marshal Mobile · PR7 定稿交互原型</div>
+          <div style="font-size:11px;color:#64748B;">feat/mobile-pr7-apple · 工单详情进群 / 对齐 Claude·GPT 会话 / 桌面同源 3D 记忆星系 / 四大主题系列</div>
+        </div>
+      </div>
+
+      <div class="wb-controls">
+        <div class="wb-pill-group">
+          <button id="btnModeHifi" onclick="setFidelityMode('hifi')" class="wb-btn active">高保真 iOS 视觉</button>
+          <button id="btnModeWire" onclick="setFidelityMode('wireframe')" class="wb-btn">交互线框图 + UE 标注</button>
+        </div>
+
+        <div class="wb-pill-group">
+          <button id="swatch-white" onclick="setThemeSeries('white')" class="wb-btn"><span style="width:10px;height:10px;border-radius:999px;background:#FFF;border:1px solid #94A3B8;"></span>白</button>
+          <button id="swatch-black" onclick="setThemeSeries('black')" class="wb-btn"><span style="width:10px;height:10px;border-radius:999px;background:#0F172A;"></span>黑</button>
+          <button id="swatch-deepseek" onclick="setThemeSeries('deepseek')" class="wb-btn active"><span style="width:10px;height:10px;border-radius:999px;background:#4D6BFE;"></span>DeepSeek 蓝</button>
+          <button id="swatch-codex" onclick="setThemeSeries('codex')" class="wb-btn"><span style="width:10px;height:10px;border-radius:999px;background:#7C3AED;"></span>Codex 紫</button>
+        </div>
+
+        <select onchange="setRelayStatus(this.value)" aria-label="模拟中继连接状态" class="wb-select">
+          <option value="online">中继状态：在线 (24ms)</option>
+          <option value="reconnecting">中继状态：SSE 重连中 (15m 缓存)</option>
+          <option value="offline">中继状态：边缘主机离线</option>
+        </select>
+      </div>
+    </div>
+  </header>
+
+  <main class="wb-main">
+    <section>
+      <div class="phone-bezel">
+        <div id="phoneRoot" class="phone-inner theme-deepseek">
+          <div class="status-bar ios-glass">
+            <span class="tabular-nums" style="font-size:13px;font-weight:600;">09:41</span>
+            <div id="dynamicIsland" onclick="triggerIslandDemo()" class="dynamic-island" title="点击查看实时调度状态">
+              <span id="islandDot" style="width:8px;height:8px;border-radius:999px;background:#34C759;flex-shrink:0;"></span>
+              <span id="islandText" class="truncate tabular-nums">Hub · 24ms</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:5px;" id="statusIconsBox"></div>
+          </div>
+
+          <div id="relayBanner" class="hidden"></div>
+          <div id="screenViewport" class="viewport"></div>
+
+          <nav class="tab-bar ios-glass ios-hairline-t">
+            <div class="tab-grid">
+              <button id="tabBtn-tickets" onclick="switchTab('tickets')" class="tab-item">
+                <div style="position:relative;"><span data-icon="clipboard"></span><span id="badgeTickets" class="tab-badge tabular-nums">2</span></div>
+                <span>工单</span>
+              </button>
+              <button id="tabBtn-sessions" onclick="switchTab('sessions')" class="tab-item">
+                <span data-icon="message"></span>
+                <span>会话</span>
+              </button>
+              <button id="tabBtn-marshal" onclick="switchTab('marshal')" class="tab-item">
+                <div style="position:relative;"><span data-icon="bot"></span><span id="badgeMemory" class="tab-badge tabular-nums" style="background:#F97316;">1</span></div>
+                <span>智能体</span>
+              </button>
+              <button id="tabBtn-node" onclick="switchTab('node')" class="tab-item">
+                <span data-icon="radio"></span>
+                <span>节点</span>
+              </button>
+            </div>
+            <div class="home-indicator"></div>
+          </nav>
+
+          <div id="sheetOverlay" onclick="if(event.target===this)closeSheet()" class="sheet-backdrop hidden">
+            <div id="sheetContainer" class="sheet-panel"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <aside class="stack-md">
+      <div class="wb-panel stack-md">
+        <div class="row-between">
+          <div style="font-size:14px;font-weight:600;color:#0F172A;">PR7 定稿核心交互一键体验（点击联动左侧手机）</div>
+          <span id="currentScreenBadge" style="font-size:11px;padding:3px 9px;border-radius:999px;background:#EFF6FF;color:#1D4ED8;font-weight:600;">当前页面：1. 工单</span>
+        </div>
+
+        <div class="wb-grid-4">
+          <button onclick="switchTab('tickets')" class="wb-jump-card">
+            <div style="font-size:12px;font-weight:600;color:#0F172A;">① 工单看板</div>
+            <div style="font-size:11px;color:#64748B;margin-top:2px;">工单详情确认 · 进工单群</div>
+          </button>
+          <button onclick="openDemoSessionChat()" class="wb-jump-card">
+            <div style="font-size:12px;font-weight:600;color:#0F172A;">② 会话 (对齐 Claude/GPT)</div>
+            <div style="font-size:11px;color:#64748B;margin-top:2px;">上滑加载 · 去对勾胶囊</div>
+          </button>
+          <button onclick="switchTab('marshal')" class="wb-jump-card">
+            <div style="font-size:12px;font-weight:600;color:#0F172A;">③ 智能体 (含 3D 星系)</div>
+            <div style="font-size:11px;color:#64748B;margin-top:2px;">花名册预设 · 实时星图</div>
+          </button>
+          <button onclick="switchTab('node')" class="wb-jump-card">
+            <div style="font-size:12px;font-weight:600;color:#0F172A;">④ 节点与空间</div>
+            <div style="font-size:11px;color:#64748B;margin-top:2px;">一码配对 · 四大主题系列</div>
+          </button>
+        </div>
+
+        <div style="display:flex;flex-wrap:wrap;gap:8px;padding-top:10px;border-top:1px solid #F1F5F9;">
+          <button onclick="openTicketApproval('TKT-209')" class="wb-demo-chip" style="background:#FFFBEB;color:#92400E;border-color:#FDE68A;">演示「工单详情确认 → 进工单群看讨论」</button>
+          <button onclick="openNewSessionSheet('direct')" class="wb-demo-chip" style="background:#EFF6FF;color:#1D4ED8;border-color:#BFDBFE;">演示「新建会话（选主机 + 选 Agent）」</button>
+          <button onclick="openDemoGroupInSessions()" class="wb-demo-chip" style="background:#EEF2FF;color:#4338CA;border-color:#C7D2FE;">演示「会话 → Agent 主持群聊」</button>
+          <button onclick="openRoutingMemoryHub()" class="wb-demo-chip" style="background:#FAF5FF;color:#6B21A8;border-color:#E9D5FF;">演示「智能体 → 实时 3D 记忆星系」</button>
+          <button onclick="openRelayPairSheet()" class="wb-demo-chip" style="background:#ECFDF5;color:#065F46;border-color:#A7F3D0;">演示「手机连接」一码配对</button>
+        </div>
+      </div>
+
+      <div id="ueSpecCard" class="wb-panel stack-sm"></div>
+
+      <div class="wb-panel">
+        <div style="font-size:11px;font-weight:700;letter-spacing:0.05em;color:#94A3B8;margin-bottom:10px;">APPLE HIG 双端统一设计契约 (iOS &amp; ANDROID · 完全离线自包含)</div>
+        <div class="wb-grid-3" style="font-size:12px;">
+          <div style="padding:12px;border-radius:12px;background:#F8FAFC;border:1px solid #F1F5F9;">
+            <div style="font-weight:600;color:#1E293B;margin-bottom:4px;">双层材质规范 (MUST-02)</div>
+            <div style="color:#475569;line-height:1.55;">内容卡片采用 100% 不透明语义实底（16pt 圆角）；磨砂半透明严格限定在吸顶栏、悬浮 4 栏底栏与模态抽屉。</div>
+          </div>
+          <div style="padding:12px;border-radius:12px;background:#F8FAFC;border:1px solid #F1F5F9;">
+            <div style="font-weight:600;color:#1E293B;margin-bottom:4px;">四大官方主题色系列</div>
+            <div style="color:#475569;line-height:1.55;">内置<b>纯粹白</b> (<span class="tabular-nums">#1D1D1F</span>)、<b>曜石黑</b> (<span class="tabular-nums">#0A84FF</span>)、<b>DeepSeek 蓝</b> (<span class="tabular-nums">#4D6BFE</span>) 与 <b>Codex 紫</b> (<span class="tabular-nums">#7C3AED</span>)。</div>
+          </div>
+          <div style="padding:12px;border-radius:12px;background:#F8FAFC;border:1px solid #F1F5F9;">
+            <div style="font-weight:600;color:#1E293B;margin-bottom:4px;">极简去噪与 3D 星系</div>
+            <div style="color:#475569;line-height:1.55;">顶部上滑自动加载更早记录、悬浮去对勾胶囊、垂直单列思考强度抽屉、桌面同源 110 步三维力导向记忆星系。</div>
+          </div>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <script>
+    function svgIcon(name, size) {
+      const sz = size || 18;
+      const paths = {
+        clipboard: '<rect x="8" y="2" width="8" height="4" rx="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><path d="M9 12h6M9 16h6"/>',
+        message: '<path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"/>',
+        bot: '<path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="3"/><path d="M2 14h2M20 14h2M15 13v2M9 13v2"/>',
+        radio: '<circle cx="12" cy="12" r="2"/><path d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48-.01a6 6 0 0 1 0-8.49m11.31-2.82a10 10 0 0 1 0 14.14m-14.14 0a10 10 0 0 1 0-14.14"/>',
+        plus: '<path d="M5 12h14M12 5v14"/>',
+        search: '<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>',
+        chevronRight: '<path d="m9 18 6-6-6-6"/>',
+        chevronLeft: '<path d="m15 18-6-6 6-6"/>',
+        chevronDown: '<path d="m6 9 6 6 6-6"/>',
+        compose: '<path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.375 2.625a1 1 0 0 1 3 3l-9.013 9.014a2 2 0 0 1-.853.505l-2.873.84a.5.5 0 0 1-.62-.62l.84-2.873a2 2 0 0 1 .506-.852z"/>',
+        sparkles: '<path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z"/>',
+        arrowUp: '<path d="m5 12 7-7 7 7M12 19V5"/>',
+        arrowUpRight: '<path d="M7 7h10v10M7 17 17 7"/>',
+        terminal: '<polyline points="4 17 10 11 4 5"/><line x1="12" x2="20" y1="19" y2="19"/>',
+        copy: '<rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>',
+        refresh: '<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/>',
+        camera: '<path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/>',
+        image: '<rect width="18" height="18" x="3" y="3" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/>',
+        fileUp: '<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4M12 12v6M15 15l-3-3-3 3"/>',
+        laptop: '<rect width="18" height="12" x="3" y="4" rx="2"/><line x1="2" x2="22" y1="20" y2="20"/>',
+        wifi: '<path d="M12 20h.01M2 8.82a15 15 0 0 1 20 0M5 12.859a10 10 0 0 1 14 0M8.5 16.429a5 5 0 0 1 7 0"/>',
+        battery: '<rect width="16" height="10" x="2" y="7" rx="2"/><line x1="22" x2="22" y1="11" y2="13"/><rect width="12" height="6" x="4" y="9" fill="currentColor"/>'
+      };
+      return `<svg width="${sz}" height="${sz}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:inline-block;vertical-align:middle;flex-shrink:0;">${paths[name] || ''}</svg>`;
+    }
+
+    const state = {
+      activeTab: 'tickets',
+      fidelity: 'hifi',
+      themeSeries: 'deepseek',
+      relayStatus: 'online',
+      customRelayUrl: 'marshal-hub.local/marshal',
+      activeHostId: 'host-mac-1',
+      workspaceName: 'v_JR · 我的调度空间',
+      boardRevision: 42,
+      superagentAutoDispatch: true,
+      todayTokensK: 148.6,
+      dailySummaryCapK: 50,
+      privacyMode: 'content',
+      pinLockEnabled: true,
+
+      ticketFilter: 'all',
+      ticketSearch: '',
+      tickets: [
+        {
+          id: 'TKT-209',
+          title: 'PR #6 路由记忆隔离修复：阻断 private / never-group 记忆外泄至共享看板',
+          template: 'PR 对抗审查',
+          roles: ['Leader (DSH)', 'DSH 审查员', 'Codex 审查员'],
+          status: 'attention',
+          patchSize: '28.4 KiB',
+          batchNo: 2,
+          stageIndex: 2,
+          tokens: '34.2k',
+          attentionPrompt: 'DSH 审查员与 Codex 审查员均已完成交叉复核（结论：PASS），等待机主确认合并验收。',
+          diffFiles: [
+            { path: 'plugin-build/lib/src/memory/agent-memory.js', stat: '+84 -19' },
+            { path: 'plugin-build/lib/src/hub/http-auth.js', stat: '+42 -8' },
+            { path: 'plugin-build/test/pr7-review-fixes.test.js', stat: '+216 -0' }
+          ],
+          roomId: 'ROOM-209'
+        },
+        {
+          id: 'TKT-208',
+          title: '手机端看板修订锁（baseRevision）与工单群跨设备分页转存',
+          template: '开发交付',
+          roles: ['Leader (DSH)', 'Coder (Codex)', 'Reviewer'],
+          status: 'attention',
+          patchSize: '19.6 KiB',
+          batchNo: 1,
+          stageIndex: 1,
+          tokens: '22.8k',
+          attentionPrompt: 'Coder 请求在隔离 Git worktree 执行回归测试并写入临时 SQLite 快照（仅本次有效）。',
+          diffFiles: [
+            { path: 'src/hub/phone.ts', stat: '+67 -14' },
+            { path: 'mobile/src/api/marshal.ts', stat: '+53 -11' }
+          ],
+          roomId: 'ROOM-208'
+        },
+        {
+          id: 'TKT-207',
+          title: 'Mnemon 0.2.13 原生私有记忆试点吞吐基准与回退验证',
+          template: '技术调研与选型',
+          roles: ['Leader (DSH)', '技术调研', '校核'],
+          status: 'running',
+          patchSize: '8.2 KiB',
+          batchNo: 1,
+          stageIndex: 1,
+          tokens: '16.5k',
+          attentionPrompt: '',
+          diffFiles: [{ path: 'docs/agent-memory.md', stat: '+38 -4' }],
+          roomId: 'ROOM-207'
+        },
+        {
+          id: 'TKT-204',
+          title: '单智能体 Token 用量徽章与工单群流式思考状态气泡验收',
+          template: '报表与报告',
+          roles: ['Leader (DSH)', '报告撰写', '校核'],
+          status: 'ended',
+          patchSize: '14.1 KiB',
+          batchNo: 1,
+          stageIndex: 3,
+          tokens: '15.8k',
+          attentionPrompt: '',
+          diffFiles: [{ path: 'plugin-build/client/index.js', stat: '+112 -18' }],
+          roomId: 'ROOM-204'
+        }
+      ],
+
+      sessionCategory: 'direct',
+      activeChat: null,
+      isStreamingReply: false,
+      isLoadingHistory: false,
+      shouldScrollBottom: false,
+      newSessionDraft: {
+        mode: 'direct',
+        hostId: 'host-mac-1',
+        agentId: 'ag-leader',
+        cwd: '~/Projects/dsh-marshal',
+        groupMemberIds: ['ag-leader', 'ag-reviewer']
+      },
+
+      sessions: [
+        {
+          id: 'SES-901',
+          engineType: 'dsh',
+          hostId: 'host-mac-1',
+          device: 'Mac Studio 主力机',
+          agentId: 'ag-leader',
+          agentName: 'Leader · 统筹指挥官',
+          title: '记忆加密与跨设备同步审查',
+          cwd: '~/Projects/dsh-marshal',
+          seat: 'DSH',
+          model: 'deepseek-reasoner',
+          effort: 'high',
+          historyPage: 0,
+          maxHistoryPages: 2,
+          updatedAt: '11 分钟前',
+          pendingQuestion: {
+            id: 'q-101',
+            prompt: '检测到跨设备工单群存在未归档批次，是否立即分页转存至云端 Hub？',
+            options: ['立即分页转存至云端 Hub', '仅保留本机 task-rooms.sqlite']
+          },
+          messages: [
+            { role: 'user', time: '09:24', text: '先检查一下全局记忆提案在未审批前会不会被别的会话读到？' },
+            {
+              role: 'assistant',
+              time: '09:25',
+              sender: 'Leader · 统筹指挥官',
+              thoughtId: 'th-901-1',
+              thoughtSecs: 6,
+              thoughtExpanded: false,
+              thought: '检查 createMemoryBridge 与 global.db 读取过滤条件：status === "pending" 条目仅在机主审批队列可见，不进入 rules.md 提示词拼接。',
+              text: '不会。Agent 提交的 Global 记忆默认处于 pending 提案态，只有你在手机或桌面点击批准写入 rules.md 后，才会按可见范围（全部会话或仅单聊）生效。'
+            },
+            { role: 'user', time: '09:28', text: '再核对一下工作区记忆推送到云端 Hub 时的加密方式。' },
+            {
+              role: 'tool',
+              id: 'tool-1',
+              expanded: false,
+              name: '读取 memory/sync-crypto.js',
+              duration: '0.7s',
+              detail: 'AES-256-GCM + 每 owner 独立随机 scrypt 盐；Hub 仅存密文与墓碑。'
+            },
+            {
+              role: 'assistant',
+              time: '09:30',
+              sender: 'Leader · 统筹指挥官',
+              thoughtId: 'th-901-2',
+              thoughtSecs: 9,
+              thoughtExpanded: false,
+              thought: '核对密钥派生链路与删除墓碑归一化：使用 DSH_MARSHAL_MEMORY_SYNC_KEY 配合随机盐派生 256-bit 密钥，防止旧备份覆盖复活已删条目。',
+              text: '已核实：本地记录与删除墓碑均使用 AES-256-GCM 端到端加密后上传，Hub 端不保存任何明文正文、标签或向量。你可以在顶部直接向上滑动消息流，自动拉取更早记录。'
+            }
+          ]
+        },
+        {
+          id: 'SES-902',
+          engineType: 'codex',
+          hostId: 'host-mac-1',
+          device: 'Mac Studio 主力机',
+          agentId: 'ag-coder',
+          agentName: 'Coder · 隔离工作树工程师',
+          title: 'Codex 线程 · PR7 回归单测',
+          cwd: '~/Projects/dsh-marshal/worktrees/pr7',
+          seat: 'Codex',
+          model: 'gpt-6-luna',
+          effort: 'high',
+          historyPage: 1,
+          maxHistoryPages: 2,
+          updatedAt: '2 分钟前',
+          pendingQuestion: null,
+          messages: [
+            { role: 'user', time: '09:35', text: '接管原线程跑一遍 pr7-review-fixes 单测。' },
+            {
+              role: 'assistant',
+              time: '09:39',
+              sender: 'Coder · 隔离工作树工程师',
+              thoughtId: 'th-902-1',
+              thoughtSecs: 5,
+              thoughtExpanded: false,
+              thought: '通过 thread/resume 恢复隔离工作树会话句柄并验证 Mnemon 记忆图谱映射断言。',
+              text: '已通过 thread/resume 恢复原线程句柄，11 项记忆边界与星系图谱断言全部通过，未出现跨工作区泄漏。'
+            }
+          ]
+        },
+        {
+          id: 'SES-903',
+          engineType: 'claude',
+          hostId: 'host-mac-2',
+          device: '第二台 Mac (.208)',
+          agentId: 'ag-architect',
+          agentName: 'Architect · 架构顾问',
+          title: 'Claude 会话 · 适配器只读观察',
+          cwd: '~/MarshalWorkTests/claude',
+          seat: 'Claude',
+          model: 'claude-sonnet-4-5',
+          effort: 'medium',
+          historyPage: 1,
+          maxHistoryPages: 2,
+          updatedAt: '刚刚',
+          pendingQuestion: null,
+          messages: [
+            { role: 'user', time: '09:40', text: '检查 resume-contract 会话恢复身份校验。' },
+            { role: 'assistant', time: '09:41', sender: 'Architect · 架构顾问', text: '当前为只读观察模式；在下方输入框直接发送消息即可自动触发 acquire 接管本地句柄。' }
+          ]
+        }
+      ],
+
+      groupRooms: [
+        {
+          id: 'GRP-01',
+          title: '双机联合重构 · 看板修订锁与防重放',
+          mode: 'work',
+          phase: '第 2/3 轮 · 成员并行执行中',
+          totalTokens: '50.8k',
+          model: 'deepseek-reasoner',
+          effort: 'high',
+          historyPage: 1,
+          maxHistoryPages: 2,
+          updatedAt: '刚刚',
+          members: [
+            { name: '主力机 DSH', role: '主持人' },
+            { name: '主力机 Codex', role: '协作推进' },
+            { name: '二号机 Codex (.208)', role: '质疑反驳' }
+          ],
+          messages: [
+            { role: 'user', time: '09:32', text: '请双机分工验证看板 apply(baseRevision) 在乱序并发请求下的一致性。' },
+            { role: 'assistant', time: '09:33', sender: '主力机 DSH', badge: '主持人 · 分工', text: '【第 2 轮分工】\n1. 主力机 Codex：在隔离目录实现 baseRevision 单调递增校验与 conflict 错误码。\n2. 二号机 Codex：构造旧修订重放与跨连接并发用例进行反驳验证。' },
+            { role: 'assistant', time: '09:36', sender: '主力机 Codex', badge: '协作推进', text: '已在 src/hub/phone.ts 完成修订比对：当 baseRevision !== currentRev 时直接抛 { code: "conflict" }，绝不返回伪成功快照。' },
+            { role: 'assistant', time: '09:38', sender: '二号机 Codex (.208)', badge: '质疑反驳', text: '补充发现：同一 requestId 重试时应返回幂等缓存结果而非误报 conflict。已补入回归断言，交回主持人汇总。' }
+          ]
+        },
+        {
+          id: 'GRP-02',
+          title: '架构评审 · 记忆同步盐值迁移方案',
+          mode: 'discuss',
+          phase: '3/3 轮已完成汇总',
+          totalTokens: '15.8k',
+          model: 'gpt-6-luna',
+          effort: 'high',
+          historyPage: 2,
+          maxHistoryPages: 2,
+          updatedAt: '25 分钟前',
+          members: [{ name: '主力机 Codex', role: '主持人' }, { name: '主力机 DSH', role: '独立审查' }],
+          messages: [
+            { role: 'assistant', time: '09:15', sender: '主力机 Codex', badge: '主持人 · 最终汇总', text: '三轮讨论达成共识：旧记录保留 v1 固定盐只读解密兼容，新写入一律按 owner 生成随机 scrypt 盐，删除操作记录归一化哈希墓碑防止旧备份复活。' }
+          ]
+        }
+      ],
+
+      ticketRooms: {
+        'ROOM-209': {
+          id: 'ROOM-209',
+          ticketId: 'TKT-209',
+          title: '工单群 · TKT-209 PR #6 对抗审查',
+          subtitle: '批次 #2 · Leader + DSH审查员 + Codex审查员',
+          model: 'deepseek-reasoner',
+          effort: 'high',
+          historyPage: 1,
+          maxHistoryPages: 2,
+          messages: [
+            { role: 'assistant', time: '09:20', sender: 'Leader (DSH)', badge: '工单统筹 · 批次 #2', text: '已按固定提交拉取 PR #6 补丁（28.4 KiB），读取工作区公共记忆 handoff.md。请两位审查员独立核查记忆可见性边界，随后互相复核。' },
+            { role: 'assistant', time: '09:24', sender: 'Codex 审查员', badge: '独立初审', text: '初审结论：PASS。createMemoryBridge 在召回时已过滤 private 与 never-group 条目，且跨 workspaceId 的 Mnemon 私有条目不会串入当前工单卡。' },
+            { role: 'assistant', time: '09:27', sender: 'DSH 审查员', badge: '交叉复核', text: '复核结论：赞同 Codex 审查员，并额外确认 http-auth.js 的 hostIsLoopback 已拦截非回环 Host 头（防 DNS Rebinding）。无阻塞问题。' },
+            { role: 'assistant', time: '09:29', sender: 'Leader (DSH)', badge: '待机主确认', text: '双方交叉复核均通过，交付报告已生成。你可以点击左上角返回「工单详情」确认验收，或在本群继续追问细节。' }
+          ]
+        },
+        'ROOM-208': {
+          id: 'ROOM-208',
+          ticketId: 'TKT-208',
+          title: '工单群 · TKT-208 看板修订锁开发',
+          subtitle: '批次 #1 · Leader + Coder + Reviewer',
+          model: 'gpt-6-luna',
+          effort: 'high',
+          historyPage: 2,
+          maxHistoryPages: 2,
+          messages: [
+            { role: 'assistant', time: '09:30', sender: 'Leader (DSH)', badge: '设计拆分', text: '已在 Git 根目录 HEAD 创建隔离工作树，交接 taskBoard.apply 契约给 Coder。' },
+            { role: 'assistant', time: '09:36', sender: 'Coder (Codex)', badge: '待确认', text: '已完成 phone.ts 与 marshal.ts 补丁（19.6 KiB），正在等待机主在工单详情页点击「确认批准执行」运行单测。' }
+          ]
+        },
+        'ROOM-207': {
+          id: 'ROOM-207',
+          ticketId: 'TKT-207',
+          title: '工单群 · TKT-207 Mnemon 吞吐调研',
+          subtitle: '批次 #1 · Leader + 技术调研 + 校核',
+          model: 'deepseek-chat',
+          effort: 'medium',
+          historyPage: 2,
+          maxHistoryPages: 2,
+          messages: [
+            { role: 'assistant', time: '09:40', sender: '技术调研 (DSH)', badge: '执行中', text: '正在采集 10,000 条记忆规模下 SQLite FTS5 与 Mnemon 0.2.13 原生检索的 P95 延迟对比数据…' }
+          ]
+        },
+        'ROOM-204': {
+          id: 'ROOM-204',
+          ticketId: 'TKT-204',
+          title: '工单群 · TKT-204 用量与气泡验收',
+          subtitle: '批次 #1 · 已归档',
+          model: 'deepseek-reasoner',
+          effort: 'medium',
+          historyPage: 2,
+          maxHistoryPages: 2,
+          messages: [
+            { role: 'assistant', time: '08:30', sender: 'Leader (DSH)', badge: '已验收归档', text: '4 次调用全部 completed，总计 15,811 tokens，补丁与验收报告已归档至工作区记忆。' }
+          ]
+        }
+      },
+
+      agentsSubTab: 'roster',
+      memoryViewMode: 'galaxy',
+      memoryScopeFilter: 'all',
+      memoryAgentFilter: 'all',
+      selectedMemoryId: 'mem-pending-1',
+      confirmDeleteMemId: '',
+
+      agentRoster: [
+        { id: 'ag-leader', name: 'Leader · 统筹指挥官', hostId: 'host-mac-1', host: 'Mac Studio 主力机', engine: 'DSH Native', defaultModel: 'deepseek-reasoner', effort: 'high', memoryBackend: 'SQLite FTS5 (18 条)', color: '#1F6FEB' },
+        { id: 'ag-coder', name: 'Coder · 隔离工作树工程师', hostId: 'host-mac-1', host: 'Mac Studio 主力机', engine: 'Codex 0.166', defaultModel: 'gpt-6-luna', effort: 'high', memoryBackend: 'Mnemon 0.2.13 试点 (9 条)', color: '#7C3AED' },
+        { id: 'ag-reviewer', name: 'Reviewer · 对抗审查员', hostId: 'host-mac-2', host: '第二台 Mac (.208)', engine: 'Codex 0.166', defaultModel: 'gpt-6-luna', effort: 'high', memoryBackend: 'SQLite 只读共享 (12 条)', color: '#10B981' },
+        { id: 'ag-architect', name: 'Architect · 架构顾问', hostId: 'host-mac-2', host: '第二台 Mac (.208)', engine: 'Claude Code', defaultModel: 'claude-sonnet-4-5', effort: 'medium', memoryBackend: 'SQLite 共享 (7 条)', color: '#D97757' }
+      ],
+
+      agentPresets: [
+        { id: 'pre-1', name: '协作工程师', depth: '专业实践', stance: '协作推进', persona: '聚焦最小可行补丁与可复现单测，严格遵守工作目录沙箱边界。', revision: 12 },
+        { id: 'pre-2', name: '反驳审查员', depth: '专家深度', stance: '质疑反驳', persona: '专门排查竞态条件、重放攻击与记忆越权泄漏，未被证伪前不默认赞同。', revision: 9 },
+        { id: 'pre-3', name: '技术主持人', depth: '专家深度', stance: '独立审查', persona: '清晰拆解分工、对齐成员分歧并如实报告未独立验证的边界。', revision: 15 }
+      ],
+
+      memories: [
+        { id: 'mem-pending-1', title: '跨机工单群接管连续性门禁', kind: 'decision', layer: 'global', agentId: 'ag-coder', status: 'pending', visibility: 'all', clarity: 'vivid', importance: 0.94, accessCount: 19, pinned: true, cue: '跨主机切换工单群存储设备前', tags: ['task-room', 'hub-sync', 'continuity'], sourceSession: 'GRP-01', scope: 'Global 提案 · 待机主审批', summary: '跨设备工单群接管正文前必须核验序号连续性，缺失帧时保留原设备存储不盲目切换。' },
+        { id: 'mem-ws-1', title: '看板 baseRevision 乐观锁与单次审批', kind: 'handoff', layer: 'workspace', agentId: 'ag-leader', status: 'active', visibility: 'group-safe', clarity: 'vivid', importance: 0.91, accessCount: 32, pinned: true, cue: '处理手机端工单修改或远端审批请求时', tags: ['board', 'baseRevision', 'security'], sourceSession: 'GRP-01', scope: 'Workspace · handoff.md 交接', summary: '手机端审批一律过滤「总是允许」，看板修改必须携带 baseRevision 防止多端乱序覆盖。' },
+        { id: 'mem-ws-2', title: '记忆同步 AES-256-GCM 与防复活墓碑', kind: 'fact', layer: 'workspace', agentId: 'ag-leader', status: 'active', visibility: 'group-safe', clarity: 'vivid', importance: 0.86, accessCount: 24, pinned: false, cue: '执行 marshal/memory/sync 跨机同步时', tags: ['crypto', 'hub-sync', 'tombstone'], sourceSession: 'SES-901', scope: 'Workspace · 共享架构事实', summary: '每名 owner 使用随机 scrypt 盐派生密钥加密上传，删除时写入归一化哈希墓碑阻止旧备份复活。' },
+        { id: 'mem-ws-3', title: 'PR 对抗审查 48 KiB 补丁体积上限', kind: 'decision', layer: 'workspace', agentId: 'ag-reviewer', status: 'active', visibility: 'group-safe', clarity: 'clear', importance: 0.76, accessCount: 15, pinned: false, cue: '生成工单补丁快照或拉取 PR 时', tags: ['pr-review', 'board', 'patch'], sourceSession: 'ROOM-209', scope: 'Workspace · 审查契约', summary: '任务补丁超过 48 KiB 时仅同步文件路径摘要与统计，避免大二进制拖慢跨设备工单群。' },
+        { id: 'mem-ws-4', title: 'marshal-stream 15 分钟环形重连缓存', kind: 'scene', layer: 'workspace', agentId: 'ag-architect', status: 'active', visibility: 'group-safe', clarity: 'clear', importance: 0.72, accessCount: 11, pinned: false, cue: '移动端切后台恢复 SSE 流式订阅时', tags: ['sse', 'continuity', 'mobile'], sourceSession: 'SES-901', scope: 'Workspace · 实时流场景', summary: '手机切后台再回前台按最后收到的事件序号从 15 分钟环形缓存平滑续传，无需重跑会话。' },
+        { id: 'mem-priv-1', title: 'Mnemon 私有排障图谱与门禁隔离', kind: 'profile', layer: 'private', agentId: 'ag-coder', status: 'active', visibility: 'never-group', clarity: 'vivid', importance: 0.88, accessCount: 21, pinned: true, cue: '在隔离 Git worktree 编写单测与补丁时', tags: ['mnemon', 'privacy', 'security'], sourceSession: 'ROOM-208', scope: 'Agent 私有 · Mnemon 隔离库', summary: '本机私有调优偏好与排障索引，受 pr6/pr7 门禁保护，严禁外泄至共享看板或群聊。' },
+        { id: 'mem-priv-2', title: '主持人三轮收敛与分歧披露准则', kind: 'profile', layer: 'private', agentId: 'ag-leader', status: 'active', visibility: 'private', clarity: 'clear', importance: 0.79, accessCount: 17, pinned: false, cue: '主持跨机多智能体群聊汇总阶段时', tags: ['moderator', 'task-room', 'board'], sourceSession: 'GRP-01', scope: 'Agent 私有 · SQLite FTS5', summary: '汇总时必须明确区分双机已独立复现通过的结论与尚未实机验证的假设，最多 3 轮内收敛。' },
+        { id: 'mem-priv-3', title: '回环地址 Host 头防 DNS Rebinding 核查', kind: 'episode', layer: 'private', agentId: 'ag-reviewer', status: 'active', visibility: 'never-group', clarity: 'vivid', importance: 0.83, accessCount: 14, pinned: false, cue: '审查本地桥接 HTTP 接口鉴权时', tags: ['security', 'pr-review', 'http-auth'], sourceSession: 'ROOM-209', scope: 'Agent 私有 · 审查经验片段', summary: '审查本地 HTTP 桥接层时必查 hostIsLoopback 校验，拦截伪造域名的跨站请求。' },
+        { id: 'mem-priv-4', title: 'Claude 适配器只读观察到接管切换契约', kind: 'scene', layer: 'private', agentId: 'ag-architect', status: 'active', visibility: 'private', clarity: 'clear', importance: 0.69, accessCount: 8, pinned: false, cue: '从手机只读观察切换至 acquire 接管时', tags: ['mobile', 'sse', 'claude'], sourceSession: 'SES-903', scope: 'Agent 私有 · 适配器约束', summary: '查看历史分页仅读取快照不触发推理，仅在用户主动发消息时调用 acquire 接管句柄。' },
+        { id: 'mem-global-2', title: '机主极简 UI 偏好与去冗余原则', kind: 'profile', layer: 'global', agentId: 'ag-leader', status: 'active', visibility: 'all', clarity: 'vivid', importance: 0.90, accessCount: 28, pinned: true, cue: '设计或修改前后端管理台与移动端界面时', tags: ['ui-minimal', 'mobile', 'design'], sourceSession: 'SES-901', scope: 'Global · rules.md 全局生效', summary: '界面坚持克制低噪音极简美学，去除重复控件、生硬对勾与高饱和彩虹标签，保持清晰留白。' },
+        { id: 'mem-global-3', title: '开发机本地目录约定 (no-group)', kind: 'fact', layer: 'global', agentId: 'ag-coder', status: 'active', visibility: 'no-group', clarity: 'fuzzy', importance: 0.58, accessCount: 6, pinned: false, cue: '单聊定位主力机与二号机工程目录时', tags: ['privacy', 'tombstone'], sourceSession: 'SES-902', scope: 'Global · 仅 1:1 单聊可见', summary: '开发机本地目录结构约定（no-group 策略：群聊或未知会话身份时自动失败关闭不注入）。' },
+        { id: 'mem-priv-5', title: '早期实验性轮询重连草稿（已淡化）', kind: 'episode', layer: 'private', agentId: 'ag-coder', status: 'active', visibility: 'private', clarity: 'trace', importance: 0.36, accessCount: 2, pinned: false, cue: '旧版调试记录', tags: ['sse'], sourceSession: 'ROOM-208', scope: 'Agent 私有 · 仅留印象 (trace)', summary: '早期轮询重连实验记录，随时间清晰度衰减至 trace，仅在精确命中关键词时低权重召回。' }
+      ],
+
+      hosts: [
+        { id: 'host-mac-1', name: 'Mac Studio 主力机', os: 'macOS · DSH 0.2.1 + Codex 0.166', latency: '24ms', sessionsCount: 259 },
+        { id: 'host-mac-2', name: '第二台 Mac (.208)', os: 'macOS · Codex + Claude Code', latency: '36ms', sessionsCount: 70 }
+      ]
+    };
+
+    let streamTimer = null;
+    let islandTimer = null;
+    let galaxyRafId = null;
+    let touchPullStartY = 0;
+
+    const galaxyCamera = { yaw: 0.38, pitch: -0.18, zoom: 1.04, auto: true, dragging: false, moved: false, lastX: 0, lastY: 0, pinchDist: 0, hoverId: '' };
+
+    const MEMORY_KIND_META = {
+      profile: { label: '画像', color: '#f6c35c' },
+      decision: { label: '决策', color: '#5aa7ff' },
+      fact: { label: '事实', color: '#4fd1c5' },
+      episode: { label: '片段', color: '#b18cff' },
+      handoff: { label: '交接', color: '#ff9f5a' },
+      scene: { label: '场景', color: '#7bd88f' }
+    };
+
+    const CLARITY_LABEL_MAP = { vivid: '清晰', clear: '清楚', fuzzy: '模糊', trace: '仅留印象' };
+
+    function escapeHtml(str) {
+      return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    function marshalLogoSvg(sz) {
+      const s = sz || 36;
+      return `<svg width="${s}" height="${s}" viewBox="0 0 64 64" style="border-radius:10px;flex-shrink:0;" aria-hidden="true"><rect width="64" height="64" rx="14" style="fill:var(--ios-blue);"/><path d="M16 42h32M20 34h24M24 26h16" stroke="#ffffff" stroke-width="4.2" stroke-linecap="round"/><circle cx="32" cy="17" r="4.2" fill="#ffffff"/></svg>`;
+    }
+
+    function hydrateStaticIcons() {
+      const statusBox = document.getElementById('statusIconsBox');
+      if (statusBox) statusBox.innerHTML = svgIcon('wifi', 14) + svgIcon('battery', 16);
+      document.querySelectorAll('[data-icon]').forEach(el => {
+        el.innerHTML = svgIcon(el.getAttribute('data-icon'), 20);
+      });
+    }
+
+    function stopGalaxyLoop() {
+      if (galaxyRafId) {
+        cancelAnimationFrame(galaxyRafId);
+        galaxyRafId = null;
+      }
+    }
+
+    function notifyIsland(text, dotColor) {
+      const island = document.getElementById('dynamicIsland');
+      const islandText = document.getElementById('islandText');
+      const islandDot = document.getElementById('islandDot');
+      if (!island || !islandText || !islandDot) return;
+      if (islandTimer) clearTimeout(islandTimer);
+      island.classList.add('expanded');
+      islandText.textContent = text;
+      islandDot.style.backgroundColor = dotColor || '#34C759';
+      islandTimer = setTimeout(() => {
+        island.classList.remove('expanded');
+        syncRelayUI();
+      }, 2300);
+    }
+
+    function triggerIslandDemo() {
+      const pTickets = state.tickets.filter(t => t.status === 'attention').length;
+      const pMem = state.memories.filter(m => m.status === 'pending').length;
+      notifyIsland(`在线 · ${pTickets} 工单待确认 · ${pMem} 记忆待审`, '#FF9500');
+    }
+
+    function applyThemeClasses() {
+      const root = document.getElementById('phoneRoot');
+      if (!root) return;
+      root.classList.remove('theme-white', 'theme-black', 'theme-dark', 'theme-deepseek', 'theme-codex');
+      if (state.themeSeries === 'black') root.classList.add('theme-dark', 'theme-black');
+      else root.classList.add('theme-' + state.themeSeries);
+
+      ['white', 'black', 'deepseek', 'codex'].forEach(s => {
+        const btn = document.getElementById('swatch-' + s);
+        if (btn) btn.className = state.themeSeries === s ? 'wb-btn active' : 'wb-btn';
+      });
+    }
+
+    function setThemeSeries(series) {
+      state.themeSeries = series;
+      const names = { white: '纯粹白', black: '曜石黑', deepseek: 'DeepSeek 蓝', codex: 'Codex 紫' };
+      const dots = { white: '#94A3B8', black: '#0A84FF', deepseek: '#4D6BFE', codex: '#7C3AED' };
+      notifyIsland('已切换主题：' + (names[series] || series), dots[series]);
+      renderApp();
+    }
+
+    function setFidelityMode(mode) {
+      state.fidelity = mode;
+      const root = document.getElementById('phoneRoot');
+      const bHifi = document.getElementById('btnModeHifi');
+      const bWire = document.getElementById('btnModeWire');
+      if (mode === 'wireframe') {
+        root.classList.add('mode-wireframe');
+        bWire.className = 'wb-btn wire-active';
+        bHifi.className = 'wb-btn';
+        notifyIsland('已开启交互线框图与 UE 标注', '#2563EB');
+      } else {
+        root.classList.remove('mode-wireframe');
+        bHifi.className = 'wb-btn active';
+        bWire.className = 'wb-btn';
+        notifyIsland('已切换高保真 iOS 视觉', '#34C759');
+      }
+      renderApp();
+    }
+
+    function setRelayStatus(status) {
+      state.relayStatus = status;
+      syncRelayUI();
+      renderApp();
+    }
+
+    function syncRelayUI() {
+      const banner = document.getElementById('relayBanner');
+      const islandText = document.getElementById('islandText');
+      const islandDot = document.getElementById('islandDot');
+      const host = state.hosts.find(h => h.id === state.activeHostId) || state.hosts[0];
+      if (!banner || !islandText || !islandDot) return;
+
+      if (state.relayStatus === 'online') {
+        banner.className = 'hidden';
+        islandText.textContent = `Hub · ${host.latency}`;
+        islandDot.style.backgroundColor = '#34C759';
+      } else if (state.relayStatus === 'reconnecting') {
+        banner.className = 'ios-hairline-b';
+        banner.style.cssText = 'padding:6px 16px;font-size:11px;font-weight:500;display:flex;justify-content:space-between;background:rgba(245,158,11,0.15);color:#D97706;';
+        banner.innerHTML = '<span>marshal-stream SSE 重连中 · 15m 环形缓存</span><span class="tabular-nums">Backoff 2s</span>';
+        islandText.textContent = 'SSE 重连中...';
+        islandDot.style.backgroundColor = '#FF9500';
+      } else {
+        banner.className = 'ios-hairline-b';
+        banner.style.cssText = 'padding:6px 16px;font-size:11px;font-weight:500;display:flex;justify-content:space-between;background:rgba(239,68,68,0.15);color:#DC2626;';
+        banner.innerHTML = '<span>边缘主机离线 · 展示 Hub 快照</span><button onclick="setRelayStatus(\'online\')" style="text-decoration:underline;font-weight:600;">重连核对</button>';
+        islandText.textContent = 'Node 离线';
+        islandDot.style.backgroundColor = '#FF3B30';
+      }
+    }
+
+    function openSheet(html) {
+      const overlay = document.getElementById('sheetOverlay');
+      const container = document.getElementById('sheetContainer');
+      if (!overlay || !container) return;
+      container.innerHTML = html;
+      overlay.classList.remove('hidden');
+    }
+
+    function closeSheet() {
+      const overlay = document.getElementById('sheetOverlay');
+      if (overlay) overlay.classList.add('hidden');
+    }
+
+    function switchTab(tab) {
+      state.activeTab = tab;
+      if (tab !== 'sessions') state.activeChat = null;
+      closeSheet();
+      renderApp();
+    }
+
+    function openDemoSessionChat() {
+      state.activeTab = 'sessions';
+      state.sessionCategory = 'direct';
+      state.activeChat = { kind: 'direct', id: 'SES-901' };
+      state.shouldScrollBottom = true;
+      closeSheet();
+      renderApp();
+    }
+
+    function openDemoGroupInSessions() {
+      state.activeTab = 'sessions';
+      state.sessionCategory = 'group';
+      state.activeChat = { kind: 'group', id: 'GRP-01' };
+      state.shouldScrollBottom = true;
+      closeSheet();
+      notifyIsland('已进入会话 → Agent 主持群聊', '#1F6FEB');
+      renderApp();
+    }
+
+    function openRoutingMemoryHub() {
+      state.activeTab = 'marshal';
+      state.agentsSubTab = 'memory';
+      state.memoryViewMode = 'galaxy';
+      closeSheet();
+      notifyIsland('已打开智能体 → 实时 3D 记忆星系', '#7C3AED');
+      renderApp();
+    }
+
+    function updateTabBarState() {
+      ['tickets', 'sessions', 'marshal', 'node'].forEach(t => {
+        const btn = document.getElementById('tabBtn-' + t);
+        if (btn) btn.style.color = state.activeTab === t ? 'var(--ios-blue)' : 'var(--ios-muted)';
+      });
+      const attentionCount = state.tickets.filter(t => t.status === 'attention').length;
+      const bTickets = document.getElementById('badgeTickets');
+      if (bTickets) {
+        bTickets.style.display = attentionCount > 0 ? 'flex' : 'none';
+        bTickets.textContent = String(attentionCount);
+      }
+      const pendingMemCount = state.memories.filter(m => m.status === 'pending').length;
+      const bMem = document.getElementById('badgeMemory');
+      if (bMem) {
+        bMem.style.display = pendingMemCount > 0 ? 'flex' : 'none';
+        bMem.textContent = String(pendingMemCount);
+      }
+    }
+
+    function renderApp() {
+      stopGalaxyLoop();
+      applyThemeClasses();
+      updateTabBarState();
+      syncRelayUI();
+
+      const viewport = document.getElementById('screenViewport');
+      if (state.activeTab === 'tickets') viewport.innerHTML = renderTicketsScreen();
+      else if (state.activeTab === 'sessions') viewport.innerHTML = state.activeChat ? renderMinimalistChatScreen() : renderSessionsHubScreen();
+      else if (state.activeTab === 'marshal') viewport.innerHTML = renderAgentsAndMemoryScreen();
+      else if (state.activeTab === 'node') viewport.innerHTML = renderNodeScreen();
+
+      renderUePanel();
+
+      if (state.activeTab === 'sessions' && state.activeChat) attachChatScrollInteractions();
+      if (state.activeTab === 'marshal' && state.agentsSubTab === 'memory' && state.memoryViewMode === 'galaxy') mountMemoryGalaxyCanvas();
+    }
+
+    // ==================== TAB 1: 工单 ====================
+    function setTicketFilter(f) { state.ticketFilter = f; renderApp(); }
+    function handleTicketSearch(v) { state.ticketSearch = v; renderApp(); }
+
+    function renderTicketsScreen() {
+      const attentionCount = state.tickets.filter(t => t.status === 'attention').length;
+      const q = state.ticketSearch.trim().toLowerCase();
+      const filtered = state.tickets.filter(t => {
+        if (state.ticketFilter !== 'all' && t.status !== state.ticketFilter) return false;
+        if (q && !(t.id.toLowerCase().includes(q) || t.title.toLowerCase().includes(q) || t.template.toLowerCase().includes(q))) return false;
+        return true;
+      });
+
+      const statusPill = (st) => {
+        if (st === 'attention') return `<span style="padding:2px 8px;border-radius:999px;font-size:10px;font-weight:600;background:rgba(245,158,11,0.16);color:var(--ios-orange);">待确认</span>`;
+        if (st === 'running') return `<span style="padding:2px 8px;border-radius:999px;font-size:10px;font-weight:600;background:rgba(16,185,129,0.16);color:var(--ios-green);">执行中</span>`;
+        return `<span style="padding:2px 8px;border-radius:999px;font-size:10px;font-weight:600;background:var(--ios-seg-bg);color:var(--ios-muted);">已验收</span>`;
+      };
+
+      const cards = filtered.map((t, idx) => {
+        const msgCount = state.ticketRooms[t.roomId]?.messages.length || 0;
+        return `
+          <div onclick="openTicketApproval('${t.id}')" class="ios-card ios-pressable stack-sm" style="padding:14px;">
+            ${idx === 0 ? '<span class="ue-pin" style="position:absolute;top:-8px;right:-8px;" title="UE 标注 ②：点击弹出结构化工单详情">2</span>' : ''}
+            <div class="row-between">
+              <div style="display:flex;align-items:center;gap:6px;min-width:0;">
+                <span class="tabular-nums" style="font-size:11px;font-weight:600;color:var(--ios-muted);">${t.id}</span>
+                <span style="padding:2px 6px;border-radius:5px;font-size:10px;font-weight:600;background:var(--ios-pill-bg);color:var(--ios-blue);">${escapeHtml(t.template)}</span>
+                <span class="tabular-nums" style="padding:2px 6px;border-radius:5px;font-size:10px;background:var(--ios-seg-bg);color:var(--ios-subtext);">批次 #${t.batchNo}</span>
+              </div>
+              ${statusPill(t.status)}
+            </div>
+            <div style="font-size:14px;font-weight:600;line-height:1.4;">${escapeHtml(t.title)}</div>
+            ${t.attentionPrompt ? `<div class="truncate" style="padding:6px 10px;border-radius:10px;font-size:11.5px;background:rgba(245,158,11,0.10);color:var(--ios-orange);">待确认：${escapeHtml(t.attentionPrompt)}</div>` : ''}
+            <div class="row-between ios-hairline-t" style="padding-top:8px;font-size:11px;color:var(--ios-subtext);">
+              <span class="truncate">${t.roles.join(' · ')}</span>
+              <span class="tabular-nums" style="color:var(--ios-blue);font-weight:600;flex-shrink:0;">工单群(${msgCount}) ›</span>
+            </div>
+          </div>
+        `;
+      }).join('');
+
+      return `
+        <div class="stack-md" style="padding:12px 16px 16px;">
+          <div class="row-between">
+            <div>
+              <div style="font-size:11px;font-weight:500;color:var(--ios-subtext);">${state.workspaceName} · <span class="tabular-nums" style="color:var(--ios-green);">rev #${state.boardRevision}</span></div>
+              <div style="font-size:26px;font-weight:700;letter-spacing:-0.02em;display:flex;align-items:center;gap:8px;">工单 <span class="ue-pin">1</span></div>
+            </div>
+            <button onclick="openNewTicketSheet()" aria-label="新建编排工单" style="width:36px;height:36px;border-radius:999px;background:var(--ios-blue);color:#FFF;display:flex;align-items:center;justify-content:center;">${svgIcon('plus', 18)}</button>
+          </div>
+
+          <div style="position:relative;">
+            <span style="position:absolute;left:11px;top:9px;color:var(--ios-muted);">${svgIcon('search', 15)}</span>
+            <input type="text" value="${escapeHtml(state.ticketSearch)}" oninput="handleTicketSearch(this.value)" placeholder="搜索工单号、PR 审查或模板..." style="width:100%;padding:8px 12px 8px 34px;border-radius:12px;font-size:13px;background:var(--ios-seg-bg);color:var(--ios-text);" />
+          </div>
+
+          <div class="ios-segmented">
+            <button onclick="setTicketFilter('all')" class="ios-seg-btn ${state.ticketFilter === 'all' ? 'active' : ''}">全部 (${state.tickets.length})</button>
+            <button onclick="setTicketFilter('attention')" class="ios-seg-btn ${state.ticketFilter === 'attention' ? 'active' : ''}">待确认 (${attentionCount})</button>
+            <button onclick="setTicketFilter('running')" class="ios-seg-btn ${state.ticketFilter === 'running' ? 'active' : ''}">执行中</button>
+            <button onclick="setTicketFilter('ended')" class="ios-seg-btn ${state.ticketFilter === 'ended' ? 'active' : ''}">已验收</button>
+          </div>
+
+          <div class="stack-sm">${cards}</div>
+        </div>
+      `;
+    }
+
+    function openTicketApproval(ticketId) {
+      state.activeTab = 'tickets';
+      renderApp();
+      const t = state.tickets.find(item => item.id === ticketId) || state.tickets[0];
+      const msgCount = state.ticketRooms[t.roomId]?.messages.length || 0;
+      const stages = ['任务拆解', '并行编码/初审', '交叉复核', '验收归档'];
+
+      openSheet(`
+        <div class="stack-md" style="padding:14px 16px 18px;overflow-y:auto;">
+          <div class="sheet-handle"></div>
+          <div class="row-between">
+            <span class="tabular-nums" style="font-size:12px;font-weight:600;color:var(--ios-subtext);">${t.id} · ${escapeHtml(t.template)} · 批次 #${t.batchNo}</span>
+            <button onclick="closeSheet()" style="font-size:13px;color:var(--ios-subtext);">关闭</button>
+          </div>
+          <div style="font-size:15px;font-weight:700;line-height:1.4;">${escapeHtml(t.title)}</div>
+
+          <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;">
+            ${stages.map((st, idx) => {
+              const done = idx <= t.stageIndex;
+              return `<div><div style="height:6px;border-radius:999px;background:${done ? 'var(--ios-blue)' : 'var(--ios-seg-bg)'};"></div><div class="truncate" style="font-size:10px;text-align:center;margin-top:4px;color:${done ? 'var(--ios-text)' : 'var(--ios-muted)'};">${st}</div></div>`;
+            }).join('')}
+          </div>
+
+          ${t.attentionPrompt ? `
+            <div style="padding:11px 12px;border-radius:14px;background:rgba(245,158,11,0.11);border:0.5px solid rgba(245,158,11,0.34);">
+              <div style="font-size:11px;font-weight:600;color:var(--ios-orange);margin-bottom:3px;">待机主确认事项</div>
+              <div style="font-size:12.5px;line-height:1.5;">${escapeHtml(t.attentionPrompt)}</div>
+            </div>
+          ` : ''}
+
+          <button onclick="enterTicketRoomFromDetail('${t.id}')" class="row-between" style="width:100%;padding:12px;border-radius:14px;background:var(--ios-pill-bg);border:0.5px solid var(--ios-sep);text-align:left;">
+            <div>
+              <div style="font-size:13px;font-weight:600;color:var(--ios-blue);">进入工单群查看各 Agent 讨论</div>
+              <div style="font-size:11px;color:var(--ios-subtext);margin-top:2px;">${t.roles.join(' · ')} · 共 ${msgCount} 条讨论记录</div>
+            </div>
+            <span style="color:var(--ios-blue);">${svgIcon('chevronRight', 16)}</span>
+          </button>
+
+          ${(t.diffFiles && t.diffFiles.length > 0) ? `
+            <div class="stack-sm" style="padding:11px 12px;border-radius:14px;background:var(--ios-card-secondary);">
+              <div class="row-between" style="font-size:11px;">
+                <span style="font-weight:600;color:var(--ios-subtext);">变更补丁摘要 (${t.patchSize} / 48 KiB 上限)</span>
+                <span class="tabular-nums" style="color:var(--ios-muted);">${t.tokens} tokens</span>
+              </div>
+              ${t.diffFiles.map(df => `<div class="row-between tabular-nums" style="font-size:11px;"><span class="truncate">${escapeHtml(df.path)}</span><span style="color:var(--ios-green);flex-shrink:0;">${df.stat}</span></div>`).join('')}
+            </div>
+          ` : ''}
+
+          ${t.status === 'attention' ? `
+            <div style="display:grid;grid-template-columns:2fr 1fr;gap:8px;">
+              <button onclick="confirmTicketAction('${t.id}', 'approve')" style="padding:10px;border-radius:14px;font-size:13.5px;font-weight:600;background:var(--ios-blue);color:#FFF;">确认批准执行 (rev #${state.boardRevision + 1})</button>
+              <button onclick="confirmTicketAction('${t.id}', 'reject')" style="padding:10px;border-radius:14px;font-size:13px;font-weight:600;background:rgba(239,68,68,0.12);color:var(--ios-red);">驳回关单</button>
+            </div>
+          ` : `
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+              <button onclick="retryTicketBatch('${t.id}')" style="padding:10px;border-radius:14px;font-size:13px;font-weight:600;background:var(--ios-seg-bg);color:var(--ios-text);">追加第 #${t.batchNo + 1} 批次</button>
+              <button onclick="enterTicketRoomFromDetail('${t.id}')" style="padding:10px;border-radius:14px;font-size:13px;font-weight:600;background:var(--ios-blue);color:#FFF;">打开工单群</button>
+            </div>
+          `}
+        </div>
+      `);
+    }
+
+    function confirmTicketAction(ticketId, decision) {
+      const t = state.tickets.find(item => item.id === ticketId);
+      if (!t) return;
+      state.boardRevision += 1;
+      t.attentionPrompt = '';
+      if (decision === 'approve') {
+        t.status = t.stageIndex >= 2 ? 'ended' : 'running';
+        t.stageIndex = Math.min(3, t.stageIndex + 1);
+        notifyIsland(`已确认 ${t.id} · rev #${state.boardRevision}`, '#34C759');
+      } else {
+        t.status = 'ended';
+        notifyIsland(`${t.id} 已驳回并归档`, '#FF9500');
+      }
+      closeSheet();
+      renderApp();
+    }
+
+    function retryTicketBatch(ticketId) {
+      const t = state.tickets.find(item => item.id === ticketId);
+      if (!t) return;
+      t.batchNo += 1;
+      t.status = 'running';
+      t.stageIndex = 1;
+      state.boardRevision += 1;
+      closeSheet();
+      notifyIsland(`${t.id} 已启动第 #${t.batchNo} 批次`, '#1F6FEB');
+      renderApp();
+    }
+
+    function enterTicketRoomFromDetail(ticketId) {
+      const t = state.tickets.find(item => item.id === ticketId);
+      if (!t) return;
+      closeSheet();
+      state.activeTab = 'sessions';
+      state.sessionCategory = 'ticketRoom';
+      state.activeChat = { kind: 'ticketRoom', id: t.roomId, fromTicketId: t.id };
+      state.shouldScrollBottom = true;
+      notifyIsland(`已进入 ${t.id} 工单群查看讨论`, '#1F6FEB');
+      renderApp();
+    }
+
+    function openNewTicketSheet() {
+      openSheet(`
+        <div class="stack-md" style="padding:14px 16px 18px;overflow-y:auto;">
+          <div class="sheet-handle"></div>
+          <div class="row-between">
+            <button onclick="closeSheet()" style="font-size:13px;color:var(--ios-subtext);">取消</button>
+            <span style="font-size:15px;font-weight:700;">新建编排工单</span>
+            <button onclick="submitNewTicket()" style="font-size:13px;font-weight:600;color:var(--ios-blue);">创建</button>
+          </div>
+          <div>
+            <label style="font-size:11px;font-weight:600;color:var(--ios-subtext);display:block;margin-bottom:4px;">任务模板（5 大官方编排）</label>
+            <select id="newTicketTemplate" style="width:100%;padding:9px 10px;border-radius:12px;font-size:12.5px;background:var(--ios-seg-bg);color:var(--ios-text);">
+              <option value="开发交付">开发交付 · Leader + Coder + Reviewer</option>
+              <option value="PR 对抗审查">PR 对抗审查 · Leader + DSH审查员 + Codex审查员</option>
+              <option value="报表与报告">报表与报告 · Leader + 撰写 + 校核</option>
+              <option value="技术调研与选型">技术调研与选型 · Leader + 调研 + 校核</option>
+              <option value="故障排查">故障排查 · 自由协作</option>
+            </select>
+          </div>
+          <div>
+            <label style="font-size:11px;font-weight:600;color:var(--ios-subtext);display:block;margin-bottom:4px;">任务描述或 PR 编号</label>
+            <textarea id="newTicketTitle" rows="2" style="width:100%;padding:9px 10px;border-radius:12px;font-size:13px;background:var(--ios-seg-bg);color:var(--ios-text);">验证移动端 PR7 四栏界面与工单群双向同步链路</textarea>
+          </div>
+          <button onclick="submitNewTicket()" style="width:100%;padding:11px;border-radius:14px;font-size:14px;font-weight:600;background:var(--ios-blue);color:#FFF;">创建工单并自动建立工单群</button>
+        </div>
+      `);
+    }
+
+    function submitNewTicket() {
+      const title = (document.getElementById('newTicketTitle')?.value || '').trim() || '新建看板编排任务';
+      const template = document.getElementById('newTicketTemplate')?.value || '开发交付';
+      const num = 210 + state.tickets.length;
+      const newId = 'TKT-' + num;
+      const roomId = 'ROOM-' + num;
+      state.boardRevision += 1;
+      state.ticketRooms[roomId] = {
+        id: roomId, ticketId: newId, title: `工单群 · ${newId} ${template}`, subtitle: '批次 #1 · Leader 正在拆解分工',
+        model: 'deepseek-reasoner', effort: 'high', historyPage: 2, maxHistoryPages: 2,
+        messages: [{ role: 'assistant', time: '刚刚', sender: 'Leader (DSH)', badge: '建群初始化', text: `已按「${template}」模板创建专属工单群，正在读取工作区公共记忆并生成分工…` }]
+      };
+      state.tickets.unshift({
+        id: newId, title, template, roles: ['Leader (DSH)', 'Coder (Codex)', 'Reviewer'],
+        status: 'running', patchSize: '准备中', batchNo: 1, stageIndex: 0, tokens: '0.2k', attentionPrompt: '', diffFiles: [], roomId
+      });
+      closeSheet();
+      notifyIsland(`工单 ${newId} 与专属工单群已创建`, '#34C759');
+      renderApp();
+    }
+
+    // ==================== TAB 2: 会话 ====================
+    function setSessionCategory(c) { state.sessionCategory = c; renderApp(); }
+
+    function renderSessionsHubScreen() {
+      const ticketRoomList = Object.values(state.ticketRooms);
+      let listHtml = '';
+
+      if (state.sessionCategory === 'direct') {
+        listHtml = state.sessions.map((s, idx) => {
+          const lastMsg = s.messages[s.messages.length - 1];
+          return `
+            <div onclick="openUnifiedChat('direct', '${s.id}')" class="ios-card ios-pressable" style="padding:13px 14px;">
+              ${idx === 0 ? '<span class="ue-pin" style="position:absolute;top:-8px;right:-8px;">2</span>' : ''}
+              <div class="row-between" style="margin-bottom:4px;">
+                <div style="display:flex;align-items:center;gap:6px;min-width:0;">
+                  <span style="padding:2px 6px;border-radius:5px;font-size:10px;font-weight:700;text-transform:uppercase;background:var(--ios-pill-bg);color:var(--ios-blue);">${s.engineType}</span>
+                  <span class="truncate" style="font-size:11px;color:var(--ios-subtext);">${escapeHtml(s.device)}</span>
+                  ${s.pendingQuestion ? '<span style="padding:2px 6px;border-radius:5px;font-size:10px;font-weight:600;background:rgba(245,158,11,0.16);color:var(--ios-orange);">待答</span>' : ''}
+                </div>
+                <span class="tabular-nums" style="font-size:11px;color:var(--ios-muted);flex-shrink:0;">${s.updatedAt}</span>
+              </div>
+              <div class="truncate" style="font-size:14px;font-weight:600;margin-bottom:3px;">${escapeHtml(s.title)}</div>
+              <div class="truncate" style="font-size:12px;color:var(--ios-subtext);">${lastMsg ? escapeHtml(lastMsg.text || lastMsg.name) : '新会话已就绪，点击开始对话'}</div>
+            </div>
+          `;
+        }).join('');
+      } else if (state.sessionCategory === 'group') {
+        listHtml = state.groupRooms.map(g => {
+          const lastMsg = g.messages[g.messages.length - 1];
+          return `
+            <div onclick="openUnifiedChat('group', '${g.id}')" class="ios-card ios-pressable" style="padding:13px 14px;">
+              <div class="row-between" style="margin-bottom:4px;">
+                <div style="display:flex;align-items:center;gap:6px;">
+                  <span style="padding:2px 6px;border-radius:5px;font-size:10px;font-weight:600;background:var(--ios-pill-bg);color:var(--ios-blue);">${g.mode === 'work' ? '工作群 Work' : '讨论群'}</span>
+                  <span class="tabular-nums" style="font-size:11px;color:var(--ios-subtext);">${g.phase}</span>
+                </div>
+                <span class="tabular-nums" style="font-size:11px;color:var(--ios-muted);">${g.updatedAt}</span>
+              </div>
+              <div class="truncate" style="font-size:14px;font-weight:600;margin-bottom:4px;">${escapeHtml(g.title)}</div>
+              <div class="truncate" style="font-size:12px;color:var(--ios-subtext);margin-bottom:8px;">${lastMsg ? escapeHtml(lastMsg.sender + ': ' + lastMsg.text) : ''}</div>
+              <div class="row-between ios-hairline-t" style="padding-top:6px;font-size:10.5px;color:var(--ios-muted);">
+                <span class="truncate">${g.members.map(m => m.name).join(' · ')}</span>
+                <span class="tabular-nums">${g.totalTokens}</span>
+              </div>
+            </div>
+          `;
+        }).join('');
+      } else {
+        listHtml = ticketRoomList.map(r => {
+          const lastMsg = r.messages[r.messages.length - 1];
+          return `
+            <div onclick="openUnifiedChat('ticketRoom', '${r.id}', '${r.ticketId}')" class="ios-card ios-pressable" style="padding:13px 14px;">
+              <div class="row-between" style="margin-bottom:4px;">
+                <span class="tabular-nums" style="padding:2px 6px;border-radius:5px;font-size:10px;font-weight:600;background:var(--ios-pill-bg);color:var(--ios-blue);">关联 ${r.ticketId}</span>
+                <span style="font-size:11px;color:var(--ios-muted);">${r.messages.length} 条 Agent 讨论</span>
+              </div>
+              <div class="truncate" style="font-size:14px;font-weight:600;margin-bottom:3px;">${escapeHtml(r.title)}</div>
+              <div class="truncate" style="font-size:12px;color:var(--ios-subtext);">${lastMsg ? escapeHtml(lastMsg.sender + ': ' + lastMsg.text) : ''}</div>
+            </div>
+          `;
+        }).join('');
+      }
+
+      const composeMode = state.sessionCategory === 'group' ? 'group' : 'direct';
+      return `
+        <div class="stack-md" style="padding:12px 16px 16px;">
+          <div class="row-between">
+            <div>
+              <div style="font-size:11px;font-weight:500;color:var(--ios-subtext);">单聊会话 · 多智能体群聊 · 工单讨论群</div>
+              <div style="font-size:26px;font-weight:700;letter-spacing:-0.02em;display:flex;align-items:center;gap:8px;">会话 <span class="ue-pin">1</span></div>
+            </div>
+            <button onclick="openNewSessionSheet('${composeMode}')" aria-label="新建会话或群聊" style="width:36px;height:36px;border-radius:999px;background:var(--ios-blue);color:#FFF;display:flex;align-items:center;justify-content:center;">${svgIcon('compose', 16)}</button>
+          </div>
+
+          <div class="ios-segmented">
+            <button onclick="setSessionCategory('direct')" class="ios-seg-btn ${state.sessionCategory === 'direct' ? 'active' : ''}">单聊 (${state.sessions.length})</button>
+            <button onclick="setSessionCategory('group')" class="ios-seg-btn ${state.sessionCategory === 'group' ? 'active' : ''}">Agent 群聊 (${state.groupRooms.length})</button>
+            <button onclick="setSessionCategory('ticketRoom')" class="ios-seg-btn ${state.sessionCategory === 'ticketRoom' ? 'active' : ''}">工单群 (${ticketRoomList.length})</button>
+          </div>
+
+          <div class="stack-sm">${listHtml}</div>
+        </div>
+      `;
+    }
+
+    function openUnifiedChat(kind, id, fromTicketId) {
+      state.activeTab = 'sessions';
+      state.activeChat = { kind, id, fromTicketId: fromTicketId || '' };
+      state.shouldScrollBottom = true;
+      closeSheet();
+      renderApp();
+    }
+
+    function backFromChat() {
+      if (state.activeChat && state.activeChat.fromTicketId) {
+        const tId = state.activeChat.fromTicketId;
+        state.activeChat = null;
+        openTicketApproval(tId);
+        return;
+      }
+      state.activeChat = null;
+      renderApp();
+    }
+
+    function getActiveThreadObject() {
+      if (!state.activeChat) return null;
+      if (state.activeChat.kind === 'direct') return state.sessions.find(s => s.id === state.activeChat.id) || state.sessions[0];
+      if (state.activeChat.kind === 'group') return state.groupRooms.find(g => g.id === state.activeChat.id) || state.groupRooms[0];
+      return state.ticketRooms[state.activeChat.id] || Object.values(state.ticketRooms)[0];
+    }
+
+    function formatModelShortName(modelId) {
+      const map = { 'deepseek-reasoner': 'DeepSeek R1', 'deepseek-chat': 'DeepSeek V3', 'gpt-6-luna': 'GPT-6 Luna', 'claude-sonnet-4-5': 'Claude Sonnet 4.5' };
+      return map[modelId] || modelId || 'DeepSeek R1';
+    }
+
+    function renderMinimalistChatScreen() {
+      const thread = getActiveThreadObject();
+      if (!thread) return '';
+      const kind = state.activeChat.kind;
+      const fromTicketId = state.activeChat.fromTicketId;
+      if (typeof thread.historyPage !== 'number') thread.historyPage = 0;
+      if (typeof thread.maxHistoryPages !== 'number') thread.maxHistoryPages = 2;
+
+      const modelShort = formatModelShortName(thread.model || 'deepseek-reasoner');
+      const effortVal = thread.effort || 'high';
+      const effortMap = { off: '关', low: '低', medium: '中', high: '高' };
+      const thinkingActive = effortVal !== 'off';
+
+      const headerPrimary = kind === 'direct' ? (thread.agentName || thread.title) : thread.title;
+      const headerSecondary = kind === 'direct'
+        ? `${thread.device} · ${thread.cwd || '~/Projects'}`
+        : (kind === 'group' ? `${thread.phase} · ${thread.members.length} 位智能体` : thread.subtitle);
+
+      const topHistoryIndicator = state.isLoadingHistory
+        ? `<div style="padding:8px 0;display:flex;align-items:center;justify-content:center;gap:6px;font-size:11px;color:var(--ios-subtext);"><span class="ios-spinner"></span><span>正在从主机同步更早对话记录…</span></div>`
+        : (thread.historyPage >= thread.maxHistoryPages
+          ? `<div style="padding:6px 0;text-align:center;font-size:10px;color:var(--ios-muted);">— 已到本次会话起点 —</div>`
+          : ((thread.messages || []).length > 0 ? `<div style="padding:4px 0;text-align:center;font-size:10px;color:var(--ios-muted);">↑ 继续上滑自动加载更早历史记录</div>` : ''));
+
+      const questionBanner = (kind === 'direct' && thread.pendingQuestion) ? `
+        <div class="stack-sm" style="padding:11px 12px;border-radius:16px;background:rgba(245,158,11,0.09);border:0.5px solid rgba(245,158,11,0.32);">
+          <div class="row-between" style="font-size:11px;">
+            <span style="font-weight:600;color:var(--ios-orange);">主机待答确认</span>
+            <button onclick="dismissSessionQuestion('${thread.id}')" style="font-size:11px;color:var(--ios-muted);">暂不处理</button>
+          </div>
+          <div style="font-size:12.5px;font-weight:500;line-height:1.45;">${escapeHtml(thread.pendingQuestion.prompt)}</div>
+          <div style="display:flex;flex-wrap:wrap;gap:6px;">
+            ${thread.pendingQuestion.options.map(opt => `<button onclick="answerSessionQuestion('${thread.id}', '${escapeHtml(opt)}')" style="padding:5px 11px;border-radius:999px;font-size:11.5px;font-weight:500;background:var(--ios-card);color:var(--ios-blue);border:0.5px solid var(--ios-sep);">${escapeHtml(opt)}</button>`).join('')}
+          </div>
+        </div>
+      ` : '';
+
+      const msgs = thread.messages || [];
+      let streamBodyHtml = '';
+      if (msgs.length === 0) {
+        const starters = ['梳理当前仓库未提交的代码改动', '运行最近修改模块的单元测试并汇报结果', '检查跨设备记忆同步是否存在冲突'];
+        streamBodyHtml = `
+          <div style="padding:28px 8px;display:flex;flex-direction:column;align-items:center;text-align:center;gap:12px;">
+            <div style="width:44px;height:44px;border-radius:15px;background:var(--ios-blue);color:#FFF;display:flex;align-items:center;justify-content:center;">${svgIcon('sparkles', 20)}</div>
+            <div>
+              <div style="font-size:16px;font-weight:600;">${escapeHtml(thread.agentName || '智能体会话已就绪')}</div>
+              <div style="display:inline-flex;align-items:center;gap:5px;padding:4px 10px;border-radius:999px;font-size:11px;background:var(--ios-seg-bg);color:var(--ios-subtext);margin-top:6px;">
+                ${svgIcon('laptop', 12)} <span>${escapeHtml(thread.device)} · ${escapeHtml(thread.cwd || '~/Projects')}</span>
+              </div>
+            </div>
+            <div class="stack-sm" style="width:100%;padding-top:10px;text-align:left;">
+              ${starters.map(st => `<button onclick="sendStarterPrompt('${escapeHtml(st)}')" class="row-between" style="width:100%;padding:10px 13px;border-radius:15px;font-size:12.5px;background:var(--ios-card-secondary);color:var(--ios-text);"><span class="truncate">${escapeHtml(st)}</span><span style="color:var(--ios-muted);">${svgIcon('arrowUpRight', 14)}</span></button>`).join('')}
+            </div>
+          </div>
+        `;
+      } else {
+        streamBodyHtml = msgs.map((m, idx) => {
+          if (m.role === 'user') {
+            return `<div style="display:flex;justify-content:flex-end;padding-top:4px;"><div style="max-width:82%;border-radius:20px;padding:8px 14px;font-size:13.5px;line-height:1.52;background:var(--ios-user-bubble);color:var(--ios-text);">${escapeHtml(m.text)}</div></div>`;
+          }
+          if (m.role === 'tool') {
+            return `
+              <div>
+                <button onclick="toggleToolCard('${thread.id}', '${m.id}')" style="display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;font-size:11px;font-weight:500;background:var(--ios-seg-bg);color:var(--ios-subtext);">
+                  <span style="color:var(--ios-blue);">${svgIcon('terminal', 12)}</span>
+                  <span class="truncate" style="max-width:210px;">${escapeHtml(m.name)}</span>
+                  <span class="tabular-nums" style="color:var(--ios-muted);">${m.duration} ${m.expanded ? '▴' : '▾'}</span>
+                </button>
+                ${m.expanded ? `<pre class="tabular-nums" style="margin:6px 0 0;padding:9px 11px;border-radius:12px;font-size:11px;white-space:pre-wrap;background:var(--ios-card-secondary);color:var(--ios-subtext);">${escapeHtml(m.detail)}</pre>` : ''}
+              </div>
+            `;
+          }
+          const isLastAssistant = idx === msgs.length - 1 && !state.isStreamingReply;
+          const senderLabel = m.sender || thread.agentName || thread.seat || 'Assistant';
+          return `
+            <div style="padding-top:4px;">
+              <div style="display:flex;align-items:center;gap:6px;margin-bottom:5px;">
+                <span style="width:17px;height:17px;border-radius:999px;background:var(--ios-blue);color:#FFF;font-size:9px;font-weight:700;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;">${escapeHtml(senderLabel.slice(0, 1))}</span>
+                <span style="font-size:12px;font-weight:600;">${escapeHtml(senderLabel)}</span>
+                ${m.badge ? `<span style="font-size:10px;padding:1px 6px;border-radius:999px;background:var(--ios-seg-bg);color:var(--ios-subtext);">${escapeHtml(m.badge)}</span>` : ''}
+                <span class="tabular-nums" style="font-size:10px;color:var(--ios-muted);margin-left:auto;">${m.time || ''}</span>
+              </div>
+              ${m.thought ? `
+                <div style="padding-left:22px;margin-bottom:5px;">
+                  <button onclick="toggleThoughtCard('${m.thoughtId}')" style="display:inline-flex;align-items:center;gap:4px;font-size:11.5px;font-weight:500;color:var(--ios-muted);">
+                    ${svgIcon('sparkles', 12)} <span>已深度思考 ${m.thoughtSecs || 6} 秒 ${m.thoughtExpanded ? '▾' : '›'}</span>
+                  </button>
+                  ${m.thoughtExpanded ? `<div style="margin-top:4px;padding-left:10px;border-left:2px solid var(--ios-sep);font-size:11.5px;line-height:1.5;color:var(--ios-subtext);">${escapeHtml(m.thought)}</div>` : ''}
+                </div>
+              ` : ''}
+              <div style="padding-left:22px;font-size:13.5px;line-height:1.62;white-space:pre-line;color:var(--ios-text);">${escapeHtml(m.text)}</div>
+              ${isLastAssistant ? `
+                <div style="padding-left:22px;padding-top:4px;display:flex;align-items:center;gap:12px;color:var(--ios-muted);">
+                  <button onclick="copyAssistantReply('${idx}')" aria-label="复制回复">${svgIcon('copy', 13)}</button>
+                  <button onclick="regenerateLastReply()" aria-label="重新生成">${svgIcon('refresh', 13)}</button>
+                </div>
+              ` : ''}
+            </div>
+          `;
+        }).join('');
+      }
+
+      return `
+        <div style="display:flex;flex-direction:column;height:100%;">
+          <div class="ios-glass ios-hairline-b row-between" style="padding:8px 12px;position:sticky;top:0;z-index:20;">
+            <button onclick="backFromChat()" style="display:inline-flex;align-items:center;gap:2px;font-size:13px;font-weight:500;color:var(--ios-text);flex-shrink:0;">
+              ${svgIcon('chevronLeft', 17)} <span>${fromTicketId ? '工单详情' : ''}</span>
+            </button>
+            <button onclick="openInlineModelSheet()" style="text-align:center;min-width:0;padding:0 6px;">
+              <div class="truncate" style="font-size:13px;font-weight:600;max-width:195px;">${escapeHtml(headerPrimary)}</div>
+              <div class="truncate tabular-nums" style="font-size:10px;color:var(--ios-muted);max-width:195px;">${escapeHtml(headerSecondary)}</div>
+            </button>
+            ${fromTicketId
+              ? `<button onclick="openTicketApproval('${fromTicketId}')" style="padding:4px 10px;border-radius:999px;font-size:11px;font-weight:600;background:var(--ios-pill-bg);color:var(--ios-blue);flex-shrink:0;">确认操作</button>`
+              : (kind === 'group' && thread.phase.includes('执行中')
+                ? `<button onclick="stopGroupRoom('${thread.id}')" style="padding:4px 10px;border-radius:999px;font-size:11px;font-weight:600;background:rgba(239,68,68,0.12);color:var(--ios-red);">停止</button>`
+                : `<button onclick="openNewSessionSheet('direct')" aria-label="新建会话" style="width:30px;height:30px;border-radius:999px;display:flex;align-items:center;justify-content:center;color:var(--ios-text);">${svgIcon('compose', 15)}</button>`)}
+          </div>
+
+          <div id="chatScrollBox" class="stack-md" style="flex:1;padding:10px 15px;overflow-y:auto;position:relative;">
+            <span class="ue-pin" style="position:absolute;top:8px;right:12px;">2</span>
+            ${topHistoryIndicator}
+            ${questionBanner}
+            ${streamBodyHtml}
+          </div>
+
+          <div style="padding:6px 12px 10px;background:var(--ios-bg);position:relative;">
+            <span class="ue-pin" style="position:absolute;top:-10px;right:16px;">3</span>
+            <div style="border-radius:24px;padding:10px 13px 8px;background:var(--ios-card);border:0.5px solid var(--ios-sep);box-shadow:0 3px 14px rgba(0,0,0,0.05);">
+              <input id="chatInputBox" type="text" placeholder="${kind === 'group' ? '向主持人与群内智能体发消息…' : (kind === 'ticketRoom' ? '在工单群补充说明…' : '发消息…')}" onkeydown="if(event.key==='Enter'){sendChatMessage();}" style="width:100%;font-size:14px;padding-bottom:8px;color:var(--ios-text);" />
+              <div class="row-between">
+                <div style="display:flex;align-items:center;gap:6px;min-width:0;">
+                  <button onclick="openChatPlusSheet()" aria-label="添加图片或文件" style="width:28px;height:28px;border-radius:999px;background:var(--ios-seg-bg);color:var(--ios-text);display:flex;align-items:center;justify-content:center;flex-shrink:0;">${svgIcon('plus', 15)}</button>
+                  <button onclick="openInlineModelSheet()" style="height:28px;padding:0 10px;border-radius:999px;background:var(--ios-seg-bg);color:var(--ios-text);font-size:11.5px;font-weight:500;display:inline-flex;align-items:center;gap:4px;min-width:0;">
+                    <span class="truncate" style="max-width:94px;">${escapeHtml(modelShort)}</span> ${svgIcon('chevronDown', 12)}
+                  </button>
+                  <button onclick="openThinkingEffortSheet()" style="height:28px;padding:0 10px;border-radius:999px;background:${thinkingActive ? 'var(--ios-pill-bg)' : 'var(--ios-seg-bg)'};color:${thinkingActive ? 'var(--ios-blue)' : 'var(--ios-subtext)'};font-size:11.5px;font-weight:500;display:inline-flex;align-items:center;gap:4px;flex-shrink:0;">
+                    ${svgIcon('sparkles', 12)} <span>${thinkingActive ? '思考 · ' + effortMap[effortVal] : '深度思考'}</span>
+                  </button>
+                </div>
+                ${state.isStreamingReply
+                  ? `<button onclick="stopStreamingReply()" aria-label="停止生成" style="width:32px;height:32px;border-radius:999px;background:var(--ios-send-bg);color:var(--ios-send-fg);display:flex;align-items:center;justify-content:center;flex-shrink:0;"><span style="width:10px;height:10px;border-radius:2px;background:var(--ios-send-fg);"></span></button>`
+                  : `<button onclick="sendChatMessage()" aria-label="发送消息" style="width:32px;height:32px;border-radius:999px;background:var(--ios-send-bg);color:var(--ios-send-fg);display:flex;align-items:center;justify-content:center;flex-shrink:0;">${svgIcon('arrowUp', 16)}</button>`}
+              </div>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    function attachChatScrollInteractions() {
+      const box = document.getElementById('chatScrollBox');
+      if (!box) return;
+      if (state.shouldScrollBottom) {
+        box.scrollTop = box.scrollHeight;
+        state.shouldScrollBottom = false;
+      }
+      let prevTop = box.scrollTop;
+      box.onscroll = () => {
+        const curTop = box.scrollTop;
+        if (curTop <= 8 && curTop < prevTop) triggerScrollHistoryLoad();
+        prevTop = curTop;
+      };
+      box.onwheel = (e) => {
+        if (box.scrollTop <= 2 && e.deltaY < -12) triggerScrollHistoryLoad();
+      };
+      box.ontouchstart = (e) => {
+        if (e.touches && e.touches[0]) touchPullStartY = e.touches[0].clientY;
+      };
+      box.ontouchmove = (e) => {
+        if (box.scrollTop <= 2 && e.touches && e.touches[0]) {
+          if (e.touches[0].clientY - touchPullStartY > 28) triggerScrollHistoryLoad();
+        }
+      };
+    }
+
+    function triggerScrollHistoryLoad() {
+      const thread = getActiveThreadObject();
+      if (!thread || state.isLoadingHistory) return;
+      if (typeof thread.historyPage !== 'number') thread.historyPage = 0;
+      if (typeof thread.maxHistoryPages !== 'number') thread.maxHistoryPages = 2;
+      if (thread.historyPage >= thread.maxHistoryPages) return;
+
+      state.isLoadingHistory = true;
+      renderApp();
+
+      setTimeout(() => {
+        const nextPage = thread.historyPage + 1;
+        thread.historyPage = nextPage;
+        const senderName = thread.agentName || thread.seat || 'Leader · 统筹指挥官';
+        const batch = nextPage === 1 ? [
+          { role: 'user', time: '09:12', text: '看下当前连接主机的 SSE 断线重连缓存窗口是多少分钟？' },
+          { role: 'assistant', time: '09:13', sender: senderName, text: '默认保留最近 15 分钟（ringBufferMinutes = 15）的事件流环形缓存，手机切后台再回前台会自动按序号续接，不漏消息。' }
+        ] : [
+          { role: 'user', time: '09:02', text: '拉取本工作区活跃的智能体配置与默认模型状态。' },
+          { role: 'assistant', time: '09:03', sender: senderName, text: '已同步主机工作区快照：DSH、Codex 0.166 与 Claude 适配器均在线，共享桌面端已登录账号额度。' }
+        ];
+        const beforeBox = document.getElementById('chatScrollBox');
+        const prevHeight = beforeBox ? beforeBox.scrollHeight : 0;
+        thread.messages.unshift(...batch);
+        state.isLoadingHistory = false;
+        notifyIsland('已自动同步更早对话记录', '#1F6FEB');
+        renderApp();
+        const afterBox = document.getElementById('chatScrollBox');
+        if (afterBox && prevHeight > 0) afterBox.scrollTop = Math.max(0, afterBox.scrollHeight - prevHeight);
+      }, 420);
+    }
+
+    function toggleThoughtCard(thoughtId) {
+      const thread = getActiveThreadObject();
+      if (!thread) return;
+      const savedTop = document.getElementById('chatScrollBox')?.scrollTop || 0;
+      const m = (thread.messages || []).find(item => item.thoughtId === thoughtId);
+      if (m) {
+        m.thoughtExpanded = !m.thoughtExpanded;
+        renderApp();
+        const nextBox = document.getElementById('chatScrollBox');
+        if (nextBox) nextBox.scrollTop = savedTop;
+      }
+    }
+
+    function toggleToolCard(threadId, toolId) {
+      const thread = getActiveThreadObject();
+      if (!thread) return;
+      const savedTop = document.getElementById('chatScrollBox')?.scrollTop || 0;
+      const m = (thread.messages || []).find(item => item.id === toolId);
+      if (m) {
+        m.expanded = !m.expanded;
+        renderApp();
+        const nextBox = document.getElementById('chatScrollBox');
+        if (nextBox) nextBox.scrollTop = savedTop;
+      }
+    }
+
+    function copyAssistantReply(msgIdx) {
+      const thread = getActiveThreadObject();
+      if (!thread || !thread.messages[msgIdx]) return;
+      try { navigator.clipboard?.writeText(thread.messages[msgIdx].text || ''); } catch (e) {}
+      notifyIsland('已复制回复内容', '#34C759');
+    }
+
+    function regenerateLastReply() {
+      const thread = getActiveThreadObject();
+      if (!thread || state.isStreamingReply) return;
+      const msgs = thread.messages || [];
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        if (msgs[i].role === 'assistant') { msgs.splice(i, 1); break; }
+      }
+      streamAssistantResponse(thread, '重新核对并输出精简结论');
+    }
+
+    function openInlineModelSheet() {
+      const thread = getActiveThreadObject();
+      if (!thread) return;
+      const models = [
+        { id: 'deepseek-reasoner', label: 'DeepSeek R1', desc: '深度架构推理与复杂排障 · deepseek-reasoner' },
+        { id: 'deepseek-chat', label: 'DeepSeek V3', desc: '高速日常问答与轻量脚本 · deepseek-chat' },
+        { id: 'gpt-6-luna', label: 'GPT-6 Luna', desc: '隔离工作树编码与单测验证 · Codex 引擎' },
+        { id: 'claude-sonnet-4-5', label: 'Claude Sonnet 4.5', desc: '长上下文代码审阅与重构 · Claude 引擎' }
+      ];
+      openSheet(`
+        <div class="stack-sm" style="padding:14px 16px 18px;overflow-y:auto;">
+          <div class="sheet-handle"></div>
+          <div class="row-between" style="padding-bottom:4px;">
+            <span style="font-size:15px;font-weight:700;">切换会话模型</span>
+            <button onclick="closeSheet()" style="font-size:13px;color:var(--ios-subtext);">关闭</button>
+          </div>
+          ${models.map(m => {
+            const active = thread.model === m.id;
+            return `
+              <button onclick="pickInlineModel('${m.id}')" class="row-between" style="width:100%;padding:11px 12px;border-radius:15px;text-align:left;background:${active ? 'var(--ios-pill-bg)' : 'var(--ios-card-secondary)'};border:1px solid ${active ? 'var(--ios-blue)' : 'transparent'};">
+                <div style="min-width:0;padding-right:8px;">
+                  <div style="font-size:13.5px;font-weight:600;color:${active ? 'var(--ios-blue)' : 'var(--ios-text)'};">${m.label}</div>
+                  <div class="truncate" style="font-size:11px;color:var(--ios-subtext);margin-top:2px;">${m.desc}</div>
+                </div>
+                ${active ? `<span style="padding:2px 8px;border-radius:999px;font-size:10px;font-weight:600;background:var(--ios-card);color:var(--ios-blue);flex-shrink:0;">当前</span>` : ''}
+              </button>
+            `;
+          }).join('')}
+        </div>
+      `);
+    }
+
+    function pickInlineModel(modelName) {
+      const thread = getActiveThreadObject();
+      if (thread) thread.model = modelName;
+      closeSheet();
+      notifyIsland('已切换为 ' + formatModelShortName(modelName), '#1F6FEB');
+      renderApp();
+    }
+
+    function openThinkingEffortSheet() {
+      const thread = getActiveThreadObject();
+      if (!thread) return;
+      const cur = thread.effort || 'high';
+      const levels = [
+        { id: 'off', label: '关闭', desc: '直接快速作答，不额外展开推理链' },
+        { id: 'low', label: '低', desc: '轻量思考，适合常规命令与简单修改' },
+        { id: 'medium', label: '中', desc: '均衡推理耗时与代码分析深度' },
+        { id: 'high', label: '高', desc: '充分推演边界条件、并发锁与架构方案' }
+      ];
+      openSheet(`
+        <div class="stack-sm" style="padding:14px 16px 18px;overflow-y:auto;">
+          <div class="sheet-handle"></div>
+          <div class="row-between" style="padding-bottom:4px;">
+            <span style="font-size:15px;font-weight:700;">深度思考强度</span>
+            <button onclick="closeSheet()" style="font-size:13px;color:var(--ios-subtext);">关闭</button>
+          </div>
+          ${levels.map(lv => {
+            const active = cur === lv.id;
+            return `
+              <button onclick="pickThinkingEffort('${lv.id}')" class="row-between" style="width:100%;padding:11px 12px;border-radius:15px;text-align:left;background:${active ? 'var(--ios-pill-bg)' : 'var(--ios-card-secondary)'};border:1px solid ${active ? 'var(--ios-blue)' : 'transparent'};">
+                <div style="min-width:0;padding-right:8px;">
+                  <div style="font-size:13.5px;font-weight:600;color:${active ? 'var(--ios-blue)' : 'var(--ios-text)'};">${lv.label}</div>
+                  <div class="truncate" style="font-size:11px;color:var(--ios-subtext);margin-top:2px;">${lv.desc}</div>
+                </div>
+                ${active ? `<span style="padding:2px 8px;border-radius:999px;font-size:10px;font-weight:600;background:var(--ios-card);color:var(--ios-blue);flex-shrink:0;">当前</span>` : ''}
+              </button>
+            `;
+          }).join('')}
+        </div>
+      `);
+    }
+
+    function pickThinkingEffort(level) {
+      const thread = getActiveThreadObject();
+      if (thread) thread.effort = level;
+      const names = { off: '已关闭深度思考', low: '思考强度：低', medium: '思考强度：中', high: '思考强度：高' };
+      closeSheet();
+      notifyIsland(names[level] || level, '#7C3AED');
+      renderApp();
+    }
+
+    function openChatPlusSheet() {
+      openSheet(`
+        <div class="stack-md" style="padding:14px 16px 18px;">
+          <div class="sheet-handle"></div>
+          <div class="row-between">
+            <span style="font-size:15px;font-weight:700;">添加内容至当前主机目录</span>
+            <button onclick="closeSheet()" style="font-size:13px;color:var(--ios-subtext);">取消</button>
+          </div>
+          <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;">
+            <button onclick="simulateAttachmentUpload('终端报错截图.png')" style="padding:12px 8px;border-radius:15px;background:var(--ios-card-secondary);display:flex;flex-direction:column;align-items:center;gap:6px;">
+              <span style="color:var(--ios-blue);">${svgIcon('camera', 20)}</span><span style="font-size:12px;font-weight:600;">拍照识别</span>
+            </button>
+            <button onclick="simulateAttachmentUpload('架构草图.jpg')" style="padding:12px 8px;border-radius:15px;background:var(--ios-card-secondary);display:flex;flex-direction:column;align-items:center;gap:6px;">
+              <span style="color:var(--ios-blue);">${svgIcon('image', 20)}</span><span style="font-size:12px;font-weight:600;">相册图片</span>
+            </button>
+            <button onclick="simulateAttachmentUpload('log-trace.txt')" style="padding:12px 8px;border-radius:15px;background:var(--ios-card-secondary);display:flex;flex-direction:column;align-items:center;gap:6px;">
+              <span style="color:var(--ios-blue);">${svgIcon('fileUp', 20)}</span><span style="font-size:12px;font-weight:600;">本地文件</span>
+            </button>
+          </div>
+          <div style="font-size:11px;text-align:center;color:var(--ios-muted);">单次最多 8 个文件（≤10 MB），自动按 256 KiB 分片 SHA-256 校验传入目标主机</div>
+        </div>
+      `);
+    }
+
+    function simulateAttachmentUpload(fileName) {
+      const thread = getActiveThreadObject();
+      closeSheet();
+      if (!thread) return;
+      const f = fileName || 'log-trace.txt';
+      thread.messages.push({
+        role: 'tool', id: 'up-' + Date.now(), expanded: false,
+        name: `已挂载附件 ${f} (SHA-256 校验通过)`, duration: '0.3s',
+        detail: `文件 ${f} 已通过 256 KiB 分片通道上传至 ${thread.device || '目标主机'} 会话临时目录。`
+      });
+      state.shouldScrollBottom = true;
+      notifyIsland('已上传 ' + f, '#34C759');
+      renderApp();
+    }
+
+    function answerSessionQuestion(sessionId, choice) {
+      const s = state.sessions.find(item => item.id === sessionId);
+      if (!s) return;
+      s.pendingQuestion = null;
+      s.messages.push({ role: 'user', time: '刚刚', text: choice });
+      state.shouldScrollBottom = true;
+      notifyIsland('远端回答已提交', '#34C759');
+      renderApp();
+    }
+
+    function dismissSessionQuestion(sessionId) {
+      const s = state.sessions.find(item => item.id === sessionId);
+      if (!s) return;
+      s.pendingQuestion = null;
+      notifyIsland('已忽略待答并交回源机器', '#FF9500');
+      renderApp();
+    }
+
+    // ==================== NEW SESSION SHEET: CHOOSE HOST + CHOOSE AGENT ====================
+    function openNewSessionSheet(defaultMode) {
+      state.activeTab = 'sessions';
+      if (defaultMode) state.newSessionDraft.mode = defaultMode;
+      if (!state.hosts.some(h => h.id === state.newSessionDraft.hostId) && state.hosts[0]) state.newSessionDraft.hostId = state.hosts[0].id;
+      renderApp();
+      renderNewSessionSheetContent();
+    }
+
+    function setNewSessionDraftMode(mode) { state.newSessionDraft.mode = mode; renderNewSessionSheetContent(); }
+
+    function selectDraftHost(hostId) {
+      state.newSessionDraft.hostId = hostId;
+      state.newSessionDraft.cwd = hostId === 'host-mac-2' ? '~/MarshalWorkTests/claude' : '~/Projects/dsh-marshal';
+      const hostAgents = state.agentRoster.filter(a => a.hostId === hostId);
+      if (hostAgents.length > 0 && !hostAgents.some(a => a.id === state.newSessionDraft.agentId)) state.newSessionDraft.agentId = hostAgents[0].id;
+      renderNewSessionSheetContent();
+    }
+
+    function selectDraftAgent(agentId) { state.newSessionDraft.agentId = agentId; renderNewSessionSheetContent(); }
+
+    function toggleDraftGroupMember(agentId) {
+      const arr = state.newSessionDraft.groupMemberIds || [];
+      const idx = arr.indexOf(agentId);
+      if (idx >= 0) { if (arr.length > 2) arr.splice(idx, 1); }
+      else if (arr.length < 4) arr.push(agentId);
+      renderNewSessionSheetContent();
+    }
+
+    function renderNewSessionSheetContent() {
+      const draft = state.newSessionDraft;
+      const selectedHost = state.hosts.find(h => h.id === draft.hostId) || state.hosts[0];
+      const hostAgents = state.agentRoster.filter(a => a.hostId === selectedHost.id);
+      const candidateAgents = hostAgents.length > 0 ? hostAgents : state.agentRoster;
+
+      if (draft.mode === 'group') {
+        openSheet(`
+          <div class="stack-md" style="padding:14px 16px 18px;overflow-y:auto;">
+            <div class="sheet-handle"></div>
+            <div class="row-between">
+              <button onclick="closeSheet()" style="font-size:13px;color:var(--ios-subtext);">取消</button>
+              <span style="font-size:15px;font-weight:700;">发起会话</span>
+              <button onclick="createModeratedGroup()" style="font-size:13px;font-weight:600;color:var(--ios-blue);">启动</button>
+            </div>
+            <div class="ios-segmented">
+              <button onclick="setNewSessionDraftMode('direct')" class="ios-seg-btn">新建单聊会话</button>
+              <button onclick="setNewSessionDraftMode('group')" class="ios-seg-btn active">多智能体群聊</button>
+            </div>
+            <div class="stack-sm">
+              <div style="font-size:11px;font-weight:600;color:var(--ios-subtext);">选择参会智能体（支持跨主机 2–4 位）</div>
+              ${state.agentRoster.map((ag, i) => {
+                const picked = (draft.groupMemberIds || []).includes(ag.id);
+                return `
+                  <button onclick="toggleDraftGroupMember('${ag.id}')" class="row-between" style="width:100%;padding:10px 12px;border-radius:13px;text-align:left;background:${picked ? 'var(--ios-pill-bg)' : 'var(--ios-card-secondary)'};border:1px solid ${picked ? 'var(--ios-blue)' : 'transparent'};">
+                    <div style="min-width:0;padding-right:8px;">
+                      <div class="truncate" style="font-size:12.5px;font-weight:600;">${escapeHtml(ag.name)}</div>
+                      <div class="truncate" style="font-size:10.5px;color:var(--ios-subtext);">${escapeHtml(ag.host)} · ${escapeHtml(ag.engine)}</div>
+                    </div>
+                    <span style="padding:2px 8px;border-radius:999px;font-size:10px;font-weight:600;background:var(--ios-card);color:${picked ? 'var(--ios-blue)' : 'var(--ios-muted)'};flex-shrink:0;">${picked ? (i === 0 ? '主持人' : '已加入') : '点按加入'}</span>
+                  </button>
+                `;
+              }).join('')}
+            </div>
+            <div>
+              <label style="font-size:11px;font-weight:600;color:var(--ios-subtext);display:block;margin-bottom:4px;">讨论或协作议题</label>
+              <input id="newGroupTopic" type="text" value="双机联合审查 SSE 重连环形缓存边界" style="width:100%;padding:8px 11px;border-radius:12px;font-size:12.5px;background:var(--ios-seg-bg);color:var(--ios-text);" />
+            </div>
+            <button onclick="createModeratedGroup()" style="width:100%;padding:11px;border-radius:14px;font-size:14px;font-weight:600;background:var(--ios-blue);color:#FFF;">启动多智能体群聊</button>
+          </div>
+        `);
+        return;
+      }
+
+      openSheet(`
+        <div class="stack-md" style="padding:14px 16px 18px;overflow-y:auto;">
+          <div class="sheet-handle"></div>
+          <div class="row-between">
+            <button onclick="closeSheet()" style="font-size:13px;color:var(--ios-subtext);">取消</button>
+            <span style="font-size:15px;font-weight:700;">新建会话</span>
+            <button onclick="confirmCreateDirectSession()" style="font-size:13px;font-weight:600;color:var(--ios-blue);">创建</button>
+          </div>
+          <div class="ios-segmented">
+            <button onclick="setNewSessionDraftMode('direct')" class="ios-seg-btn active">新建单聊会话</button>
+            <button onclick="setNewSessionDraftMode('group')" class="ios-seg-btn">多智能体群聊</button>
+          </div>
+
+          <div class="stack-sm">
+            <div class="row-between"><span style="font-size:11.5px;font-weight:600;color:var(--ios-subtext);">1. 选择运行主机</span><span style="font-size:10.5px;color:var(--ios-muted);">共享所选电脑账号与本地环境</span></div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+              ${state.hosts.map(h => {
+                const active = h.id === selectedHost.id;
+                return `
+                  <button onclick="selectDraftHost('${h.id}')" style="padding:10px;border-radius:14px;text-align:left;background:${active ? 'var(--ios-pill-bg)' : 'var(--ios-card-secondary)'};border:1.5px solid ${active ? 'var(--ios-blue)' : 'transparent'};">
+                    <div class="row-between" style="margin-bottom:3px;"><span style="width:7px;height:7px;border-radius:999px;background:var(--ios-green);"></span><span class="tabular-nums" style="font-size:10px;color:var(--ios-muted);">${h.latency}</span></div>
+                    <div class="truncate" style="font-size:12.5px;font-weight:600;color:${active ? 'var(--ios-blue)' : 'var(--ios-text)'};">${escapeHtml(h.name)}</div>
+                    <div class="truncate" style="font-size:10px;color:var(--ios-subtext);margin-top:2px;">${escapeHtml(h.os)}</div>
+                  </button>
+                `;
+              }).join('')}
+            </div>
+          </div>
+
+          <div class="stack-sm">
+            <div class="row-between"><span style="font-size:11.5px;font-weight:600;color:var(--ios-subtext);">2. 选择智能体 (Agent)</span><span style="font-size:10.5px;color:var(--ios-muted);">${escapeHtml(selectedHost.name)} 可用</span></div>
+            ${candidateAgents.map(ag => {
+              const active = draft.agentId === ag.id;
+              return `
+                <button onclick="selectDraftAgent('${ag.id}')" class="row-between" style="width:100%;padding:10px 11px;border-radius:14px;text-align:left;background:${active ? 'var(--ios-pill-bg)' : 'var(--ios-card-secondary)'};border:1.5px solid ${active ? 'var(--ios-blue)' : 'transparent'};">
+                  <div style="display:flex;align-items:center;gap:9px;min-width:0;padding-right:8px;">
+                    <span style="width:28px;height:28px;border-radius:9px;background:${ag.color};color:#FFF;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0;">${escapeHtml(ag.name.slice(0, 1))}</span>
+                    <div style="min-width:0;">
+                      <div class="truncate" style="font-size:13px;font-weight:600;color:${active ? 'var(--ios-blue)' : 'var(--ios-text)'};">${escapeHtml(ag.name)}</div>
+                      <div class="truncate tabular-nums" style="font-size:10.5px;color:var(--ios-subtext);">${escapeHtml(ag.engine)} · ${escapeHtml(formatModelShortName(ag.defaultModel))}</div>
+                    </div>
+                  </div>
+                  ${active ? `<span style="padding:2px 8px;border-radius:999px;font-size:10px;font-weight:600;background:var(--ios-card);color:var(--ios-blue);flex-shrink:0;">已选</span>` : ''}
+                </button>
+              `;
+            }).join('')}
+            <button onclick="selectDraftAgent('raw-engine')" class="row-between" style="width:100%;padding:10px 11px;border-radius:14px;text-align:left;background:${draft.agentId === 'raw-engine' ? 'var(--ios-pill-bg)' : 'var(--ios-card-secondary)'};border:1.5px solid ${draft.agentId === 'raw-engine' ? 'var(--ios-blue)' : 'transparent'};">
+              <div style="display:flex;align-items:center;gap:9px;min-width:0;padding-right:8px;">
+                <span style="width:28px;height:28px;border-radius:9px;background:#64748B;color:#FFF;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0;">R</span>
+                <div style="min-width:0;">
+                  <div class="truncate" style="font-size:13px;font-weight:600;">纯净直连助手 (不挂载角色记忆)</div>
+                  <div class="truncate" style="font-size:10.5px;color:var(--ios-subtext);">直接调用主机默认 CLI 引擎对话</div>
+                </div>
+              </div>
+              ${draft.agentId === 'raw-engine' ? `<span style="padding:2px 8px;border-radius:999px;font-size:10px;font-weight:600;background:var(--ios-card);color:var(--ios-blue);flex-shrink:0;">已选</span>` : ''}
+            </button>
+          </div>
+
+          <div>
+            <label style="font-size:11px;font-weight:600;color:var(--ios-subtext);display:block;margin-bottom:4px;">工作目录</label>
+            <input id="newSessionCwdInput" type="text" value="${escapeHtml(draft.cwd)}" oninput="state.newSessionDraft.cwd=this.value" class="tabular-nums" style="width:100%;padding:8px 11px;border-radius:12px;font-size:12px;background:var(--ios-seg-bg);color:var(--ios-text);" />
+          </div>
+
+          <button onclick="confirmCreateDirectSession()" style="width:100%;padding:11px;border-radius:14px;font-size:14px;font-weight:600;background:var(--ios-blue);color:#FFF;">在「${escapeHtml(selectedHost.name)}」开启对话</button>
+        </div>
+      `);
+    }
+
+    function confirmCreateDirectSession() {
+      const draft = state.newSessionDraft;
+      const host = state.hosts.find(h => h.id === draft.hostId) || state.hosts[0];
+      const ag = state.agentRoster.find(a => a.id === draft.agentId);
+      const cwd = (document.getElementById('newSessionCwdInput')?.value || '').trim() || draft.cwd || '~/Projects/dsh-marshal';
+      const engineType = ag ? (ag.engine.toLowerCase().includes('codex') ? 'codex' : (ag.engine.toLowerCase().includes('claude') ? 'claude' : 'dsh')) : 'dsh';
+      const agentName = ag ? ag.name : '纯净直连助手';
+      const newId = 'SES-' + (904 + state.sessions.length);
+
+      state.sessions.unshift({
+        id: newId, engineType, hostId: host.id, device: host.name, agentId: ag ? ag.id : 'raw-engine', agentName,
+        title: `${agentName.split(' · ')[0]} · 新会话`, cwd, seat: engineType.toUpperCase(),
+        model: ag ? ag.defaultModel : 'deepseek-reasoner', effort: ag ? ag.effort : 'medium',
+        historyPage: 2, maxHistoryPages: 2, updatedAt: '刚刚', pendingQuestion: null, messages: []
+      });
+      closeSheet();
+      state.sessionCategory = 'direct';
+      state.activeChat = { kind: 'direct', id: newId };
+      notifyIsland(`已在 ${host.name} 连接 ${agentName.split(' · ')[0]}`, '#34C759');
+      renderApp();
+    }
+
+    function createModeratedGroup() {
+      const title = (document.getElementById('newGroupTopic')?.value || '').trim() || '新建主持式 Agent 群聊';
+      const pickedIds = state.newSessionDraft.groupMemberIds || ['ag-leader', 'ag-reviewer'];
+      const members = pickedIds.map((id, idx) => {
+        const ag = state.agentRoster.find(a => a.id === id) || state.agentRoster[0];
+        return { name: ag.name.split(' · ')[0] + ' (' + ag.host.split(' ')[0] + ')', role: idx === 0 ? '主持人' : '协作审查' };
+      });
+      const newId = 'GRP-0' + (state.groupRooms.length + 1);
+      state.groupRooms.unshift({
+        id: newId, title, mode: 'work', phase: '第 1/3 轮 · 主持分工中', totalTokens: '0.4k',
+        model: 'deepseek-reasoner', effort: 'high', historyPage: 2, maxHistoryPages: 2, updatedAt: '刚刚', members,
+        messages: [{ role: 'assistant', time: '刚刚', sender: members[0].name, badge: '主持人 · 第 1 轮', text: `已围绕「${title}」生成首轮分工，参会成员：${members.map(m => m.name).join('、')}。` }]
+      });
+      closeSheet();
+      state.sessionCategory = 'group';
+      state.activeChat = { kind: 'group', id: newId };
+      state.shouldScrollBottom = true;
+      notifyIsland('多智能体群聊已启动', '#34C759');
+      renderApp();
+    }
+
+    function sendStarterPrompt(promptText) {
+      const thread = getActiveThreadObject();
+      if (!thread || state.isStreamingReply) return;
+      if (thread.title && thread.title.endsWith('新会话')) thread.title = promptText.slice(0, 16);
+      thread.messages.push({ role: 'user', time: '刚刚', text: promptText });
+      streamAssistantResponse(thread, promptText);
+    }
+
+    function stopStreamingReply() {
+      if (streamTimer) { clearInterval(streamTimer); streamTimer = null; }
+      state.isStreamingReply = false;
+      const thread = getActiveThreadObject();
+      if (thread && thread.messages.length > 0) {
+        const last = thread.messages[thread.messages.length - 1];
+        if (last.role === 'assistant') last.text = last.text.replace(/▍$/, '') + '（已手动停止生成）';
+      }
+      notifyIsland('已停止生成', '#FF9500');
+      renderApp();
+    }
+
+    function sendChatMessage() {
+      if (state.isStreamingReply) return;
+      const input = document.getElementById('chatInputBox');
+      if (!input) return;
+      const text = input.value.trim();
+      if (!text) return;
+      const thread = getActiveThreadObject();
+      if (!thread) return;
+      input.value = '';
+      if (thread.messages.length === 0 && thread.title && thread.title.endsWith('新会话')) thread.title = text.slice(0, 16);
+      thread.messages.push({ role: 'user', time: '刚刚', text });
+      streamAssistantResponse(thread, text);
+    }
+
+    function streamAssistantResponse(thread, userText) {
+      const modelShort = formatModelShortName(thread.model || 'deepseek-reasoner');
+      const effortVal = thread.effort || 'high';
+      const sender = state.activeChat.kind === 'group' ? '主持人汇总' : (state.activeChat.kind === 'ticketRoom' ? 'Leader (DSH)' : (thread.agentName || modelShort));
+      const replyMsg = {
+        role: 'assistant', time: '刚刚', sender,
+        thoughtId: effortVal !== 'off' ? ('th-' + Date.now()) : '',
+        thoughtSecs: effortVal === 'high' ? 8 : (effortVal === 'medium' ? 4 : 2),
+        thoughtExpanded: false,
+        thought: effortVal !== 'off' ? `已在 ${thread.device || '目标主机'} (${thread.cwd || '~/Projects'}) 检索上下文并按 ${modelShort} 生成执行结果。` : '',
+        text: '▍'
+      };
+      thread.messages.push(replyMsg);
+      state.isStreamingReply = true;
+      state.shouldScrollBottom = true;
+      notifyIsland(`${modelShort} 正在回复…`, '#34C759');
+      renderApp();
+
+      const fullReply = `已在「${thread.device || '连接主机'}」通过 ${modelShort} 处理完毕：「${userText}」。所有变更与上下文均实时同步至当前工作区。`;
+      let i = 0;
+      if (streamTimer) clearInterval(streamTimer);
+      streamTimer = setInterval(() => {
+        i += 5;
+        if (i >= fullReply.length) {
+          replyMsg.text = fullReply;
+          state.isStreamingReply = false;
+          state.todayTokensK = +(state.todayTokensK + 1.4).toFixed(1);
+          clearInterval(streamTimer);
+          streamTimer = null;
+          state.shouldScrollBottom = true;
+          renderApp();
+        } else {
+          replyMsg.text = fullReply.slice(0, i) + '▍';
+          state.shouldScrollBottom = true;
+          renderApp();
+        }
+      }, 45);
+    }
+
+    function stopGroupRoom(roomId) {
+      const r = state.groupRooms.find(item => item.id === roomId);
+      if (!r) return;
+      r.phase = '已手动停止本轮';
+      notifyIsland('已停止当前群聊轮次', '#FF9500');
+      renderApp();
+    }
+
+    // ==================== TAB 3: 智能体 + DESKTOP-PORTED REAL 3D MEMORY GALAXY ====================
+    function setAgentsSubTab(sub) { state.agentsSubTab = sub; renderApp(); }
+    function toggleSuperagent() { state.superagentAutoDispatch = !state.superagentAutoDispatch; notifyIsland(state.superagentAutoDispatch ? 'Superagent 自动派单已开启' : '自动派单已关闭', '#1F6FEB'); renderApp(); }
+    function toggleMemoryViewMode(mode) { state.memoryViewMode = mode; renderApp(); }
+
+    function openAgentGalaxyDirect(agentId) {
+      closeSheet();
+      state.activeTab = 'marshal';
+      state.agentsSubTab = 'memory';
+      state.memoryViewMode = 'galaxy';
+      state.memoryScopeFilter = 'private';
+      state.memoryAgentFilter = agentId || 'all';
+      const filtered = getFilteredMemories();
+      if (filtered.length > 0) state.selectedMemoryId = filtered[0].id;
+      renderApp();
+    }
+
+    function setMemoryScopeFilter(scope) {
+      state.memoryScopeFilter = scope;
+      state.confirmDeleteMemId = '';
+      const filtered = getFilteredMemories();
+      if (filtered.length > 0 && !filtered.some(m => m.id === state.selectedMemoryId)) state.selectedMemoryId = filtered[0].id;
+      renderApp();
+    }
+
+    function setMemoryAgentFilter(agentId) {
+      state.memoryAgentFilter = agentId;
+      const filtered = getFilteredMemories();
+      if (filtered.length > 0 && !filtered.some(m => m.id === state.selectedMemoryId)) state.selectedMemoryId = filtered[0].id;
+      renderApp();
+    }
+
+    function getFilteredMemories() {
+      return state.memories.filter(m => {
+        if (state.memoryScopeFilter === 'pending' && m.status !== 'pending') return false;
+        if (state.memoryScopeFilter === 'workspace' && m.layer !== 'workspace') return false;
+        if (state.memoryScopeFilter === 'private') {
+          if (m.layer !== 'private') return false;
+          if (state.memoryAgentFilter !== 'all' && m.agentId !== state.memoryAgentFilter) return false;
+        }
+        return true;
+      });
+    }
+
+    function buildMemoryGraphData(items) {
+      const edges = [];
+      const seen = new Set();
+      const addEdge = (source, target, relation, weight) => {
+        if (source === target) return;
+        const key = source < target ? `${source}|${target}|${relation}` : `${target}|${source}|${relation}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        edges.push({ source, target, relation, weight });
+      };
+      const byTag = new Map();
+      for (const node of items) {
+        for (const tag of (node.tags || [])) {
+          const arr = byTag.get(tag) || [];
+          arr.push(node.id);
+          byTag.set(tag, arr);
+        }
+      }
+      for (const [, ids] of byTag) {
+        for (let i = 0; i < ids.length; i++) for (let j = i + 1; j < ids.length; j++) addEdge(ids[i], ids[j], 'tag', 0.72);
+      }
+      const bySession = new Map();
+      for (const node of items) {
+        if (!node.sourceSession) continue;
+        const arr = bySession.get(node.sourceSession) || [];
+        arr.push(node.id);
+        bySession.set(node.sourceSession, arr);
+      }
+      for (const [, ids] of bySession) {
+        for (let i = 0; i < ids.length; i++) for (let j = i + 1; j < ids.length; j++) addEdge(ids[i], ids[j], 'session', 0.58);
+      }
+      return { nodes: items, edges };
+    }
+
+    function zoomGalaxy(factor) { galaxyCamera.zoom = Math.max(0.5, Math.min(2.4, galaxyCamera.zoom * factor)); }
+    function resetGalaxyCamera() { galaxyCamera.yaw = 0.38; galaxyCamera.pitch = -0.18; galaxyCamera.zoom = 1.04; galaxyCamera.auto = true; notifyIsland('星系视角已重置', '#1F6FEB'); }
+
+    function toggleGalaxyPin(memId) {
+      const m = state.memories.find(item => item.id === memId);
+      if (!m) return;
+      m.pinned = !m.pinned;
+      if (m.pinned) m.clarity = 'vivid';
+      notifyIsland(m.pinned ? '已固定该记忆（永不衰减）' : '已取消固定', '#34C759');
+      renderSelectedMemoryInspectorOnly();
+    }
+
+    function requestForgetMemory(memId) {
+      if (state.confirmDeleteMemId !== memId) {
+        state.confirmDeleteMemId = memId;
+        renderSelectedMemoryInspectorOnly();
+        return;
+      }
+      state.confirmDeleteMemId = '';
+      state.memories = state.memories.filter(item => item.id !== memId);
+      const rest = getFilteredMemories();
+      state.selectedMemoryId = rest[0] ? rest[0].id : '';
+      notifyIsland('记忆已删除并写入防复活加密墓碑', '#FF3B30');
+      renderApp();
+    }
+
+    function approveGlobalMemory(memId, visibility) {
+      const m = state.memories.find(item => item.id === memId);
+      if (!m) return;
+      m.status = 'active';
+      m.visibility = visibility;
+      m.scope = visibility === 'all' ? 'Global · rules.md 全局生效' : 'Global · 仅 1:1 单聊可见';
+      notifyIsland(visibility === 'all' ? '已批准写入 rules.md' : '已批准为仅单聊可见', '#34C759');
+      renderApp();
+    }
+
+    function rejectGlobalMemory(memId) {
+      state.memories = state.memories.filter(item => item.id !== memId);
+      const rest = getFilteredMemories();
+      if (!rest.some(item => item.id === state.selectedMemoryId)) state.selectedMemoryId = rest[0] ? rest[0].id : '';
+      notifyIsland('已拒绝该条全局记忆提案', '#FF3B30');
+      renderApp();
+    }
+
+    function triggerEncryptedMemorySync() { notifyIsland('AES-256-GCM 推送 2 条 · 拉取 0 条', '#34C759'); }
+
+    function openAddMemorySheet() {
+      openSheet(`
+        <div class="stack-md" style="padding:14px 16px 18px;overflow-y:auto;">
+          <div class="sheet-handle"></div>
+          <div class="row-between">
+            <button onclick="closeSheet()" style="font-size:13px;color:var(--ios-subtext);">取消</button>
+            <span style="font-size:15px;font-weight:700;">写入新记忆星体</span>
+            <button onclick="submitNewMemoryNode()" style="font-size:13px;font-weight:600;color:var(--ios-blue);">保存</button>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+            <div>
+              <label style="font-size:11px;color:var(--ios-subtext);display:block;margin-bottom:4px;">归属层级</label>
+              <select id="newMemLayer" style="width:100%;padding:8px;border-radius:10px;font-size:12px;background:var(--ios-seg-bg);color:var(--ios-text);">
+                <option value="workspace">工作区共享 (Workspace)</option>
+                <option value="private">智能体私有 (Agent)</option>
+                <option value="global">全局记忆 (Global)</option>
+              </select>
+            </div>
+            <div>
+              <label style="font-size:11px;color:var(--ios-subtext);display:block;margin-bottom:4px;">星体类型</label>
+              <select id="newMemKind" style="width:100%;padding:8px;border-radius:10px;font-size:12px;background:var(--ios-seg-bg);color:var(--ios-text);">
+                <option value="decision">决策 (Decision)</option>
+                <option value="fact">事实 (Fact)</option>
+                <option value="handoff">交接 (Handoff)</option>
+                <option value="profile">画像 (Profile)</option>
+              </select>
+            </div>
+          </div>
+          <div>
+            <label style="font-size:11px;color:var(--ios-subtext);display:block;margin-bottom:4px;">记忆标题</label>
+            <input id="newMemTitle" type="text" value="移动端思考强度采用单列无对勾选择" style="width:100%;padding:8px 10px;border-radius:10px;font-size:12.5px;background:var(--ios-seg-bg);color:var(--ios-text);" />
+          </div>
+          <div>
+            <label style="font-size:11px;color:var(--ios-subtext);display:block;margin-bottom:4px;">触发场景 Cue（可选）</label>
+            <input id="newMemCue" type="text" value="迭代会话输入框与参数抽屉时" style="width:100%;padding:8px 10px;border-radius:10px;font-size:12px;background:var(--ios-seg-bg);color:var(--ios-text);" />
+          </div>
+          <div>
+            <label style="font-size:11px;color:var(--ios-subtext);display:block;margin-bottom:4px;">记忆正文</label>
+            <textarea id="newMemSummary" rows="2" style="width:100%;padding:8px 10px;border-radius:10px;font-size:12.5px;background:var(--ios-seg-bg);color:var(--ios-text);">思考强度抽屉仅保留垂直单列卡片，不叠放重复的横向分段条。</textarea>
+          </div>
+          <button onclick="submitNewMemoryNode()" style="width:100%;padding:11px;border-radius:14px;font-size:14px;font-weight:600;background:var(--ios-blue);color:#FFF;">写入并投影至 3D 记忆星系</button>
+        </div>
+      `);
+    }
+
+    function submitNewMemoryNode() {
+      const layer = document.getElementById('newMemLayer')?.value || 'workspace';
+      const kind = document.getElementById('newMemKind')?.value || 'decision';
+      const title = (document.getElementById('newMemTitle')?.value || '').trim() || '新建记忆节点';
+      const cue = (document.getElementById('newMemCue')?.value || '').trim();
+      const summary = (document.getElementById('newMemSummary')?.value || '').trim() || title;
+      const newId = 'mem-new-' + Date.now();
+      const scopeMap = { workspace: 'Workspace · 手动沉淀', private: 'Agent 私有 · Leader', global: 'Global · rules.md 全局生效' };
+      state.memories.unshift({
+        id: newId, title, kind, layer, agentId: 'ag-leader', status: 'active', visibility: layer === 'private' ? 'private' : 'all',
+        clarity: 'vivid', importance: 0.85, accessCount: 1, pinned: true, cue, tags: ['mobile', 'ui-minimal', 'design'], sourceSession: 'SES-901',
+        scope: scopeMap[layer] || 'Workspace', summary
+      });
+      state.memoryScopeFilter = 'all';
+      state.memoryViewMode = 'galaxy';
+      state.selectedMemoryId = newId;
+      closeSheet();
+      notifyIsland('新记忆星体已加入 3D 星系', '#34C759');
+      renderApp();
+    }
+
+    function buildSelectedMemoryCardHtml(selected) {
+      if (!selected) return `<div class="ios-card" style="padding:14px;font-size:12px;text-align:center;color:var(--ios-muted);">当前筛选下暂无记忆节点</div>`;
+      const kindInfo = MEMORY_KIND_META[selected.kind] || { label: '事实', color: '#8fb4ff' };
+      const clarityText = CLARITY_LABEL_MAP[selected.clarity] || '清晰';
+      const isConfirmingDel = state.confirmDeleteMemId === selected.id;
+
+      return `
+        <div class="ios-card stack-sm" style="padding:13px 14px;">
+          <div class="row-between">
+            <div style="display:flex;align-items:center;gap:6px;min-width:0;">
+              <span style="width:9px;height:9px;border-radius:999px;background:${kindInfo.color};flex-shrink:0;"></span>
+              <span class="truncate" style="font-size:10.5px;font-weight:600;color:${selected.status === 'pending' ? 'var(--ios-orange)' : 'var(--ios-blue)'};">${escapeHtml(selected.scope)} · ${kindInfo.label}</span>
+            </div>
+            <span class="tabular-nums" style="font-size:10px;color:var(--ios-muted);flex-shrink:0;">${clarityText} · 重要度 ${Math.round((selected.importance || 0.7) * 100)}% · 访问 ${selected.accessCount || 1} 次</span>
+          </div>
+
+          <div style="font-size:14px;font-weight:700;display:flex;align-items:center;gap:6px;">
+            <span>${escapeHtml(selected.title)}</span>
+            ${selected.pinned ? `<span style="font-size:10px;padding:1px 6px;border-radius:999px;background:rgba(246,195,92,0.18);color:#D97706;">已固定</span>` : ''}
+          </div>
+
+          ${selected.cue ? `<div style="padding:5px 9px;border-radius:8px;font-size:11px;background:var(--ios-card-secondary);color:var(--ios-subtext);">触发场景：${escapeHtml(selected.cue)}</div>` : ''}
+          <div style="font-size:12.5px;line-height:1.52;">${escapeHtml(selected.summary)}</div>
+
+          ${(selected.tags && selected.tags.length > 0) ? `
+            <div style="display:flex;flex-wrap:wrap;gap:5px;">
+              ${selected.tags.map(tag => `<span class="tabular-nums" style="padding:2px 7px;border-radius:999px;font-size:10px;background:var(--ios-seg-bg);color:var(--ios-subtext);">#${escapeHtml(tag)}</span>`).join('')}
+            </div>
+          ` : ''}
+
+          ${selected.status === 'pending' ? `
+            <div class="ios-hairline-t" style="padding-top:8px;display:grid;grid-template-columns:repeat(3,1fr);gap:6px;">
+              <button onclick="approveGlobalMemory('${selected.id}', 'all')" style="padding:7px 4px;border-radius:10px;font-size:11.5px;font-weight:600;background:var(--ios-blue);color:#FFF;">同意(全部会话)</button>
+              <button onclick="approveGlobalMemory('${selected.id}', 'no-group')" style="padding:7px 4px;border-radius:10px;font-size:11.5px;font-weight:600;background:var(--ios-seg-bg);color:var(--ios-text);">仅单聊可见</button>
+              <button onclick="rejectGlobalMemory('${selected.id}')" style="padding:7px 4px;border-radius:10px;font-size:11.5px;font-weight:600;background:rgba(239,68,68,0.12);color:var(--ios-red);">拒绝提案</button>
+            </div>
+          ` : `
+            <div class="row-between ios-hairline-t" style="padding-top:8px;font-size:11.5px;">
+              <div style="display:flex;gap:6px;">
+                <button onclick="toggleGalaxyPin('${selected.id}')" style="padding:4px 10px;border-radius:8px;font-weight:500;background:var(--ios-seg-bg);color:var(--ios-text);">${selected.pinned ? '取消固定' : '固定星体'}</button>
+                <button onclick="triggerEncryptedMemorySync()" style="padding:4px 10px;border-radius:8px;font-weight:500;background:var(--ios-seg-bg);color:var(--ios-blue);">加密同步</button>
+              </div>
+              <button onclick="requestForgetMemory('${selected.id}')" style="padding:4px 10px;border-radius:8px;font-weight:500;background:${isConfirmingDel ? 'var(--ios-red)' : 'rgba(239,68,68,0.10)'};color:${isConfirmingDel ? '#FFF' : 'var(--ios-red)'};">${isConfirmingDel ? '再次点按确认删除' : '删除'}</button>
+            </div>
+          `}
+        </div>
+      `;
+    }
+
+    function renderSelectedMemoryInspectorOnly() {
+      const box = document.getElementById('selectedMemoryInspector');
+      if (!box) return;
+      const filtered = getFilteredMemories();
+      box.innerHTML = buildSelectedMemoryCardHtml(filtered.find(m => m.id === state.selectedMemoryId) || filtered[0]);
+    }
+
+    function mountMemoryGalaxyCanvas() {
+      const canvas = document.getElementById('memoryGalaxyCanvas');
+      if (!canvas) return;
+
+      const filtered = getFilteredMemories();
+      const graph = buildMemoryGraphData(filtered);
+      if (filtered.length > 0 && !filtered.some(m => m.id === state.selectedMemoryId)) state.selectedMemoryId = filtered[0].id;
+
+      const fnvHash = (value) => {
+        let h = 2166136261;
+        for (let i = 0; i < value.length; i++) { h ^= value.charCodeAt(i); h = Math.imul(h, 16777619); }
+        return h >>> 0;
+      };
+
+      const nodes = graph.nodes.map((node, index) => {
+        const h = fnvHash(node.id || String(index));
+        const angle = (h % 1000) / 1000 * Math.PI * 2;
+        const radius = 70 + ((h >>> 10) % 1000) / 1000 * 300;
+        return { ...node, x: Math.cos(angle) * radius, y: ((h >>> 20) % 1000) / 1000 * 420 - 210, z: Math.sin(angle) * radius, vx: 0, vy: 0, vz: 0 };
+      });
+
+      const idToIdx = new Map(nodes.map((n, i) => [n.id, i]));
+      const edges = graph.edges.map(e => ({ ...e, a: idToIdx.get(e.source), b: idToIdx.get(e.target) })).filter(e => e.a !== undefined && e.b !== undefined && e.a !== e.b);
+
+      for (let iter = 0; iter < 110; iter++) {
+        for (let i = 0; i < nodes.length; i++) {
+          const a = nodes[i];
+          for (let j = i + 1; j < nodes.length; j++) {
+            const b = nodes[j];
+            let dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
+            const d2 = dx * dx + dy * dy + dz * dz + 12;
+            const force = 5200 / d2;
+            const d = Math.sqrt(d2);
+            dx /= d; dy /= d; dz /= d;
+            a.vx += dx * force; a.vy += dy * force; a.vz += dz * force;
+            b.vx -= dx * force; b.vy -= dy * force; b.vz -= dz * force;
+          }
+          a.vx -= a.x * 0.0007; a.vy -= a.y * 0.0007; a.vz -= a.z * 0.0007;
+        }
+        for (const edge of edges) {
+          const a = nodes[edge.a], b = nodes[edge.b];
+          const dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
+          const d = Math.sqrt(dx * dx + dy * dy + dz * dz) + 0.01;
+          const force = (d - 170) * 0.008 * (0.4 + Number(edge.weight || 0.4));
+          const fx = dx / d * force, fy = dy / d * force, fz = dz / d * force;
+          a.vx += fx; a.vy += fy; a.vz += fz;
+          b.vx -= fx; b.vy -= fy; b.vz -= fz;
+        }
+        for (const n of nodes) {
+          n.vx *= 0.72; n.vy *= 0.72; n.vz *= 0.72;
+          n.x += n.vx; n.y += n.vy; n.z += n.vz;
+        }
+      }
+
+      let maxR = 1;
+      for (const n of nodes) maxR = Math.max(maxR, Math.hypot(n.x, n.y, n.z));
+      const mobileSpread = nodes.length <= 4 ? 95 : 108;
+      for (const n of nodes) {
+        const factor = mobileSpread / maxR;
+        n.x *= factor; n.y *= factor * 0.78; n.z *= factor;
+      }
+
+      const stars = Array.from({ length: 180 }, (_, idx) => ({
+        x: (idx * 73 % 997) / 997, y: (idx * 151 % 991) / 991, r: (idx % 7) / 7 * 1.15 + 0.22, phase: idx
+      }));
+
+      const labelIds = new Set([...nodes].sort((a, b) => (Number(b.pinned) - Number(a.pinned)) || ((b.importance || 0) - (a.importance || 0))).slice(0, 5).map(n => n.id));
+
+      const toScreen = (node, width, height) => {
+        const cy = Math.cos(galaxyCamera.yaw), sy = Math.sin(galaxyCamera.yaw);
+        const cp = Math.cos(galaxyCamera.pitch), sp = Math.sin(galaxyCamera.pitch);
+        let x = node.x * cy - node.z * sy;
+        let z = node.x * sy + node.z * cy;
+        let y = node.y * cp - z * sp;
+        z = node.y * sp + z * cp;
+        const focal = 520;
+        const scale = (focal / (focal + z)) * galaxyCamera.zoom;
+        return { x: width / 2 + x * scale, y: height / 2 + y * scale, scale, depth: z };
+      };
+
+      const drawFrame = () => {
+        if (!document.body.contains(canvas)) { stopGalaxyLoop(); return; }
+        const dpr = Math.min(2, window.devicePixelRatio || 1);
+        const width = canvas.clientWidth || 335;
+        const height = canvas.clientHeight || 232;
+        if (canvas.width !== Math.round(width * dpr) || canvas.height !== Math.round(height * dpr)) {
+          canvas.width = Math.round(width * dpr); canvas.height = Math.round(height * dpr);
+        }
+        const ctx = canvas.getContext('2d');
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+        const bgGrad = ctx.createRadialGradient(width * 0.5, height * 0.45, 16, width * 0.5, height * 0.5, Math.max(width, height) * 0.78);
+        bgGrad.addColorStop(0, '#121b2f');
+        bgGrad.addColorStop(1, '#05070d');
+        ctx.fillStyle = bgGrad;
+        ctx.fillRect(0, 0, width, height);
+
+        const now = performance.now();
+        for (const st of stars) {
+          const alpha = 0.16 + 0.34 * (0.5 + 0.5 * Math.sin((now / 2200) + st.phase));
+          ctx.fillStyle = `rgba(185,212,255,${alpha.toFixed(3)})`;
+          ctx.beginPath();
+          ctx.arc(st.x * width, st.y * height, st.r, 0, Math.PI * 2);
+          ctx.fill();
+        }
+
+        if (galaxyCamera.auto && !galaxyCamera.dragging) galaxyCamera.yaw += 0.0016;
+
+        const projected = nodes.map(node => ({ node, ...toScreen(node, width, height) }));
+        const byNodeId = new Map(projected.map(p => [p.node.id, p]));
+        projected.sort((a, b) => b.depth - a.depth);
+
+        for (const edge of edges) {
+          const na = nodes[edge.a], nb = nodes[edge.b];
+          const pa = byNodeId.get(na.id), pb = byNodeId.get(nb.id);
+          if (!pa || !pb) continue;
+          const isLinked = (na.id === state.selectedMemoryId || nb.id === state.selectedMemoryId);
+          ctx.strokeStyle = isLinked
+            ? (edge.relation === 'session' ? 'rgba(110,190,255,0.62)' : 'rgba(190,165,255,0.68)')
+            : (edge.relation === 'session' ? 'rgba(120,180,255,0.16)' : 'rgba(160,140,255,0.20)');
+          ctx.lineWidth = isLinked ? 1.25 : 0.75;
+          ctx.beginPath(); ctx.moveTo(pa.x, pa.y); ctx.lineTo(pb.x, pb.y); ctx.stroke();
+        }
+
+        for (const entry of projected) {
+          const node = entry.node;
+          const base = 3.0 + Math.sqrt(Math.max(0.05, Number(node.importance || 0.6))) * 6.4 + Math.log1p(Number(node.accessCount || 1)) * 1.25;
+          const radius = Math.max(2.6, base * entry.scale);
+          const clarityAlpha = node.clarity === 'fuzzy' ? 0.52 : (node.clarity === 'trace' ? 0.30 : (node.clarity === 'clear' ? 0.86 : 1));
+          const depthAlpha = Math.max(0.22, Math.min(1, 1 - (entry.depth + 180) / 480));
+          const alpha = depthAlpha * clarityAlpha;
+          const color = (MEMORY_KIND_META[node.kind] && MEMORY_KIND_META[node.kind].color) || '#8fb4ff';
+          const isSelected = state.selectedMemoryId === node.id;
+
+          const glow = ctx.createRadialGradient(entry.x, entry.y, 0, entry.x, entry.y, radius * 3.2);
+          glow.addColorStop(0, color); glow.addColorStop(0.26, color + '55'); glow.addColorStop(1, 'rgba(0,0,0,0)');
+          ctx.globalAlpha = alpha * (isSelected ? 0.85 : 0.55);
+          ctx.fillStyle = glow;
+          ctx.beginPath(); ctx.arc(entry.x, entry.y, radius * 3.2, 0, Math.PI * 2); ctx.fill();
+
+          ctx.globalAlpha = alpha;
+          ctx.fillStyle = color;
+          ctx.beginPath(); ctx.arc(entry.x, entry.y, radius, 0, Math.PI * 2); ctx.fill();
+
+          if (node.pinned) {
+            ctx.globalAlpha = 0.85; ctx.strokeStyle = 'rgba(255,220,150,0.85)'; ctx.lineWidth = 1;
+            ctx.beginPath(); ctx.arc(entry.x, entry.y, radius + 2.8, 0, Math.PI * 2); ctx.stroke();
+          }
+          if (node.status === 'pending') {
+            const pulse = 3.5 + 2.2 * (0.5 + 0.5 * Math.sin(now / 320));
+            ctx.globalAlpha = 0.9; ctx.strokeStyle = '#FF9F0A'; ctx.lineWidth = 1.3;
+            ctx.beginPath(); ctx.arc(entry.x, entry.y, radius + pulse, 0, Math.PI * 2); ctx.stroke();
+          }
+          if (isSelected) {
+            ctx.globalAlpha = 0.96; ctx.strokeStyle = '#FFFFFF'; ctx.lineWidth = 1.6;
+            ctx.beginPath(); ctx.arc(entry.x, entry.y, radius + 5.2, 0, Math.PI * 2); ctx.stroke();
+          }
+          if (isSelected || galaxyCamera.hoverId === node.id || labelIds.has(node.id)) {
+            ctx.globalAlpha = isSelected ? 1 : 0.86;
+            ctx.font = (isSelected ? '600 ' : '500 ') + '10.5px -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif';
+            const rawTitle = String(node.title || '').slice(0, 13);
+            const textW = ctx.measureText(rawTitle).width;
+            const lx = Math.min(width - textW - 8, Math.max(8, entry.x + radius + 5));
+            const ly = Math.min(height - 22, Math.max(16, entry.y + 3.5));
+            ctx.fillStyle = isSelected ? '#FFFFFF' : 'rgba(232,237,247,0.92)';
+            ctx.fillText(rawTitle, lx, ly);
+          }
+        }
+
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = 'rgba(200,215,235,0.58)';
+        ctx.font = '10px -apple-system, BlinkMacSystemFont, "SF Mono", sans-serif';
+        ctx.fillText(`${nodes.length} 颗星体 · ${edges.length} 条关联 · 拖拽旋转 / 点选星体`, 10, height - 10);
+
+        galaxyRafId = requestAnimationFrame(drawFrame);
+      };
+
+      const findNearestNode = (clientX, clientY, maxDist) => {
+        const rect = canvas.getBoundingClientRect();
+        const mx = clientX - rect.left, my = clientY - rect.top;
+        const w = canvas.clientWidth || 335, h = canvas.clientHeight || 232;
+        let best = null, bestDist = maxDist;
+        for (const n of nodes) {
+          const p = toScreen(n, w, h);
+          const d = Math.hypot(p.x - mx, p.y - my);
+          if (d < bestDist) { best = n; bestDist = d; }
+        }
+        return best;
+      };
+
+      canvas.onpointerdown = (ev) => {
+        galaxyCamera.dragging = true; galaxyCamera.moved = false;
+        galaxyCamera.lastX = ev.clientX; galaxyCamera.lastY = ev.clientY;
+        try { canvas.setPointerCapture(ev.pointerId); } catch (e) {}
+      };
+      canvas.onpointermove = (ev) => {
+        if (galaxyCamera.dragging) {
+          const dx = ev.clientX - galaxyCamera.lastX, dy = ev.clientY - galaxyCamera.lastY;
+          if (Math.abs(dx) + Math.abs(dy) > 2.5) galaxyCamera.moved = true;
+          galaxyCamera.yaw += dx * 0.009;
+          galaxyCamera.pitch = Math.max(-1.15, Math.min(1.15, galaxyCamera.pitch + dy * 0.009));
+          galaxyCamera.lastX = ev.clientX; galaxyCamera.lastY = ev.clientY;
+          return;
+        }
+        const hovered = findNearestNode(ev.clientX, ev.clientY, 20);
+        galaxyCamera.hoverId = hovered ? hovered.id : '';
+        canvas.style.cursor = hovered ? 'pointer' : 'grab';
+      };
+      canvas.onpointerup = (ev) => {
+        if (galaxyCamera.dragging && !galaxyCamera.moved) {
+          const hit = findNearestNode(ev.clientX, ev.clientY, 26);
+          if (hit) {
+            state.selectedMemoryId = hit.id;
+            state.confirmDeleteMemId = '';
+            notifyIsland('已选中星体：' + hit.title, (MEMORY_KIND_META[hit.kind]?.color) || '#5aa7ff');
+            renderSelectedMemoryInspectorOnly();
+          }
+        }
+        galaxyCamera.dragging = false;
+      };
+      canvas.onwheel = (ev) => {
+        ev.preventDefault();
+        galaxyCamera.zoom = Math.max(0.5, Math.min(2.4, galaxyCamera.zoom * (ev.deltaY > 0 ? 0.92 : 1.08)));
+      };
+
+      drawFrame();
+    }
+
+    function selectMemoryFromList(memId) { state.selectedMemoryId = memId; state.confirmDeleteMemId = ''; state.memoryViewMode = 'galaxy'; renderApp(); }
+
+    function renderAgentsAndMemoryScreen() {
+      const pendingGlobalCount = state.memories.filter(m => m.status === 'pending').length;
+      let bodyHtml = '';
+
+      if (state.agentsSubTab === 'roster') {
+        bodyHtml = `
+          <div class="stack-sm">
+            <div class="row-between" style="padding:0 2px;font-size:12px;"><span style="font-weight:600;color:var(--ios-subtext);">跨设备智能体花名册 (dsh-agents)</span><span style="font-size:11px;color:var(--ios-muted);">点击查看专属记忆星系</span></div>
+            ${state.agentRoster.map((ag, idx) => `
+              <div onclick="openAgentDetailSheet('${ag.id}')" class="ios-card ios-pressable" style="padding:13px 14px;">
+                ${idx === 0 ? '<span class="ue-pin" style="position:absolute;top:-8px;right:-8px;">2</span>' : ''}
+                <div class="row-between">
+                  <div style="display:flex;align-items:center;gap:10px;min-width:0;">
+                    <div style="width:36px;height:36px;border-radius:11px;background:${ag.color};color:#FFF;font-size:12px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0;">${ag.name.slice(0, 1)}</div>
+                    <div style="min-width:0;">
+                      <div class="truncate" style="font-size:14px;font-weight:600;">${escapeHtml(ag.name)}</div>
+                      <div class="truncate" style="font-size:11px;color:var(--ios-subtext);">${escapeHtml(ag.host)} · ${ag.engine}</div>
+                    </div>
+                  </div>
+                  <span style="color:var(--ios-muted);">${svgIcon('chevronRight', 16)}</span>
+                </div>
+                <div class="row-between ios-hairline-t" style="margin-top:9px;padding-top:7px;font-size:11px;">
+                  <span style="color:var(--ios-muted);">${ag.memoryBackend}</span>
+                  <span class="tabular-nums" style="font-weight:600;color:var(--ios-blue);">${formatModelShortName(ag.defaultModel)}</span>
+                </div>
+              </div>
+            `).join('')}
+          </div>
+
+          <div class="stack-sm" style="padding-top:4px;">
+            <div style="font-size:12px;font-weight:600;color:var(--ios-subtext);padding:0 2px;">账号共享预设库 (64 套上限 · revision 同步)</div>
+            ${state.agentPresets.map(p => `
+              <div onclick="openPresetEditSheet('${p.id}')" class="ios-card ios-pressable stack-sm" style="padding:13px 14px;">
+                <div class="row-between">
+                  <div style="display:flex;align-items:center;gap:7px;">
+                    <span style="font-size:13px;font-weight:600;">${escapeHtml(p.name)}</span>
+                    <span style="padding:2px 6px;border-radius:5px;font-size:10px;font-weight:600;background:var(--ios-pill-bg);color:var(--ios-blue);">${p.depth} · ${p.stance}</span>
+                  </div>
+                  <span class="tabular-nums" style="font-size:10px;color:var(--ios-muted);">rev #${p.revision}</span>
+                </div>
+                <div style="font-size:12px;line-height:1.5;color:var(--ios-subtext);">${escapeHtml(p.persona)}</div>
+              </div>
+            `).join('')}
+          </div>
+        `;
+      } else {
+        const filteredMemories = getFilteredMemories();
+        const selectedMem = filteredMemories.find(m => m.id === state.selectedMemoryId) || filteredMemories[0];
+
+        const agentFilterRow = state.memoryScopeFilter === 'private' ? `
+          <div style="display:flex;gap:6px;overflow-x:auto;font-size:11px;">
+            <button onclick="setMemoryAgentFilter('all')" style="padding:4px 10px;border-radius:999px;white-space:nowrap;font-weight:500;background:${state.memoryAgentFilter === 'all' ? 'var(--ios-pill-bg)' : 'var(--ios-seg-bg)'};color:${state.memoryAgentFilter === 'all' ? 'var(--ios-blue)' : 'var(--ios-subtext)'};">全部智能体</button>
+            ${state.agentRoster.map(ag => {
+              const active = state.memoryAgentFilter === ag.id;
+              return `<button onclick="setMemoryAgentFilter('${ag.id}')" style="padding:4px 10px;border-radius:999px;white-space:nowrap;font-weight:500;background:${active ? 'var(--ios-pill-bg)' : 'var(--ios-seg-bg)'};color:${active ? 'var(--ios-blue)' : 'var(--ios-subtext)'};">${escapeHtml(ag.name.split(' · ')[0])}</button>`;
+            }).join('')}
+          </div>
+        ` : '';
+
+        const mainMemoryArea = state.memoryViewMode === 'galaxy' ? `
+          <div style="border-radius:16px;overflow:hidden;position:relative;border:0.5px solid var(--ios-sep);background:#05070d;">
+            <span class="ue-pin" style="position:absolute;top:8px;left:8px;z-index:10;">3</span>
+            <div style="position:absolute;top:9px;right:9px;z-index:10;display:flex;gap:4px;">
+              <button onclick="zoomGalaxy(1.18)" aria-label="放大星系" style="width:24px;height:24px;border-radius:999px;background:rgba(255,255,255,0.14);color:#FFF;font-size:13px;font-weight:700;">+</button>
+              <button onclick="zoomGalaxy(0.84)" aria-label="缩小星系" style="width:24px;height:24px;border-radius:999px;background:rgba(255,255,255,0.14);color:#FFF;font-size:13px;font-weight:700;">−</button>
+              <button onclick="resetGalaxyCamera()" style="height:24px;padding:0 8px;border-radius:999px;background:rgba(255,255,255,0.14);color:#FFF;font-size:10px;">重置</button>
+            </div>
+            <div style="position:absolute;top:9px;left:9px;z-index:10;display:flex;flex-wrap:wrap;gap:5px;pointer-events:none;">
+              ${Object.entries(MEMORY_KIND_META).slice(0, 5).map(([, meta]) => `<span style="display:inline-flex;align-items:center;gap:4px;padding:2px 6px;border-radius:5px;font-size:9.5px;color:#E2E8F0;background:rgba(15,23,42,0.62);"><span style="width:6px;height:6px;border-radius:999px;background:${meta.color};"></span>${meta.label}</span>`).join('')}
+            </div>
+            <canvas id="memoryGalaxyCanvas" style="width:100%;height:232px;display:block;touch-action:none;user-select:none;cursor:grab;"></canvas>
+          </div>
+          <div id="selectedMemoryInspector">${buildSelectedMemoryCardHtml(selectedMem)}</div>
+        ` : `
+          <div class="stack-sm">
+            ${filteredMemories.map(m => {
+              const kindInfo = MEMORY_KIND_META[m.kind] || { color: '#8fb4ff' };
+              return `
+                <div onclick="selectMemoryFromList('${m.id}')" class="ios-card ios-pressable stack-sm" style="padding:13px 14px;">
+                  <div class="row-between">
+                    <div style="display:flex;align-items:center;gap:6px;min-width:0;"><span style="width:8px;height:8px;border-radius:999px;background:${kindInfo.color};"></span><span class="truncate" style="font-size:10.5px;font-weight:600;color:${m.status === 'pending' ? 'var(--ios-orange)' : 'var(--ios-blue)'};">${escapeHtml(m.scope)}</span></div>
+                    <span class="tabular-nums" style="font-size:10px;color:var(--ios-muted);">${CLARITY_LABEL_MAP[m.clarity] || m.clarity} · ${m.visibility}</span>
+                  </div>
+                  <div style="font-size:13px;font-weight:600;">${escapeHtml(m.title)}</div>
+                  <div style="font-size:12px;color:var(--ios-subtext);line-height:1.5;">${escapeHtml(m.summary)}</div>
+                </div>
+              `;
+            }).join('')}
+          </div>
+        `;
+
+        bodyHtml = `
+          <div class="row-between">
+            <div style="display:flex;gap:4px;overflow-x:auto;font-size:11px;">
+              <button onclick="setMemoryScopeFilter('all')" style="padding:4px 9px;border-radius:999px;white-space:nowrap;font-weight:500;background:${state.memoryScopeFilter === 'all' ? 'var(--ios-pill-bg)' : 'var(--ios-seg-bg)'};color:${state.memoryScopeFilter === 'all' ? 'var(--ios-blue)' : 'var(--ios-subtext)'};">全部(${state.memories.length})</button>
+              <button onclick="setMemoryScopeFilter('pending')" style="padding:4px 9px;border-radius:999px;white-space:nowrap;font-weight:500;background:${state.memoryScopeFilter === 'pending' ? 'var(--ios-pill-bg)' : 'var(--ios-seg-bg)'};color:${state.memoryScopeFilter === 'pending' ? 'var(--ios-blue)' : 'var(--ios-subtext)'};">待审(${pendingGlobalCount})</button>
+              <button onclick="setMemoryScopeFilter('workspace')" style="padding:4px 9px;border-radius:999px;white-space:nowrap;font-weight:500;background:${state.memoryScopeFilter === 'workspace' ? 'var(--ios-pill-bg)' : 'var(--ios-seg-bg)'};color:${state.memoryScopeFilter === 'workspace' ? 'var(--ios-blue)' : 'var(--ios-subtext)'};">工作区</button>
+              <button onclick="setMemoryScopeFilter('private')" style="padding:4px 9px;border-radius:999px;white-space:nowrap;font-weight:500;background:${state.memoryScopeFilter === 'private' ? 'var(--ios-pill-bg)' : 'var(--ios-seg-bg)'};color:${state.memoryScopeFilter === 'private' ? 'var(--ios-blue)' : 'var(--ios-subtext)'};">私有库</button>
+            </div>
+            <div style="display:inline-flex;padding:2px;border-radius:8px;background:var(--ios-seg-bg);flex-shrink:0;">
+              <button onclick="toggleMemoryViewMode('galaxy')" style="padding:3px 8px;border-radius:6px;font-size:11px;font-weight:500;background:${state.memoryViewMode === 'galaxy' ? 'var(--ios-seg-active)' : 'transparent'};color:${state.memoryViewMode === 'galaxy' ? 'var(--ios-text)' : 'var(--ios-subtext)'};">星系</button>
+              <button onclick="toggleMemoryViewMode('list')" style="padding:3px 8px;border-radius:6px;font-size:11px;font-weight:500;background:${state.memoryViewMode === 'list' ? 'var(--ios-seg-active)' : 'transparent'};color:${state.memoryViewMode === 'list' ? 'var(--ios-text)' : 'var(--ios-subtext)'};">列表</button>
+            </div>
+          </div>
+          ${agentFilterRow}
+          ${mainMemoryArea}
+        `;
+      }
+
+      return `
+        <div class="stack-md" style="padding:12px 16px 16px;">
+          <div class="row-between">
+            <div>
+              <div style="font-size:11px;font-weight:500;color:var(--ios-subtext);">跨设备花名册 · 账号预设 · 3D 记忆星系</div>
+              <div style="font-size:26px;font-weight:700;letter-spacing:-0.02em;display:flex;align-items:center;gap:8px;">智能体 <span class="ue-pin">1</span></div>
+            </div>
+            ${state.agentsSubTab === 'memory'
+              ? `<button onclick="openAddMemorySheet()" style="padding:6px 12px;border-radius:999px;font-size:11.5px;font-weight:600;background:var(--ios-blue);color:#FFF;">+ 记忆</button>`
+              : `<button onclick="toggleSuperagent()" style="padding:6px 10px;border-radius:999px;font-size:11px;font-weight:600;background:${state.superagentAutoDispatch ? 'rgba(16,185,129,0.15)' : 'var(--ios-seg-bg)'};color:${state.superagentAutoDispatch ? 'var(--ios-green)' : 'var(--ios-subtext)'};">${state.superagentAutoDispatch ? '自动派单: 开' : '自动派单: 关'}</button>`}
+          </div>
+
+          <div class="ios-segmented">
+            <button onclick="setAgentsSubTab('roster')" class="ios-seg-btn ${state.agentsSubTab === 'roster' ? 'active' : ''}">成员与预设 (${state.agentRoster.length})</button>
+            <button onclick="setAgentsSubTab('memory')" class="ios-seg-btn ${state.agentsSubTab === 'memory' ? 'active' : ''}">记忆与星系${pendingGlobalCount > 0 ? ' · 待审' + pendingGlobalCount : ''}</button>
+          </div>
+
+          ${bodyHtml}
+        </div>
+      `;
+    }
+
+    function openAgentDetailSheet(agentId) {
+      const ag = state.agentRoster.find(a => a.id === agentId);
+      if (!ag) return;
+      openSheet(`
+        <div class="stack-md" style="padding:14px 16px 18px;">
+          <div class="sheet-handle"></div>
+          <div class="row-between"><span style="font-size:14px;font-weight:700;">${escapeHtml(ag.name)}</span><button onclick="closeSheet()" style="font-size:13px;color:var(--ios-subtext);">关闭</button></div>
+          <div class="stack-sm" style="padding:12px;border-radius:12px;background:var(--ios-card-secondary);font-size:12px;">
+            <div>所属节点：<b>${escapeHtml(ag.host)}</b> (${ag.engine})</div>
+            <div>默认模型：<b class="tabular-nums">${ag.defaultModel} (${ag.effort})</b></div>
+            <div>记忆存储：<b>${escapeHtml(ag.memoryBackend)}</b></div>
+          </div>
+          <button onclick="openAgentGalaxyDirect('${ag.id}')" style="width:100%;padding:11px;border-radius:14px;font-size:13px;font-weight:600;background:var(--ios-blue);color:#FFF;">进入该智能体的 3D 记忆星系</button>
+        </div>
+      `);
+    }
+
+    function openPresetEditSheet(presetId) {
+      const p = state.agentPresets.find(item => item.id === presetId);
+      if (!p) return;
+      openSheet(`
+        <div class="stack-md" style="padding:14px 16px 18px;">
+          <div class="sheet-handle"></div>
+          <div class="row-between"><span style="font-size:14px;font-weight:700;">编辑预设 · ${escapeHtml(p.name)}</span><button onclick="closeSheet()" style="font-size:13px;color:var(--ios-subtext);">取消</button></div>
+          <textarea id="presetPersonaInput" rows="3" style="width:100%;padding:10px;border-radius:12px;font-size:12px;background:var(--ios-seg-bg);color:var(--ios-text);">${escapeHtml(p.persona)}</textarea>
+          <button onclick="savePresetPersona('${p.id}')" style="width:100%;padding:11px;border-radius:14px;font-size:13px;font-weight:600;background:var(--ios-blue);color:#FFF;">保存并同步至账号预设库 (rev #${p.revision + 1})</button>
+        </div>
+      `);
+    }
+
+    function savePresetPersona(presetId) {
+      const p = state.agentPresets.find(item => item.id === presetId);
+      const val = (document.getElementById('presetPersonaInput')?.value || '').trim();
+      if (p && val) { p.persona = val; p.revision += 1; }
+      closeSheet();
+      notifyIsland('预设已同步更新', '#34C759');
+      renderApp();
+    }
+
+    // ==================== TAB 4: 节点与空间 ====================
+    function selectHost(hostId) {
+      state.activeHostId = hostId;
+      const h = state.hosts.find(item => item.id === hostId);
+      if (h) notifyIsland('默认主机已切换：' + h.name, '#34C759');
+      renderApp();
+    }
+
+    function updateDailyCap(val) {
+      state.dailySummaryCapK = Number(val) || 50;
+      const el = document.getElementById('dailyCapValueText');
+      if (el) el.textContent = state.dailySummaryCapK + 'k tokens / 日';
+    }
+
+    function tightenPrivacyMode() {
+      if (state.privacyMode === 'metadata') { notifyIsland('当前已是最严格的仅元数据模式', '#FF9500'); return; }
+      state.privacyMode = 'metadata';
+      notifyIsland('已单向收紧为 metadata 隐私模式', '#34C759');
+      renderApp();
+    }
+
+    function togglePinLock() {
+      state.pinLockEnabled = !state.pinLockEnabled;
+      notifyIsland(state.pinLockEnabled ? '6 位 PIN 应用锁已启用' : '应用锁已关闭', '#1F6FEB');
+      renderApp();
+    }
+
+    function renderNodeScreen() {
+      const currentHost = state.hosts.find(h => h.id === state.activeHostId) || state.hosts[0];
+      return `
+        <div class="stack-md" style="padding:12px 16px 18px;">
+          <div class="row-between">
+            <div style="display:flex;align-items:center;gap:10px;">
+              ${marshalLogoSvg(36)}
+              <div>
+                <div style="font-size:11px;color:var(--ios-subtext);">${state.workspaceName}</div>
+                <div style="font-size:23px;font-weight:700;letter-spacing:-0.02em;display:flex;align-items:center;gap:6px;">节点与空间 <span class="ue-pin">1</span></div>
+              </div>
+            </div>
+            <button onclick="openRelayPairSheet()" style="padding:6px 12px;border-radius:999px;font-size:12px;font-weight:600;background:var(--ios-pill-bg);color:var(--ios-blue);">扫码连接</button>
+          </div>
+
+          <div class="ios-card stack-md" style="padding:14px;">
+            <span class="ue-pin" style="position:absolute;top:-8px;right:-8px;">2</span>
+            <div class="row-between" style="font-size:12px;"><span style="font-weight:600;">纯出站安全拓扑 (dshAccountHash 已核验)</span><span class="tabular-nums" style="font-weight:600;color:var(--ios-green);">${currentHost.latency}</span></div>
+            <div style="display:grid;grid-template-columns:repeat(3,1fr);align-items:center;text-align:center;padding:10px;border-radius:12px;background:var(--ios-card-secondary);">
+              <div><div style="font-size:11px;font-weight:600;">手机 Node</div><div class="tabular-nums" style="font-size:9.5px;color:var(--ios-muted);">mph1.*</div></div>
+              <div><span style="padding:2px 8px;border-radius:999px;font-size:10px;font-weight:600;background:var(--ios-blue);color:#FFF;">marshal-hub</span><div class="tabular-nums" style="font-size:9.5px;color:var(--ios-muted);margin-top:2px;">TLS + SSE</div></div>
+              <div><div style="font-size:11px;font-weight:600;">边缘主机</div><div class="tabular-nums" style="font-size:9.5px;color:var(--ios-green);">WSS mnd1.*</div></div>
+            </div>
+            <div class="stack-sm">
+              ${state.hosts.map(h => {
+                const active = h.id === state.activeHostId;
+                return `
+                  <div onclick="selectHost('${h.id}')" class="row-between ios-pressable" style="padding:10px 11px;border-radius:12px;background:${active ? 'var(--ios-pill-bg)' : 'var(--ios-card-secondary)'};border:0.5px solid ${active ? 'var(--ios-blue)' : 'var(--ios-sep)'};">
+                    <div style="min-width:0;padding-right:8px;">
+                      <div class="truncate" style="font-size:13px;font-weight:600;">${escapeHtml(h.name)}</div>
+                      <div class="truncate" style="font-size:11px;color:var(--ios-subtext);">${escapeHtml(h.os)} · ${h.sessionsCount} 会话</div>
+                    </div>
+                    <span class="tabular-nums" style="font-size:11px;font-weight:600;color:var(--ios-green);">${h.latency}</span>
+                  </div>
+                `;
+              }).join('')}
+            </div>
+          </div>
+
+          <div class="ios-card stack-sm" style="padding:14px;">
+            <div class="row-between"><span style="font-size:13px;font-weight:600;">主题色系列</span><span style="font-size:11px;color:var(--ios-muted);">白 · 黑 · DeepSeek 蓝 · Codex 紫</span></div>
+            <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;">
+              ${[
+                { id: 'white', name: '纯粹白', swatch: '#FFFFFF', ring: '#CBD5E1', dot: '#1D1D1F' },
+                { id: 'black', name: '曜石黑', swatch: '#161618', ring: '#334155', dot: '#0A84FF' },
+                { id: 'deepseek', name: 'DeepSeek 蓝', swatch: '#F6F8FF', ring: '#4D6BFE', dot: '#4D6BFE' },
+                { id: 'codex', name: 'Codex 紫', swatch: '#F8F5FF', ring: '#7C3AED', dot: '#7C3AED' }
+              ].map(th => `
+                <button onclick="setThemeSeries('${th.id}')" style="padding:8px 4px;border-radius:12px;background:var(--ios-card-secondary);border:1.5px solid ${state.themeSeries === th.id ? 'var(--ios-blue)' : 'transparent'};display:flex;flex-direction:column;align-items:center;gap:6px;">
+                  <span style="width:24px;height:24px;border-radius:999px;background:${th.swatch};border:1.5px solid ${th.ring};display:flex;align-items:center;justify-content:center;"><span style="width:10px;height:10px;border-radius:999px;background:${th.dot};"></span></span>
+                  <span style="font-size:10px;font-weight:600;">${th.name}</span>
+                </button>
+              `).join('')}
+            </div>
+          </div>
+
+          <div class="ios-card stack-md" style="padding:14px;">
+            <span class="ue-pin" style="position:absolute;top:-8px;right:-8px;">3</span>
+            <div class="row-between"><span style="font-size:13px;font-weight:600;">共享桌面账号额度与安全边界</span><span class="tabular-nums" style="font-size:11px;font-weight:600;color:var(--ios-blue);">今日 ${state.todayTokensK}k tokens</span></div>
+            <div>
+              <div class="row-between" style="font-size:11.5px;margin-bottom:4px;"><span style="color:var(--ios-subtext);">自动记忆摘要每日上限</span><span id="dailyCapValueText" class="tabular-nums">${state.dailySummaryCapK}k tokens / 日</span></div>
+              <input type="range" min="10" max="120" step="10" value="${state.dailySummaryCapK}" oninput="updateDailyCap(this.value)" style="width:100%;" />
+            </div>
+            <div class="row-between ios-hairline-t" style="padding-top:8px;font-size:12px;">
+              <div><div style="font-weight:500;">远端隐私：${state.privacyMode === 'content' ? '完整正文 (content)' : '仅元数据 (metadata)'}</div><div style="font-size:10.5px;color:var(--ios-muted);">手机仅允许单向收紧，放宽须回源主机</div></div>
+              <button onclick="tightenPrivacyMode()" style="padding:4px 10px;border-radius:8px;font-size:11px;font-weight:600;background:var(--ios-seg-bg);color:var(--ios-text);">单向收紧</button>
+            </div>
+            <div class="row-between ios-hairline-t" style="padding-top:8px;font-size:12px;">
+              <span>6 位 PIN 应用锁 (PBKDF2-SHA256)</span>
+              <button onclick="togglePinLock()" style="padding:4px 10px;border-radius:8px;font-size:11px;font-weight:600;background:${state.pinLockEnabled ? 'var(--ios-pill-bg)' : 'var(--ios-seg-bg)'};color:${state.pinLockEnabled ? 'var(--ios-blue)' : 'var(--ios-subtext)'};">${state.pinLockEnabled ? '已开启' : '已关闭'}</button>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    function openRelayPairSheet() {
+      state.activeTab = 'node';
+      renderApp();
+      openSheet(`
+        <div class="stack-md" style="padding:14px 16px 18px;">
+          <div class="sheet-handle"></div>
+          <div class="row-between"><span style="font-size:15px;font-weight:700;">扫码连接（「手机连接」一个码）</span><button onclick="closeSheet()" style="font-size:13px;color:var(--ios-subtext);">关闭</button></div>
+          <div class="stack-sm" style="padding:16px;border-radius:16px;background:#111827;color:#F9FAFB;text-align:center;">
+            <div style="width:92px;height:92px;margin:0 auto;border-radius:16px;border:2px solid #60A5FA;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;background:#0F172A;">
+              ${marshalLogoSvg(34)} <span class="tabular-nums" style="font-size:9px;color:#93C5FD;">60s 动态码</span>
+            </div>
+            <div class="tabular-nums" style="font-size:11px;color:#34D399;">marshal-pair: code=9f8a..c21e &amp; hub=marshal-hub.local</div>
+          </div>
+          <input id="relayUrlInput" type="text" value="${escapeHtml(state.customRelayUrl)}" class="tabular-nums" style="width:100%;padding:8px 11px;border-radius:12px;font-size:12px;background:var(--ios-seg-bg);color:var(--ios-text);" />
+          <button onclick="confirmPairNewHost()" style="width:100%;padding:11px;border-radius:14px;font-size:14px;font-weight:600;background:var(--ios-blue);color:#FFF;">模拟扫码接入新边缘主机</button>
+        </div>
+      `);
+    }
+
+    function confirmPairNewHost() {
+      if (!state.hosts.some(h => h.id === 'host-mac-3')) {
+        state.hosts.push({ id: 'host-mac-3', name: 'MacBook Pro 外出节点', os: 'macOS · 同账号自动入组', latency: '29ms', sessionsCount: 18 });
+      }
+      state.activeHostId = 'host-mac-3';
+      closeSheet();
+      notifyIsland('一码配对成功', '#34C759');
+      renderApp();
+    }
+
+    function renderUePanel() {
+      const badge = document.getElementById('currentScreenBadge');
+      const box = document.getElementById('ueSpecCard');
+      const specs = {
+        tickets: {
+          badge: '当前页面：1. 工单 (点开弹工单详情 → 进工单群)',
+          title: '工单详情确认与工单群解耦 · UI/UE 要点',
+          points: [
+            '【点工单先看清爽的工单详情】点击卡片弹出结构清晰的「工单详情」：展示四步阶段进度条、待确认事项与补丁变更文件 Diff（48 KiB 上限）。',
+            '【在工单详情内直接拍板确认】「确认批准执行 / 追加批次 / 驳回关单」集中置于工单详情底部拇指区，一键完成 baseRevision 确认。',
+            '【一键跳转工单群看完整讨论】详情页内设醒目的「进入工单群查看各 Agent 讨论 ›」入口，点入阅读完整协作流，左上角随时返回工单详情。'
+          ]
+        },
+        sessions: {
+          badge: state.activeChat ? '当前页面：2B. 对话详情页 (对齐 Claude / ChatGPT / Gemini)' : '当前页面：2A. 会话中心 (支持选主机 + 选 Agent 新建会话)',
+          title: '对齐 Claude / ChatGPT / Gemini 的现代会话体验 · UI/UE 要点',
+          points: [
+            '【无按钮上滑自动加载历史】取消生硬的「读取历史」按钮；在聊天流顶部向上滑动/滚轮上滚即自动触发原生 Spinner 拉取更早回合，并锁定阅读位置。',
+            '【去对勾悬浮胶囊 & 单列思考抽屉】AI 回复采用去边框全宽排版与可折叠「已深度思考」链；悬浮胶囊内整合「+」、纯净模型胶囊与思考胶囊，思考强度抽屉仅保留垂直单列卡片。',
+            '【新建会话直选主机与 Agent】点右上角新建图标弹出「1. 选择运行主机 → 2. 选择该主机智能体 → 3. 工作目录」抽屉，创建后展示带快捷提问建议的欢迎页。'
+          ]
+        },
+        marshal: {
+          badge: '当前页面：3. 智能体 (花名册预设 + 真实 3D 记忆星系)',
+          title: '桌面同源 3D 记忆星系实时绘制 · UI/UE 要点',
+          points: [
+            '【1:1 移植桌面端 MemoryGalaxy 3D 引擎】直接采用 client/index.js 同源的 110 步三维力导向布局（库仑斥力 + 标签/会话关联弹簧边 + 透视投影）与动态深空星尘 Canvas 实时绘制。',
+            '【完整触控轨道交互与属性编码】支持单指/鼠标拖拽 360° 旋转轨道、滚轮或按钮缩放；星体大小映射重要度与访问频次，透明度映射清晰度衰减，金圈代表已固定记忆。',
+            '【点选星体实时联动下方详情卡】直接点按三维空间中的任意发光星体即可高亮其关联边并检视触发场景 Cue、执行全局提案审批或二次点按确认删除。'
+          ]
+        },
+        node: {
+          badge: '当前页面：4. 节点与空间 (一码配对 · 四大主题色)',
+          title: '私人调度空间与四大主题系列 · UI/UE 要点',
+          points: [
+            '【一码配齐双通道】扫电脑端生成的 60 秒动态码即可配好 mph1 手机凭证、群聊 Cookie 与工作台，直接共享同账号下多台电脑的算力与余额。',
+            '【四大官方主题色系列】支持纯粹白、曜石黑、DeepSeek 蓝、Codex 紫四套配色，严格保持内容卡片实底不透明、仅导航与底栏磨砂的 Apple 双层材质质感。',
+            '【只收紧不放宽安全边界】保留单向隐私收紧（content → metadata）、自动记忆摘要每日上限滑块与 6 位 PIN 应用锁。'
+          ]
+        }
+      };
+
+      const cur = specs[state.activeTab] || specs.tickets;
+      if (badge) badge.textContent = cur.badge;
+      if (box) {
+        box.innerHTML = `
+          <div class="row-between">
+            <div style="font-size:14px;font-weight:600;color:#0F172A;">${cur.title}</div>
+            <span style="font-size:11px;color:#94A3B8;">${state.fidelity === 'wireframe' ? '线框图标注已开启 ①②③' : '可切至「线框图」查看热区标号'}</span>
+          </div>
+          <div class="stack-sm" style="font-size:12px;color:#475569;line-height:1.55;">
+            ${cur.points.map((p, i) => `<div style="display:flex;align-items:flex-start;gap:8px;"><span style="width:19px;height:19px;border-radius:999px;background:#EFF6FF;color:#1D4ED8;font-size:11px;font-weight:700;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:1px;">${i + 1}</span><span>${p}</span></div>`).join('')}
+          </div>
+        `;
+      }
+    }
+
+    window.addEventListener('DOMContentLoaded', () => {
+      hydrateStaticIcons();
+      renderApp();
+    });
+  </script>
+</body>
+</html>
