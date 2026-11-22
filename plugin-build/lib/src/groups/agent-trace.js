@@ -108,3 +108,13 @@ export function decodeAgentTrace(rawText) {
 export function stripAgentTrace(rawText) {
     return decodeAgentTrace(rawText).text;
 }
+
+/** Recognize the host plugins' actual signal names, not natural-language guesses. */
+export function toolAnomalyCode(...values) {
+    for (const value of values) {
+        if (typeof value !== 'string') continue;
+        if (/\bTOOL_TIMEOUT\b/i.test(value)) return 'TOOL_TIMEOUT';
+        if (/\brepeat-tool-reminder\b/i.test(value)) return 'repeat-tool-reminder';
+    }
+    return undefined;
+}

@@ -1,4 +1,35 @@
-import { encodeAgentTrace, sanitizeUsage } from './agent-trace.js';
+import { createHash } from 'node:crypto';
+import { isPermissionBlockedError } from './task-orchestration.js';
+import { encodeAgentTrace, sanitizeUsage, toolAnomalyCode } from './agent-trace.js';
+
+export function residentIncidentRecords(events, { sessionId, runId, actor, startedAt, endedAt }) {
+    const sessionKey = createHash('sha256').update(sessionId).digest('hex').slice(0, 24);
+    return events.flatMap(ev => {
+        if (!Number.isSafeInteger(ev?.seq)) return [];
+        const at = ev.timestamp;
+        if ((startedAt != null && !(at >= startedAt)) || (endedAt != null && !(at <= endedAt))) return [];
+        const data = ev.data ?? {};
+        const toolErrors = ev.type === 'tool/result' && data.message?.isError === true && Array.isArray(data.message.content)
+            ? data.message.content.map(part => part?.text).filter(text => typeof text === 'string') : [];
+        const errorDetails = [data.error?.code, data.error?.message, typeof data.error === 'string' ? data.error : undefined,
+            data.reason?.code, data.reason?.message, ...toolErrors];
+        const anomaly = toolAnomalyCode(ev.type, data.source, data.code, ...errorDetails);
+        const blocked = [data.code, ...errorDetails].some(text => text === 'isolation-violation' || isPermissionBlockedError(text));
+        return [...(anomaly ? [anomaly] : []), ...(blocked ? ['permission-blocked'] : [])].map(phase => ({
+            id: `sess-incident:${sessionKey}:${ev.seq}:${phase}`, kind: 'status', phase, text: phase,
+            actor: actor || '执行智能体', ...(runId ? { runId } : {}), ...(Number.isSafeInteger(at) ? { at } : {}),
+        }));
+    });
+}
+
+export async function persistResidentIncidents(rooms, room, records) {
+    if (!room || room.closed) return;
+    for (const record of records) {
+        if (rooms.hasEvent?.(room.id, record.id)) continue;
+        try { await rooms.append(room.id, record); }
+        catch { /* Incident reads can still report the original signal from host history. */ }
+    }
+}
 
 function joinTail(parts, maxChars = 9000) {
     if (!Array.isArray(parts) || parts.length === 0) return '';
@@ -49,7 +80,7 @@ function addEventUsage(acc, rawUsage) {
  * workflows when the turn completes, and returns a live in-flight bubble while active.
  */
 export async function syncResidentSessionToRoom({
-    surface, rooms, room, sessionId, actor, runId, workflowState, onTurnCompleted,
+    surface, rooms, room, sessionId, actor, runId, workflowState, onTurnCompleted, startedAt, endedAt, captureIncidents = true,
 }) {
     if (!surface || typeof surface.history !== 'function' || !rooms || !room || !sessionId) {
         return undefined;
@@ -182,6 +213,7 @@ export async function syncResidentSessionToRoom({
     const cleanUsage = sanitizeUsage(cumulativeUsage);
 
     if (!room.closed) {
+        if (captureIncidents) await persistResidentIncidents(rooms, room, residentIncidentRecords(turnEvents, { sessionId, runId, actor, startedAt, endedAt }));
         for (const msg of assistantMessages) {
             const detId = `sess-msg:${shortSess}:${msg.seq}`;
             if (rooms.hasEvent?.(room.id, detId)) continue;

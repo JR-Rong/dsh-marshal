@@ -51,7 +51,12 @@ export function createTaskRooms({ store, deviceId, hub, now = Date.now, eventBus
         return active;
     };
     // Only publish a cursor; consumers still fetch message content through the room API.
-    const emitMessage = (roomId, record) => eventBus?.emit('room.message', { roomId, seq: record.seq });
+    const emitMessage = (roomId, record) => {
+        eventBus?.emit('room.message', { roomId, seq: record.seq });
+        if (record.kind === 'status' && ['repeat-tool-reminder', 'TOOL_TIMEOUT', 'permission-blocked'].includes(record.phase)) {
+            eventBus?.emit('incidents.changed');
+        }
+    };
     const append = async (id, event) => {
         let room = store.get(id);
         if (!room) throw taskError('task-room-not-found', '此工单群由原设备管理。');

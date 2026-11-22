@@ -302,16 +302,19 @@ function parseRunRequestBody(value) {
 	if (body === void 0 || !exactKeys(body, [
 		"teamId",
 		"memberId",
-		"firstMessage"
+		"firstMessage",
+		"purpose"
 	])) return void 0;
 	const teamId = definitionId(body.teamId);
 	const memberId = definitionId(body.memberId);
 	if (teamId === void 0 || memberId === void 0) return void 0;
 	if (body.firstMessage !== void 0 && !boundedString(body.firstMessage, 32e3)) return void 0;
+	if (body.purpose !== void 0 && body.purpose !== "direct" && body.purpose !== "ticket") return void 0;
 	const firstMessage = typeof body.firstMessage === "string" && body.firstMessage.trim() !== "" ? body.firstMessage : void 0;
 	return {
 		teamId,
 		memberId,
+		...body.purpose === void 0 ? {} : { purpose: body.purpose },
 		...firstMessage === void 0 ? {} : { firstMessage }
 	};
 }
@@ -1946,6 +1949,7 @@ function readRunRow(value) {
 		sessionId: row.sessionId,
 		createdAt: row.createdAt,
 		status: row.status,
+		...(kind === "member" && (row.purpose === "direct" || row.purpose === "ticket")) ? { purpose: row.purpose } : {},
 		...row.failure === void 0 ? {} : { failure: row.failure },
 		...kind === "squad" ? { kind: "squad" } : {},
 		...row.goal === void 0 ? {} : { goal: row.goal }
@@ -2608,17 +2612,18 @@ var AgentsHostService = class {
 		} catch (error) {
 			throw new AgentsError("session-create-failed", "the host refused to create the member session: " + describe(error));
 		}
+		const fail = (code, message) => this.failRun(team, member, sessionId, code, message, request.purpose);
 		const title = team.name + " / " + member.name;
 		try {
 			await this.gateway.renameSession(sessionId, title);
 		} catch (error) {
-			throw this.failRun(team, member, sessionId, "session-rename-failed", "the session could not be renamed to \"" + title + "\": " + describe(error));
+			throw fail("session-rename-failed", "the session could not be renamed to \"" + title + "\": " + describe(error));
 		}
 		try {
 			if (member.permission !== void 0) await this.gateway.applyPermission(sessionId, member.permission);
 			if (route !== void 0) await this.gateway.selectModel(sessionId, route, member.reasoningEffort);
 		} catch (error) {
-			throw this.failRun(team, member, sessionId, "session-pin-failed", "the session refused the pinned permission or model: " + describe(error));
+			throw fail("session-pin-failed", "the session refused the pinned permission or model: " + describe(error));
 		}
 		if (request.firstMessage !== void 0) try {
 			await this.gateway.prompt({
@@ -2626,9 +2631,9 @@ var AgentsHostService = class {
 				text: request.firstMessage
 			});
 		} catch (error) {
-			throw this.failRun(team, member, sessionId, "session-prompt-failed", "the first message could not be queued: " + describe(error));
+			throw fail("session-prompt-failed", "the first message could not be queued: " + describe(error));
 		}
-		return this.recordRun(team, member, sessionId, "running");
+		return this.recordRun(team, member, sessionId, "running", undefined, request.purpose);
 	}
 	/** Release the owner lock. Idempotent. */
 	dispose() {
@@ -2751,11 +2756,11 @@ var AgentsHostService = class {
 	* Append a failed run record for a session that exists, and return the error to
 	* throw. A session this Host opened is never left without its record.
 	*/
-	failRun(team, member, sessionId, code, message) {
-		this.recordRun(team, member, sessionId, "failed", message);
+	failRun(team, member, sessionId, code, message, purpose) {
+		this.recordRun(team, member, sessionId, "failed", message, purpose);
 		return new AgentsError(code, message);
 	}
-	recordRun(team, member, sessionId, status, failure) {
+	recordRun(team, member, sessionId, status, failure, purpose) {
 		const run = {
 			id: this.idFactory(),
 			teamId: team.id,
@@ -2763,6 +2768,7 @@ var AgentsHostService = class {
 			sessionId,
 			createdAt: this.now(),
 			status,
+			...purpose === void 0 ? {} : { purpose },
 			...failure === void 0 ? {} : { failure }
 		};
 		this.requireLedger().mutate((document) => {

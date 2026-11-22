@@ -32,11 +32,12 @@ export function parseRoomMentions(text) {
     return out;
 }
 
-export async function readOperatorNotes(rooms, roomId) {
+export async function readOperatorNotes(rooms, roomId, omitGuidance) {
     if (!rooms || !roomId) return '';
     try {
         const page = await rooms.page(roomId, { limit: 80 });
-        const items = (page.records ?? []).filter(r => r.kind === 'user' && r.phase !== 'brief');
+        const items = (page.records ?? []).filter(r => r.kind === 'user' && r.phase !== 'brief' &&
+            !(omitGuidance && r.phase === 'guidance' && r.text === omitGuidance));
         if (items.length === 0) return '';
         return items.slice(-12).map(r => '- [' + new Date(r.at).toISOString() + '] ' + r.text.trim()).join('\n').slice(-6000);
     } catch {
@@ -99,7 +100,7 @@ export function taskRoomAudit(rooms, room, reason, leader, remoteTarget, allowMe
 export function createTaskRoomRoutes({
     exact, write, readBody, authenticate, allowed, auth, rooms, orchestration, getBoard, boardSource, getInitiator,
     ticketNumbers, workspacePath, normalizeAttachments, resolveAttachments, surface, moveCardStatus,
-    getEffectiveCard, saveCardPromptOverride, launchPlainCardWithOverrides, patchStore, steerResidentSession, eventBus,
+    getEffectiveCard, saveCardPromptOverride, launchPlainCardWithOverrides, patchStore, steerResidentSession, eventBus, clearPermissionBlock,
 }) {
     const viewRoom = room => visibleTaskRoom(room, ticketNumbers);
     const operations = new Set();
@@ -202,10 +203,9 @@ export function createTaskRoomRoutes({
             const card = rawCard && typeof getEffectiveCard === 'function' ? getEffectiveCard(room.source, rawCard) : rawCard;
             const mentions = parseRoomMentions(text);
             const mentionAll = mentions.some(m => m.toLowerCase() === 'all' || m === '所有人' || m === '全体');
-            const cardExecSessionId = Array.isArray(card?.executions)
-                ? [...card.executions].reverse().find(ex => typeof ex?.sessionId === 'string' && ex.sessionId !== '')?.sessionId
-                : undefined;
-            const residentSessionId = workflowView?.sessionId || (!workflowView ? (card?.sessionId || cardExecSessionId) : undefined);
+            const currentExecution = card?.executions?.at(-1);
+            const cardExecSessionId = currentExecution?.sessionId;
+            const residentSessionId = workflowView?.sessionId || (!workflowView ? (cardExecSessionId || (!currentExecution ? card?.sessionId : undefined)) : undefined);
             const residentOwnerName = workflowView?.leaderName || extractAgentTag(card) || '执行智能体';
             const targetsResident = Boolean(
                 !target
@@ -288,7 +288,7 @@ export function createTaskRoomRoutes({
         finally { chatOperations.delete(room.id); }
     };
 
-    const confirmReview = async ({ room, card, body, access, initiatorTag }) => {
+    const confirmReview = async ({ room, card, body, access, initiatorTag, guidance }) => {
         const source = room?.source ?? boardSource();
         if (room) assertIdle(room);
         else orchestration?.assertIdle(source, card.id);
@@ -341,6 +341,7 @@ export function createTaskRoomRoutes({
                 snapshot = await board.apply(randomUUID(), { kind: 'move', taskId: card.id, status: 'done' }, initiatorTag ?? ('marshal:' + getInitiator()));
             }
             orchestration?.syncStatus?.(source, card.id, 'done');
+            clearPermissionBlock?.(source, card.id);
             return {
                 snapshot,
                 patchApplied,
@@ -354,7 +355,7 @@ export function createTaskRoomRoutes({
         }
     };
 
-    const reviseTask = async ({ room: initialRoom, card, body, access, initiatorTag }) => {
+    const reviseTask = async ({ room: initialRoom, card, body, access, initiatorTag, guidance }) => {
         const source = initialRoom?.source ?? boardSource();
         const workflow = orchestration?.target(source, card.id);
         let room = initialRoom;
@@ -386,6 +387,7 @@ export function createTaskRoomRoutes({
             }
             const board = getBoard();
             let snapshot = board?.snapshot();
+            let woken = false;
             if (workflow) {
                 if (!orchestration) throw unavailable();
                 orchestration.cancel?.(source, card.id);
@@ -398,18 +400,30 @@ export function createTaskRoomRoutes({
                 }
                 const audit = room ? taskRoomAudit(rooms, room, 'revise', undefined, workflow.remoteTarget, member => allowed(access, member)) : undefined;
                 if (audit && seedPatch) audit.seedPatch = seedPatch;
-                orchestration.start(source, card, audit);
+                if (audit && guidance) audit.guidance = guidance;
+                const started = orchestration.start(source, card, audit);
+                if (guidance && audit && started) {
+                    // A new orchestration batch accepts the pinned guidance. Plain
+                    // host runs instead need the execution/session check below.
+                    const runId = orchestration.target(source, card.id)?.runId;
+                    woken = Boolean(runId && runId !== workflow.runId);
+                }
+                clearPermissionBlock?.(source, card.id);
                 if (board && card.status !== 'running') {
                     try {
                         snapshot = await board.apply(randomUUID(), { kind: 'move', taskId: card.id, status: 'running' }, initiatorTag ?? ('marshal:' + getInitiator()));
                     } catch { snapshot = board.snapshot(); }
                 }
             } else if (board) {
-                const notes = room ? await readOperatorNotes(rooms, room.id) : (feedbackText ? '- ' + feedbackText : '');
+                const notes = room ? await readOperatorNotes(rooms, room.id, guidance) : (feedbackText ? '- ' + feedbackText : '');
                 let nextPrompt;
-                if (notes) {
+                if (notes || guidance) {
                     const basePrompt = String(card.prompt || card.description || card.title || '').replace(/\n\n【机主补充修正意见】[\s\S]*$/, '');
-                    nextPrompt = (basePrompt + '\n\n【机主补充修正意见】\n' + notes).slice(0, 15_000);
+                    const heading = '\n\n【机主补充修正意见】\n';
+                    nextPrompt = guidance
+                        ? (basePrompt.slice(0, 15_000 - heading.length - guidance.length) + heading + guidance
+                            + (notes ? '\n\n' + notes : '')).slice(0, 15_000)
+                        : (basePrompt + heading + notes).slice(0, 15_000);
                     if (typeof saveCardPromptOverride === 'function') {
                         snapshot = await saveCardPromptOverride(source, card, nextPrompt, initiatorTag ?? ('marshal:' + getInitiator()));
                     } else {
@@ -420,13 +434,15 @@ export function createTaskRoomRoutes({
                     await rooms.begin(room.id, randomUUID(), 'Marshal', 'revise', '按群内修正意见重新启动工单执行');
                 }
                 if (typeof launchPlainCardWithOverrides === 'function') {
-                    snapshot = await launchPlainCardWithOverrides(source, card.id, initiatorTag ?? ('marshal:' + getInitiator()), nextPrompt);
+                    snapshot = await launchPlainCardWithOverrides(source, card.id, initiatorTag ?? ('marshal:' + getInitiator()), nextPrompt, guidance);
+                    woken = Boolean(guidance); // Guided launches resolve only after confirmation.
                 } else {
                     snapshot = await board.apply(randomUUID(), { kind: 'run', taskId: card.id }, initiatorTag ?? ('marshal:' + getInitiator()));
                 }
             }
             return {
                 snapshot,
+                ...(guidance ? { woken } : {}),
                 room: room ? viewRoom((await rooms.page(room.id, { limit: 1 })).room) : undefined,
             };
         }
@@ -480,8 +496,9 @@ export function createTaskRoomRoutes({
             const rawCard = origin ? getBoard()?.snapshot().tasks?.find(task => task.id === page.room.taskId) : undefined;
             const card = rawCard && typeof getEffectiveCard === 'function' ? getEffectiveCard(page.room.source, rawCard) : rawCard;
             const liveBubbles = origin ? [...(orchestration?.live?.(page.room.source, page.room.taskId) ?? [])] : [];
+            const currentExecution = card?.executions?.at(-1);
             const cardExecSessionId = Array.isArray(card?.executions)
-                ? [...card.executions].reverse().find(ex => typeof ex?.sessionId === 'string' && ex.sessionId !== '')?.sessionId
+                ? card.executions.findLast(ex => typeof ex?.sessionId === 'string' && ex.sessionId !== '')?.sessionId
                 : undefined;
             const residentSessionId = origin
                 ? (workflowView?.sessionId || (!workflowView ? (card?.sessionId || cardExecSessionId) : undefined))
@@ -496,6 +513,8 @@ export function createTaskRoomRoutes({
                     actor: workflowView?.leaderName || extractAgentTag(card) || '执行智能体',
                     runId: page.room.runId ?? workflowView?.runId,
                     workflowState: workflowView?.state,
+                    ...(currentExecution ? { startedAt: currentExecution.startedAt, endedAt: currentExecution.endedAt,
+                        captureIncidents: currentExecution.sessionId === residentSessionId } : {}),
                     onTurnCompleted: async (reason, lastText) => {
                         if (reason === 'completed') {
                             orchestration?.syncStatus?.(page.room.source, page.room.taskId, 'review', {
