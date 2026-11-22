@@ -6,9 +6,6 @@ import test from 'node:test';
 import { createAgentMemoryService, mountAgentMemory, resolveMemoryIdentity, resolveWorkspaceIdForCwd, workspaceKey } from '../lib/src/memory/agent-memory.js';
 import { parseDotEdges } from '../lib/src/memory/mnemon-native.js';
 import { createMemoryHttpAuth, hostIsLoopback } from '../lib/src/memory/http-auth.js';
-import { createMemoryBridge } from '../lib/src/superagent/memory.js';
-import { findMember, resolveAgentForTask } from '../lib/src/superagent/agents.js';
-import { defaultSettings } from '../lib/src/superagent/settings.js';
 import { parseModelJson, VerdictSchema } from '../lib/src/groups/task-plans.js';
 import { createTaskOrchestration, isPermissionBlockedError } from '../lib/src/groups/task-orchestration.js';
 import { createWorkspaceRosters } from '../lib/src/groups/workspace-rosters.js';
@@ -18,36 +15,9 @@ import { memoryTargetAllowed } from '../lib/src/memory/http-auth.js';
 import { parseConfig } from '../lib/src/config.js';
 import { createLocalBoard } from '../lib/src/groups/local-board.js';
 import { detectAmbiguousTask } from '../lib/src/groups/mount.js';
-import { createSuperagentBridge, mountSuperagent } from '../lib/src/superagent/mount.js';
-import { agentsFixture, createFakeBoard, createFakeContext, createFakeMemory, loggerFixture, memberFixture, taskFixture } from './superagent-support.js';
 
 const tempRoot = () => mkdtempSync(join(tmpdir(), 'marshal-pr7-fixes-'));
 const mnemonBin = process.env.MARSHAL_TEST_MNEMON;
-
-test('superagent memory bridge never leaks private or never-group memories onto shared board cards', async (t) => {
-    const root = tempRoot();
-    const service = createAgentMemoryService({
-        root,
-        ...(mnemonBin ? { mnemonPilot: { agentId: 'agent-a', executable: mnemonBin } } : {}),
-    });
-    t.after(() => { service.store.close(); rmSync(root, { recursive: true, force: true }); });
-
-    await service.rememberFor({ agentId: 'agent-a', workspaceId: 'ws-1', scope: 'agent', title: 'Secret Key', text: 'PRIVATE_TOKEN_XYZ', visibility: 'private' });
-    await service.rememberFor({ agentId: 'agent-a', workspaceId: 'ws-1', scope: 'agent', title: 'Never Group', text: 'NEVER_GROUP_SECRET', visibility: 'never-group' });
-    await service.rememberFor({ agentId: 'agent-a', workspaceId: 'ws-1', scope: 'agent', title: 'Shared Checklist', text: 'SAFE_CHECKLIST_ITEM', visibility: 'group-safe' });
-    await service.rememberFor({ agentId: 'agent-a', workspaceId: 'ws-2', scope: 'workspace', title: 'Other Workspace', text: 'OTHER_WS_ITEM', visibility: 'group-safe' });
-    if (mnemonBin) {
-        await service.rememberFor({ agentId: 'agent-a', workspaceId: 'ws-2', scope: 'agent', title: 'Other Workspace Private', text: 'OTHER_WS_MNEMON_ITEM', visibility: 'group-safe' });
-    }
-
-    const bridge = createMemoryBridge(service);
-    const recalled = await bridge.recall({ agentId: 'agent-a', workspaceId: 'ws-1', text: 'Secret Key Never Group Shared Checklist Other Workspace', limit: 6 });
-    assert.doesNotMatch(recalled.text, /PRIVATE_TOKEN_XYZ/);
-    assert.doesNotMatch(recalled.text, /NEVER_GROUP_SECRET/);
-    assert.doesNotMatch(recalled.text, /OTHER_WS_ITEM/);
-    if (mnemonBin) assert.doesNotMatch(recalled.text, /OTHER_WS_MNEMON_ITEM/);
-    assert.match(recalled.text, /SAFE_CHECKLIST_ITEM/);
-});
 
 test('memory http-auth requires connection admission for desktop mode and blocks DNS rebinding Host headers', async () => {
     assert.equal(hostIsLoopback('127.0.0.1:53478'), true);
@@ -142,18 +112,9 @@ test('Mnemon native updates metadata on duplicate content and injects pinned pro
     assert.match(prompt, /先跑回归再打包/);
 });
 
-test('parseModelJson tolerates prose around JSON fences and superagent disambiguates duplicate names by workspace', () => {
+test('parseModelJson tolerates prose around JSON fences', () => {
     const wrapped = '审查结论如下：\n```json\n{"verdict":"pass","findings":"ok"}\n```\n以上。';
     assert.deepEqual(parseModelJson(wrapped, VerdictSchema), { verdict: 'pass', findings: 'ok' });
-
-    const members = [
-        { id: 'm1', name: '丞相', teamId: 't1', teamWorkspaceId: 'ws-1', legacy: false },
-        { id: 'm2', name: '丞相', teamId: 't2', teamWorkspaceId: 'ws-2', legacy: false },
-    ];
-    assert.equal(findMember(members, '丞相'), undefined);
-    assert.equal(findMember(members, '丞相', 'ws-2')?.id, 'm2');
-    const resolved = resolveAgentForTask({ id: 'card-1', workspaceId: 'ws-2', tags: [{ name: '@丞相' }] }, defaultSettings(), members);
-    assert.equal(resolved.member?.id, 'm2');
 });
 
 test('task orchestration matches bare model ids and clips oversize handoffs instead of failing', async (t) => {
@@ -197,36 +158,6 @@ test('shipped client keeps plain card create/run working and sends auth for task
     assert.ok(source.includes('api/task-board/model-catalog'), 'board should load models and reasoning efforts');
     assert.ok(source.includes('api/task-board/attachments/upload'), 'board should support optional attachment uploads');
     assert.ok(source.includes('指派 Agent Leader'), 'board should support assigning an Agent Leader');
-});
-
-test('mountSuperagent adopts connection trust with only the real connection service (no connection.authentication)', async () => {
-    const context = createFakeContext({
-        taskBoard: createFakeBoard(),
-        memory: createFakeMemory(),
-        logger: loggerFixture(),
-        connection: {
-            requestRejection(req) {
-                return String(req.headers.cookie ?? '').includes('dsh-auth-live=ok') ? undefined : 401;
-            },
-        },
-    });
-    try {
-        mountSuperagent(context, { agents: ['dsh'] }, { root: tempRoot(), memory: createFakeMemory(), logger: context.logger, reconcileDelayMs: -1 });
-        const route = context.routes.find(item => item.path === '/api/marshal-superagent/human-create');
-        assert.ok(route);
-        const invoke = async headers => {
-            let status = 0;
-            const req = { method: 'POST', headers, socket: { remoteAddress: '127.0.0.1' }, async *[Symbol.asyncIterator]() { yield Buffer.from('{"taskId":"t1","source":"board-ui"}'); } };
-            const res = { writeHead(code) { status = code; }, end() {} };
-            await route.handler(req, res);
-            return status;
-        };
-        assert.equal(await invoke({ host: '127.0.0.1:56822', 'content-type': 'application/json' }), 403);
-        assert.notEqual(await invoke({ host: '127.0.0.1:56822', 'content-type': 'application/json', cookie: 'dsh-auth-live=ok' }), 403);
-    }
-    finally {
-        context.close();
-    }
 });
 
 test('local board supports moving tasks across all six columns including review', async (t) => {
@@ -653,90 +584,6 @@ test('POST /marshal/memory/remember forwards cue and shipped client .22 exposes 
 });
 
 // --- .23 universal todo auto-dispatch regardless of trigger source ---
-test('superagent auto-dispatches any todo card regardless of trigger source (tool, marshal UI, move from backlog) while skipping backlog/review/scheduled/already-recorded', async () => {
-    const dir = tempRoot();
-    const backlogCard = taskFixture({ id: 'card-backlog', title: '待规划卡', status: 'backlog', workspaceId: 'ws-canonical-1' });
-    const reviewCard = taskFixture({ id: 'card-review', title: '待确认卡', status: 'review' });
-    const scheduledCard = taskFixture({ id: 'card-sched', title: '定时卡', status: 'todo', schedule: { enabled: true, mode: 'cron', cron: '0 9 * * *' } });
-    const board = createFakeBoard({ tasks: [backlogCard, reviewCard, scheduledCard] });
-    // Extend fake board apply() to handle create & move like the real Host task board
-    const baseApply = board.apply;
-    const extraTasks = [backlogCard, reviewCard, scheduledCard];
-    const listeners = new Set();
-    const origSub = board.subscribe;
-    const origSnap = board.snapshot;
-    let customTasks = structuredClone(extraTasks);
-    const fakeBoard = {
-        ...board,
-        actions: [],
-        snapshot: () => ({ tasks: structuredClone(customTasks), sessionDefaultPermission: 'danger-full-access' }),
-        subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
-        async apply(requestId, action, initiator) {
-            fakeBoard.actions.push({ requestId, action, initiator });
-            if (action.kind === 'create') {
-                customTasks.push({
-                    id: action.id, status: 'todo', executions: [], createdAt: Date.now(), updatedAt: Date.now(),
-                    ...action.input,
-                });
-            } else if (action.kind === 'move') {
-                const t = customTasks.find(x => x.id === action.taskId);
-                if (t) { t.status = action.status; t.updatedAt = Date.now(); }
-            } else if (action.kind === 'update') {
-                const t = customTasks.find(x => x.id === action.taskId);
-                if (t) Object.assign(t, action.patch, { updatedAt: Date.now() });
-            } else if (action.kind === 'run') {
-                const t = customTasks.find(x => x.id === action.taskId);
-                if (t) {
-                    t.status = 'running';
-                    t.executions = [...t.executions, { id: 'exec-' + (t.executions.length + 1), startedAt: Date.now(), sessionId: 'sess-' + t.id }];
-                }
-            }
-            for (const fn of listeners) fn();
-            return fakeBoard.snapshot();
-        },
-        registerExtension: () => () => {},
-    };
-    const memory = createFakeMemory([{ id: 'm-ws', scope: 'workspace', ownerId: 'ws-canonical-1', title: '工作区规范', content: '使用规范 UUID', kind: 'fact' }]);
-    const memberNoWs = memberFixture({ id: 'cx-id', name: '丞相', teamWorkspaceId: undefined, brief: '你是丞相。' });
-    const bridge = createSuperagentBridge({
-        root: dir,
-        memory,
-        readAgents: () => agentsFixture([memberNoWs]),
-        logger: loggerFixture(),
-        reconcileDelayMs: 20,
-        trustedRequest: () => true,
-    });
-    try {
-        bridge.configure({ defaultAgent: '丞相' });
-        bridge.setBoard(fakeBoard);
-        await new Promise(r => setTimeout(r, 80));
-        // backlog, review, scheduled todo must NOT be dispatched
-        assert.equal(fakeBoard.actions.filter(a => a.action.kind === 'run').length, 0);
-
-        // 1. Card created directly via tool / Marshal UI (no browser hook!) -> auto-dispatched!
-        await fakeBoard.apply('r1', { kind: 'create', id: 'card-tool', input: { title: '工具建卡', description: '不经旧钩子', prompt: '执行任务', workspaceId: 'ws-canonical-1' } }, 'agent-tool');
-        await new Promise(r => setTimeout(r, 120));
-        assert.equal(customTasks.find(t => t.id === 'card-tool').status, 'running', 'todo card created from any source must auto-wake agent');
-        assert.equal(bridge.stateStore.get('card-tool').source, 'todo');
-        assert.equal(bridge.stateStore.get('card-tool').workspaceId, 'ws-canonical-1', 'card workspaceId must flow into superagent state & memory recall');
-        assert.ok(memory.recalls.some(q => q.scope === 'workspace' && q.workspaceId === 'ws-canonical-1'), 'workspace memory must be recalled from card workspaceId even when member has no teamWorkspaceId');
-
-        // 2. Backlog card moved to todo -> auto-dispatched!
-        await fakeBoard.apply('r2', { kind: 'move', taskId: 'card-backlog', status: 'todo' }, 'marshal');
-        await new Promise(r => setTimeout(r, 120));
-        assert.equal(customTasks.find(t => t.id === 'card-backlog').status, 'running', 'backlog card moved into todo must auto-wake agent');
-
-        // 3. Subsequent board changes must never double-dispatch already-running cards
-        await new Promise(r => setTimeout(r, 80));
-        assert.equal(fakeBoard.actions.filter(a => a.action.kind === 'run' && a.action.taskId === 'card-tool').length, 1);
-        assert.equal(fakeBoard.actions.filter(a => a.action.kind === 'run' && a.action.taskId === 'card-backlog').length, 1);
-    }
-    finally {
-        bridge.close();
-        rmSync(dir, { recursive: true, force: true });
-    }
-});
-
 test('groups/mount.js persists workspaceId on board create and task-development.js explains non-Git workspace errors clearly', () => {
     const gmSrc = readFileSync(new URL('../lib/src/groups/mount.js', import.meta.url), 'utf8');
     assert.ok(gmSrc.includes('cardWorkspaceId'), 'POST /marshal/tasks/create should persist workspaceId onto the task-board card');

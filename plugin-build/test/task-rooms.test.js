@@ -129,6 +129,24 @@ test('Hub migration resumes after a partial upload and a lost commit response', 
     await assert.rejects(restarted.handle(reader, { action: 'page', roomId: room.id, workspaceId: workspace }), { code: 'workspace-forbidden' });
 });
 
+test('Hub-backed append only publishes an inserted cursor, including overlapping identical requests', async t => {
+    const f = fixtures(t);
+    const hub = f.newHub(f.open('hub'));
+    const origin = f.devices.get('origin-device');
+    const observed = [];
+    const rooms = createTaskRooms({
+        store: f.open('local'), deviceId: origin.id, hub: input => hub.handle(origin, input),
+        eventBus: { emit: (...value) => observed.push(value) },
+    });
+    const room = rooms.ensure('host', { id: 'card', title: 'Hub room' }, workspace, owner);
+    await rooms.promote(room.id, peer);
+    const entry = { id: 'message', at: 42, kind: 'user', actor: 'owner', text: 'one message' };
+    const [first, replay] = await Promise.all([rooms.append(room.id, entry), rooms.append(room.id, entry)]);
+    assert.deepEqual(replay, first);
+    assert.deepEqual(await rooms.append(room.id, entry), first);
+    assert.deepEqual(observed, [['room.message', { roomId: room.id, seq: 1 }]]);
+});
+
 test('Hub admits a workspace-bound remote turn and attributes a late reply to its original group and batch', async t => {
     const f = fixtures(t);
     const hubStore = f.open('hub');

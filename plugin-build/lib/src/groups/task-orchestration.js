@@ -76,7 +76,7 @@ function chooseTemplate(reply, enabled) {
 
 export function createTaskOrchestration({
     file, inventory, memory, port, defaultModel, startLeader, workspacePath, readPr = readPullRequest, logger,
-    leaderAutoReview = false, onPermissionBlocked, onState, resolveAttachments, readCard, patchStore,
+    leaderAutoReview = false, onPermissionBlocked, onState, resolveAttachments, readCard, patchStore, eventBus,
 }) {
     const tasks = load(file);
     const active = new Map();
@@ -88,14 +88,19 @@ export function createTaskOrchestration({
     const save = () => atomicWriteFile(file, JSON.stringify({ version: 1, tasks: [...tasks.values()] }) + '\n');
     const update = (key, patch) => {
         const previous = tasks.get(key);
-        tasks.set(key, { ...previous, ...patch });
+        const next = { ...previous, ...patch };
+        tasks.set(key, next);
         try { save(); }
         catch (error) {
             if (previous) tasks.set(key, previous);
             else tasks.delete(key);
             throw error;
         }
-        return tasks.get(key);
+        if (!disposed && previous && (previous.state !== next.state || previous.phase !== next.phase)) {
+            eventBus?.emit('tasks.changed');
+            eventBus?.emit('incidents.changed');
+        }
+        return next;
     };
     const leaders = () => (inventory().teams ?? []).flatMap(team => {
         const global = isGlobalAgentTeam(team);

@@ -248,7 +248,7 @@ export function createMemoryHttpAuth({ now = Date.now, resolveOwner = async () =
                 ],
             };
         },
-        authenticate(req, { write = false, origins = allowedOrigins } = {}) {
+        authenticate(req, { write = false, origins = allowedOrigins, touch = true } = {}) {
             if (!isLoopbackAddress(req.socket?.remoteAddress ?? '') || !hostOk(req)) return { ok: false, status: 403, code: 'forbidden' };
             if (req.headers?.['sec-fetch-site'] === 'cross-site') return { ok: false, status: 403, code: 'forbidden' };
             const native = desktop(req);
@@ -264,7 +264,7 @@ export function createMemoryHttpAuth({ now = Date.now, resolveOwner = async () =
                 return { ok: false, status: 401, code: 'unauthorized' };
             }
             if (write && !csrfMatches(req, session)) return { ok: false, status: 403, code: 'memory-csrf-mismatch' };
-            session.lastSeenAt = at;
+            if (touch) session.lastSeenAt = at;
             return { ok: true, session };
         },
         loadWorkspaces,

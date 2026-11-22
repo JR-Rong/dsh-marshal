@@ -30,7 +30,7 @@ const git = async (cwd, args, signal, allowDifference = false) => {
             throw taskError('development-patch-too-large', '开发补丁超过自动审查的最大缓冲上限（2 MiB），请按模块拆分工单。');
         }
         if (/not a git repository/i.test(String(error.stderr ?? ''))) {
-            throw taskError('development-root-required', '所选工作区（' + cwd + '）不是 Git 仓库根目录；「开发交付」模板需要绑定具体 Git 仓库的工作区，或改用普通模式 / Superagent 直接唤醒智能体。');
+            throw taskError('development-root-required', '所选工作区（' + cwd + '）不是 Git 仓库根目录；请选择绑定到 Git 仓库根目录的工作区，或在任务看板中使用普通模式。');
         }
         throw taskError('development-git', '无法读取或创建该工作区的 Git 审查副本。');
     }

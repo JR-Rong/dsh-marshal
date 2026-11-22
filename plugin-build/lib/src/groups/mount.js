@@ -11,6 +11,7 @@ import { agentsLedgerPath, readAgentsLedger } from './inventory.js';
 import { createAgentDrafter } from './draft.js';
 import { createCrossClient } from './cross-client.js';
 import { createLocalBoard } from './local-board.js';
+import { createMarshalEventBus } from './event-bus.js';
 import { createTaskRooms } from './task-rooms.js';
 import { createTaskRoomStore, TaskRoomKey } from './task-room-store.js';
 import { createTaskRoomRoutes, taskRoomAccess, taskRoomAudit, visibleTaskRoom } from './task-room-routes.js';
@@ -369,8 +370,13 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
     const {
         root: groupsRootDir, rosters, ticketNumbers, sessionTitles, sessionController, config, llm, readDefaultModel,
         workspacePath, webOrigin, getAttachmentStore, resolveAttachments, surface: dshSurface, moveCardStatus,
-        taskOverrides: injectedTaskOverrides, patchStore: injectedPatchStore,
+        taskOverrides: injectedTaskOverrides, patchStore: injectedPatchStore, eventBus, eventStreams,
     } = extras;
+    const writeMutation = (res, value, ...topics) => {
+        write(res, 200, value);
+        for (const topic of topics) eventBus.emit(topic);
+    };
+    const writeTaskMutation = (res, value) => writeMutation(res, value, 'tasks.changed', 'incidents.changed');
     const patchStore = injectedPatchStore ?? (groupsRootDir ? createPatchStore(join(groupsRootDir, 'patches')) : undefined);
     const taskOverrides = injectedTaskOverrides ?? createTaskOverrides(groupsRootDir ? join(groupsRootDir, 'task-overrides.json') : undefined);
     const effectiveCard = (source, task) => task ? taskOverrides.applyTo(source, task) : undefined;
@@ -387,7 +393,8 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
         }
         return board.apply(requestId, action, actionInitiator);
     };
-    const authenticate = (req, write = false) => auth.authenticate(req, { write, origins: allowedOrigins() });
+    const authenticate = (req, write = false, { touch = true } = {}) =>
+        auth.authenticate(req, { write, origins: allowedOrigins(), touch });
     const allowed = (access, target, ledger) => access.ok && auth.allows(access.session, {
         agentId: target.agentId, workspaceId: target.workspaceId,
     }, ledger);
@@ -576,7 +583,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
         ticketNumbers, workspacePath, normalizeAttachments: normalizeAttachmentsPayload, resolveAttachments,
         surface: dshSurface, moveCardStatus,
         getEffectiveCard: effectiveCard, saveCardPromptOverride, launchPlainCardWithOverrides,
-        patchStore, steerResidentSession,
+        patchStore, steerResidentSession, eventBus,
     });
     return [
         ...roomRoutes.routes,
@@ -591,7 +598,62 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
                 agentMemory: memory !== undefined,
             }));
         }, true),
-        ...createMemoryRoutes({ memory, auth, allowedOrigins }).map(route => exact(route.method, route.path, route.handler, true)),
+        exact('GET', '/marshal/events', (req, res) => {
+            const initialAccess = authenticate(req, false);
+            if (initialAccess.ok !== true) { write(res, 403, { ok: false, code: initialAccess.code }); return; }
+            res.writeHead(200, {
+                'content-type': 'text/event-stream; charset=utf-8',
+                'cache-control': 'no-cache, no-transform',
+                'connection': 'keep-alive',
+                'x-accel-buffering': 'no',
+            });
+            let timer;
+            let unsubscribe;
+            let closed = false;
+            const cleanup = () => {
+                if (closed) return false;
+                closed = true;
+                clearInterval(timer);
+                unsubscribe?.();
+                req.off('close', stop);
+                res.off('close', stop);
+                eventStreams.delete(stop);
+                return true;
+            };
+            const stop = () => {
+                if (cleanup() && !res.destroyed) res.destroy?.();
+            };
+            const reauthenticate = () => {
+                if (closed) return;
+                // Outbound traffic is not session activity.
+                const access = authenticate(req, false, { touch: false });
+                if (access.ok === true) return access;
+                stop();
+            };
+            const safeWrite = chunk => {
+                if (closed) return;
+                // Reconnect a slow client rather than queueing an unbounded event stream.
+                if (res.destroyed || res.writableEnded || res.write(chunk) === false) stop();
+            };
+            req.on('close', stop);
+            res.on('close', stop);
+            eventStreams.add(stop);
+            unsubscribe = eventBus.subscribe((topic, payload) => {
+                const access = reauthenticate();
+                if (!access) return;
+                if (typeof topic !== 'string' || /[\r\n]/.test(topic)) return;
+                if (topic === 'room.message' && (typeof payload?.roomId !== 'string'
+                    || !taskRoomAccess(access, rooms?.local(payload.roomId), allowed))) return;
+                const json = JSON.stringify(payload);
+                if (json !== undefined) safeWrite(`event: ${topic}\ndata: ${json}\n\n`);
+            });
+            timer = setInterval(() => {
+                if (reauthenticate()) safeWrite(': ping\n\n');
+            }, 25_000);
+            timer.unref?.();
+            safeWrite('event: ready\ndata: {}\n\n');
+        }, true),
+        ...createMemoryRoutes({ memory, auth, allowedOrigins, eventBus }).map(route => exact(route.method, route.path, route.handler, true)),
         exact('GET', '/marshal/tasks/orchestration', async (req, res) => {
             const access = authenticate(req);
             if (!access.ok) { write(res, access.status, { ok: false, code: access.code }); return; }
@@ -904,7 +966,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
                 ...(reuseSession === undefined ? {} : { reuseSession }),
             };
             const beforeIds = existing ?? new Set((board.snapshot().tasks ?? []).map(task => task.id));
-            // Attach orchestration BEFORE board.apply('create') so superagent or other
+            // Attach orchestration BEFORE board.apply('create') so other
             // synchronous board-change listeners immediately observe the workflow instead
             // of racing and falling back to a plain un-orchestrated dispatch.
             let preAttached = false;
@@ -966,7 +1028,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
                     movedToReview = true;
                 } catch { /* keep created status if board refuses move */ }
             }
-            write(res, 200, {
+            writeTaskMutation(res, {
                 ok: true,
                 tasks: taskList(snapshot, req, source),
                 ...(movedToReview ? { movedToReview: true, ambiguityReason } : {}),
@@ -1008,7 +1070,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
                 }
                 orchestration.start(source, task, taskRoomAudit(rooms, room, workflow.state === 'done' || workflow.state === 'review-blocked' ? 'retry' : undefined, undefined, undefined,
                     member => allowed(access, member)));
-                write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
+                writeTaskMutation(res, { ok: true, tasks: taskList(snapshot, req, source) });
                 return;
             }
             if (boundRoom) {
@@ -1025,7 +1087,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             }
             try {
                 const snapshot = await launchPlainCardWithOverrides(source, body.taskId, initiator);
-                write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
+                writeTaskMutation(res, { ok: true, tasks: taskList(snapshot, req, source) });
             }
             catch (error) {
                 if (isPermissionBlockedError(error)) {
@@ -1035,7 +1097,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
                         snapshot = await board.apply(randomUUID(), { kind: 'move', taskId: body.taskId, status: 'review' }, initiator);
                         movedToReview = true;
                     } catch { /* keep snapshot if move refused */ }
-                    write(res, 200, {
+                    writeTaskMutation(res, {
                         ok: true,
                         permissionBlocked: true,
                         movedToReview,
@@ -1096,7 +1158,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
                     }
                 } catch { /* room sync is best-effort */ }
             }
-            write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
+            writeTaskMutation(res, { ok: true, tasks: taskList(snapshot, req, source) });
         }),
         exact('POST', '/marshal/tasks/confirm-review', async (req, res) => {
             const board = getBoard();
@@ -1115,7 +1177,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             }
             if (workflow && !authorize(req, res, workflow)) return;
             const result = await roomRoutes.confirmReview({ room: boundRoom, card, body, access, initiatorTag: initiator });
-            write(res, 200, {
+            writeTaskMutation(res, {
                 ok: true,
                 patchApplied: result.patchApplied,
                 patchAlreadyApplied: result.patchAlreadyApplied,
@@ -1145,7 +1207,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             }
             if (workflow && !authorize(req, res, workflow)) return;
             const result = await roomRoutes.reviseTask({ room: boundRoom, card, body, access, initiatorTag: initiator });
-            write(res, 200, { ok: true, tasks: taskList(result.snapshot ?? board.snapshot(), req, source) });
+            writeTaskMutation(res, { ok: true, tasks: taskList(result.snapshot ?? board.snapshot(), req, source) });
         }),
         exact('POST', '/marshal/tasks/update', async (req, res) => {
             const board = getBoard();
@@ -1283,7 +1345,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
                 }
             }
 
-            write(res, 200, {
+            writeTaskMutation(res, {
                 ok: true,
                 ...(steered ? { steered: true } : {}),
                 ...(plainConfigNotice ? { configNotice: plainConfigNotice } : {}),
@@ -1307,7 +1369,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             }
             if (workflow && !authorize(req, res, workflow)) return;
             const snapshot = await board.apply(randomUUID(), { kind: 'set-parent', taskId: body.taskId, parentId }, initiator);
-            write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
+            writeTaskMutation(res, { ok: true, tasks: taskList(snapshot, req, source) });
         }),
         exact('POST', '/marshal/tasks/archive', async (req, res) => {
             const board = getBoard();
@@ -1324,7 +1386,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             if (workflow && !authorize(req, res, workflow)) return;
             orchestration?.assertIdle(source, body.taskId);
             const snapshot = await board.apply(randomUUID(), { kind: 'archive', taskId: body.taskId }, initiator);
-            write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
+            writeTaskMutation(res, { ok: true, tasks: taskList(snapshot, req, source) });
         }),
         exact('POST', '/marshal/tasks/restore', async (req, res) => {
             const board = getBoard();
@@ -1340,7 +1402,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             }
             if (workflow && !authorize(req, res, workflow)) return;
             const snapshot = await board.apply(randomUUID(), { kind: 'restore', taskId: body.taskId }, initiator);
-            write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
+            writeTaskMutation(res, { ok: true, tasks: taskList(snapshot, req, source) });
         }),
         exact('POST', '/marshal/tasks/schedule', async (req, res) => {
             const board = getBoard();
@@ -1362,7 +1424,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             if (typeof body.at === 'number' && Number.isInteger(body.at)) patch.at = body.at;
             if (Object.keys(patch).length === 0) { write(res, 400, { ok: false, code: 'invalid-schedule' }); return; }
             const snapshot = await board.apply(randomUUID(), { kind: 'set-schedule', taskId: body.taskId, patch }, initiator);
-            write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
+            writeTaskMutation(res, { ok: true, tasks: taskList(snapshot, req, source) });
         }),
         exact('POST', '/marshal/tasks/settle', async (req, res) => {
             const board = getBoard();
@@ -1378,7 +1440,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             }
             if (workflow && !authorize(req, res, workflow)) return;
             const snapshot = await board.apply(randomUUID(), { kind: 'settle', taskId: body.taskId }, initiator);
-            write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
+            writeTaskMutation(res, { ok: true, tasks: taskList(snapshot, req, source) });
         }),
         exact('POST', '/marshal/tasks/confirm-permission', async (req, res) => {
             const board = getBoard();
@@ -1394,7 +1456,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             }
             if (workflow && !authorize(req, res, workflow)) return;
             const snapshot = await board.apply(randomUUID(), { kind: 'confirm-permission', taskId: body.taskId }, initiator);
-            write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
+            writeTaskMutation(res, { ok: true, tasks: taskList(snapshot, req, source) });
         }),
         exact('POST', '/marshal/tasks/delete', async (req, res) => {
             const board = getBoard();
@@ -1426,7 +1488,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
                 if (workflow) orchestration.remove(source, body.taskId);
                 taskOverrides.remove(source, body.taskId);
             }
-            write(res, 200, { ok: true, tasks: taskList(snapshot, req, source) });
+            writeTaskMutation(res, { ok: true, tasks: taskList(snapshot, req, source) });
         }),
         exact('POST', '/marshal/workspaces/agent', async (req, res) => {
             const body = await readBody(req);
@@ -1465,7 +1527,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             const workspaceId = typeof body.workspaceId === 'string' ? body.workspaceId.trim() : '';
             if (!workspaceId) { write(res, 400, { ok: false, code: 'invalid-workspace' }); return; }
             const saved = rosters.set(workspaceId, body);
-            write(res, 200, { ok: true, roster: saved, rosters: rosters.list() });
+            writeMutation(res, { ok: true, roster: saved, rosters: rosters.list() }, 'agents.changed');
         }),
         exact('GET', '/marshal/agents/sessions', async (req, res) => {
             const url = new URL(req.url ?? '/', 'http://127.0.0.1');
@@ -1707,12 +1769,12 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
         }),
         exact('POST', '/marshal/cross-groups/create', async (req, res) => {
             if (cross === undefined) { write(res, 503, { ok: false, code: 'cross-groups-unavailable' }); return; }
-            try { write(res, 200, { ok: true, ...(await cross.create(await readBody(req))) }); }
+            try { writeMutation(res, { ok: true, ...(await cross.create(await readBody(req))) }, 'groups.changed'); }
             catch (error) { write(res, 502, { ok: false, code: 'hub-unavailable', message: error instanceof Error ? error.message : String(error) }); }
         }),
         exact('POST', '/marshal/cross-groups/send', async (req, res) => {
             if (cross === undefined) { write(res, 503, { ok: false, code: 'cross-groups-unavailable' }); return; }
-            try { write(res, 200, { ok: true, ...(await cross.send(await readBody(req))) }); }
+            try { writeMutation(res, { ok: true, ...(await cross.send(await readBody(req))) }, 'groups.changed'); }
             catch (error) { write(res, 502, { ok: false, code: 'hub-unavailable', message: error instanceof Error ? error.message : String(error) }); }
         }),
         exact('GET', '/marshal/groups/state', async (req, res) => {
@@ -1743,24 +1805,24 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
         }),
         exact('POST', '/marshal/groups/create', async (req, res) => {
             const body = await readBody(req);
-            write(res, 200, { ok: true, group: service.create(body) });
+            writeMutation(res, { ok: true, group: service.create(body) }, 'groups.changed');
         }),
         exact('POST', '/marshal/groups/update', async (req, res) => {
             const body = await readBody(req);
-            write(res, 200, { ok: true, group: service.update(body.id, body.patch ?? {}) });
+            writeMutation(res, { ok: true, group: service.update(body.id, body.patch ?? {}) }, 'groups.changed');
         }),
         exact('POST', '/marshal/groups/remove', async (req, res) => {
             const body = await readBody(req);
-            write(res, 200, { ok: true, removed: service.remove(body.id) });
+            writeMutation(res, { ok: true, removed: service.remove(body.id) }, 'groups.changed');
         }),
         exact('POST', '/marshal/groups/members', async (req, res) => {
             const body = await readBody(req);
             if (body.action === 'add') {
-                write(res, 200, { ok: true, group: service.addMember(body.id, body.member ?? {}) });
+                writeMutation(res, { ok: true, group: service.addMember(body.id, body.member ?? {}) }, 'groups.changed', 'agents.changed');
                 return;
             }
             if (body.action === 'remove') {
-                write(res, 200, { ok: true, group: service.removeMember(body.id, body.key) });
+                writeMutation(res, { ok: true, group: service.removeMember(body.id, body.key) }, 'groups.changed', 'agents.changed');
                 return;
             }
             write(res, 400, { ok: false, code: 'invalid-action' });
@@ -1798,12 +1860,15 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             const created = (snapshot.tasks || []).find(task => !beforeIds.has(task.id));
             if (created === undefined) throw new Error('task-create-not-observed');
             service.setMessageTask(body.id, body.messageId, { taskId: created.id, deviceId: initiator.replace('marshal:', '') });
-            write(res, 200, { ok: true, task: taskView(created) });
+            writeMutation(res, { ok: true, task: taskView(created) }, 'groups.changed', 'tasks.changed', 'incidents.changed');
         }),
     ];
 }
 
 export function mountGroups(ctx, config, options = {}) {
+    const eventBus = options.eventBus ?? createMarshalEventBus();
+    const eventStreams = new Set();
+    const closeEventStreams = () => { for (const stop of eventStreams) stop(); };
     const root = config.groupsRoot ?? join(homedir(), '.dsh-marshal', 'groups');
     const localBoard = createLocalBoard(join(root, 'tasks.json'));
     const getBoard = () => taskBoard ?? localBoard;
@@ -1927,6 +1992,7 @@ export function mountGroups(ctx, config, options = {}) {
         root,
         deviceId: config.deviceId,
         inventory,
+        eventBus,
         prompt: ({ sessionId, text, requestId }) => ctx.sessionController.prompt({
             requestId,
             sessionId,
@@ -2008,7 +2074,7 @@ export function mountGroups(ctx, config, options = {}) {
     let rooms;
     try {
         rooms = createTaskRooms({ store: createTaskRoomStore(join(root, 'task-rooms.sqlite')),
-            deviceId: config.deviceId, hub: crossClient?.taskRoom });
+            deviceId: config.deviceId, hub: crossClient?.taskRoom, eventBus });
     } catch { options.logger?.warn?.('marshal: local task room archive unavailable'); }
     const rosters = createWorkspaceRosters(join(root, 'workspace-rosters.json'));
     const ticketNumbers = createTicketNumbers(join(root, 'ticket-numbers.json'));
@@ -2029,6 +2095,8 @@ export function mountGroups(ctx, config, options = {}) {
         if (!task || task.status === status) return false;
         try {
             await board.apply(randomUUID(), { kind: 'move', taskId, status }, `marshal:${config.deviceId}`);
+            eventBus.emit('tasks.changed');
+            eventBus.emit('incidents.changed');
             return true;
         }
         catch (error) {
@@ -2043,7 +2111,7 @@ export function mountGroups(ctx, config, options = {}) {
             port: createDiscussionPort({ agents: config.agents, llm, codexExecutable: config.codexExecutable, maxModels: 256, maxPerProvider: 64 }),
             defaultModel: readDefaultModel, logger: options.logger, workspacePath: agents.workspace,
             resolveAttachments: resolveTicketAttachments,
-            patchStore,
+            patchStore, eventBus,
             readCard: (src, id) => {
                 const raw = (getBoard()?.snapshot()?.tasks ?? []).find(item => item.id === id);
                 return raw ? taskOverrides.applyTo(src, raw) : undefined;
@@ -2089,9 +2157,6 @@ export function mountGroups(ctx, config, options = {}) {
         });
     }
     catch { options.logger?.warn?.('marshal: task orchestration unavailable'); }
-    // The superagent bridge wakes a card; when the card carries a preset
-    // workflow, the bridge must start that workflow instead of opening a plain
-    // board run. This runtime is the narrow seam between the two subsystems.
     const resolveDesktopOwnerId = async () => {
         const owner = await desktopOwner();
         if (typeof owner === 'string' && owner.trim() !== '') return owner.trim();
@@ -2160,9 +2225,7 @@ export function mountGroups(ctx, config, options = {}) {
                 if (orchestration.target(source, taskId) === undefined) return { ok: false, code: 'no-workflow' };
                 const room = ensureRuntimeRoom(source, taskId, card);
                 const audit = room ? taskRoomAudit(rooms, room, settings.reason ?? 'auto-dispatch', undefined, undefined, () => true) : undefined;
-                // The caller may already have opened the room batch (the superagent
-                // posts its dispatch note through `begin` first); skip the second
-                // batch so one dispatch produces exactly one ticket-group run.
+                // A caller that already opened the room batch can skip opening another.
                 if (audit && settings.skipBegin === true) audit.begin = async () => {};
                 const started = orchestration.start(source, taskOverrides.applyTo(source, card), audit);
                 return { ok: true, started, state: orchestration.view(source, taskId)?.state };
@@ -2241,6 +2304,8 @@ export function mountGroups(ctx, config, options = {}) {
     }, 15_000);
     handedOffSyncTimer.unref?.();
     if (typeof ctx.effect === 'function') ctx.effect(() => () => {
+        closeEventStreams();
+        if (options.eventBus == null) eventBus.dispose();
         clearInterval(handedOffSyncTimer);
         orchestration?.dispose();
         rooms?.close();
@@ -2258,9 +2323,15 @@ export function mountGroups(ctx, config, options = {}) {
     });
     ctx.inject(['taskBoard'], (scoped) => {
         scoped.effect(() => {
-            taskBoard = scoped.taskBoard;
+            const board = scoped.taskBoard;
+            taskBoard = board;
+            const unsubscribe = board?.subscribe?.(() => {
+                eventBus.emit('tasks.changed', {});
+                eventBus.emit('incidents.changed', {});
+            });
             return () => {
-                taskBoard = undefined;
+                if (taskBoard === board) taskBoard = undefined;
+                unsubscribe?.();
             };
         }, 'marshal: groups task board');
     });
@@ -2279,9 +2350,10 @@ export function mountGroups(ctx, config, options = {}) {
                 root, rosters, ticketNumbers, sessionTitles, sessionController: ctx.sessionController,
                 config, llm, readDefaultModel, workspacePath: agents.workspace,
                 webOrigin: resolveWebOrigin, getAttachmentStore, resolveAttachments: resolveTicketAttachments,
-                surface, moveCardStatus, taskOverrides, patchStore,
+                surface, moveCardStatus, taskOverrides, patchStore, eventBus, eventStreams,
             }).map((route) => scoped.webServer.register(route));
             return () => {
+                closeEventStreams();
                 for (const dispose of disposers) dispose();
             };
         }, 'marshal: groups routes');

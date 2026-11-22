@@ -30,7 +30,6 @@
     "build": "tsc -p tsconfig.json && node scripts/build-client.mjs",
     "test": "vitest run && node --test plugin-build/test/*.test.js",
     "test:memory": "node --test plugin-build/test/*.test.js",
-    "build:superagent-hook": "node scripts/append-superagent-hook.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "typecheck:test": "tsc -p tsconfig.test.json",
     "prepare": "tsc -p tsconfig.json"
