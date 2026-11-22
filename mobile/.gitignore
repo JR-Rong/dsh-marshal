@@ -1,8 +1,9 @@
 node_modules/
-dist/
+/dist/
 .cache/
 android/build/
 android/app/build/
+plugins/marshal-stream/android/build/
 android/.gradle/
 ios/build/
 ios/App/Pods/
@@ -11,3 +12,5 @@ ios/App/DerivedData/
 .DS_Store
 local.properties
 artifacts/
+node_modules
+ios/App/App/public/

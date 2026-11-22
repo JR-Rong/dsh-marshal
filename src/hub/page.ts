@@ -170,6 +170,7 @@ ${NATIVE_BRIDGE_CSS}
   <div class="workspace" id="singleWorkspace">
     <nav class="device-rail" aria-label="设备与智能体">
       <h2 class="rail-label">设备</h2><div id="devices">正在连接设备…</div>
+      <h2 class="rail-label">手机</h2><div id="phones"></div>
       <details id="pendingPanel" hidden><summary>未决写入</summary><div id="pending"></div></details>
     </nav>
     <section class="session-rail" aria-label="会话列表">
@@ -1055,8 +1056,34 @@ async function refreshDevices() {
     }
   }
   if (data.devices.length === 0) devicesRoot.append(textNode('p', '暂无设备连接', 'empty-list'));
+  renderPhones(data);
   if (current !== null) evaluateCurrentWriteState();
   return data;
+}
+
+function renderPhones(data) {
+  var root = document.getElementById('phones');
+  if (!root) return;
+  clearNode(root);
+  var phones = data && Array.isArray(data.phones) ? data.phones : [];
+  if (phones.length === 0) { root.append(textNode('p', '没有配对的手机', 'empty-list')); return; }
+  for (var index = 0; index < phones.length; index += 1) {
+    var phone = phones[index];
+    var row = textNode('div', '', 'row');
+    row.append(textNode('span', phone.online ? '在线' : '离线', 'agent-symbol'), document.createTextNode(phone.name || phone.id));
+    var button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = '吊销';
+    button.onclick = (function(id) {
+      return async function() {
+        await request('/marshal/api/phones/revoke', { method: 'POST', body: JSON.stringify({ deviceId: id }) });
+        devicesRenderSignature = '';
+        await refreshDevices();
+      };
+    })(phone.id);
+    row.append(button);
+    root.append(row);
+  }
 }
 
 function findDevice(data, deviceId) {

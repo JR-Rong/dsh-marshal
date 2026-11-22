@@ -26,6 +26,7 @@ import { createInteractionRelay } from './node/interactions.ts'
 import { createAuditLog } from './node/audit.ts'
 import { createPrivacyProjector, type PrivacyProjector } from './node/privacy.ts'
 import { mountSetup } from './setup.ts'
+import { hubHttpOrigin, startPhoneRelay, type PhoneHost } from './node/phone-sync.ts'
 
 export const name = 'marshal'
 
@@ -404,7 +405,33 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
     logger: ctx.logger,
   })
 
+  const phoneHost = (): PhoneHost => {
+    const board = lookupService(ctx, 'taskBoard')
+    const memory = lookupService(ctx, 'memory')
+    const roster = lookupService(ctx, 'roster')
+    return {
+      ...(board === undefined ? {} : { board: board as NonNullable<PhoneHost['board']> }),
+      ...(memory === undefined ? {} : { memory: memory as NonNullable<PhoneHost['memory']> }),
+      ...(roster === undefined ? {} : { roster: roster as NonNullable<PhoneHost['roster']> }),
+    }
+  }
+  const stopRelay = config.hubUrl !== undefined && config.token !== undefined && config.deviceId !== undefined
+    ? startPhoneRelay({
+        host: phoneHost,
+        contentGrant: () => {
+          const handshake = link.handshake
+          const binding = link.binding
+          if (!link.online || !handshake || binding?.policies.allowContent !== true) return undefined
+          return { connectionId: handshake.connectionId, policyRevision: binding.policyRevision }
+        },
+        origin: hubHttpOrigin(config.hubUrl),
+        token: config.token,
+        deviceId: config.deviceId,
+        ...(hubCa === undefined ? {} : { ca: hubCa }),
+      })
+    : undefined
   ctx.effect(() => () => {
+    stopRelay?.()
     discussions?.dispose()
     nodeSync?.dispose()
     for (const item of bindings.values()) {
@@ -418,4 +445,10 @@ function applyNode(ctx: MarshalContext, config: MarshalConfig): void {
     journal.close()
   }, 'marshal: node link')
   link.start()
+}
+
+function lookupService(ctx: MarshalContext, name: string): unknown {
+  const bag = ctx as MarshalContext & { get?: (service: string) => unknown }
+  if (typeof bag.get !== 'function') return undefined
+  try { return bag.get(name) } catch { return undefined }
 }

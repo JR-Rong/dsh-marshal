@@ -10,10 +10,43 @@ export const DEFAULT_HUB = ''
 export const CONSOLE_PATH = '/marshal'
 export const MIN_TOKEN_LENGTH = 16
 
+export const MOBILE_THEMES = ['system', 'deepseek', 'white', 'dark', 'codex'] as const
+export type MobileTheme = typeof MOBILE_THEMES[number]
+export type PrivacyMode = 'content' | 'metadata'
+
+export function tightenPrivacyMode(_current?: PrivacyMode): 'metadata' {
+  return 'metadata'
+}
+
+export function normalizeDailySummaryCapK(raw: unknown): number {
+  return typeof raw === 'number' && Number.isFinite(raw)
+    ? Math.min(200, Math.max(10, Math.round(raw))) : 50
+}
+
+export function normalizeTheme(raw: unknown): MobileTheme {
+  return MOBILE_THEMES.find((theme) => theme === raw) ?? 'system'
+}
+
 export interface AppLock {
   salt: string
   hash: string
   iterations: number
+}
+
+/**
+ * 账号 ticket 换来的浏览器会话。
+ * 只用于群聊接口（discussions 只认 cookie），不替代管理令牌。
+ */
+export interface AccountSession {
+  /** 原样保存的 Cookie 头：__Host-marshal-session=…; __Host-marshal-csrf=… */
+  cookies: string
+  /** 服务端会话绑定的 CSRF token，写请求必须同时放在 x-marshal-csrf 头里。 */
+  csrf: string
+  /** 会话绝对到期时间（毫秒）；Hub 侧 8 小时。 */
+  expiresAt: number
+  /** 可选：票面账号摘要/名称，仅用于界面显示。 */
+  accountHash?: string
+  name?: string
 }
 
 export interface MarshalConfig {
@@ -26,6 +59,13 @@ export interface MarshalConfig {
   label: string
   /** 应用锁；null 表示未启用。 */
   lock: AppLock | null
+  /** 局域网 DSH 工作台。默认关闭，打开后才保存桥令牌并连接本机电脑。 */
+  lanBridge?: boolean
+  /** 群聊账号会话；null/缺省表示未用 ticket 登录。 */
+  account?: AccountSession | null
+  theme?: MobileTheme
+  privacyMode?: PrivacyMode
+  dailySummaryCapK?: number
   updatedAt: number
 }
 
@@ -120,13 +160,41 @@ export function parseConfig(raw: unknown): MarshalConfig | null {
   if (!normalized.ok) return null
   const token = typeof value.token === 'string' ? value.token : ''
   const lock = parseLock(value.lock)
+  const account = parseAccount(value.account)
+  const theme = MOBILE_THEMES.find((theme) => theme === value.theme)
   return {
     version: CONFIG_VERSION,
     hubUrl: normalized.value,
     token,
     label: typeof value.label === 'string' ? value.label.slice(0, 60) : '',
     lock,
+    ...(value.lanBridge === true ? { lanBridge: true } : {}),
+    ...(account === null ? {} : { account }),
+    ...(theme === undefined ? {} : { theme }),
+    ...(value.privacyMode === 'content' || value.privacyMode === 'metadata' ? { privacyMode: value.privacyMode } : {}),
+    ...(value.dailySummaryCapK === undefined ? {} : { dailySummaryCapK: normalizeDailySummaryCapK(value.dailySummaryCapK) }),
     updatedAt: typeof value.updatedAt === 'number' && Number.isFinite(value.updatedAt) ? value.updatedAt : Date.now(),
+  }
+}
+
+/** Cookie/CSRF 只接受单行、可控长度的字符串，防止把头注入或写坏存储。 */
+function parseAccount(raw: unknown): AccountSession | null {
+  if (typeof raw !== 'object' || raw === null) return null
+  const value = raw as Record<string, unknown>
+  if (typeof value.cookies !== 'string' || !value.cookies || value.cookies.length > 4_096) return null
+  if (typeof value.csrf !== 'string' || !value.csrf || value.csrf.length > 512) return null
+  if (/[\x00-\x1f\x7f]/.test(value.cookies) || /[\x00-\x1f\x7f]/.test(value.csrf)) return null
+  if (typeof value.expiresAt !== 'number' || !Number.isFinite(value.expiresAt) || value.expiresAt <= 0) return null
+  return {
+    cookies: value.cookies,
+    csrf: value.csrf,
+    expiresAt: Math.round(value.expiresAt),
+    ...(typeof value.accountHash === 'string' && /^[a-f0-9]{64}$/.test(value.accountHash)
+      ? { accountHash: value.accountHash }
+      : {}),
+    ...(typeof value.name === 'string' && value.name.trim()
+      ? { name: value.name.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 80) }
+      : {}),
   }
 }
 
@@ -146,6 +214,7 @@ export function makeConfig(input: { hubUrl: string; token?: string; label?: stri
     token: input.token ?? '',
     label: input.label ?? '',
     lock: null,
+    account: null,
     updatedAt: Date.now(),
   }
 }

@@ -2,6 +2,8 @@ import { join, dirname } from 'node:path';
 import { openJournal } from "../node/journal.js";
 import { createDiscussions } from "./discussions/coordinator.js";
 import { createCrossGroups } from "./cross-groups.js";
+import { createHubTaskRooms } from './task-rooms.js';
+import { createTaskRoomStore } from '../groups/task-room-store.js';
 import { randomUUID } from 'node:crypto';
 import { registerMarshalRoutes } from "./api.js";
 import { ensureInstall } from "./identity.js";
@@ -10,7 +12,10 @@ import { HubRelay } from "./relay.js";
 import { mountHubSocket, webServerPort } from "./server.js";
 import { createHubSync } from "./sync.js";
 import { createAccountLogin } from "./account.js";
-import { createHubMemorySync } from "./memory-sync.js";
+import { accountOwnerForDevice, createHubMemorySync } from "./memory-sync.js";
+import { createPhoneHub } from "./phone.js";
+import { deliverPush, noticeForEvent } from "./push-send.js";
+import { readFileSync } from 'node:fs';
 /** Shared Hub composition for the desktop host and the standalone cloud service. */
 export function mountHub(webServer, config, logger) {
     if (config.role !== 'hub')
@@ -49,23 +54,74 @@ export function mountHub(webServer, config, logger) {
         catch {
             logger.warn('marshal: group discussion storage requires recovery; group calls disabled');
         }
+        const phone = createPhoneHub({
+            now: Date.now,
+            ...(config.dshAccountHash === undefined ? {} : { ownerHash: config.dshAccountHash }),
+            store: install.store,
+            nodeConnection: id => registry.get(id)?.connectionId,
+            accountOwnerForNode: accountOwnerForDevice,
+            findNode: (tokenDigest) => {
+                const row = install.store.findByTokenDigest(tokenDigest);
+                return row !== undefined && row.role !== 'phone' ? row : undefined;
+            },
+        });
+        const pushConfig = readPushConfig(config.devicesFile);
+        const stopPush = relay.subscribe((event) => {
+            const payload = typeof event.payload === 'object' && event.payload !== null ? event.payload : {};
+            for (const target of install.store.phones()) {
+                if (target.pushProvider === undefined || target.pushToken === undefined) continue;
+                const notice = noticeForEvent(event.kind, {
+                    ...payload,
+                    deviceId: event.deviceId,
+                    agent: event.agent,
+                    sessionId: event.sessionId,
+                }, phone.watchedBy(target.id));
+                if (notice === null) continue;
+                void deliverPush({
+                    config: pushConfig,
+                    deviceId: target.id,
+                    target: {
+                        provider: target.pushProvider,
+                        token: target.pushToken,
+                        ...(target.liveToken === undefined ? {} : { liveToken: target.liveToken }),
+                        ...(target.liveTokens === undefined ? {} : { liveTokens: target.liveTokens }),
+                    },
+                    notice,
+                }).then((result) => {
+                    if (!result.delivered) logger.warn(`marshal: push ${result.reason}`);
+                });
+            }
+        });
+        disposers.push(stopPush);
         const crossGroups = createCrossGroups({ relay: relay, now: Date.now, file: join(dirname(config.devicesFile), 'cross-groups.json') });
         disposers.push(() => crossGroups.dispose());
+        let taskRooms;
+        try {
+            const archive = createTaskRoomStore(join(dirname(config.devicesFile), 'task-rooms.sqlite'));
+            taskRooms = createHubTaskRooms({ store: archive, registry, deviceStore: install.store, inventories, relay });
+            disposers.push(() => { taskRooms.dispose(); archive.close(); });
+        } catch { logger.warn('marshal: Hub task room archive unavailable'); }
         const socket = mountHubSocket({
             port: webServerPort(webServer), registry, store: install.store,
             operatorId: install.operatorId, hubEpoch, now: Date.now, logger, sync,
             onDetach: deviceId => { relay.deviceOffline(deviceId); discussions?.invalidate(deviceId); },
             onContentRevoked: deviceId => { relay.purgeHistory(deviceId); },
             onFrame: (identity, frame) => {
-                if (frame.type === 'discussion.catalog')
+                if (frame.type === 'discussion.catalog') {
                     discussions?.acceptCatalog(identity, frame);
-                else if (frame.type === 'discussion.result')
+                    taskRooms?.catalog(identity, frame);
+                }
+                else if (frame.type === 'discussion.result') {
                     discussions?.acceptResult(identity, frame);
+                    taskRooms?.result(identity, frame);
+                }
                 else if (frame.type === 'discussion.progress')
                     discussions?.acceptProgress(identity, frame);
                 else if (frame.type === 'device.inventory')
                     inventories.set(identity.deviceId, {
                         deviceName: frame.deviceName,
+                        connectionId: frame.connectionId, nodeEpoch: frame.nodeEpoch,
+                        policyRevision: install.store.findById(identity.deviceId)?.policyRevision,
                         squads: frame.squads,
                         codex: frame.codex,
                         receivedAt: Date.now(),
@@ -85,7 +141,7 @@ export function mountHub(webServer, config, logger) {
         disposers.push(() => socket.dispose());
         for (const desktopEmbed of [false, true]) {
             disposers.push(registerMarshalRoutes({
-                webServer, registry, relay, sync, deviceStore: install.store, inventories, ...(discussions === undefined ? {} : { discussions }), crossGroups, memorySync, desktopEmbed, requireToken: config.dashboardToken,
+                webServer, registry, relay, sync, deviceStore: install.store, phone, inventories, ...(discussions === undefined ? {} : { discussions }), crossGroups, taskRooms, memorySync, desktopEmbed, requireToken: config.dashboardToken,
                 publicOrigin: config.publicOrigin, operatorId: install.operatorId,
                 ...(accountLogin === undefined ? {} : { accountLogin }),
             }).dispose);
@@ -96,5 +152,15 @@ export function mountHub(webServer, config, logger) {
     catch (error) {
         dispose();
         throw error;
+    }
+}
+function readPushConfig(devicesFile) {
+    try {
+        const text = readFileSync(join(dirname(devicesFile), 'push.json'), 'utf8');
+        const parsed = JSON.parse(text);
+        return typeof parsed === 'object' && parsed !== null ? parsed : undefined;
+    }
+    catch {
+        return undefined;
     }
 }

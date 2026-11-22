@@ -317,7 +317,7 @@ export function mountHubSocket(options: HubSocketOptions): HubSocketHandle {
     if (stateUnconfirmed) { endHttp(socket, '503 Service Unavailable'); return }
     // token 只在 Authorization 头里；按摘要查找，绝不记录原值。
     const record = store.findByTokenDigest(sha256Hex(bearerToken(req)))
-    if (record === undefined || record.revoked) {
+    if (record === undefined || record.revoked || record.role === 'phone') {
       endHttp(socket, '401 Unauthorized')
       return
     }

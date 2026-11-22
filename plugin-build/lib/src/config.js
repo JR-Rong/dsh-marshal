@@ -5,7 +5,7 @@ const KNOWN_KEYS = new Set([
     'privacy', 'questionRelay', 'approvalRelay', 'answerTimeoutMs', 'approvalTimeoutMs',
     'agents', 'codexExecutable', 'claudeExecutable', 'ringBufferMinutes', 'redaction',
     'allowDiscussion', 'devicesFile', 'accountLogin', 'dshAccountHash',
-    'dispatch', 'memory', 'dispatchRoot', 'memoryRoot', 'groups', 'groupsRoot',
+    'dispatch', 'memory', 'dispatchRoot', 'memoryRoot', 'mnemonPilot', 'groups', 'groupsRoot',
 ]);
 const WEAK_DASHBOARD_TOKENS = new Set([
     'changeme', 'password', 'letmein', 'test', 'secret', 'admin', 'dsh-marshal',
@@ -253,6 +253,14 @@ export function parseConfig(raw, hostname) {
     const memory = parseBoolean(input.memory, 'memory', true);
     const dispatchRoot = parseOptionalRoot(input.dispatchRoot, 'dispatchRoot');
     const memoryRoot = parseOptionalRoot(input.memoryRoot, 'memoryRoot');
+    const pilot = input.mnemonPilot;
+    if (pilot !== undefined && (pilot === null || typeof pilot !== 'object' || Array.isArray(pilot) ||
+        Object.keys(pilot).some(key => !['agentId', 'executable', 'scopes'].includes(key)) ||
+        typeof pilot.agentId !== 'string' || (pilot.agentId !== '*' && !/^[A-Za-z0-9_.:-]{1,160}$/.test(pilot.agentId)) ||
+        (pilot.scopes !== undefined && !['all', 'agents'].includes(pilot.scopes)) ||
+        typeof pilot.executable !== 'string' || !isAbsolute(pilot.executable) || pilot.executable.includes('\0'))) {
+        throw new Error('marshal: config.mnemonPilot requires a stable agentId (or "*") and an absolute native executable path');
+    }
     const groups = parseBoolean(input.groups, 'groups', true);
     const groupsRoot = parseOptionalRoot(input.groupsRoot, 'groupsRoot');
     const accountLogin = parseBoolean(input.accountLogin, 'accountLogin', false);
@@ -288,6 +296,7 @@ export function parseConfig(raw, hostname) {
         memory,
         ...(dispatchRoot === undefined ? {} : { dispatchRoot }),
         ...(memoryRoot === undefined ? {} : { memoryRoot }),
+        ...(pilot === undefined ? {} : { mnemonPilot: Object.freeze({ agentId: pilot.agentId, executable: pilot.executable, ...(pilot.scopes ? { scopes: pilot.scopes } : {}) }) }),
         groups,
         ...(groupsRoot === undefined ? {} : { groupsRoot }),
         ...(dshAccountHash === undefined ? {} : { dshAccountHash: dshAccountHash }),

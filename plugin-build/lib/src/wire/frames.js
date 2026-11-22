@@ -259,6 +259,7 @@ const InventoryMemberSchema = z.object({
 const InventorySquadSchema = z.object({
     id: z.string().min(1).max(128),
     name: z.string().min(1).max(120),
+    workspaceId: z.string().min(1).max(256).optional(),
     members: z.array(InventoryMemberSchema).max(50),
 }).strict();
 const DeviceInventorySchema = z.object({

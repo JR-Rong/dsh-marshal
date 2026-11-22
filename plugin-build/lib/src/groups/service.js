@@ -67,36 +67,54 @@ export function createGroupService({ root, deviceId, store, inventory, prompt, r
     const groupStore = store ?? createGroupStore({ root, now, idFactory });
     const promptSession = prompt ?? (async () => { throw new Error('marshal: groups no-session-controller'); });
     const isAvailable = typeof available === 'function' ? available : () => true;
-    const replyReader = reader;
+    const watches = new Map();
+    let disposed = false;
     const watchReplies = (groupId, member, baseline) => {
-        if (replyReader === undefined || member.sessionId === undefined) return;
+        if (disposed || reader === undefined || member.sessionId === undefined) return;
         const sessionId = member.sessionId;
-        let last = baseline;
-        let attempts = 0;
-        const tick = () => {
-            attempts += 1;
-            if (attempts > 24) return;
-            void (async () => {
-                try {
-                    const replies = await replyReader.since(sessionId, last);
-                    for (const reply of replies) {
-                        if (!Number.isSafeInteger(reply.seq) || reply.seq <= last) continue;
-                        last = reply.seq;
-                        if (typeof reply.text === 'string' && reply.text.trim() !== '') {
-                            groupStore.appendMessage(groupId, {
-                                author: 'member',
-                                authorMemberId: member.memberId,
-                                authorDeviceId: member.deviceId,
-                                text: reply.text.slice(0, 4000),
-                            });
-                        }
-                    }
+        const memberKey = groupMemberKey(member);
+        const key = JSON.stringify([groupId, memberKey]);
+        const previous = watches.get(key);
+        if (previous?.sessionId === sessionId) {
+            previous.remaining = 24;
+            return;
+        }
+        if (!Number.isSafeInteger(baseline)) return;
+        if (previous !== undefined) clearTimeout(previous.timer);
+        const watch = { sessionId, last: baseline, remaining: 24, timer: undefined };
+        watches.set(key, watch);
+        const tick = async () => {
+            watch.remaining--;
+            try {
+                const replies = await reader.since(sessionId, watch.last);
+                if (watches.get(key) !== watch) return;
+                const bound = groupStore.get(groupId).members.find(candidate => groupMemberKey(candidate) === memberKey);
+                if (bound?.sessionId !== sessionId) {
+                    watches.delete(key);
+                    return;
                 }
-                catch { /* a reply poll must never fail the send */ }
-                if (attempts < 24) setTimeout(tick, replyPollMs).unref?.();
-            })();
+                for (const reply of replies) {
+                    if (!Number.isSafeInteger(reply.seq) || reply.seq <= watch.last) continue;
+                    if (typeof reply.text === 'string' && reply.text.trim() !== '') {
+                        groupStore.appendMessage(groupId, {
+                            author: 'member',
+                            authorMemberId: member.memberId,
+                            authorDeviceId: member.deviceId,
+                            source: { sessionId, seq: reply.seq },
+                            text: reply.text.slice(0, 4000),
+                        });
+                    }
+                    watch.last = reply.seq;
+                }
+            }
+            catch (error) {
+                if (errorCode(error) === 'group-not-found' && watches.get(key) === watch) watches.delete(key);
+            }
+            if (watches.get(key) !== watch) return;
+            if (watch.remaining > 0) watch.timer = setTimeout(tick, replyPollMs).unref?.();
+            else watches.delete(key);
         };
-        setTimeout(tick, Math.min(replyPollMs, 1500)).unref?.();
+        watch.timer = setTimeout(tick, Math.min(replyPollMs, 1500)).unref?.();
     };
     const summary = (group) => ({
         id: group.id,
@@ -120,6 +138,11 @@ export function createGroupService({ root, deviceId, store, inventory, prompt, r
     };
     return {
         store: groupStore,
+        dispose() {
+            disposed = true;
+            for (const watch of watches.values()) clearTimeout(watch.timer);
+            watches.clear();
+        },
         state() {
             return {
                 deviceId,
@@ -218,9 +241,7 @@ export function createGroupService({ root, deviceId, store, inventory, prompt, r
                     return { memberKey: key, state: 'failed', code: 'no-session' };
                 }
                 try {
-                    const baseline = replyReader === undefined
-                        ? 0
-                        : await replyReader.latest(member.sessionId).catch(() => 0);
+                    const baseline = await reader?.latest(member.sessionId).catch(() => undefined);
                     await promptSession({
                         sessionId: member.sessionId,
                         text,
