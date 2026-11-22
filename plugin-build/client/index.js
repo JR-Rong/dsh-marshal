@@ -5345,11 +5345,37 @@ window.__ModuleLoader__.load({
       const button = (label, onClick, disabled = false, primary = false) =>
         h('button', { type: 'button', style: { ...uiButton(primary), opacity: disabled ? .52 : 1 }, onClick, disabled }, label);
 
-      const downloadPatch = record => {
-        const blobUrl = URL.createObjectURL(new Blob([record.text], { type: 'text/x-diff' }));
+      const parsePatchRecordClient = text => {
+        const prefix = '<!--marshal-patch-artifact:';
+        if (typeof text !== 'string' || !text.startsWith(prefix)) return { meta: null, body: String(text || '') };
+        const end = text.indexOf('-->', prefix.length);
+        if (end === -1) return { meta: null, body: text };
+        try {
+          const meta = JSON.parse(text.slice(prefix.length, end).trim());
+          return { meta, body: text.slice(end + 3).replace(/^\n+/, '') };
+        } catch {
+          return { meta: null, body: text };
+        }
+      };
+
+      const downloadPatch = async record => {
+        const parsed = parsePatchRecordClient(record.text);
+        let content = record.text;
+        if (parsed.meta?.stored && room?.id) {
+          try {
+            const qs = 'roomId=' + encodeURIComponent(room.id)
+              + (parsed.meta.digest ? '&digest=' + encodeURIComponent(parsed.meta.digest) : '')
+              + (record.seq ? '&seq=' + encodeURIComponent(String(record.seq)) : '');
+            const res = await fetchJson(prefix + 'patch?' + qs, undefined, true);
+            if (typeof res?.patch === 'string' && res.patch) content = res.patch;
+          } catch (e) {
+            setError(e?.message || '读取完整补丁失败，将下载预览片段。');
+          }
+        }
+        const blobUrl = URL.createObjectURL(new Blob([content], { type: 'text/x-diff' }));
         const link = document.createElement('a');
         link.href = blobUrl;
-        link.download = 'development-' + (record.ref?.slice(0, 12) ?? record.seq) + '.patch';
+        link.download = 'development-' + ((parsed.meta?.digest || record.ref)?.slice(0, 12) ?? record.seq) + '.patch';
         link.click();
         setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
       };
@@ -5440,19 +5466,28 @@ window.__ModuleLoader__.load({
 
         // 4) Development patch card
         if (record.phase === 'development-patch') {
-          const fileCount = (record.text.match(/^diff --git /gm) || []).length;
+          const parsedPatch = parsePatchRecordClient(record.text);
+          const meta = parsedPatch.meta;
+          const fileCount = meta?.fileCount ?? (parsedPatch.body.match(/^diff --git /gm) || []).length;
+          const sizeLabel = meta?.bytes ? ((meta.bytes / 1024).toFixed(1) + ' KiB') : '';
+          const diffStats = (typeof meta?.additions === 'number' || typeof meta?.deletions === 'number')
+            ? ('+' + (meta.additions || 0) + ' / -' + (meta.deletions || 0))
+            : '';
           return h('div', { key: record.seq, className: 'mtr-patch-card' },
             h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' } },
-              h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 12.5, fontWeight: 600 } },
+              h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 12.5, fontWeight: 600, flexWrap: 'wrap' } },
                 '📦 隔离工作树代码补丁',
                 fileCount > 0 && h('span', { style: uiMuted }, fileCount + ' 个文件变更'),
-                record.ref && h('code', { className: 'mtr-inline-code' }, record.ref.slice(0, 10))),
+                sizeLabel && h('span', { style: uiMuted }, sizeLabel),
+                diffStats && h('span', { style: uiMuted }, diffStats),
+                (meta?.digest || record.ref) && h('code', { className: 'mtr-inline-code' }, (meta?.digest || record.ref).slice(0, 10))),
               h('div', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
                 h('span', { style: uiMuted }, timeStr),
-                button('下载 .patch', () => downloadPatch(record)))),
+                button('下载 .patch', () => { void downloadPatch(record); }))),
             h('details', { style: { marginTop: 8 } },
-              h('summary', { style: { cursor: 'pointer', fontSize: 12, color: dswTheme.dim } }, '展开查看 Git Diff 补丁明细'),
-              h(CodeFenceBlock, { language: 'diff', code: record.text })));
+              h('summary', { style: { cursor: 'pointer', fontSize: 12, color: dswTheme.dim } },
+                meta?.stored ? '展开查看补丁变更摘要与前段预览（完整版已持久化）' : '展开查看 Git Diff 补丁明细'),
+              h(CodeFenceBlock, { language: 'diff', code: parsedPatch.body })));
         }
 
         // 5) Assignment configuration card or short Marshal status pill

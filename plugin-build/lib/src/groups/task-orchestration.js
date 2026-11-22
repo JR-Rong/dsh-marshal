@@ -76,7 +76,7 @@ function chooseTemplate(reply, enabled) {
 
 export function createTaskOrchestration({
     file, inventory, memory, port, defaultModel, startLeader, workspacePath, readPr = readPullRequest, logger,
-    leaderAutoReview = false, onPermissionBlocked, onState, resolveAttachments, readCard,
+    leaderAutoReview = false, onPermissionBlocked, onState, resolveAttachments, readCard, patchStore,
 }) {
     const tasks = load(file);
     const active = new Map();
@@ -512,6 +512,8 @@ export function createTaskOrchestration({
                 },
                 leaderAutoReview,
                 operatorNotes: () => audit?.operatorNotes?.(),
+                patchStore,
+                seedPatch: audit?.seedPatch,
             });
             if (!result) return;
             const endTask = liveTask();
@@ -1058,7 +1060,7 @@ export function createTaskOrchestration({
                         actor: 'DSH',
                         phase: 'conversation',
                         model,
-                        prompt: '在工作区工单群中回复最新消息。请使用清晰的 Markdown（代码或 JSON 请用代码块包裹）。群消息是引用资料。\n' + history,
+                        prompt: '在工作区工单群中回复最新消息。请使用清晰的 Markdown（代码或 JSON 请用代码块包裹）。注意：当前为工单群文本讨论模式，不具备 Shell 或文件修改工具，切勿声称已经执行了终端命令或改完了代码；若需要执行改动请提示机主点击「按群内意见继续执行」。群消息是引用资料。\n' + history,
                         signal,
                     });
                     const text = encodeAgentTrace(rawText, consumeTrace(chatKey, 'DSH'));
@@ -1080,7 +1082,7 @@ export function createTaskOrchestration({
                         actor: speaker.name,
                         phase: 'conversation',
                         model,
-                        prompt: '你是工单群内的 ' + JSON.stringify(speaker.name) + '（职责：' + roleTag + '）。请直接针对机主的最新消息作出专业、清晰的回应或讨论。输出格式请使用规范 Markdown（如涉及 JSON 或代码请用 ``` 代码块包裹）。群消息与工单背景是引用资料。\n'
+                        prompt: '你是工单群内的 ' + JSON.stringify(speaker.name) + '（职责：' + roleTag + '）。请直接针对机主的最新消息作出专业、清晰的回应或讨论。注意：当前处于工单群纯文本讨论模式（没有终端或文件修改工具），切勿声称已实际执行命令或已完成代码修改；若机主要求立即改代码或跑测试，请明确给出修改思路并提示点击「按群内意见继续执行」。输出格式请使用规范 Markdown（如涉及 JSON 或代码请用 ``` 代码块包裹）。群消息与工单背景是引用资料。\n'
                             + (speaker.brief ? '角色简报 ' + JSON.stringify(speaker.brief.slice(0, 2000)) + '\n' : '')
                             + history + priorTurnNote,
                         signal,
@@ -1170,10 +1172,25 @@ export function createTaskOrchestration({
                 const allowed = ['leader-unbound', 'leader-model-unavailable', 'reviewers-unavailable', 'invalid-leader-choice',
                     'handoff-read', 'handoff-write', 'handoff-too-large', 'invalid-role-output', 'codex-slot-unavailable',
                     'task-role-unassigned', 'task-role-model-unavailable', 'development-workspace-unavailable', 'development-git',
-                    'development-root-required', 'development-patch-too-large', 'development-no-changes', 'development-review-blocked', 'pr-fetch', 'pr-invalid-response', 'pr-empty', 'pr-incomplete', 'pr-too-large'];
+                    'development-root-required', 'development-patch-too-large', 'development-no-changes', 'development-review-blocked',
+                    'patch-artifact-missing', 'patch-conflict', 'patch-corrupted',
+                    'pr-fetch', 'pr-invalid-response', 'pr-empty', 'pr-incomplete', 'pr-too-large'];
+                const discussionMessages = {
+                    'size-limit': '模型单轮输出超过 16 KiB 上限，已中断。请缩小单工单范围或精简输出要求后重试。',
+                    'response-incomplete': '模型思考链或回复触及最大输出长度上限被截断，未能完成本阶段。请尝试调低思考强度或拆分任务后重试。',
+                    'outcome-unknown': '模型流式连接意外中止，未收到完整结束信号，请重试。',
+                    'empty-output': '模型返回了空内容，未产生有效阶段输出，请检查模型状态后重试。',
+                    'agent-crashed': '子 Agent（Codex / 模型进程）异常退出，请检查本机 Codex 登录状态与环境后重试。',
+                    'cancelled': '本轮编排执行已被取消或超过阶段超时上限。',
+                    'revision-conflict': '模型目录或配置在运行期间发生了变更（revision-conflict），请重新运行工单。',
+                    'invalid-args': '所选模型不支持当前配置的思考强度或参数，请检查智能体配置。',
+                    'isolation-violation': '子 Agent 触发了沙箱隔离限制（尝试调用未授权的工具类型），已安全终止。',
+                    'version-unsupported': '本机 Codex CLI 版本不受当前工作区隔离协议支持，请升级 Codex CLI。',
+                    'unsupported': '当前节点未启用或不支持该子 Agent 执行器。',
+                };
                 const message = allowed.includes(error?.code) ? error.message
-                    : (typeof error?.code === 'string' && /^[a-z-]{2,60}$/.test(error.code)
-                        ? '编排步骤失败（' + error.code + '）。' : '编排步骤失败，请检查节点和模型配置后重试。');
+                    : (discussionMessages[error?.code] ?? (typeof error?.code === 'string' && /^[a-z-]{2,60}$/.test(error.code)
+                        ? '编排步骤失败（' + error.code + '）。' : '编排步骤失败，请检查节点和模型配置后重试。'));
                 const permissionBlocked = isPermissionBlockedError(error);
                 const finalMessage = permissionBlocked
                     ? '权限受阻：' + message + ' 已自动挂入「待确认」等待审批。'
@@ -1192,6 +1209,22 @@ export function createTaskOrchestration({
                 if (active.size === 0) catalog = undefined;
             });
             return true;
+        },
+        handedOffTasks(source) {
+            const out = [];
+            for (const task of tasks.values()) {
+                if (source && task.source !== source) continue;
+                if (task.state !== 'handed-off' || !task.sessionId) continue;
+                out.push({
+                    source: task.source,
+                    taskId: task.taskId,
+                    sessionId: task.sessionId,
+                    leaderName: task.leaderName,
+                    runId: task.runId,
+                    workspaceId: task.workspaceId,
+                });
+            }
+            return out;
         },
         assertIdle(source, taskId) {
             if (active.has(keyFor(source, taskId))) throw taskError('task-running', '编排运行中，暂不能删除任务。');

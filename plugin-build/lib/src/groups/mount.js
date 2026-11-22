@@ -15,6 +15,9 @@ import { createTaskRooms } from './task-rooms.js';
 import { createTaskRoomStore, TaskRoomKey } from './task-room-store.js';
 import { createTaskRoomRoutes, taskRoomAccess, taskRoomAudit, visibleTaskRoom } from './task-room-routes.js';
 import { createTaskOrchestration, isPermissionBlockedError } from './task-orchestration.js';
+import { createPatchStore } from './patch-store.js';
+import { createTaskToolController } from './task-tool-controller.js';
+import { syncResidentSessionToRoom } from './session-room-sync.js';
 import { createTaskOverrides, describeContentSteeringMessage, describePlainConfigChanges } from './task-overrides.js';
 import { createWorkspaceRosters } from './workspace-rosters.js';
 import { createTicketNumbers, withTicketPrefix } from './ticket-numbers.js';
@@ -366,8 +369,9 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
     const {
         root: groupsRootDir, rosters, ticketNumbers, sessionTitles, sessionController, config, llm, readDefaultModel,
         workspacePath, webOrigin, getAttachmentStore, resolveAttachments, surface: dshSurface, moveCardStatus,
-        taskOverrides: injectedTaskOverrides,
+        taskOverrides: injectedTaskOverrides, patchStore: injectedPatchStore,
     } = extras;
+    const patchStore = injectedPatchStore ?? (groupsRootDir ? createPatchStore(join(groupsRootDir, 'patches')) : undefined);
     const taskOverrides = injectedTaskOverrides ?? createTaskOverrides(groupsRootDir ? join(groupsRootDir, 'task-overrides.json') : undefined);
     const effectiveCard = (source, task) => task ? taskOverrides.applyTo(source, task) : undefined;
     const applyBoardAction = async (req, board, source, action, actionInitiator = initiator) => {
@@ -572,6 +576,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
         ticketNumbers, workspacePath, normalizeAttachments: normalizeAttachmentsPayload, resolveAttachments,
         surface: dshSurface, moveCardStatus,
         getEffectiveCard: effectiveCard, saveCardPromptOverride, launchPlainCardWithOverrides,
+        patchStore, steerResidentSession,
     });
     return [
         ...roomRoutes.routes,
@@ -899,22 +904,54 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
                 ...(reuseSession === undefined ? {} : { reuseSession }),
             };
             const beforeIds = existing ?? new Set((board.snapshot().tasks ?? []).map(task => task.id));
-            let snapshot = await applyBoardAction(req, board, source, { kind: 'create', id, input }, initiator);
+            // Attach orchestration BEFORE board.apply('create') so superagent or other
+            // synchronous board-change listeners immediately observe the workflow instead
+            // of racing and falling back to a plain un-orchestrated dispatch.
+            let preAttached = false;
+            if (scope && prepared) {
+                try {
+                    orchestration.attach(source, id, prepared);
+                    preAttached = true;
+                } catch {
+                    write(res, 500, { ok: false, code: 'task-orchestration-not-saved', message: '无法保存任务编排。' });
+                    return;
+                }
+            }
+            let snapshot;
+            try {
+                snapshot = await applyBoardAction(req, board, source, { kind: 'create', id, input }, initiator);
+            } catch (createError) {
+                if (preAttached) {
+                    try { orchestration.remove(source, id); } catch { /* preserve original error */ }
+                }
+                throw createError;
+            }
             const added = (snapshot.tasks ?? []).filter(task => !beforeIds.has(task.id));
             const created = (snapshot.tasks ?? []).find(task => task.id === id) ?? (added.length === 1 ? added[0] : undefined);
             if (scope) {
                 if (!created) {
+                    if (preAttached) {
+                        try { orchestration.remove(source, id); } catch { /* ignore */ }
+                    }
                     write(res, 409, { ok: false, code: 'task-create-not-observed' });
                     return;
                 }
                 try {
-                    if (prepared) orchestration.attach(source, created.id, prepared);
+                    if (prepared && created.id !== id) {
+                        if (preAttached) {
+                            try { orchestration.remove(source, id); } catch { /* ignore */ }
+                        }
+                        orchestration.attach(source, created.id, prepared);
+                    }
                     const ticketNo = ticketNumbers?.ensure?.(created.id);
                     rooms.ensure(source, ticketNo ? { ...created, title: withTicketPrefix(ticketNo, created.title) } : created, scope.workspaceId, scope.ownerId);
                 }
                 catch {
                     if (prepared) {
                         try { orchestration.remove(source, created.id); } catch { /* preserve original error */ }
+                        if (preAttached && created.id !== id) {
+                            try { orchestration.remove(source, id); } catch { /* preserve original error */ }
+                        }
                     }
                     try { await board.apply(randomUUID(), { kind: 'delete', taskId: created.id }, initiator); }
                     catch { /* A host without rollback can leave an unconfigured card. */ }
@@ -1082,6 +1119,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
                 ok: true,
                 patchApplied: result.patchApplied,
                 patchAlreadyApplied: result.patchAlreadyApplied,
+                ...(result.committed ? { committed: true, commitHash: result.commitHash } : {}),
                 tasks: taskList(result.snapshot ?? board.snapshot(), req, source),
             });
         }),
@@ -1975,6 +2013,7 @@ export function mountGroups(ctx, config, options = {}) {
     const rosters = createWorkspaceRosters(join(root, 'workspace-rosters.json'));
     const ticketNumbers = createTicketNumbers(join(root, 'ticket-numbers.json'));
     const sessionTitles = createSessionTitles(join(root, 'session-titles.json'));
+    const patchStore = createPatchStore(join(root, 'patches'));
     const boardSourceOf = () => taskBoard === undefined ? 'local' : 'host';
     // A workflow owns its card's execution, so it also owns the card's column.
     // Writing the column here keeps the desktop board, the mobile node and the
@@ -2004,6 +2043,7 @@ export function mountGroups(ctx, config, options = {}) {
             port: createDiscussionPort({ agents: config.agents, llm, codexExecutable: config.codexExecutable, maxModels: 256, maxPerProvider: 64 }),
             defaultModel: readDefaultModel, logger: options.logger, workspacePath: agents.workspace,
             resolveAttachments: resolveTicketAttachments,
+            patchStore,
             readCard: (src, id) => {
                 const raw = (getBoard()?.snapshot()?.tasks ?? []).find(item => item.id === id);
                 return raw ? taskOverrides.applyTo(src, raw) : undefined;
@@ -2094,7 +2134,77 @@ export function mountGroups(ctx, config, options = {}) {
             ticketNo: taskId => ticketNumbers?.ensure?.(taskId),
         });
     }
+    const steerHostResidentSession = async (sessionId, text) => {
+        if (!sessionId || !text || typeof ctx.sessionController?.prompt !== 'function') return false;
+        try {
+            await ctx.sessionController.prompt({
+                requestId: 'marshal-steer-' + randomUUID(),
+                sessionId,
+                mode: 'queue',
+                content: [{ type: 'text', text }],
+            }, AbortSignal.timeout(10_000));
+            return true;
+        } catch {
+            return false;
+        }
+    };
+    const tasksController = createTaskToolController({
+        getBoard,
+        boardSource: boardSourceOf,
+        initiator: `marshal:${config.deviceId}`,
+        resolveOwnerId: desktopOwner,
+        orchestration,
+        rooms,
+        patchStore,
+        ticketNumbers,
+        taskOverrides,
+        workspacePath: agents.workspace,
+        readInventory: readAgentsLedger,
+        readWorkspaces: () => readWorkspaceRegistry().workspaces.map(w => ({ id: w.id, title: w.title, path: w.path })),
+        surface,
+        moveCardStatus,
+        steerResidentSession: steerHostResidentSession,
+    });
+    // Background reconciliation for handed-off resident sessions so completed turns
+    // settle into "review" even when no browser tab is actively polling the room.
+    let handedOffSyncRunning = false;
+    const handedOffSyncTimer = setInterval(() => {
+        if (handedOffSyncRunning || !orchestration || !rooms || !surface) return;
+        const source = boardSourceOf();
+        const activeHandedOff = orchestration.handedOffTasks?.(source) ?? [];
+        if (activeHandedOff.length === 0) return;
+        handedOffSyncRunning = true;
+        void (async () => {
+            try {
+                for (const item of activeHandedOff) {
+                    const room = rooms.find(item.source, item.taskId);
+                    if (!room || room.closed) continue;
+                    await syncResidentSessionToRoom({
+                        surface,
+                        rooms,
+                        room,
+                        sessionId: item.sessionId,
+                        actor: item.leaderName || '执行智能体',
+                        runId: room.runId ?? item.runId,
+                        workflowState: 'handed-off',
+                        onTurnCompleted: async (reason, lastText) => {
+                            if (reason === 'completed') {
+                                orchestration.syncStatus?.(item.source, item.taskId, 'review', {
+                                    reviewReason: 'delivery-review',
+                                    reviewSummary: String(lastText || '').slice(0, 500),
+                                });
+                                await moveCardStatus(item.source, item.taskId, 'review');
+                            }
+                        },
+                    });
+                }
+            } catch { /* best-effort background sync */ }
+            finally { handedOffSyncRunning = false; }
+        })();
+    }, 15_000);
+    handedOffSyncTimer.unref?.();
     if (typeof ctx.effect === 'function') ctx.effect(() => () => {
+        clearInterval(handedOffSyncTimer);
         orchestration?.dispose();
         rooms?.close();
         promptAbort.abort();
@@ -2102,7 +2212,7 @@ export function mountGroups(ctx, config, options = {}) {
     }, 'marshal: groups prompt lifetime');
     ctx.inject(['tools'], (scoped) => {
         scoped.effect(() => {
-            const disposers = agentToolDefinitions({ agents, service })
+            const disposers = agentToolDefinitions({ agents, service, tasks: tasksController })
                 .map((definition) => scoped.tools.register(definition));
             return () => {
                 for (const dispose of disposers) dispose();
@@ -2132,7 +2242,7 @@ export function mountGroups(ctx, config, options = {}) {
                 root, rosters, ticketNumbers, sessionTitles, sessionController: ctx.sessionController,
                 config, llm, readDefaultModel, workspacePath: agents.workspace,
                 webOrigin: resolveWebOrigin, getAttachmentStore, resolveAttachments: resolveTicketAttachments,
-                surface, moveCardStatus, taskOverrides,
+                surface, moveCardStatus, taskOverrides, patchStore,
             }).map((route) => scoped.webServer.register(route));
             return () => {
                 for (const dispose of disposers) dispose();

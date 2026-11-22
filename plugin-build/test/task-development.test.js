@@ -77,14 +77,15 @@ for (const run of [{ reviewerDelegates: true }, { reviewerDelegates: false }, { 
                 if (prompt.includes('在运行前推荐协作分工')) {
                     return JSON.stringify({ templateId: 'development', members: { coder: 'team/coder', reviewer: 'team/reviewer' } });
                 }
-                if (model.agent === 'codex' && work) {
+                if (model.agent === 'codex' && work && !work.readOnly) {
                     assert.notEqual(work.workspace, repo);
                     writeFileSync(join(work.workspace, 'sum.mjs'), 'export const sum = (x, y) => x + y;\n');
                     writeFileSync(join(work.workspace, 'new.mjs'), 'export const metadata = "new";\n');
                     return 'Codex implementation and command evidence';
                 }
                 if (model.agent === 'codex') {
-                    assert.equal(work, undefined);
+                    assert.equal(work?.readOnly, true);
+                    assert.ok(typeof work?.workspace === 'string' && work.workspace !== repo);
                     assert.match(prompt, /固定补丁/);
                     assert.match(prompt, /new\.mjs/);
                     reviewed = true;

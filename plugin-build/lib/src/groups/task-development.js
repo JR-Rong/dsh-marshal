@@ -9,22 +9,25 @@ import { createWorkspaceLeases } from '../discussions/workspace.js';
 import { WORK_TURN_MS } from '../discussions/types.js';
 import { taskError } from './pr-material.js';
 import { DelegationSchema, VerdictSchema, parseModelJson } from './task-plans.js';
+import { extractPatchTouchedFiles, formatPatchRoomRecord, MAX_STORED_PATCH_BYTES } from './patch-store.js';
 
 const gitExec = promisify(execFile);
 const leases = createWorkspaceLeases();
-const PATCH_BYTES = 48 * 1024;
+export const PATCH_BYTES = 512 * 1024;
+const INLINE_REVIEW_PATCH_BYTES = 24 * 1024;
+const GIT_MAX_BUFFER = MAX_STORED_PATCH_BYTES + 256 * 1024;
 const gitEnvironment = () => Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
 const git = async (cwd, args, signal, allowDifference = false) => {
     try {
         const { stdout } = await gitExec('git', ['--no-pager', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', ...args], {
-            cwd, env: { ...gitEnvironment(), GIT_TERMINAL_PROMPT: '0' }, signal, maxBuffer: PATCH_BYTES + 64 * 1024,
+            cwd, env: { ...gitEnvironment(), GIT_TERMINAL_PROMPT: '0' }, signal, maxBuffer: GIT_MAX_BUFFER,
         });
         return stdout;
     } catch (error) {
         if (signal.aborted) signal.throwIfAborted();
         if (allowDifference && error.code === 1 && typeof error.stdout === 'string') return error.stdout;
         if (error.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') {
-            throw taskError('development-patch-too-large', '开发补丁超过自动审查的材料上限。');
+            throw taskError('development-patch-too-large', '开发补丁超过自动审查的最大缓冲上限（2 MiB），请按模块拆分工单。');
         }
         if (/not a git repository/i.test(String(error.stderr ?? ''))) {
             throw taskError('development-root-required', '所选工作区（' + cwd + '）不是 Git 仓库根目录；「开发交付」模板需要绑定具体 Git 仓库的工作区，或改用普通模式 / Superagent 直接唤醒智能体。');
@@ -35,10 +38,10 @@ const git = async (cwd, args, signal, allowDifference = false) => {
 
 export async function linkWorkspaceNodeModules(root, worktree) {
     const created = [];
-    const tryLink = async relDir => {
-        const src = relDir ? join(root, relDir, 'node_modules') : join(root, 'node_modules');
-        const dstParent = relDir ? join(worktree, relDir) : worktree;
-        const dst = join(dstParent, 'node_modules');
+    const tryLinkPath = async relPath => {
+        const src = join(root, relPath);
+        const dst = join(worktree, relPath);
+        const dstParent = join(dst, '..');
         if (!existsSync(src) || !existsSync(dstParent) || existsSync(dst)) return;
         try {
             const st = await lstat(dst).catch(() => null);
@@ -47,17 +50,31 @@ export async function linkWorkspaceNodeModules(root, worktree) {
             created.push(dst);
         } catch { /* best-effort read-only dependency projection */ }
     };
+    const tryLink = async relDir => {
+        const relPath = relDir ? join(relDir, 'node_modules') : 'node_modules';
+        await tryLinkPath(relPath);
+    };
     await tryLink('');
+    await tryLinkPath('.toolchain');
     try {
         const entries = await readdir(root, { withFileTypes: true });
         for (const entry of entries) {
             if (!entry.isDirectory() || entry.name.startsWith('.') || entry.name === 'node_modules') continue;
             await tryLink(entry.name);
-            if (entry.name === 'packages' || entry.name === 'apps') {
+            if (entry.name === 'packages' || entry.name === 'apps' || entry.name === 'plugins') {
                 const nested = await readdir(join(root, entry.name), { withFileTypes: true }).catch(() => []);
                 for (const sub of nested) {
                     if (sub.isDirectory() && !sub.name.startsWith('.') && sub.name !== 'node_modules') {
                         await tryLink(join(entry.name, sub.name));
+                    }
+                }
+            }
+            const subPluginsDir = join(root, entry.name, 'plugins');
+            if (existsSync(subPluginsDir)) {
+                const subPlugins = await readdir(subPluginsDir, { withFileTypes: true }).catch(() => []);
+                for (const sub of subPlugins) {
+                    if (sub.isDirectory() && !sub.name.startsWith('.') && sub.name !== 'node_modules') {
+                        await tryLink(join(entry.name, 'plugins', sub.name));
                     }
                 }
             }
@@ -73,7 +90,82 @@ export async function linkWorkspaceNodeModules(root, worktree) {
     };
 }
 
-async function isolatedCheckout(path, signal, use) {
+export async function readRepoContext(workspacePathStr, card, signal) {
+    if (typeof workspacePathStr !== 'string' || !workspacePathStr.trim()) return undefined;
+    try {
+        const root = await realpath(workspacePathStr);
+        const [branchRaw, headRaw, logRaw, statusRaw, entriesRaw] = await Promise.all([
+            git(root, ['rev-parse', '--abbrev-ref', 'HEAD'], signal).catch(() => ''),
+            git(root, ['rev-parse', '--short', 'HEAD'], signal).catch(() => ''),
+            git(root, ['log', '-n', '5', '--oneline'], signal).catch(() => ''),
+            git(root, ['status', '--porcelain'], signal).catch(() => ''),
+            readdir(root, { withFileTypes: true }).catch(() => []),
+        ]);
+        const dirtyLines = statusRaw.split('\n').map(l => l.trim()).filter(Boolean);
+        const topLevel = entriesRaw
+            .filter(e => !e.name.startsWith('.') && e.name !== 'node_modules')
+            .map(e => e.isDirectory() ? e.name + '/' : e.name)
+            .sort()
+            .slice(0, 32);
+        const text = [card?.title, card?.description, card?.prompt].filter(Boolean).join('\n');
+        const pathMatches = new Set();
+        const re = /(?:^|[\s`"'(（\[【])((?:[A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+(?:\.[A-Za-z0-9]+)?)/g;
+        let match;
+        while ((match = re.exec(text)) !== null && pathMatches.size < 20) {
+            const candidate = match[1].replace(/[.,;:!?)'"`\]]+$/, '');
+            if (!candidate || candidate.startsWith('http') || candidate.includes('..') || candidate.startsWith('/')) continue;
+            pathMatches.add(candidate);
+        }
+        const referencedPaths = [...pathMatches].slice(0, 16).map(rel => ({
+            path: rel,
+            exists: existsSync(join(root, rel)),
+        }));
+        return {
+            branch: branchRaw.trim() || undefined,
+            head: headRaw.trim() || undefined,
+            recentCommits: logRaw.split('\n').map(l => l.trim()).filter(Boolean).slice(0, 5),
+            dirtyFilesCount: dirtyLines.length,
+            ...(dirtyLines.length > 0 ? { dirtyPreview: dirtyLines.slice(0, 10) } : {}),
+            topLevel,
+            ...(referencedPaths.length > 0 ? { referencedPaths } : {}),
+        };
+    } catch {
+        return undefined;
+    }
+}
+
+async function applyPatchToDir(dir, patchText, signal) {
+    const tempDir = await mkdtemp(join(tmpdir(), 'marshal-seed-patch-'));
+    try {
+        const patchFile = join(tempDir, 'seed.patch');
+        await writeFile(patchFile, patchText.endsWith('\n') ? patchText : patchText + '\n', { encoding: 'utf8', mode: 0o600 });
+        try {
+            await gitExec('git', ['--no-pager', 'apply', '--check', '--', patchFile], {
+                cwd: dir, env: { ...gitEnvironment(), GIT_TERMINAL_PROMPT: '0' }, signal,
+            });
+            await gitExec('git', ['--no-pager', 'apply', '--', patchFile], {
+                cwd: dir, env: { ...gitEnvironment(), GIT_TERMINAL_PROMPT: '0' }, signal,
+            });
+            return { applied: true, method: 'direct' };
+        } catch {
+            try {
+                await gitExec('git', ['--no-pager', 'apply', '--check', '--3way', '--', patchFile], {
+                    cwd: dir, env: { ...gitEnvironment(), GIT_TERMINAL_PROMPT: '0' }, signal,
+                });
+                await gitExec('git', ['--no-pager', 'apply', '--3way', '--', patchFile], {
+                    cwd: dir, env: { ...gitEnvironment(), GIT_TERMINAL_PROMPT: '0' }, signal,
+                });
+                return { applied: true, method: '3way' };
+            } catch (err) {
+                return { applied: false, reason: String(err?.stderr || err?.message || 'patch-mismatch').trim().slice(0, 200) };
+            }
+        }
+    } finally {
+        try { await rm(tempDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+}
+
+async function isolatedCheckout(path, signal, use, { seedPatch } = {}) {
     const lease = leases.acquire(path);
     let parent, worktree, activeUnlink;
     try {
@@ -82,9 +174,15 @@ async function isolatedCheckout(path, signal, use) {
         if (await realpath(top.trim()) !== root) throw taskError('development-root-required', '请选择与 Git 仓库根目录绑定的工作区。');
         const base = (await git(root, ['rev-parse', '--verify', 'HEAD^{commit}'], signal)).trim();
         if (!/^[a-f\d]{40,64}$/.test(base)) throw taskError('development-git', '工作区缺少可审查的基准提交。');
+        const dirtyStatus = await git(root, ['status', '--porcelain'], signal).catch(() => '');
+        const dirtyLines = dirtyStatus.split('\n').map(l => l.trim()).filter(Boolean);
         parent = await mkdtemp(join(tmpdir(), 'marshal-development-'));
         worktree = join(parent, 'checkout');
         await git(root, ['worktree', 'add', '--detach', '--', worktree, base], signal);
+        let seedResult = { applied: false };
+        if (typeof seedPatch === 'string' && seedPatch.trim() !== '') {
+            seedResult = await applyPatchToDir(worktree, seedPatch, signal);
+        }
         const mountDeps = async () => {
             if (activeUnlink) await activeUnlink();
             activeUnlink = await linkWorkspaceNodeModules(root, worktree);
@@ -94,7 +192,11 @@ async function isolatedCheckout(path, signal, use) {
                 if (fn) await fn();
             };
         };
-        return await use(worktree, base, mountDeps);
+        return await use(worktree, base, mountDeps, {
+            dirtyFilesCount: dirtyLines.length,
+            seededFromPreviousPatch: seedResult.applied === true,
+            seedFailureReason: seedResult.applied ? undefined : seedResult.reason,
+        });
     } finally {
         if (activeUnlink) {
             try { await activeUnlink(); } catch { /* ignore */ }
@@ -108,25 +210,50 @@ async function isolatedCheckout(path, signal, use) {
     }
 }
 
-async function freezePatch(worktree, base, signal) {
+async function freezePatch(worktree, base, signal, patchStore) {
     const diffOptions = ['--binary', '--no-ext-diff', '--no-textconv', '--no-color', '--src-prefix=a/', '--dst-prefix=b/'];
-    const parts = [await git(worktree, ['diff', ...diffOptions, '--no-relative', base, '--'], signal)];
-    let bytes = Buffer.byteLength(parts[0]);
-    const untracked = bytes <= PATCH_BYTES
-        ? (await git(worktree, ['ls-files', '--others', '--exclude-standard', '-z'], signal)).split('\0').filter(Boolean) : [];
+    const tracked = await git(worktree, ['diff', ...diffOptions, '--no-relative', base, '--'], signal);
+    const statTracked = await git(worktree, ['diff', '--stat', '--no-color', base, '--'], signal).catch(() => '');
+    const parts = [tracked];
+    let bytes = Buffer.byteLength(tracked, 'utf8');
+    const untracked = (await git(worktree, ['ls-files', '--others', '--exclude-standard', '-z'], signal)).split('\0').filter(Boolean);
     for (const file of untracked) {
-        const path = file === '-' ? './-' : file;
-        const diff = await git(worktree, ['diff', '--no-index', ...diffOptions, '--', '/dev/null', path], signal, true);
-        const part = path === file ? diff : diff.replace(/^diff --git a\/\.\/- b\/\.\/-$/m, 'diff --git a/- b/-')
+        const filePath = file === '-' ? './-' : file;
+        const diff = await git(worktree, ['diff', '--no-index', ...diffOptions, '--', '/dev/null', filePath], signal, true);
+        const part = filePath === file ? diff : diff.replace(/^diff --git a\/\.\/- b\/\.\/-$/m, 'diff --git a/- b/-')
             .replace(/^\+\+\+ b\/\.\/-$/m, '+++ b/-');
-        bytes += Buffer.byteLength(part);
-        if (bytes > PATCH_BYTES) break;
+        bytes += Buffer.byteLength(part, 'utf8');
         parts.push(part);
+        if (bytes > MAX_STORED_PATCH_BYTES) break;
     }
-    if (bytes > PATCH_BYTES) throw taskError('development-patch-too-large', '开发补丁超过 48 KiB，请拆分后审查。');
+    const untrackedStat = untracked.length > 0
+        ? untracked.slice(0, 30).map(f => ' ' + f + ' (new file)').join('\n')
+        : '';
+    const diffStat = [statTracked.trim(), untrackedStat].filter(Boolean).join('\n');
     const patch = parts.join('');
     if (!patch.trim()) throw taskError('development-no-changes', '编码阶段没有可交付的 Git 变更。');
-    return { patch, digest: createHash('sha256').update(patch).digest('hex') };
+    const digest = createHash('sha256').update(patch).digest('hex');
+    if (bytes > PATCH_BYTES) {
+        let savedHint = '';
+        if (patchStore && bytes <= MAX_STORED_PATCH_BYTES) {
+            try {
+                const saved = patchStore.save(patch, { digest });
+                savedHint = '（已将完整超限补丁暂存至本机补丁库，SHA-256: ' + saved.digest.slice(0, 12) + '）';
+            } catch { /* ignore save error on oversized patch */ }
+        }
+        const statHint = diffStat ? '\n变更摘要：\n' + diffStat.slice(0, 800) : '';
+        throw taskError('development-patch-too-large',
+            '开发补丁体积 ' + (bytes / 1024).toFixed(1) + ' KiB 超过单工单上限（' + (PATCH_BYTES / 1024) + ' KiB），请拆分工单后审查。' + savedHint + statHint);
+    }
+    let stored = false;
+    if (patchStore) {
+        try {
+            patchStore.save(patch, { digest });
+            stored = true;
+        } catch { /* inline fallback still works for small patches */ }
+    }
+    const roomRecordText = formatPatchRoomRecord(patch, { digest, stat: diffStat, stored });
+    return { patch, digest, bytes, diffStat, roomRecordText };
 }
 
 const brief = (title, description, plan, extra) => JSON.stringify({ title, description, plan, ...extra });
@@ -153,7 +280,7 @@ const withGuidance = (prompt, guidance) => guidance
     ? prompt + '\n\n【机主在工单群内的最新讨论与修正指示（最高优先级，必须逐条回应并落实）】\n' + guidance
     : prompt;
 
-export async function applyDevelopmentPatch(workspacePathStr, patchText, signal = AbortSignal.timeout(30_000)) {
+export async function applyDevelopmentPatch(workspacePathStr, patchText, signal = AbortSignal.timeout(30_000), options = {}) {
     if (typeof workspacePathStr !== 'string' || !workspacePathStr.trim()) {
         throw taskError('development-workspace-unavailable', '未找到可应用补丁的目标工作区目录。');
     }
@@ -169,33 +296,66 @@ export async function applyDevelopmentPatch(workspacePathStr, patchText, signal 
         tempDir = await mkdtemp(join(tmpdir(), 'marshal-apply-patch-'));
         const patchFile = join(tempDir, 'delivery.patch');
         await writeFile(patchFile, patchText.endsWith('\n') ? patchText : patchText + '\n', { encoding: 'utf8', mode: 0o600 });
+        let alreadyApplied = false;
+        let applied = false;
         try {
             await gitExec('git', ['--no-pager', 'apply', '--reverse', '--check', '--', patchFile], {
                 cwd: root, env: { ...gitEnvironment(), GIT_TERMINAL_PROMPT: '0' }, signal,
             });
-            return { applied: false, alreadyApplied: true };
+            alreadyApplied = true;
         } catch { /* not yet applied; proceed to forward check */ }
-        let use3Way = false;
-        try {
-            await gitExec('git', ['--no-pager', 'apply', '--check', '--', patchFile], {
-                cwd: root, env: { ...gitEnvironment(), GIT_TERMINAL_PROMPT: '0' }, signal,
-            });
-        } catch (directErr) {
+        if (!alreadyApplied) {
+            let use3Way = false;
             try {
-                await gitExec('git', ['--no-pager', 'apply', '--check', '--3way', '--', patchFile], {
+                await gitExec('git', ['--no-pager', 'apply', '--check', '--', patchFile], {
                     cwd: root, env: { ...gitEnvironment(), GIT_TERMINAL_PROMPT: '0' }, signal,
                 });
-                use3Way = true;
-            } catch {
-                const detail = String(directErr?.stderr || directErr?.message || '补丁不匹配').trim().slice(0, 320);
-                throw taskError('patch-conflict', '补丁与当前工作区文件存在冲突，请处理工作区改动后再试，或选择「仅确认完成」：' + detail);
+            } catch (directErr) {
+                try {
+                    await gitExec('git', ['--no-pager', 'apply', '--check', '--3way', '--', patchFile], {
+                        cwd: root, env: { ...gitEnvironment(), GIT_TERMINAL_PROMPT: '0' }, signal,
+                    });
+                    use3Way = true;
+                } catch {
+                    const detail = String(directErr?.stderr || directErr?.message || '补丁不匹配').trim().slice(0, 320);
+                    throw taskError('patch-conflict', '补丁与当前工作区文件存在冲突，请处理工作区改动后再试，或选择「仅确认完成」：' + detail);
+                }
+            }
+            const applyArgs = use3Way ? ['--no-pager', 'apply', '--3way', '--', patchFile] : ['--no-pager', 'apply', '--', patchFile];
+            await gitExec('git', applyArgs, {
+                cwd: root, env: { ...gitEnvironment(), GIT_TERMINAL_PROMPT: '0' }, signal,
+            });
+            applied = true;
+        }
+        let committed = false;
+        let commitHash;
+        const commitMsg = typeof options?.commitMessage === 'string' ? options.commitMessage.trim() : '';
+        if (commitMsg) {
+            const touchedFiles = extractPatchTouchedFiles(patchText);
+            if (touchedFiles.length > 0) {
+                await gitExec('git', ['--no-pager', 'add', '-A', '--', ...touchedFiles], {
+                    cwd: root, env: { ...gitEnvironment(), GIT_TERMINAL_PROMPT: '0' }, signal,
+                });
+                const staged = await git(root, ['diff', '--cached', '--name-only', '--', ...touchedFiles], signal).catch(() => '');
+                if (staged.trim()) {
+                    const hasName = (await git(root, ['config', 'user.name'], signal).catch(() => '')).trim();
+                    const hasEmail = (await git(root, ['config', 'user.email'], signal).catch(() => '')).trim();
+                    const authorArgs = (!hasName || !hasEmail)
+                        ? ['-c', 'user.name=Marshal', '-c', 'user.email=marshal@local']
+                        : [];
+                    await gitExec('git', ['--no-pager', ...authorArgs, 'commit', '-m', commitMsg, '--', ...touchedFiles], {
+                        cwd: root, env: { ...gitEnvironment(), GIT_TERMINAL_PROMPT: '0' }, signal,
+                    });
+                    commitHash = (await git(root, ['rev-parse', '--short', 'HEAD'], signal).catch(() => '')).trim() || undefined;
+                    committed = true;
+                }
             }
         }
-        const applyArgs = use3Way ? ['--no-pager', 'apply', '--3way', '--', patchFile] : ['--no-pager', 'apply', '--', patchFile];
-        await gitExec('git', applyArgs, {
-            cwd: root, env: { ...gitEnvironment(), GIT_TERMINAL_PROMPT: '0' }, signal,
-        });
-        return { applied: true, alreadyApplied: false };
+        return {
+            applied,
+            alreadyApplied,
+            ...(committed ? { committed: true, commitHash } : {}),
+        };
     } finally {
         if (tempDir) {
             try { await rm(tempDir, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -205,7 +365,8 @@ export async function applyDevelopmentPatch(workspacePathStr, patchText, signal 
 }
 
 export async function runTaskDevelopment({
-    card, getCard, path, plan, getPlan, signal, asLeader, asRole, runChild, record, handoff, phase, manual, leaderAutoReview = false, operatorNotes,
+    card, getCard, path, plan, getPlan, signal, asLeader, asRole, runChild, record, handoff, phase, manual,
+    leaderAutoReview = false, operatorNotes, patchStore, seedPatch,
 }) {
     const readGuidance = async () => {
         try {
@@ -217,11 +378,14 @@ export async function runTaskDevelopment({
     const resolvePlan = () => getPlan?.() ?? plan;
     const initialCard = await resolveCard();
     const initialAttachments = Array.isArray(initialCard.resolvedAttachments) && initialCard.resolvedAttachments.length > 0 ? initialCard.resolvedAttachments : undefined;
+    const repoContext = await readRepoContext(path, initialCard, signal);
     phase('designing');
     const designGuidance = await readGuidance();
     const design = await asLeader(withGuidance(
-        '你负责设计和拆分开发任务。给出要修改的模块、边界、验收条件和可运行的测试。限制为 2500 字符。\n'
+        '你负责设计和拆分开发任务。给出要修改的模块、边界、验收条件和可运行的测试。请严格基于 repoContext 中的真实分支、提交与文件存在情况设计方案，不要编造不存在的文件或旧提交。限制为 2500 字符。\n'
         + brief(initialCard.title, initialCard.description, resolvePlan(), {
+            ...(repoContext ? { repoContext } : {}),
+            ...(seedPatch ? { incrementalRevision: true } : {}),
             ...(initialAttachments ? { attachments: initialAttachments } : {}),
             ...(designGuidance ? { operatorGuidance: designGuidance } : {}),
         }),
@@ -231,7 +395,38 @@ export async function runTaskDevelopment({
     const implementationPlan = await handoff('开发设计交接', design, 'designing');
     if (resolvePlan().codex?.coding === null) return manual(implementationPlan);
 
-    return isolatedCheckout(path, signal, async (worktree, base, mountDeps) => {
+    return isolatedCheckout(path, signal, async (worktree, base, mountDeps, checkoutMeta) => {
+        if (checkoutMeta?.dirtyFilesCount > 0) {
+            await record('status', 'Marshal',
+                '提示：宿主工作区存在 ' + checkoutMeta.dirtyFilesCount + ' 处未提交改动；本隔离工作树基于基准提交 ' + base.slice(0, 8) + ' 创建。若依赖前序工单改动，请先提交或合并后再运行。',
+                'coding');
+        }
+        if (checkoutMeta?.seededFromPreviousPatch) {
+            await record('status', 'Marshal', '已将上一轮未落盘补丁预载到隔离工作树，本轮将在上次改动基础上继续增量修正。', 'coding');
+        } else if (seedPatch && checkoutMeta?.seedFailureReason) {
+            await record('status', 'Marshal', '提示：未能自动预载上一轮补丁（' + checkoutMeta.seedFailureReason + '），将从当前 HEAD 重新构建。', 'coding');
+        }
+        const invokeDelegation = async (callFn, actorName, phaseName, fullPrompt, compactPrompt, fallbackDecision) => {
+            try {
+                const raw = await callFn(fullPrompt);
+                await record('agent', actorName, raw, phaseName);
+                return parseModelJson(raw, DelegationSchema);
+            } catch (firstErr) {
+                if (signal.aborted || !RECOVERABLE_VERDICT_CODES.has(firstErr?.code)) throw firstErr;
+                try {
+                    const retryRaw = await callFn(compactPrompt);
+                    await record('agent', actorName, retryRaw, phaseName);
+                    return parseModelJson(retryRaw, DelegationSchema);
+                } catch (secondErr) {
+                    if (signal.aborted || !RECOVERABLE_VERDICT_CODES.has(secondErr?.code)) throw secondErr;
+                    if (fallbackDecision) {
+                        await record('status', 'Marshal', actorName + ' 委派响应格式受限（' + (secondErr?.code || firstErr?.code) + '），已自动回退为直接进入下一步裁决。', phaseName);
+                        return fallbackDecision;
+                    }
+                    throw secondErr;
+                }
+            }
+        };
         const invokeVerdict = async (callFn, actorName, phaseName, fullPrompt, compactPrompt) => {
             try {
                 const raw = await callFn(fullPrompt);
@@ -261,14 +456,22 @@ export async function runTaskDevelopment({
             const codingGuidance = await readGuidance();
             const context = brief(codingCard.title, codingCard.description, implementationPlan, {
                 base, round, feedback,
+                ...(checkoutMeta?.seededFromPreviousPatch ? { preloadedPreviousPatch: true } : {}),
                 ...(codingAttachments ? { attachments: codingAttachments } : {}),
                 ...(codingGuidance ? { operatorGuidance: codingGuidance } : {}),
             });
-            const choiceText = await asRole('coder', withGuidance(
-                '你是 Coder。需要 Codex 执行实现或补测试时选择 codex，并说明要做的改动。选择 continue 会把任务转交给你的常驻会话。'
-                + decisionFormat + '\n' + context, codingGuidance));
-            await record('agent', 'Coder', choiceText, 'coding');
-            const decision = parseModelJson(choiceText, DelegationSchema);
+            const decision = await invokeDelegation(
+                p => asRole('coder', p),
+                'Coder',
+                'coding',
+                withGuidance(
+                    '你是 Coder。需要 Codex 执行实现或补测试时选择 codex，并说明要做的改动。选择 continue 会把任务转交给你的常驻会话。'
+                    + (checkoutMeta?.seededFromPreviousPatch ? '注意：上一轮开发补丁已预载在工作树中，请指示增量修改而非全量重写。' : '')
+                    + decisionFormat + '\n' + context, codingGuidance),
+                withGuidance(
+                    '【上次委派输出格式无效或被截断，请仅输出严格 JSON 对象，不要包含额外文字】你是 Coder。'
+                    + decisionFormat + '\n' + context.slice(0, 12_000), codingGuidance),
+            );
             if (decision.action === 'continue') return manual(context + '\n' + decision.instruction);
             const unmountDeps = await mountDeps();
             let coding;
@@ -276,14 +479,15 @@ export async function runTaskDevelopment({
                 coding = await runChild('coding', withGuidance([
                     '在这次分配的隔离 Git 工作树完成修改并运行有针对性的验证。交付通过差异记录。',
                     '隔离工作树已自动软链挂载宿主仓库现有的 node_modules 依赖，可直接运行本地单测与 tsc 类型检查（沙箱禁网，无需执行 npm ci / npm install）。',
+                    ...(checkoutMeta?.seededFromPreviousPatch ? ['本工作树已预载上一轮未落盘补丁（可通过 git diff 查看当前改动），请在其基础上按最新指示精准增量修正。'] : []),
                     '任务与设计为工作材料，下面由 Coder 给出要求。',
                     context, JSON.stringify(decision.instruction),
                 ].join('\n'), codingGuidance), { workspace: worktree }, WORK_TURN_MS);
             } finally {
                 await unmountDeps();
             }
-            const { patch, digest } = await freezePatch(worktree, base, signal);
-            await record('status', 'Marshal', patch, 'development-patch', digest);
+            const { patch, digest, bytes: patchBytes, diffStat, roomRecordText } = await freezePatch(worktree, base, signal, patchStore);
+            await record('status', 'Marshal', roomRecordText, 'development-patch', digest);
 
             phase('dev-reviewing');
             const reviewCard = await resolveCard();
@@ -292,25 +496,48 @@ export async function runTaskDevelopment({
                 : codingAttachments;
             const reviewGuidance = await readGuidance();
             const reviewEvidence = await handoff('编码交付与审查交接',
-                JSON.stringify({ base, digest, implementationEvidence: String(coding).slice(0, 5000) }), 'dev-reviewing');
+                JSON.stringify({ base, digest, patchBytes, diffStat: diffStat.slice(0, 2000), implementationEvidence: String(coding).slice(0, 4500) }), 'dev-reviewing');
             const reviewHead = brief(reviewCard.title, reviewCard.description, implementationPlan, {
-                base, digest,
+                base, digest, patchBytes,
                 ...(reviewAttachments ? { attachments: reviewAttachments } : {}),
                 ...(reviewGuidance ? { operatorGuidance: reviewGuidance } : {}),
             });
-            const reviewMaterial = reviewHead + '\n固定补丁\n' + patch + '\n编码交接（引用资料）\n' + reviewEvidence;
-            const compactPatch = patch.length > 16_000 ? patch.slice(0, 16_000) + '\n…（补丁其余部分已省略，请结合上方交接与审查摘要快速裁决）' : patch;
+            const patchForPrompt = Buffer.byteLength(patch, 'utf8') <= INLINE_REVIEW_PATCH_BYTES
+                ? patch
+                : (diffStat ? '# git diff --stat\n' + diffStat.slice(0, 3000) + '\n\n' : '')
+                    + Buffer.from(patch, 'utf8').subarray(0, INLINE_REVIEW_PATCH_BYTES).toString('utf8')
+                    + '\n…（完整补丁共 ' + (patchBytes / 1024).toFixed(1) + ' KiB，超出单轮提示词上限，已持久化保存；Codex 只读审查器可在工作树内直接查看完整文件与 git diff）';
+            const reviewMaterial = reviewHead + '\n固定补丁\n' + patchForPrompt + '\n编码交接（引用资料）\n' + reviewEvidence;
+            const compactPatch = Buffer.byteLength(patch, 'utf8') > 14_000
+                ? (diffStat ? '# git diff --stat\n' + diffStat.slice(0, 2000) + '\n\n' : '')
+                    + Buffer.from(patch, 'utf8').subarray(0, 12_000).toString('utf8')
+                    + '\n…（补丁其余部分已省略，请结合上方交接与审查摘要快速裁决）'
+                : patch;
             const compactReviewMaterial = reviewHead + '\n固定补丁（摘要）\n' + compactPatch + '\n编码交接（引用资料）\n' + reviewEvidence;
             let child;
             if (plan.codex.review !== null) {
-                const request = await asRole('reviewer', withGuidance(
-                    '你是独立 Reviewer。需要 Codex 只读协助检查边界、证据或回归时选择 codex，已有足够证据时选择 continue。'
-                    + decisionFormat + '\n' + reviewMaterial, reviewGuidance));
-                await record('agent', 'Reviewer', request, 'dev-reviewing');
-                const route = parseModelJson(request, DelegationSchema);
+                const route = await invokeDelegation(
+                    p => asRole('reviewer', p),
+                    'Reviewer',
+                    'dev-reviewing',
+                    withGuidance(
+                        '你是独立 Reviewer。需要 Codex 在只读工作树中检查周边代码、边界条件或运行测试验证回归时选择 codex，已有足够证据时选择 continue。'
+                        + decisionFormat + '\n' + reviewMaterial, reviewGuidance),
+                    withGuidance(
+                        '【上次委派输出格式无效或被截断，请仅输出严格 JSON 对象】你是独立 Reviewer。'
+                        + decisionFormat + '\n' + compactReviewMaterial, reviewGuidance),
+                    { action: 'continue', instruction: '直接进入 Reviewer 终审裁决' },
+                );
                 if (route.action === 'codex') {
-                    child = await runChild('review', withGuidance('独立复核固定 Git 补丁。按文件和证据列出具体问题，检查失败路径和缺失验证。只返回审查发现。\n'
-                        + reviewMaterial + '\nReviewer 重点 ' + JSON.stringify(route.instruction), reviewGuidance));
+                    const unmountReviewDeps = await mountDeps();
+                    try {
+                        child = await runChild('review', withGuidance(
+                            '独立只读复核当前隔离 Git 工作树中的固定补丁。你拥有该工作树的只读访问权限（可查看完整文件、运行 git diff 及只读测试验证，严禁修改文件）。按文件和证据列出具体问题，检查失败路径和缺失验证。只返回审查发现。\n'
+                            + reviewMaterial + '\nReviewer 重点 ' + JSON.stringify(route.instruction), reviewGuidance),
+                            { workspace: worktree, readOnly: true }, WORK_TURN_MS);
+                    } finally {
+                        await unmountReviewDeps();
+                    }
                 }
             }
             const reviewerOutcome = await invokeVerdict(
@@ -408,5 +635,5 @@ export async function runTaskDevelopment({
                     '\n\n完整补丁和执行证据已保存在本工单群的当前批次。',
             };
         }
-    });
+    }, { seedPatch });
 }

@@ -369,13 +369,13 @@ test('full development + Codex sub-agent slot overrides (model + reasoningEffort
         catalog: async () => [dshChat, dshReasoner, codexDefault, codexPro],
         dispose() {},
         async run(model, prompt, _signal, work, reasoning, onUsage, onProgress) {
-            portCalls.push({ id: model.id, reasoning, work: Boolean(work), snippet: prompt.slice(0, 40) });
+            portCalls.push({ id: model.id, reasoning, work: Boolean(work), readOnly: work?.readOnly === true, snippet: prompt.slice(0, 40) });
             const sampleUsage = model.agent === 'codex'
                 ? { inputTokens: 3000, outputTokens: 800, totalTokens: 3800, durationMs: 500 }
                 : { inputTokens: 1500, outputTokens: 350, totalTokens: 1850, durationMs: 300 };
             onProgress?.({ text: 'working...', durationMs: 100, usage: sampleUsage, thinking: 'step reasoning' });
             onUsage?.(sampleUsage);
-            if (model.agent === 'codex' && work) {
+            if (model.agent === 'codex' && work && !work.readOnly) {
                 writeFileSync(join(work.workspace, 'app.js'), 'export const x = 2;\n');
                 return 'Updated app.js and verified.';
             }
@@ -443,7 +443,7 @@ test('full development + Codex sub-agent slot overrides (model + reasoningEffort
     assert.deepEqual({ id: coderDelegate.id, r: coderDelegate.reasoning }, { id: 'dsh:dp:chat', r: undefined }); // 'off' disabled 'high'
     assert.deepEqual({ id: codexCode.id, r: codexCode.reasoning, w: codexCode.work }, { id: 'codex:openai:gpt-6.2-sol', r: 'xhigh', w: true });
     assert.deepEqual({ id: reviewerDelegate.id, r: reviewerDelegate.reasoning }, { id: 'dsh:dp:reasoner', r: 'medium' });
-    assert.deepEqual({ id: codexRev.id, r: codexRev.reasoning, w: codexRev.work }, { id: 'codex:openai:codex-mini', r: 'low', w: false });
+    assert.deepEqual({ id: codexRev.id, r: codexRev.reasoning, w: codexRev.work, ro: codexRev.readOnly }, { id: 'codex:openai:codex-mini', r: 'low', w: true, ro: true });
     assert.deepEqual({ id: reviewerVerdict.id, r: reviewerVerdict.reasoning }, { id: 'dsh:dp:reasoner', r: 'medium' });
     assert.deepEqual({ id: leaderFinal.id, r: leaderFinal.reasoning }, { id: 'dsh:dp:reasoner', r: 'high' });
 

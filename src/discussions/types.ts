@@ -13,7 +13,10 @@ export const DiscussionModelSchema = z.object({
   reasoningEfforts: z.array(z.string().min(1).max(32)).max(12).optional(),
 }).strict()
 export type DiscussionModel = z.infer<typeof DiscussionModelSchema>
-export const WorkScopeSchema = z.object({ workspace: z.string().min(2).max(2048).startsWith('/').refine(p => !/[\x00-\x1f]/.test(p)) }).strict()
+export const WorkScopeSchema = z.object({
+  workspace: z.string().min(2).max(2048).startsWith('/').refine(p => !/[\x00-\x1f]/.test(p)),
+  readOnly: z.boolean().optional(),
+}).strict()
 export type WorkScope = z.infer<typeof WorkScopeSchema>
 export const DiscussionTurnSchema = z.object({
   roomId: id, memberId: id, turnId: id, modelId: id,

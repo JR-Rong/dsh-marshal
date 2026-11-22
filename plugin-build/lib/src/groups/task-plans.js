@@ -45,13 +45,13 @@ export const PlanSchema = z.object({
 }).strict();
 export const DelegationSchema = z.object({
     action: z.enum(['codex', 'continue']),
-    instruction: z.string().trim().min(1).max(4000),
+    instruction: z.string().trim().min(1).max(12000),
 }).strict();
-const findingsText = z.string().trim().min(1).max(5000);
+const findingsText = z.string().trim().min(1).max(10000);
 const findingsList = z.array(z.object({
     file: z.string().trim().min(1).max(280),
     conclusion: z.string().trim().min(1).max(1800),
-}).strict()).min(1).max(12).transform(items =>
+}).strict()).min(1).max(20).transform(items =>
     items.map(item => '- ' + item.file + '：' + item.conclusion).join('\n'));
 export const VerdictSchema = z.object({
     verdict: z.enum(['pass', 'revise', 'blocked']),
@@ -74,16 +74,54 @@ export function sanitizeAgentConfigs(raw) {
     return Object.keys(out).length > 0 ? out : undefined;
 }
 
+function extractBalancedJsonObjects(text) {
+    const out = [];
+    let depth = 0;
+    let start = -1;
+    let inString = false;
+    let escape = false;
+    for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        if (inString) {
+            if (escape) { escape = false; continue; }
+            if (ch === '\\') { escape = true; continue; }
+            if (ch === '"') inString = false;
+            continue;
+        }
+        if (ch === '"') { inString = true; continue; }
+        if (ch === '{') {
+            if (depth === 0) start = i;
+            depth += 1;
+        } else if (ch === '}') {
+            if (depth > 0) {
+                depth -= 1;
+                if (depth === 0 && start !== -1) {
+                    out.push(text.slice(start, i + 1));
+                    start = -1;
+                }
+            }
+        }
+    }
+    return out;
+}
+
 export function parseModelJson(text, schema) {
     const raw = String(text).trim();
     const candidates = [raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '')];
     for (const match of raw.matchAll(/```(?:json)?\s*([\s\S]*?)\s*```/gi)) {
         if (match[1]) candidates.push(match[1].trim());
     }
+    const balanced = extractBalancedJsonObjects(raw);
+    for (let i = balanced.length - 1; i >= 0; i--) {
+        candidates.push(balanced[i]);
+    }
     const firstBrace = raw.indexOf('{');
     const lastBrace = raw.lastIndexOf('}');
     if (firstBrace !== -1 && lastBrace > firstBrace) candidates.push(raw.slice(firstBrace, lastBrace + 1));
+    const seen = new Set();
     for (const candidate of candidates) {
+        if (!candidate || seen.has(candidate)) continue;
+        seen.add(candidate);
         try { return schema.parse(JSON.parse(candidate)); }
         catch { /* try next candidate */ }
     }

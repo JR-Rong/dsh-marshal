@@ -11,7 +11,10 @@ export const DiscussionModelSchema = z.object({
     id, agent: z.enum(['dsh', 'codex', 'claude']), model: id, provider: id, work: z.boolean().optional(),
     reasoningEfforts: z.array(z.string().min(1).max(32)).max(12).optional(),
 }).strict();
-export const WorkScopeSchema = z.object({ workspace: z.string().min(2).max(2048).startsWith('/').refine(p => !/[\x00-\x1f]/.test(p)) }).strict();
+export const WorkScopeSchema = z.object({
+    workspace: z.string().min(2).max(2048).startsWith('/').refine(p => !/[\x00-\x1f]/.test(p)),
+    readOnly: z.boolean().optional(),
+}).strict();
 export const DiscussionTurnSchema = z.object({
     roomId: id, memberId: id, turnId: id, modelId: id,
     text: z.string().min(1).refine(text => Buffer.byteLength(text) <= DISCUSSION_INPUT_BYTES),

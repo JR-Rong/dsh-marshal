@@ -136,7 +136,7 @@ test('linkWorkspaceNodeModules symlinks root and subdir node_modules during codi
         catalog: async () => [dsh, codex],
         dispose() {},
         async run(model, prompt, _signal, work) {
-            if (model.agent === 'codex' && work) {
+            if (model.agent === 'codex' && work && !work.readOnly) {
                 sawMountedDepsInWorktree =
                     existsSync(join(work.workspace, 'node_modules', 'root-dep', 'index.js')) &&
                     existsSync(join(work.workspace, 'mobile', 'node_modules', 'vitest', 'index.js'));
@@ -145,6 +145,8 @@ test('linkWorkspaceNodeModules symlinks root and subdir node_modules during codi
                 return 'Implemented offline banner and ran vitest via mounted node_modules.';
             }
             if (model.agent === 'codex') {
+                assert.equal(work?.readOnly, true);
+                assert.equal(existsSync(join(work.workspace, 'mobile', 'node_modules', 'vitest', 'index.js')), true);
                 return '1. mobile/src/offline-banner.ts: verify retry button state when reconnected.';
             }
             if (prompt.includes('设计和拆分')) return 'Update mobile offline banner and add tests.';

@@ -6,6 +6,7 @@ import { stripAgentTrace } from './agent-trace.js';
 import { syncResidentSessionToRoom } from './session-room-sync.js';
 import { withTicketPrefix } from './ticket-numbers.js';
 import { applyDevelopmentPatch } from './task-development.js';
+import { parsePatchArtifactHeader, resolvePatchText, summarizePatch } from './patch-store.js';
 
 const remoteChoice = z.object({ deviceId: TaskRoomKey, modelId: TaskRoomKey }).strict();
 const ROOM_ID = z.uuid();
@@ -43,16 +44,29 @@ export async function readOperatorNotes(rooms, roomId) {
     }
 }
 
-async function findLatestPatch(rooms, roomId, expectedDigest) {
+export async function findLatestPatch(rooms, roomId, expectedDigest, patchStore, expectedSeq) {
     const page = await rooms.page(roomId, { limit: 100 });
     const patches = (page.records ?? []).filter(r => r.phase === 'development-patch' && typeof r.text === 'string' && r.text.trim() !== '');
     if (patches.length === 0) return undefined;
-    if (expectedDigest) {
-        const exactMatch = [...patches].reverse().find(r => r.ref === expectedDigest);
-        if (exactMatch) return { text: exactMatch.text, digest: exactMatch.ref };
+    let chosen;
+    if (Number.isSafeInteger(expectedSeq) && expectedSeq > 0) {
+        chosen = patches.find(r => r.seq === expectedSeq);
     }
-    const latest = patches.at(-1);
-    return { text: latest.text, digest: latest.ref };
+    if (!chosen && expectedDigest) {
+        chosen = [...patches].reverse().find(r => {
+            if (r.ref === expectedDigest) return true;
+            const parsed = parsePatchArtifactHeader(r.text);
+            return parsed?.meta?.digest === expectedDigest;
+        });
+    }
+    if (!chosen) chosen = patches.at(-1);
+    const resolved = resolvePatchText(chosen.text, chosen.ref, patchStore);
+    return {
+        text: resolved.text,
+        digest: resolved.digest,
+        meta: resolved.meta ?? summarizePatch(resolved.text),
+        seq: chosen.seq,
+    };
 }
 
 export function visibleTaskRoom(room, ticketNumbers) {
@@ -85,7 +99,7 @@ export function taskRoomAudit(rooms, room, reason, leader, remoteTarget, allowMe
 export function createTaskRoomRoutes({
     exact, write, readBody, authenticate, allowed, auth, rooms, orchestration, getBoard, boardSource, getInitiator,
     ticketNumbers, workspacePath, normalizeAttachments, resolveAttachments, surface, moveCardStatus,
-    getEffectiveCard, saveCardPromptOverride, launchPlainCardWithOverrides,
+    getEffectiveCard, saveCardPromptOverride, launchPlainCardWithOverrides, patchStore, steerResidentSession,
 }) {
     const viewRoom = room => visibleTaskRoom(room, ticketNumbers);
     const operations = new Set();
@@ -180,6 +194,36 @@ export function createTaskRoomRoutes({
             const board = getBoard();
             const rawCard = board?.snapshot().tasks?.find(task => task.id === room.taskId);
             const card = rawCard && typeof getEffectiveCard === 'function' ? getEffectiveCard(room.source, rawCard) : rawCard;
+            const mentions = parseRoomMentions(text);
+            const mentionAll = mentions.some(m => m.toLowerCase() === 'all' || m === '所有人' || m === '全体');
+            const cardExecSessionId = Array.isArray(card?.executions)
+                ? [...card.executions].reverse().find(ex => typeof ex?.sessionId === 'string' && ex.sessionId !== '')?.sessionId
+                : undefined;
+            const residentSessionId = workflowView?.sessionId || (!workflowView ? (card?.sessionId || cardExecSessionId) : undefined);
+            const residentOwnerName = workflowView?.leaderName || extractAgentTag(card) || '执行智能体';
+            const targetsResident = Boolean(
+                !target
+                && residentSessionId
+                && typeof steerResidentSession === 'function'
+                && !mentionAll
+                && (mentions.length === 0 || mentions.every(m => m === residentOwnerName))
+            );
+            if (targetsResident) {
+                const steerText = '【工单群内机主最新消息，请直接使用你的工具执行并回复结果】\n' + text;
+                const steered = await steerResidentSession(residentSessionId, steerText);
+                if (steered) {
+                    await rooms.append(room.id, {
+                        kind: 'status', runId, actor: 'Marshal', phase: 'steering',
+                        text: '已将您的消息转发至「' + residentOwnerName + '」的常驻会话（具备工具执行能力），执行结果将自动同步回本工单群。',
+                    });
+                    view = await rooms.page(room.id, { limit: 12 });
+                    return { room: viewRoom(view.room), steeredResident: true };
+                }
+                await rooms.append(room.id, {
+                    kind: 'status', runId, actor: 'Marshal', phase: 'conversation',
+                    text: '提示：常驻会话当前无法接收消息，已切换为工单群文本讨论回复。',
+                });
+            }
             const messages = view.records
                 .filter(record => record.kind === 'user' || record.kind === 'agent' || record.kind === 'status')
                 .map(record => ({
@@ -216,7 +260,7 @@ export function createTaskRoomRoutes({
                     if (!orchestration) throw unavailable();
                     const result = await orchestration.respond(room.source, room.taskId, context, AbortSignal.timeout(125_000), {
                         leaderId: body.leaderId,
-                        mentions: parseRoomMentions(text),
+                        mentions,
                         workspaceId: room.workspaceId,
                         fallbackAgentName: extractAgentTag(card),
                         allowMember: member => allowed(access, member),
@@ -247,21 +291,27 @@ export function createTaskRoomRoutes({
             const workflow = orchestration?.target(source, card.id);
             let patchApplied = false;
             let patchAlreadyApplied = false;
+            let committed = false;
+            let commitHash;
             if (body?.applyPatch === true) {
                 if (!room) throw taskError('development-no-changes', '未找到绑定工单群中的开发补丁。');
                 if (typeof workspacePath !== 'function') throw taskError('development-workspace-unavailable', '工作区路径解析服务不可用。');
-                const patch = await findLatestPatch(rooms, room.id, workflow?.development?.digest);
+                const patch = await findLatestPatch(rooms, room.id, workflow?.development?.digest, patchStore);
                 if (!patch) throw taskError('development-no-changes', '当前工单群中没有可应用的开发补丁。');
                 const wsDir = await workspacePath(workflow?.workspaceId ?? room.workspaceId, AbortSignal.timeout(10_000));
-                const applied = await applyDevelopmentPatch(wsDir, patch.text, AbortSignal.timeout(30_000));
+                const commitMessage = typeof body?.commitMessage === 'string' && body.commitMessage.trim() !== '' ? body.commitMessage.trim() : undefined;
+                const applied = await applyDevelopmentPatch(wsDir, patch.text, AbortSignal.timeout(30_000), { commitMessage });
                 patchApplied = applied.applied === true;
                 patchAlreadyApplied = applied.alreadyApplied === true;
+                committed = applied.committed === true;
+                commitHash = applied.commitHash;
                 orchestration?.markPatchApplied?.(source, card.id, Date.now());
                 const latestRoom = (await rooms.page(room.id, { limit: 1 })).room;
                 if (!latestRoom.closed) {
+                    const commitNote = committed && commitHash ? '，并已自动提交（' + commitHash + '）' : (committed ? '，并已自动提交' : '');
                     await rooms.append(room.id, {
                         kind: 'status', runId: latestRoom.runId, actor: 'Marshal', phase: 'confirmed',
-                        text: patchAlreadyApplied ? '检查确认：本批次隔离开发补丁此前已在工作区生效。' : '已将本批次隔离开发补丁应用到工作区目录。',
+                        text: (patchAlreadyApplied ? '检查确认：本批次隔离开发补丁此前已在工作区生效' : '已将本批次隔离开发补丁应用到工作区目录') + commitNote + '。',
                     });
                 }
             }
@@ -289,6 +339,7 @@ export function createTaskRoomRoutes({
                 snapshot,
                 patchApplied,
                 patchAlreadyApplied,
+                ...(committed ? { committed: true, commitHash } : {}),
                 room: room ? viewRoom((await rooms.page(room.id, { limit: 1 })).room) : undefined,
             };
         }
@@ -332,7 +383,15 @@ export function createTaskRoomRoutes({
             if (workflow) {
                 if (!orchestration) throw unavailable();
                 orchestration.cancel?.(source, card.id);
+                let seedPatch;
+                if (room && !workflow.development?.appliedAt) {
+                    try {
+                        const prevPatch = await findLatestPatch(rooms, room.id, workflow.development?.digest, patchStore);
+                        if (prevPatch?.text) seedPatch = prevPatch.text;
+                    } catch { /* fallback to fresh HEAD if prior patch unavailable */ }
+                }
                 const audit = room ? taskRoomAudit(rooms, room, 'revise', undefined, workflow.remoteTarget, member => allowed(access, member)) : undefined;
+                if (audit && seedPatch) audit.seedPatch = seedPatch;
                 orchestration.start(source, card, audit);
                 if (board && card.status !== 'running') {
                     try {
@@ -477,6 +536,29 @@ export function createTaskRoomRoutes({
                 liveBubbles,
             };
         }),
+        route('GET', 'patch', async (req, access) => {
+            const url = new URL(req.url, 'http://localhost');
+            const id = url.searchParams.get('roomId');
+            const digest = url.searchParams.get('digest') || undefined;
+            const seqRaw = url.searchParams.get('seq');
+            const seq = seqRaw ? Number(seqRaw) : undefined;
+            const room = readLocal(id, access);
+            const workflow = orchestration?.target(room.source, room.taskId);
+            const found = await findLatestPatch(rooms, room.id, digest ?? workflow?.development?.digest, patchStore, Number.isSafeInteger(seq) ? seq : undefined);
+            if (!found) throw taskError('development-no-changes', '当前工单群中没有可读取的开发补丁。');
+            return {
+                patch: found.text,
+                digest: found.digest,
+                seq: found.seq,
+                ...(found.meta ? {
+                    bytes: found.meta.bytes,
+                    fileCount: found.meta.fileCount,
+                    files: found.meta.files,
+                    additions: found.meta.additions,
+                    deletions: found.meta.deletions,
+                } : {}),
+            };
+        }),
         route('GET', 'peers', async (req, access) => {
             const id = new URL(req.url, 'http://localhost').searchParams.get('roomId');
             const room = readLocal(id, access);
@@ -541,5 +623,12 @@ export function createTaskRoomRoutes({
             finally { operations.delete(room.id); }
         }),
     ];
-    return { routes, assertIdle, confirmReview, reviseTask };
+    return {
+        routes,
+        assertIdle,
+        confirmReview,
+        reviseTask,
+        sendMessage: send,
+        findPatch: (roomId, expectedDigest, expectedSeq) => findLatestPatch(rooms, roomId, expectedDigest, patchStore, expectedSeq),
+    };
 }

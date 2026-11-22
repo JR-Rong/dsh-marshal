@@ -2,6 +2,7 @@ import { specToJsonSchema } from '../tools/schema.js';
 
 const AGENT_ACTIONS = ['list', 'create', 'update', 'delete', 'chat'];
 const GROUP_ACTIONS = ['list', 'get', 'create', 'send'];
+const TASK_ACTIONS = ['catalog', 'list', 'get', 'create', 'plan', 'run', 'room_read', 'room_send', 'patch', 'revise', 'confirm'];
 
 function textOutput(value) {
     return { type: 'string' };
@@ -97,7 +98,7 @@ export function createAgentsHttpClient({ baseUrl, fetchImpl = fetch } = {}) {
     };
 }
 
-export function agentToolDefinitions({ agents, service } = {}) {
+export function agentToolDefinitions({ agents, service, tasks } = {}) {
     const agentTool = {
         name: 'marshal_agent',
         description: '管理调度官里的智能体（不是小队）：list 列出；create 创建；update 修改；delete 删除；chat 打开/创建该智能体的常驻会话，返回 sessionId。修改会整条替换定义，清空的字段恢复默认。',
@@ -193,6 +194,63 @@ export function agentToolDefinitions({ agents, service } = {}) {
             throw new Error('unknown group action');
         },
     };
-    for (const tool of [agentTool, groupTool]) tool.parameters = specToJsonSchema(tool.parameters);
-    return [agentTool, groupTool];
+    const tools = [agentTool, groupTool];
+    if (tasks) {
+        const taskTool = {
+            name: 'marshal_task',
+            description: '调度官工单全流程工具：catalog 查模板/工作区/智能体；list 列出工单；get 读工单与编排详情；create 建单并挂编排（支持 development/pr-review 等模板与 Leader/Coder/Reviewer 分工）；plan 修改编排分工或模型；run 启动工单（遵守人工权限确认门禁）；room_read 读工单群消息与实时气泡；room_send 在工单群发言（常驻会话自动直达执行）；patch 读取隔离开发补丁；revise 按意见继续执行（自动预载上轮补丁增量修正）；confirm 验收确认（可 applyPatch 并可选 commitMessage 自动提交）。',
+            parameters: {
+                action: { type: 'string', required: true, enum: TASK_ACTIONS },
+                taskId: { type: 'string', description: 'get/plan/run/room_read/room_send/patch/revise/confirm 的工单 ID。' },
+                roomId: { type: 'string', description: 'room_read/room_send/patch 可选直接指定工单群 ID。' },
+                status: { type: 'string', enum: ['backlog', 'todo', 'running', 'review', 'done', 'failed'], description: 'list 的状态筛选。' },
+                query: { type: 'string', description: 'list 的关键词搜索。' },
+                includeArchived: { type: 'boolean', description: 'list 是否包含已归档工单。' },
+                title: { type: 'string', description: 'create 的工单标题。' },
+                description: { type: 'string', description: 'create 的工单详细需求说明。' },
+                prompt: { type: 'string', description: 'create 的执行指令（留空自动回退到 description）。' },
+                workspaceId: { type: 'string', description: 'create/plan 的目标工作区 ID。' },
+                permission: { type: 'string', enum: ['read-only', 'workspace-write', 'danger-full-access'], description: 'create 的权限级别。' },
+                parentId: { type: 'string', description: 'create 的父工单 ID（子任务）。' },
+                tags: { type: 'array', items: { type: 'string' }, description: 'create 的标签列表。' },
+                skipAmbiguityCheck: { type: 'boolean', description: 'create 跳过模糊需求拦截。' },
+                orchestration: {
+                    type: 'object',
+                    additionalProperties: true,
+                    description: 'create/plan 的编排配置，如 { leaderId, choice: "template"|"leader"|"none", templateId: "development"|"pr-review"|"report"|"research"|"incident", prUrl?, plan?: { templateId, members?: { coder, reviewer }, codex?: { coding, review } }, agentConfigs? }。',
+                },
+                text: { type: 'string', description: 'room_send 或 revise 的消息/修正意见正文。' },
+                autoReopen: { type: 'boolean', description: 'room_send 时若工单群已关闭是否自动重开。' },
+                limit: { type: 'integer', description: 'room_read 返回记录条数（默认 40，上限 100）。' },
+                after: { type: 'integer', description: 'room_read 增量拉取起始 seq。' },
+                before: { type: 'integer', description: 'room_read 向前翻页 seq。' },
+                digest: { type: 'string', description: 'patch 指定要读取的补丁 SHA-256 摘要。' },
+                seq: { type: 'integer', description: 'patch 指定补丁事件 seq。' },
+                maxChars: { type: 'integer', description: 'patch 返回补丁正文的最大字符数（默认 32000）。' },
+                applyPatch: { type: 'boolean', description: 'confirm 时是否将隔离工作树补丁应用到宿主工作区。' },
+                commitMessage: { type: 'string', description: 'confirm 且 applyPatch=true 时可选自动提交补丁所改文件的 Git commit 信息。' },
+                note: { type: 'string', description: 'confirm 时的验收备注。' },
+            },
+            output: { schema: textOutput(), render },
+            async execute(args) {
+                switch (args.action) {
+                    case 'catalog': return JSON.stringify(await tasks.catalog());
+                    case 'list': return JSON.stringify(await tasks.list(args));
+                    case 'get': return JSON.stringify(await tasks.get(args));
+                    case 'create': return JSON.stringify(await tasks.create(args));
+                    case 'plan': return JSON.stringify(await tasks.plan(args));
+                    case 'run': return JSON.stringify(await tasks.run(args));
+                    case 'room_read': return JSON.stringify(await tasks.roomRead(args));
+                    case 'room_send': return JSON.stringify(await tasks.roomSend(args));
+                    case 'patch': return JSON.stringify(await tasks.patch(args));
+                    case 'revise': return JSON.stringify(await tasks.revise(args));
+                    case 'confirm': return JSON.stringify(await tasks.confirm(args));
+                    default: throw new Error('unknown task action');
+                }
+            },
+        };
+        tools.push(taskTool);
+    }
+    for (const tool of tools) tool.parameters = specToJsonSchema(tool.parameters);
+    return tools;
 }
