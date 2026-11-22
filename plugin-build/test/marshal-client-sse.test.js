@@ -821,8 +821,7 @@ test('memory bundle keeps ordering, workspace TDZ, and the main panel error boun
     for (const label of ['全局记忆与审批', '智能体私有记忆', '工作区共享记忆']) assert.ok(page.includes(label));
     assert.match(readClient('src/60-agents'), /function SafeMarshalPanel\(props\)\s*\{\s*return h\(MarshalErrorBoundary, \{ resetKey: 'marshal-panel-root' \}, h\(MarshalPanel, props\)\);/);
     assert.match(readClient('src/70-plugin-register'), /h\(SafeMarshalPanel, props\)/);
-    assert.doesNotMatch(bundle, /\b(?:AgentsPage|TaskRoomsPage)\b/);
-    assert.match(bundle, /function TaskBoardPage\(/);
+    assert.doesNotMatch(bundle, /\b(?:AgentsPage|TaskRoomsPage|TaskBoardPage)\b/);
     assert.match(readClient('src/56-hub-agents'), /fetchJson\('marshal\/rosters\/save'/);
     assert.doesNotMatch(readClient('src/20-memory'), /\p{Extended_Pictographic}|\bsetInterval\b|\brequire\s*\(/u);
 });

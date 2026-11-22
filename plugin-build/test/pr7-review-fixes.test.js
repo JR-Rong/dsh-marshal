@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { runInNewContext } from 'node:vm';
 import { createAgentMemoryService, mountAgentMemory, resolveMemoryIdentity, resolveWorkspaceIdForCwd, workspaceKey } from '../lib/src/memory/agent-memory.js';
 import { parseDotEdges } from '../lib/src/memory/mnemon-native.js';
 import { createMemoryHttpAuth, hostIsLoopback } from '../lib/src/memory/http-auth.js';
@@ -137,27 +138,31 @@ test('task orchestration matches bare model ids and clips oversize handoffs inst
     assert.equal(rec.plan.templateId, 'report');
 });
 
-test('shipped client keeps plain card create/run working and sends auth for taskRoom cards', () => {
+test('shipped Hub kanban creates plain cards and authenticates create and run requests', () => {
     const source = readFileSync(new URL('../client/index.js', import.meta.url), 'utf8');
-    assert.ok(source.includes('if (leaderId && !workspace)'));
-    assert.ok(source.includes("fetchJson('marshal/tasks/run', { taskId: task.id }, Boolean(task.workflow || task.taskRoom))"));
-    assert.ok(source.includes("fetchJson('marshal/tasks/move', { taskId: task.id, status }, Boolean(task.workflow || task.taskRoom))"));
-    assert.ok(source.includes("fetchJson('marshal/tasks/delete', { taskId: task.id }, Boolean(task.workflow || task.taskRoom))"));
-    assert.ok(source.includes("!task.taskRoom?.closed && task.status !== 'running' && (!workflow || workflow.state !== 'done')"));
-    for (const [key, label] of [['backlog', '待规划'], ['todo', '待办'], ['running', '进行中'], ['review', '待确认'], ['done', '已完成'], ['failed', '已失败']]) {
-        assert.ok(source.includes("key: '" + key + "', label: '" + label + "'"), 'missing board column ' + key);
-    }
-    assert.ok(source.includes('--mtb-accent'), 'board should apply per-column theme accents');
-    assert.ok(source.includes('taskTagTone'), 'board should render colored tag and priority pills');
-    assert.ok(source.includes('mtb-drawer'), 'board should open a detail drawer on card click');
-    assert.ok(source.includes('mtb-tpl-pill'), 'create form should expose agent orchestration templates directly');
-    assert.ok(source.includes("fetchJson('marshal/tasks/set-parent'"), 'board should support linking subtasks');
-    assert.ok(source.includes("fetchJson('marshal/tasks/update'"), 'board should support editing tags and card details');
-    assert.ok(source.includes('--mtb-res-c'), 'bottom-left result badge should use high-contrast explicit dot + label-primary text');
-    assert.ok(source.includes('api/task-board/parse'), 'board should expose AI task draft parser modal');
-    assert.ok(source.includes('api/task-board/model-catalog'), 'board should load models and reasoning efforts');
-    assert.ok(source.includes('api/task-board/attachments/upload'), 'board should support optional attachment uploads');
-    assert.ok(source.includes('指派 Agent Leader'), 'board should support assigning an Agent Leader');
+    const viewStart = source.indexOf('function MarshalHubKanbanView(');
+    const formStart = source.indexOf('function mvHubTicketForm(', viewStart);
+    const formEnd = source.indexOf('\n    }', formStart);
+    assert.ok(viewStart >= 0 && formStart > viewStart && formEnd > formStart);
+    const kanban = source.slice(viewStart, formStart);
+    const form = source.slice(formStart, formEnd);
+    assert.match(kanban, /label: '新建工单', onClick: \(\) => openForm\(\)/);
+    assert.match(kanban, /form && h\(mvHubTicketForm,/);
+    assert.match(form, /if \(!form\.task && !title\)/);
+    assert.match(form, /if \(\(form\.task \|\| isOrchestrated\) && \(!template \|\| !draft\.workspaceId \|\| !draft\.leaderId \|\| slots\.some\(role => role\.required && !draft\.members\[role\.id\]\)\)\)/);
+    assert.match(form, /mvHubSelect\('编排模板'[^\n]+\n\s*action\.busy, form\.task \? '选择模板' : '不启用编排'/);
+    assert.match(form, /mvHubSelect\('Leader 人选', draft\.leaderId, members,/);
+    assert.match(form, /fetchJson\('marshal\/tasks\/create', \{ title, description,\s+\.\.\.\(draft\.workspaceId \? \{ workspaceId: draft\.workspaceId \} : \{\}\), \.\.\.\(orchestration \? \{ orchestration \} : \{\}\),[\s\S]*?attachments: attachments\.map\(serializeAttachmentForWire\) \}, true, signal\)/);
+    assert.match(form, /h\(mvCascadePicker\.MarshalCascadeContextPicker,/);
+    assert.match(form, /checked: draft\.run[^\n]+创建后立即运行/);
+    assert.match(form, /!form\.task && draft\.run \? await fetchJson\('marshal\/tasks\/state', undefined, true, signal\)/);
+    assert.match(form, /if \(result\.movedToReview\) \{[^\n]+return; \}/);
+    assert.match(form, /const added = \(result\.tasks \?\? \[\]\)\.filter\(row => !known\.has\(row\.id\)\);\s+const created = added\.length === 1 && added\[0\];/);
+    assert.match(form, /if \(!created \|\| created\.title !== title \|\| mvHubWorkspace\(created\) !== draft\.workspaceId\) \{[^}]+return;/);
+    assert.match(form, /fetchJson\('marshal\/tasks\/run', \{ taskId: created\.id \}, true, signal\)/);
+    assert.match(kanban, /!task\.workflow && !mvHubIsLive\(task\) && mvHubLane\(task\) !== 'done' && h\(MvButton, \{[^}]+onClick: \(\) => mutate\('marshal\/tasks\/run', \{ taskId: task\.id \}\)/);
+    assert.match(kanban, /const mutate = \(path, body\) => action\.run\(async signal => \{\s+const result = await fetchJson\(path, body, true, signal\)/);
+    assert.match(kanban, /if \(path === 'marshal\/tasks\/run' && body\?\.taskId\) markBlocked\(body\.taskId, Boolean\(result\.permissionBlocked\)\)/);
 });
 
 test('local board supports moving tasks across all six columns including review', async (t) => {
@@ -391,12 +396,28 @@ test('memoryTargetAllowed admits owner real DSH workspaces even without pinned a
     assert.equal(memoryTargetAllowed(guestSession, { workspaceId: 'ws-foreign', scope: 'workspace' }, ledger, registered), true);
 });
 
-test('shipped client .20 exposes session rename/summarize, [GD-00001] ticket numbers, and board flow guide', () => {
+test('shipped client exposes session rename/summarize, [GD-00001] ticket numbers, and Hub kanban status routing', () => {
     const source = readFileSync(new URL('../client/index.js', import.meta.url), 'utf8');
     assert.ok(source.includes("fetchJson('marshal/agents/sessions/rename'"), 'client should allow renaming sessions');
     assert.ok(source.includes("fetchJson('marshal/agents/sessions/summarize'"), 'client should allow summarizing session titles');
     assert.ok(source.includes('task.ticketNo'), 'board should render GD ticket numbers');
-    assert.ok(source.includes('流转规则'), 'board should expose status transition guide');
+    const laneStart = source.indexOf('function mvHubLane(');
+    const laneEnd = source.indexOf('const mvHubIsLive', laneStart);
+    assert.ok(laneStart >= 0 && laneEnd > laneStart);
+    const laneFor = runInNewContext(source.slice(laneStart, laneEnd) + '\nmvHubLane');
+    for (const [task, lane] of [
+        [{ status: 'backlog' }, 'queued'],
+        [{ status: 'todo' }, 'queued'],
+        [{ status: 'running' }, 'running'],
+        [{ openExecution: true }, 'running'],
+        [{ status: 'review' }, 'review'],
+        [{ workflow: { state: 'review-blocked' } }, 'review'],
+        [{ status: 'failed' }, 'failed'],
+        [{ workflow: { state: 'permission-blocked' } }, 'failed'],
+        [{ status: 'done' }, 'done'],
+        [{ taskRoom: { closed: true } }, 'done'],
+    ]) assert.equal(laneFor(task), lane, JSON.stringify(task));
+    assert.match(source, /MV_HUB_LANES\.map\(\(\[id, label\]\) => \[id, label, visible\.filter\(row => mvHubLane\(row\) === id\)\]\)/);
 });
 
 
@@ -457,22 +478,27 @@ test('full-fleet Mnemon powers both agent and workspace scopes, migrates SQLite 
     assert.match(prompt, /奏对铁律|看板列宽|发版前必跑双测/);
 });
 
-test('shipped client .21 fixes MemoryPage realWorkspaces TDZ, wraps with ErrorBoundary, and enables TaskBoard horizontal scroll & collapse', () => {
+test('shipped client fixes MemoryPage realWorkspaces TDZ, wraps with ErrorBoundary, and ships the adaptive Hub kanban', () => {
     const source = readFileSync(new URL('../client/index.js', import.meta.url), 'utf8');
     const mpStart = source.indexOf('function MemoryPage(');
     const mpEnd = source.indexOf('function AgentDirectChatsView(', mpStart);
+    assert.ok(mpStart >= 0 && mpEnd > mpStart, 'MemoryPage must precede AgentDirectChatsView');
     const mpSrc = source.slice(mpStart, mpEnd);
     const declIdx = mpSrc.indexOf('const realWorkspaces = React.useMemo');
     const firstUseIdx = mpSrc.indexOf('realWorkspaces');
     assert.ok(declIdx > 0, 'realWorkspaces declaration should exist in MemoryPage');
     assert.equal(firstUseIdx, declIdx + 'const '.length, 'realWorkspaces must never be referenced before its declaration (TDZ bug)');
     assert.ok(source.includes('class MarshalErrorBoundary'), 'panel should wrap tabs in an ErrorBoundary');
-    assert.ok(source.includes('.mtb-page{flex:1;min-height:0;min-width:0;width:100%;overflow:hidden'), 'TaskBoard .mtb-page must constrain min-width: 0 for horizontal scroll');
-    assert.ok(source.includes('handleGridDragOver'), 'TaskBoard should auto-scroll horizontally while dragging cards');
-    assert.ok(source.includes('toggleCollapseCol'), 'TaskBoard should allow collapsing columns into vertical rails');
+    const kanban = source.slice(source.indexOf('function MarshalHubKanbanView('), source.indexOf('function mvHubTicketForm('));
+    assert.match(source, /const MV_HUB_LANES = \[\['queued', '[^']+'\], \['running', '[^']+'\], \['review', '[^']+'\], \['failed', '[^']+'\], \['done', '[^']+'\]\];/);
+    assert.match(kanban, /MV_HUB_LANES\.map/);
+    assert.match(kanban, /gridTemplateColumns: 'repeat\(auto-fit, minmax\(/);
+    assert.match(kanban, /mvHubSelect\('筛选工作区', scope, workspaceOptions, setScope/);
+    assert.match(kanban, /!scope \|\| scope === mvHubWorkspace\(row\)/);
+    assert.match(kanban, /'aria-label': '工单详情'/);
 });
 
-// --- .22 canonical workspace UUID, zero-duplication Mnemon, graph edges, cue HTTP, and TaskBoard drag-pan tests ---
+// --- .22 canonical workspace UUID, zero-duplication Mnemon, graph edges, cue HTTP, and Hub kanban tests ---
 test('resolveWorkspaceIdForCwd resolves registered workspace UUID, skips legacy Agent pseudo-workspaces, and falls back to workspaceKey', () => {
     const workspaces = [
         { id: 'ws-default-uuid', title: 'default-workspace', path: '/tmp/ws/default-workspace' },
@@ -569,17 +595,20 @@ test('full-fleet Mnemon eliminates SQLite duplicates, migrates legacy workspaceK
     assert.equal(stats[0].total, 1);
 });
 
-test('POST /marshal/memory/remember forwards cue and shipped client .22 exposes TaskBoard drag-pan, collapseEmptyCols & legacyReadOnly badge', () => {
+test('POST /marshal/memory/remember forwards cue and shipped client exposes live Hub kanban actions and the legacyReadOnly badge', () => {
     const httpSrc = readFileSync(new URL('../lib/src/memory/http.js', import.meta.url), 'utf8');
     const remIdx = httpSrc.indexOf("path: '/marshal/memory/remember'");
     assert.ok(remIdx > 0);
     assert.ok(httpSrc.slice(remIdx, remIdx + 1200).includes('cue: body.cue.trim()'), '/marshal/memory/remember must forward cue');
 
     const clientSrc = readFileSync(new URL('../client/index.js', import.meta.url), 'utf8');
-    assert.ok(clientSrc.includes('handleGridMouseDown'), 'TaskBoard should support drag-to-pan on empty grid canvas');
-    assert.ok(clientSrc.includes('handleGridWheel'), 'TaskBoard should support horizontal wheel scrolling');
-    assert.ok(clientSrc.includes('collapseEmptyCols'), 'TaskBoard should expose 1-click collapse empty columns');
-    assert.ok(clientSrc.includes('mtb-edge-pan-right'), 'TaskBoard should render right-edge quick jump cue');
+    const kanban = clientSrc.slice(clientSrc.indexOf('function MarshalHubKanbanView('), clientSrc.indexOf('function mvHubTicketForm('));
+    assert.match(kanban, /fetchJson\('marshal\/tasks\/update', \{ taskId: targetId, \.\.\.patch, steerNow: Boolean\(steerNow\)/);
+    assert.match(kanban, /label: '保存并立即插话发送'[^\n]*saveEdit\(true\)/);
+    assert.match(kanban, /label: '单次放行'[^\n]*\n\s*onClick: \(\) => mutate\('marshal\/tasks\/confirm-permission'/);
+    assert.match(kanban, /mvUseHubSnapshot\(MV_HUB_TASK_TOPICS, MV_HUB_KANBAN_READS\)/);
+    const snapshot = clientSrc.slice(clientSrc.indexOf('function mvUseHubSnapshot('), clientSrc.indexOf('function mvHubPlainNotice('));
+    assert.match(snapshot, /subscribeMarshalEvents\(topics, visible\.request,/);
     assert.ok(clientSrc.includes('legacyReadOnly'), 'Agent chat list should label cleaned legacy sessions as read-only archive');
 });
 
@@ -591,12 +620,11 @@ test('groups/mount.js persists workspaceId on board create and task-development.
     assert.ok(devSrc.includes('不是 Git 仓库根目录'), 'task-development.js should clearly explain non-Git workspace errors');
 });
 
-test('vNext ticket conversation keeps Markdown, bubble roles, independent send and dual-surface review', () => {
+test('vNext ticket conversation keeps Markdown, bubble roles, independent send and DAG review', () => {
     const read = name => readFileSync(new URL(`../client/src/${name}.js`, import.meta.url), 'utf8');
     const room = read('48-ticket-room-vnext');
     const bubbles = read('40-groups');
     const markdown = read('45-trace-and-markdown');
-    const board = read('50-tasks');
     const dag = read('46-dag-sidebar');
     assert.match(markdown, /const normalized = React.useMemo\(\(\) => normalizeMessageMarkdown\(text, phase\)/);
     assert.match(bubbles, /h\(RichMarkdown, \{ text, phase \}/);
@@ -604,8 +632,6 @@ test('vNext ticket conversation keeps Markdown, bubble roles, independent send a
     assert.match(bubbles, /marginInlineStart: mine \? 'var\(--mv-xl\)' : undefined/);
     assert.match(bubbles, /marginInlineEnd: mine \? undefined : 'var\(--mv-xl\)'/);
     assert.match(room, /buildRoomColorMap\(visible\?\.records, visible\?\.participants\)/);
-    assert.ok(board.includes("fetchJson('marshal/tasks/confirm-review'"));
-    assert.ok(board.includes("fetchJson('marshal/tasks/revise'"));
     assert.match(dag, /fetchJson\(action === 'confirm' \? 'marshal\/tasks\/confirm-review' : 'marshal\/tasks\/revise'/);
     assert.match(room, /action !== 'send' && action !== 'revise' && locked/);
     assert.match(room, /if \(text && !visible\?\.chatBusy\) return act\('send'/);
