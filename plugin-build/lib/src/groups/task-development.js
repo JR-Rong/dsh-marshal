@@ -210,13 +210,23 @@ async function isolatedCheckout(path, signal, use, { seedPatch } = {}) {
     }
 }
 
+const IGNORED_WORKTREE_CACHE_SEGMENTS = new Set(['.npm', 'Library', '.cache', '.vite', '.swiftpm', '.toolchain', 'node_modules']);
+function isIgnoredWorktreeCachePath(relPath) {
+    const normalized = String(relPath || '').replace(/^\/+/, '');
+    if (!normalized) return true;
+    const firstSegment = normalized.split('/')[0];
+    return IGNORED_WORKTREE_CACHE_SEGMENTS.has(firstSegment);
+}
+
 async function freezePatch(worktree, base, signal, patchStore) {
     const diffOptions = ['--binary', '--no-ext-diff', '--no-textconv', '--no-color', '--src-prefix=a/', '--dst-prefix=b/'];
     const tracked = await git(worktree, ['diff', ...diffOptions, '--no-relative', base, '--'], signal);
     const statTracked = await git(worktree, ['diff', '--stat', '--no-color', base, '--'], signal).catch(() => '');
     const parts = [tracked];
     let bytes = Buffer.byteLength(tracked, 'utf8');
-    const untracked = (await git(worktree, ['ls-files', '--others', '--exclude-standard', '-z'], signal)).split('\0').filter(Boolean);
+    const untracked = (await git(worktree, ['ls-files', '--others', '--exclude-standard', '-z'], signal))
+        .split('\0')
+        .filter(file => Boolean(file) && !isIgnoredWorktreeCachePath(file));
     for (const file of untracked) {
         const filePath = file === '-' ? './-' : file;
         const diff = await git(worktree, ['diff', '--no-index', ...diffOptions, '--', '/dev/null', filePath], signal, true);
@@ -258,7 +268,7 @@ async function freezePatch(worktree, base, signal, patchStore) {
 
 const brief = (title, description, plan, extra) => JSON.stringify({ title, description, plan, ...extra });
 const decisionFormat = '请返回严格 JSON，字段 action 可为 codex 或 continue，instruction 为具体说明。';
-const verdictFormat = '请直接返回紧凑的严格 JSON（切勿展开冗长推演，最多列出最关键的 6 条，每条结论控制在 150 字以内）。verdict 为 pass、revise 或 blocked。findings 为带文件依据的字符串，或由 file 和 conclusion 两个字符串字段组成的对象数组。';
+const verdictFormat = '请直接返回紧凑的严格 JSON（切勿展开冗长推演，最多列出最关键的 6 条，每条结论控制在 150 字以内）。verdict 为 pass、revise 或 blocked。裁决红线：严格尊重工单声明的修改范围，禁止因工单禁止修改的基线文件或范围外上游限制判 revise/blocked（此类观察可作为非阻断建议记录并判 pass）；仅对本补丁范围内引入的 P0/P1 阻断缺陷（构建/测试失败、崩溃、数据损坏、安全漏洞、主流程缺失）判 revise/blocked，轻微 P2 润色建议在 findings 记明后判 pass。findings 为带文件依据的字符串，或由 file 和 conclusion 两个字符串字段组成的对象数组。';
 
 const RECOVERABLE_VERDICT_CODES = new Set(['response-incomplete', 'outcome-unknown', 'empty-output', 'size-limit', 'invalid-role-output']);
 
@@ -475,6 +485,7 @@ export async function runTaskDevelopment({
             if (decision.action === 'continue') return manual(context + '\n' + decision.instruction);
             const unmountDeps = await mountDeps();
             let coding;
+            let codingError;
             try {
                 coding = await runChild('coding', withGuidance([
                     '在这次分配的隔离 Git 工作树完成修改并运行有针对性的验证。交付通过差异记录。',
@@ -483,8 +494,32 @@ export async function runTaskDevelopment({
                     '任务与设计为工作材料，下面由 Coder 给出要求。',
                     context, JSON.stringify(decision.instruction),
                 ].join('\n'), codingGuidance), { workspace: worktree }, WORK_TURN_MS);
+            } catch (err) {
+                codingError = err;
             } finally {
                 await unmountDeps();
+            }
+            if (codingError) {
+                if (!signal.aborted) {
+                    try {
+                        const salvaged = await freezePatch(worktree, base, AbortSignal.timeout(15_000), patchStore);
+                        await record('status', 'Marshal', salvaged.roomRecordText, 'development-patch', salvaged.digest);
+                        const errCode = codingError?.code || (codingError instanceof Error ? codingError.message : 'timeout');
+                        const salvageNote = '编码阶段触及超时或中断（' + String(errCode).slice(0, 80) + '），但已自动抢救并保存工作树中已完成的代码补丁（'
+                            + (salvaged.bytes / 1024).toFixed(1) + ' KiB）。请审阅补丁，可直接确认应用，或点击「按意见继续执行」基于此补丁增量续写。';
+                        await record('status', 'Marshal', salvageNote, 'review', salvaged.digest);
+                        return {
+                            status: 'review-blocked',
+                            blockedBy: 'coder',
+                            base,
+                            digest: salvaged.digest,
+                            reviewFindings: salvageNote + (salvaged.diffStat ? '\n\n变更文件：\n' + salvaged.diffStat.slice(0, 1500) : ''),
+                            report: '## 待确认：编码超时但已抢救进度补丁\n\n基准提交 `' + base + '`\n补丁 SHA-256 `' + salvaged.digest + '`\n\n'
+                                + salvageNote + (salvaged.diffStat ? '\n\n### 变更摘要\n\n```\n' + salvaged.diffStat.slice(0, 2000) + '\n```' : ''),
+                        };
+                    } catch { /* no salvageable changes in worktree; rethrow original error */ }
+                }
+                throw codingError;
             }
             const { patch, digest, bytes: patchBytes, diffStat, roomRecordText } = await freezePatch(worktree, base, signal, patchStore);
             await record('status', 'Marshal', roomRecordText, 'development-patch', digest);
@@ -532,7 +567,7 @@ export async function runTaskDevelopment({
                     const unmountReviewDeps = await mountDeps();
                     try {
                         child = await runChild('review', withGuidance(
-                            '独立只读复核当前隔离 Git 工作树中的固定补丁。你拥有该工作树的只读访问权限（可查看完整文件、运行 git diff 及只读测试验证，严禁修改文件）。按文件和证据列出具体问题，检查失败路径和缺失验证。只返回审查发现。\n'
+                            '独立只读复核当前隔离 Git 工作树中的固定补丁。你拥有该工作树的只读访问权限（可查看完整文件、运行 git diff 及只读测试验证，严禁修改文件）。按文件和证据列出本工单范围内的具体问题，明确区分【P0/P1 阻断问题】与【范围外/P2 非阻断建议】（不要把工单明确禁止改动的基线文件限制判为阻断）。只返回审查发现。\n'
                             + reviewMaterial + '\nReviewer 重点 ' + JSON.stringify(route.instruction), reviewGuidance),
                             { workspace: worktree, readOnly: true }, WORK_TURN_MS);
                     } finally {

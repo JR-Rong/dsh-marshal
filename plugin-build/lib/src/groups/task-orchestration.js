@@ -523,9 +523,15 @@ export function createTaskOrchestration({
             const endCard = await liveCard();
             const summarySnippet = String(result.reviewFindings ?? '').slice(0, 1200);
             if (result.status === 'review-blocked') {
-                const blockedActor = result.blockedBy === 'leader' ? endLeader.name : endReviewer.name;
-                const reportId = await output('审查待裁决报告', blockedActor, result.report, 'summarizing', 'handoff');
-                await record('status', 'Marshal', '审查阶段存在待裁决分歧，工单已转入「待确认」。可在工单群讨论或补充意见后继续执行，亦可直接确认完成。', 'review', reportId);
+                const blockedActor = result.blockedBy === 'leader'
+                    ? endLeader.name
+                    : (result.blockedBy === 'coder' ? endCoder.name : endReviewer.name);
+                const reportLabel = result.blockedBy === 'coder' ? '编码进度抢救报告' : '审查待裁决报告';
+                const statusNotice = result.blockedBy === 'coder'
+                    ? '编码阶段触及超时/中断，但已自动抢救工作树中的进度补丁并转入「待确认」。可点击「按意见继续执行」基于此补丁增量续写，或直接验收。'
+                    : '审查阶段存在待裁决分歧，工单已转入「待确认」。可在工单群讨论或补充意见后继续执行，亦可直接确认完成。';
+                const reportId = await output(reportLabel, blockedActor, result.report, 'summarizing', 'handoff');
+                await record('status', 'Marshal', statusNotice, 'review', reportId);
                 update(key, {
                     state: 'review-blocked', reviewReason: 'review-blocked', reviewSummary: summarySnippet.slice(0, 600),
                     phase: undefined, error: undefined, reportId, handoffs: [...(endTask.handoffs ?? []), reportId],

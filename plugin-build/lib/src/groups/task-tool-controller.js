@@ -57,8 +57,16 @@ export function createTaskToolController({
     steerResidentSession,
 }) {
     const getOwnerId = async () => {
-        if (typeof ownerId === 'string' && ownerId) return ownerId;
-        if (typeof resolveOwnerId === 'function') return await resolveOwnerId();
+        if (typeof ownerId === 'string' && ownerId.trim()) return ownerId.trim();
+        if (typeof resolveOwnerId === 'function') {
+            const resolved = await resolveOwnerId();
+            if (typeof resolved === 'string' && resolved.trim()) return resolved.trim();
+            if (resolved && typeof resolved === 'object') {
+                if (typeof resolved.caller === 'string' && resolved.caller.trim()) return resolved.caller.trim();
+                if (typeof resolved.install === 'string' && resolved.install.trim()) return resolved.install.trim();
+                if (typeof resolved.ownerId === 'string' && resolved.ownerId.trim()) return resolved.ownerId.trim();
+            }
+        }
         return 'local-owner';
     };
     const requireBoard = () => {
@@ -219,6 +227,7 @@ export function createTaskToolController({
             if (prepared && requestedWs && prepared.workspaceId !== requestedWs) {
                 throw taskError('workspace-conflict', '编排工作区与指定工作区不一致。');
             }
+            const resolvedOwnerId = (rooms && workspaceId) ? await getOwnerId().catch(() => 'local-owner') : undefined;
             const id = randomUUID();
             const beforeIds = new Set((board.snapshot().tasks ?? []).map(t => t.id));
             let preAttached = false;
@@ -260,13 +269,19 @@ export function createTaskToolController({
                 orchestration.attach(source, created.id, prepared);
             }
             let room;
+            let roomWarning;
             if (rooms && workspaceId) {
-                const tNo = ticketNumbers?.ensure?.(created.id);
-                room = rooms.ensure(source, tNo ? { ...created, title: withTicketPrefix(tNo, created.title) } : created, workspaceId, await getOwnerId());
+                try {
+                    const tNo = ticketNumbers?.ensure?.(created.id);
+                    room = rooms.ensure(source, tNo ? { ...created, title: withTicketPrefix(tNo, created.title) } : created, workspaceId, resolvedOwnerId || 'local-owner');
+                } catch (err) {
+                    roomWarning = err instanceof Error ? err.message : String(err);
+                }
             }
             return {
                 task: summarizeTask(source, created),
                 ...(room ? { roomId: room.id } : {}),
+                ...(roomWarning ? { roomWarning } : {}),
             };
         },
         async plan(args = {}) {
@@ -473,15 +488,22 @@ export function createTaskToolController({
         },
         async patch(args = {}) {
             const source = boardSource();
-            const room = await resolveRoom(source, args);
-            const wf = orchestration?.target(room.source, room.taskId);
-            const found = await findLatestPatch(rooms, room.id, args.digest ?? wf?.development?.digest, patchStore, args.seq);
-            if (!found) throw taskError('development-no-changes', '当前工单群中没有可读取的开发补丁。');
+            let room;
+            try { room = await resolveRoom(source, args); } catch { room = undefined; }
+            const taskId = args.taskId ?? room?.taskId;
+            const wf = taskId ? orchestration?.target(source, taskId) : undefined;
+            const expectedDigest = args.digest ?? wf?.development?.digest;
+            let found = room ? await findLatestPatch(rooms, room.id, expectedDigest, patchStore, args.seq) : undefined;
+            if (!found && expectedDigest && patchStore) {
+                const stored = patchStore.read(expectedDigest);
+                if (stored) found = { text: stored, digest: expectedDigest };
+            }
+            if (!found) throw taskError('development-no-changes', '当前工单中没有可读取的开发补丁。');
             const maxChars = Math.max(1000, Math.min(200_000, Number(args.maxChars) || 32_000));
             const truncated = found.text.length > maxChars;
             return {
                 digest: found.digest,
-                seq: found.seq,
+                ...(found.seq ? { seq: found.seq } : {}),
                 ...(found.meta ? {
                     bytes: found.meta.bytes,
                     fileCount: found.meta.fileCount,
@@ -557,11 +579,15 @@ export function createTaskToolController({
             let committed = false;
             let commitHash;
             if (args.applyPatch === true) {
-                if (!room) throw taskError('development-no-changes', '未找到绑定工单群中的开发补丁。');
                 if (typeof workspacePath !== 'function') throw taskError('development-workspace-unavailable', '工作区路径解析服务不可用。');
-                const patch = await findLatestPatch(rooms, room.id, wf?.development?.digest, patchStore);
-                if (!patch) throw taskError('development-no-changes', '当前工单群中没有可应用的开发补丁。');
-                const wsDir = await workspacePath(wf?.workspaceId ?? room.workspaceId, AbortSignal.timeout(10_000));
+                const expectedDigest = args.digest ?? wf?.development?.digest;
+                let patch = room ? await findLatestPatch(rooms, room.id, expectedDigest, patchStore) : undefined;
+                if (!patch && expectedDigest && patchStore) {
+                    const stored = patchStore.read(expectedDigest);
+                    if (stored) patch = { text: stored, digest: expectedDigest };
+                }
+                if (!patch) throw taskError('development-no-changes', '当前工单中没有可应用的开发补丁。');
+                const wsDir = await workspacePath(wf?.workspaceId ?? room?.workspaceId ?? card.workspaceId, AbortSignal.timeout(10_000));
                 const commitMessage = typeof args.commitMessage === 'string' && args.commitMessage.trim() ? args.commitMessage.trim() : undefined;
                 const applied = await applyDevelopmentPatch(wsDir, patch.text, AbortSignal.timeout(30_000), { commitMessage });
                 patchApplied = applied.applied === true;
@@ -569,13 +595,15 @@ export function createTaskToolController({
                 committed = applied.committed === true;
                 commitHash = applied.commitHash;
                 orchestration?.markPatchApplied?.(source, card.id, Date.now());
-                const latestRoom = (await rooms.page(room.id, { limit: 1 })).room;
-                if (!latestRoom.closed) {
-                    const commitNote = committed && commitHash ? '，并已自动提交（' + commitHash + '）' : (committed ? '，并已自动提交' : '');
-                    await rooms.append(room.id, {
-                        kind: 'status', runId: latestRoom.runId, actor: 'Marshal', phase: 'confirmed',
-                        text: (patchAlreadyApplied ? '检查确认：本批次隔离开发补丁此前已在工作区生效' : '已将本批次隔离开发补丁应用到工作区目录') + commitNote + '。',
-                    });
+                if (room) {
+                    const latestRoom = (await rooms.page(room.id, { limit: 1 })).room;
+                    if (!latestRoom.closed) {
+                        const commitNote = committed && commitHash ? '，并已自动提交（' + commitHash + '）' : (committed ? '，并已自动提交' : '');
+                        await rooms.append(room.id, {
+                            kind: 'status', runId: latestRoom.runId, actor: 'Marshal', phase: 'confirmed',
+                            text: (patchAlreadyApplied ? '检查确认：本批次隔离开发补丁此前已在工作区生效' : '已将本批次隔离开发补丁应用到工作区目录') + commitNote + '。',
+                        });
+                    }
                 }
             }
             const note = typeof args.note === 'string' ? args.note.trim() : '';

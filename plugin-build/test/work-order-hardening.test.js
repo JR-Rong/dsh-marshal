@@ -394,3 +394,153 @@ test('DiscussionError codes map to clear Chinese diagnostics in orchestration fa
     });
     assert.match(settled.error, /16 KiB/);
 });
+
+test('Bug #9: all registered Marshal agent tool schemas stay under 1950 bytes for eager MCP loaders', async () => {
+    const tools = agentToolDefinitions({
+        agents: {},
+        service: {},
+        tasks: {
+            catalog: async () => ({}), list: async () => ({}), get: async () => ({}),
+            create: async () => ({}), plan: async () => ({}), run: async () => ({}),
+            roomRead: async () => ({}), roomSend: async () => ({}), patch: async () => ({}),
+            revise: async () => ({}), confirm: async () => ({}),
+        },
+    });
+    for (const tool of tools) {
+        const bytes = Buffer.byteLength(JSON.stringify({
+            name: tool.name,
+            description: tool.description,
+            parameters: tool.parameters,
+        }), 'utf8');
+        assert.ok(bytes < 1950, `${tool.name} schema is ${bytes} bytes (>= 1950 bytes risks MCP eager cutoff)`);
+    }
+});
+
+test('Bug #10: resolveOwnerId unwraps desktopOwner {caller, install} object, creates task room, and patch/confirm fall back to patchStore without room', async t => {
+    const root = mkdtempSync(join(tmpdir(), 'marshal-bug10-'));
+    const { repo } = initTempRepo(root);
+    const board = createLocalBoard(join(root, 'board.json'));
+    const rooms = createTaskRooms({ store: createTaskRoomStore(join(root, 'rooms.sqlite')), deviceId: 'dev-1' });
+    const patchStore = createPatchStore(root);
+    const memory = createAgentMemoryService({ root: join(root, 'memory') });
+    const flow = createTaskOrchestration({
+        file: join(root, 'orch.json'),
+        memory,
+        port: { catalog: async () => [DSH_MODEL, CODEX_MODEL], dispose() {}, async run() { return 'ok'; } },
+        workspacePath: async () => repo,
+        inventory: () => ({ teams: [{ id: 'team', workspaceId: 'ws-1', members: MEMBERS }] }),
+        patchStore,
+    });
+    t.after(() => { flow.dispose(); rooms.close(); memory.store.close(); rmSync(root, { recursive: true, force: true }); });
+
+    const controller = createTaskToolController({
+        getBoard: () => board,
+        boardSource: () => 'host',
+        initiator: 'marshal:dev-1',
+        // Exact object shape returned by desktopOwner() in mount.js
+        resolveOwnerId: async () => ({ caller: 'owner-hash-abc', install: 'install-hash-xyz' }),
+        orchestration: flow,
+        rooms,
+        patchStore,
+        workspacePath: async () => repo,
+        readInventory: () => ({ teams: [{ id: 'team', workspaceId: 'ws-1', members: MEMBERS }] }),
+        readWorkspaces: () => [{ id: 'ws-1', title: 'repo', path: repo }],
+    });
+
+    const created = await controller.create({
+        title: 'Room creation unwrap test',
+        description: 'Verify task room is created cleanly',
+        workspaceId: 'ws-1',
+        orchestration: {
+            leaderId: 'team/lead',
+            choice: 'template',
+            templateId: 'development',
+            plan: { templateId: 'development', members: { coder: 'team/coder', reviewer: 'team/reviewer' } },
+        },
+    });
+    assert.ok(created.roomId, 'create() must return a real roomId when resolveOwnerId returns {caller, install}');
+    assert.equal(rooms.local(created.roomId)?.ownerId, 'owner-hash-abc');
+
+    // Also verify patch() & confirm(applyPatch=true) fall back cleanly to patchStore when no room exists
+    const noRoomCtrl = createTaskToolController({
+        getBoard: () => board,
+        boardSource: () => 'host',
+        initiator: 'marshal:dev-1',
+        ownerId: 'owner-hash-abc',
+        orchestration: flow,
+        rooms: undefined,
+        patchStore,
+        workspacePath: async () => repo,
+    });
+    const patchText = [
+        'diff --git a/src/from-store.js b/src/from-store.js',
+        'new file mode 100644',
+        '--- /dev/null',
+        '+++ b/src/from-store.js',
+        '@@ -0,0 +1 @@',
+        '+export const fallback = true;',
+        '',
+    ].join('\n');
+    const saved = patchStore.save(patchText);
+    const snap = await board.apply('c-noroom', { kind: 'create', id: 'noroom-1', input: { title: 'No room card', workspaceId: 'ws-1' } }, 'marshal:dev-1');
+    assert.ok(snap.tasks.some(x => x.id === 'noroom-1'));
+    const readBack = await noRoomCtrl.patch({ taskId: 'noroom-1', digest: saved.digest });
+    assert.match(readBack.patch, /fallback = true/);
+    const confirmed = await noRoomCtrl.confirm({ taskId: 'noroom-1', digest: saved.digest, applyPatch: true });
+    assert.equal(confirmed.patchApplied, true);
+    assert.equal(readFileSync(join(repo, 'src', 'from-store.js'), 'utf8'), 'export const fallback = true;\n');
+});
+
+test('Bugs #11 & #13: freezePatch excludes .npm/Library cache junk and coding timeout salvages worktree patch into review-blocked', async t => {
+    const root = mkdtempSync(join(tmpdir(), 'marshal-bug11-13-'));
+    const { repo } = initTempRepo(root);
+    const memory = createAgentMemoryService({ root: join(root, 'memory') });
+    const rooms = createTaskRooms({ store: createTaskRoomStore(join(root, 'rooms.sqlite')), deviceId: 'dev-1' });
+    const patchStore = createPatchStore(root);
+    t.after(() => { flow.dispose(); rooms.close(); memory.store.close(); rmSync(root, { recursive: true, force: true }); });
+
+    const port = {
+        catalog: async () => [DSH_MODEL, CODEX_MODEL],
+        dispose() {},
+        async run(model, prompt, _signal, work) {
+            if (model.agent === 'codex' && work) {
+                // Simulate npm/macOS cache pollution inside worktree + real code written before timeout
+                mkdirSync(join(work.workspace, '.npm', '_logs'), { recursive: true });
+                writeFileSync(join(work.workspace, '.npm', '_logs', 'debug.log'), 'noisy npm cache\n');
+                mkdirSync(join(work.workspace, 'Library', 'Caches'), { recursive: true });
+                writeFileSync(join(work.workspace, 'Library', 'Caches', 'tmp.bin'), 'noisy mac cache\n');
+                writeFileSync(join(work.workspace, 'src', 'salvaged.js'), 'export const salvaged = 42;\n');
+                throw new DiscussionError('cancelled');
+            }
+            if (prompt.includes('设计和拆分')) return 'Implement src/salvaged.js';
+            if (prompt.includes('你是 Coder')) return JSON.stringify({ action: 'codex', instruction: 'Write src/salvaged.js' });
+            throw new Error('unexpected prompt: ' + prompt.slice(0, 100));
+        },
+    };
+    const flow = createTaskOrchestration({
+        file: join(root, 'orch.json'),
+        memory,
+        port,
+        workspacePath: async () => repo,
+        inventory: () => ({ teams: [{ id: 'team', workspaceId: 'ws-1', members: MEMBERS }] }),
+        patchStore,
+    });
+    const card = { id: 'salvage-card', title: 'Timeout salvage test' };
+    flow.attach('host', card.id, flow.prepare({
+        leaderId: 'team/lead', workspaceId: 'ws-1', choice: 'template', templateId: 'development',
+        plan: { templateId: 'development', members: { coder: 'team/coder', reviewer: 'team/reviewer' } },
+    }));
+    const room = rooms.ensure('host', card, 'ws-1', 'owner-1');
+    flow.start('host', card, taskRoomAudit(rooms, room, 'start'));
+
+    const settled = await waitUntil(() => {
+        const v = flow.view('host', card.id);
+        return v && v.state !== 'running' ? v : undefined;
+    });
+    assert.equal(settled.state, 'review-blocked', 'timeout with worktree edits should salvage into review-blocked instead of discarding work');
+    assert.ok(settled.development?.digest, 'salvaged patch digest must be recorded on workflow');
+    const salvagedPatch = patchStore.read(settled.development.digest);
+    assert.ok(salvagedPatch, 'salvaged patch must exist in patchStore');
+    assert.match(salvagedPatch, /src\/salvaged\.js/);
+    assert.doesNotMatch(salvagedPatch, /\.npm\/_logs|Library\/Caches/, 'runtime cache directories must be excluded from frozen patch');
+});

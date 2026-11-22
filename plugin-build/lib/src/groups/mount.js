@@ -2092,6 +2092,40 @@ export function mountGroups(ctx, config, options = {}) {
     // The superagent bridge wakes a card; when the card carries a preset
     // workflow, the bridge must start that workflow instead of opening a plain
     // board run. This runtime is the narrow seam between the two subsystems.
+    const resolveDesktopOwnerId = async () => {
+        const owner = await desktopOwner();
+        if (typeof owner === 'string' && owner.trim() !== '') return owner.trim();
+        if (typeof owner?.caller === 'string' && owner.caller.trim() !== '') return owner.caller.trim();
+        if (typeof owner?.install === 'string' && owner.install.trim() !== '') return owner.install.trim();
+        if (typeof config.deviceId === 'string' && config.deviceId.trim() !== '') return 'device:' + config.deviceId.trim();
+        return 'local-owner';
+    };
+    let cachedDesktopOwnerId = typeof config.deviceId === 'string' && config.deviceId.trim() !== ''
+        ? 'device:' + config.deviceId.trim()
+        : 'local-owner';
+    void resolveDesktopOwnerId().then(id => { if (id) cachedDesktopOwnerId = id; }).catch(() => {});
+    const ensureRuntimeRoom = (source, taskId, card) => {
+        if (!rooms) return undefined;
+        const existing = rooms.find(source, taskId);
+        if (existing) return existing;
+        const wf = orchestration?.target(source, taskId);
+        const wsId = wf?.workspaceId ?? card?.workspaceId;
+        if (!wsId) return undefined;
+        const resolvedCard = card ?? (getBoard()?.snapshot()?.tasks ?? []).find(item => item.id === taskId);
+        if (!resolvedCard) return undefined;
+        try {
+            const tNo = ticketNumbers?.ensure?.(taskId);
+            return rooms.ensure(
+                source,
+                tNo ? { ...resolvedCard, title: withTicketPrefix(tNo, resolvedCard.title) } : resolvedCard,
+                wsId,
+                cachedDesktopOwnerId,
+            );
+        } catch (error) {
+            options.logger?.warn?.('marshal: runtime room ensure failed: ' + (error instanceof Error ? error.message : String(error)));
+            return undefined;
+        }
+    };
     const runtime = options.runtime;
     if (runtime !== undefined && runtime !== null && typeof runtime === 'object') {
         Object.assign(runtime, {
@@ -2103,13 +2137,16 @@ export function mountGroups(ctx, config, options = {}) {
                 return orchestration?.target(source, taskId) === undefined ? undefined : orchestration.view(source, taskId);
             },
             async begin(taskId, runId, text) {
-                const room = rooms?.find(boardSourceOf(), taskId);
+                const source = boardSourceOf();
+                const ownerId = await resolveDesktopOwnerId().catch(() => cachedDesktopOwnerId);
+                if (ownerId) cachedDesktopOwnerId = ownerId;
+                const room = ensureRuntimeRoom(source, taskId);
                 if (!room || room.closed) return undefined;
                 try { return await rooms.begin(room.id, runId, 'Marshal', 'auto-dispatch', text); }
                 catch { return undefined; }
             },
             async note(taskId, event) {
-                const room = rooms?.find(boardSourceOf(), taskId);
+                const room = ensureRuntimeRoom(boardSourceOf(), taskId);
                 if (!room || room.closed) return undefined;
                 try { return await rooms.append(room.id, event); }
                 catch (error) {
@@ -2121,7 +2158,7 @@ export function mountGroups(ctx, config, options = {}) {
                 const source = boardSourceOf();
                 if (!orchestration) return { ok: false, code: 'orchestration-unavailable' };
                 if (orchestration.target(source, taskId) === undefined) return { ok: false, code: 'no-workflow' };
-                const room = rooms?.find(source, taskId);
+                const room = ensureRuntimeRoom(source, taskId, card);
                 const audit = room ? taskRoomAudit(rooms, room, settings.reason ?? 'auto-dispatch', undefined, undefined, () => true) : undefined;
                 // The caller may already have opened the room batch (the superagent
                 // posts its dispatch note through `begin` first); skip the second
@@ -2152,7 +2189,7 @@ export function mountGroups(ctx, config, options = {}) {
         getBoard,
         boardSource: boardSourceOf,
         initiator: `marshal:${config.deviceId}`,
-        resolveOwnerId: desktopOwner,
+        resolveOwnerId: resolveDesktopOwnerId,
         orchestration,
         rooms,
         patchStore,
