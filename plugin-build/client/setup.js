@@ -1,8 +1,8 @@
 function marshalSetup(React) {
   const h = React.createElement;
   const errors = { 'account-required': '请先在 DeepSeek Harness 左下角登录账号，登录后会自动继续。', 'account-mismatch': '当前 DSH 账号与该中心绑定的账号不同。', revoked: '此设备已被中心撤销，无法自动重新加入。', 'duplicate-id': '设备凭据与已有安装不一致，请恢复原安装状态。', 'runtime-unavailable': '配置已保存，但服务启动失败，请检查插件日志。' };
-  const request = async body => {
-    const response = await fetch(new URL('marshal/setup', document.baseURI), { method: 'POST', headers: { 'x-marshal-setup': '1', 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  const request = async (body, signal) => {
+    const response = await fetch(new URL('marshal/setup', document.baseURI), { method: 'POST', headers: { 'x-marshal-setup': '1', 'content-type': 'application/json' }, body: JSON.stringify(body), signal });
     const data = await response.json(); if (!response.ok) throw Error(data.code); return data;
   };
   function Setup({ initial, onReady }) {
@@ -14,12 +14,35 @@ function marshalSetup(React) {
     const [busy, setBusy] = React.useState(false);
     const locked = busy || status.busy || status.configured;
     React.useEffect(() => {
-      let closed = false, checking = false;
-      const timer = setInterval(async () => {
-        if (checking) return; checking = true;
-        try { const next = await request({ action: 'status' }); if (!closed) { setStatus(next); if (next.ready) onReady(); } } catch {} finally { checking = false; }
-      }, 3000);
-      return () => { closed = true; clearInterval(timer); };
+      // Pre-authentication exception: there is no event stream until setup completes.
+      const controller = new AbortController();
+      let checking = false, ready = false, timer, delay = 3_500;
+      const schedule = () => { timer = setTimeout(checkStatus, delay); };
+      async function checkStatus() {
+        if (checking || ready || controller.signal.aborted) return;
+        clearTimeout(timer);
+        checking = true;
+        try {
+          const next = await request({ action: 'status' }, controller.signal);
+          if (controller.signal.aborted) return;
+          setStatus(next);
+          ready = next.ready === true;
+          delay = 3_500;
+          if (ready) onReady();
+        } catch {
+          delay = Math.min(delay * 2, 10_000);
+        } finally {
+          checking = false;
+          if (!ready && !controller.signal.aborted) schedule();
+        }
+      }
+      schedule();
+      window.addEventListener('focus', checkStatus);
+      return () => {
+        controller.abort();
+        clearTimeout(timer);
+        window.removeEventListener('focus', checkStatus);
+      };
     }, []);
     const save = async event => {
       event.preventDefault(); if (busy) return; setBusy(true);

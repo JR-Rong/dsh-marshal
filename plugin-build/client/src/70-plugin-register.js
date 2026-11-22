@@ -10,7 +10,7 @@
           const existingStyle = document.getElementById('marshal-consolidated-rows');
           const style = existingStyle || document.createElement('style');
           style.id = 'marshal-consolidated-rows';
-          style.textContent = 'button:has([data-dsh-panel-entry="agents"]),[role="button"]:has([data-dsh-panel-entry="agents"]),li:has([data-dsh-panel-entry="agents"]),button:has([data-dsh-panel-entry="task-board"]),[role="button"]:has([data-dsh-panel-entry="task-board"]),li:has([data-dsh-panel-entry="task-board"]){display:none!important}[data-dsh-taskboard-view]{padding-top:44px!important;box-sizing:border-box!important;position:relative}';
+          style.textContent = 'button:has([data-dsh-panel-entry="agents"]),[role="button"]:has([data-dsh-panel-entry="agents"]),li:has([data-dsh-panel-entry="agents"]),button:has([data-dsh-panel-entry="task-board"]),[role="button"]:has([data-dsh-panel-entry="task-board"]),li:has([data-dsh-panel-entry="task-board"]){display:none!important}';
           if (!existingStyle) document.head.appendChild(style);
         } catch (error) { /* a DOM-less host keeps its own panel list */ }
         installSidebarWorkspaceSwitch();
@@ -58,39 +58,6 @@
             order: 40,
           }, () => h(MarshalNav, { active: 'chats', onTab: goTab, compact: true }))));
         } catch (error) { /* older host without the conversation header action slot */ }
-        const ensureTaskboardHeader = () => {
-          if (typeof document === 'undefined') return;
-          const root = document.querySelector('[data-dsh-taskboard-view]');
-          if (root === null || root.querySelector('#marshal-taskboard-head') !== null) return;
-          const bar = document.createElement('div');
-          bar.id = 'marshal-taskboard-head';
-          bar.style.cssText = 'position:absolute;top:0;left:0;right:0;height:44px;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:0 16px;box-sizing:border-box;background:var(--dsw-alias-bg-base);border-bottom:1px solid var(--dsw-alias-border-l1);z-index:6;color:inherit;font-family:inherit';
-          const title = document.createElement('div');
-          title.textContent = '任务看板';
-          title.style.cssText = 'font-size:14px;font-weight:600;white-space:nowrap';
-          const nav = document.createElement('div');
-          nav.style.cssText = 'display:flex;align-items:center;gap:2px;padding:3px;border-radius:999px;border:1px solid color-mix(in srgb, currentColor 14%, transparent);background:color-mix(in srgb, currentColor 5%, transparent);overflow-x:auto;max-width:100%';
-          const add = (label, key) => {
-            const button = document.createElement('button');
-            button.type = 'button';
-            button.textContent = label;
-            button.setAttribute('aria-pressed', key === 'tasks' ? 'true' : 'false');
-            button.style.cssText = 'border:0;border-radius:999px;cursor:pointer;white-space:nowrap;font:11px/1 inherit;padding:6px 9px;color:inherit;background:' + (key === 'tasks' ? 'color-mix(in srgb, currentColor 16%, transparent)' : 'transparent') + ';font-weight:' + (key === 'tasks' ? '600' : '400');
-            button.onclick = () => {
-              goTab(key);
-            };
-            nav.appendChild(button);
-          };
-          add('任务看板', 'tasks');
-          add('会话', 'chats');
-          add('智能体', 'agents');
-          add('记忆', 'memory');
-          bar.append(title, nav);
-          root.prepend(bar);
-        };
-        ensureTaskboardHeader();
-        const headerTimer = setInterval(ensureTaskboardHeader, 1000);
-        disposers.push(() => clearInterval(headerTimer));
         track(ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({ name: 'sidebar.panellist', id: PANEL, order: 25, label: () => '调度官' }, MarshalIcon)));
         track(ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: PANEL,
           children: { 'marshal.native.body': { kind: 'single', scope: 'session' } },
@@ -107,6 +74,7 @@
         track(ctx.slots.inject('marshal.native.body', () => ctx.slots.register({ name: 'marshal.native.body' }, NativeBody)));
         if (typeof ctx.effect === 'function') {
           ctx.effect(() => () => {
+            disposeAllMarshalSse();
             for (const dispose of disposers.splice(0).reverse()) {
               try { dispose(); } catch {}
             }

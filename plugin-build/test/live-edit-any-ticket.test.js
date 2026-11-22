@@ -826,6 +826,7 @@ test('shipped client/index.js unlocks Agent switchers & live-steering editor on 
     const mockFetch = async (url, init = {}) => {
         const u = String(url);
         const method = init.method || 'GET';
+        if (u.endsWith('/marshal/setup')) return Response.json({ ok: true, ready: true });
         if (u.includes('api/task-board/model-catalog')) {
             return new Response(JSON.stringify({
                 defaultModel: { provider: 'deepseek-account', model: 'deepseek-chat' },
@@ -904,7 +905,7 @@ test('shipped client/index.js unlocks Agent switchers & live-steering editor on 
 
     runInNewContext(source, {
         window: win, globalThis: win, document: doc, MutationObserver: MockMutationObserver,
-        fetch: win.fetch, URL, URLSearchParams, Response, Blob, Intl, performance,
+        fetch: win.fetch, URL, URLSearchParams, Response, AbortController, TextDecoder, Blob, Intl, performance,
         setTimeout: noopTimer, clearTimeout() {}, setInterval: noopTimer, clearInterval() {},
         requestAnimationFrame: fn => fn(), console,
     });

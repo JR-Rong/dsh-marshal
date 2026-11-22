@@ -144,8 +144,8 @@ function marshalNative() {
 function marshalSetup(React) {
   const h = React.createElement;
   const errors = { 'account-required': '请先在 DeepSeek Harness 左下角登录账号，登录后会自动继续。', 'account-mismatch': '当前 DSH 账号与该中心绑定的账号不同。', revoked: '此设备已被中心撤销，无法自动重新加入。', 'duplicate-id': '设备凭据与已有安装不一致，请恢复原安装状态。', 'runtime-unavailable': '配置已保存，但服务启动失败，请检查插件日志。' };
-  const request = async body => {
-    const response = await fetch(new URL('marshal/setup', document.baseURI), { method: 'POST', headers: { 'x-marshal-setup': '1', 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  const request = async (body, signal) => {
+    const response = await fetch(new URL('marshal/setup', document.baseURI), { method: 'POST', headers: { 'x-marshal-setup': '1', 'content-type': 'application/json' }, body: JSON.stringify(body), signal });
     const data = await response.json(); if (!response.ok) throw Error(data.code); return data;
   };
   function Setup({ initial, onReady }) {
@@ -157,12 +157,35 @@ function marshalSetup(React) {
     const [busy, setBusy] = React.useState(false);
     const locked = busy || status.busy || status.configured;
     React.useEffect(() => {
-      let closed = false, checking = false;
-      const timer = setInterval(async () => {
-        if (checking) return; checking = true;
-        try { const next = await request({ action: 'status' }); if (!closed) { setStatus(next); if (next.ready) onReady(); } } catch {} finally { checking = false; }
-      }, 3000);
-      return () => { closed = true; clearInterval(timer); };
+      // Pre-authentication exception: there is no event stream until setup completes.
+      const controller = new AbortController();
+      let checking = false, ready = false, timer, delay = 3_500;
+      const schedule = () => { timer = setTimeout(checkStatus, delay); };
+      async function checkStatus() {
+        if (checking || ready || controller.signal.aborted) return;
+        clearTimeout(timer);
+        checking = true;
+        try {
+          const next = await request({ action: 'status' }, controller.signal);
+          if (controller.signal.aborted) return;
+          setStatus(next);
+          ready = next.ready === true;
+          delay = 3_500;
+          if (ready) onReady();
+        } catch {
+          delay = Math.min(delay * 2, 10_000);
+        } finally {
+          checking = false;
+          if (!ready && !controller.signal.aborted) schedule();
+        }
+      }
+      schedule();
+      window.addEventListener('focus', checkStatus);
+      return () => {
+        controller.abort();
+        clearTimeout(timer);
+        window.removeEventListener('focus', checkStatus);
+      };
     }, []);
     const save = async event => {
       event.preventDefault(); if (busy) return; setBusy(true);
@@ -246,7 +269,12 @@ window.__ModuleLoader__.load({
         h('rect', { x: 7, y: 2, width: 10, height: 7, rx: 1.5 }), h('path', { d: 'M12 9v5M5 14h14M5 14v3M19 14v3' }),
         h('rect', { x: 2, y: 17, width: 6, height: 5, rx: 1 }), h('rect', { x: 16, y: 17, width: 6, height: 5, rx: 1 }));
     }
-    async function readAddress(role, signal) {
+    function readAddress(role, signal) {
+      // Without an entry role, use the same local base as fetchJson, not an HTTPS dashboard.
+      if (role === undefined) return new URL('.', document.baseURI).href.replace(/\/$/, '');
+      return readDashboardAddress(role, signal);
+    }
+    async function readDashboardAddress(role, signal) {
       const response = await fetch(new URL(`marshal/entry/${role}`, document.baseURI), { signal });
       if (!response.ok) return null;
       const data = await response.json(); const url = new URL(data.dashboardUrl);
@@ -1400,7 +1428,7 @@ window.__ModuleLoader__.load({
     }
     function requestError(response, data, explain) {
       const code = data?.code ?? 'HTTP ' + response.status;
-      return Object.assign(new Error(String(explain ? data?.message || code : code)), { code });
+      return Object.assign(new Error(String(explain ? data?.message || code : code)), { code, status: response.status });
     }
     function memoryProof() {
       return nativeMemory ? desktopMemorySession : (readBrowserCookie(MEMORY_CSRF_COOKIE) || undefined);
@@ -1424,26 +1452,33 @@ window.__ModuleLoader__.load({
         }
         const proof = memoryProof();
         if (!proof) throw Object.assign(new Error('记忆会话凭证不可用。'), { code: 'memory-session-invalid' });
+        if (typeof resumeDeniedMarshalSse === 'function') resumeDeniedMarshalSse(true);
         return proof;
       }).finally(() => { memorySessionPromise = undefined; });
       return memorySessionPromise;
     }
-    async function fetchJson(path, body, workspaceAuth = false) {
+    async function fetchJson(path, body, workspaceAuth = false, signal) {
       const memory = String(path).startsWith('marshal/memory') && !String(path).startsWith('marshal/memory/session');
       const authenticated = memory || workspaceAuth;
       const url = new URL(path, document.baseURI);
-      const send = proof => fetch(url, {
-        credentials: 'same-origin',
-        ...(body === undefined ? {} : { method: 'POST', body: JSON.stringify(body) }),
-        headers: {
-          ...(body === undefined ? {} : { 'content-type': 'application/json' }),
-          ...(typeof proof === 'string' ? { 'x-marshal-csrf': proof } : proof),
-        },
-      });
+      const send = proof => {
+        signal?.throwIfAborted();
+        return fetch(url, {
+          credentials: 'same-origin',
+          ...(signal ? { signal } : {}),
+          ...(body === undefined ? {} : { method: 'POST', body: JSON.stringify(body) }),
+          headers: {
+            ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+            ...(typeof proof === 'string' ? { 'x-marshal-csrf': proof } : proof),
+          },
+        });
+      };
+      signal?.throwIfAborted();
       const proof = authenticated ? await ensureMemorySession() : undefined;
       let response = await send(proof);
       let data = await readJson(response);
       if (authenticated && (response.status === 401 || data?.code === 'memory-csrf-mismatch')) {
+        signal?.throwIfAborted();
         response = await send(await ensureMemorySession(proof));
         data = await readJson(response);
       }
@@ -1644,6 +1679,287 @@ window.__ModuleLoader__.load({
         action && h('button', { type: 'button', style: uiButton(false), onClick: onAction }, action));
     }
 
+    const marshalSseConnections = new Map();
+    const marshalSseRetryDelays = [1000, 2000, 5000, 15000];
+
+    function marshalAuthDenied(status) {
+      return status === 401 || status === 403;
+    }
+
+    async function refreshMarshalSseProof(connection) {
+      const proof = await ensureMemorySession(connection.rejectedProof);
+      connection.auth = 'refreshed';
+      connection.rejectedProof = undefined;
+      connection.refreshedProof = proof;
+      return proof;
+    }
+
+    function notifyMarshalSubscriber(subscriber, topic, data) {
+      if (!subscriber.active || (!subscriber.topics.has(topic) && !subscriber.topics.has('*'))) return;
+      if (!subscriber.debounceMs) {
+        try { void Promise.resolve(subscriber.listener(topic, data)).catch(() => {}); } catch {}
+        return;
+      }
+      // Coalesce invalidations without waiting for a quiet period during continuous streaming.
+      subscriber.pending = [topic, data];
+      scheduleMarshalSubscriber(subscriber);
+    }
+
+    function scheduleMarshalSubscriber(subscriber) {
+      if (!subscriber.active || !subscriber.pending || subscriber.running || subscriber.timer !== undefined) return;
+      subscriber.timer = setTimeout(() => {
+        subscriber.timer = undefined;
+        void deliverMarshalRefresh(subscriber);
+      }, subscriber.debounceMs);
+    }
+
+    async function deliverMarshalRefresh(subscriber) {
+      const args = subscriber.pending;
+      subscriber.pending = undefined;
+      subscriber.running = true;
+      try { await subscriber.listener(...args); } catch {}
+      finally {
+        subscriber.running = false;
+        scheduleMarshalSubscriber(subscriber);
+      }
+    }
+
+    function dispatchMarshalFrame(connection, frame) {
+      let topic = 'message';
+      const lines = [];
+      for (const line of frame.split(/\r?\n/)) {
+        if (line.startsWith(':')) continue;
+        const colon = line.indexOf(':');
+        const field = colon < 0 ? line : line.slice(0, colon);
+        const value = colon < 0 ? '' : line.slice(colon + 1).replace(/^ /, '');
+        if (field === 'event') topic = value || 'message';
+        else if (field === 'data') lines.push(value);
+      }
+      if (!lines.length) return;
+      let data;
+      try { data = JSON.parse(lines.join('\n')); } catch { return; }
+      if (topic === 'ready') {
+        connection.ready = { data };
+        connection.auth = undefined;
+        connection.refreshedProof = undefined;
+      }
+      for (const subscriber of [...connection.subscribers]) notifyMarshalSubscriber(subscriber, topic, data);
+    }
+
+    async function runMarshalSse(connection) {
+      if (connection.running || connection.controller.signal.aborted) return;
+      connection.running = true;
+      const { signal } = connection.controller;
+      connection.ready = undefined;
+      let openedAt;
+      try {
+        const proof = connection.auth === 'refreshing'
+          ? await refreshMarshalSseProof(connection)
+          : connection.auth === 'refreshed' ? memoryProof() ?? connection.refreshedProof
+          : nativeMemory ? await ensureMemorySession() : memoryProof();
+        if (signal.aborted) return;
+        const response = await fetch(connection.address + '/marshal/events', {
+          headers: {
+            accept: 'text/event-stream',
+            ...(typeof proof === 'string' ? { 'x-marshal-csrf': proof } : proof),
+          },
+          credentials: 'same-origin',
+          signal,
+        });
+        if (signal.aborted || !response.ok) {
+          void response.body?.cancel().catch(() => {});
+          if (!signal.aborted && marshalAuthDenied(response.status) && !connection.auth) {
+            connection.auth = 'refreshing';
+            connection.rejectedProof = proof;
+            // Don't clear credentials another request has already refreshed.
+            if (nativeMemory && desktopMemorySession === proof) desktopMemorySession = undefined;
+            await refreshMarshalSseProof(connection);
+          }
+          return;
+        }
+        if (!response.body) return;
+        openedAt = Date.now();
+        const reader = response.body.getReader();
+        connection.reader = reader;
+        const decoder = new TextDecoder();
+        let buffer = '';
+        try {
+          while (!signal.aborted) {
+            const { value, done } = await reader.read();
+            if (done || signal.aborted) break;
+            buffer += decoder.decode(value, { stream: true });
+            // Match LF and CRLF delimiters even when split across byte chunks.
+            const frames = buffer.split(/\r?\n\r?\n/);
+            buffer = frames.pop();
+            for (const frame of frames) {
+              if (signal.aborted) break;
+              dispatchMarshalFrame(connection, frame);
+            }
+            if (buffer.length > 1_048_576) break; // Bound an unterminated frame.
+          }
+        } finally {
+          connection.reader = undefined;
+          void reader.cancel().catch(() => {});
+          reader.releaseLock();
+        }
+      } catch (error) {
+        // A session endpoint rejection, unlike a transport failure, cannot be retried in the background.
+        if (marshalAuthDenied(error?.status)) connection.auth = 'denied';
+      }
+      finally {
+        connection.running = false;
+        connection.ready = undefined;
+        if (!signal.aborted && connection.subscribers.size && connection.auth !== 'denied') {
+          // A stream that immediately closes after ready is still a failed attempt.
+          if (openedAt !== undefined && Date.now() - openedAt >= 30_000) connection.retry = 0;
+          const delay = marshalSseRetryDelays[connection.retry] + Math.floor(Math.random() * 250);
+          connection.retry = Math.min(connection.retry + 1, marshalSseRetryDelays.length - 1);
+          connection.timer = setTimeout(() => {
+            connection.timer = undefined;
+            void runMarshalSse(connection);
+          }, delay);
+        }
+      }
+    }
+
+    function resumeMarshalSseConnection(connection, fromSessionSuccess = false) {
+      if (connection.auth !== 'denied' || connection.running || connection.controller.signal.aborted || !connection.subscribers.size) return;
+      if (!fromSessionSuccess && nativeMemory && connection.rejectedProof && desktopMemorySession === connection.rejectedProof) {
+        desktopMemorySession = undefined;
+      }
+      connection.auth = undefined;
+      connection.rejectedProof = undefined;
+      connection.refreshedProof = undefined;
+      connection.retry = 0;
+      clearTimeout(connection.timer);
+      connection.timer = undefined;
+      void runMarshalSse(connection);
+    }
+
+    function resumeDeniedMarshalSse(fromSessionSuccess = false) {
+      for (const connection of [...marshalSseConnections.values()]) {
+        resumeMarshalSseConnection(connection, fromSessionSuccess);
+      }
+    }
+
+    function stopMarshalSubscriber(subscriber) {
+      subscriber.active = false;
+      clearTimeout(subscriber.timer);
+      subscriber.pending = undefined;
+    }
+
+    function stopMarshalSse(connection) {
+      marshalSseConnections.delete(connection.address);
+      clearTimeout(connection.timer);
+      if (connection.onWake) {
+        window.removeEventListener?.('focus', connection.onWake);
+        document.removeEventListener?.('visibilitychange', connection.onWake);
+        connection.onWake = undefined;
+      }
+      for (const subscriber of connection.subscribers) stopMarshalSubscriber(subscriber);
+      connection.subscribers.clear();
+      connection.controller.abort();
+      void connection.reader?.cancel().catch(() => {});
+    }
+
+    // Listeners receive (topic, data). Refresh views can opt into a synthetic initial
+    // read and coalesced, serialized invalidations (including a replay of an active ready).
+    function subscribeMarshalEvents(topics, listener, { debounceMs = 0, initial = false } = {}) {
+      const address = readAddress();
+      let connection = marshalSseConnections.get(address);
+      const start = !connection;
+      if (start) {
+        connection = { address, controller: new AbortController(), subscribers: new Set(), retry: 0, running: false };
+        connection.onWake = () => {
+          if (document.visibilityState === 'hidden') return;
+          resumeMarshalSseConnection(connection, false);
+        };
+        window.addEventListener?.('focus', connection.onWake);
+        document.addEventListener?.('visibilitychange', connection.onWake);
+        marshalSseConnections.set(address, connection);
+      }
+      const subscriber = { topics: new Set(typeof topics === 'string' ? [topics] : topics), listener, debounceMs, active: true };
+      connection.subscribers.add(subscriber);
+      if (initial) {
+        subscriber.pending = ['initial', undefined];
+        void deliverMarshalRefresh(subscriber);
+      }
+      if (connection.ready) notifyMarshalSubscriber(subscriber, 'ready', connection.ready.data);
+      if (start && !connection.controller.signal.aborted) void runMarshalSse(connection);
+      return () => {
+        if (!connection.subscribers.delete(subscriber)) return;
+        stopMarshalSubscriber(subscriber);
+        if (!connection.subscribers.size) stopMarshalSse(connection);
+      };
+    }
+
+    function disposeAllMarshalSse() {
+      for (const connection of [...marshalSseConnections.values()]) stopMarshalSse(connection);
+    }
+
+    // SSE, manual refresh and the low-frequency fallback share one read at a time.
+    // Keep one trailing refresh if an invalidation arrives during a read.
+    function createVisibleMarshalRefresh(read, intervalMs) {
+      let closed = false;
+      let polling = false;
+      let currentInterval = intervalMs;
+      let queued = false;
+      let timer, flight, controller;
+      const visible = () => !closed && document.visibilityState !== 'hidden';
+      const clearTimer = () => {
+        clearTimeout(timer);
+        timer = undefined;
+      };
+      const schedule = () => {
+        if (!visible() || !polling || flight || timer !== undefined) return;
+        timer = setTimeout(request, currentInterval + Math.floor(Math.random() * 750));
+      };
+      function request() {
+        if (!visible()) return;
+        clearTimer();
+        queued = true;
+        flight ??= Promise.resolve().then(async () => {
+          while (queued && visible()) {
+            queued = false;
+            controller = new AbortController();
+            try { await read(controller.signal); } catch {}
+            finally { controller = undefined; }
+          }
+        }).finally(() => {
+          flight = undefined;
+          if (queued) request();
+          else schedule();
+        });
+        return flight;
+      }
+      const cancel = () => {
+        queued = false;
+        clearTimer();
+        controller?.abort();
+      };
+      const onVisibility = () => {
+        if (visible()) request();
+        else cancel();
+      };
+      document.addEventListener?.('visibilitychange', onVisibility);
+      return {
+        request,
+        setPolling(enabled, nextIntervalMs) {
+          if (closed) return;
+          const nextInterval = typeof nextIntervalMs === 'number' && nextIntervalMs > 0 ? nextIntervalMs : intervalMs;
+          if (polling === enabled && currentInterval === nextInterval) return;
+          polling = enabled;
+          currentInterval = nextInterval;
+          clearTimer();
+          if (enabled) schedule();
+        },
+        dispose() {
+          closed = true;
+          cancel();
+          document.removeEventListener?.('visibilitychange', onVisibility);
+        },
+      };
+    }
     function GroupsPage({ openSession, onOpenAgents }) {
       const [state, setState] = React.useState(null);
       const [library, setLibrary] = React.useState(null);
@@ -1661,32 +1977,36 @@ window.__ModuleLoader__.load({
       const agents = library && Array.isArray(library.agents) ? library.agents : [];
       const groups = (state && state.groups) || [];
 
-      const load = async () => {
+      const load = async (isAlive = () => true) => {
         try {
           const [groupsState, agentLibrary] = await Promise.all([fetchJson('marshal/groups/state'), loadAgentLibrary()]);
+          if (!isAlive()) return;
           setState(groupsState);
           setLibrary(agentLibrary);
           setError('');
         }
-        catch (e) { setError(friendlyError(e, '智能体/群聊')); }
+        catch (e) { if (isAlive()) setError(friendlyError(e, '智能体/群聊')); }
       };
       const reloadGroup = async () => {
         if (!group) return;
         const fresh = await fetchJson('marshal/groups/get?id=' + encodeURIComponent(group.id));
         setGroup(fresh.group);
       };
-      React.useEffect(() => { void load(); }, []);
+      React.useEffect(() => {
+        let alive = true;
+        const unsubscribe = subscribeMarshalEvents(['ready', 'groups.changed', 'agents.changed'],
+          () => load(() => alive), { initial: true, debounceMs: 80 });
+        return () => { alive = false; unsubscribe(); };
+      }, []);
       React.useEffect(() => {
         if (!selected) { setGroup(null); return; }
         let alive = true;
-        const pull = () => {
+        const pull = () =>
           fetchJson('marshal/groups/get?id=' + encodeURIComponent(selected))
             .then(data => { if (alive) setGroup(data.group); })
             .catch(e => { if (alive) setError('读取群失败：' + (e.message || e)); });
-        };
-        pull();
-        const timer = setInterval(pull, 2000);
-        return () => { alive = false; clearInterval(timer); };
+        const unsubscribe = subscribeMarshalEvents(['ready', 'groups.changed'], pull, { initial: true, debounceMs: 80 });
+        return () => { alive = false; unsubscribe(); };
       }, [selected]);
 
       const create = async () => {
@@ -1901,6 +2221,7 @@ window.__ModuleLoader__.load({
       const [text, setText] = React.useState('');
       const [busy, setBusy] = React.useState(false);
       const [, setTick] = React.useState(0);
+      const refreshRef = React.useRef(null);
       const reveal = React.useRef(new Map());
       const seenMessages = React.useRef(false);
       const lastGroupId = React.useRef('');
@@ -1908,28 +2229,30 @@ window.__ModuleLoader__.load({
       const group = groups.find(item => item.id === selected) || null;
       const devices = (catalog && catalog.devices) || [];
 
-      const load = async () => {
-        try {
-          const [nextState, nextCatalog] = await Promise.all([
-            fetchJson('marshal/cross-groups/state'),
-            fetchJson('marshal/cross-groups/catalog'),
-          ]);
-          setState(nextState);
-          setCatalog(nextCatalog);
-          setError('');
-        }
-        catch (e) { setError('跨设备路由不可用：' + (e.message || e)); }
-      };
-      React.useEffect(() => { void load(); }, []);
       React.useEffect(() => {
-        let alive = true;
-        const timer = setInterval(() => {
-          fetchJson('marshal/cross-groups/state')
-            .then(next => { if (alive) setState(next); })
-            .catch(() => {});
-        }, 350);
-        return () => { alive = false; clearInterval(timer); };
+        // The local SSE stream does not relay changes made on the Hub.
+        const refresh = createVisibleMarshalRefresh(async signal => {
+          const [nextState, nextCatalog] = await Promise.allSettled([
+            fetchJson('marshal/cross-groups/state', undefined, false, signal),
+            fetchJson('marshal/cross-groups/catalog', undefined, false, signal),
+          ]);
+          if (signal.aborted) return;
+          if (nextState.status === 'fulfilled') setState(nextState.value);
+          if (nextCatalog.status === 'fulfilled') setCatalog(nextCatalog.value);
+          const failure = [nextState, nextCatalog].find(result => result.status === 'rejected');
+          setError(failure ? '跨设备路由不可用：' + (failure.reason?.message || failure.reason) : '');
+        }, 12_000);
+        refreshRef.current = refresh;
+        refresh.setPolling(true);
+        const unsubscribe = subscribeMarshalEvents(['ready', 'groups.changed', 'agents.changed'],
+          refresh.request, { initial: true, debounceMs: 80 });
+        return () => {
+          refreshRef.current = null;
+          refresh.dispose();
+          unsubscribe();
+        };
       }, []);
+      const load = () => refreshRef.current?.request();
       const messageSignature = group === null ? '' : group.messages.map(message => message.id + ':' + message.text.length).join(',');
       React.useEffect(() => {
         if (group === null) return;
@@ -3198,18 +3521,21 @@ window.__ModuleLoader__.load({
       ];
       const knownStatuses = new Set(columns.map(c => c.key));
 
-      const load = async () => {
+      const load = async (isAlive = () => true) => {
         try {
           const data = await fetchJson('marshal/tasks/state', undefined, true);
+          if (!isAlive()) return;
           setTasks(data.tasks || []);
           if (typeof data.sessionDefaultPermission === 'string') setSessionDefaultPerm(data.sessionDefaultPermission);
           setError('');
         }
-        catch (e) { setError(friendlyError(e, '任务看板')); }
+        catch (e) { if (isAlive()) setError(friendlyError(e, '任务看板')); }
       };
       React.useEffect(() => {
         ensureTaskBoardStyles();
-        void load();
+        let alive = true;
+        const unsubscribe = subscribeMarshalEvents(['ready', 'tasks.changed', 'incidents.changed', 'agents.changed', 'room.message'],
+          () => load(() => alive), { initial: true, debounceMs: 80 });
         void fetchJson('marshal/tasks/orchestration', undefined, true)
           .then(data => {
             setCatalog(data);
@@ -3234,8 +3560,7 @@ window.__ModuleLoader__.load({
             setDefaultModelRoute(flat.defaultRoute);
             setParseModel(cur => cur || flat.defaultRoute || flat.options[0]?.route || '');
           }).catch(() => {});
-        const timer = setInterval(() => { void load(); }, 3000);
-        return () => clearInterval(timer);
+        return () => { alive = false; unsubscribe(); };
       }, []);
 
       React.useEffect(() => {
@@ -4729,6 +5054,7 @@ window.__ModuleLoader__.load({
                 onClick: expandAllCols,
               }, '全展'))),
           h('div', { className: 'mtb-head-right' },
+            h('button', { type: 'button', style: uiButton(false), onClick: () => { void load(); } }, '刷新'),
             archivedTasks.length > 0 && h('button', { type: 'button', style: tabStyle(showArchive), onClick: () => setShowArchive(v => !v) },
               showArchive ? '返回看板' : '归档 (' + archivedTasks.length + ')'),
             !showArchive && h('button', { type: 'button', style: tabStyle(showFlowGuide), onClick: () => setShowFlowGuide(v => !v), title: '查看工单 6 列状态流转规则' }, '流转规则'),
@@ -5151,8 +5477,9 @@ window.__ModuleLoader__.load({
       const [leader, setLeader] = React.useState('');
       const [remote, setRemote] = React.useState('');
       const [draft, setDraft] = React.useState('');
-      const cursor = React.useRef(0);
+      const cursor = React.useRef(null);
       const selection = React.useRef('');
+      const roomRefreshRef = React.useRef(null);
       const streamRef = React.useRef(null);
       const inputRef = React.useRef(null);
       const stickBottomRef = React.useRef(true);
@@ -5199,27 +5526,31 @@ window.__ModuleLoader__.load({
         return () => { alive = false; };
       }, [workspace]);
 
-      const mergePage = (data, key) => {
+      const mergePage = (data, key, history = false) => {
         if (selection.current !== key) return;
-        cursor.current = Math.max(cursor.current, data.records.at(-1)?.seq ?? 0);
         setView(previous => {
+          if (history && previous?.key !== key) return previous;
           const records = new Map((previous?.key === key ? previous.records : []).map(record => [record.seq, record]));
-          for (const record of data.records) records.set(record.seq, record);
-          return { ...data, key, records: [...records.values()].sort((a, b) => a.seq - b.seq) };
+          for (const record of data.records) {
+            if (!history || !records.has(record.seq)) records.set(record.seq, record);
+          }
+          return { ...(history ? previous : data), key, records: [...records.values()].sort((a, b) => a.seq - b.seq) };
         });
       };
 
       const failedRead = (e, key) => {
         if (selection.current !== key) return;
         if (['forbidden', 'workspace-forbidden', 'unauthorized', 'task-room-not-found'].includes(e.code)) {
-          cursor.current = 0;
+          cursor.current = null;
           setView(null);
         }
         setError(e.message);
       };
 
+      const loadRoom = () => roomRefreshRef.current?.request();
+
       React.useEffect(() => {
-        cursor.current = 0;
+        cursor.current = null;
         prevLastSeqRef.current = 0;
         stickBottomRef.current = true;
         setView(null);
@@ -5228,24 +5559,39 @@ window.__ModuleLoader__.load({
         setLeader('');
         setRemote('');
         if (!id || !workspace) return;
-        let alive = true;
-        let inFlight = false;
-        const load = async () => {
-          if (inFlight) return;
-          inFlight = true;
+        const refresh = createVisibleMarshalRefresh(async signal => {
+          const active = () => !signal.aborted && selection.current === viewKey;
           try {
-            const data = await fetchJson(url + (cursor.current ? '&after=' + cursor.current : ''), undefined, true);
-            if (alive) mergePage(data, viewKey);
-          } catch (e) { if (alive) failedRead(e, viewKey); }
-          finally { inFlight = false; }
+            while (active()) {
+              const after = cursor.current;
+              const data = await fetchJson(url + (after === null ? '' : '&after=' + after), undefined, true, signal);
+              if (!active()) return;
+              const next = data.records.at(-1)?.seq ?? after ?? 0;
+              mergePage(data, viewKey);
+              // Only the initial read defaults to the latest page; an empty room has a real cursor of 0.
+              cursor.current = Math.max(after ?? 0, next);
+              if (!data.hasNewer || next <= (after ?? 0)) return;
+            }
+          } catch (e) { if (active()) failedRead(e, viewKey); }
+        }, 5_000);
+        roomRefreshRef.current = refresh;
+        const unsubscribe = subscribeMarshalEvents(['ready', 'tasks.changed', 'incidents.changed', 'agents.changed', 'room.message'],
+          refresh.request, { initial: true, debounceMs: 80 });
+        return () => {
+          roomRefreshRef.current = null;
+          refresh.dispose();
+          unsubscribe();
         };
-        void load();
-        const timer = setInterval(load, 1600);
-        return () => { alive = false; clearInterval(timer); };
       }, [id, workspace]);
 
       const visible = view?.key === viewKey ? view : null;
       const room = visible?.room;
+      const isWorkflowRunning = visible?.runState === 'running' || visible?.cardStatus === 'running';
+      const roomExecuting = Boolean(room && !room.closed && (isWorkflowRunning || visible.busy || visible.chatBusy));
+      const roomOpen = Boolean(room && !room.closed);
+      const roomPollMs = roomExecuting ? 5_000 : 12_000;
+      // Live thinking/steps/text need ~5s refresh while running; open non-closed rooms keep a 12s cross-device fallback.
+      React.useEffect(() => { roomRefreshRef.current?.setPolling(roomOpen, roomPollMs); }, [id, workspace, roomOpen, roomPollMs]);
       const lastSeq = visible?.records?.at(-1)?.seq ?? 0;
       const liveSig = (visible?.liveBubbles ?? []).map(b => b.id + ':' + (b.updatedAt || 0) + ':' + (b.thinking?.length || 0) + ':' + (b.text?.length || 0) + ':' + (b.steps?.length || 0)).join('|');
 
@@ -5288,6 +5634,7 @@ window.__ModuleLoader__.load({
         setError('');
         setNotice('');
         const key = viewKey;
+        const refresh = roomRefreshRef.current;
         try {
           const res = await fetchJson(prefix + 'action', { roomId: room.id, action, ...data }, true);
           if (action === 'revise' && selection.current === key) {
@@ -5298,7 +5645,7 @@ window.__ModuleLoader__.load({
             setNotice(res.patchApplied ? '已将补丁应用到工作区并确认工单完成。' : '已确认验收完成并归档。');
           }
           stickBottomRef.current = true;
-          mergePage(await fetchJson(url + '&after=' + cursor.current, undefined, true), key);
+          await refresh?.request();
         }
         catch (e) { failedRead(e, key); }
         finally { setBusy(false); }
@@ -5311,6 +5658,7 @@ window.__ModuleLoader__.load({
         setSendingChat(true);
         setError('');
         const key = viewKey;
+        const refresh = roomRefreshRef.current;
         try {
           if (room.closed) {
             await fetchJson(prefix + 'action', { roomId: room.id, action: 'reopen' }, true);
@@ -5318,7 +5666,7 @@ window.__ModuleLoader__.load({
           setDraft('');
           stickBottomRef.current = true;
           await fetchJson(prefix + 'action', { roomId: room.id, action: 'send', text: messageText, ...(room.closed ? { autoReopen: true } : {}) }, true);
-          mergePage(await fetchJson(url + '&after=' + cursor.current, undefined, true), key);
+          await refresh?.request();
         }
         catch (e) {
           if (selection.current === key) setDraft(prev => prev || messageText);
@@ -5335,10 +5683,14 @@ window.__ModuleLoader__.load({
 
       const older = async () => {
         if (!visible?.records[0] || busy) return;
+        const refresh = roomRefreshRef.current;
         setBusy(true);
         stickBottomRef.current = false;
-        try { mergePage(await fetchJson(url + '&before=' + visible.records[0].seq, undefined, true), viewKey); }
-        catch (e) { failedRead(e, viewKey); }
+        try {
+          const data = await fetchJson(url + '&before=' + visible.records[0].seq, undefined, true);
+          if (roomRefreshRef.current === refresh) mergePage(data, viewKey, true);
+        }
+        catch (e) { if (roomRefreshRef.current === refresh) setError(e.message); }
         finally { setBusy(false); }
       };
 
@@ -5420,7 +5772,6 @@ window.__ModuleLoader__.load({
       }, [visible?.records, visible?.liveBubbles]);
       const roleOfActor = actorName => participants.find(p => p.name === actorName)?.role || '';
       const isInReview = Boolean(visible?.origin && !room?.closed && (visible?.cardStatus === 'review' || visible?.runState === 'review-blocked'));
-      const isWorkflowRunning = visible?.runState === 'running' || visible?.cardStatus === 'running';
 
       const renderRecord = record => {
         const timeStr = new Date(record.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
@@ -5570,6 +5921,7 @@ window.__ModuleLoader__.load({
         setUploadingAtt(true);
         setError('');
         const key = viewKey;
+        const refresh = roomRefreshRef.current;
         try {
           const uploaded = await uploadAttachmentFiles(files, roomPreviewUrlsRef.current);
           if (uploaded.length === 0) return;
@@ -5579,9 +5931,7 @@ window.__ModuleLoader__.load({
             ...uploaded.filter(a => !existingIds.has(a.attachmentId)),
           ].slice(0, 8);
           await fetchJson('marshal/tasks/update', { taskId: roomTaskId, attachments: merged, ...(isWorkflowRunning ? { steerNow: true } : {}) }, true);
-          if (id && workspace) {
-            mergePage(await fetchJson(url + (cursor.current ? '&after=' + cursor.current : ''), undefined, true), key);
-          }
+          await refresh?.request();
           if (selection.current === key) {
             setNotice('已上传 ' + uploaded.length + ' 个工单附件：' + uploaded.map(item => item.name).join('、') + (isWorkflowRunning ? '（已作为实时插话同步给运行中的 Agent）' : ''));
           }
@@ -5617,6 +5967,7 @@ window.__ModuleLoader__.load({
         h('main', { className: 'mtr-main' },
           h('header', { className: 'mtr-header' },
             button('← 回任务看板', () => openBoard(visible?.origin ? room?.taskId : task?.id)),
+            id && workspace && button('刷新', () => { void loadRoom(); }),
             h('strong', { style: { fontSize: 14, flex: 1, minWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
               room?.title ?? task?.title ?? '工单群聊'),
             isWorkflowRunning && h('span', { style: { fontSize: 11.5, color: '#3b82f6', fontWeight: 600 } }, '● 编排执行中（可随时发言参与讨论）'),
@@ -6261,7 +6612,7 @@ window.__ModuleLoader__.load({
           const existingStyle = document.getElementById('marshal-consolidated-rows');
           const style = existingStyle || document.createElement('style');
           style.id = 'marshal-consolidated-rows';
-          style.textContent = 'button:has([data-dsh-panel-entry="agents"]),[role="button"]:has([data-dsh-panel-entry="agents"]),li:has([data-dsh-panel-entry="agents"]),button:has([data-dsh-panel-entry="task-board"]),[role="button"]:has([data-dsh-panel-entry="task-board"]),li:has([data-dsh-panel-entry="task-board"]){display:none!important}[data-dsh-taskboard-view]{padding-top:44px!important;box-sizing:border-box!important;position:relative}';
+          style.textContent = 'button:has([data-dsh-panel-entry="agents"]),[role="button"]:has([data-dsh-panel-entry="agents"]),li:has([data-dsh-panel-entry="agents"]),button:has([data-dsh-panel-entry="task-board"]),[role="button"]:has([data-dsh-panel-entry="task-board"]),li:has([data-dsh-panel-entry="task-board"]){display:none!important}';
           if (!existingStyle) document.head.appendChild(style);
         } catch (error) { /* a DOM-less host keeps its own panel list */ }
         installSidebarWorkspaceSwitch();
@@ -6309,39 +6660,6 @@ window.__ModuleLoader__.load({
             order: 40,
           }, () => h(MarshalNav, { active: 'chats', onTab: goTab, compact: true }))));
         } catch (error) { /* older host without the conversation header action slot */ }
-        const ensureTaskboardHeader = () => {
-          if (typeof document === 'undefined') return;
-          const root = document.querySelector('[data-dsh-taskboard-view]');
-          if (root === null || root.querySelector('#marshal-taskboard-head') !== null) return;
-          const bar = document.createElement('div');
-          bar.id = 'marshal-taskboard-head';
-          bar.style.cssText = 'position:absolute;top:0;left:0;right:0;height:44px;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:0 16px;box-sizing:border-box;background:var(--dsw-alias-bg-base);border-bottom:1px solid var(--dsw-alias-border-l1);z-index:6;color:inherit;font-family:inherit';
-          const title = document.createElement('div');
-          title.textContent = '任务看板';
-          title.style.cssText = 'font-size:14px;font-weight:600;white-space:nowrap';
-          const nav = document.createElement('div');
-          nav.style.cssText = 'display:flex;align-items:center;gap:2px;padding:3px;border-radius:999px;border:1px solid color-mix(in srgb, currentColor 14%, transparent);background:color-mix(in srgb, currentColor 5%, transparent);overflow-x:auto;max-width:100%';
-          const add = (label, key) => {
-            const button = document.createElement('button');
-            button.type = 'button';
-            button.textContent = label;
-            button.setAttribute('aria-pressed', key === 'tasks' ? 'true' : 'false');
-            button.style.cssText = 'border:0;border-radius:999px;cursor:pointer;white-space:nowrap;font:11px/1 inherit;padding:6px 9px;color:inherit;background:' + (key === 'tasks' ? 'color-mix(in srgb, currentColor 16%, transparent)' : 'transparent') + ';font-weight:' + (key === 'tasks' ? '600' : '400');
-            button.onclick = () => {
-              goTab(key);
-            };
-            nav.appendChild(button);
-          };
-          add('任务看板', 'tasks');
-          add('会话', 'chats');
-          add('智能体', 'agents');
-          add('记忆', 'memory');
-          bar.append(title, nav);
-          root.prepend(bar);
-        };
-        ensureTaskboardHeader();
-        const headerTimer = setInterval(ensureTaskboardHeader, 1000);
-        disposers.push(() => clearInterval(headerTimer));
         track(ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({ name: 'sidebar.panellist', id: PANEL, order: 25, label: () => '调度官' }, MarshalIcon)));
         track(ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: PANEL,
           children: { 'marshal.native.body': { kind: 'single', scope: 'session' } },
@@ -6358,6 +6676,7 @@ window.__ModuleLoader__.load({
         track(ctx.slots.inject('marshal.native.body', () => ctx.slots.register({ name: 'marshal.native.body' }, NativeBody)));
         if (typeof ctx.effect === 'function') {
           ctx.effect(() => () => {
+            disposeAllMarshalSse();
             for (const dispose of disposers.splice(0).reverse()) {
               try { dispose(); } catch {}
             }

@@ -637,6 +637,7 @@ test('shipped client/index.js renders per-agent model/thinking switchers in Task
     const mockFetch = async (input, init) => {
         const u = typeof input === 'string' ? input : String(input?.href || input?.url || input);
         const method = String(init?.method || 'GET').toUpperCase();
+        if (u.endsWith('/marshal/setup')) return Response.json({ ok: true, ready: true });
         if (u.includes('marshal/memory/session')) {
             return new Response(JSON.stringify({ ok: true, csrf: 'csrf-ui' }), { status: 200 });
         }
@@ -766,6 +767,8 @@ test('shipped client/index.js renders per-agent model/thinking switchers in Task
         URL,
         URLSearchParams,
         Response,
+        AbortController,
+        TextDecoder,
         Blob,
         Intl,
         performance,

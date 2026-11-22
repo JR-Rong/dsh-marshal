@@ -48,7 +48,12 @@
         h('rect', { x: 7, y: 2, width: 10, height: 7, rx: 1.5 }), h('path', { d: 'M12 9v5M5 14h14M5 14v3M19 14v3' }),
         h('rect', { x: 2, y: 17, width: 6, height: 5, rx: 1 }), h('rect', { x: 16, y: 17, width: 6, height: 5, rx: 1 }));
     }
-    async function readAddress(role, signal) {
+    function readAddress(role, signal) {
+      // Without an entry role, use the same local base as fetchJson, not an HTTPS dashboard.
+      if (role === undefined) return new URL('.', document.baseURI).href.replace(/\/$/, '');
+      return readDashboardAddress(role, signal);
+    }
+    async function readDashboardAddress(role, signal) {
       const response = await fetch(new URL(`marshal/entry/${role}`, document.baseURI), { signal });
       if (!response.ok) return null;
       const data = await response.json(); const url = new URL(data.dashboardUrl);

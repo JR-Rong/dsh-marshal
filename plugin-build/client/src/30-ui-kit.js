@@ -79,7 +79,7 @@
     }
     function requestError(response, data, explain) {
       const code = data?.code ?? 'HTTP ' + response.status;
-      return Object.assign(new Error(String(explain ? data?.message || code : code)), { code });
+      return Object.assign(new Error(String(explain ? data?.message || code : code)), { code, status: response.status });
     }
     function memoryProof() {
       return nativeMemory ? desktopMemorySession : (readBrowserCookie(MEMORY_CSRF_COOKIE) || undefined);
@@ -103,26 +103,33 @@
         }
         const proof = memoryProof();
         if (!proof) throw Object.assign(new Error('记忆会话凭证不可用。'), { code: 'memory-session-invalid' });
+        if (typeof resumeDeniedMarshalSse === 'function') resumeDeniedMarshalSse(true);
         return proof;
       }).finally(() => { memorySessionPromise = undefined; });
       return memorySessionPromise;
     }
-    async function fetchJson(path, body, workspaceAuth = false) {
+    async function fetchJson(path, body, workspaceAuth = false, signal) {
       const memory = String(path).startsWith('marshal/memory') && !String(path).startsWith('marshal/memory/session');
       const authenticated = memory || workspaceAuth;
       const url = new URL(path, document.baseURI);
-      const send = proof => fetch(url, {
-        credentials: 'same-origin',
-        ...(body === undefined ? {} : { method: 'POST', body: JSON.stringify(body) }),
-        headers: {
-          ...(body === undefined ? {} : { 'content-type': 'application/json' }),
-          ...(typeof proof === 'string' ? { 'x-marshal-csrf': proof } : proof),
-        },
-      });
+      const send = proof => {
+        signal?.throwIfAborted();
+        return fetch(url, {
+          credentials: 'same-origin',
+          ...(signal ? { signal } : {}),
+          ...(body === undefined ? {} : { method: 'POST', body: JSON.stringify(body) }),
+          headers: {
+            ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+            ...(typeof proof === 'string' ? { 'x-marshal-csrf': proof } : proof),
+          },
+        });
+      };
+      signal?.throwIfAborted();
       const proof = authenticated ? await ensureMemorySession() : undefined;
       let response = await send(proof);
       let data = await readJson(response);
       if (authenticated && (response.status === 401 || data?.code === 'memory-csrf-mismatch')) {
+        signal?.throwIfAborted();
         response = await send(await ensureMemorySession(proof));
         data = await readJson(response);
       }

@@ -561,18 +561,21 @@
       ];
       const knownStatuses = new Set(columns.map(c => c.key));
 
-      const load = async () => {
+      const load = async (isAlive = () => true) => {
         try {
           const data = await fetchJson('marshal/tasks/state', undefined, true);
+          if (!isAlive()) return;
           setTasks(data.tasks || []);
           if (typeof data.sessionDefaultPermission === 'string') setSessionDefaultPerm(data.sessionDefaultPermission);
           setError('');
         }
-        catch (e) { setError(friendlyError(e, '任务看板')); }
+        catch (e) { if (isAlive()) setError(friendlyError(e, '任务看板')); }
       };
       React.useEffect(() => {
         ensureTaskBoardStyles();
-        void load();
+        let alive = true;
+        const unsubscribe = subscribeMarshalEvents(['ready', 'tasks.changed', 'incidents.changed', 'agents.changed', 'room.message'],
+          () => load(() => alive), { initial: true, debounceMs: 80 });
         void fetchJson('marshal/tasks/orchestration', undefined, true)
           .then(data => {
             setCatalog(data);
@@ -597,8 +600,7 @@
             setDefaultModelRoute(flat.defaultRoute);
             setParseModel(cur => cur || flat.defaultRoute || flat.options[0]?.route || '');
           }).catch(() => {});
-        const timer = setInterval(() => { void load(); }, 3000);
-        return () => clearInterval(timer);
+        return () => { alive = false; unsubscribe(); };
       }, []);
 
       React.useEffect(() => {
@@ -2092,6 +2094,7 @@
                 onClick: expandAllCols,
               }, '全展'))),
           h('div', { className: 'mtb-head-right' },
+            h('button', { type: 'button', style: uiButton(false), onClick: () => { void load(); } }, '刷新'),
             archivedTasks.length > 0 && h('button', { type: 'button', style: tabStyle(showArchive), onClick: () => setShowArchive(v => !v) },
               showArchive ? '返回看板' : '归档 (' + archivedTasks.length + ')'),
             !showArchive && h('button', { type: 'button', style: tabStyle(showFlowGuide), onClick: () => setShowFlowGuide(v => !v), title: '查看工单 6 列状态流转规则' }, '流转规则'),
@@ -2514,8 +2517,9 @@
       const [leader, setLeader] = React.useState('');
       const [remote, setRemote] = React.useState('');
       const [draft, setDraft] = React.useState('');
-      const cursor = React.useRef(0);
+      const cursor = React.useRef(null);
       const selection = React.useRef('');
+      const roomRefreshRef = React.useRef(null);
       const streamRef = React.useRef(null);
       const inputRef = React.useRef(null);
       const stickBottomRef = React.useRef(true);
@@ -2562,27 +2566,31 @@
         return () => { alive = false; };
       }, [workspace]);
 
-      const mergePage = (data, key) => {
+      const mergePage = (data, key, history = false) => {
         if (selection.current !== key) return;
-        cursor.current = Math.max(cursor.current, data.records.at(-1)?.seq ?? 0);
         setView(previous => {
+          if (history && previous?.key !== key) return previous;
           const records = new Map((previous?.key === key ? previous.records : []).map(record => [record.seq, record]));
-          for (const record of data.records) records.set(record.seq, record);
-          return { ...data, key, records: [...records.values()].sort((a, b) => a.seq - b.seq) };
+          for (const record of data.records) {
+            if (!history || !records.has(record.seq)) records.set(record.seq, record);
+          }
+          return { ...(history ? previous : data), key, records: [...records.values()].sort((a, b) => a.seq - b.seq) };
         });
       };
 
       const failedRead = (e, key) => {
         if (selection.current !== key) return;
         if (['forbidden', 'workspace-forbidden', 'unauthorized', 'task-room-not-found'].includes(e.code)) {
-          cursor.current = 0;
+          cursor.current = null;
           setView(null);
         }
         setError(e.message);
       };
 
+      const loadRoom = () => roomRefreshRef.current?.request();
+
       React.useEffect(() => {
-        cursor.current = 0;
+        cursor.current = null;
         prevLastSeqRef.current = 0;
         stickBottomRef.current = true;
         setView(null);
@@ -2591,24 +2599,39 @@
         setLeader('');
         setRemote('');
         if (!id || !workspace) return;
-        let alive = true;
-        let inFlight = false;
-        const load = async () => {
-          if (inFlight) return;
-          inFlight = true;
+        const refresh = createVisibleMarshalRefresh(async signal => {
+          const active = () => !signal.aborted && selection.current === viewKey;
           try {
-            const data = await fetchJson(url + (cursor.current ? '&after=' + cursor.current : ''), undefined, true);
-            if (alive) mergePage(data, viewKey);
-          } catch (e) { if (alive) failedRead(e, viewKey); }
-          finally { inFlight = false; }
+            while (active()) {
+              const after = cursor.current;
+              const data = await fetchJson(url + (after === null ? '' : '&after=' + after), undefined, true, signal);
+              if (!active()) return;
+              const next = data.records.at(-1)?.seq ?? after ?? 0;
+              mergePage(data, viewKey);
+              // Only the initial read defaults to the latest page; an empty room has a real cursor of 0.
+              cursor.current = Math.max(after ?? 0, next);
+              if (!data.hasNewer || next <= (after ?? 0)) return;
+            }
+          } catch (e) { if (active()) failedRead(e, viewKey); }
+        }, 5_000);
+        roomRefreshRef.current = refresh;
+        const unsubscribe = subscribeMarshalEvents(['ready', 'tasks.changed', 'incidents.changed', 'agents.changed', 'room.message'],
+          refresh.request, { initial: true, debounceMs: 80 });
+        return () => {
+          roomRefreshRef.current = null;
+          refresh.dispose();
+          unsubscribe();
         };
-        void load();
-        const timer = setInterval(load, 1600);
-        return () => { alive = false; clearInterval(timer); };
       }, [id, workspace]);
 
       const visible = view?.key === viewKey ? view : null;
       const room = visible?.room;
+      const isWorkflowRunning = visible?.runState === 'running' || visible?.cardStatus === 'running';
+      const roomExecuting = Boolean(room && !room.closed && (isWorkflowRunning || visible.busy || visible.chatBusy));
+      const roomOpen = Boolean(room && !room.closed);
+      const roomPollMs = roomExecuting ? 5_000 : 12_000;
+      // Live thinking/steps/text need ~5s refresh while running; open non-closed rooms keep a 12s cross-device fallback.
+      React.useEffect(() => { roomRefreshRef.current?.setPolling(roomOpen, roomPollMs); }, [id, workspace, roomOpen, roomPollMs]);
       const lastSeq = visible?.records?.at(-1)?.seq ?? 0;
       const liveSig = (visible?.liveBubbles ?? []).map(b => b.id + ':' + (b.updatedAt || 0) + ':' + (b.thinking?.length || 0) + ':' + (b.text?.length || 0) + ':' + (b.steps?.length || 0)).join('|');
 
@@ -2651,6 +2674,7 @@
         setError('');
         setNotice('');
         const key = viewKey;
+        const refresh = roomRefreshRef.current;
         try {
           const res = await fetchJson(prefix + 'action', { roomId: room.id, action, ...data }, true);
           if (action === 'revise' && selection.current === key) {
@@ -2661,7 +2685,7 @@
             setNotice(res.patchApplied ? '已将补丁应用到工作区并确认工单完成。' : '已确认验收完成并归档。');
           }
           stickBottomRef.current = true;
-          mergePage(await fetchJson(url + '&after=' + cursor.current, undefined, true), key);
+          await refresh?.request();
         }
         catch (e) { failedRead(e, key); }
         finally { setBusy(false); }
@@ -2674,6 +2698,7 @@
         setSendingChat(true);
         setError('');
         const key = viewKey;
+        const refresh = roomRefreshRef.current;
         try {
           if (room.closed) {
             await fetchJson(prefix + 'action', { roomId: room.id, action: 'reopen' }, true);
@@ -2681,7 +2706,7 @@
           setDraft('');
           stickBottomRef.current = true;
           await fetchJson(prefix + 'action', { roomId: room.id, action: 'send', text: messageText, ...(room.closed ? { autoReopen: true } : {}) }, true);
-          mergePage(await fetchJson(url + '&after=' + cursor.current, undefined, true), key);
+          await refresh?.request();
         }
         catch (e) {
           if (selection.current === key) setDraft(prev => prev || messageText);
@@ -2698,10 +2723,14 @@
 
       const older = async () => {
         if (!visible?.records[0] || busy) return;
+        const refresh = roomRefreshRef.current;
         setBusy(true);
         stickBottomRef.current = false;
-        try { mergePage(await fetchJson(url + '&before=' + visible.records[0].seq, undefined, true), viewKey); }
-        catch (e) { failedRead(e, viewKey); }
+        try {
+          const data = await fetchJson(url + '&before=' + visible.records[0].seq, undefined, true);
+          if (roomRefreshRef.current === refresh) mergePage(data, viewKey, true);
+        }
+        catch (e) { if (roomRefreshRef.current === refresh) setError(e.message); }
         finally { setBusy(false); }
       };
 
@@ -2783,7 +2812,6 @@
       }, [visible?.records, visible?.liveBubbles]);
       const roleOfActor = actorName => participants.find(p => p.name === actorName)?.role || '';
       const isInReview = Boolean(visible?.origin && !room?.closed && (visible?.cardStatus === 'review' || visible?.runState === 'review-blocked'));
-      const isWorkflowRunning = visible?.runState === 'running' || visible?.cardStatus === 'running';
 
       const renderRecord = record => {
         const timeStr = new Date(record.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
@@ -2933,6 +2961,7 @@
         setUploadingAtt(true);
         setError('');
         const key = viewKey;
+        const refresh = roomRefreshRef.current;
         try {
           const uploaded = await uploadAttachmentFiles(files, roomPreviewUrlsRef.current);
           if (uploaded.length === 0) return;
@@ -2942,9 +2971,7 @@
             ...uploaded.filter(a => !existingIds.has(a.attachmentId)),
           ].slice(0, 8);
           await fetchJson('marshal/tasks/update', { taskId: roomTaskId, attachments: merged, ...(isWorkflowRunning ? { steerNow: true } : {}) }, true);
-          if (id && workspace) {
-            mergePage(await fetchJson(url + (cursor.current ? '&after=' + cursor.current : ''), undefined, true), key);
-          }
+          await refresh?.request();
           if (selection.current === key) {
             setNotice('已上传 ' + uploaded.length + ' 个工单附件：' + uploaded.map(item => item.name).join('、') + (isWorkflowRunning ? '（已作为实时插话同步给运行中的 Agent）' : ''));
           }
@@ -2980,6 +3007,7 @@
         h('main', { className: 'mtr-main' },
           h('header', { className: 'mtr-header' },
             button('← 回任务看板', () => openBoard(visible?.origin ? room?.taskId : task?.id)),
+            id && workspace && button('刷新', () => { void loadRoom(); }),
             h('strong', { style: { fontSize: 14, flex: 1, minWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
               room?.title ?? task?.title ?? '工单群聊'),
             isWorkflowRunning && h('span', { style: { fontSize: 11.5, color: '#3b82f6', fontWeight: 600 } }, '● 编排执行中（可随时发言参与讨论）'),

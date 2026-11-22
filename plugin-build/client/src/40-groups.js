@@ -15,32 +15,36 @@
       const agents = library && Array.isArray(library.agents) ? library.agents : [];
       const groups = (state && state.groups) || [];
 
-      const load = async () => {
+      const load = async (isAlive = () => true) => {
         try {
           const [groupsState, agentLibrary] = await Promise.all([fetchJson('marshal/groups/state'), loadAgentLibrary()]);
+          if (!isAlive()) return;
           setState(groupsState);
           setLibrary(agentLibrary);
           setError('');
         }
-        catch (e) { setError(friendlyError(e, '智能体/群聊')); }
+        catch (e) { if (isAlive()) setError(friendlyError(e, '智能体/群聊')); }
       };
       const reloadGroup = async () => {
         if (!group) return;
         const fresh = await fetchJson('marshal/groups/get?id=' + encodeURIComponent(group.id));
         setGroup(fresh.group);
       };
-      React.useEffect(() => { void load(); }, []);
+      React.useEffect(() => {
+        let alive = true;
+        const unsubscribe = subscribeMarshalEvents(['ready', 'groups.changed', 'agents.changed'],
+          () => load(() => alive), { initial: true, debounceMs: 80 });
+        return () => { alive = false; unsubscribe(); };
+      }, []);
       React.useEffect(() => {
         if (!selected) { setGroup(null); return; }
         let alive = true;
-        const pull = () => {
+        const pull = () =>
           fetchJson('marshal/groups/get?id=' + encodeURIComponent(selected))
             .then(data => { if (alive) setGroup(data.group); })
             .catch(e => { if (alive) setError('读取群失败：' + (e.message || e)); });
-        };
-        pull();
-        const timer = setInterval(pull, 2000);
-        return () => { alive = false; clearInterval(timer); };
+        const unsubscribe = subscribeMarshalEvents(['ready', 'groups.changed'], pull, { initial: true, debounceMs: 80 });
+        return () => { alive = false; unsubscribe(); };
       }, [selected]);
 
       const create = async () => {
@@ -255,6 +259,7 @@
       const [text, setText] = React.useState('');
       const [busy, setBusy] = React.useState(false);
       const [, setTick] = React.useState(0);
+      const refreshRef = React.useRef(null);
       const reveal = React.useRef(new Map());
       const seenMessages = React.useRef(false);
       const lastGroupId = React.useRef('');
@@ -262,28 +267,30 @@
       const group = groups.find(item => item.id === selected) || null;
       const devices = (catalog && catalog.devices) || [];
 
-      const load = async () => {
-        try {
-          const [nextState, nextCatalog] = await Promise.all([
-            fetchJson('marshal/cross-groups/state'),
-            fetchJson('marshal/cross-groups/catalog'),
-          ]);
-          setState(nextState);
-          setCatalog(nextCatalog);
-          setError('');
-        }
-        catch (e) { setError('跨设备路由不可用：' + (e.message || e)); }
-      };
-      React.useEffect(() => { void load(); }, []);
       React.useEffect(() => {
-        let alive = true;
-        const timer = setInterval(() => {
-          fetchJson('marshal/cross-groups/state')
-            .then(next => { if (alive) setState(next); })
-            .catch(() => {});
-        }, 350);
-        return () => { alive = false; clearInterval(timer); };
+        // The local SSE stream does not relay changes made on the Hub.
+        const refresh = createVisibleMarshalRefresh(async signal => {
+          const [nextState, nextCatalog] = await Promise.allSettled([
+            fetchJson('marshal/cross-groups/state', undefined, false, signal),
+            fetchJson('marshal/cross-groups/catalog', undefined, false, signal),
+          ]);
+          if (signal.aborted) return;
+          if (nextState.status === 'fulfilled') setState(nextState.value);
+          if (nextCatalog.status === 'fulfilled') setCatalog(nextCatalog.value);
+          const failure = [nextState, nextCatalog].find(result => result.status === 'rejected');
+          setError(failure ? '跨设备路由不可用：' + (failure.reason?.message || failure.reason) : '');
+        }, 12_000);
+        refreshRef.current = refresh;
+        refresh.setPolling(true);
+        const unsubscribe = subscribeMarshalEvents(['ready', 'groups.changed', 'agents.changed'],
+          refresh.request, { initial: true, debounceMs: 80 });
+        return () => {
+          refreshRef.current = null;
+          refresh.dispose();
+          unsubscribe();
+        };
       }, []);
+      const load = () => refreshRef.current?.request();
       const messageSignature = group === null ? '' : group.messages.map(message => message.id + ':' + message.text.length).join(',');
       React.useEffect(() => {
         if (group === null) return;
