@@ -20,7 +20,12 @@ import { acceptEventSeq } from './lib/transcript.ts'
 import { hasStoredBridge, loadBridgeDevice, openBridgeWorkbench, saveBridgeDevice } from './bridge/workbench.ts'
 import { classifyPairing, pairBridge, parsePairPayload, parseUnifiedPairing } from './lib/bridge.ts'
 import { openQrScanner } from './lib/scanner.ts'
-import { installationId, readConfig, readPinGuard, removeConfig, writeConfig, writePinGuard, readTheme, writeTheme } from './lib/storage.ts'
+import { ConfigReadError, installationId, readConfig, readPinGuard, removeConfig, updateConfig, writePinGuard, readTheme, writeTheme, writeNodePreference } from './lib/storage.ts'
+import { createConnectivity } from './lib/connectivity.ts'
+import { createSummaryCapDraft, renderSummaryCap } from './lib/summary-cap.ts'
+import { buildMemoryGraph, CLARITY_LABELS, GALAXY_NODE_LIMIT, layoutMemoryGalaxy, MEMORY_KIND_META, MEMORY_LAYERS,
+  toGalaxyNodes, type GalaxyNode } from './lib/memory-galaxy.ts'
+import { initialGalaxyCamera, mountGalaxyCanvas } from './lib/memory-galaxy-canvas.ts'
 import { createLock, pinDelay, verifyPin, isValidPin, type LockRecord } from './lib/lock.ts'
 import { decideDeepLink, linkCarriesSecret, parsePairingLink } from './lib/deeplink.ts'
 import { livePhaseAfterApproval } from './lib/live.ts'
@@ -250,13 +255,20 @@ function switchTab(view: View): void {
 }
 
 function render(prependHistory = false): void {
+  clearTimeout(connectivityExpiry)
+  clearTimeout(connectivityRefresh)
+  if (state.view !== 'home') { privacyConfirming = false; sliderDragging = false }
+  disposeGalaxy?.()
+  disposeGalaxy = undefined
   if (composerSheet && (state.view !== 'session' || composerSheet.session !== sessionGeneration)) composerSheet.close()
   if (chatSheet && state.view !== chatSheet.view) chatSheet.dismiss()
   if (appConfirmation && (appLocked() || state.view !== appConfirmation.view)) appConfirmation.cancel()
   if (state.view !== 'groupRoom' && state.view !== 'ticketGroup') stopGroupPoll()
-  if (!showingMemory()) clearTimeout(memoryPoll)
+  if (!showingMemory()) { clearTimeout(memoryPoll); memoryLoad++ }
   const app = rootNode()
-  const restoreSegment = document.activeElement?.matches('.chat-segments [aria-pressed="true"]') && app.contains(document.activeElement)
+  const segment = document.activeElement
+  const segmentGroup = segment?.matches('[aria-pressed="true"]') && app.contains(segment)
+    ? segment.closest('[role="group"]')?.getAttribute('aria-label') : null
   const previous = state.view === 'session' && renderedSession === sessionGeneration
     ? app.querySelector<HTMLElement>('.transcript') : null
   const prevTop = previous?.scrollTop ?? 0
@@ -271,6 +283,7 @@ function render(prependHistory = false): void {
   clear(app)
   const withTabs = TAB_VIEWS.has(state.view) || state.view === 'ticketGroup' || state.view === 'groups'
   app.className = 'app screen-' + state.view + (withTabs ? ' has-tabs' : '')
+  app.append(el('p', { id: 'config-read-error', class: 'banner warn', role: 'status', hidden: !configReadError, text: configReadError }))
   for (const child of screenChildren()) {
     // 浏览器 append(null) 会渲染出 "null" 字样，必须先过滤空槽位。
     if (child === null || child === undefined || child === false) continue
@@ -293,13 +306,17 @@ function render(prependHistory = false): void {
     }
   }
   if (withTabs) app.append(tabBar())
-  if (restoreSegment) app.querySelector<HTMLElement>('.chat-segments [aria-pressed="true"]')?.focus()
+  if (segmentGroup) [...app.querySelectorAll('[role="group"]')].find(group => group.getAttribute('aria-label') === segmentGroup)
+    ?.querySelector<HTMLElement>('[aria-pressed="true"]')?.focus({ preventScroll: true })
   if (state.view === 'board') { refreshTicketList(); updateTicketSheet() }
+  scheduleConnectivityExpiry()
 }
 
 function screenChildren(): Child[] {
   switch (state.view) {
-    case 'booting': return [brand(), el('p', { class: 'empty', text: '正在读取本机配置…' })]
+    case 'booting': return [brand(), configReadError
+      ? button('重试读取本机配置', () => { void start() }, { class: 'primary block' })
+      : el('p', { class: 'empty', text: '正在读取本机配置…' })]
     case 'setup': return setupView()
     case 'lock': return lockView()
     case 'home': return homeView()
@@ -367,14 +384,17 @@ function applyTheme(theme: MobileTheme): void {
 function themeCard(): HTMLElement {
   const choices = el('div', { class: 'theme-options', role: 'group', 'aria-label': '外观主题' })
   for (const theme of MOBILE_THEMES) {
-    choices.append(button(THEME_LABELS[theme], () => {
+    choices.append(el('button', { type: 'button', 'data-choice': theme, 'aria-pressed': String(mobileTheme === theme), onClick: () => {
       if (mobileTheme === theme) return
       applyTheme(theme)
       for (const node of choices.querySelectorAll('button')) {
         node.setAttribute('aria-pressed', String(node.dataset.choice === theme))
       }
-      void writeTheme(theme).catch(() => toast('外观预览已应用，但未能保存', 'error'))
-    }, { type: 'button', 'data-choice': theme, 'aria-pressed': String(mobileTheme === theme) }))
+      void writeTheme(theme).catch(error => {
+        reportConfigReadError(error)
+        toast('外观预览已应用，但未能保存', 'error')
+      })
+    } }, el('span', { class: 'theme-swatch', 'aria-hidden': 'true' }), THEME_LABELS[theme]))
   }
   return el('section', { class: 'card' }, el('h2', { text: '外观' }), choices)
 }
@@ -411,14 +431,73 @@ function backButton(to: View | (() => void)): HTMLButtonElement {
 
 export async function start(): Promise<void> {
   state.view = 'booting'
+  configReadError = ''
   applyTheme(readTheme())
   state.online = navigator.onLine
   render()
   void setupChrome()
-  const config = await readConfig()
+  const stored = await readConfig()
+  if (stored.status === 'error') {
+    configReadError = stored.error.message
+    render()
+    return
+  }
+  const config = stored.status === 'ok' ? stored.config : null
   applyTheme(readTheme(config))
   state.config = config
   state.account = config?.account && config.account.expiresAt > Date.now() ? config.account : null
+  function onNetwork(online: boolean): void {
+    const reconnected = online && !state.online
+    state.online = online
+    if (!online) {
+      connectivity.invalidate()
+      state.statusText = '连接状态未确认。'
+    }
+    redrawConnectivity()
+    if (reconnected && state.api && !appLocked()) {
+      void refreshDevices()
+      void recoverPendingInputs(state.api)
+      void loadBoard(true)
+    }
+  }
+  let networkDispose: (() => void) | undefined
+  let networkGeneration = 0
+  const onForeground = () => {
+    if (document.hidden || connectivityPaused) return
+    if (showingConnectivity()) {
+      redrawConnectivity()
+      void refreshDevices()
+    }
+    scheduleBoardRefresh()
+  }
+  const bindNetwork = async () => {
+    const generation = ++networkGeneration
+    document.addEventListener('visibilitychange', onForeground)
+    const dispose = await watchNetwork(online => {
+      if (generation === networkGeneration) onNetwork(online)
+    })
+    if (generation === networkGeneration) networkDispose = dispose
+    else dispose()
+  }
+  window.addEventListener('pagehide', () => {
+    networkGeneration++
+    networkDispose?.()
+    networkDispose = undefined
+    document.removeEventListener('visibilitychange', onForeground)
+    connectivityPaused = true
+    connectivity.invalidate()
+    clearTimeout(connectivityExpiry)
+    clearTimeout(connectivityRefresh)
+  })
+  window.addEventListener('pageshow', event => {
+    if (!event.persisted) return
+    connectivityPaused = false
+    const wasOnline = state.online
+    onNetwork(navigator.onLine)
+    void bindNetwork()
+    if (wasOnline && state.online) void refreshDevices()
+  })
+  await bindNetwork()
   if (!config) {
     state.view = 'setup'
     render()
@@ -434,21 +513,8 @@ export async function start(): Promise<void> {
   if (config?.lanBridge && !config.lock && state.view !== 'lock') {
     setTimeout(() => { if (hasStoredBridge()) openDshWorkbench() }, 250)
   }
-  await watchNetwork((online) => {
-    const reconnected = online && !state.online
-    state.online = online
-    if (state.view === 'home') render()
-    else if (state.view === 'board') { refreshTicketList(); refreshTabBar() }
-    else refreshTabBar()
-    if (reconnected && state.api && !appLocked()) {
-      void refreshDevices()
-      void recoverPendingInputs(state.api)
-      void loadBoard(true)
-    }
-  })
   await watchDeepLinks((url) => { void handleDeepLink(url) })
   await registerBackButton()
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) scheduleBoardRefresh() })
   window.addEventListener('pageshow', (event) => { if (event.persisted) void registerBackButton() })
 }
 
@@ -476,8 +542,7 @@ async function registerBackButton(): Promise<void> {
 async function enterApp(): Promise<void> {
   const config = state.config
   if (!config) { state.view = 'setup'; render(); return }
-  stream?.close()
-  stream = null
+  closeMainStream()
   subscriptionId = null
   state.api = new MarshalApi(config)
   roster = []
@@ -489,12 +554,18 @@ async function enterApp(): Promise<void> {
   state.sessions = []
   state.deviceId = null
   hubUnavailable = false
+  connectivity.stream('reset')
   resetTicketBoard()
   agentsSegment = 'members'
   boardTasks = []
   boardRevisions = {}
   boardReceipts = []
   memoryEntries = []
+  memoryMember = null
+  memoryLayer = 'all'
+  memoryMode = 'galaxy'
+  selectedMemory = ''
+  Object.assign(galaxyCamera, initialGalaxyCamera())
   state.view = 'board'
   state.statusText = '正在连接…'
   render()
@@ -531,49 +602,125 @@ async function showLive(title: string, phase: string, session = phase, end = fal
   } catch { /* 浏览器没有 Live Activity */ }
 }
 
+let mainStreamGeneration = 0
+function closeMainStream(): void {
+  mainStreamGeneration++
+  stream?.close()
+  stream = null
+  connectivity.stream('close')
+}
+
 async function openStream(): Promise<void> {
   const api = state.api
   if (!api || !api.token) return
-  stream?.close()
-  stream = await openEventStream({
-    url: api.streamUrl(),
-    token: api.token,
-    onFrame: (frame) => { if (state.api === api) void onFrame(frame) },
-    onError: (message) => {
-      state.statusText = '事件流断开：' + message
-      if (state.view === 'home') render()
-    },
-  })
+  const generation = ++mainStreamGeneration
+  const current = () => state.api === api && generation === mainStreamGeneration
+  const onError = (message: string) => {
+    if (!current()) return
+    connectivity.stream('error')
+    state.statusText = '事件流断开：' + message
+    redrawConnectivity()
+  }
+  try {
+    const opened = await openEventStream({
+      url: api.streamUrl(),
+      token: api.token,
+      onFrame: (frame) => { if (current()) void onFrame(frame) },
+      onOpen: () => {
+        if (!current()) return
+        connectivity.stream('open')
+        state.statusText = '正在检查连接状态…'
+        redrawConnectivity()
+        void refreshDevices()
+      },
+      onError,
+    })
+    if (current()) stream = opened
+    else opened.close()
+  } catch {
+    onError('未能开启事件流')
+  }
+}
+
+const connectivity = createConnectivity()
+let connectivityExpiry: ReturnType<typeof setTimeout> | undefined
+let connectivityRefresh: ReturnType<typeof setTimeout> | undefined
+let connectivityPaused = false
+let privacyConfirming = false
+let sliderDragging = false
+function showingConnectivity(): boolean {
+  return state.view === 'home' || (state.view === 'agents' && agentsSegment === 'members')
+}
+
+function redrawConnectivity(): void {
+  if (connectivityPaused) return
+  if (showingConnectivity()) {
+    if (state.view === 'home' && state.config && (privacyConfirming || sliderDragging || document.activeElement?.id === 'summary-cap')) {
+      const card = rootNode().querySelector<HTMLElement>('#node-topology-card')
+      if (card) {
+        card.replaceWith(nodeTopologyCard(state.config))
+        scheduleConnectivityExpiry()
+        refreshTabBar()
+        return
+      }
+    }
+    render()
+    const memberStatus = activeMemberStatus
+    if (memberStatus) memberStatus.node.textContent = memberHostText(memberStatus.member)
+  } else if (state.view === 'board') { refreshTicketList(); updateTicketSheet(); refreshTabBar() }
+  else refreshTabBar()
+}
+
+function scheduleConnectivityExpiry(): void {
+  clearTimeout(connectivityExpiry)
+  clearTimeout(connectivityRefresh)
+  if (!showingConnectivity() || connectivityPaused || document.hidden) return
+  const now = Date.now()
+  const { expiry } = connectivity.snapshot(now)
+  if (Number.isFinite(expiry)) {
+    const remaining = Math.max(0, expiry - now)
+    connectivityExpiry = setTimeout(redrawConnectivity, remaining)
+    if (state.online && state.api) {
+      const refreshDelay = Math.max(1_000, Math.min(30_000, remaining - 5_000))
+      connectivityRefresh = setTimeout(() => {
+        if (showingConnectivity() && !connectivityPaused && !document.hidden && state.online && state.api) {
+          void refreshDevices()
+        }
+      }, refreshDelay)
+    }
+  }
 }
 
 async function refreshDevices(): Promise<void> {
   const api = state.api
-  if (!api) return
+  if (!api || !state.online || connectivityPaused) return
+  const probe = connectivity.beginProbe()
   const result = await api.devices()
-  if (state.api !== api) return
+  if (state.api !== api || !connectivity.accepts(probe)) return
   if (!result.ok) {
+    connectivity.invalidate()
     hubUnavailable = true
     state.statusText = result.message
     if (result.error === 'unauthorized') { state.view = 'setup'; render(); return }
-    if (state.view === 'home') render()
-    else refreshTabBar()
+    redrawConnectivity()
     return
   }
   hubUnavailable = false
+  connectivity.devices(Date.now())
   state.devices = result.data
+  state.statusText = ''
+  redrawConnectivity()
   const named = await api.roster()
-  if (state.api !== api) return
+  if (state.api !== api || !connectivity.accepts(probe)) return
   roster = named.ok ? named.data : roster
-  state.statusText = result.data.length === 0 ? '暂无设备在线' : '已连接调度中心'
+  connectivity.roster(named.ok ? Date.now() : null)
   if (state.view === 'sessions' && !state.deviceId) {
     const first = state.devices.find((entry) => !entry.stale)
     if (first) { void openDevice(first); return }
     render()
     return
   }
-  if (state.view === 'home' || (state.view === 'agents' && agentsSegment === 'members')) render()
-  else if (state.view === 'board') { refreshTicketList(); updateTicketSheet(); refreshTabBar() }
-  else refreshTabBar()
+  redrawConnectivity()
 }
 
 async function openDevice(device: DeviceRow): Promise<void> {
@@ -1281,21 +1428,20 @@ async function saveSetup(hubInput: HTMLInputElement, tokenInput: HTMLInputElemen
   if (!parsed.ok) { result.textContent = parsed.error; return }
   const previous = state.config
   const hubChanged = previous?.hubUrl !== parsed.hubUrl
-  const config: MarshalConfig = {
-    ...(previous ?? makeConfig({ hubUrl: parsed.hubUrl })),
+  const patch = {
     version: CONFIG_VERSION,
     hubUrl: parsed.hubUrl,
     token: parsed.token,
     ...(hubChanged ? { account: null } : {}),
-    updatedAt: Date.now(),
   }
+  let config: MarshalConfig
   try {
-    await writeConfig(config)
+    config = await saveConfigPatch(patch, makeConfig({ hubUrl: parsed.hubUrl }))
   } catch (error) {
     result.textContent = '保存失败：' + (error instanceof Error ? error.message : '未知错误')
     return
   }
-  state.config = config
+  adoptConfig(config)
   state.account = config.account ?? null
   await enterApp()
 }
@@ -1346,30 +1492,182 @@ function scanPairing(): void {
   })
 }
 
+function topologyNode(title: string, protocol: string, status: string): HTMLElement {
+  return el('li', {}, el('strong', { text: title }), el('span', { text: protocol }), el('span', { text: status }))
+}
+
+function appLockRow(config: MarshalConfig): HTMLElement {
+  return config.lock
+    ? el('div', { class: 'row-between' },
+      el('div', { class: 'label' }, el('strong', { text: '应用锁' }), el('span', { text: '已开启，启动需 6 位 PIN' })),
+      button('关闭', () => { disableLock() }, { class: 'icon-button danger' }))
+    : el('div', { class: 'row-between' },
+      el('div', { class: 'label' }, el('strong', { text: '应用锁' }), el('span', { text: '开启后每次启动要输 6 位 PIN' })),
+      button('开启', () => { openLockSetup() }, { class: 'icon-button' }))
+}
+
+function nodeSecurityCard(config: MarshalConfig): HTMLElement {
+  const metadata = config.privacyMode === 'metadata'
+  if (metadata) privacyConfirming = false
+  const status = el('p', { class: 'node-caption', role: 'status' })
+  const cancel = button('取消', () => {
+    privacyConfirming = false; cancel.hidden = true; tighten.textContent = '收紧为仅元数据'; tighten.focus()
+  }, { hidden: !privacyConfirming })
+  const tighten = button(privacyConfirming ? '再次点按确认收紧' : '收紧为仅元数据', () => {
+    if (!privacyConfirming) {
+      privacyConfirming = true; cancel.hidden = false; tighten.textContent = '再次点按确认收紧'
+      return
+    }
+    tighten.disabled = true; cancel.disabled = true
+    void writeNodePreference({ tightenPrivacy: true }).then(saved => {
+      privacyConfirming = false
+      if (!state.config) return
+      state.config = { ...state.config, privacyMode: saved.privacyMode }
+      clearConfigReadError()
+      memoryEntries = memoryEntries.map(maskMemoryNode)
+      if (state.view === 'home' || showingMemory()) render()
+    }).catch(error => {
+      reportConfigReadError(error)
+      tighten.disabled = false; cancel.disabled = false
+      status.textContent = '未能保存隐私偏好，请重试。'
+    })
+  })
+  const capNode = renderSummaryCap(summaryCap, config.dailySummaryCapK, value => { sliderDragging = false; void saveSummaryCap(value) })
+  const slider = capNode.querySelector<HTMLInputElement>('#summary-cap')
+  if (slider) {
+    slider.addEventListener('pointerdown', () => { sliderDragging = true })
+    slider.addEventListener('touchstart', () => { sliderDragging = true }, { passive: true })
+    const finishDrag = () => { sliderDragging = false }
+    slider.addEventListener('pointerup', finishDrag)
+    slider.addEventListener('pointercancel', finishDrag)
+    slider.addEventListener('touchend', finishDrag)
+    slider.addEventListener('blur', finishDrag)
+  }
+  return el('section', { class: 'card' }, el('h2', { text: '安全与隐私边界' }), appLockRow(config),
+    el('div', { class: 'node-preference' },
+      el('strong', { text: metadata ? '本机记忆显示：仅元数据' : '本机记忆显示：正文（如已授权）' }),
+      el('p', { class: 'node-caption', text: '手机上只能单向收紧，收紧后不显示记忆标题和正文。真实内容授权以电脑端为准，此处不会修改 Hub 权限。' }),
+      metadata ? null : el('div', { class: 'node-pref-actions' }, tighten, cancel)),
+    capNode, status)
+}
+
+const summaryCap = createSummaryCapDraft()
+
+async function saveSummaryCap(value: number): Promise<void> {
+  let saved: MarshalConfig | undefined
+  const latest = await summaryCap.save(value, async cap => {
+    saved = await writeNodePreference({ dailySummaryCapK: cap })
+  }, rememberConfigReadError)
+  if (!latest || !state.config) return
+  if (saved) {
+    state.config = { ...state.config, dailySummaryCapK: saved.dailySummaryCapK,
+      privacyMode: saved.privacyMode === 'metadata' ? 'metadata' : state.config.privacyMode }
+    if (state.config.privacyMode === 'metadata') memoryEntries = memoryEntries.map(maskMemoryNode)
+  }
+  if (state.view === 'home' || configReadError || (showingMemory() && saved?.privacyMode === 'metadata')) render()
+}
+
+let configReadError = ''
+function clearConfigReadError(): void {
+  configReadError = ''
+  const banner = rootNode().querySelector<HTMLElement>('#config-read-error')
+  if (banner) banner.hidden = true
+}
+
+function rememberConfigReadError(error: unknown): boolean {
+  if (!(error instanceof ConfigReadError)) return false
+  configReadError = error.message
+  memoryEntries = memoryEntries.map(maskMemoryNode)
+  return true
+}
+
+function reportConfigReadError(error: unknown): void {
+  if (!rememberConfigReadError(error)) return
+  if (showingMemory()) render()
+  else {
+    const banner = rootNode().querySelector<HTMLElement>('#config-read-error')
+    if (banner) { banner.textContent = configReadError; banner.hidden = false }
+  }
+}
+
+async function saveConfigPatch(patch: Partial<MarshalConfig>, initialize?: MarshalConfig): Promise<MarshalConfig> {
+  try {
+    return await updateConfig(current => {
+      const base = current ?? initialize
+      if (!base) throw new Error('未找到本机配置')
+      return { ...base, ...patch, updatedAt: Date.now() }
+    })
+  } catch (error) {
+    reportConfigReadError(error)
+    throw error
+  }
+}
+
+function adoptConfig(next: MarshalConfig): void {
+  clearConfigReadError()
+  state.config = { ...next,
+    privacyMode: state.config?.privacyMode === 'metadata' ? 'metadata' : next.privacyMode }
+  if (state.config.privacyMode === 'metadata') {
+    memoryEntries = memoryEntries.map(maskMemoryNode)
+    if (showingMemory()) render()
+  }
+}
+
+function hostStatusLabel(hubReachable: boolean, device: DeviceRow): string {
+  if (!hubReachable) return '状态未确认'
+  if (device.syncing) return '同步中'
+  return device.stale ? '同步滞后' : '在线'
+}
+
+function nodeTopologyCard(config: MarshalConfig): HTMLElement {
+  const hubReachable = state.online && connectivity.snapshot(Date.now()).hub
+  const syncingCount = state.devices.filter((device) => device.syncing).length
+  const hostSummary = !hubReachable
+    ? '状态未确认'
+    : `${state.devices.length} 台已连${syncingCount > 0 ? `（${syncingCount} 同步中）` : ''}`
+  const rows = state.devices.map((device) => el('button', {
+    type: 'button', class: 'device-head card-tap',
+    'aria-current': device.id === state.deviceId ? 'true' : undefined,
+    onClick: () => { vibrate(); void openDevice(device) },
+  },
+  el('span', { class: 'dot' + (hubReachable && !device.stale ? ' online' : '') }),
+  el('span', { class: 'name' }, device.name, el('small', { text: hostStatusLabel(hubReachable, device) })),
+  el('span', { class: 'chip', text: device.agents.map(agentLabel).join(' / ') || '无 agent' }),
+  el('span', { class: 'chevron', 'aria-hidden': 'true' }),
+  ))
+  return el('section', { id: 'node-topology-card', class: 'card' },
+    el('h2', { text: '纯出站安全拓扑' }),
+    el('ol', { class: 'node-topology' },
+      topologyNode('手机 Node', config.token.startsWith('mph1.') ? 'mph1.*' : '未使用 mph1.*', state.online ? '网络可用' : '网络离线'),
+      topologyNode('marshal-hub', config.hubUrl.startsWith('https:') ? 'TLS + SSE' : '本地 HTTP + SSE',
+        hubReachable ? 'Hub 可达' : '状态未确认'),
+      topologyNode('边缘主机', 'WSS · mnd1.*', hostSummary),
+    ),
+    el('p', { class: 'node-caption', text: '手机与边缘主机均主动连接 Hub，手机不监听入站端口。' }),
+    el('h3', { class: 'node-subtitle', text: '边缘主机' }),
+    ...(rows.length ? rows : [el('p', { class: 'empty', text: '暂无可显示的边缘主机。' })]),
+  )
+}
+
 function homeView(): Child[] {
   const config = state.config
   if (!config) { state.view = 'setup'; return setupView() }
-  const header = topbar('节点', '手机端 node · ' + hubLabel(config.hubUrl), [
-    button('扫码', scanPairing, { class: 'icon-button' }),
+  const header = topbar('节点与空间', hubLabel(config.hubUrl), [
+    button('扫码连接', scanPairing, { class: 'icon-button' }),
     button('设置', () => { state.view = 'settings'; render() }, { class: 'icon-button' }),
   ])
+  header.classList.add('node-header')
+  header.prepend(logoMark())
   const banners: Child[] = []
   if (!state.online) banners.push(el('div', { class: 'banner warn', text: '设备离线：网络恢复后会自动刷新。' }))
   if (state.statusText) banners.push(el('div', { class: 'banner', text: state.statusText }))
 
-  const rows = state.devices.map((device) => el('button', {
-    class: 'device-head card-tap',
-    onClick: () => { vibrate(); void openDevice(device) },
-  },
-  el('span', { class: 'dot' + (device.stale ? '' : ' online') }),
-  el('span', { class: 'name', text: device.name }),
-  el('span', { class: 'chip', text: device.agents.map(agentLabel).join(' / ') || '无 agent' }),
-  el('span', { class: 'chevron', 'aria-hidden': 'true' }),
-  ))
-
   return [
     header,
     ...banners,
+    nodeTopologyCard(config),
+    themeCard(),
+    nodeSecurityCard(config),
     state.config?.lanBridge
       ? el('div', { class: 'card' },
         el('h2', { text: '局域网工作台' }),
@@ -1377,10 +1675,6 @@ function homeView(): Child[] {
         button('进入局域网工作台', openDshWorkbench, { class: 'block' }),
       )
       : null,
-    el('div', { class: 'card' },
-      el('h2', { text: '设备' }),
-      ...(rows.length > 0 ? rows : [el('p', { class: 'empty', text: '暂无设备在线。' })]),
-    ),
     el('div', { class: 'card' },
       el('h2', { text: '协作' }),
       el('div', { class: 'row-between' },
@@ -1392,13 +1686,24 @@ function homeView(): Child[] {
         button('打开', () => { memoryEntries = []; state.view = 'memory'; render(); void loadMemory() }, { class: 'icon-button' }),
       ),
     ),
-    themeCard(),
     el('div', { class: 'foot', text: 'v' + APP_VERSION + ' · 手机端 node · 出站直连，不承载 hub' }),
   ]
 }
 
 function showingMemory(): boolean {
   return state.view === 'memory' || (state.view === 'agents' && agentsSegment === 'memory')
+}
+
+function memberConnectivity(member: RosterEntry): string {
+  const device = state.devices.find(entry => entry.id === member.deviceId)
+  if (!state.online || !connectivity.snapshot(Date.now()).roster || !device) return '状态未确认'
+  if (!roster.some(entry => entry.id === member.id && entry.deviceId === member.deviceId)) return '状态未确认'
+  if (device.syncing) return '同步中'
+  return device.stale ? '同步滞后' : '在线'
+}
+
+function memberHostText(member: RosterEntry): string {
+  return `运行主机：${deviceName(member.deviceId)} · ${memberConnectivity(member)}`
 }
 
 function agentsView(): Child[] {
@@ -1413,16 +1718,16 @@ function agentsView(): Child[] {
       agentsSegment = id
       render()
       if (id === 'memory') void loadMemory()
+      else void refreshDevices()
     }, { type: 'button', 'aria-pressed': String(agentsSegment === id) })),
   )
-  if (showingMemory()) return [header, picker,
-    // Reserved mount for the future MemoryGalaxy renderer.
-    el('div', { id: 'memory-galaxy' }), ...memoryContent(),
-  ]
+  if (showingMemory()) return [header, picker, ...memoryContent()]
   const members = roster.map((item) => {
     const device = state.devices.find(entry => entry.id === item.deviceId)
-    const online = !!(device && !device.stale)
-    return el('div', { class: 'row-between' },
+    const status = memberConnectivity(item)
+    const online = status === '在线'
+    return el('button', { type: 'button', class: 'row-between roster-member', 'aria-haspopup': 'dialog',
+      onClick: event => openMemberSheet(item, event.currentTarget as HTMLElement) },
       el('div', { class: 'roster-main' },
         el('span', { class: 'dot' + (online ? ' online' : '') }),
         el('div', { class: 'label' },
@@ -1430,13 +1735,50 @@ function agentsView(): Child[] {
           el('span', { text: device?.name ?? item.deviceId }),
         ),
       ),
-      el('span', { class: 'chip' + (online ? ' on' : ''), text: online ? '在线' : '离线' }),
+      el('span', { class: 'chip' + (online ? ' on' : ''), text: status }),
     )
   })
   return [header, picker, el('section', { class: 'card' },
     el('h2', { text: '智能体花名册' }),
     ...(members.length > 0 ? members : [el('p', { class: 'empty', text: '等待电脑上报智能体花名册。' })]),
   )]
+}
+
+let activeMemberStatus: { node: HTMLElement; member: RosterEntry } | undefined
+function openMemberSheet(member: RosterEntry, opener: HTMLElement): void {
+  if (chatSheet) return
+  const dialog = el('dialog', { class: 'ticket-sheet', 'aria-labelledby': 'member-sheet-title' })
+  const dismiss = () => {
+    activeMemberStatus = undefined
+    chatSheet = null
+    dialog.close()
+    dialog.remove()
+    opener.focus()
+  }
+  chatSheet = { view: state.view, dismiss, close: dismiss }
+  dialog.addEventListener('cancel', event => { event.preventDefault(); dismiss() })
+  dialog.addEventListener('click', event => { if (event.target === dialog) dismiss() })
+  const hostStatus = el('p', { text: memberHostText(member) })
+  activeMemberStatus = { node: hostStatus, member }
+  dialog.append(
+    el('header', { class: 'ticket-sheet-header' }, el('div', { class: 'row-between' },
+      el('h2', { id: 'member-sheet-title', text: member.name }), button('关闭', dismiss))),
+    el('div', { class: 'ticket-sheet-body' },
+      hostStatus,
+      el('p', { text: `智能体：${member.id}` }),
+      button('查看该成员的记忆星系', () => {
+        dismiss()
+        memoryMember = member
+        memoryLayer = 'all'
+        memoryMode = 'galaxy'
+        agentsSegment = 'memory'
+        render()
+        rootNode().querySelector<HTMLElement>('.segments [aria-pressed="true"]')?.focus({ preventScroll: true })
+        void loadMemory()
+      }, { class: 'primary block' })),
+  )
+  document.body.append(dialog)
+  dialog.showModal()
 }
 
 let agentsSegment: 'members' | 'memory' = 'members'
@@ -1451,7 +1793,13 @@ let boardPoll: ReturnType<typeof setTimeout> | undefined
 let boardLoad = 0
 let memoryPoll: ReturnType<typeof setTimeout> | undefined
 let memoryLoad = 0
-let memoryEntries: Array<{ id: string; deviceId: string; layer: string; agent: string; text: string }> = []
+let memoryEntries: GalaxyNode[] = []
+let memoryMember: RosterEntry | null = null
+let memoryLayer: 'all' | GalaxyNode['layer'] = 'all'
+let memoryMode: 'galaxy' | 'list' = 'galaxy'
+let selectedMemory = ''
+const galaxyCamera = initialGalaxyCamera()
+let disposeGalaxy: (() => void) | undefined
 let groupKey = ''
 let groupsParent: 'home' | 'sessions' = 'home'
 
@@ -2182,14 +2530,12 @@ async function handleDeepLink(raw: string): Promise<void> {
   }
   const hub = decision.action === 'same' ? state.config?.hubUrl : decision.hubUrl
   if (!hub) return
-  const next = state.config ?? makeConfig({ hubUrl: hub })
-  const hubChanged = next.hubUrl !== hub
-  next.hubUrl = hub
-  if (hubChanged || !state.config) next.token = ''
-  if (hubChanged) next.account = null
-  next.updatedAt = Date.now()
-  try { await writeConfig(next) } catch { toast('配对信息保存失败', 'error'); return }
-  state.config = next
+  const hubChanged = !!state.config && state.config.hubUrl !== hub
+  let next: MarshalConfig
+  try {
+    next = await saveConfigPatch({ hubUrl: hub, ...(hubChanged ? { token: '', account: null } : {}) }, makeConfig({ hubUrl: hub }))
+  } catch { toast('配对信息保存失败', 'error'); return }
+  adoptConfig(next)
   state.account = next.account ?? null
   state.view = next.token ? state.view : 'setup'
   render()
@@ -2216,15 +2562,14 @@ async function redeemPairingCode(hubUrl: string, code: string): Promise<void> {
     return
   }
   const previous = state.config
-  const next: MarshalConfig = {
-    ...(previous ?? makeConfig({ hubUrl })),
+  const patch = {
     hubUrl,
     token: body.credential,
     ...(previous && previous.hubUrl !== hubUrl ? { account: null } : {}),
-    updatedAt: Date.now(),
   }
-  try { await writeConfig(next) } catch { toast('凭证保存失败', 'error'); return }
-  state.config = next
+  let next: MarshalConfig
+  try { next = await saveConfigPatch(patch, makeConfig({ hubUrl })) } catch { toast('凭证保存失败', 'error'); return }
+  adoptConfig(next)
   toast('配对完成')
   if (!appLocked()) await enterApp()
 }
@@ -2242,13 +2587,11 @@ async function loginTicket(ticket: string): Promise<boolean> {
     if (state.view === 'settings') render()
     return false
   }
-  const next: MarshalConfig = { ...config, account: result.data, updatedAt: Date.now() }
   try {
-    await writeConfig(next)
+    adoptConfig(await saveConfigPatch({ account: result.data }))
   } catch {
     toast('登录成功，但本机保存失败', 'error')
   }
-  state.config = next
   state.account = result.data
   toast('群聊账号已登录')
   openGroups('home')
@@ -2263,9 +2606,9 @@ async function clearAccount(message?: string): Promise<void> {
   state.catalog = []
   stopGroupPoll()
   if (config?.account) {
-    const next: MarshalConfig = { ...config, account: null, updatedAt: Date.now() }
-    try { await writeConfig(next) } catch { /* 清除本地为准 */ }
-    state.config = next
+    try { adoptConfig(await saveConfigPatch({ account: null })) } catch {
+      if (state.config) state.config = { ...state.config, account: null }
+    }
   }
   if (message) toast(message, 'error')
   if (state.view === 'groups' || state.view === 'groupRoom' || state.view === 'settings') render()
@@ -2701,27 +3044,112 @@ async function loadMemory(): Promise<void> {
   const load = ++memoryLoad
   const result = await api.memory()
   if (load !== memoryLoad || state.api !== api || !showingMemory()) return
-  memoryEntries = result.ok ? result.data : []
+  const nodes = result.ok ? toGalaxyNodes(result.data) : []
+  const entries = configReadError || state.config?.privacyMode === 'metadata' ? nodes.map(maskMemoryNode) : nodes
+  const changed = JSON.stringify(entries) !== JSON.stringify(memoryEntries)
+  memoryEntries = entries
   if (!result.ok) toast(result.message, 'error')
   else memoryPoll = setTimeout(() => { if (showingMemory()) void loadMemory() }, 15_000)
-  render()
+  if (changed) render()
+}
+
+function maskMemoryNode(node: GalaxyNode): GalaxyNode {
+  return { ...node, title: '记忆条目', text: '', cue: '', tags: [] }
 }
 
 function memoryView(): Child[] {
   return [
     topbar('记忆', '只读', [button('刷新', () => { void loadMemory() }, { class: 'icon-button' })], backButton('home')),
+    button('前往智能体的记忆星系', () => {
+      agentsSegment = 'memory'; memoryMember = null; memoryLayer = 'all'; memoryMode = 'galaxy'
+      state.view = 'agents'; render(); void loadMemory()
+    }),
     ...memoryContent(),
   ]
 }
 
 function memoryContent(): Child[] {
+  const inAgents = state.view === 'agents'
+  const member = inAgents ? memoryMember : null
+  const nodes = memoryEntries.filter(node =>
+    (!inAgents || memoryLayer === 'all' || memoryLayer === node.layer)
+    && (!member || (member.deviceId === node.deviceId && member.id === node.agent)))
+  const galaxy = inAgents && memoryMode === 'galaxy'
+  const visible = galaxy ? nodes.slice(0, GALAXY_NODE_LIMIT) : nodes
+  if (!visible.some(n => n.id === selectedMemory)) selectedMemory = visible[0]?.id ?? ''
+  const inspector = el('section', { class: 'card memory-inspector', 'aria-label': '记忆详情', 'aria-live': 'polite' })
+  const list = el('div', { class: 'card memory-list', role: 'group', 'aria-label': '记忆列表' })
+  const inspect = (id: string) => {
+    selectedMemory = id
+    clear(inspector)
+    const node = visible.find(n => n.id === id)
+    if (!node) {
+      inspector.append(el('p', { class: 'empty', text: member
+        ? memoryEntries.length && memoryEntries.every(entry => !entry.agent)
+          ? '当前只读快照未标注智能体。清除筛选可查看全部条目，包括未标注条目。'
+          : '当前只读快照在此范围没有明确归属于该成员的条目。清除筛选可查看全部条目，包括未标注条目。'
+        : '此范围暂无可读记忆。正文共享由电脑端授权。' }))
+      return
+    }
+    const meta = MEMORY_KIND_META[node.kind]
+    inspector.append(
+      el('div', { class: 'memory-meta' }, memoryTypeDot(node), `${meta.label} · ${CLARITY_LABELS[node.clarity]}`
+        + (node.pinned ? ' · 已固定' : '') + (node.pending ? ' · 待审批' : '')),
+      el('h2', { text: node.title }),
+      el('p', { class: 'memory-meta', text: [MEMORY_LAYERS[node.layer], node.deviceId ? deviceName(node.deviceId) : '未标注设备',
+        (roster.find(item => item.id === node.agent && item.deviceId === node.deviceId)?.name ?? node.agent) || '未标注智能体'].join(' · ') }),
+      ...(node.cue ? [el('p', { text: '触发场景：' + node.cue })] : []),
+      ...(node.tags.length ? [el('p', { class: 'memory-meta', text: node.tags.map(tag => '#' + tag).join(' · ') })] : []),
+      el('p', { class: 'memory-body', text: node.text || (configReadError ? '无法确认本机隐私设置，已隐藏正文。' : state.config?.privacyMode === 'metadata' ? '根据本机隐私设置隐藏正文。' : '快照未提供正文。') }),
+    )
+  }
+  const select = (id: string) => {
+    if (id === selectedMemory) return
+    inspect(id)
+    for (const b of list.querySelectorAll('button')) b.setAttribute('aria-pressed', String(b.dataset.memoryId === id))
+  }
+  inspect(selectedMemory)
+  let content: HTMLElement | null = null
+  if (galaxy) {
+    const canvas = el('canvas', { 'aria-label': '记忆星系。可切换列表，用键盘选择记忆。', role: 'img' }, '浏览器不支持 Canvas，请切换列表。')
+    const plus = el('button', { type: 'button', text: '+', 'aria-label': '放大' })
+    const minus = el('button', { type: 'button', text: '−', 'aria-label': '缩小' })
+    const reset = el('button', { type: 'button', text: '重置', 'aria-label': '重置星系视角' })
+    content = el('section', { id: 'memory-galaxy', 'aria-label': '3D 记忆星系' }, canvas,
+      el('div', { class: 'galaxy-controls' }, plus, minus, reset))
+    disposeGalaxy = mountGalaxyCanvas(canvas, layoutMemoryGalaxy(buildMemoryGraph(visible)), galaxyCamera,
+      () => selectedMemory, select, { plus, minus, reset })
+  } else if (visible.length) {
+    content = list
+    for (const node of visible) list.append(el('button', {
+      type: 'button', class: 'memory-row', 'data-memory-id': node.id,
+      'aria-pressed': String(node.id === selectedMemory), onClick: () => select(node.id),
+    }, memoryTypeDot(node), el('span', { text: node.title }),
+    el('small', { text: `${MEMORY_LAYERS[node.layer]} · ${MEMORY_KIND_META[node.kind].label}` })))
+  }
   return [
-    ...memoryEntries.map((entry) => el('div', { class: 'card' },
-      el('h2', { text: entry.layer === 'global' ? '全局 · 可共享' : (entry.agent || entry.deviceId) + ' · ' + entry.layer }),
-      el('p', { text: entry.text }),
-    )),
-    memoryEntries.length === 0 ? el('p', { class: 'empty', text: '还没有可读的记忆。内容共享关闭时电脑不会外发正文。' }) : null,
+    inAgents ? el('div', { class: 'memory-filters' },
+      chatSegments('记忆视图', [['galaxy', '3D 星系'], ['list', '列表']], memoryMode, mode => {
+        if (mode !== memoryMode) { memoryMode = mode; render() }
+      }),
+      chatSegments('记忆层级', [['all', '全部'], ['global', '全局'], ['workspace', '工作区'], ['private', '私有']], memoryLayer, layer => {
+        if (layer !== memoryLayer) { memoryLayer = layer; render() }
+      }),
+      member ? el('div', { class: 'row-between memory-member-filter' },
+        el('span', { text: `成员：${member.name}` }),
+        button('清除筛选', () => { memoryMember = null; memoryLayer = 'all'; render(); rootNode().querySelector<HTMLElement>('.memory-filters button')?.focus() })) : null,
+    ) : null,
+    el('p', { class: 'memory-meta', text: 'Hub 只读快照 · 手机端无法批准、编辑或删除记忆' }),
+    content,
+    galaxy && nodes.length > visible.length ? el('p', { class: 'memory-meta', text: `星系显示 ${visible.length} / ${nodes.length} 条 · 切换列表查看全部` }) : null,
+    inspector,
   ]
+}
+
+function memoryTypeDot(node: GalaxyNode): HTMLElement {
+  const dot = el('span', { class: 'memory-kind-dot', 'aria-hidden': 'true' })
+  dot.style.setProperty('--memory-kind', MEMORY_KIND_META[node.kind].color)
+  return dot
 }
 
 async function loadRooms(notify = false): Promise<void> {
@@ -3236,13 +3664,7 @@ function settingsView(): Child[] {
       ),
     )
 
-  const lockRow = config.lock
-    ? el('div', { class: 'row-between' },
-      el('div', { class: 'label' }, el('strong', { text: '应用锁' }), el('span', { text: '已开启，启动需 6 位 PIN' })),
-      button('关闭', () => { disableLock() }, { class: 'icon-button danger' }))
-    : el('div', { class: 'row-between' },
-      el('div', { class: 'label' }, el('strong', { text: '应用锁' }), el('span', { text: '开启后每次启动要输 6 位 PIN' })),
-      button('开启', () => { openLockSetup() }, { class: 'icon-button' }))
+
 
   return [
     topbar('设置', hubLabel(config.hubUrl), [], backButton('home')),
@@ -3262,14 +3684,14 @@ function settingsView(): Child[] {
       ),
     ),
     accountCard,
-    el('div', { class: 'card' }, el('h2', { text: '安全' }), lockRow,
+    el('div', { class: 'card' }, el('h2', { text: '安全' }), appLockRow(config),
       el('div', { class: 'row-between' },
         el('div', { class: 'label' }, el('strong', { text: '局域网工作台' }), el('span', { text: config.lanBridge ? '已打开，可连接同一网络的电脑' : '默认关闭' })),
         button(config.lanBridge ? '关闭' : '打开', () => {
-          void writeConfig({ ...config, lanBridge: !config.lanBridge, updatedAt: Date.now() }).then(( ) => {
-            state.config = { ...config, lanBridge: !config.lanBridge }
+          void saveConfigPatch({ lanBridge: !config.lanBridge }).then(saved => {
+            adoptConfig(saved)
             render()
-          })
+          }).catch(() => toast('局域网工作台偏好未能保存', 'error'))
         }, { class: 'icon-button' }),
       ),
     ),
@@ -3313,20 +3735,19 @@ async function saveSettings(hubInput: HTMLInputElement, tokenInput: HTMLInputEle
   const token = resolveSettingsToken({ typed: tokenInput.value, saved: config.token, previousHub: config.hubUrl, nextHub: hub.value })
   if (!token.ok) { result.textContent = token.error; return }
   const hubChanged = hub.value !== config.hubUrl
-  const next: MarshalConfig = {
-    ...config,
+  const patch = {
     hubUrl: hub.value,
     token: token.token,
     ...(hubChanged ? { account: null } : {}),
-    updatedAt: Date.now(),
   }
+  let next: MarshalConfig
   try {
-    await writeConfig(next)
+    next = await saveConfigPatch(patch)
   } catch (error) {
     result.textContent = '保存失败：' + (error instanceof Error ? error.message : '未知错误')
     return
   }
-  state.config = next
+  adoptConfig(next)
   if (hubChanged) state.account = null
   toast('已保存')
   await enterApp()
@@ -3334,8 +3755,9 @@ async function saveSettings(hubInput: HTMLInputElement, tokenInput: HTMLInputEle
 
 async function wipeData(): Promise<void> {
   await removeConfig()
-  stream?.close()
-  stream = null
+  summaryCap.reset()
+  clearConfigReadError()
+  closeMainStream()
   stopGroupPoll()
   clearTimeout(boardPoll)
   state.config = null
@@ -3376,11 +3798,7 @@ function disableLock(): void {
 }
 
 async function persistLock(lock: LockRecord | null): Promise<void> {
-  const config = state.config
-  if (!config) return
-  const next: MarshalConfig = { ...config, lock, updatedAt: Date.now() }
-  await writeConfig(next)
-  state.config = next
+  adoptConfig(await saveConfigPatch({ lock }))
 }
 
 let pinBuffer = ''
@@ -3463,7 +3881,11 @@ function lockView(): Child[] {
     if (pinBuffer.length >= 6) return
     pinBuffer += digit
     refreshDots()
-    if (pinBuffer.length === 6) void finish()
+    if (pinBuffer.length === 6) void finish().catch(() => {
+      pinBuffer = ''
+      state.pinError = '未能保存本机应用锁，请重试。'
+      render()
+    })
   }
 
   const keys = ['1', '2', '3', '4', '5', '6', '7', '8', '9']

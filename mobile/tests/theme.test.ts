@@ -1,9 +1,13 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { makeConfig, MOBILE_THEMES, normalizeTheme, parseConfig } from '../src/lib/config.ts'
-import { readConfig, readTheme, writeConfig, writeTheme } from '../src/lib/storage.ts'
+import { readConfig, readTheme, updateConfig, writeTheme, type ConfigReadResult } from '../src/lib/storage.ts'
 
 const legacy = makeConfig({ hubUrl: 'https://hub.example.test' })
+const configOf = (result: ConfigReadResult) => {
+  assert.equal(result.status, 'ok')
+  return result.config
+}
 
 test('theme normalization preserves official values and defaults invalid/legacy values to system', () => {
   assert.deepEqual(MOBILE_THEMES, ['system', 'deepseek', 'white', 'dark', 'codex'])
@@ -35,15 +39,15 @@ test('theme persists before pairing, is adopted by the first config, and survive
   await writeTheme('deepseek')
   assert.equal(items.get('dsh-marshal-mobile.theme'), 'deepseek')
   assert.equal(readTheme(), 'deepseek')
-  assert.equal(await readConfig(), null)
-  await writeConfig(legacy)
-  assert.equal((await readConfig())?.theme, 'deepseek')
-  await Promise.all([writeTheme('dark'), writeTheme('codex'), writeConfig({ ...legacy, label: 'test' })])
+  assert.deepEqual(await readConfig(), { status: 'missing' })
+  await updateConfig(() => legacy)
+  assert.equal(configOf(await readConfig()).theme, 'deepseek')
+  await Promise.all([writeTheme('dark'), writeTheme('codex'), updateConfig(current => ({ ...(current ?? legacy), label: 'test' }))])
   assert.equal(readTheme(), 'codex')
-  assert.equal((await readConfig())?.theme, 'codex')
-  assert.equal((await readConfig())?.label, 'test')
+  assert.equal(configOf(await readConfig()).theme, 'codex')
+  assert.equal(configOf(await readConfig()).label, 'test')
   await writeTheme('system')
-  assert.equal((await readConfig())?.theme, 'system')
+  assert.equal(configOf(await readConfig()).theme, 'system')
 })
 
 test('paired native theme survives a stale cache after a failed cache write and restart', async (t) => {
@@ -64,7 +68,7 @@ test('paired native theme survives a stale cache after a failed cache write and 
   await writeTheme('codex')
   const restarted = await import('../src/lib/storage.ts?restart')
   assert.equal(restarted.readTheme(), 'dark')
-  assert.equal(restarted.readTheme(await restarted.readConfig()), 'codex')
-  await restarted.writeConfig({ ...legacy, theme: 'dark', label: 'updated' })
-  assert.equal((await restarted.readConfig())?.theme, 'codex')
+  assert.equal(restarted.readTheme(configOf(await restarted.readConfig())), 'codex')
+  await restarted.updateConfig(current => ({ ...(current ?? legacy), label: 'updated' }))
+  assert.equal(configOf(await restarted.readConfig()).theme, 'codex')
 })

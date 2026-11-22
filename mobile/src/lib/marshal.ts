@@ -483,20 +483,13 @@ export class MarshalApi {
     return { ok: true, data: typeof payload.commandId === 'string' ? { commandId: payload.commandId } : {} }
   }
 
-  async memory(): Promise<ApiResult<Array<{ id: string; deviceId: string; layer: string; agent: string; text: string }>>> {
+  async memory(): Promise<ApiResult<Record<string, unknown>[]>> {
     const result = await this.request<{ entries?: unknown }>('/marshal/api/memory')
     if (!result.ok) return result
     const entries = Array.isArray(result.data?.entries) ? result.data.entries.flatMap((row) => {
       if (typeof row !== 'object' || row === null) return []
-      const item = row as Record<string, unknown>
-      if (typeof item.text !== 'string') return []
-      return [{
-        id: typeof item.id === 'string' ? item.id : '',
-        deviceId: typeof item.deviceId === 'string' ? item.deviceId : '',
-        layer: item.layer === 'workspace' || item.layer === 'global' ? item.layer : 'private',
-        agent: typeof item.agent === 'string' ? item.agent : '',
-        text: item.text,
-      }]
+      // Preserve optional snapshot metadata for the mobile galaxy normalizer.
+      return [row as Record<string, unknown>]
     }) : []
     return { ok: true, data: entries }
   }
