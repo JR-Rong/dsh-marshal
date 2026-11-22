@@ -136,3 +136,28 @@ test('手机仅把明确入队的结果视为已接收，展示 Hub 返回的版
   }
   assert.deepEqual(await api.board(), { ok: true, data: response })
 })
+
+test('工单解析保留待确认和进行中状态以计算角标', async (t) => {
+  const api = new MarshalApi({ hubUrl: 'https://hub.example', token: 'mph1.fixture' })
+  t.mock.method(api, 'request', async () => ({
+    ok: true, data: {
+      tasks: ['attention', 'pending-confirmation', 'doing', 'done', 'unknown'].map((status, id) => ({
+        id: String(id), title: '测试工单', status,
+      })),
+    },
+  }))
+  const result = await api.board()
+  assert.ok(result.ok)
+  assert.deepEqual(result.data.tasks.map((task) => task.status), ['attention', 'pending-confirmation', 'doing', 'done', 'todo'])
+})
+
+test('待答快照区分无卡片、结果未知和凭证不受支持', async (t) => {
+  const api = new MarshalApi({ hubUrl: 'https://hub.example', token: 'mph1.fixture' })
+  const target = { deviceId: 'a', agent: 'codex', sessionId: 'b' }
+  const request = t.mock.method(api, 'request', async () => ({ ok: true, data: { code: 'outcome-unknown' } }))
+  assert.equal((await api.inputs(target)).ok, false)
+  request.mock.mockImplementation(async () => ({ ok: false, error: 'unauthorized', status: 401, message: 'unauthorized' }))
+  assert.equal((await api.inputs(target)).ok, false)
+  request.mock.mockImplementation(async () => ({ ok: true, data: { cards: [] } }))
+  assert.deepEqual(await api.inputs(target), { ok: true, data: [] })
+})

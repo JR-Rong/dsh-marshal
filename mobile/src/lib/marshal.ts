@@ -7,6 +7,7 @@
  */
 import { Capacitor, CapacitorHttp } from '@capacitor/core'
 import type { MarshalConfig } from './config.ts'
+import { isActiveBoardStatus } from './tab-badges.ts'
 
 export const TOKEN_HEADER = 'x-marshal-token'
 
@@ -322,7 +323,7 @@ export class MarshalApi {
     return { ok: true, data: parseDevices(result.data) }
   }
 
-  async sessions(deviceId: string): Promise<ApiResult<SessionRow[]>> {
+  async sessions(deviceId = ''): Promise<ApiResult<SessionRow[]>> {
     const result = await this.request<{ sessions?: unknown }>(
       '/marshal/api/sessions?device=' + encodeURIComponent(deviceId),
     )
@@ -444,7 +445,7 @@ export class MarshalApi {
         deviceId: typeof item.deviceId === 'string' ? item.deviceId : '',
         title: item.title,
         detail: typeof item.detail === 'string' ? item.detail : '',
-        status: item.status === 'doing' || item.status === 'done' ? item.status : 'todo',
+        status: typeof item.status === 'string' && (isActiveBoardStatus(item.status) || item.status === 'done') ? item.status : 'todo',
         revision: typeof item.revision === 'number' ? item.revision : 0,
       }]
     }) : []
@@ -516,9 +517,12 @@ export class MarshalApi {
   }
 
   async inputs(target: Target): Promise<ApiResult<InputCard[]>> {
-    const result = await this.request<{ cards?: unknown }>('/marshal/api/inputs', { body: { target } })
+    const result = await this.request<{ cards?: unknown; code?: string }>('/marshal/api/inputs', { body: { target } })
     if (!result.ok) return result
-    return { ok: true, data: parseCards((result.data as { cards?: unknown })?.cards) }
+    if (!Array.isArray(result.data?.cards)) {
+      return { ok: false, error: 'server', message: '待答快照暂不可用', code: result.data?.code }
+    }
+    return { ok: true, data: parseCards(result.data.cards) }
   }
 
   async history(target: Target, limit = 40, cursor?: string): Promise<ApiResult<{ items: HistoryItem[]; completeness: string; nextCursor?: string }>> {

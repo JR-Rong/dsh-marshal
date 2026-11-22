@@ -6,9 +6,10 @@
  */
 import { SecureStorage } from '@aparajita/capacitor-secure-storage'
 import { Capacitor } from '@capacitor/core'
-import { parseConfig, type MarshalConfig } from './config.ts'
+import { MOBILE_THEMES, normalizeTheme, parseConfig, type MarshalConfig, type MobileTheme } from './config.ts'
 
 const STORE_KEY = 'dsh-marshal-mobile.config'
+const THEME_KEY = 'dsh-marshal-mobile.theme'
 const BRIDGE_KEY = 'dsh-marshal-mobile.bridge'
 const PIN_KEY = 'dsh-marshal-mobile.pin-guard'
 
@@ -40,8 +41,7 @@ export async function readConfig(): Promise<MarshalConfig | null> {
     }
   }
   if (raw === null) {
-    const fallback = webStorage()
-    raw = fallback ? fallback.getItem(STORE_KEY) : null
+    try { raw = webStorage()?.getItem(STORE_KEY) ?? null } catch { return null }
   }
   if (!raw) return null
   let parsed: unknown
@@ -53,7 +53,44 @@ export async function readConfig(): Promise<MarshalConfig | null> {
   return parseConfig(parsed)
 }
 
-export async function writeConfig(config: MarshalConfig): Promise<void> {
+let configWrites = Promise.resolve()
+
+function queueConfigWrite(action: () => Promise<void>): Promise<void> {
+  const next = configWrites.then(action)
+  configWrites = next.catch(() => {})
+  return next
+}
+
+export function readTheme(config?: MarshalConfig | null): MobileTheme {
+  if (config?.theme !== undefined) return normalizeTheme(config.theme)
+  let saved: string | null | undefined
+  try { saved = webStorage()?.getItem(THEME_KEY) } catch { /* use config */ }
+  return MOBILE_THEMES.find((theme) => theme === saved) ?? normalizeTheme(undefined)
+}
+
+export function writeTheme(theme: MobileTheme): Promise<void> {
+  return queueConfigWrite(async () => {
+    // Paired config is authoritative; the non-secret cache is only for early/unpaired preview.
+    const config = await readConfig()
+    if (config) await storeConfig({ ...config, theme, updatedAt: Date.now() })
+    try {
+      const storage = webStorage()
+      if (!storage) throw new Error('本机存储不可用')
+      storage.setItem(THEME_KEY, theme)
+    } catch (error) {
+      if (!config) throw error
+    }
+  })
+}
+
+export function writeConfig(config: MarshalConfig): Promise<void> {
+  return queueConfigWrite(async () => {
+    const current = await readConfig()
+    await storeConfig({ ...config, theme: readTheme(current?.theme !== undefined ? current : config) })
+  })
+}
+
+async function storeConfig(config: MarshalConfig): Promise<void> {
   const serialized = JSON.stringify(config)
   if (isNativeRuntime()) {
     await SecureStorage.setItem(STORE_KEY, serialized)
@@ -117,7 +154,11 @@ export async function writePinGuard(value: string | null): Promise<void> {
   } catch { /* 浏览器预览记不住也只影响这一页 */ }
 }
 
-export async function removeConfig(): Promise<void> {
+export function removeConfig(): Promise<void> {
+  return queueConfigWrite(clearConfig)
+}
+
+async function clearConfig(): Promise<void> {
   if (isNativeRuntime()) {
     try {
       await SecureStorage.removeItem(STORE_KEY)
@@ -126,4 +167,5 @@ export async function removeConfig(): Promise<void> {
     }
   }
   webStorage()?.removeItem(STORE_KEY)
+  webStorage()?.removeItem(THEME_KEY)
 }

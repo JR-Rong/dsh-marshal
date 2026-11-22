@@ -3,10 +3,10 @@ import {
 } from './lib/dom.ts'
 import {
   DEFAULT_HUB, consoleUrl, hubLabel, normalizeHubUrl, normalizeToken, makeConfig, CONFIG_VERSION,
-  type MarshalConfig,
+  MOBILE_THEMES, type MarshalConfig, type MobileTheme,
 } from './lib/config.ts'
 import {
-  MarshalApi, agentLabel, sessionTitle, sameTarget, can, formatTokens, buildPromptArgs, newIdempotencyKey, decisionIsSafe,
+  MarshalApi, agentLabel, sessionTitle, sameTarget, can, formatTokens, buildPromptArgs, newIdempotencyKey, decisionIsSafe, parseCards,
   type BoardReceipt, type Capability, type DeviceRow, type InputCard, type RosterEntry, type SessionRow, type Target, type SessionControls,
 } from './lib/marshal.ts'
 import {
@@ -20,7 +20,7 @@ import { acceptEventSeq } from './lib/transcript.ts'
 import { hasStoredBridge, loadBridgeDevice, openBridgeWorkbench, saveBridgeDevice } from './bridge/workbench.ts'
 import { classifyPairing, pairBridge, parsePairPayload, parseUnifiedPairing } from './lib/bridge.ts'
 import { openQrScanner } from './lib/scanner.ts'
-import { installationId, readConfig, readPinGuard, removeConfig, writeConfig, writePinGuard } from './lib/storage.ts'
+import { installationId, readConfig, readPinGuard, removeConfig, writeConfig, writePinGuard, readTheme, writeTheme } from './lib/storage.ts'
 import { createLock, pinDelay, verifyPin, isValidPin, type LockRecord } from './lib/lock.ts'
 import { decideDeepLink, linkCarriesSecret, parsePairingLink } from './lib/deeplink.ts'
 import { livePhaseAfterApproval } from './lib/live.ts'
@@ -29,9 +29,11 @@ import {
   setupChrome, inNativeShell, openExternal, vibrate, exitApp,
   watchNetwork, watchDeepLinks, watchBackButton,
 } from './lib/native.ts'
+import { computeTabBadges, formatTabBadge, scheduleBoardPoll } from './lib/tab-badges.ts'
+import { createPendingInputs, inputTarget, inputTargetKey } from './lib/pending-inputs.ts'
 import { APP_TITLE, APP_VERSION, CLIENT_ONLY_NOTE } from './lib/version.ts'
 
-type View = 'booting' | 'setup' | 'lock' | 'home' | 'sessions' | 'session' | 'controls' | 'groups' | 'groupRoom' | 'groupNew' | 'settings' | 'board' | 'memory'
+type View = 'booting' | 'setup' | 'lock' | 'home' | 'sessions' | 'session' | 'controls' | 'groups' | 'groupRoom' | 'groupNew' | 'settings' | 'board' | 'agents' | 'memory'
 
 type Role = 'user' | 'assistant' | 'reason' | 'tool' | 'system'
 
@@ -71,7 +73,6 @@ interface UiState {
   uploading: boolean
   running: boolean
   messages: Message[]
-  cards: InputCard[]
   busy: boolean
   statusText: string
   online: boolean
@@ -112,7 +113,6 @@ const state: UiState = {
   uploading: false,
   running: false,
   messages: [],
-  cards: [],
   busy: false,
   statusText: '',
   online: true,
@@ -140,6 +140,8 @@ const state: UiState = {
 let stream: StreamHandle | null = null
 let subscriptionId: string | null = null
 let lastSeq = 0
+let pendingInputs = createPendingInputs()
+let inputRecovery = 0
 let disposeBack: (() => void) | null = null
 let draft = ''
 
@@ -149,14 +151,14 @@ const rootNode = (): HTMLElement => {
   return node
 }
 
-const TAB_ITEMS: ReadonlyArray<{ view: View; label: string; icon: string }> = [
-  { view: 'home', label: '设备', icon: 'device' },
+const TAB_ITEMS = [
+  { view: 'board', label: '工单', icon: 'board' },
   { view: 'sessions', label: '会话', icon: 'chat' },
-  { view: 'board', label: '看板', icon: 'board' },
-  { view: 'settings', label: '设置', icon: 'gear' },
-]
+  { view: 'agents', label: '智能体', icon: 'agents' },
+  { view: 'home', label: '节点', icon: 'device' },
+] as const
 
-const TAB_VIEWS: ReadonlySet<View> = new Set<View>(['home', 'sessions', 'board', 'settings'])
+const TAB_VIEWS: ReadonlySet<View> = new Set(TAB_ITEMS.map((item) => item.view))
 
 function tabIcon(kind: string): SVGElement {
   const svg = document.createElementNS(SVG_NS, 'svg')
@@ -166,7 +168,7 @@ function tabIcon(kind: string): SVGElement {
     device: 'M8 3.5h8a2 2 0 0 1 2 2v13a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2v-13a2 2 0 0 1 2-2Z M10.5 17.5h3',
     chat: 'M4.5 6.5A2.5 2.5 0 0 1 7 4h10a2.5 2.5 0 0 1 2.5 2.5v6A2.5 2.5 0 0 1 17 15H9l-4.5 3.5v-12Z',
     board: 'M4.5 5.5h15v6h-15z M4.5 15h7v4h-7z M14.5 15h5v4h-5z',
-    gear: 'M12 15.2a3.2 3.2 0 1 0 0-6.4 3.2 3.2 0 0 0 0 6.4Z M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.03 1.56V21a2 2 0 1 1-4 0v-.09A1.7 1.7 0 0 0 8.98 19.4a1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.62 15a1.7 1.7 0 0 0-1.56-1.03H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.6 8.98a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 8.98 4.6a1.7 1.7 0 0 0 1.03-1.56V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1.03 1.56 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9a1.7 1.7 0 0 0 1.56 1.03H21a2 2 0 1 1 0 4h-.09A1.7 1.7 0 0 0 19.4 15Z',
+    agents: 'M12 11a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z M5 20v-1a5 5 0 0 1 5-5h4a5 5 0 0 1 5 5v1Z M3 13a3 3 0 0 0 0-6 M21 13a3 3 0 0 0 0-6',
   }
   const path = document.createElementNS(SVG_NS, 'path')
   path.setAttribute('d', paths[kind] ?? paths.device)
@@ -175,18 +177,29 @@ function tabIcon(kind: string): SVGElement {
 }
 
 function tabBar(): HTMLElement {
-  const current = state.view
-  const secondary = current === 'groups' || current === 'groupRoom' || current === 'groupNew' || current === 'memory'
+  const badges = computeTabBadges(boardTasks, pendingInputs.waitingCounts(), state.online && !hubUnavailable)
   return el('nav', { class: 'tabbar', 'aria-label': '主导航' },
-    ...TAB_ITEMS.map((item) => el('button', {
-      class: 'tab-item' + (item.view === current || (item.view === 'home' && secondary) ? ' active' : ''),
-      'aria-label': item.label,
-      onClick: () => { vibrate(); switchTab(item.view) },
-    },
-    tabIcon(item.icon),
-    el('span', { class: 'tab-label', text: item.label }),
-    )),
+    ...TAB_ITEMS.map(({ view, label, icon }) => {
+      const active = view === state.view
+      const count = view === 'board' ? badges.board : view === 'sessions' ? badges.sessions : 0
+      const offline = view === 'home' && badges.home
+      return el('button', {
+        type: 'button', class: 'tab-item' + (active ? ' active' : ''),
+        'aria-current': active ? 'page' : undefined,
+        'aria-label': label + (offline ? '，离线' : count ? `，${count} 项${view === 'board' ? '待确认或进行中' : '待回答'}` : ''),
+        onClick: () => { vibrate(); switchTab(view) },
+      },
+      el('span', { class: 'tab-symbol' }, tabIcon(icon),
+        count ? el('span', { class: 'tab-badge', 'aria-hidden': 'true', text: formatTabBadge(count) }) : null,
+        offline ? el('span', { class: 'tab-badge offline', 'aria-hidden': 'true' }) : null,
+      ),
+      el('span', { class: 'tab-label', text: label }))
+    }),
   )
+}
+
+function refreshTabBar(): void {
+  rootNode().querySelector('.tabbar')?.replaceWith(tabBar())
 }
 
 function switchTab(view: View): void {
@@ -200,11 +213,17 @@ function switchTab(view: View): void {
     return
   }
   if (view === 'board') { state.view = 'board'; render(); void loadBoard(); return }
-  if (view === 'settings') { state.view = 'settings'; render() }
+  if (view === 'agents') {
+    state.view = 'agents'
+    render()
+    if (agentsSegment === 'memory') void loadMemory()
+    else void refreshDevices()
+  }
 }
 
 function render(): void {
   if (state.view !== 'groupRoom') stopGroupPoll()
+  if (!showingMemory()) clearTimeout(memoryPoll)
   const app = rootNode()
   clear(app)
   const withTabs = TAB_VIEWS.has(state.view)
@@ -231,6 +250,7 @@ function screenChildren(): Child[] {
     case 'groupNew': return groupNewView()
     case 'settings': return settingsView()
     case 'board': return boardView()
+    case 'agents': return agentsView()
     case 'memory': return memoryView()
   }
 }
@@ -272,25 +292,29 @@ function brand(): HTMLElement {
   )
 }
 
-/** Apple HIG：外观跟随系统，不在应用内提供换肤；强调色固定为仓库图标的品牌蓝。 */
+const THEME_LABELS: Record<MobileTheme, string> = {
+  system: '跟随系统', deepseek: 'DeepSeek 蓝', white: '纯粹白', dark: '曜石黑', codex: 'Codex 紫',
+}
+let mobileTheme: MobileTheme = 'system'
+
+function applyTheme(theme: MobileTheme): void {
+  mobileTheme = theme
+  document.documentElement.dataset.theme = theme
+}
+
 function themeCard(): HTMLElement {
-  return el('div', { class: 'card' },
-    el('h2', { text: '外观' }),
-    el('div', { class: 'row-between' },
-      el('div', { class: 'label' },
-        el('strong', { text: '跟随系统' }),
-        el('span', { text: '浅色 / 深色随 iOS、Android 设置自动切换' }),
-      ),
-      el('span', { class: 'chip on', text: '自动' }),
-    ),
-    el('div', { class: 'row-between' },
-      el('div', { class: 'label' },
-        el('strong', { text: '强调色' }),
-        el('span', { text: '取自仓库应用图标 · Marshal 蓝' }),
-      ),
-      el('span', { class: 'accent-dot', 'aria-hidden': 'true' }),
-    ),
-  )
+  const choices = el('div', { class: 'theme-options', role: 'group', 'aria-label': '外观主题' })
+  for (const theme of MOBILE_THEMES) {
+    choices.append(button(THEME_LABELS[theme], () => {
+      if (mobileTheme === theme) return
+      applyTheme(theme)
+      for (const node of choices.querySelectorAll('button')) {
+        node.setAttribute('aria-pressed', String(node.dataset.choice === theme))
+      }
+      void writeTheme(theme).catch(() => toast('外观预览已应用，但未能保存', 'error'))
+    }, { type: 'button', 'data-choice': theme, 'aria-pressed': String(mobileTheme === theme) }))
+  }
+  return el('section', { class: 'card' }, el('h2', { text: '外观' }), choices)
 }
 
 function topbar(title: string, subtitle: string, actions: Child[], back?: HTMLButtonElement): HTMLElement {
@@ -325,9 +349,12 @@ function backButton(to: View): HTMLButtonElement {
 
 export async function start(): Promise<void> {
   state.view = 'booting'
+  applyTheme(readTheme())
+  state.online = navigator.onLine
   render()
   void setupChrome()
   const config = await readConfig()
+  applyTheme(readTheme(config))
   state.config = config
   state.account = config?.account && config.account.expiresAt > Date.now() ? config.account : null
   if (!config) {
@@ -346,11 +373,19 @@ export async function start(): Promise<void> {
     setTimeout(() => { if (hasStoredBridge()) openDshWorkbench() }, 250)
   }
   await watchNetwork((online) => {
+    const reconnected = online && !state.online
     state.online = online
-    if (state.view === 'home' || state.view === 'sessions') render()
+    if (state.view === 'home') render()
+    else refreshTabBar()
+    if (reconnected && state.api && !appLocked()) {
+      void refreshDevices()
+      void recoverPendingInputs(state.api)
+      void loadBoard(true)
+    }
   })
   await watchDeepLinks((url) => { void handleDeepLink(url) })
   await registerBackButton()
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) scheduleBoardRefresh() })
   window.addEventListener('pageshow', (event) => { if (event.persisted) void registerBackButton() })
 }
 
@@ -358,7 +393,7 @@ async function registerBackButton(): Promise<void> {
   disposeBack?.()
   disposeBack = await watchBackButton(() => {
     const parent: Partial<Record<View, View>> = {
-      settings: 'home', sessions: 'home', session: 'sessions', controls: 'session', groups: 'home', groupRoom: 'groups', groupNew: 'groups',
+      settings: 'home', sessions: 'home', session: 'sessions', controls: 'session', groups: groupsParent, groupRoom: 'groups', groupNew: 'groups', memory: 'home',
     }
     const to = parent[state.view]
     if (to) { state.view = to; render(); return true }
@@ -371,16 +406,28 @@ async function registerBackButton(): Promise<void> {
 async function enterApp(): Promise<void> {
   const config = state.config
   if (!config) { state.view = 'setup'; render(); return }
+  stream?.close()
+  stream = null
+  subscriptionId = null
   state.api = new MarshalApi(config)
   roster = []
+  state.session = null
+  pendingInputs = createPendingInputs()
+  state.devices = []
+  state.sessions = []
+  state.deviceId = null
+  hubUnavailable = false
+  boardEdit = null
+  agentsSegment = 'members'
   boardTasks = []
   boardRevisions = {}
   boardReceipts = []
   memoryEntries = []
-  state.view = 'home'
+  state.view = 'board'
   state.statusText = '正在连接…'
   render()
-  await refreshDevices()
+  await Promise.all([refreshDevices(), loadBoard()])
+  void recoverPendingInputs(state.api)
   await openStream()
   void registerDevicePush()
 }
@@ -419,7 +466,7 @@ async function openStream(): Promise<void> {
   stream = await openEventStream({
     url: api.streamUrl(),
     token: api.token,
-    onFrame: (frame) => { void onFrame(frame) },
+    onFrame: (frame) => { if (state.api === api) void onFrame(frame) },
     onError: (message) => {
       state.statusText = '事件流断开：' + message
       if (state.view === 'home') render()
@@ -433,17 +480,28 @@ async function refreshDevices(): Promise<void> {
   const result = await api.devices()
   if (state.api !== api) return
   if (!result.ok) {
+    hubUnavailable = true
     state.statusText = result.message
     if (result.error === 'unauthorized') { state.view = 'setup'; render(); return }
-    if (state.view === 'home' || state.view === 'sessions') render()
+    if (state.view === 'home') render()
+    else refreshTabBar()
     return
   }
+  hubUnavailable = false
   state.devices = result.data
   const named = await api.roster()
   if (state.api !== api) return
   roster = named.ok ? named.data : roster
   state.statusText = result.data.length === 0 ? '暂无设备在线' : '已连接调度中心'
-  if (state.view === 'home') render()
+  if (state.view === 'sessions' && !state.deviceId) {
+    const first = state.devices.find((entry) => !entry.stale)
+    if (first) { void openDevice(first); return }
+    render()
+    return
+  }
+  if (state.view === 'home' || (state.view === 'agents' && agentsSegment === 'members')) render()
+  else if (state.view === 'board' && !boardEdit && !rootNode().querySelector('.modal-drawer[open], .board-create input:focus')) render()
+  else refreshTabBar()
 }
 
 async function openDevice(device: DeviceRow): Promise<void> {
@@ -455,10 +513,12 @@ async function openDevice(device: DeviceRow): Promise<void> {
   state.statusText = '读取会话…'
   render()
   const result = await api.sessions(device.id)
-  if (!result.ok) { state.statusText = result.message; render(); return }
-  state.sessions = result.data
-  state.statusText = ''
-  render()
+  if (state.api !== api || state.deviceId !== device.id) return
+  if (result.ok) state.sessions = result.data
+  if (state.view === 'sessions') {
+    state.statusText = result.ok ? '' : result.message
+    render()
+  }
 }
 
 /* ------------------------------ 会话 ------------------------------ */
@@ -475,7 +535,6 @@ async function openSession(deviceId: string, row: SessionRow): Promise<void> {
   state.capability = row.capability
   state.running = row.running
   state.messages = []
-  state.cards = []
   state.historyCursor = null
   state.controls = null
   state.modelChoice = ''
@@ -492,13 +551,18 @@ async function openSession(deviceId: string, row: SessionRow): Promise<void> {
   const target = targetOf(state.session)
   void api.watchSession(target)
   const subscribed = await api.subscribe(target)
+  if (state.api !== api || !state.session || !sameTarget(target, state.session)) {
+    if (subscribed.ok) void api.unsubscribe(target, subscribed.data)
+    return
+  }
   subscriptionId = subscribed.ok ? subscribed.data : null
 
-  const [history, inputs, controls] = await Promise.all([
+  const [history, , controls] = await Promise.all([
     api.history(target, 40),
-    api.inputs(target),
+    loadPendingInputs(api, target),
     api.controls(target),
   ])
+  if (state.api !== api || !state.session || !sameTarget(target, state.session)) return
   if (!history.ok) {
     state.statusText = history.message
   } else {
@@ -506,14 +570,12 @@ async function openSession(deviceId: string, row: SessionRow): Promise<void> {
     state.historyCursor = history.data.nextCursor ?? null
     state.statusText = ''
   }
-  if (inputs.ok) {
-    state.cards = inputs.data
-  }
   if (controls.ok) {
     state.controls = controls.data
   }
   // 能力文档以 sessions 列表为准，读一次刷新。
-  const sessions = await api.sessions(row.deviceId)
+  const sessions = await api.sessions(deviceId)
+  if (state.api !== api || !state.session || !sameTarget(target, state.session)) return
   if (sessions.ok) {
     const fresh = sessions.data.find((item) => item.agent === row.agent && item.sessionId === row.sessionId)
     if (fresh) {
@@ -546,10 +608,51 @@ export function historyToMessage(item: { kind: string; payload?: Record<string, 
   }
 }
 
+async function loadPendingInputs(api: MarshalApi, target: Target, isCurrent?: () => boolean): Promise<boolean> {
+  const commit = pendingInputs.beginSnapshot(target)
+  const result = await api.inputs(target)
+  if (state.api !== api || (isCurrent && !isCurrent())) return false
+  commit(result.ok ? result.data : undefined)
+  refreshPendingInputs(target)
+  return result.ok || result.error !== 'unauthorized'
+}
+
+function refreshPendingInputs(target?: Target): void {
+  if (target && state.view === 'session' && state.session && sameTarget(target, state.session)) render()
+  else refreshTabBar()
+}
+
+async function recoverPendingInputs(api: MarshalApi): Promise<void> {
+  const recovery = ++inputRecovery
+  const current = () => state.api === api && recovery === inputRecovery && !appLocked()
+  const known = pendingInputs.knownTargets()
+  const result = await api.sessions()
+  if (!current() || !result.ok) return
+  const targets = new Set(result.data.map(inputTargetKey))
+  for (const target of known) {
+    if (!targets.has(inputTargetKey(target))) {
+      pendingInputs.remove(target)
+      refreshPendingInputs(target)
+    }
+  }
+  // Limit simultaneous RPCs even on installations with a large session index.
+  // Older Hubs accept only operator credentials on /inputs. Never retry with
+  // another credential or clear the live cache on denial.
+  let next = 0
+  if (api.token.startsWith('mph1.') && result.data.length) {
+    if (!await loadPendingInputs(api, targetOf(result.data[next++]), current)) return
+  }
+  await Promise.all(Array.from({ length: Math.min(4, result.data.length - next) }, async () => {
+    while (current() && next < result.data.length) await loadPendingInputs(api, targetOf(result.data[next++]), current)
+  }))
+}
+
 async function onFrame(frame: StreamFrame): Promise<void> {
   if (frame.event === 'reset') {
+    lastSeq = 0
+    if (state.api && !appLocked()) void recoverPendingInputs(state.api)
+    if (state.view === 'session') void reloadTranscript()
     await refreshDevices()
-    if (state.session) await reloadTranscript()
     return
   }
   const event = frame.data as Record<string, unknown> | null
@@ -559,11 +662,34 @@ async function onFrame(frame: StreamFrame): Promise<void> {
   const kind = typeof event.kind === 'string' ? event.kind : ''
   const payload = (typeof event.payload === 'object' && event.payload !== null ? event.payload : {}) as Record<string, unknown>
 
+  const eventTarget = inputTarget(event)
+  if (eventTarget && kind === 'session.removed') {
+    pendingInputs.remove(eventTarget)
+    refreshPendingInputs(eventTarget)
+  }
+  if (eventTarget && (kind === 'input.requested' || kind === 'input.resolved')) {
+    const requestId = payload.requestId
+    if (typeof requestId !== 'string' || !requestId) return
+    const card = kind === 'input.requested' ? parseCards([payload])[0] : undefined
+    if (kind === 'input.requested' && !card) return
+    pendingInputs.update(eventTarget, requestId, card)
+    if (target && sameTarget(target, eventTarget)) {
+      if (card?.approval) void showLive('待审批', 'approval', eventTarget.sessionId)
+      if (!card) {
+        const phase = livePhaseAfterApproval(state.running)
+        void showLive(phase.title, phase.phase, eventTarget.sessionId, phase.end)
+      }
+    }
+    refreshPendingInputs(eventTarget)
+    return
+  }
   if (kind === 'session.updated' || kind === 'session.removed') {
     if (state.view === 'sessions' && state.deviceId === event.deviceId) {
       const api = state.api
-      if (api) {
-        const result = await api.sessions(state.deviceId)
+      const deviceId = state.deviceId
+      if (api && deviceId) {
+        const result = await api.sessions(deviceId)
+        if (state.api !== api || state.deviceId !== deviceId || state.view !== 'sessions') return
         if (result.ok) { state.sessions = result.data; render() }
       }
     }
@@ -578,23 +704,6 @@ async function onFrame(frame: StreamFrame): Promise<void> {
     case 'capability.changed':
       state.capability = payload as unknown as Capability
       return
-    case 'input.requested': {
-      const card = payload as unknown as InputCard
-      if (typeof card.requestId === 'string') {
-        state.cards = [...state.cards.filter((entry) => entry.requestId !== card.requestId), card]
-        if (card.approval) void showLive('待审批', 'approval', typeof event.sessionId === 'string' ? event.sessionId : card.requestId)
-        render()
-      }
-      return
-    }
-    case 'input.resolved': {
-      const requestId = typeof payload.requestId === 'string' ? payload.requestId : ''
-      state.cards = state.cards.filter((card) => card.requestId !== requestId)
-      const phase = livePhaseAfterApproval(state.running)
-      void showLive(phase.title, phase.phase, typeof event.sessionId === 'string' ? event.sessionId : requestId, phase.end)
-      render()
-      return
-    }
     case 'message.delta':
     case 'reasoning.delta': {
       const text = typeof payload.text === 'string' ? payload.text : ''
@@ -649,9 +758,10 @@ function closeOpenMessages(): void {
 
 async function reloadTranscript(): Promise<void> {
   const api = state.api
-  if (!api || !state.session) return
-  const result = await api.history(targetOf(state.session), 40)
-  if (result.ok) {
+  const session = state.session
+  if (!api || !session) return
+  const result = await api.history(targetOf(session), 40)
+  if (result.ok && state.api === api && state.session === session && state.view === 'session') {
     state.messages = result.data.items.map(historyToMessage).filter((m): m is Message => m !== null)
     state.historyCursor = result.data.nextCursor ?? null
     render()
@@ -813,9 +923,10 @@ async function cancelCard(card: InputCard): Promise<void> {
     toast(result.message, 'error')
     return
   }
-  state.cards = state.cards.filter((entry) => entry.requestId !== card.requestId)
+  if (state.api !== api) return
+  pendingInputs.update(targetOf(session), card.requestId)
   toast('已忽略该请求')
-  render()
+  refreshPendingInputs(targetOf(session))
 }
 
 let answering = false
@@ -827,9 +938,10 @@ async function answerCard(card: InputCard, answers: Array<{ id: string; selected
   const result = await api.command('answer', targetOf(session), { requestId: card.requestId, answers })
   answering = false
   if (!result.ok) { toast(result.message, 'error'); return }
-  state.cards = state.cards.filter((entry) => entry.requestId !== card.requestId)
+  if (state.api !== api) return
+  pendingInputs.update(targetOf(session), card.requestId)
   toast('已提交')
-  render()
+  refreshPendingInputs(targetOf(session))
 }
 
 async function interrupt(): Promise<void> {
@@ -1005,8 +1117,9 @@ function scanPairing(): void {
 function homeView(): Child[] {
   const config = state.config
   if (!config) { state.view = 'setup'; return setupView() }
-  const header = topbar('设备', '手机端 node · ' + hubLabel(config.hubUrl), [
+  const header = topbar('节点', '手机端 node · ' + hubLabel(config.hubUrl), [
     button('扫码', scanPairing, { class: 'icon-button' }),
+    button('设置', () => { state.view = 'settings'; render() }, { class: 'icon-button' }),
   ])
   const banners: Child[] = []
   if (!state.online) banners.push(el('div', { class: 'banner warn', text: '设备离线：网络恢复后会自动刷新。' }))
@@ -1022,27 +1135,9 @@ function homeView(): Child[] {
   el('span', { class: 'chevron', 'aria-hidden': 'true' }),
   ))
 
-  const members = roster.map((item) => {
-    const device = state.devices.find(entry => entry.id === item.deviceId)
-    const online = !!(device && !device.stale)
-    return el('div', { class: 'row-between' },
-      el('div', { class: 'roster-main' },
-        el('span', { class: 'dot' + (online ? ' online' : '') }),
-        el('div', { class: 'label' },
-          el('strong', { text: item.name }),
-          el('span', { text: device?.name ?? item.deviceId }),
-        ),
-      ),
-      el('span', { class: 'chip' + (online ? ' on' : ''), text: online ? '在线' : '离线' }),
-    )
-  })
   return [
     header,
     ...banners,
-    el('div', { class: 'card' },
-      el('h2', { text: '智能体花名册' }),
-      ...(members.length > 0 ? members : [el('p', { class: 'empty', text: '等待电脑上报智能体花名册。' })]),
-    ),
     state.config?.lanBridge
       ? el('div', { class: 'card' },
         el('h2', { text: '局域网工作台' }),
@@ -1058,17 +1153,62 @@ function homeView(): Child[] {
       el('h2', { text: '协作' }),
       el('div', { class: 'row-between' },
         el('div', { class: 'label' }, el('strong', { text: '群聊' }), el('span', { text: '跨设备智能体讨论与汇总' })),
-        button('打开', () => { state.view = 'groups'; void loadRooms() }, { class: 'icon-button' }),
+        button('打开', () => openGroups('home'), { class: 'icon-button' }),
       ),
       el('div', { class: 'row-between' },
         el('div', { class: 'label' }, el('strong', { text: '记忆' }), el('span', { text: '智能体长期记忆 · 只读浏览' })),
         button('打开', () => { memoryEntries = []; state.view = 'memory'; render(); void loadMemory() }, { class: 'icon-button' }),
       ),
     ),
+    themeCard(),
     el('div', { class: 'foot', text: 'v' + APP_VERSION + ' · 手机端 node · 出站直连，不承载 hub' }),
   ]
 }
 
+function showingMemory(): boolean {
+  return state.view === 'memory' || (state.view === 'agents' && agentsSegment === 'memory')
+}
+
+function agentsView(): Child[] {
+  const segments = [{ id: 'members', label: '成员与预设' }, { id: 'memory', label: '记忆与星系' }] as const
+  const header = topbar('智能体', '跨设备协作', [button('刷新', () => {
+    if (showingMemory()) void loadMemory()
+    else void refreshDevices()
+  }, { class: 'icon-button' })])
+  const picker = el('div', { class: 'segments', role: 'group', 'aria-label': '智能体视图' },
+    ...segments.map(({ id, label }) => button(label, () => {
+      if (agentsSegment === id) return
+      agentsSegment = id
+      render()
+      if (id === 'memory') void loadMemory()
+    }, { type: 'button', 'aria-pressed': String(agentsSegment === id) })),
+  )
+  if (showingMemory()) return [header, picker,
+    // Reserved mount for the future MemoryGalaxy renderer.
+    el('div', { id: 'memory-galaxy' }), ...memoryContent(),
+  ]
+  const members = roster.map((item) => {
+    const device = state.devices.find(entry => entry.id === item.deviceId)
+    const online = !!(device && !device.stale)
+    return el('div', { class: 'row-between' },
+      el('div', { class: 'roster-main' },
+        el('span', { class: 'dot' + (online ? ' online' : '') }),
+        el('div', { class: 'label' },
+          el('strong', { text: item.name }),
+          el('span', { text: device?.name ?? item.deviceId }),
+        ),
+      ),
+      el('span', { class: 'chip' + (online ? ' on' : ''), text: online ? '在线' : '离线' }),
+    )
+  })
+  return [header, picker, el('section', { class: 'card' },
+    el('h2', { text: '智能体花名册' }),
+    ...(members.length > 0 ? members : [el('p', { class: 'empty', text: '等待电脑上报智能体花名册。' })]),
+  )]
+}
+
+let agentsSegment: 'members' | 'memory' = 'members'
+let hubUnavailable = false
 let sessionQuery = ''
 let sessionLimit = SESSION_PAGE_SIZE
 let roster: RosterEntry[] = []
@@ -1081,6 +1221,15 @@ let memoryPoll: ReturnType<typeof setTimeout> | undefined
 let memoryLoad = 0
 let memoryEntries: Array<{ id: string; deviceId: string; layer: string; agent: string; text: string }> = []
 let groupKey = ''
+let groupsParent: 'home' | 'sessions' = 'home'
+
+function openGroups(from: typeof groupsParent): void {
+  groupsParent = from
+  state.view = 'groups'
+  render()
+  void loadRooms()
+}
+
 
 async function startDeviceSession(deviceId: string, agent: string): Promise<void> {
   const api = state.api
@@ -1095,7 +1244,9 @@ async function startDeviceSession(deviceId: string, agent: string): Promise<void
 
 function sessionsView(): Child[] {
   const device = state.devices.find((entry) => entry.id === state.deviceId)
-  const header = topbar(device?.name ?? '会话', '选择会话', [], backButton('home'))
+  const header = topbar(device?.name ?? '会话', '选择会话', [
+    button('群聊', () => openGroups('sessions'), { class: 'icon-button' }),
+  ], backButton('home'))
   const newRow = (device?.agents ?? []).map((agent) => button('新会话 · ' + agentLabel(agent), () => {
     if (device) void startDeviceSession(device.id, agent)
   }, { class: 'icon-button' }))
@@ -1248,6 +1399,7 @@ function statRow(label: string, value: number | undefined): HTMLElement | null {
 function sessionView(): Child[] {
   const session = state.session
   if (!session) { state.view = 'sessions'; return sessionsView() }
+  const cards = pendingInputs.cards(session)
   const header = topbar(sessionTitle(session), agentLabel(session.agent) + ' · ' + (state.running ? '运行中' : '空闲'), [
     button('控制', () => { openControls() }, { class: 'icon-button' }),
     can(state.capability, 'interrupt')
@@ -1321,7 +1473,7 @@ function sessionView(): Child[] {
   return [
     header,
     ...sessionStatChips(),
-    state.cards.length > 0 ? el('div', {}, ...state.cards.map(cardNode)) : null,
+    cards.length > 0 ? el('div', {}, ...cards.map(cardNode)) : null,
     el('div', { class: 'transcript' },
       state.historyCursor ? button('加载更早消息', () => { void loadOlder() }, { class: 'block ghost' }) : null,
       ...state.messages.map(messageNode),
@@ -1626,30 +1778,42 @@ function phoneApi(): MarshalApi | null {
   return api && api.token.startsWith('mph1.') ? api : null
 }
 
-async function loadBoard(): Promise<void> {
+async function loadBoard(quiet = false): Promise<void> {
   clearTimeout(boardPoll)
   const api = phoneApi()
-  if (!api) { toast('看板需要手机配对凭证', 'error'); return }
+  if (!api || appLocked()) return
   const load = ++boardLoad
   const result = await api.board()
-  if (load !== boardLoad || state.api !== api || state.view !== 'board') return
+  if (load !== boardLoad || state.api !== api || appLocked()) return
+  const beforeEdit = boardEdit && boardEditorStatus(boardEdit)
   if (result.ok) {
     boardTasks = result.data.tasks
     boardRevisions = result.data.revisions
     boardReceipts = result.data.receipts
-    if (boardReceipts.some(receipt => receipt.state === 'queued')) {
-      boardPoll = setTimeout(() => { if (state.view === 'board') void loadBoard() }, 3000)
-    }
-  } else toast(result.message, 'error')
-  render()
+    reconcileBoardEdit()
+  } else if (!quiet && state.view === 'board') toast(result.message, 'error')
+  const queued = Boolean(boardEdit?.commandId) || boardReceipts.some(receipt => receipt.state === 'queued')
+  boardPoll = scheduleBoardPoll(queued,
+    () => state.api === api && !appLocked() && state.view !== 'setup' && !document.hidden && state.online,
+    () => { void loadBoard(true) }, setTimeout)
+  if (state.view === 'board' && !rootNode().querySelector('.modal-drawer[open], .board-create input:focus')
+    && (!boardEdit || beforeEdit !== boardEditorStatus(boardEdit))) renderBoardEditor()
+  else refreshTabBar()
 }
 
-async function writeBoard(body: Record<string, unknown>): Promise<void> {
+function scheduleBoardRefresh(): void {
+  clearTimeout(boardPoll)
+  if (!phoneApi() || appLocked() || state.view === 'setup' || document.hidden || !state.online) return
+  void loadBoard(true)
+}
+
+async function writeBoard(body: Record<string, unknown>, onAccepted?: () => void): Promise<void> {
   const api = phoneApi()
   if (!api) return
   const result = await api.boardWrite(body)
   if (state.api !== api || state.view !== 'board') return
   if (!result.ok) { toast(result.message, 'error'); return }
+  onAccepted?.()
   toast(result.data.commandId ? '已排队，等待电脑回执' : '已排队，请刷新看板确认结果')
   await loadBoard()
 }
@@ -1662,20 +1826,132 @@ const BOARD_RECEIPT_REASON: Record<string, string> = {
   unavailable: '电脑未返回有效修订',
   expired: '未在时限内收到回执',
 }
+const BOARD_STATUS_LABELS: Record<string, string> = {
+  todo: '待办', doing: '进行中', done: '完成', attention: '待确认', 'pending-confirmation': '待确认',
+}
+
+interface BoardEdit {
+  deviceId: string
+  taskId: string
+  title: string
+  baseRevision: number
+  saving: boolean
+  conflict?: boolean
+  commandId?: string
+  notice?: string
+}
+let boardEdit: BoardEdit | null = null
+
+function editedTask(edit: BoardEdit) {
+  return boardTasks.find(task => task.deviceId === edit.deviceId && task.id === edit.taskId)
+}
+
+function reconcileBoardEdit(): void {
+  const edit = boardEdit
+  if (!edit?.commandId) return
+  const receipt = boardReceipts.find(row => row.id === edit.commandId)
+  if (!receipt || receipt.state === 'queued') return
+  edit.commandId = undefined
+  if (receipt.state === 'applied') { boardEdit = null; return }
+  edit.conflict = receipt.code === 'conflict'
+  edit.notice = BOARD_RECEIPT_REASON[receipt.code ?? ''] ?? BOARD_RECEIPT_STATE[receipt.state]
+}
+
+function boardEditorStatus(edit: BoardEdit): string {
+  const task = editedTask(edit)
+  const revision = boardRevisions[edit.deviceId]
+  if (!task) return '工单已不在当前看板。草稿仍可复制。'
+  if (edit.commandId) return '已排队，等待电脑回执。'
+  if (edit.conflict || revision !== edit.baseRevision) {
+    return `看板修订冲突 · 当前修订 ${revision ?? '未知'} · 当前标题「${task.title}」`
+      + (revision === undefined || edit.conflict && revision === edit.baseRevision ? '。等待最新修订。' : '。确认后可用该修订重试。')
+  }
+  return edit.notice ?? ''
+}
+
+function renderBoardEditor(): void {
+  const active = document.activeElement
+  const input = active instanceof HTMLInputElement && active.closest('.board-title-editor') ? active : null
+  render()
+  if (input && boardEdit) {
+    const next = rootNode().querySelector<HTMLInputElement>('.board-title-editor input')
+    next?.focus()
+    next?.setSelectionRange(input.selectionStart, input.selectionEnd)
+  }
+}
+
+function boardTitleEditor(edit: BoardEdit): HTMLElement {
+  const revision = boardRevisions[edit.deviceId]
+  const changed = edit.conflict || revision !== edit.baseRevision
+  const blocked = !editedTask(edit) || revision === undefined || edit.conflict && revision === edit.baseRevision
+  const input = el('input', {
+    type: 'text', value: edit.title, required: true, 'aria-label': '新工单标题',
+    readonly: edit.saving || edit.commandId ? true : undefined, onInput: () => { edit.title = input.value },
+  })
+  const save = el('button', { type: 'submit', disabled: blocked || edit.saving || Boolean(edit.commandId),
+    class: 'primary', text: changed ? '确认并重试' : '保存标题' })
+  return el('form', { class: 'board-title-editor', onSubmit: (event) => {
+    event.preventDefault()
+    const title = edit.title.trim()
+    const api = phoneApi()
+    if (!api || !title || save.disabled || revision === undefined) return
+    // Only use the revision actually shown to the user; a newer one needs its own confirmation.
+    if (revision !== boardRevisions[edit.deviceId] || !editedTask(edit)) { renderBoardEditor(); return }
+    edit.baseRevision = revision
+    edit.saving = save.disabled = input.readOnly = true
+    void api.boardWrite({ deviceId: edit.deviceId, taskId: edit.taskId, baseRevision: revision, action: 'edit', title }).then(async result => {
+      if (state.api !== api || boardEdit !== edit) return
+      edit.saving = false
+      if (result.ok) {
+        edit.commandId = result.data.commandId
+        edit.conflict = false
+        edit.notice = edit.commandId ? undefined : '已排队，但未收到回执编号。请先核对看板。'
+      } else {
+        edit.conflict = result.error === 'conflict' || result.code === 'conflict'
+        edit.notice = result.message
+      }
+      if (state.view === 'board') renderBoardEditor()
+      await loadBoard(true)
+    })
+  } }, input, el('p', { role: 'status', text: boardEditorStatus(edit) }),
+  el('div', { class: 'board-title-actions' }, save, button('取消', () => {
+    boardEdit = null
+    render()
+  }, { type: 'button', disabled: edit.saving })))
+}
+
+function confirmBoardDelete(task: typeof boardTasks[number]): void {
+  const revision = boardRevisions[task.deviceId]
+  if (revision === undefined) return
+  const dialog = el('dialog', { class: 'modal-drawer', 'aria-labelledby': 'delete-board-title' },
+    el('header', { class: 'modal-drawer-header' }, el('h2', { id: 'delete-board-title', text: '删除工单？' })),
+    el('div', { class: 'modal-drawer-body' }, el('p', { text: task.title }),
+      el('div', { class: 'choices' }, button('取消', () => dialog.close(), { autofocus: true }),
+        button('删除', () => {
+          dialog.close()
+          void writeBoard({ deviceId: task.deviceId, action: 'delete', taskId: task.id, baseRevision: revision })
+        }, { class: 'danger' }))))
+  dialog.addEventListener('close', () => { dialog.remove(); if (state.view === 'board') refreshTabBar() })
+  rootNode().append(dialog)
+  dialog.showModal()
+}
 
 function boardView(): Child[] {
-  const title = el('input', { type: 'text', placeholder: '新任务标题' }) as HTMLInputElement
-  const deviceId = state.deviceId || boardTasks[0]?.deviceId || state.devices[0]?.id || ''
+  const title = el('input', { type: 'text', placeholder: '新工单标题', 'aria-label': '新工单标题' })
+  const deviceId = state.deviceId || boardTasks[0]?.deviceId || Object.keys(boardRevisions)[0] || state.devices[0]?.id || ''
   const head = boardRevisions[deviceId]
   return [
-    topbar('任务看板', '每台电脑用自己的修订号', [button('刷新', () => { void loadBoard() }, { class: 'icon-button' })], backButton('home')),
-    el('div', { class: 'card' },
+    topbar('工单', '任务看板', [button('刷新', () => { void loadBoard() }, { class: 'icon-button' })]),
+    !phoneApi() ? el('p', { class: 'banner', text: '请在节点页扫描电脑配对码，以管理工单。' }) : null,
+    el('div', { class: 'card board-create' },
       title,
       button('新建', () => {
         const revision = boardRevisions[deviceId]
         if (revision === undefined || !deviceId) { toast('这台电脑还没有上报看板修订', 'error'); return }
-        void writeBoard({ deviceId, action: 'create', title: title.value, baseRevision: revision })
-      }, { class: 'primary' }),
+        const text = title.value.trim()
+        if (!text) { title.focus(); return }
+        void writeBoard({ deviceId, action: 'create', title: text, baseRevision: revision }, () => { title.value = '' })
+      }, { class: 'primary', disabled: head === undefined }),
       head === undefined ? el('p', { class: 'empty', text: '还没有这台电脑的看板修订。空看板也会带修订号，收到之后才能新建。' }) : null,
     ),
     ...(boardReceipts.length > 0 ? [el('section', { class: 'card' },
@@ -1690,19 +1966,23 @@ function boardView(): Child[] {
     )] : []),
     ...boardTasks.map((task) => el('div', { class: 'card' },
       el('h2', { text: task.title }),
-      el('p', { class: 'empty', text: task.status + ' · 修订 ' + task.revision }),
-      el('div', { class: 'choices' },
+      el('p', { class: 'empty', text: BOARD_STATUS_LABELS[task.status] ?? '待办' }),
+      boardEdit && boardEdit.deviceId === task.deviceId && boardEdit.taskId === task.id
+        ? boardTitleEditor(boardEdit) : el('div', { class: 'choices' },
         button('待办', () => { const revision = boardRevisions[task.deviceId]; if (revision === undefined) return; void writeBoard({ deviceId: task.deviceId, action: 'move', taskId: task.id, status: 'todo', baseRevision: revision }) }),
         button('进行中', () => { const revision = boardRevisions[task.deviceId]; if (revision === undefined) return; void writeBoard({ deviceId: task.deviceId, action: 'move', taskId: task.id, status: 'doing', baseRevision: revision }) }),
         button('完成', () => { const revision = boardRevisions[task.deviceId]; if (revision === undefined) return; void writeBoard({ deviceId: task.deviceId, action: 'move', taskId: task.id, status: 'done', baseRevision: revision }) }),
         button('改标题', () => {
-          const next = window.prompt('新标题', task.title)
-          const revision = boardRevisions[task.deviceId]
-          if (next && next.trim() && revision !== undefined) void writeBoard({ deviceId: task.deviceId, action: 'edit', taskId: task.id, title: next.trim(), baseRevision: revision })
-        }),
-        button('删除', () => { const revision = boardRevisions[task.deviceId]; if (revision === undefined) return; void writeBoard({ deviceId: task.deviceId, action: 'delete', taskId: task.id, baseRevision: revision }) }, { class: 'danger' }),
+          const baseRevision = boardRevisions[task.deviceId]
+          if (baseRevision === undefined || boardEdit) return
+          boardEdit = { deviceId: task.deviceId, taskId: task.id, title: task.title, baseRevision, saving: false }
+          render()
+          rootNode().querySelector<HTMLInputElement>('.board-title-editor input')?.focus()
+        }, { disabled: Boolean(boardEdit) }),
+        button('删除', () => confirmBoardDelete(task), { class: 'danger' }),
       ),
     )),
+    boardEdit && !editedTask(boardEdit) ? el('div', { class: 'card' }, boardTitleEditor(boardEdit)) : null,
     boardTasks.length === 0 ? el('p', { class: 'empty', text: '电脑还没有上报看板。空列表不会当成“已经清空”。' }) : null,
   ]
 }
@@ -1713,16 +1993,22 @@ async function loadMemory(): Promise<void> {
   clearTimeout(memoryPoll)
   const load = ++memoryLoad
   const result = await api.memory()
-  if (load !== memoryLoad || state.api !== api || state.view !== 'memory') return
+  if (load !== memoryLoad || state.api !== api || !showingMemory()) return
   memoryEntries = result.ok ? result.data : []
   if (!result.ok) toast(result.message, 'error')
-  else memoryPoll = setTimeout(() => { if (state.view === 'memory') void loadMemory() }, 15_000)
+  else memoryPoll = setTimeout(() => { if (showingMemory()) void loadMemory() }, 15_000)
   render()
 }
 
 function memoryView(): Child[] {
   return [
     topbar('记忆', '只读', [button('刷新', () => { void loadMemory() }, { class: 'icon-button' })], backButton('home')),
+    ...memoryContent(),
+  ]
+}
+
+function memoryContent(): Child[] {
+  return [
     ...memoryEntries.map((entry) => el('div', { class: 'card' },
       el('h2', { text: entry.layer === 'global' ? '全局 · 可共享' : (entry.agent || entry.deviceId) + ' · ' + entry.layer }),
       el('p', { text: entry.text }),
@@ -1863,7 +2149,7 @@ function groupsView(): Child[] {
   const header = topbar('群聊', phoneApi() ? '手机凭证' : (account?.name || '未配对'), [
     button('刷新', () => { void loadRooms(true) }, { class: 'icon-button' }),
     phoneApi() ? button('新建', () => { openGroupNew() }, { class: 'icon-button' }) : null,
-  ], backButton('home'))
+  ], backButton(groupsParent))
   if (!account || account.expiresAt <= Date.now()) {
     return [
       header,
@@ -2282,8 +2568,12 @@ async function wipeData(): Promise<void> {
   stream?.close()
   stream = null
   stopGroupPoll()
+  clearTimeout(boardPoll)
   state.config = null
+  applyTheme('system')
   state.api = null
+  boardEdit = null
+  pendingInputs = createPendingInputs()
   state.devices = []
   state.sessions = []
   state.account = null
