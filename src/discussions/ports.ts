@@ -118,12 +118,13 @@ export function createDiscussionPort(options: { llm?: DiscussionLlm; agents?: re
     if (binary.entry === undefined || selected.native === undefined) throw new DiscussionError('unsupported')
     const dir = scratch()
     const workHome = join(dir, 'home')
-    mkdirSync(workHome, { recursive: true, mode: 0o700 })
+    const workTmp = join(workHome, 'tmp')
+    mkdirSync(workTmp, { recursive: true, mode: 0o700 })
     const isReadOnlyWork = work?.readOnly === true
     const canWriteWork = Boolean(work && !isReadOnlyWork)
     // Credentials stay on the same node, in a private temporary home. No user
     // config, hooks, skills, MCP definitions or working history are inherited.
-    // Keep HOME outside the Git worktree so npm/Playwright/macOS caches never pollute patches.
+    // Keep HOME and TMPDIR outside the Git worktree so npm/Playwright/heredoc caches never pollute patches.
     const config = {
       model: selected.public.model, model_catalog_json: join(dir, 'models.json'),
       ...(reasoning === undefined ? {} : { model_reasoning_effort: reasoning }),
@@ -137,6 +138,7 @@ export function createDiscussionPort(options: { llm?: DiscussionLlm; agents?: re
         set: {
           PATH: '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin',
           HOME: workHome,
+          TMPDIR: workTmp,
           npm_config_cache: join(workHome, '.npm'),
           XDG_CACHE_HOME: join(workHome, '.cache'),
         },

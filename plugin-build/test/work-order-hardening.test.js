@@ -504,11 +504,15 @@ test('Bugs #11 & #13: freezePatch excludes .npm/Library cache junk and coding ti
         dispose() {},
         async run(model, prompt, _signal, work) {
             if (model.agent === 'codex' && work) {
-                // Simulate npm/macOS cache pollution inside worktree + real code written before timeout
+                // Simulate npm/macOS/node-compile-cache/xcrun_db pollution inside worktree + real code written before timeout
                 mkdirSync(join(work.workspace, '.npm', '_logs'), { recursive: true });
                 writeFileSync(join(work.workspace, '.npm', '_logs', 'debug.log'), 'noisy npm cache\n');
                 mkdirSync(join(work.workspace, 'Library', 'Caches'), { recursive: true });
                 writeFileSync(join(work.workspace, 'Library', 'Caches', 'tmp.bin'), 'noisy mac cache\n');
+                mkdirSync(join(work.workspace, 'mobile', 'node-compile-cache'), { recursive: true });
+                writeFileSync(join(work.workspace, 'mobile', 'node-compile-cache', 'v8.bin'), 'noisy v8 cache\n');
+                mkdirSync(join(work.workspace, 'mobile', 'xcrun_db'), { recursive: true });
+                writeFileSync(join(work.workspace, 'mobile', 'xcrun_db', 'db.plist'), 'noisy xcrun cache\n');
                 writeFileSync(join(work.workspace, 'src', 'salvaged.js'), 'export const salvaged = 42;\n');
                 throw new DiscussionError('cancelled');
             }
@@ -542,5 +546,11 @@ test('Bugs #11 & #13: freezePatch excludes .npm/Library cache junk and coding ti
     const salvagedPatch = patchStore.read(settled.development.digest);
     assert.ok(salvagedPatch, 'salvaged patch must exist in patchStore');
     assert.match(salvagedPatch, /src\/salvaged\.js/);
-    assert.doesNotMatch(salvagedPatch, /\.npm\/_logs|Library\/Caches/, 'runtime cache directories must be excluded from frozen patch');
+    assert.doesNotMatch(salvagedPatch, /\.npm\/_logs|Library\/Caches|node-compile-cache|xcrun_db/, 'runtime cache directories (root or nested) must be excluded from frozen patch');
+});
+
+test('Bug #14: Codex worktree ports configure writable TMPDIR inside private workHome', () => {
+    const portsJs = readFileSync(new URL('../lib/src/discussions/ports.js', import.meta.url), 'utf8');
+    assert.match(portsJs, /const workTmp = join\(workHome, 'tmp'\)/);
+    assert.match(portsJs, /TMPDIR:\s*workTmp/);
 });

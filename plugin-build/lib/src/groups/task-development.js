@@ -210,12 +210,12 @@ async function isolatedCheckout(path, signal, use, { seedPatch } = {}) {
     }
 }
 
-const IGNORED_WORKTREE_CACHE_SEGMENTS = new Set(['.npm', 'Library', '.cache', '.vite', '.swiftpm', '.toolchain', 'node_modules']);
+const IGNORED_WORKTREE_CACHE_SEGMENTS = new Set(['.npm', 'Library', '.cache', '.vite', '.swiftpm', '.toolchain', 'node_modules', 'node-compile-cache', 'xcrun_db']);
 function isIgnoredWorktreeCachePath(relPath) {
     const normalized = String(relPath || '').replace(/^\/+/, '');
     if (!normalized) return true;
-    const firstSegment = normalized.split('/')[0];
-    return IGNORED_WORKTREE_CACHE_SEGMENTS.has(firstSegment);
+    const segments = normalized.split('/');
+    return segments.some(seg => IGNORED_WORKTREE_CACHE_SEGMENTS.has(seg));
 }
 
 async function freezePatch(worktree, base, signal, patchStore) {
