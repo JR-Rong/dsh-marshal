@@ -134,6 +134,9 @@
         data = await readJson(response);
       }
       if (!response.ok || data?.ok === false) throw requestError(response, data, authenticated);
+      if (body !== undefined && String(path).startsWith('dsh-agents/api/')) {
+        try { window.dispatchEvent(new CustomEvent('marshal:agents-changed')); } catch {}
+      }
       return data;
     }
 
