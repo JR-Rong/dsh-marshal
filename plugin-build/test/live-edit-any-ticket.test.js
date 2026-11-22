@@ -950,7 +950,9 @@ test('shipped client/index.js unlocks Agent switchers & live-steering editor on 
     tree = expand(React.createElement(RegisteredMainPanel, { marshalContext: {}, openPanel() {} }));
 
     // Verify Agent switchers are ENABLED (not disabled!) even while running!
-    const selects = collectAll(tree, n => n.tag === 'select');
+    const drawer = root => collectAll(root, n => n.tag === 'aside' && n.props?.['aria-label'] === '工单详情')[0];
+    assert.ok(drawer(tree), 'running ticket must open the Hub detail drawer');
+    const selects = collectAll(drawer(tree), n => n.tag === 'select');
     const coderModelSelect = selects.find(s => s.props?.['aria-label'] === 'Coder 模型');
     const coderThinkSelect = selects.find(s => s.props?.['aria-label'] === 'Coder 思考模式');
     assert.ok(coderModelSelect && coderThinkSelect);
@@ -997,7 +999,8 @@ test('shipped client/index.js unlocks Agent switchers & live-steering editor on 
     flushEffects();
     tree = expand(React.createElement(RegisteredMainPanel, { marshalContext: {}, openPanel() {} }));
 
-    const failedSelects = collectAll(tree, n => n.tag === 'select');
+    assert.ok(drawer(tree), 'failed ticket must open the Hub detail drawer');
+    const failedSelects = collectAll(drawer(tree), n => n.tag === 'select');
     const plainModelSelect = failedSelects.find(s => s.props?.['aria-label'] === '工单模型');
     const plainThinkSelect = failedSelects.find(s => s.props?.['aria-label'] === '工单思考模式');
     assert.ok(plainModelSelect && plainThinkSelect);

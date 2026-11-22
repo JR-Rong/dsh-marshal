@@ -295,15 +295,15 @@ test('global agents can orchestrate in any target project workspace while permis
 
 test('shipped client .19 delivers 4-tab nav, default tasks landing, dual casual-chat entry, rosters and 3-layer memory', () => {
     const source = readFileSync(new URL('../client/index.js', import.meta.url), 'utf8');
-    assert.ok(source.includes("['tasks', '任务看板']"), 'MarshalNav should list tasks tab');
-    assert.ok(source.includes("['chats', '会话']"), 'MarshalNav should list chats tab');
-    assert.ok(source.includes("['agents', '智能体']"), 'MarshalNav should list agents tab');
-    assert.ok(source.includes("['memory', '记忆']"), 'MarshalNav should list memory tab');
+    assert.ok(source.includes("['tasks', '工单看板']"), 'MarshalNav should list tasks tab');
+    assert.ok(source.includes("['monitor', '问题监控']"), 'MarshalNav should list monitor tab');
+    assert.ok(source.includes("['agents', '智能体与集群']"), 'MarshalNav should list agents tab');
+    assert.ok(source.includes("['memory', '3D 记忆星系']"), 'MarshalNav should list memory tab');
     assert.ok(source.includes("return { tab: 'tasks' };"), 'default landing tab should be tasks');
     assert.ok(source.includes('function AgentDirectChatsView'), 'chats tab should include direct casual chat history view');
     assert.ok(source.includes("fetchJson('marshal/agents/sessions')"), 'client should load agent casual chat history');
     assert.ok(source.includes("fetchJson('marshal/rosters/save'"), 'client should save workspace default rosters');
-    assert.ok(source.includes("fetchJson('marshal/devices/status')"), 'client should poll device status capsule');
+    assert.ok(source.includes("fetchJson('marshal/devices/status', undefined, true, signal)"), 'client should refresh authenticated device status');
     assert.ok(source.includes('全局记忆与审批') && source.includes('智能体私有记忆') && source.includes('工作区共享记忆'), 'MemoryPage should render 3 orthogonal layers');
     assert.ok(source.includes('isPseudoAgentWorkspace'), 'client should hide pseudo Agent · workspaces');
     assert.ok(!source.includes('自动创建「Agent · '), 'creating a new agent must no longer create pseudo Agent · workspaces');

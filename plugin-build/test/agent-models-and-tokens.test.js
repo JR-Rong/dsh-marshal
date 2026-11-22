@@ -849,7 +849,7 @@ test('shipped client/index.js renders per-agent model/thinking switchers in Task
     const coderThinkSelect = byAria('Coder 思考模式');
     const reviewerModelSelect = byAria('Reviewer 模型');
     const reviewerThinkSelect = byAria('Reviewer 思考模式');
-    const codexCodeThinkSelect = byAria('⚙️ Codex · 编码执行子 Agent 思考模式');
+    const codexCodeThinkSelect = byAria('Codex · 编码执行子 Agent 思考模式');
 
     assert.ok(leaderModelSelect && leaderThinkSelect, 'Drawer must render Leader model & thinking mode switchers');
     assert.ok(coderModelSelect && coderThinkSelect, 'Drawer must render Coder model & thinking mode switchers');

@@ -132,7 +132,7 @@
 
     // Pass the currently selected wire attachments to validate the entire
     // selection before uploading. Retain successful uploads on partial failure.
-    async function mvUploadPickerAttachments(e, selected = []) {
+    async function mvUploadPickerAttachments(e, selected = [], signal) {
       const chosen = Array.from(e.target.files || []);
       e.target.value = '';
       for (const file of chosen) {
@@ -146,7 +146,7 @@
         const kind = /^image\/(png|jpeg|webp|gif)$/.test(mediaType) ? 'image' : 'file';
         const qs = new URLSearchParams({ kind, name: file.name || 'attachment', mediaType });
         const response = await fetch(new URL('api/task-board/attachments/upload?' + qs, document.baseURI), {
-          method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/octet-stream' }, body: file,
+          method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/octet-stream' }, body: file, signal,
         });
         const data = await response.json().catch(() => ({}));
         if (!response.ok || !data?.attachment) throw new Error(data?.error || data?.message || ('HTTP ' + response.status));
@@ -193,7 +193,7 @@
     // value/onChange use { links: { sessionIds, proposalIds, docPaths }, attachments }.
     // directAgentSessions opts in to agent-only sessions in its workspace (never globally).
     // resolveMemoryLink(item) may return { key, id } for host-backed memory.
-    function mvCascadeContextPicker({ workspaces, agentKey, agentWorkspaceId, directAgentSessions = false, value, onChange, resolveMemoryLink }) {
+    function mvCascadeContextPicker({ workspaces, agentKey, agentWorkspaceId, directAgentSessions = false, value, onChange, resolveMemoryLink, onUploadState, disableUpload }) {
       const popup = mvUsePickerPopup();
       const [scopeId, setScopeId] = React.useState(null);
       const [kind, setKind] = React.useState('');
@@ -203,6 +203,8 @@
       const [stored, setStored] = React.useState({ links: {}, attachments: [] });
       const [storedRows, setStoredRows] = React.useState(() => new Map());
       const [uploading, setUploading] = React.useState(false);
+      const [uploadFailures, setUploadFailures] = React.useState([]);
+      const [uploadValidation, setUploadValidation] = React.useState('');
       const [error, setError] = React.useState('');
       const [retry, setRetry] = React.useState(0);
       const pending = React.useRef(false);
@@ -217,12 +219,17 @@
         for (const row of rows.values()) if (row.key === key && row.id === id) return true;
         return false;
       };
-      current.current = { links, attachments, onChange, selectedRows };
+      current.current = { links, attachments, onChange, selectedRows, onUploadState };
       React.useEffect(() => {
         const controller = new AbortController();
         lifetime.current = controller;
+        if (pending.current) {
+          pending.current = false;
+          setUploading(false);
+          current.current.onUploadState?.(false);
+        }
         return () => controller.abort();
-      }, []);
+      }, [disableUpload]);
       const commit = (nextLinks, nextAttachments) => {
         const next = { links: nextLinks, attachments: nextAttachments };
         current.current = { ...current.current, ...next };
@@ -274,14 +281,19 @@
         commit({ ...links, [key]: nextIds }, attachments);
       };
       const upload = async e => {
-        if (pending.current) return;
-        pending.current = true;
         const signal = lifetime.current?.signal;
+        if (!signal || signal.aborted || pending.current || disableUpload) return;
+        pending.current = true;
         setUploading(true);
-        setError('');
+        setUploadValidation('');
+        const failures = [];
+        let validation = '';
         try {
-          const uploaded = await mvUploadPickerAttachments(e, current.current.attachments);
+          const request = mvUploadPickerAttachments(e, current.current.attachments, signal);
+          onUploadState?.(true);
+          const uploaded = await request;
           if (signal?.aborted) return;
+          failures.push(...uploaded.errors);
           const latest = current.current;
           const unique = new Map(latest.attachments.map(item => [item.attachmentId, item]));
           for (const item of uploaded.attachments) unique.set(item.attachmentId, item);
@@ -291,9 +303,20 @@
             mvValidatePickerAttachmentBudget(next);
             commit(latest.links, next);
           }
-          if (uploaded.errors.length) setError(uploaded.errors.join('；'));
-        } catch (failure) { if (!signal?.aborted) setError(failure.message || String(failure)); }
-        finally { pending.current = false; if (!signal?.aborted) setUploading(false); }
+        } catch (failure) { validation = failure.message || String(failure); }
+        finally {
+          if (!signal.aborted) {
+            pending.current = false;
+            setUploading(false);
+            // The controlled form owns its failure history and submission guard.
+            if (onUploadState) onUploadState(false, validation ? [...failures, validation] : failures);
+            else {
+              // Without a host submission guard, selection validation is per attempt.
+              setUploadValidation(validation);
+              if (failures.length) setUploadFailures(previous => [...previous, ...failures]);
+            }
+          }
+        }
       };
       const loaded = result?.requestKey === requestKey ? result : null;
       const keyword = query.trim().toLowerCase();
@@ -318,7 +341,7 @@
             mvPickerColumn('上下文类型', scope ? MV_CONTEXT_KINDS.map(([key, label]) => mvPickerChoice(key, label, key === kind,
               () => { setKind(key); setQuery(''); })) : '请选择工作区'),
             mvPickerColumn('选择内容', !scope || !kind ? '请选择上下文类型' : kind === 'files'
-              ? h('label', null, '选择文件', h('input', { type: 'file', multiple: true, disabled: uploading || attachments.length >= MV_ATTACHMENT_LIMIT,
+              ? h('label', null, '选择文件', h('input', { type: 'file', multiple: true, disabled: disableUpload || uploading || attachments.length >= MV_ATTACHMENT_LIMIT,
                 onChange: e => void upload(e) }))
               : h(React.Fragment, null, h('input', { type: 'search', className: 'mv-field', 'aria-label': '筛选上下文',
                 placeholder: '筛选上下文', value: query, onChange: e => setQuery(e.target.value) }),
@@ -337,6 +360,9 @@
                       () => { if (valid) toggle(rowKey, ref, row.label); }, subtitle, !valid);
                   }) : '没有匹配的上下文')))),
         uploading && h('div', { role: 'status' }, '正在上传附件…'),
+        uploadValidation && h('div', { role: 'alert' }, uploadValidation),
+        uploadFailures.length > 0 && h('div', { role: 'alert' }, uploadFailures.join('；'),
+          h(MvButton, { label: '仅保留已上传附件', disabled: uploading, onClick: () => setUploadFailures([]) })),
         error && h('div', { role: 'alert' }, error));
     }
 

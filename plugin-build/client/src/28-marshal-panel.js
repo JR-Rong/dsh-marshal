@@ -1,4 +1,5 @@
-    function MarshalPanel({ marshalContext, openSession, openPanel, mvOpenDirect, workspaceService, SessionProvider, renderSlot }) {
+    function MarshalPanel({ marshalContext, openSession, openPanel, mvOpenDirect, mvStartVoice, SessionProvider, renderSlot }) {
+      React.useEffect(ensureMarshalVnextStyles, []);
       const [attempt, retry] = React.useState(0);
       const initialNav = React.useMemo(() => {
         if (pendingTab) {
@@ -6,35 +7,29 @@
           pendingTab = null;
           return resolved;
         }
-        try {
-          const saved = globalThis.localStorage?.getItem(ACTIVE_TAB_STORAGE_KEY);
-          if (saved && ['tasks', 'chats', 'agents', 'memory'].includes(saved)) return { tab: saved };
-        } catch {}
         return { tab: 'tasks' };
       }, []);
       const [tab, setTab] = React.useState(initialNav.tab);
-      const [chatSection, setChatSection] = React.useState(initialNav.chatSection || 'groups');
+      const [chatSection, setChatSection] = React.useState(initialNav.chatSection || '');
       const [groupSub, setGroupSub] = React.useState(initialNav.groupSub || 'local');
       const [agentSub, setAgentSub] = React.useState(initialNav.agentSub || 'pool');
       const [memoryTarget, setMemoryTarget] = React.useState({ agentId: '', layer: '' });
       const [roomTask, setRoomTask] = React.useState(null);
       const [focusedTask, focusTask] = React.useState('');
-      const [deviceStatus, setDeviceStatus] = React.useState(null);
       const [deviceDrawerOpen, setDeviceDrawerOpen] = React.useState(false);
 
       const chooseTab = value => {
         pendingTab = null;
         const resolved = resolveNavTarget(value);
-        if (resolved.chatSection) setChatSection(resolved.chatSection);
+        setChatSection(resolved.chatSection || '');
+        setRoomTask(null);
         if (resolved.groupSub) setGroupSub(resolved.groupSub);
-        if (resolved.agentSub) setAgentSub(resolved.agentSub);
-        if (value === 'taskRooms') setRoomTask(null);
+        if (resolved.tab === 'agents') setAgentSub(resolved.agentSub || 'pool');
         setTab(resolved.tab);
-        try { globalThis.localStorage?.setItem(ACTIVE_TAB_STORAGE_KEY, resolved.tab); } catch {}
       };
-      const openTaskRoom = task => { setRoomTask(task); setChatSection('taskRooms'); setTab('chats'); };
-      const openBoard = taskId => { focusTask(taskId ?? ''); setTab('tasks'); };
-      const openAgentMemory = agentId => { setMemoryTarget({ agentId, layer: 'agent' }); setTab('memory'); };
+      const openTaskRoom = task => { setRoomTask(task); setChatSection('taskRooms'); setTab('tasks'); };
+      const openBoard = taskId => { focusTask(taskId ?? ''); chooseTab('tasks'); };
+      const openAgentMemory = (agentId, layer = 'agent') => { setMemoryTarget({ agentId, layer }); chooseTab('memory'); };
 
       React.useEffect(() => {
         const onTab = event => { if (event && typeof event.detail === 'string') chooseTab(event.detail); };
@@ -42,26 +37,14 @@
         return () => { window.removeEventListener('marshal:tab', onTab); };
       }, []);
 
-      const refreshDeviceStatus = React.useCallback(() => {
-        fetchJson('marshal/devices/status')
-          .then(next => setDeviceStatus(next))
-          .catch(() => setDeviceStatus(null));
-      }, []);
-
-      React.useEffect(() => {
-        let alive = true;
-        fetchJson('marshal/health')
-          .then(next => { if (alive) setHealth(next); })
-          .catch(() => { if (alive) setHealth(null); });
-        refreshDeviceStatus();
-        const timer = setInterval(refreshDeviceStatus, 15000);
-        return () => { alive = false; clearInterval(timer); };
-      }, [attempt, refreshDeviceStatus]);
+      const [hub, refreshDeviceStatus] = mvUseHubSnapshot(MV_HUB_MONITOR_TOPICS, MV_HUB_CHROME_READS, attempt);
+      const monitorCount = hub.incidents?.totalCount ?? 0;
+      const deviceStatus = hub.devices;
+      const health = hub.health;
 
       const [address, setAddress] = React.useState(null);
       const [setup, setSetup] = React.useState(null);
       const [state, setState] = React.useState({ authenticated: false });
-      const [health, setHealth] = React.useState(null);
       const [binding, setBinding] = React.useState(null);
       const [notice, setNotice] = React.useState('正在连接调度官…');
       const [older, setOlder] = React.useState(null);
@@ -86,8 +69,8 @@
         pending.current.set(id, { resolve, reject, timer });
         connection.current.postMessage({ id, op, args, target });
       });
-      const accountRequest = async action => {
-        const response = await fetch(new URL(`marshal/account/${action}`, document.baseURI), { method: 'POST', headers: { 'x-marshal-account': '1' } });
+      const accountRequest = async (action, signal) => {
+        const response = await fetch(new URL(`marshal/account/${action}`, document.baseURI), { method: 'POST', headers: { 'x-marshal-account': '1' }, signal });
         return response.json();
       };
       const loginAccount = async () => {
@@ -124,8 +107,9 @@
         choices.current.set(targetKey(active.current.target), value); setSelection(value);
         setControlsNotice('已选择，下次发送时应用');
       };
-      const uploadFiles = async event => {
-        const chosen = Array.from(event.target.files || []); event.target.value = '';
+      const uploadFiles = async e => {
+        const chosen = Array.from(e.target.files || []);
+        e.target.value = '';
         const bridge = active.current; if (!bridge || !chosen.length) return;
         if (uploads.current.length + chosen.length > 8 || chosen.some(file => file.size > 10 * 1024 * 1024)) {
           setControlsNotice('每次最多 8 个附件，每个不超过 10 MB'); return;
@@ -192,28 +176,30 @@
           else setNotice('暂时无法连接，请检查插件配置后重试。');
         });
         let checking = false;
-        const checkAccount = async () => {
+        const checkAccount = async signal => {
           if (!accountMode.current || !connection.current || accountBusy.current || checking) return;
           checking = true;
           try {
-            const data = await accountRequest('status');
-            if (abort.signal.aborted) return;
+            const data = await accountRequest('status', signal);
+            if (signal.aborted) return;
             const next = data.ok ? data.accountHash : null;
             if (next !== accountHash.current) {
               accountHash.current = next; disposeSession();
               await invoke('account.logout', { code: data.code || 'account-required' });
-              if (next && !abort.signal.aborted) await loginAccount();
+              if (next && !signal.aborted) await loginAccount();
             }
           } catch (error) {
-            if (!abort.signal.aborted && accountHash.current !== null) {
+            if (!signal.aborted && accountHash.current !== null) {
               accountHash.current = null; disposeSession();
               await invoke('account.logout', { code: 'account-unavailable' }).catch(() => {});
             }
           } finally { checking = false; }
         };
-        const timer = setInterval(checkAccount, 20000); window.addEventListener('focus', checkAccount);
+        const accountRefresh = createVisibleMarshalRefresh(checkAccount);
+        const stop = subscribeMarshalEvents(['ready'], accountRefresh.request);
+        window.addEventListener('focus', accountRefresh.request);
         return () => {
-          clearInterval(timer); window.removeEventListener('focus', checkAccount);
+          stop(); accountRefresh.dispose(); window.removeEventListener('focus', accountRefresh.request);
           abort.abort(); active.current?.dispose(); active.current = null;
           connection.current?.close(); connection.current = null;
           for (const task of pending.current.values()) { clearTimeout(task.timer); task.reject(Error('连接已关闭')); }
@@ -270,15 +256,18 @@
         ['remote', '远端设备会话', '云端与多设备'],
       ];
 
+      if (chatSection === 'taskRooms') return h('div', { className: 'mv-room-fill' },
+        h(MarshalErrorBoundary, { resetKey: 'taskRooms-' + (roomTask?.id || 'archive') },
+          h(MarshalTicketRoomView, { key: roomTask?.id ?? 'archive', task: roomTask, openBoard, onOpenAgents: () => chooseTab('agents') })));
       if (setup) return h(Setup, { initial: setup, onReady: () => retry(value => value + 1) });
-      return h('section', { 'aria-label': '调度官', style: { flex: 1, height: '100%', minHeight: 0, width: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden', background: 'var(--dsw-alias-bg-base, transparent)', color: 'var(--dsw-alias-label-primary, inherit)' } },
+      return h('section', { 'aria-label': '调度官', className: 'mv-scope', style: { flex: 1, height: '100%', minHeight: 0, width: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden', background: 'var(--dsw-alias-bg-base, transparent)', color: 'var(--dsw-alias-label-primary, inherit)' } },
         h('header', { style: { padding: '10px 18px', minHeight: 52, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, borderBottom: '1px solid #8883', flexShrink: 0 } },
           h('div', { style: { display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 } },
             h(MarshalIcon),
             h('h1', { style: { fontSize: 15, fontWeight: 600, margin: 0, whiteSpace: 'nowrap' } }, '调度官'),
             state.account && h('span', { style: { fontSize: 11, opacity: .55, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } }, state.account.name + (state.workspaceName ? ' · ' + state.workspaceName : ''))),
           h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' } },
-            h(MarshalNav, { active: tab, onTab: chooseTab, compact: true }),
+            h(MarshalNav, { active: tab, onTab: chooseTab, compact: true, monitorCount }),
             health && (!health.capabilities?.agents || !health.capabilities?.taskBoard) && h('span', { style: { fontSize: 11, color: dswTheme.danger } },
               '缺少：' + [!health.capabilities?.agents ? '智能体后端' : '', !health.capabilities?.taskBoard ? '任务看板后端' : ''].filter(Boolean).join('、')),
             h('button', {
@@ -289,15 +278,15 @@
             },
               h('span', { style: { width: 7, height: 7, borderRadius: '50%', background: deviceDotColor, flexShrink: 0 } }),
               h('span', null, deviceLabel)))),
-        tab === 'tasks' && h('div', { style: { flex: 1, minHeight: 0, minWidth: 0, width: '100%', overflow: 'hidden', display: 'flex' } },
+        tab === 'tasks' && !chatSection && h('div', { style: { flex: 1, minHeight: 0, minWidth: 0, width: '100%', overflow: 'hidden', display: 'flex' } },
           h(MarshalErrorBoundary, { resetKey: 'tasks' },
-            h(TaskBoardPage, { openSession, openTaskRoom, focusedTask, openNativeBoard: openPanel ? () => openPanel('task-board') : undefined, onOpenRosters: () => chooseTab('rosters') }))),
-        tab === 'chats' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex', overflow: 'hidden' } },
+            h(MarshalHubKanbanView, { openSession, openTaskRoom, focusedTask, openNativeBoard: openPanel ? () => openPanel('task-board') : undefined, onOpenRosters: () => chooseTab('rosters') }))),
+        chatSection && h('div', { style: { flex: 1, minHeight: 0, display: 'flex', overflow: 'hidden' } },
           h('nav', { 'aria-label': '会话分类', style: { width: 168, flexShrink: 0, borderRight: '1px solid ' + dswTheme.border, padding: 10, display: 'flex', flexDirection: 'column', gap: 4, background: 'color-mix(in srgb, currentColor 2%, transparent)' } },
             chatSections.map(([key, label, hint]) => h('button', {
               key, type: 'button', 'aria-pressed': chatSection === key,
               style: { ...tabStyle(chatSection === key), textAlign: 'left', padding: '9px 10px', display: 'grid', gap: 2 },
-              onClick: () => { if (key === 'taskRooms') setRoomTask(null); setChatSection(key); },
+              onClick: () => { chooseTab(key); },
             },
               h('span', { style: { fontSize: 13, fontWeight: chatSection === key ? 600 : 500 } }, label),
               h('span', { style: { fontSize: 10, opacity: .6 } }, hint)))),
@@ -310,8 +299,6 @@
                 groupSub === 'local'
                   ? h(GroupsPage, { openSession, onOpenAgents: () => chooseTab('agents') })
                   : h(CrossGroupsPage))),
-            chatSection === 'taskRooms' && h(MarshalErrorBoundary, { resetKey: 'taskRooms-' + (roomTask?.id || 'archive') },
-              h(MarshalTicketRoomView, { key: roomTask?.id ?? 'archive', task: roomTask, openBoard, onOpenAgents: () => chooseTab('agents') })),
             chatSection === 'direct' && h(MarshalErrorBoundary, { resetKey: 'direct' },
               h(AgentDirectChatsView, { openSession, mvOpenDirect, onOpenAgents: () => chooseTab('agents') })),
             chatSection === 'remote' && h('div', { style: { display: 'flex', flex: 1, minHeight: 0 } },
@@ -343,10 +330,12 @@
                   : h('p', { style: { margin: 'auto', opacity: .55 } }, notice || '选择一个远端会话，继续工作'),
                 h(Statistics, { value: state.statistics, agent: state.target?.agent })),
               !address && h('p', { role: 'status', style: { margin: 'auto', padding: 24 } }, notice)))),
-        tab === 'agents' && h('div', { style: { flex: 1, minHeight: 0, minWidth: 0, width: '100%', overflow: 'hidden', display: 'flex' } },
-          h(MarshalErrorBoundary, { resetKey: 'agents' },
-            h(AgentsPage, { onOpenChats: () => chooseTab('chats'), onOpenMemory: openAgentMemory, openSession, mvOpenDirect, workspaceService, initialSubTab: agentSub }))),
-        tab === 'memory' && h('div', { style: { flex: 1, minHeight: 0, minWidth: 0, width: '100%', overflow: 'hidden', display: 'flex' } },
+        tab === 'agents' && !chatSection && h(MarshalErrorBoundary, { resetKey: 'agents' },
+          h(MarshalHubAgentsView, { key: agentSub, onOpenChats: () => chooseTab('direct'), onOpenMemory: openAgentMemory,
+            openSession, mvOpenDirect, onStartVoice: mvStartVoice, initialSubTab: agentSub })),
+        tab === 'monitor' && h(MarshalErrorBoundary, { resetKey: 'monitor' },
+          h(MarshalHubMonitorView, { openTaskRoom, onOpenMemory: openAgentMemory, onOpenDirect: mvOpenDirect })),
+        tab === 'memory' && h('div', { className: 'mv-room-fill' },
           h(MarshalErrorBoundary, { resetKey: 'memory' },
             h(MemoryPage, { initialAgentId: memoryTarget.agentId, initialLayer: memoryTarget.layer, mvOpenDirect }))),
         h(DeviceStatusDrawer, {
@@ -354,6 +343,6 @@
           onClose: () => setDeviceDrawerOpen(false),
           status: deviceStatus,
           onRefresh: () => { retry(v => v + 1); refreshDeviceStatus(); },
-          onOpenRemote: () => { setChatSection('remote'); setTab('chats'); },
+          onOpenRemote: () => chooseTab('remote'),
         }));
     }

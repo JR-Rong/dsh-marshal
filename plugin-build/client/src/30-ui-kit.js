@@ -145,12 +145,12 @@
       return team.name === AGENT_TEAM_NAME || team.name.startsWith(AGENT_TEAM_PREFIX);
     }
 
-    async function loadAgentLibrary() {
-      const state = await fetchJson('dsh-agents/api/state');
+    async function loadAgentLibrary(signal, mvAllTeams = false) {
+      const state = await fetchJson('dsh-agents/api/state', undefined, false, signal);
       const workspaces = state.workspaces || [];
       const agents = [];
       for (const team of state.teams || []) {
-        if (!isAgentTeam(team)) continue;
+        if (!mvAllTeams && !isAgentTeam(team)) continue;
         for (const member of team.members || []) {
           agents.push({
             ...member,
@@ -280,17 +280,16 @@
       const schedule = () => { requestAnimationFrame(() => { apply(); }); };
       const observer = new MutationObserver(schedule);
       observer.observe(document.body, { childList: true, subtree: true });
-      setInterval(apply, 1500);
       apply();
     }
 
-    function MarshalNav({ active, onTab, compact = false }) {
+    function MarshalNav({ active, onTab, compact = false, monitorCount = 0 }) {
       const normalized = resolveNavTarget(active).tab;
       const tabs = [
-        ['tasks', '任务看板'],
-        ['chats', '会话'],
-        ['agents', '智能体'],
-        ['memory', '记忆'],
+        ['tasks', '工单看板'],
+        ['monitor', '问题监控'],
+        ['memory', '3D 记忆星系'],
+        ['agents', '智能体与集群'],
       ];
       return h('div', {
         id: 'marshal-quick-nav',
@@ -305,6 +304,7 @@
       },
         tabs.map(([key, label]) => h('button', {
           key, type: 'button', 'aria-pressed': normalized === key,
+          'aria-label': key === 'monitor' && monitorCount > 0 ? label + '，' + monitorCount + ' 条告警' : label,
           style: {
             border: 0, borderRadius: 999, cursor: 'pointer', whiteSpace: 'nowrap',
             font: (compact ? '11px/1' : '12px/1') + ' inherit',
@@ -314,7 +314,7 @@
             transition: 'background .15s ease',
           },
           onClick: () => onTab(key),
-        }, label)));
+        }, label, key === 'monitor' && monitorCount > 0 && h('span', { className: 'mv-badge', 'aria-hidden': true, style: { marginInlineStart: 'var(--mv-xs, 4px)' } }, monitorCount))));
     }
 
     function Field({ label, children }) {

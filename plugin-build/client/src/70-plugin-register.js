@@ -93,7 +93,7 @@
           mvDirectLookups.set(key, request);
           return request;
         };
-        let mvNativeDirect;
+        let mvNativeDirect, mvStartVoice;
         const MarshalDesktopPanel = props => {
           // The default panel still works on hosts without the vNext sidebar slots.
           const route = typeof React.useSyncExternalStore === 'function' ? useMvSnapshot(routes) : null;
@@ -102,7 +102,7 @@
           const key = kind + ':' + (item.agentKey ?? item.id);
           return h('div', { className: 'mv-scope mv-stack mv-routed' },
             h('header', { className: 'mv-line' }, h(MvButton, { icon: 'back', label: '返回调度官', onClick: () => routes.set(null) })),
-            h(MarshalErrorBoundary, { resetKey: key },
+            h(MarshalErrorBoundary, { resetKey: kind === 'taskRooms' ? 'taskRooms-' + (item.taskId || 'archive') : key },
               h('div', { className: 'mv-room-fill' },
                 kind === 'taskRooms' ? h(MarshalTicketRoomView, { key, task: { id: item.taskId, title: item.title, taskRoom: item }, openBoard: () => goTab('tasks') })
                   : kind === 'direct' ? h(AgentDirectChatsView, { key, initialAgentId: item.agentId, openSession: props.openSession,
@@ -113,13 +113,14 @@
             name: 'conversation.session.header.actions',
             id: 'marshal-quick-nav',
             order: 40,
-          }, () => h(MarshalNav, { active: 'chats', onTab: goTab, compact: true }));
+          }, () => h(MarshalNav, { active: 'agents', onTab: goTab, compact: true }));
         register({ name: 'main', key: PANEL,
           children: { 'marshal.native.body': { kind: 'single', scope: 'session' } },
           inject: () => ({
             marshalContext: desktopContext ?? nativeContext ?? ctx,
             openSession: sessionId => openSessionRef.current?.(sessionId),
             mvOpenDirect: agent => mvNativeDirect?.(agent),
+            mvStartVoice: agent => mvStartVoice?.(agent),
             openPanel,
             workspaceService: () => {
               if (workspacesRef.current) return workspacesRef.current;
@@ -162,6 +163,7 @@
             track(sidebar, lifetime);
             track(target, lifetime);
             const voiceLayer = createMvStore(null);
+            mvStartVoice = agent => voiceLayer.getSnapshot()?.start(agent);
             const idleVoice = createMvStore(mvVoiceIdle);
             const runtime = mvCreateAgentTasks();
             track(runtime, lifetime);
@@ -270,6 +272,7 @@
               closed = true;
               mvDockMounted = false;
               mvNativeDirect = undefined;
+              mvStartVoice = undefined;
               mvCancelNative?.();
               mvCancelNative = undefined;
               voiceLayer.getSnapshot()?.dispose();

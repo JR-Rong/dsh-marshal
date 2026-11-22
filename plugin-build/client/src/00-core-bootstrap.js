@@ -1,5 +1,4 @@
     let pendingTab = null;
-    const ACTIVE_TAB_STORAGE_KEY = 'marshal.activeTab.v2';
     function isPseudoAgentWorkspace(ws) {
       if (!ws) return false;
       const title = String(ws.title || ws.name || '').trim();
@@ -10,12 +9,13 @@
     }
     function resolveNavTarget(raw) {
       if (raw === 'tasks') return { tab: 'tasks' };
-      if (raw === 'chats') return { tab: 'chats' };
-      if (raw === 'groups') return { tab: 'chats', chatSection: 'groups', groupSub: 'local' };
-      if (raw === 'cross') return { tab: 'chats', chatSection: 'groups', groupSub: 'cross' };
-      if (raw === 'taskRooms') return { tab: 'chats', chatSection: 'taskRooms' };
-      if (raw === 'direct') return { tab: 'chats', chatSection: 'direct' };
-      if (raw === 'session' || raw === 'remote') return { tab: 'chats', chatSection: 'remote' };
+      if (raw === 'monitor') return { tab: 'monitor' };
+      if (raw === 'chats') return { tab: 'agents', chatSection: 'groups' };
+      if (raw === 'groups') return { tab: 'agents', chatSection: 'groups', groupSub: 'local' };
+      if (raw === 'cross') return { tab: 'agents', chatSection: 'groups', groupSub: 'cross' };
+      if (raw === 'taskRooms') return { tab: 'tasks', chatSection: 'taskRooms' };
+      if (raw === 'direct') return { tab: 'agents', chatSection: 'direct' };
+      if (raw === 'session' || raw === 'remote') return { tab: 'agents', chatSection: 'remote' };
       if (raw === 'agents') return { tab: 'agents' };
       if (raw === 'rosters') return { tab: 'agents', agentSub: 'rosters' };
       if (raw === 'memory') return { tab: 'memory' };
