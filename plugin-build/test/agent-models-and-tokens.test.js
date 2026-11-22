@@ -491,6 +491,7 @@ test('shipped client/index.js renders per-agent model/thinking switchers in Task
 
     // Minimal stateful React hooks runtime to execute and inspect real component VDOM trees
     function createMiniReact() {
+        let nextId = 0;
         let currentHookIdx = 0;
         let currentInstance = null;
         const pendingEffects = [];
@@ -531,6 +532,13 @@ test('shipped client/index.js renders per-agent model/thinking switchers in Task
             useCallback(fn) {
                 currentHookIdx++;
                 return fn;
+            },
+            useId() {
+                const idx = currentHookIdx++;
+                return currentInstance.hooks[idx] ??= 'mini-' + nextId++;
+            },
+            useLayoutEffect(fn, deps) {
+                React.useEffect(fn, deps);
             },
             useEffect(fn, deps) {
                 const inst = currentInstance;
@@ -880,5 +888,5 @@ test('shipped client/index.js renders per-agent model/thinking switchers in Task
     assert.match(fullRoomText, /5\.4k tok \(入 4\.5k · 出 900\)/, 'Persisted 丞相 bubble must render formatted token badge');
     assert.match(fullRoomText, /2\.5k tok \(入 2\.1k · 出 400\)/, 'Live 工部尚书 bubble must render live token badge');
     assert.match(fullRoomText, /累计 7\.9k tok/, 'Room header must render cumulative token total across agents');
-    assert.match(fullRoomText, /@丞相· Leader· 🪙5\.4k/, '@角色 chip must display per-agent cumulative token count');
+    assert.match(fullRoomText, /@丞相\s*·\s*Leader\s*·\s*5\.4k/, '@角色 chip must display per-agent cumulative token count');
 });

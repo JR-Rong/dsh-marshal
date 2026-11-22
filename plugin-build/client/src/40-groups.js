@@ -1,9 +1,17 @@
+    // Reuse the sidebar helpers without changing the sidebar entry points.
+    function mvValidateSidebarGroupMentions(text, group, cross) {
+      return validateSidebarGroupMentions(text, group, cross);
+    }
+    function mvCrossGroupDeliveryError(result) {
+      return marshalCrossGroupDeliveryError(result);
+    }
+
     function GroupsPage({ openSession, onOpenAgents }) {
       const [state, setState] = React.useState(null);
       const [library, setLibrary] = React.useState(null);
       const [selected, setSelected] = React.useState(null);
-      const [group, setGroup] = React.useState(null);
-      const [text, setText] = React.useState('');
+      const [loadedGroup, setGroup] = React.useState(null);
+      const group = loadedGroup?.id === selected ? loadedGroup : null;
       const [error, setError] = React.useState('');
       const [busy, setBusy] = React.useState(false);
       const [notice, setNotice] = React.useState('');
@@ -15,36 +23,32 @@
       const agents = library && Array.isArray(library.agents) ? library.agents : [];
       const groups = (state && state.groups) || [];
 
-      const load = async (isAlive = () => true) => {
-        try {
-          const [groupsState, agentLibrary] = await Promise.all([fetchJson('marshal/groups/state'), loadAgentLibrary()]);
-          if (!isAlive()) return;
-          setState(groupsState);
-          setLibrary(agentLibrary);
-          setError('');
-        }
-        catch (e) { if (isAlive()) setError(friendlyError(e, '智能体/群聊')); }
-      };
-      const reloadGroup = async () => {
-        if (!group) return;
-        const fresh = await fetchJson('marshal/groups/get?id=' + encodeURIComponent(group.id));
-        setGroup(fresh.group);
-      };
+      const listRefresh = React.useRef(null);
+      const detailRefresh = React.useRef(null);
+      const load = () => listRefresh.current?.request();
+      const reloadGroup = () => detailRefresh.current?.request();
       React.useEffect(() => {
-        let alive = true;
-        const unsubscribe = subscribeMarshalEvents(['ready', 'groups.changed', 'agents.changed'],
-          () => load(() => alive), { initial: true, debounceMs: 80 });
-        return () => { alive = false; unsubscribe(); };
+        const refresh = createVisibleMarshalRefresh(async signal => {
+          try {
+            const [groupsState, agentLibrary] = await Promise.all([fetchJson('marshal/groups/state', undefined, true, signal), loadAgentLibrary()]);
+            if (!signal.aborted) { setState(groupsState); setLibrary(agentLibrary); }
+          } catch (e) { if (!signal.aborted) setError(friendlyError(e, '智能体/群聊')); }
+        });
+        listRefresh.current = refresh;
+        const unsubscribe = subscribeMarshalEvents(['ready', 'groups.changed', 'agents.changed'], refresh.request, { initial: true, debounceMs: 80 });
+        return () => { listRefresh.current = null; unsubscribe(); refresh.dispose(); };
       }, []);
       React.useEffect(() => {
-        if (!selected) { setGroup(null); return; }
-        let alive = true;
-        const pull = () =>
-          fetchJson('marshal/groups/get?id=' + encodeURIComponent(selected))
-            .then(data => { if (alive) setGroup(data.group); })
-            .catch(e => { if (alive) setError('读取群失败：' + (e.message || e)); });
-        const unsubscribe = subscribeMarshalEvents(['ready', 'groups.changed'], pull, { initial: true, debounceMs: 80 });
-        return () => { alive = false; unsubscribe(); };
+        if (!selected) return;
+        const refresh = createVisibleMarshalRefresh(async signal => {
+          try {
+            const data = await fetchJson('marshal/groups/get?' + new URLSearchParams({ id: selected }), undefined, true, signal);
+            if (!signal.aborted) setGroup(data.group);
+          } catch (e) { if (!signal.aborted) setError('读取群失败：' + e.message); }
+        });
+        detailRefresh.current = refresh;
+        const unsubscribe = subscribeMarshalEvents(['ready', 'groups.changed', 'agents.changed'], refresh.request, { initial: true, debounceMs: 80 });
+        return () => { detailRefresh.current = null; unsubscribe(); refresh.dispose(); };
       }, [selected]);
 
       const create = async () => {
@@ -67,13 +71,13 @@
           }));
           const leader = chosen.find(agent => agent.id === (leaderId || chosen[0].id)) || chosen[0];
           const leaderKey = deviceId + '/' + leader.squadId + '/' + leader.id;
-          const created = await fetchJson('marshal/groups/create', { name: draftName.trim(), members, leaderKey });
+          const created = await fetchJson('marshal/groups/create', { name: draftName.trim(), members, leaderKey }, true);
           const id = created.group.id;
           for (const agent of chosen) {
             try {
               const run = await fetchJson('dsh-agents/api/run', { teamId: agent.squadId, memberId: agent.id });
               const sessionId = run && run.run && run.run.sessionId;
-              if (sessionId) await fetchJson('marshal/groups/bind', { id, key: deviceId + '/' + agent.squadId + '/' + agent.id, sessionId });
+              if (sessionId) await fetchJson('marshal/groups/bind', { id, key: deviceId + '/' + agent.squadId + '/' + agent.id, sessionId }, true);
             }
             catch (e) { setError('会话创建失败（' + agent.name + '）：' + (e.message || e)); }
           }
@@ -88,24 +92,22 @@
         finally { setCreating(false); }
       };
 
-      const send = async () => {
-        if (!group || !text.trim()) return;
-        setBusy(true);
-        setError('');
-        try {
-          const result = await fetchJson('marshal/groups/send', { id: group.id, text });
-          if (result && result.error === 'leader-unavailable') {
-            throw new Error('leader 所在设备离线，这个群暂时不可用');
-          }
-          if (result && Array.isArray(result.offline) && result.offline.length > 0) {
-            setNotice('成员离线：' + result.offline.join('、') + (result.fallback ? '；已通知 leader 新建临时智能体或改派' : ''));
-          }
-          setText('');
-          await reloadGroup();
-          setState(await fetchJson('marshal/groups/state'));
-        }
-        catch (e) { setError('发送失败：' + (e.message || e)); }
-        finally { setBusy(false); }
+      const send = async (text, context) => {
+        const mentions = mvValidateSidebarGroupMentions(text, group, false);
+        const result = await fetchJson('marshal/groups/send', { id: group.id, text: mvChatWireText(text, context), mentions }, true);
+        if (result?.error === 'leader-unavailable') throw new Error('群主所在设备离线，这个群暂时不可用');
+        if (result?.offline?.length) setNotice('成员离线：' + result.offline.join('、'));
+        void reloadGroup();
+        void load();
+      };
+      const changeModel = async ({ agentId, model, reasoningEffort }) => {
+        const member = group.members.find(row => mvChatMemberId(row) === agentId);
+        const agent = agents.find(row => row.id === member?.memberId && row.squadId === member?.squadId);
+        if (!agent) throw new Error('只能更新本机智能体的默认模型与思考。');
+        const { id, name, brief, preset, permission } = agent;
+        await fetchJson('dsh-agents/api/member', { teamId: agent.squadId, member: { id, name, brief, preset, permission, model, reasoningEffort } });
+        setNotice('已更新智能体默认模型与思考；现有常驻会话不受影响。');
+        void load();
       };
 
       const convertToTask = async (message) => {
@@ -114,7 +116,7 @@
         setError('');
         setNotice('');
         try {
-          const data = await fetchJson('marshal/groups/task', { id: group.id, messageId: message.id });
+          const data = await fetchJson('marshal/groups/task', { id: group.id, messageId: message.id }, true);
           setNotice('已创建任务：' + ((data && data.task && data.task.title) || ''));
           await reloadGroup();
         }
@@ -123,7 +125,7 @@
       };
 
       const ensureSession = async (member) => {
-        if (!group || !library) return;
+        if (!group || !library || busy) return;
         setBusy(true);
         setError('');
         try {
@@ -131,7 +133,7 @@
           const run = await fetchJson('dsh-agents/api/run', { teamId: member.squadId, memberId: member.memberId });
           const sessionId = run && run.run && run.run.sessionId;
           if (!sessionId) throw new Error('no-session');
-          await fetchJson('marshal/groups/bind', { id: group.id, key, sessionId });
+          await fetchJson('marshal/groups/bind', { id: group.id, key, sessionId }, true);
           await reloadGroup();
         }
         catch (e) { setError('创建会话失败：' + (e.message || e)); }
@@ -150,34 +152,6 @@
           h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, item.name),
           h('span', { style: { fontSize: 11, color: dswTheme.faint, flexShrink: 0 } }, item.memberCount + ' 人')),
         h('div', { style: { fontSize: 11, color: dswTheme.faint, marginTop: 3 } }, item.messageCount + ' 条消息' + (item.mode === 'discussion' ? ' · 讨论' : '')));
-
-      const memberChip = member => h('button', {
-        key: member.memberId, type: 'button',
-        onClick: () => { if (member.sessionId) { if (openSession) openSession(member.sessionId); } else void ensureSession(member); },
-        style: {
-          display: 'inline-flex', alignItems: 'center', gap: 6, border: '1px solid ' + dswTheme.border2,
-          background: 'transparent', color: dswTheme.text, borderRadius: 999, padding: '4px 10px 4px 4px',
-          fontSize: 12, cursor: 'pointer', fontFamily: 'inherit',
-        },
-      }, h(Avatar, { name: member.name, size: 22 }), member.name,
-        h('span', { style: { color: member.sessionId ? dswTheme.faint : dswTheme.brand, fontSize: 11 } }, member.sessionId ? '打开' : '建会话'));
-
-      const messageView = message => {
-        const mine = message.author === 'user';
-        const name = mine ? '我' : ((group && group.members.find(member => member.memberId === message.authorMemberId)) || {}).name || '成员';
-        return h('div', { key: message.id, style: { display: 'flex', gap: 10, alignItems: 'flex-start', flexDirection: mine ? 'row-reverse' : 'row' } },
-          h(Avatar, { name, size: 28 }),
-          h('div', { style: { maxWidth: '74%' } },
-            h('div', { style: { fontSize: 11, color: dswTheme.faint, marginBottom: 4, textAlign: mine ? 'right' : 'left' } },
-              name + ' · ' + new Date(message.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })),
-            h('div', { style: { padding: '9px 12px', borderRadius: 12, background: mine ? dswTheme.layer3 : dswTheme.layer, border: '1px solid ' + dswTheme.border, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontSize: 13, lineHeight: 1.6 } }, message.text),
-            h('div', { style: { display: 'flex', gap: 8, alignItems: 'center', marginTop: 4, justifyContent: mine ? 'flex-end' : 'flex-start' } },
-              message.deliveries && message.deliveries.length > 0 && h('span', { style: { fontSize: 11, color: dswTheme.faint } },
-                message.deliveries.map(delivery => delivery.memberKey.split('/').pop() + (delivery.state === 'accepted' ? ' ✓' : ' ✕ ' + (delivery.code || ''))).join('  ')),
-              mine && (message.taskId
-                ? h('span', { style: { fontSize: 11, color: dswTheme.faint } }, '已建任务')
-                : h('button', { type: 'button', style: { ...uiButton(false), padding: '2px 8px', fontSize: 11 }, onClick: () => { void convertToTask(message); } }, '变任务')))));
-      };
 
       const createDialog = () => h('div', { style: { position: 'absolute', inset: 0, background: 'rgba(0,0,0,.48)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 20, padding: 20 } },
         h('div', { role: 'dialog', 'aria-label': '新建群聊', style: { width: 480, maxWidth: '100%', maxHeight: '86%', overflow: 'auto', background: dswTheme.layer, border: '1px solid ' + dswTheme.border2, borderRadius: 14, padding: 20, boxShadow: '0 24px 60px rgba(0,0,0,.45)' } },
@@ -212,13 +186,13 @@
             h('button', { type: 'button', style: uiButton(false), onClick: () => setCreateOpen(false) }, '取消'),
             h('button', { type: 'button', disabled: creating, style: { ...uiButton(true), opacity: creating ? .6 : 1 }, onClick: () => { void create(); } }, creating ? '创建中…' : '创建并开会话'))));
 
-      return h('section', { style: { flex: 1, minHeight: 0, display: 'flex', position: 'relative', background: dswTheme.bg, color: dswTheme.text } },
+      return h('section', { className: 'mv-scope mv-room-fill', style: { position: 'relative' }, 'aria-label': '群聊' },
         h('aside', { style: { width: 292, flexShrink: 0, background: dswTheme.layer, borderRight: '1px solid ' + dswTheme.border, display: 'flex', flexDirection: 'column', minHeight: 0 } },
           h('div', { style: { padding: '14px 14px 10px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' } },
             h('div', null,
               h('div', { style: { fontSize: 13, fontWeight: 600 } }, '群聊'),
               h('div', { style: uiMuted }, groups.length + ' 个会话')),
-            h('button', { type: 'button', style: uiButton(true), onClick: () => setCreateOpen(true) }, '＋ 新建')),
+            h('button', { type: 'button', style: uiButton(true), onClick: () => setCreateOpen(true) }, '新建')),
           h('div', { style: { flex: 1, overflow: 'auto', padding: '2px 8px 10px' } },
             groups.map(groupRow),
             groups.length === 0 && h('p', { style: { ...uiMuted, padding: '10px 6px' } }, '还没有群聊')),
@@ -228,20 +202,15 @@
         h('main', { style: { flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', minHeight: 0 } },
           error && h('div', { style: { padding: '8px 18px', fontSize: 12, color: dswTheme.danger, borderBottom: '1px solid ' + dswTheme.border } }, error),
           group
-            ? h('div', { style: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' } },
-                h('header', { style: { padding: '14px 20px', borderBottom: '1px solid ' + dswTheme.border, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexShrink: 0 } },
-                  h('div', null,
-                    h('div', { style: { fontSize: 15, fontWeight: 600 } }, group.name),
-                    h('div', { style: uiMuted }, group.members.length + ' 个智能体 · 不 @ 由 leader 回')),
-                  h('button', { type: 'button', style: uiButton(false), onClick: () => { void reloadGroup(); } }, '刷新')),
-                h('div', { style: { padding: '10px 20px', display: 'flex', gap: 8, flexWrap: 'wrap', borderBottom: '1px solid ' + dswTheme.border, flexShrink: 0 } }, group.members.map(memberChip)),
-                h('div', { style: { flex: 1, minHeight: 0, overflow: 'auto', padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 14 } },
-                  (group.messages || []).length === 0
-                    ? h('div', { style: { margin: 'auto', textAlign: 'center', color: dswTheme.faint, fontSize: 12, lineHeight: 1.8 } }, '还没有消息', h('br'), '@ 某个智能体，或直接说话让 leader 接。')
-                    : (group.messages || []).map(messageView)),
-                h('div', { style: { padding: '12px 20px', borderTop: '1px solid ' + dswTheme.border, display: 'flex', gap: 10, alignItems: 'flex-end', flexShrink: 0 } },
-                  h('textarea', { value: text, onChange: event => setText(event.target.value), rows: 2, placeholder: '@成员名 或 @all；不 @ 时由 leader 回', style: { ...uiInput, flex: 1, resize: 'none', minHeight: 44, lineHeight: 1.5 } }),
-                  h('button', { type: 'button', disabled: busy || !text.trim(), style: { ...uiButton(true), opacity: busy || !text.trim() ? .5 : 1 }, onClick: () => { void send(); } }, '发送')))
+            ? h(mvGroupConversation, { key: group.id, group, onSend: send, changeModel,
+                members: group.members.map(member => {
+                  const agent = agents.find(row => row.id === member.memberId && row.squadId === member.squadId);
+                  const model = agent?.model || member.model;
+                  return { ...member, model, reasoningEffort: agent?.reasoningEffort || member.reasoningEffort,
+                    models: agent ? mvChatModelsWithCurrent(mvChatModels(library?.models), model) : [] };
+                }), onMember: member => member.sessionId ? openSession?.(member.sessionId) : ensureSession(member),
+                onRebuildSession: ensureSession,
+                onTask: convertToTask, busy, notice }, mvGroupRefreshButton(reloadGroup))
             : h(EmptyState, { title: '选择一个群聊', hint: '群里的智能体各自有一个常驻会话。\n@ 谁谁回，@all 全体回，不 @ 由 leader 回。', action: '新建群聊', onAction: () => setCreateOpen(true) })),
         createOpen && createDialog());
     }
@@ -256,13 +225,8 @@
       const [createOpen, setCreateOpen] = React.useState(false);
       const [name, setName] = React.useState('');
       const [picked, setPicked] = React.useState({});
-      const [text, setText] = React.useState('');
       const [busy, setBusy] = React.useState(false);
-      const [, setTick] = React.useState(0);
       const refreshRef = React.useRef(null);
-      const reveal = React.useRef(new Map());
-      const seenMessages = React.useRef(false);
-      const lastGroupId = React.useRef('');
       const groups = (state && state.groups) || [];
       const group = groups.find(item => item.id === selected) || null;
       const devices = (catalog && catalog.devices) || [];
@@ -271,8 +235,8 @@
         // The local SSE stream does not relay changes made on the Hub.
         const refresh = createVisibleMarshalRefresh(async signal => {
           const [nextState, nextCatalog] = await Promise.allSettled([
-            fetchJson('marshal/cross-groups/state', undefined, false, signal),
-            fetchJson('marshal/cross-groups/catalog', undefined, false, signal),
+            fetchJson('marshal/cross-groups/state', undefined, true, signal),
+            fetchJson('marshal/cross-groups/catalog', undefined, true, signal),
           ]);
           if (signal.aborted) return;
           if (nextState.status === 'fulfilled') setState(nextState.value);
@@ -291,41 +255,6 @@
         };
       }, []);
       const load = () => refreshRef.current?.request();
-      const messageSignature = group === null ? '' : group.messages.map(message => message.id + ':' + message.text.length).join(',');
-      React.useEffect(() => {
-        if (group === null) return;
-        const map = reveal.current;
-        if (lastGroupId.current !== group.id) {
-          lastGroupId.current = group.id;
-          map.clear();
-          for (const message of group.messages) map.set(message.id, message.text.length);
-          seenMessages.current = true;
-          setTick(value => value + 1);
-          return;
-        }
-        if (!seenMessages.current) {
-          for (const message of group.messages) map.set(message.id, message.text.length);
-          seenMessages.current = true;
-          setTick(value => value + 1);
-          return;
-        }
-        for (const message of group.messages) {
-          if (!map.has(message.id)) map.set(message.id, message.streaming === true ? message.text.length : 0);
-        }
-        const timer = setInterval(() => {
-          let changed = false;
-          for (const message of group.messages) {
-            const target = message.text.length;
-            const current = map.get(message.id) ?? target;
-            if (current >= target) continue;
-            map.set(message.id, Math.min(target, current + 2));
-            changed = true;
-          }
-          if (changed) setTick(value => value + 1);
-        }, 25);
-        return () => clearInterval(timer);
-      }, [group === null ? '' : group.id, messageSignature]);
-
       const candidates = [];
       for (const device of devices) {
         for (const member of device.members || []) {
@@ -343,7 +272,7 @@
           const data = await fetchJson('marshal/cross-groups/create', {
             name: name.trim(),
             members: members.map(item => ({ deviceId: item.deviceId, agent: item.agent, sessionId: item.sessionId, name: item.name })),
-          });
+          }, true);
           setSelected(data.group.id);
           setCreateOpen(false); setName(''); setPicked({});
           await load();
@@ -352,31 +281,18 @@
         finally { setBusy(false); }
       };
 
-      const send = async () => {
-        if (!group || !text.trim()) return;
-        const mentions = [];
-        const pattern = /@([^\s@]+)/g;
-        let match;
-        while ((match = pattern.exec(text)) !== null) if (!mentions.includes(match[1])) mentions.push(match[1]);
-        setBusy(true); setError('');
-        try {
-          const result = await fetchJson('marshal/cross-groups/send', { id: group.id, text, mentions });
-          if (result && Array.isArray(result.deliveries)) {
-            const failed = result.deliveries.filter(item => item.state === 'failed');
-            if (failed.length > 0) setError('部分成员失败：' + failed.map(item => item.name + ' ' + (item.code || '')).join('、'));
-          }
-          setText('');
-          await load();
-        }
-        catch (e) { setError('发送失败：' + (e.message || e)); }
-        finally { setBusy(false); }
+      const send = async (text, context) => {
+        const mentions = mvValidateSidebarGroupMentions(text, group, true);
+        const result = await fetchJson('marshal/cross-groups/send', { id: group.id, text: mvChatWireText(text, context), mentions }, true);
+        void load();
+        return mvCrossGroupDeliveryError(result);
       };
 
-      return h('div', { style: { flex: 1, minHeight: 0, display: 'flex' } },
+      return h('div', { className: 'mv-scope mv-room-fill', 'aria-label': '跨设备群聊' },
         h('aside', { style: { width: 260, borderRight: '1px solid ' + dswTheme.border, display: 'flex', flexDirection: 'column' } },
           h('div', { style: { padding: 12, display: 'flex', alignItems: 'center', justifyContent: 'space-between' } },
             h('div', { style: { fontSize: 13, fontWeight: 600 } }, '跨设备群聊'),
-            h('button', { type: 'button', style: uiButton(true), onClick: () => setCreateOpen(value => !value) }, '＋ 新建')),
+            h('button', { type: 'button', style: uiButton(true), onClick: () => setCreateOpen(value => !value) }, '新建')),
           createOpen && h('div', { style: { padding: 12, borderBottom: '1px solid ' + dswTheme.border, display: 'grid', gap: 8 } },
             h('input', { value: name, onChange: event => setName(event.target.value), placeholder: '群名称', style: uiInput }),
             candidates.length === 0 && h('div', { style: uiMuted }, '没有带常驻会话的成员；先在各设备打开智能体私聊。'),
@@ -394,24 +310,144 @@
           error && h('div', { style: { padding: '8px 16px', color: dswTheme.danger, fontSize: 12 } }, error),
           group === null
             ? h(EmptyState, { title: '选择一个跨设备群', hint: '成员各自在自己的设备上，用常驻会话回复。' })
-            : h(React.Fragment, null,
-              h('header', { style: { padding: '12px 16px', borderBottom: '1px solid ' + dswTheme.border, display: 'flex', justifyContent: 'space-between', alignItems: 'center' } },
-                h('div', null,
-                  h('div', { style: { fontSize: 14, fontWeight: 600 } }, group.name),
-                  h('div', { style: uiMuted }, group.members.map(member => member.name + ' · ' + member.deviceId).join(' / '))),
-                h('button', { type: 'button', style: uiButton(false), onClick: () => { void load(); } }, '刷新')),
-              h('div', { style: { flex: 1, overflow: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 8 } },
-                group.messages.length === 0 ? h('p', { style: uiMuted }, '还没有消息') : group.messages.map(message => h('div', {
-                  key: message.id,
-                  'data-group-message': message.id,
-                  'data-group-role': message.role,
-                  style: { alignSelf: message.role === 'user' ? 'flex-end' : 'flex-start', maxWidth: '80%', padding: '8px 10px', borderRadius: 10, background: message.role === 'user' ? 'color-mix(in srgb, #4c8bf5 18%, transparent)' : 'color-mix(in srgb, currentColor 8%, transparent)' },
-                },
-                  h('div', { style: { fontSize: 11, opacity: .6 } }, message.author + ' · ' + new Date(message.at).toLocaleTimeString()),
-                  (() => { const shown = message.role === 'user' || message.streaming === true ? message.text : message.text.slice(0, reveal.current.get(message.id) ?? message.text.length); return h('div', { style: { whiteSpace: 'pre-wrap', fontSize: 13, lineHeight: 1.6 } }, shown); })())),
-                (group.active || []).length > 0 && h('div', { style: { alignSelf: 'flex-start', color: dswTheme.dim, fontSize: 12 } }, '成员正在生成…')),
-              h('div', { style: { padding: 12, borderTop: '1px solid ' + dswTheme.border, display: 'flex', gap: 8 } },
-                h('textarea', { value: text, onChange: event => setText(event.target.value), rows: 2, placeholder: '@成员名 或直接说话让 leader 接', style: { ...uiInput, flex: 1, resize: 'vertical' } }),
-                h('button', { type: 'button', disabled: busy, style: { ...uiButton(true), opacity: busy ? .6 : 1 }, onClick: () => { void send(); } }, '发送')))));
+            : h(mvGroupConversation, { key: group.id, cross: true, group, members: group.members.map(member => {
+                const device = devices.find(item => item.id === member.deviceId);
+                const current = device?.members?.find(item => item.sessionId === member.sessionId);
+                return { ...member, deviceName: device?.name || member.deviceName,
+                  model: current?.model || member.model, reasoningEffort: current?.reasoningEffort || member.reasoningEffort };
+              }),
+                onSend: send, busy }, mvGroupRefreshButton(load), (group.messages ?? []).map(row =>
+                  mvChatMessage({ mine: row.role === 'user', name: row.author, at: row.at, text: row.text,
+                    streaming: row.streaming, messageId: row.id, children: mvChatDeliveries(row.deliveries) })))));
     }
 
+    function mvChatModels(models = []) {
+      const rows = models.map(item => ({ ...item, route: item.route || (item.provider && item.model ? item.provider + '/' + item.model : item.id),
+        efforts: item.efforts ?? item.reasoning?.efforts?.map(e => typeof e === 'string' ? e : e.id).filter(Boolean) }));
+      return [...new Map(rows.filter(row => row.route).map(row => [row.route, row])).values()];
+    }
+
+    function mvChatModelsWithCurrent(models, model) {
+      return model && !models.some(item => item.route === model) ? [{ route: model }, ...models] : models;
+    }
+
+    function mvChatLinks(context) {
+      const links = Object.fromEntries(Object.entries(context.links ?? {}).filter(([, ids]) => ids.length));
+      return Object.keys(links).length ? links : undefined;
+    }
+
+    function mvChatWireText(text, context) {
+      // Group endpoints accept text only. Use reference IDs, not local paths to
+      // uploaded files, and avoid interpreting @ in reference labels as delivery targets.
+      const links = mvChatLinks(context);
+      if (!links) return text;
+      const labels = { sessionIds: '会话', proposalIds: '工单或记忆', docPaths: '文档' };
+      return text + '\n\n关联上下文：\n' + Object.entries(links).flatMap(([key, ids]) =>
+        ids.map(id => `${labels[key] || key}：${id.replaceAll('@', '＠')}`)).join('\n');
+    }
+
+    function mvChatMemberId(member) {
+      return member.key || [member.deviceId, member.squadId, member.memberId || member.sessionId || member.name].filter(Boolean).join('/');
+    }
+
+    function mvChatMentions({ members, usage, all, input, setText }) {
+      const chip = (key, name, role) => {
+        const count = usage?.get(name);
+        return h('button', { type: 'button', key, className: 'mv-btn mv-chip', onClick: () => {
+          setText(current => (current.trimEnd() ? current.trimEnd() + ' ' : '') + '@' + name + ' ');
+          input.current?.focus();
+        } }, '@' + name, role && ' · ' + role, count > 0 && ' · ' + formatTokenCount(count) + ' tok');
+      };
+      return h('div', { className: 'mv-actions', 'aria-label': '提及成员' },
+        members.map(member => chip(member.id || mvChatMemberId(member), member.name, member.role)), all && chip('all', '全体'));
+    }
+
+    function mvChatMessage({ mine, name, at, phase, text, trace, live, streaming, messageId, children }) {
+      const u = trace?.usage;
+      const total = Number(u?.totalTokens) || Number(u?.inputTokens || 0) + Number(u?.outputTokens || 0);
+      return h('article', { key: messageId, className: 'mv-room-message', style: { marginInlineStart: mine ? 'var(--mv-xl)' : undefined,
+        marginInlineEnd: mine ? undefined : 'var(--mv-xl)', background: mine ? 'var(--dsw-alias-marshal-tint)' : undefined } },
+        h('div', { className: 'mv-actions mv-muted' }, h('strong', null, mine ? '我' : name),
+          at != null && h('time', null, new Date(at).toLocaleTimeString()),
+          phase && taskPhases[phase] && h('span', null, taskPhases[phase]),
+          total > 0 && h('span', { className: 'mv-time', title: formatUsageTitle(u) },
+            formatTokenCount(total) + ' tok (入 ' + (formatTokenCount(Number(u.inputTokens)) || '0') + ' · 出 ' + (formatTokenCount(Number(u.outputTokens)) || '0') + ')'),
+          (live || streaming) && h('span', null, live ? '思考/处理中' : '生成中')),
+        trace && h(AgentTracePanel, { trace, live, hasBody: Boolean(text?.trim()) }),
+        text && (streaming ? h('div', null, text) : h(RichMarkdown, { text, phase })), children);
+    }
+
+    function mvChatDeliveries(deliveries) {
+      return deliveries?.length > 0 && h('p', { className: 'mv-muted' }, deliveries.map(item =>
+        (item.name || item.memberKey?.split('/').pop() || '成员') + (item.state === 'accepted' ? ' 已送达' : ' ' + (item.code || item.state))).join(' · '));
+    }
+
+    function mvGroupRefreshButton(refresh) {
+      return h('button', { type: 'button', className: 'mv-btn', onClick: refresh }, '刷新');
+    }
+
+    function mvGroupConversation({ cross, group, members, onSend, changeModel, onMember, onRebuildSession, onTask, busy, notice, children }) {
+      const [refreshButton, crossTranscript] = Array.isArray(children) ? children : [children];
+      const [draft, setDraft] = React.useState('');
+      const [context, setContext] = React.useState({});
+      const [sending, setSending] = React.useState(false);
+      const [error, setError] = React.useState('');
+      const [panel, setPanel] = React.useState(false);
+      const input = React.useRef(null);
+      const stream = React.useRef(null);
+      const stick = React.useRef(true);
+      const pending = React.useRef(false);
+      const messages = group.messages ?? [];
+      const messageVersion = messages.map(row => row.id + ':' + row.text?.length).join(',');
+      React.useEffect(() => {
+        if (stick.current && stream.current) stream.current.scrollTop = stream.current.scrollHeight;
+      }, [messageVersion]);
+      const send = async () => {
+        if (!draft.trim() || pending.current) return;
+        if (context.attachments?.length) { setError('当前群聊只支持上下文引用。请移除文件后再发送。'); return; }
+        pending.current = true;
+        setSending(true); setError('');
+        try {
+          const warning = await onSend(draft.trim(), context);
+          setDraft(current => current === draft ? '' : current);
+          setContext(current => current === context ? {} : current);
+          if (warning) setError(warning);
+          stick.current = true;
+        } catch (e) { setError('发送失败：' + e.message); }
+        finally { pending.current = false; setSending(false); }
+      };
+      const roster = h('div', { className: 'mv-stack' }, members.map(member => h('div', { key: mvChatMemberId(member), className: 'mv-task-item' },
+        h('strong', null, member.name), h('div', { className: 'mv-muted' }, [member.deviceName || member.deviceId,
+          member.model || (cross ? '模型未上报' : '默认模型'), member.reasoningEffort].filter(Boolean).join(' · ')),
+        onMember && h('button', { type: 'button', className: 'mv-btn', disabled: !member.sessionId && busy, onClick: () => onMember(member) }, member.sessionId ? '打开会话' : '建立会话'),
+        member.sessionId && onRebuildSession && h('button', { type: 'button', className: 'mv-btn', disabled: busy, onClick: () => onRebuildSession(member) }, '重建会话'))),
+        h('strong', null, '关联工单'),
+        [...new Set(messages.map(row => row.taskId).filter(Boolean))].map(id => h('div', { key: id }, id)),
+        !messages.some(row => row.taskId) && h('span', { className: 'mv-muted' }, '暂无关联工单'));
+      return h('div', { className: 'mv-room-fill' }, h('section', { className: 'mv-room', style: { overflow: 'visible' } },
+        h('header', { className: 'mv-dag-header mv-actions' }, h('strong', { className: 'mv-copy mv-truncate' }, group.name),
+          refreshButton,
+          h('button', { type: 'button', className: 'mv-btn', 'aria-pressed': panel, onClick: () => setPanel(v => !v) }, '群聊成员')),
+        (notice || error) && h('div', { role: error ? 'alert' : 'status', className: error ? 'mv-danger' : 'mv-muted' }, error || notice),
+        h('div', { ref: stream, className: 'mv-room-log', 'aria-label': '群聊记录', onScroll: e => {
+          const el = e.currentTarget; stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+        } }, messages.length === 0 && h('p', { className: 'mv-muted' }, '还没有消息'),
+        crossTranscript ?? messages.map(message => {
+          const mine = message.role === 'user' || message.author === 'user';
+          const name = members.find(member => member.memberId === message.authorMemberId)?.name || '成员';
+          return h(mvChatMessage, { key: message.id, mine, name, at: message.at ?? message.ts, text: message.text, streaming: message.streaming },
+            onTask && mine && !message.taskId && h('button', { type: 'button', className: 'mv-btn', disabled: busy, onClick: () => onTask(message) }, '创建工单'),
+            mvChatDeliveries(message.deliveries));
+        }), group.active?.length > 0 && h('p', { className: 'mv-muted' }, '成员正在生成…')),
+        h('footer', { className: 'mv-composer-dock' },
+          h(mvChatMentions, { members, all: !cross, input, setText: setDraft }),
+          h('textarea', { ref: input, className: 'mv-field', value: draft, rows: 2, 'aria-label': '群聊消息', placeholder: '输入消息或 @成员', onChange: e => setDraft(e.target.value) }),
+          h('div', { className: 'mv-actions' },
+            !cross && h(mvCascadePicker.MarshalAgentModelCascade, {
+              agents: members.map(member => ({ ...member, id: mvChatMemberId(member), models: member.models ?? [] })), onApply: changeModel }),
+            h('span', { className: 'mv-muted' }, cross ? '跨设备成员模型只读（由所在设备管理）' : '默认模型与思考，新会话生效'),
+            h(mvCascadePicker.MarshalCascadeContextPicker, { value: context, onChange: setContext }),
+            context.attachments?.length > 0 && h('span', { className: 'mv-muted' }, '此群只能发送关联引用，不能发送文件。'),
+            h('button', { type: 'button', className: 'mv-btn mv-guidance-action', disabled: busy || sending || !draft.trim(), onClick: send }, '发送')))),
+        panel && h(mvDagSidebar.MarshalVerticalDagSidebar, { members: roster }));
+    }

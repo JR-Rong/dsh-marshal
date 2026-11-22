@@ -310,8 +310,8 @@
                 groupSub === 'local'
                   ? h(GroupsPage, { openSession, onOpenAgents: () => chooseTab('agents') })
                   : h(CrossGroupsPage))),
-            chatSection === 'taskRooms' && h(MarshalErrorBoundary, { resetKey: 'taskRooms-' + (roomTask?.id ?? 'archive') },
-              h(TaskRoomsPage, { key: roomTask?.id ?? 'archive', task: roomTask, openBoard })),
+            chatSection === 'taskRooms' && h(MarshalErrorBoundary, { resetKey: 'taskRooms-' + (roomTask?.id || 'archive') },
+              h(MarshalTicketRoomView, { key: roomTask?.id ?? 'archive', task: roomTask, openBoard, onOpenAgents: () => chooseTab('agents') })),
             chatSection === 'direct' && h(MarshalErrorBoundary, { resetKey: 'direct' },
               h(AgentDirectChatsView, { openSession, mvOpenDirect, onOpenAgents: () => chooseTab('agents') })),
             chatSection === 'remote' && h('div', { style: { display: 'flex', flex: 1, minHeight: 0 } },

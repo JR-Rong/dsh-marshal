@@ -2706,8 +2706,8 @@ window.__ModuleLoader__.load({
                 groupSub === 'local'
                   ? h(GroupsPage, { openSession, onOpenAgents: () => chooseTab('agents') })
                   : h(CrossGroupsPage))),
-            chatSection === 'taskRooms' && h(MarshalErrorBoundary, { resetKey: 'taskRooms-' + (roomTask?.id ?? 'archive') },
-              h(TaskRoomsPage, { key: roomTask?.id ?? 'archive', task: roomTask, openBoard })),
+            chatSection === 'taskRooms' && h(MarshalErrorBoundary, { resetKey: 'taskRooms-' + (roomTask?.id || 'archive') },
+              h(MarshalTicketRoomView, { key: roomTask?.id ?? 'archive', task: roomTask, openBoard, onOpenAgents: () => chooseTab('agents') })),
             chatSection === 'direct' && h(MarshalErrorBoundary, { resetKey: 'direct' },
               h(AgentDirectChatsView, { openSession, mvOpenDirect, onOpenAgents: () => chooseTab('agents') })),
             chatSection === 'remote' && h('div', { style: { display: 'flex', flex: 1, minHeight: 0 } },
@@ -3717,12 +3717,20 @@ window.__ModuleLoader__.load({
       MarshalCascadeContextPicker: mvCascadeContextPicker,
       mvUploadPickerAttachments,
     };
+    // Reuse the sidebar helpers without changing the sidebar entry points.
+    function mvValidateSidebarGroupMentions(text, group, cross) {
+      return validateSidebarGroupMentions(text, group, cross);
+    }
+    function mvCrossGroupDeliveryError(result) {
+      return marshalCrossGroupDeliveryError(result);
+    }
+
     function GroupsPage({ openSession, onOpenAgents }) {
       const [state, setState] = React.useState(null);
       const [library, setLibrary] = React.useState(null);
       const [selected, setSelected] = React.useState(null);
-      const [group, setGroup] = React.useState(null);
-      const [text, setText] = React.useState('');
+      const [loadedGroup, setGroup] = React.useState(null);
+      const group = loadedGroup?.id === selected ? loadedGroup : null;
       const [error, setError] = React.useState('');
       const [busy, setBusy] = React.useState(false);
       const [notice, setNotice] = React.useState('');
@@ -3734,36 +3742,32 @@ window.__ModuleLoader__.load({
       const agents = library && Array.isArray(library.agents) ? library.agents : [];
       const groups = (state && state.groups) || [];
 
-      const load = async (isAlive = () => true) => {
-        try {
-          const [groupsState, agentLibrary] = await Promise.all([fetchJson('marshal/groups/state'), loadAgentLibrary()]);
-          if (!isAlive()) return;
-          setState(groupsState);
-          setLibrary(agentLibrary);
-          setError('');
-        }
-        catch (e) { if (isAlive()) setError(friendlyError(e, '智能体/群聊')); }
-      };
-      const reloadGroup = async () => {
-        if (!group) return;
-        const fresh = await fetchJson('marshal/groups/get?id=' + encodeURIComponent(group.id));
-        setGroup(fresh.group);
-      };
+      const listRefresh = React.useRef(null);
+      const detailRefresh = React.useRef(null);
+      const load = () => listRefresh.current?.request();
+      const reloadGroup = () => detailRefresh.current?.request();
       React.useEffect(() => {
-        let alive = true;
-        const unsubscribe = subscribeMarshalEvents(['ready', 'groups.changed', 'agents.changed'],
-          () => load(() => alive), { initial: true, debounceMs: 80 });
-        return () => { alive = false; unsubscribe(); };
+        const refresh = createVisibleMarshalRefresh(async signal => {
+          try {
+            const [groupsState, agentLibrary] = await Promise.all([fetchJson('marshal/groups/state', undefined, true, signal), loadAgentLibrary()]);
+            if (!signal.aborted) { setState(groupsState); setLibrary(agentLibrary); }
+          } catch (e) { if (!signal.aborted) setError(friendlyError(e, '智能体/群聊')); }
+        });
+        listRefresh.current = refresh;
+        const unsubscribe = subscribeMarshalEvents(['ready', 'groups.changed', 'agents.changed'], refresh.request, { initial: true, debounceMs: 80 });
+        return () => { listRefresh.current = null; unsubscribe(); refresh.dispose(); };
       }, []);
       React.useEffect(() => {
-        if (!selected) { setGroup(null); return; }
-        let alive = true;
-        const pull = () =>
-          fetchJson('marshal/groups/get?id=' + encodeURIComponent(selected))
-            .then(data => { if (alive) setGroup(data.group); })
-            .catch(e => { if (alive) setError('读取群失败：' + (e.message || e)); });
-        const unsubscribe = subscribeMarshalEvents(['ready', 'groups.changed'], pull, { initial: true, debounceMs: 80 });
-        return () => { alive = false; unsubscribe(); };
+        if (!selected) return;
+        const refresh = createVisibleMarshalRefresh(async signal => {
+          try {
+            const data = await fetchJson('marshal/groups/get?' + new URLSearchParams({ id: selected }), undefined, true, signal);
+            if (!signal.aborted) setGroup(data.group);
+          } catch (e) { if (!signal.aborted) setError('读取群失败：' + e.message); }
+        });
+        detailRefresh.current = refresh;
+        const unsubscribe = subscribeMarshalEvents(['ready', 'groups.changed', 'agents.changed'], refresh.request, { initial: true, debounceMs: 80 });
+        return () => { detailRefresh.current = null; unsubscribe(); refresh.dispose(); };
       }, [selected]);
 
       const create = async () => {
@@ -3786,13 +3790,13 @@ window.__ModuleLoader__.load({
           }));
           const leader = chosen.find(agent => agent.id === (leaderId || chosen[0].id)) || chosen[0];
           const leaderKey = deviceId + '/' + leader.squadId + '/' + leader.id;
-          const created = await fetchJson('marshal/groups/create', { name: draftName.trim(), members, leaderKey });
+          const created = await fetchJson('marshal/groups/create', { name: draftName.trim(), members, leaderKey }, true);
           const id = created.group.id;
           for (const agent of chosen) {
             try {
               const run = await fetchJson('dsh-agents/api/run', { teamId: agent.squadId, memberId: agent.id });
               const sessionId = run && run.run && run.run.sessionId;
-              if (sessionId) await fetchJson('marshal/groups/bind', { id, key: deviceId + '/' + agent.squadId + '/' + agent.id, sessionId });
+              if (sessionId) await fetchJson('marshal/groups/bind', { id, key: deviceId + '/' + agent.squadId + '/' + agent.id, sessionId }, true);
             }
             catch (e) { setError('会话创建失败（' + agent.name + '）：' + (e.message || e)); }
           }
@@ -3807,24 +3811,22 @@ window.__ModuleLoader__.load({
         finally { setCreating(false); }
       };
 
-      const send = async () => {
-        if (!group || !text.trim()) return;
-        setBusy(true);
-        setError('');
-        try {
-          const result = await fetchJson('marshal/groups/send', { id: group.id, text });
-          if (result && result.error === 'leader-unavailable') {
-            throw new Error('leader 所在设备离线，这个群暂时不可用');
-          }
-          if (result && Array.isArray(result.offline) && result.offline.length > 0) {
-            setNotice('成员离线：' + result.offline.join('、') + (result.fallback ? '；已通知 leader 新建临时智能体或改派' : ''));
-          }
-          setText('');
-          await reloadGroup();
-          setState(await fetchJson('marshal/groups/state'));
-        }
-        catch (e) { setError('发送失败：' + (e.message || e)); }
-        finally { setBusy(false); }
+      const send = async (text, context) => {
+        const mentions = mvValidateSidebarGroupMentions(text, group, false);
+        const result = await fetchJson('marshal/groups/send', { id: group.id, text: mvChatWireText(text, context), mentions }, true);
+        if (result?.error === 'leader-unavailable') throw new Error('群主所在设备离线，这个群暂时不可用');
+        if (result?.offline?.length) setNotice('成员离线：' + result.offline.join('、'));
+        void reloadGroup();
+        void load();
+      };
+      const changeModel = async ({ agentId, model, reasoningEffort }) => {
+        const member = group.members.find(row => mvChatMemberId(row) === agentId);
+        const agent = agents.find(row => row.id === member?.memberId && row.squadId === member?.squadId);
+        if (!agent) throw new Error('只能更新本机智能体的默认模型与思考。');
+        const { id, name, brief, preset, permission } = agent;
+        await fetchJson('dsh-agents/api/member', { teamId: agent.squadId, member: { id, name, brief, preset, permission, model, reasoningEffort } });
+        setNotice('已更新智能体默认模型与思考；现有常驻会话不受影响。');
+        void load();
       };
 
       const convertToTask = async (message) => {
@@ -3833,7 +3835,7 @@ window.__ModuleLoader__.load({
         setError('');
         setNotice('');
         try {
-          const data = await fetchJson('marshal/groups/task', { id: group.id, messageId: message.id });
+          const data = await fetchJson('marshal/groups/task', { id: group.id, messageId: message.id }, true);
           setNotice('已创建任务：' + ((data && data.task && data.task.title) || ''));
           await reloadGroup();
         }
@@ -3842,7 +3844,7 @@ window.__ModuleLoader__.load({
       };
 
       const ensureSession = async (member) => {
-        if (!group || !library) return;
+        if (!group || !library || busy) return;
         setBusy(true);
         setError('');
         try {
@@ -3850,7 +3852,7 @@ window.__ModuleLoader__.load({
           const run = await fetchJson('dsh-agents/api/run', { teamId: member.squadId, memberId: member.memberId });
           const sessionId = run && run.run && run.run.sessionId;
           if (!sessionId) throw new Error('no-session');
-          await fetchJson('marshal/groups/bind', { id: group.id, key, sessionId });
+          await fetchJson('marshal/groups/bind', { id: group.id, key, sessionId }, true);
           await reloadGroup();
         }
         catch (e) { setError('创建会话失败：' + (e.message || e)); }
@@ -3869,34 +3871,6 @@ window.__ModuleLoader__.load({
           h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, item.name),
           h('span', { style: { fontSize: 11, color: dswTheme.faint, flexShrink: 0 } }, item.memberCount + ' 人')),
         h('div', { style: { fontSize: 11, color: dswTheme.faint, marginTop: 3 } }, item.messageCount + ' 条消息' + (item.mode === 'discussion' ? ' · 讨论' : '')));
-
-      const memberChip = member => h('button', {
-        key: member.memberId, type: 'button',
-        onClick: () => { if (member.sessionId) { if (openSession) openSession(member.sessionId); } else void ensureSession(member); },
-        style: {
-          display: 'inline-flex', alignItems: 'center', gap: 6, border: '1px solid ' + dswTheme.border2,
-          background: 'transparent', color: dswTheme.text, borderRadius: 999, padding: '4px 10px 4px 4px',
-          fontSize: 12, cursor: 'pointer', fontFamily: 'inherit',
-        },
-      }, h(Avatar, { name: member.name, size: 22 }), member.name,
-        h('span', { style: { color: member.sessionId ? dswTheme.faint : dswTheme.brand, fontSize: 11 } }, member.sessionId ? '打开' : '建会话'));
-
-      const messageView = message => {
-        const mine = message.author === 'user';
-        const name = mine ? '我' : ((group && group.members.find(member => member.memberId === message.authorMemberId)) || {}).name || '成员';
-        return h('div', { key: message.id, style: { display: 'flex', gap: 10, alignItems: 'flex-start', flexDirection: mine ? 'row-reverse' : 'row' } },
-          h(Avatar, { name, size: 28 }),
-          h('div', { style: { maxWidth: '74%' } },
-            h('div', { style: { fontSize: 11, color: dswTheme.faint, marginBottom: 4, textAlign: mine ? 'right' : 'left' } },
-              name + ' · ' + new Date(message.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })),
-            h('div', { style: { padding: '9px 12px', borderRadius: 12, background: mine ? dswTheme.layer3 : dswTheme.layer, border: '1px solid ' + dswTheme.border, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontSize: 13, lineHeight: 1.6 } }, message.text),
-            h('div', { style: { display: 'flex', gap: 8, alignItems: 'center', marginTop: 4, justifyContent: mine ? 'flex-end' : 'flex-start' } },
-              message.deliveries && message.deliveries.length > 0 && h('span', { style: { fontSize: 11, color: dswTheme.faint } },
-                message.deliveries.map(delivery => delivery.memberKey.split('/').pop() + (delivery.state === 'accepted' ? ' ✓' : ' ✕ ' + (delivery.code || ''))).join('  ')),
-              mine && (message.taskId
-                ? h('span', { style: { fontSize: 11, color: dswTheme.faint } }, '已建任务')
-                : h('button', { type: 'button', style: { ...uiButton(false), padding: '2px 8px', fontSize: 11 }, onClick: () => { void convertToTask(message); } }, '变任务')))));
-      };
 
       const createDialog = () => h('div', { style: { position: 'absolute', inset: 0, background: 'rgba(0,0,0,.48)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 20, padding: 20 } },
         h('div', { role: 'dialog', 'aria-label': '新建群聊', style: { width: 480, maxWidth: '100%', maxHeight: '86%', overflow: 'auto', background: dswTheme.layer, border: '1px solid ' + dswTheme.border2, borderRadius: 14, padding: 20, boxShadow: '0 24px 60px rgba(0,0,0,.45)' } },
@@ -3931,13 +3905,13 @@ window.__ModuleLoader__.load({
             h('button', { type: 'button', style: uiButton(false), onClick: () => setCreateOpen(false) }, '取消'),
             h('button', { type: 'button', disabled: creating, style: { ...uiButton(true), opacity: creating ? .6 : 1 }, onClick: () => { void create(); } }, creating ? '创建中…' : '创建并开会话'))));
 
-      return h('section', { style: { flex: 1, minHeight: 0, display: 'flex', position: 'relative', background: dswTheme.bg, color: dswTheme.text } },
+      return h('section', { className: 'mv-scope mv-room-fill', style: { position: 'relative' }, 'aria-label': '群聊' },
         h('aside', { style: { width: 292, flexShrink: 0, background: dswTheme.layer, borderRight: '1px solid ' + dswTheme.border, display: 'flex', flexDirection: 'column', minHeight: 0 } },
           h('div', { style: { padding: '14px 14px 10px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' } },
             h('div', null,
               h('div', { style: { fontSize: 13, fontWeight: 600 } }, '群聊'),
               h('div', { style: uiMuted }, groups.length + ' 个会话')),
-            h('button', { type: 'button', style: uiButton(true), onClick: () => setCreateOpen(true) }, '＋ 新建')),
+            h('button', { type: 'button', style: uiButton(true), onClick: () => setCreateOpen(true) }, '新建')),
           h('div', { style: { flex: 1, overflow: 'auto', padding: '2px 8px 10px' } },
             groups.map(groupRow),
             groups.length === 0 && h('p', { style: { ...uiMuted, padding: '10px 6px' } }, '还没有群聊')),
@@ -3947,20 +3921,15 @@ window.__ModuleLoader__.load({
         h('main', { style: { flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', minHeight: 0 } },
           error && h('div', { style: { padding: '8px 18px', fontSize: 12, color: dswTheme.danger, borderBottom: '1px solid ' + dswTheme.border } }, error),
           group
-            ? h('div', { style: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' } },
-                h('header', { style: { padding: '14px 20px', borderBottom: '1px solid ' + dswTheme.border, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexShrink: 0 } },
-                  h('div', null,
-                    h('div', { style: { fontSize: 15, fontWeight: 600 } }, group.name),
-                    h('div', { style: uiMuted }, group.members.length + ' 个智能体 · 不 @ 由 leader 回')),
-                  h('button', { type: 'button', style: uiButton(false), onClick: () => { void reloadGroup(); } }, '刷新')),
-                h('div', { style: { padding: '10px 20px', display: 'flex', gap: 8, flexWrap: 'wrap', borderBottom: '1px solid ' + dswTheme.border, flexShrink: 0 } }, group.members.map(memberChip)),
-                h('div', { style: { flex: 1, minHeight: 0, overflow: 'auto', padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 14 } },
-                  (group.messages || []).length === 0
-                    ? h('div', { style: { margin: 'auto', textAlign: 'center', color: dswTheme.faint, fontSize: 12, lineHeight: 1.8 } }, '还没有消息', h('br'), '@ 某个智能体，或直接说话让 leader 接。')
-                    : (group.messages || []).map(messageView)),
-                h('div', { style: { padding: '12px 20px', borderTop: '1px solid ' + dswTheme.border, display: 'flex', gap: 10, alignItems: 'flex-end', flexShrink: 0 } },
-                  h('textarea', { value: text, onChange: event => setText(event.target.value), rows: 2, placeholder: '@成员名 或 @all；不 @ 时由 leader 回', style: { ...uiInput, flex: 1, resize: 'none', minHeight: 44, lineHeight: 1.5 } }),
-                  h('button', { type: 'button', disabled: busy || !text.trim(), style: { ...uiButton(true), opacity: busy || !text.trim() ? .5 : 1 }, onClick: () => { void send(); } }, '发送')))
+            ? h(mvGroupConversation, { key: group.id, group, onSend: send, changeModel,
+                members: group.members.map(member => {
+                  const agent = agents.find(row => row.id === member.memberId && row.squadId === member.squadId);
+                  const model = agent?.model || member.model;
+                  return { ...member, model, reasoningEffort: agent?.reasoningEffort || member.reasoningEffort,
+                    models: agent ? mvChatModelsWithCurrent(mvChatModels(library?.models), model) : [] };
+                }), onMember: member => member.sessionId ? openSession?.(member.sessionId) : ensureSession(member),
+                onRebuildSession: ensureSession,
+                onTask: convertToTask, busy, notice }, mvGroupRefreshButton(reloadGroup))
             : h(EmptyState, { title: '选择一个群聊', hint: '群里的智能体各自有一个常驻会话。\n@ 谁谁回，@all 全体回，不 @ 由 leader 回。', action: '新建群聊', onAction: () => setCreateOpen(true) })),
         createOpen && createDialog());
     }
@@ -3975,13 +3944,8 @@ window.__ModuleLoader__.load({
       const [createOpen, setCreateOpen] = React.useState(false);
       const [name, setName] = React.useState('');
       const [picked, setPicked] = React.useState({});
-      const [text, setText] = React.useState('');
       const [busy, setBusy] = React.useState(false);
-      const [, setTick] = React.useState(0);
       const refreshRef = React.useRef(null);
-      const reveal = React.useRef(new Map());
-      const seenMessages = React.useRef(false);
-      const lastGroupId = React.useRef('');
       const groups = (state && state.groups) || [];
       const group = groups.find(item => item.id === selected) || null;
       const devices = (catalog && catalog.devices) || [];
@@ -3990,8 +3954,8 @@ window.__ModuleLoader__.load({
         // The local SSE stream does not relay changes made on the Hub.
         const refresh = createVisibleMarshalRefresh(async signal => {
           const [nextState, nextCatalog] = await Promise.allSettled([
-            fetchJson('marshal/cross-groups/state', undefined, false, signal),
-            fetchJson('marshal/cross-groups/catalog', undefined, false, signal),
+            fetchJson('marshal/cross-groups/state', undefined, true, signal),
+            fetchJson('marshal/cross-groups/catalog', undefined, true, signal),
           ]);
           if (signal.aborted) return;
           if (nextState.status === 'fulfilled') setState(nextState.value);
@@ -4010,41 +3974,6 @@ window.__ModuleLoader__.load({
         };
       }, []);
       const load = () => refreshRef.current?.request();
-      const messageSignature = group === null ? '' : group.messages.map(message => message.id + ':' + message.text.length).join(',');
-      React.useEffect(() => {
-        if (group === null) return;
-        const map = reveal.current;
-        if (lastGroupId.current !== group.id) {
-          lastGroupId.current = group.id;
-          map.clear();
-          for (const message of group.messages) map.set(message.id, message.text.length);
-          seenMessages.current = true;
-          setTick(value => value + 1);
-          return;
-        }
-        if (!seenMessages.current) {
-          for (const message of group.messages) map.set(message.id, message.text.length);
-          seenMessages.current = true;
-          setTick(value => value + 1);
-          return;
-        }
-        for (const message of group.messages) {
-          if (!map.has(message.id)) map.set(message.id, message.streaming === true ? message.text.length : 0);
-        }
-        const timer = setInterval(() => {
-          let changed = false;
-          for (const message of group.messages) {
-            const target = message.text.length;
-            const current = map.get(message.id) ?? target;
-            if (current >= target) continue;
-            map.set(message.id, Math.min(target, current + 2));
-            changed = true;
-          }
-          if (changed) setTick(value => value + 1);
-        }, 25);
-        return () => clearInterval(timer);
-      }, [group === null ? '' : group.id, messageSignature]);
-
       const candidates = [];
       for (const device of devices) {
         for (const member of device.members || []) {
@@ -4062,7 +3991,7 @@ window.__ModuleLoader__.load({
           const data = await fetchJson('marshal/cross-groups/create', {
             name: name.trim(),
             members: members.map(item => ({ deviceId: item.deviceId, agent: item.agent, sessionId: item.sessionId, name: item.name })),
-          });
+          }, true);
           setSelected(data.group.id);
           setCreateOpen(false); setName(''); setPicked({});
           await load();
@@ -4071,31 +4000,18 @@ window.__ModuleLoader__.load({
         finally { setBusy(false); }
       };
 
-      const send = async () => {
-        if (!group || !text.trim()) return;
-        const mentions = [];
-        const pattern = /@([^\s@]+)/g;
-        let match;
-        while ((match = pattern.exec(text)) !== null) if (!mentions.includes(match[1])) mentions.push(match[1]);
-        setBusy(true); setError('');
-        try {
-          const result = await fetchJson('marshal/cross-groups/send', { id: group.id, text, mentions });
-          if (result && Array.isArray(result.deliveries)) {
-            const failed = result.deliveries.filter(item => item.state === 'failed');
-            if (failed.length > 0) setError('部分成员失败：' + failed.map(item => item.name + ' ' + (item.code || '')).join('、'));
-          }
-          setText('');
-          await load();
-        }
-        catch (e) { setError('发送失败：' + (e.message || e)); }
-        finally { setBusy(false); }
+      const send = async (text, context) => {
+        const mentions = mvValidateSidebarGroupMentions(text, group, true);
+        const result = await fetchJson('marshal/cross-groups/send', { id: group.id, text: mvChatWireText(text, context), mentions }, true);
+        void load();
+        return mvCrossGroupDeliveryError(result);
       };
 
-      return h('div', { style: { flex: 1, minHeight: 0, display: 'flex' } },
+      return h('div', { className: 'mv-scope mv-room-fill', 'aria-label': '跨设备群聊' },
         h('aside', { style: { width: 260, borderRight: '1px solid ' + dswTheme.border, display: 'flex', flexDirection: 'column' } },
           h('div', { style: { padding: 12, display: 'flex', alignItems: 'center', justifyContent: 'space-between' } },
             h('div', { style: { fontSize: 13, fontWeight: 600 } }, '跨设备群聊'),
-            h('button', { type: 'button', style: uiButton(true), onClick: () => setCreateOpen(value => !value) }, '＋ 新建')),
+            h('button', { type: 'button', style: uiButton(true), onClick: () => setCreateOpen(value => !value) }, '新建')),
           createOpen && h('div', { style: { padding: 12, borderBottom: '1px solid ' + dswTheme.border, display: 'grid', gap: 8 } },
             h('input', { value: name, onChange: event => setName(event.target.value), placeholder: '群名称', style: uiInput }),
             candidates.length === 0 && h('div', { style: uiMuted }, '没有带常驻会话的成员；先在各设备打开智能体私聊。'),
@@ -4113,27 +4029,147 @@ window.__ModuleLoader__.load({
           error && h('div', { style: { padding: '8px 16px', color: dswTheme.danger, fontSize: 12 } }, error),
           group === null
             ? h(EmptyState, { title: '选择一个跨设备群', hint: '成员各自在自己的设备上，用常驻会话回复。' })
-            : h(React.Fragment, null,
-              h('header', { style: { padding: '12px 16px', borderBottom: '1px solid ' + dswTheme.border, display: 'flex', justifyContent: 'space-between', alignItems: 'center' } },
-                h('div', null,
-                  h('div', { style: { fontSize: 14, fontWeight: 600 } }, group.name),
-                  h('div', { style: uiMuted }, group.members.map(member => member.name + ' · ' + member.deviceId).join(' / '))),
-                h('button', { type: 'button', style: uiButton(false), onClick: () => { void load(); } }, '刷新')),
-              h('div', { style: { flex: 1, overflow: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 8 } },
-                group.messages.length === 0 ? h('p', { style: uiMuted }, '还没有消息') : group.messages.map(message => h('div', {
-                  key: message.id,
-                  'data-group-message': message.id,
-                  'data-group-role': message.role,
-                  style: { alignSelf: message.role === 'user' ? 'flex-end' : 'flex-start', maxWidth: '80%', padding: '8px 10px', borderRadius: 10, background: message.role === 'user' ? 'color-mix(in srgb, #4c8bf5 18%, transparent)' : 'color-mix(in srgb, currentColor 8%, transparent)' },
-                },
-                  h('div', { style: { fontSize: 11, opacity: .6 } }, message.author + ' · ' + new Date(message.at).toLocaleTimeString()),
-                  (() => { const shown = message.role === 'user' || message.streaming === true ? message.text : message.text.slice(0, reveal.current.get(message.id) ?? message.text.length); return h('div', { style: { whiteSpace: 'pre-wrap', fontSize: 13, lineHeight: 1.6 } }, shown); })())),
-                (group.active || []).length > 0 && h('div', { style: { alignSelf: 'flex-start', color: dswTheme.dim, fontSize: 12 } }, '成员正在生成…')),
-              h('div', { style: { padding: 12, borderTop: '1px solid ' + dswTheme.border, display: 'flex', gap: 8 } },
-                h('textarea', { value: text, onChange: event => setText(event.target.value), rows: 2, placeholder: '@成员名 或直接说话让 leader 接', style: { ...uiInput, flex: 1, resize: 'vertical' } }),
-                h('button', { type: 'button', disabled: busy, style: { ...uiButton(true), opacity: busy ? .6 : 1 }, onClick: () => { void send(); } }, '发送')))));
+            : h(mvGroupConversation, { key: group.id, cross: true, group, members: group.members.map(member => {
+                const device = devices.find(item => item.id === member.deviceId);
+                const current = device?.members?.find(item => item.sessionId === member.sessionId);
+                return { ...member, deviceName: device?.name || member.deviceName,
+                  model: current?.model || member.model, reasoningEffort: current?.reasoningEffort || member.reasoningEffort };
+              }),
+                onSend: send, busy }, mvGroupRefreshButton(load), (group.messages ?? []).map(row =>
+                  mvChatMessage({ mine: row.role === 'user', name: row.author, at: row.at, text: row.text,
+                    streaming: row.streaming, messageId: row.id, children: mvChatDeliveries(row.deliveries) })))));
     }
 
+    function mvChatModels(models = []) {
+      const rows = models.map(item => ({ ...item, route: item.route || (item.provider && item.model ? item.provider + '/' + item.model : item.id),
+        efforts: item.efforts ?? item.reasoning?.efforts?.map(e => typeof e === 'string' ? e : e.id).filter(Boolean) }));
+      return [...new Map(rows.filter(row => row.route).map(row => [row.route, row])).values()];
+    }
+
+    function mvChatModelsWithCurrent(models, model) {
+      return model && !models.some(item => item.route === model) ? [{ route: model }, ...models] : models;
+    }
+
+    function mvChatLinks(context) {
+      const links = Object.fromEntries(Object.entries(context.links ?? {}).filter(([, ids]) => ids.length));
+      return Object.keys(links).length ? links : undefined;
+    }
+
+    function mvChatWireText(text, context) {
+      // Group endpoints accept text only. Use reference IDs, not local paths to
+      // uploaded files, and avoid interpreting @ in reference labels as delivery targets.
+      const links = mvChatLinks(context);
+      if (!links) return text;
+      const labels = { sessionIds: '会话', proposalIds: '工单或记忆', docPaths: '文档' };
+      return text + '\n\n关联上下文：\n' + Object.entries(links).flatMap(([key, ids]) =>
+        ids.map(id => `${labels[key] || key}：${id.replaceAll('@', '＠')}`)).join('\n');
+    }
+
+    function mvChatMemberId(member) {
+      return member.key || [member.deviceId, member.squadId, member.memberId || member.sessionId || member.name].filter(Boolean).join('/');
+    }
+
+    function mvChatMentions({ members, usage, all, input, setText }) {
+      const chip = (key, name, role) => {
+        const count = usage?.get(name);
+        return h('button', { type: 'button', key, className: 'mv-btn mv-chip', onClick: () => {
+          setText(current => (current.trimEnd() ? current.trimEnd() + ' ' : '') + '@' + name + ' ');
+          input.current?.focus();
+        } }, '@' + name, role && ' · ' + role, count > 0 && ' · ' + formatTokenCount(count) + ' tok');
+      };
+      return h('div', { className: 'mv-actions', 'aria-label': '提及成员' },
+        members.map(member => chip(member.id || mvChatMemberId(member), member.name, member.role)), all && chip('all', '全体'));
+    }
+
+    function mvChatMessage({ mine, name, at, phase, text, trace, live, streaming, messageId, children }) {
+      const u = trace?.usage;
+      const total = Number(u?.totalTokens) || Number(u?.inputTokens || 0) + Number(u?.outputTokens || 0);
+      return h('article', { key: messageId, className: 'mv-room-message', style: { marginInlineStart: mine ? 'var(--mv-xl)' : undefined,
+        marginInlineEnd: mine ? undefined : 'var(--mv-xl)', background: mine ? 'var(--dsw-alias-marshal-tint)' : undefined } },
+        h('div', { className: 'mv-actions mv-muted' }, h('strong', null, mine ? '我' : name),
+          at != null && h('time', null, new Date(at).toLocaleTimeString()),
+          phase && taskPhases[phase] && h('span', null, taskPhases[phase]),
+          total > 0 && h('span', { className: 'mv-time', title: formatUsageTitle(u) },
+            formatTokenCount(total) + ' tok (入 ' + (formatTokenCount(Number(u.inputTokens)) || '0') + ' · 出 ' + (formatTokenCount(Number(u.outputTokens)) || '0') + ')'),
+          (live || streaming) && h('span', null, live ? '思考/处理中' : '生成中')),
+        trace && h(AgentTracePanel, { trace, live, hasBody: Boolean(text?.trim()) }),
+        text && (streaming ? h('div', null, text) : h(RichMarkdown, { text, phase })), children);
+    }
+
+    function mvChatDeliveries(deliveries) {
+      return deliveries?.length > 0 && h('p', { className: 'mv-muted' }, deliveries.map(item =>
+        (item.name || item.memberKey?.split('/').pop() || '成员') + (item.state === 'accepted' ? ' 已送达' : ' ' + (item.code || item.state))).join(' · '));
+    }
+
+    function mvGroupRefreshButton(refresh) {
+      return h('button', { type: 'button', className: 'mv-btn', onClick: refresh }, '刷新');
+    }
+
+    function mvGroupConversation({ cross, group, members, onSend, changeModel, onMember, onRebuildSession, onTask, busy, notice, children }) {
+      const [refreshButton, crossTranscript] = Array.isArray(children) ? children : [children];
+      const [draft, setDraft] = React.useState('');
+      const [context, setContext] = React.useState({});
+      const [sending, setSending] = React.useState(false);
+      const [error, setError] = React.useState('');
+      const [panel, setPanel] = React.useState(false);
+      const input = React.useRef(null);
+      const stream = React.useRef(null);
+      const stick = React.useRef(true);
+      const pending = React.useRef(false);
+      const messages = group.messages ?? [];
+      const messageVersion = messages.map(row => row.id + ':' + row.text?.length).join(',');
+      React.useEffect(() => {
+        if (stick.current && stream.current) stream.current.scrollTop = stream.current.scrollHeight;
+      }, [messageVersion]);
+      const send = async () => {
+        if (!draft.trim() || pending.current) return;
+        if (context.attachments?.length) { setError('当前群聊只支持上下文引用。请移除文件后再发送。'); return; }
+        pending.current = true;
+        setSending(true); setError('');
+        try {
+          const warning = await onSend(draft.trim(), context);
+          setDraft(current => current === draft ? '' : current);
+          setContext(current => current === context ? {} : current);
+          if (warning) setError(warning);
+          stick.current = true;
+        } catch (e) { setError('发送失败：' + e.message); }
+        finally { pending.current = false; setSending(false); }
+      };
+      const roster = h('div', { className: 'mv-stack' }, members.map(member => h('div', { key: mvChatMemberId(member), className: 'mv-task-item' },
+        h('strong', null, member.name), h('div', { className: 'mv-muted' }, [member.deviceName || member.deviceId,
+          member.model || (cross ? '模型未上报' : '默认模型'), member.reasoningEffort].filter(Boolean).join(' · ')),
+        onMember && h('button', { type: 'button', className: 'mv-btn', disabled: !member.sessionId && busy, onClick: () => onMember(member) }, member.sessionId ? '打开会话' : '建立会话'),
+        member.sessionId && onRebuildSession && h('button', { type: 'button', className: 'mv-btn', disabled: busy, onClick: () => onRebuildSession(member) }, '重建会话'))),
+        h('strong', null, '关联工单'),
+        [...new Set(messages.map(row => row.taskId).filter(Boolean))].map(id => h('div', { key: id }, id)),
+        !messages.some(row => row.taskId) && h('span', { className: 'mv-muted' }, '暂无关联工单'));
+      return h('div', { className: 'mv-room-fill' }, h('section', { className: 'mv-room', style: { overflow: 'visible' } },
+        h('header', { className: 'mv-dag-header mv-actions' }, h('strong', { className: 'mv-copy mv-truncate' }, group.name),
+          refreshButton,
+          h('button', { type: 'button', className: 'mv-btn', 'aria-pressed': panel, onClick: () => setPanel(v => !v) }, '群聊成员')),
+        (notice || error) && h('div', { role: error ? 'alert' : 'status', className: error ? 'mv-danger' : 'mv-muted' }, error || notice),
+        h('div', { ref: stream, className: 'mv-room-log', 'aria-label': '群聊记录', onScroll: e => {
+          const el = e.currentTarget; stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+        } }, messages.length === 0 && h('p', { className: 'mv-muted' }, '还没有消息'),
+        crossTranscript ?? messages.map(message => {
+          const mine = message.role === 'user' || message.author === 'user';
+          const name = members.find(member => member.memberId === message.authorMemberId)?.name || '成员';
+          return h(mvChatMessage, { key: message.id, mine, name, at: message.at ?? message.ts, text: message.text, streaming: message.streaming },
+            onTask && mine && !message.taskId && h('button', { type: 'button', className: 'mv-btn', disabled: busy, onClick: () => onTask(message) }, '创建工单'),
+            mvChatDeliveries(message.deliveries));
+        }), group.active?.length > 0 && h('p', { className: 'mv-muted' }, '成员正在生成…')),
+        h('footer', { className: 'mv-composer-dock' },
+          h(mvChatMentions, { members, all: !cross, input, setText: setDraft }),
+          h('textarea', { ref: input, className: 'mv-field', value: draft, rows: 2, 'aria-label': '群聊消息', placeholder: '输入消息或 @成员', onChange: e => setDraft(e.target.value) }),
+          h('div', { className: 'mv-actions' },
+            !cross && h(mvCascadePicker.MarshalAgentModelCascade, {
+              agents: members.map(member => ({ ...member, id: mvChatMemberId(member), models: member.models ?? [] })), onApply: changeModel }),
+            h('span', { className: 'mv-muted' }, cross ? '跨设备成员模型只读（由所在设备管理）' : '默认模型与思考，新会话生效'),
+            h(mvCascadePicker.MarshalCascadeContextPicker, { value: context, onChange: setContext }),
+            context.attachments?.length > 0 && h('span', { className: 'mv-muted' }, '此群只能发送关联引用，不能发送文件。'),
+            h('button', { type: 'button', className: 'mv-btn mv-guidance-action', disabled: busy || sending || !draft.trim(), onClick: send }, '发送')))),
+        panel && h(mvDagSidebar.MarshalVerticalDagSidebar, { members: roster }));
+    }
     const taskPhases = {
       selecting: 'Leader 选择编排',
       material: '读取 PR 快照',
@@ -5008,6 +5044,583 @@ window.__ModuleLoader__.load({
 
     // Public names for sibling shards sharing the client factory.
     const mvDagSidebar = { MarshalVerticalDagSidebar: mvVerticalDagSidebar, MarshalDagNodeModal: mvDagNodeModal };
+    const MV_ROOM_API = 'marshal/task-rooms/';
+
+    function mvRoomMerge(previous, data, older) {
+      const records = new Map((previous?.records ?? []).map(row => [row.seq, row]));
+      for (const row of data.records ?? []) if (!older || !records.has(row.seq)) records.set(row.seq, row);
+      return { ...(older ? previous : data), hasOlder: older || !previous ? data.hasOlder : previous.hasOlder,
+        records: [...records.values()].sort((a, b) => a.seq - b.seq) };
+    }
+
+    function mvRoomHandoffText(...values) {
+      return values.find(value => typeof value === 'string' && value.trim())?.trim();
+    }
+
+    function mvRoomPatchSummary(artifact) {
+      if (!artifact) return;
+      const digest = mvRoomHandoffText(artifact.digest);
+      const files = artifact.fileCount ?? (Array.isArray(artifact.files) ? artifact.files.length : artifact.files);
+      const parts = [];
+      if (digest) parts.push(digest.slice(0, 12));
+      if (Number.isInteger(files)) parts.push(`${files} 个文件`);
+      if (Number.isInteger(artifact.additions)) parts.push(`+${artifact.additions}`);
+      if (Number.isInteger(artifact.deletions)) parts.push(`-${artifact.deletions}`);
+      if (parts.length) return '补丁 ' + parts.join(' · ');
+    }
+
+    function mvRoomIsPatch(record) {
+      return record.phase === 'development-patch' || record.kind === 'development-patch';
+    }
+
+    function mvRoomParsePatchArtifact(record) {
+      const text = record.body ?? record.text ?? '';
+      const marker = /^<!--marshal-patch-artifact:([\s\S]*?)-->/.exec(text);
+      if (marker) {
+        try { return { meta: JSON.parse(marker[1]), body: text.slice(marker[0].length).replace(/^\r?\n/, '') }; }
+        catch {}
+      }
+      return { meta: null, body: text };
+    }
+
+    async function mvRoomFetchFullPatch({ roomId, taskId, nodeId, digest, seq, preview, stored, bytes, signal }) {
+      const qs = new URLSearchParams({ roomId });
+      if (digest) qs.set('digest', digest);
+      if (seq != null) qs.set('seq', seq);
+      const complete = text => {
+        if (typeof text !== 'string' || !text) return false;
+        if (text.startsWith('<!--marshal-patch-artifact:') || text.includes('点击「下载 .patch」或「应用补丁」可获取完整补丁')) return false;
+        if (Number.isSafeInteger(bytes) && bytes > 0 && new TextEncoder().encode(text).length < bytes) return false;
+        if (stored && preview && !(Number.isSafeInteger(bytes) && bytes > 0) && text === preview) return false;
+        return true;
+      };
+      try {
+        const result = await fetchJson(MV_ROOM_API + 'patch?' + qs, undefined, true, signal);
+        if ((seq != null && result?.seq != null && result.seq !== seq) ||
+            (digest && result?.digest && result.digest !== digest)) {
+          throw new Error('服务端返回的补丁与请求记录不一致');
+        }
+        const text = typeof result === 'string' ? result : result?.patch;
+        if (!complete(text)) throw new Error('服务端未返回完整补丁内容');
+        return text;
+      } catch (e) {
+        if (signal.aborted || !taskId) throw e;
+        // The room patch endpoint only searches its latest page. DAG detail resolves the exact record.
+        let targetNodeId = nodeId;
+        if (!targetNodeId) {
+          const dag = await fetchJson('marshal/tasks/dag?' + new URLSearchParams({ taskId }), undefined, true, signal);
+          const nodes = (dag?.layers ?? []).flatMap(layer => layer.nodes ?? []);
+          const matched = (digest && nodes.find(item => item.patchDigest === digest))
+            || nodes.findLast(item => item.phase === 'development-patch' || item.id?.startsWith('development-patch:') || item.id?.startsWith('patch:'));
+          targetNodeId = matched?.id;
+          if (!targetNodeId) throw e;
+        }
+        const { node } = await fetchJson('marshal/tasks/dag/node?' + new URLSearchParams({ taskId, nodeId: targetNodeId }),
+          undefined, true, signal);
+        if (node?.id !== targetNodeId || (digest && node.patchDigest && node.patchDigest !== digest) || !complete(node.diff)) throw e;
+        return node.diff;
+      }
+    }
+
+    function mvRoomDownloadPatch(text, { digest, seq }) {
+      const url = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
+      try {
+        const link = document.createElement('a');
+        link.hidden = true;
+        link.href = url;
+        link.download = `development-${digest?.slice(0, 12) || (seq ?? 'latest')}.patch`;
+        link.click();
+      } finally {
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      }
+    }
+
+    function mvRoomReadPatch(record, artifact, digest) {
+      const summary = mvRoomPatchSummary(artifact.meta);
+      if (summary) return summary;
+      const files = new Set();
+      let additions = 0, deletions = 0, inHunk = false;
+      for (const line of artifact.body.split('\n')) {
+        if (line.startsWith('diff --git ')) {
+          files.add(line.slice('diff --git '.length));
+          inHunk = false;
+        } else if (line.startsWith('@@ ')) inHunk = true;
+        else if (inHunk && line.startsWith('+')) additions++;
+        else if (inHunk && line.startsWith('-')) deletions++;
+      }
+      if (files.size) return mvRoomPatchSummary({ fileCount: files.size, additions, deletions, digest: record.patchDigest || digest });
+    }
+
+    function mvRoomHandoffMeta(record, text) {
+      const parse = value => {
+        if (typeof value !== 'string') return value;
+        try { return JSON.parse(value); } catch { return null; }
+      };
+      let data = parse(record.meta) ?? parse(record.body ?? text);
+      for (let depth = 0; data && depth < 2; depth++) {
+        const wrapped = parse(data.meta ?? data.body);
+        if (!wrapped || typeof wrapped !== 'object') break;
+        data = wrapped;
+      }
+      return data;
+    }
+
+    function mvRoomHandoff(record, participants, text, workflow, patchSummary, { runAssignment, isCurrentRun }) {
+      const phase = record.phase || record.kind;
+      const meta = mvRoomHandoffMeta(record, text);
+      const direction = /→|->|(?:移交|转交|交接|分配)\s*(?:给|至)|退回(?:给|至)?|交给|hand(?:ed)?\s*off\s+to\b/i.exec(text);
+      const structuredTarget = mvRoomHandoffText(record.targetName, record.target, record.assignee, record.to,
+        meta?.targetName, meta?.target, meta?.assignee, meta?.to)?.replace(/^@\s*/, '');
+      const assignment = record.kind === 'assignment' || phase === 'assignment';
+      const transfer = direction && !['→', '->'].includes(direction[0]);
+      const explicit = record.kind === 'handoff' || phase === 'handoff' || assignment;
+      const designHandoff = phase === 'designing' && /^开发设计交接已写入工作区公共记忆[。.]?$/.test(text.trim());
+      const reviewHandoff = phase === 'dev-reviewing' && /^编码交付与审查交接已写入工作区公共记忆[。.]?$/.test(text.trim());
+      if (!explicit && !['agent', 'status'].includes(record.kind)) return null;
+
+      const labels = new Map(isCurrentRun ? [
+        ['leader', workflow?.leaderName || 'Leader'], ['coder', 'Coder'], ['reviewer', 'Reviewer'],
+      ] : []);
+      for (const member of isCurrentRun ? participants : []) {
+        if (!member.name) continue;
+        labels.set(member.name.toLowerCase(), member.name);
+        for (const role of member.roles ?? member.role?.split('/') ?? []) labels.set(role.toLowerCase(), member.name);
+      }
+      for (const [role, name] of Object.entries({ ...runAssignment?.roles,
+        ...(runAssignment?.leaderName ? { Leader: runAssignment.leaderName } : {}) })) {
+        if (!mvRoomHandoffText(name)) continue;
+        labels.set(role.toLowerCase(), name);
+        labels.set(name.toLowerCase(), name);
+      }
+      const matchMember = (segment, end) => {
+        const name = segment.trimStart().replace(/^@\s*/, '').toLowerCase();
+        const label = [...labels.keys()].sort((a, b) => b.length - a.length)
+          .find(key => name.startsWith(key) && end.test(name.slice(key.length)));
+        return labels.get(label);
+      };
+      const destination = direction && text.slice(direction.index + direction[0].length).replace(/^[\s:：]+/, '');
+      const mentioned = /^@\s*([^\s，。；、,.!?！？;:：/]+)/.exec((destination || (explicit && !direction ? text.trimStart() : '')))?.[1];
+      const codingRecipient = /^编码交给[ \t]+([^@\r\n，。；、,.!?！？;:：/]+?)[ \t]+的常驻会话[。.]?$/.exec(text.trim())?.[1]?.trim();
+      const target = structuredTarget
+        ? labels.get(structuredTarget.toLowerCase()) || structuredTarget
+        : (destination && matchMember(destination, /^(?:$|[，。；、,.!?！？;:：/]|[ \t]+(?:的|常驻|[·（(]|$))/))
+          || (codingRecipient && (labels.get(codingRecipient.toLowerCase()) || codingRecipient))
+          || (mentioned && (labels.get(mentioned.toLowerCase()) || mentioned));
+      const source = direction && matchMember(text.slice(0, direction.index).trim().replace(/^由\s*/, ''), /^(?:$|\s|[，,：:]|要求|决定)/);
+      // An arrow alone can be part of an ordinary agent reply (e.g. a code snippet).
+      if (!explicit && !structuredTarget && !designHandoff && !reviewHandoff &&
+          !(transfer ? target || source : source && target)) return null;
+      const roles = assignment ? Object.values(meta?.roles ?? {}).filter(name => typeof name === 'string' && name.trim()) : [];
+      let sourceRole, targetRole;
+      if ((runAssignment || (isCurrentRun && (workflow || participants.length))) && !direction && !structuredTarget) {
+        if (designHandoff || (explicit && phase === 'designing')) {
+          sourceRole = 'leader'; targetRole = 'coder';
+        } else if (reviewHandoff || (explicit && phase === 'dev-reviewing')) {
+          sourceRole = 'coder'; targetRole = 'reviewer';
+        }
+      }
+      const recipient = target || labels.get(targetRole);
+      const projectedPhase = phase === 'coding' && /返工|退回 Coder/.test(text) ? 'revise' : phase;
+      return { targets: [...new Set(recipient ? [recipient] : roles)], phase,
+        source: mvRoomHandoffText(record.sourceName, record.from, meta?.sourceName, meta?.from, source, labels.get(sourceRole), record.actor) || 'Marshal',
+        // A room ref can point to shared memory rather than a patch or artifact.
+        summary: mvRoomHandoffText(record.artifactSummary, meta?.artifactSummary, record.patchDigest, meta?.patchDigest,
+          phase === 'dev-reviewing' && patchSummary, record.patchSummary, meta?.patchSummary, meta?.template, meta?.group),
+        nodeId: record.nodeId || meta?.nodeId || `${projectedPhase}:${record.id ?? record.seq}` };
+    }
+
+    function MarshalTicketRoomView({ task, openBoard, onOpenAgents }) {
+      const bound = task?.taskRoom;
+      const [workspace, setWorkspace] = React.useState(bound?.workspaceId || task?.workflow?.workspaceId || task?.workspaceId || '');
+      const [workspaces, setWorkspaces] = React.useState([]);
+      const [rooms, setRooms] = React.useState([]);
+      const [roomId, setRoomId] = React.useState(bound?.id || '');
+      const [error, setError] = React.useState('');
+      const [opening, setOpening] = React.useState(false);
+      const listRefresh = React.useRef(null);
+      const life = React.useRef(null);
+      React.useEffect(() => {
+        ensureTaskRoomStyles();
+        return ensureMarshalVnextStyles();
+      }, []);
+      React.useEffect(() => {
+        const controller = new AbortController();
+        life.current = controller;
+        const { signal } = controller;
+        void fetchJson(MV_ROOM_API + 'workspaces', undefined, true, signal).then(data => {
+          if (signal.aborted) return;
+          const available = (data.workspaces ?? []).filter(ws => !isPseudoAgentWorkspace(ws) || ws.id === bound?.workspaceId);
+          setWorkspaces(available);
+          setWorkspace(current => current || (available.length === 1 ? available[0].id : ''));
+        }).catch(e => { if (!signal.aborted) setError(e.message); });
+        return () => controller.abort();
+      }, []);
+      React.useEffect(() => {
+        if (!workspace) return;
+        const refresh = createVisibleMarshalRefresh(async signal => {
+          try {
+            const data = await fetchJson(MV_ROOM_API + 'list?' + new URLSearchParams({ workspaceId: workspace }), undefined, true, signal);
+            if (signal.aborted) return;
+            setRooms(data.rooms ?? []);
+            if (!task) setRoomId(current => current || data.rooms?.[0]?.id || '');
+          } catch (e) { if (!signal.aborted) setError(e.message); }
+        });
+        listRefresh.current = refresh;
+        const unsubscribe = subscribeMarshalEvents(['ready', 'tasks.changed', 'room.message'], refresh.request, { initial: true, debounceMs: 80 });
+        return () => { listRefresh.current = null; unsubscribe(); refresh.dispose(); };
+      }, [workspace]);
+      const open = async () => {
+        const signal = life.current.signal;
+        setOpening(true);
+        setError('');
+        try {
+          const data = await fetchJson(MV_ROOM_API + 'open', { taskId: task.id, workspaceId: workspace }, true, signal);
+          if (!signal.aborted) { setRoomId(data.room.id); void listRefresh.current?.request(); }
+        } catch (e) { if (!signal.aborted) setError(e.message); }
+        finally { if (!signal.aborted) setOpening(false); }
+      };
+      return h('section', { className: 'mv-scope mv-room-fill', 'aria-label': '工单群', style: { flexDirection: 'column' } },
+        (!task || !roomId || error) && h('div', { className: 'mv-dag-header mv-actions' },
+          !roomId && h(MvButton, { label: '返回工作台', icon: 'back', onClick: () => openBoard?.(task?.id) }),
+          (!task || !workspace) && h('select', { className: 'mv-field mv-compact-field', 'aria-label': '工作区', value: workspace, disabled: opening,
+            onChange: e => { setWorkspace(e.target.value); setRoomId(''); setRooms([]); setError(''); } },
+            h('option', { value: '' }, '选择工作区'), workspaces.map(ws => h('option', { key: ws.id, value: ws.id }, ws.name || ws.title || ws.id))),
+          !task && workspace && h('select', { className: 'mv-field mv-compact-field', 'aria-label': '工单群记录', value: roomId,
+            onChange: e => setRoomId(e.target.value) }, h('option', { value: '' }, '选择工单群'),
+            rooms.map(room => h('option', { key: room.id, value: room.id }, room.title))),
+          error && h('span', { role: 'alert', className: 'mv-danger' }, error)),
+        roomId && workspace ? h(mvTicketConversation, { key: 'taskRooms-' + workspace + '/' + roomId, workspace, roomId, task, openBoard, onOpenAgents })
+          : h(EmptyState, { title: task?.title || '选择一个工单群', hint: task ? '开启工单群后即可参与协作。' : '从工作区查看工单群记录。',
+            action: task && workspace && !opening ? '开启此工单群聊' : undefined, onAction: open }));
+    }
+
+    function mvTicketConversation({ workspace, roomId, task, openBoard, onOpenAgents }) {
+      const [visible, setVisible] = React.useState(null);
+      const [draft, setDraft] = React.useState('');
+      const [context, setContext] = React.useState({});
+      const [library, setLibrary] = React.useState(null);
+      const [leaders, setLeaders] = React.useState([]);
+      const [assignee, setAssignee] = React.useState('');
+      const [peers, setPeers] = React.useState([]);
+      const [error, setError] = React.useState('');
+      const [notice, setNotice] = React.useState('');
+      const [pending, setPending] = React.useState('');
+      const [paging, setPaging] = React.useState(false);
+      const [dagOpen, setDagOpen] = React.useState(false);
+      const [nodeId, setNodeId] = React.useState('');
+      const [locating, setLocating] = React.useState(false);
+      const [catalogModels, setCatalogModels] = React.useState([]);
+      const [fullPatch, setFullPatch] = React.useState(null);
+      const patchRequest = React.useRef(null);
+      const patchResult = React.useRef(null);
+      const cursor = React.useRef(null);
+      const refreshRef = React.useRef(null);
+      const lifetime = React.useRef(null);
+      const flight = React.useRef('');
+      const stream = React.useRef(null);
+      const stick = React.useRef(true);
+      const prepend = React.useRef(null);
+      const input = React.useRef(null);
+      const url = MV_ROOM_API + 'page?' + new URLSearchParams({ roomId, workspaceId: workspace });
+      const room = visible?.room;
+      const taskId = visible?.taskId || room?.taskId || task?.id;
+      const workflow = visible?.workflow ?? task?.workflow;
+      const projectedTask = { ...task, id: taskId, title: room?.title || task?.title,
+        workflow, status: visible?.cardStatus ?? task?.status, taskRoom: room };
+      const participants = visible?.participants ?? [];
+      const reviewing = visible?.origin && !room?.closed && (visible.cardStatus === 'review' || visible.runState === 'review-blocked');
+      const runningRevision = visible?.origin && !room?.closed && (visible.busy || visible.cardStatus === 'running');
+      const actionPending = Boolean(pending || visible?.chatBusy);
+      const locked = actionPending || Boolean(visible?.busy);
+      React.useEffect(() => () => patchRequest.current?.abort(), [url, room?.id]);
+      React.useEffect(() => {
+        if (fullPatch?.focusResult && !fullPatch.loading) patchResult.current?.focus();
+      }, [fullPatch]);
+      React.useEffect(() => {
+        const controller = new AbortController();
+        lifetime.current = controller;
+        const refresh = createVisibleMarshalRefresh(async signal => {
+          try {
+            while (!signal.aborted) {
+              const after = cursor.current;
+              const page = await fetchJson(url + (after === null ? '' : '&after=' + after), undefined, true, signal);
+              if (signal.aborted) return;
+              const next = page.records?.at(-1)?.seq ?? after ?? 0;
+              setVisible(previous => mvRoomMerge(previous, page, false));
+              cursor.current = Math.max(after ?? 0, next);
+              if (!page.hasNewer || next <= (after ?? 0)) break;
+            }
+          } catch (e) {
+            if (signal.aborted) return;
+            if (['forbidden', 'workspace-forbidden', 'unauthorized', 'task-room-not-found'].includes(e.code)) {
+              cursor.current = null; setVisible(null);
+            }
+            setError(e.message);
+          }
+        }, 12_000);
+        refreshRef.current = refresh;
+        const unsubscribe = subscribeMarshalEvents(['ready', 'tasks.changed', 'room.message'], refresh.request, { initial: true, debounceMs: 80 });
+        void fetchJson('api/task-board/model-catalog', undefined, false, controller.signal)
+          .then(data => { if (!controller.signal.aborted) setCatalogModels(flattenModelCatalog(data).options); }).catch(() => {});
+        void loadAgentLibrary().then(data => { if (!controller.signal.aborted) setLibrary(data); }).catch(() => {});
+        void fetchJson('marshal/tasks/orchestration', undefined, true, controller.signal)
+          .then(data => { if (!controller.signal.aborted) setLeaders(data.leaders ?? []); }).catch(() => {});
+        return () => { controller.abort(); refreshRef.current = null; unsubscribe(); refresh.dispose(); };
+      }, [url]);
+      React.useEffect(() => {
+        if (!visible?.origin) return;
+        const controller = new AbortController();
+        void fetchJson(MV_ROOM_API + 'peers?' + new URLSearchParams({ roomId }), undefined, true, controller.signal)
+          .then(data => { if (!controller.signal.aborted) setPeers(data.peers ?? []); }).catch(() => {});
+        return () => controller.abort();
+      }, [roomId, visible?.origin]);
+      React.useEffect(() => {
+        refreshRef.current?.setPolling(Boolean(room && !room.closed), visible?.busy || visible?.chatBusy ? 5_000 : 12_000);
+      }, [room?.id, room?.closed, visible?.busy, visible?.chatBusy]);
+      React.useEffect(() => {
+        const el = stream.current;
+        if (!el) return;
+        if (prepend.current) {
+          const anchor = prepend.current;
+          prepend.current = null;
+          el.scrollTop = anchor.top + el.scrollHeight - anchor.height;
+        } else if (stick.current) el.scrollTop = el.scrollHeight;
+      }, [visible]);
+      const older = async () => {
+        if (!visible?.records[0] || paging) return;
+        const signal = lifetime.current.signal;
+        setPaging(true);
+        try {
+          const page = await fetchJson(url + '&before=' + visible.records[0].seq, undefined, true, signal);
+          if (signal.aborted) return;
+          if (stream.current) prepend.current = { top: stream.current.scrollTop, height: stream.current.scrollHeight };
+          stick.current = false;
+          setVisible(previous => previous && mvRoomMerge(previous, page, true));
+        } catch (e) { if (!signal.aborted) setError(e.message); }
+        finally { if (!signal.aborted) setPaging(false); }
+      };
+      const act = async (action, fields = {}) => {
+        if (!room || !visible.origin || flight.current || actionPending ||
+            (action !== 'send' && action !== 'revise' && locked)) return false;
+        const signal = lifetime.current.signal;
+        flight.current = action;
+        setPending(action);
+        setError('');
+        setNotice('');
+        try {
+          if (action === 'send' && context.attachments?.length) {
+            const attachments = new Map([...(visible.attachments ?? []), ...context.attachments].map(item => [item.attachmentId, item]));
+            mvValidatePickerAttachmentBudget([...attachments.values()]);
+            await fetchJson('marshal/tasks/update', { taskId, attachments: [...attachments.values()].map(serializeAttachmentForWire) }, true, signal);
+          }
+          await fetchJson(MV_ROOM_API + 'action', { roomId: room.id, action, ...fields }, true, signal);
+          if (signal.aborted) return false;
+          if (['send', 'confirm', 'revise'].includes(action)) setDraft(current => current === draft ? '' : current);
+          if (action === 'send') { setContext(current => current === context ? {} : current); stick.current = true; }
+          if (action === 'confirm' || action === 'revise') setNotice(action === 'confirm' ? '已确认验收。' : '已提交返工。');
+          await refreshRef.current?.request();
+          return true;
+        } catch (e) { if (!signal.aborted) setError(e.message); return false; }
+        finally { flight.current = ''; if (!signal.aborted) setPending(''); }
+      };
+      const review = (action, applyPatch = false) => action === 'confirm'
+        ? act('confirm', { applyPatch, ...(draft.trim() ? { note: draft.trim() } : {}) })
+        : act('revise', draft.trim() ? { text: draft.trim() } : {});
+      const onReview = action => review(action);
+      const send = () => {
+        const links = mvChatLinks(context);
+        const text = draft.trim();
+        if (text && !visible?.chatBusy) return act('send', { text, ...(room?.closed ? { autoReopen: true } : {}), ...(links ? { links } : {}) });
+      };
+      const locate = async (record, fallback) => {
+        const signal = lifetime.current.signal;
+        setLocating(true);
+        setError('');
+        try {
+          const dag = await fetchJson('marshal/tasks/dag?' + new URLSearchParams({ taskId }), undefined, true, signal);
+          if (signal.aborted) return;
+          // Projection may coalesce several room records into the same node.
+          const nodes = (dag.layers ?? []).flatMap(layer => layer.nodes ?? []);
+          const node = nodes.find(node => node.logs?.some(log => log.seq === record.seq || (record.id && log.id === record.id)));
+          setNodeId(node?.id || fallback);
+        } catch (e) {
+          if (!signal.aborted) setError('无法定位 DAG 节点：' + e.message);
+        } finally { if (!signal.aborted) setLocating(false); }
+      };
+      const assignees = [
+        ...leaders.filter(p => p.global || p.workspaceId === workspace).map(p => ({ id: 'local/' + p.id, name: p.name, fields: { leaderId: p.id } })),
+        ...peers.flatMap(peer => (peer.models ?? []).map(model => ({ id: 'remote/' + peer.id + '/' + model.id,
+          name: peer.name + ' · ' + (model.model || model.id), fields: { remote: { deviceId: peer.id, modelId: model.id } } }))),
+      ];
+      const assigneeFields = assignees.find(row => row.id === assignee)?.fields;
+      const models = mvChatModels([...(library?.models ?? []), ...catalogModels]);
+      const agents = participants.filter(p => mvAgentConfigSlot(p, workflow)).map(p => {
+        const slot = mvAgentConfigSlot(p, workflow);
+        const member = library?.agents.find(a => a.id === p.agentId);
+        const config = workflow?.plan?.agentConfigs?.[slot] || workflow?.agentConfigs?.[slot] || member || p;
+        return { ...p, model: config.model, reasoningEffort: config.reasoningEffort, configKey: slot,
+          models: p.models ?? mvChatModelsWithCurrent(models, config.model) };
+      });
+      const records = visible?.records;
+      const [inlineDigests, setInlineDigests] = React.useState(() => new Map());
+      React.useEffect(() => {
+        if (!globalThis.crypto?.subtle || !records) return;
+        const inline = records.filter(record => mvRoomIsPatch(record) && !record.patchDigest &&
+          record.text?.startsWith('diff --git ') && !inlineDigests.has(record.text));
+        if (!inline.length) return;
+        let active = true;
+        void Promise.all(inline.map(async record => {
+          const bytes = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(record.text));
+          return [record.text, Array.from(new Uint8Array(bytes), byte => byte.toString(16).padStart(2, '0')).join('')];
+        })).then(entries => {
+          if (active) setInlineDigests(current => new Map([...current, ...entries]));
+        }).catch(() => {}); // The file and line counts remain available without SHA-256.
+        return () => { active = false; };
+      }, [records]);
+      let runId, runAssignment = null, priorPatchSummary, sawPatch = false;
+      const lastPatch = records?.findLast(mvRoomIsPatch);
+      const rows = (records ?? []).map(record => {
+        if (record.kind === 'batch' || (record.runId && record.runId !== runId)) {
+          runId = record.runId;
+          runAssignment = null;
+          priorPatchSummary = undefined;
+          sawPatch = false;
+        }
+        const decoded = decodeAgentTraceClient(record.text ?? record.body ?? '');
+        if (record.kind === 'assignment' || record.phase === 'assignment') {
+          const meta = mvRoomHandoffMeta(record, decoded.text);
+          runAssignment = meta ? { leaderName: meta.leader || meta.leaderName, roles: meta.roles } : null;
+        }
+        const isCurrentRun = !record.runId || !workflow?.runId || record.runId === workflow.runId;
+        const artifact = mvRoomIsPatch(record) ? mvRoomParsePatchArtifact(record) : null;
+        if (artifact) {
+          sawPatch = true;
+          priorPatchSummary = mvRoomReadPatch(record, artifact, inlineDigests.get(record.text));
+        }
+        // The workflow describes the latest deliverable, not a past batch or iteration.
+        const patchSummary = sawPatch ? priorPatchSummary :
+          runId && runId === workflow?.runId && (!lastPatch || lastPatch.seq < record.seq) ? mvRoomPatchSummary(workflow.development) : undefined;
+        return { record, ...decoded, patchSummary, runAssignment, isCurrentRun, artifact };
+      });
+      const patchTarget = ({ record, artifact }) => ({
+        digest: artifact?.meta?.digest || record.patchDigest, seq: record.seq, preview: artifact?.body,
+        nodeId: `development-patch:${record.id ?? record.seq}`,
+        stored: Boolean(artifact?.meta?.stored), bytes: artifact?.meta?.bytes,
+      });
+      const headerPatchRow = visible?.patchAvailable
+        ? rows.findLast(row => row.artifact && row.isCurrentRun)
+        : rows.findLast(row => row.artifact?.meta?.stored);
+      const headerPatch = room?.id && (headerPatchRow || visible?.patchAvailable) &&
+        (headerPatchRow ? patchTarget(headerPatchRow) : {
+          digest: workflow?.development?.digest,
+          bytes: workflow?.development?.bytes,
+          stored: true,
+        });
+      const patchKey = ({ digest, seq }) => JSON.stringify([room.id, digest, seq]);
+      const loadPatch = async (target, download, focusResult) => {
+        const key = patchKey(target);
+        const previous = fullPatch?.key === key ? fullPatch : null;
+        if (!download && previous?.text) {
+          setFullPatch({ ...previous, open: !previous.open, error: '', focusResult: focusResult && !previous.open });
+          return;
+        }
+        patchRequest.current?.abort();
+        const controller = new AbortController();
+        patchRequest.current = controller;
+        const { signal } = controller;
+        setFullPatch({ ...previous, key, loading: true, error: '' });
+        let text, patchError = '';
+        try {
+          text = await mvRoomFetchFullPatch({ roomId: room.id, taskId, ...target, signal });
+        } catch (e) {
+          if (signal.aborted) return;
+          patchError = `完整补丁读取失败：${e.message}${download && target.preview ? '（将下载预览）' : ''}`;
+        }
+        if (signal.aborted) return;
+        if (download && (text || target.preview)) {
+          try { mvRoomDownloadPatch(text || target.preview, target); }
+          catch (e) { patchError = [patchError, `补丁下载失败：${e.message}`].filter(Boolean).join('；'); }
+        }
+        setFullPatch({ key, loading: false, error: patchError, text: text ?? previous?.text,
+          open: download ? previous?.open : Boolean(text), focusResult: focusResult && (!download || Boolean(patchError)) });
+      };
+      const patchControls = (target, focusResult = false) => {
+        const state = fullPatch?.key === patchKey(target) ? fullPatch : null;
+        return h('div', { className: 'mv-actions' },
+          h(MvButton, { label: state?.open ? '收起完整补丁' : '查看完整补丁',
+            'aria-expanded': Boolean(state?.open), disabled: Boolean(state?.loading), onClick: () => loadPatch(target, false, focusResult) }),
+          h(MvButton, { label: '下载完整 .patch', disabled: Boolean(state?.loading), onClick: () => loadPatch(target, true, focusResult) }));
+      };
+      const patchContents = target => fullPatch?.key === patchKey(target) && [
+        fullPatch.error && h('div', { key: 'error', ref: patchResult, tabIndex: -1, role: 'alert', className: 'mv-danger' }, fullPatch.error),
+        fullPatch.open && h('pre', { key: 'diff', ref: fullPatch.error ? undefined : patchResult, className: 'mv-dag-diff', tabIndex: 0 }, fullPatch.text),
+      ];
+      const usage = new Map();
+      const add = (actor, u) => usage.set(actor, (usage.get(actor) || 0) + (Number(u?.totalTokens) || (Number(u?.inputTokens || 0) + Number(u?.outputTokens || 0))));
+      rows.forEach(({ record, trace }) => { if (trace?.usage) add(record.actor, trace.usage); });
+      (visible?.liveBubbles ?? []).forEach(live => { if (live.usage) add(live.actor, live.usage); });
+      const ticketNo = room?.ticketNo || task?.ticketNo;
+      const heading = projectedTask.title || '工单群';
+      const total = [...usage.values()].reduce((a, b) => a + b, 0);
+      const renderRow = ({ record, text, trace, patchSummary, runAssignment, isCurrentRun, artifact }) => {
+        const handoff = mvRoomHandoff(record, participants, text, workflow, patchSummary, { runAssignment, isCurrentRun });
+        const banner = handoff && h('div', { 'data-record-seq': record.seq, className: 'mv-task-item mv-guidance-action', 'aria-label': '阶段交接' },
+          h('div', { className: 'mv-actions' }, h('strong', null, handoff.source), ' → ',
+            handoff.targets.length ? handoff.targets.map(target => h('span', { key: target, className: 'mv-capsule' }, '@' + target)) : '待分配',
+            ' · ' + (taskPhases[handoff.phase] || (handoff.phase === 'assignment' ? '编排分工' : '阶段交接')),
+            taskId && h(MvButton, { label: '定位 DAG 节点', disabled: locating, onClick: () => locate(record, handoff.nodeId) })),
+          handoff.summary && h(RichMarkdown, { text: handoff.summary }));
+        const target = artifact && room?.id && patchTarget({ record, artifact });
+        return h(mvChatMessage, { key: record.seq, mine: record.kind === 'user', name: record.actor, text: artifact?.body ?? text,
+          at: record.at, phase: record.phase, trace }, banner, target && patchControls(target), target && patchContents(target));
+      };
+      return h('div', { className: 'mv-room-fill' },
+        h('main', { className: 'mv-room', style: { overflow: 'visible' } },
+          h('header', { className: 'mv-dag-header mv-actions' },
+            h(MvButton, { label: '返回工作台', icon: 'back', onClick: () => openBoard?.(taskId) }),
+            h('strong', { className: 'mv-copy mv-truncate', title: projectedTask.title }, ticketNo && !heading.startsWith('[' + ticketNo + ']') && !heading.startsWith(ticketNo) ? ticketNo + ' · ' + heading : heading),
+            h('span', { className: 'mv-capsule' }, room?.closed ? '已归档' : taskPhases[workflow?.phase] || (reviewing ? '待验收' : visible?.busy ? '执行中' : room ? '讨论中' : '读取中')),
+            h('span', { className: 'mv-actions', 'aria-label': '智能体头像' }, participants.slice(0, 5).map(p => h('span', { key: p.id, title: p.name }, h(MvAvatar, { agent: p })))),
+            total > 0 && h('span', { className: 'mv-capsule mv-time' }, h(MvIcon, { name: 'dot' }), '累计 ' + formatTokenCount(total) + ' tok'),
+            headerPatch && patchControls(headerPatch, true),
+            h(MvButton, { label: '刷新', icon: 'refresh', iconOnly: true, onClick: () => refreshRef.current?.request() }),
+            taskId && h(MvButton, { label: 'DAG 编排', 'aria-pressed': dagOpen, onClick: () => setDagOpen(v => !v) })),
+          error && h('div', { role: 'alert', className: 'mv-danger' }, error),
+          notice && h('div', { role: 'status' }, notice),
+          headerPatch && !headerPatchRow && patchContents(headerPatch),
+          h('section', { ref: stream, className: 'mv-room-log', 'aria-label': '群聊记录', onScroll: e => {
+            const el = e.currentTarget;
+            stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+          } }, visible?.hasOlder && h(MvButton, { label: '加载更早消息', disabled: paging, onClick: older }),
+          !rows.length && !(visible?.liveBubbles?.length) && h('p', { className: 'mv-muted' }, room ? '还没有消息。' : '正在读取工单群…'),
+          rows.map(renderRow), visible && (visible.liveBubbles ?? []).map(live => h(mvChatMessage, { key: 'live-' + live.id,
+            name: live.actor, phase: live.phase, text: live.text, trace: live, live: true })),
+          workflow?.reportId && taskId && h(TaskReviewReport, { key: workflow.reportId, taskId, development: Boolean(workflow.development) })),
+          visible?.origin && room && h('footer', { className: 'mv-composer-dock' },
+            h(mvChatMentions, { members: participants, usage, all: true, input, setText: setDraft }),
+            visible.attachments?.length > 0 && h('div', { className: 'mv-muted', 'aria-label': '工单附件' },
+              '工单附件：' + visible.attachments.map(item => item.name).join('、')),
+            h('textarea', { ref: input, rows: 2, className: 'mv-field', value: draft, 'aria-label': '工单群消息', placeholder: '输入消息或 @成员', onChange: e => setDraft(e.target.value) }),
+            h('div', { className: 'mv-actions' },
+              h(mvCascadePicker.MarshalAgentModelCascade, { agents, task: projectedTask, onSaved: () => { setNotice('模型与思考配置已更新。'); return refreshRef.current?.request(); } }),
+              h(mvCascadePicker.MarshalCascadeContextPicker, { value: context, onChange: setContext }),
+              !participants.length && onOpenAgents && h(MvButton, { label: '打开智能体', onClick: onOpenAgents }),
+              h(MvButton, { icon: 'send', label: pending === 'send' ? '发送中…' : '发送', disabled: !draft.trim() || Boolean(pending) || visible.chatBusy, onClick: send })),
+            h('div', { className: 'mv-actions' },
+              reviewing && h(MvButton, { label: '确认验收', disabled: locked, onClick: () => review('confirm') }),
+              reviewing && visible.patchAvailable && h(MvButton, { label: '应用补丁并验收', disabled: locked, onClick: () => review('confirm', true) }),
+              (reviewing || runningRevision) && h(MvButton, { label: reviewing ? '返工' : '按意见返工',
+                disabled: actionPending || (!reviewing && !draft.trim()), onClick: () => {
+                  if (reviewing || draft.trim()) return review('revise');
+                } }),
+              h(MvButton, { label: room.closed ? '重开工单' : '关闭工单', disabled: locked, onClick: () => act(room.closed ? 'reopen' : 'close') }),
+              !room.closed && h(MvButton, { label: '重试', disabled: locked, onClick: () => act('retry') }),
+              !room.closed && h('select', { className: 'mv-field mv-compact-field', 'aria-label': '改派负责人', value: assignee, disabled: locked, onChange: e => setAssignee(e.target.value) },
+                h('option', { value: '' }, '选择负责人'), assignees.map(p => h('option', { key: p.id, value: p.id }, p.name))),
+              !room.closed && h(MvButton, { label: '改派并运行', disabled: locked || !assigneeFields, onClick: () => act('reassign', assigneeFields) })))),
+        dagOpen && taskId && h(mvDagSidebar.MarshalVerticalDagSidebar, { taskId, task: projectedTask, onReview }),
+        nodeId && taskId && h(mvDagSidebar.MarshalDagNodeModal, { taskId, task: projectedTask, nodeId, onReview, onClose: () => setNodeId('') }));
+    }
     function ensureTaskBoardStyles() {
       if (typeof document === 'undefined') return;
       const existing = document.getElementById('marshal-taskboard-styles');
@@ -8757,7 +9370,7 @@ window.__ModuleLoader__.load({
             h('header', { className: 'mv-line' }, h(MvButton, { icon: 'back', label: '返回调度官', onClick: () => routes.set(null) })),
             h(MarshalErrorBoundary, { resetKey: key },
               h('div', { className: 'mv-room-fill' },
-                kind === 'taskRooms' ? h(TaskRoomsPage, { key, task: { id: item.taskId, title: item.title, taskRoom: item }, openBoard: () => goTab('tasks') })
+                kind === 'taskRooms' ? h(MarshalTicketRoomView, { key, task: { id: item.taskId, title: item.title, taskRoom: item }, openBoard: () => goTab('tasks') })
                   : kind === 'direct' ? h(AgentDirectChatsView, { key, initialAgentId: item.agentId, openSession: props.openSession,
                     mvOpenDirect: props.mvOpenDirect, onOpenAgents: () => goTab('agents') })
                     : h(MarshalSidebarGroupRoom, { key, route, ownerSignal: routeLifetime.signal }))));

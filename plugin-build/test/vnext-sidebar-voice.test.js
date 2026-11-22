@@ -328,7 +328,7 @@ test('Plan A binds the host slots, moves the Portal with its native anchor and r
     button(sections, '测试工单').props.onClick();
     assert.equal(host.roomEvents.at(-1).kind, 'taskRooms');
     const routed = stop => host.expand(host.render('main'), ['MarshalErrorBoundary', stop]);
-    const boardRoom = find(routed('TaskRoomsPage'), node => node.type?.name === 'TaskRoomsPage');
+    const boardRoom = find(routed('MarshalTicketRoomView'), node => node.type?.name === 'MarshalTicketRoomView');
     assert.equal(boardRoom.props.task.taskRoom.id, room.id);
     button(sections, '本机群').props.onClick();
     assert.equal(host.roomEvents.at(-1).item.id, 'group');

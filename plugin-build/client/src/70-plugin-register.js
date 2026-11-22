@@ -104,7 +104,7 @@
             h('header', { className: 'mv-line' }, h(MvButton, { icon: 'back', label: '返回调度官', onClick: () => routes.set(null) })),
             h(MarshalErrorBoundary, { resetKey: key },
               h('div', { className: 'mv-room-fill' },
-                kind === 'taskRooms' ? h(TaskRoomsPage, { key, task: { id: item.taskId, title: item.title, taskRoom: item }, openBoard: () => goTab('tasks') })
+                kind === 'taskRooms' ? h(MarshalTicketRoomView, { key, task: { id: item.taskId, title: item.title, taskRoom: item }, openBoard: () => goTab('tasks') })
                   : kind === 'direct' ? h(AgentDirectChatsView, { key, initialAgentId: item.agentId, openSession: props.openSession,
                     mvOpenDirect: props.mvOpenDirect, onOpenAgents: () => goTab('agents') })
                     : h(MarshalSidebarGroupRoom, { key, route, ownerSignal: routeLifetime.signal }))));
