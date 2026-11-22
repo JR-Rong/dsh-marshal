@@ -79,7 +79,7 @@ test('client/index.js snapshots FileList before clearing input.value and uses oc
 
     // Guard against black-screen regressions: no ensureBoardStyles typo, root & taskRoom ErrorBoundaries, and proper layout inject
     assert.equal(source.includes('ensureBoardStyles('), false, 'must call ensureTaskBoardStyles(), never undefined ensureBoardStyles()');
-    assert.ok(source.includes("resetKey: 'taskRooms-'"), 'TaskRoomsPage must be wrapped in MarshalErrorBoundary');
+    assert.ok(source.includes("resetKey: 'taskRooms-'"), 'MarshalTicketRoomView must be wrapped in MarshalErrorBoundary');
     assert.ok(source.includes('SafeMarshalPanel'), 'MarshalPanel must be wrapped in SafeMarshalPanel root ErrorBoundary');
     assert.ok(source.includes("ctx.inject(['layout']"), 'must inject layout service via Cordis ctx.inject');
     assert.ok(source.includes("'marshal: client lifecycle'"), 'must dispose slots and intervals on client-hmr reload');

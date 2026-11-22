@@ -591,14 +591,23 @@ test('groups/mount.js persists workspaceId on board create and task-development.
     assert.ok(devSrc.includes('不是 Git 仓库根目录'), 'task-development.js should clearly explain non-Git workspace errors');
 });
 
-test('task room client renders chat bubbles, smart Markdown/JSON code blocks, live sendChat, and dual-surface review controls', () => {
-    const clientSrc = readFileSync(new URL('../client/index.js', import.meta.url), 'utf8');
-    assert.ok(clientSrc.includes('function normalizeMessageMarkdown'), 'client should normalize raw JSON/diff/code into Markdown');
-    assert.ok(clientSrc.includes('function RichMarkdown'), 'client should render safe React GFM Markdown');
-    assert.ok(clientSrc.includes('mtr-bubble-agent') && clientSrc.includes('mtr-bubble-user'), 'task room should render left agent bubbles and right user bubbles');
-    assert.ok(clientSrc.includes('buildRoomColorMap'), 'task room should assign distinct per-agent bubble colors');
-    assert.ok(clientSrc.includes("fetchJson('marshal/tasks/confirm-review'"), 'board drawer should call unified confirm-review endpoint');
-    assert.ok(clientSrc.includes("fetchJson('marshal/tasks/revise'"), 'board drawer should call unified revise endpoint');
-    assert.ok(clientSrc.includes('const sendChat = async () =>'), 'task room should provide non-blocking live sendChat independent of workflow busy state');
-    assert.ok(clientSrc.includes('item.global || item.workspaceId === workspace'), 'task room leader picker should include global agents');
+test('vNext ticket conversation keeps Markdown, bubble roles, independent send and dual-surface review', () => {
+    const read = name => readFileSync(new URL(`../client/src/${name}.js`, import.meta.url), 'utf8');
+    const room = read('48-ticket-room-vnext');
+    const bubbles = read('40-groups');
+    const markdown = read('45-trace-and-markdown');
+    const board = read('50-tasks');
+    const dag = read('46-dag-sidebar');
+    assert.match(markdown, /const normalized = React.useMemo\(\(\) => normalizeMessageMarkdown\(text, phase\)/);
+    assert.match(bubbles, /h\(RichMarkdown, \{ text, phase \}/);
+    assert.match(room, /mine: record.kind === 'user', accent: colorMap.get\(record.actor\)/);
+    assert.match(bubbles, /marginInlineStart: mine \? 'var\(--mv-xl\)' : undefined/);
+    assert.match(bubbles, /marginInlineEnd: mine \? undefined : 'var\(--mv-xl\)'/);
+    assert.match(room, /buildRoomColorMap\(visible\?\.records, visible\?\.participants\)/);
+    assert.ok(board.includes("fetchJson('marshal/tasks/confirm-review'"));
+    assert.ok(board.includes("fetchJson('marshal/tasks/revise'"));
+    assert.match(dag, /fetchJson\(action === 'confirm' \? 'marshal\/tasks\/confirm-review' : 'marshal\/tasks\/revise'/);
+    assert.match(room, /action !== 'send' && action !== 'revise' && locked/);
+    assert.match(room, /if \(text && !visible\?\.chatBusy\) return act\('send'/);
+    assert.match(room, /leaders.filter\(p => p.global \|\| p.workspaceId === workspace\)/);
 });

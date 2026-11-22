@@ -53,7 +53,7 @@ test('shipped client reopens a desktop session once across concurrent reads and 
         return new Response(body, { status });
     }
     const context = { window: { location: new URL('dsh-app://app/') },
-        document: { baseURI: 'dsh-app://app/', cookie: '' }, fetch, URL };
+        document: { baseURI: 'dsh-app://app/', cookie: '' }, fetch, URL, AbortController };
     const call = runInNewContext(block + '\nfetchJson', context);
     await Promise.all([call('marshal/memory/settings/get'), call('marshal/memory/settings/get')]);
     assert.equal(opens, 1);
@@ -64,4 +64,34 @@ test('shipped client reopens a desktop session once across concurrent reads and 
     assert.equal(written.settings.autoRecall, false);
     assert.equal(changes, 1);
     assert.equal(opens, 2);
+});
+
+test('aborting one caller does not cancel a handshake another caller still needs', async () => {
+    const source = readFileSync(new URL('../client/index.js', import.meta.url), 'utf8');
+    const block = source.slice(source.indexOf('    const MEMORY_CSRF_COOKIE ='), source.indexOf('    const AGENT_TEAM_PREFIX'));
+    let handshake, resolveSession;
+    const requests = [];
+    const call = runInNewContext(block + '\nfetchJson', {
+        URL, AbortController, window: { location: new URL('dsh-app://app/') },
+        document: { baseURI: 'dsh-app://app/', cookie: '' },
+        fetch(url, init) {
+            if (url.pathname.endsWith('/session')) {
+                assert.equal(handshake, undefined, 'concurrent reads share a single handshake');
+                handshake = init.signal;
+                return new Promise(resolve => { resolveSession = resolve; });
+            }
+            requests.push(url.pathname);
+            assert.equal(init.headers['x-marshal-csrf'], 'proof');
+            return Response.json({ ok: true });
+        },
+    });
+    const left = new AbortController();
+    const first = call('marshal/memory/graph', undefined, true, left.signal);
+    const second = call('marshal/memory/list', undefined, true, new AbortController().signal);
+    left.abort();
+    await assert.rejects(first, { name: 'AbortError' });
+    assert.equal(handshake.aborted, false);
+    resolveSession(Response.json({ ok: true, sessionToken: 'token', csrf: 'proof' }));
+    await second;
+    assert.deepEqual(requests, ['/marshal/memory/list']);
 });

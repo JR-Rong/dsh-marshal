@@ -65,7 +65,7 @@
     const MEMORY_CSRF_COOKIE = 'marshal-memory-csrf';
     const nativeMemory = window.location.protocol === 'dsh-app:' && window.location.hostname === 'app';
     let desktopMemorySession;
-    let memorySessionPromise;
+    let memorySessionFlight;
     function readBrowserCookie(name) {
       const parts = String(document.cookie || '').split(';');
       for (const part of parts) {
@@ -84,36 +84,63 @@
     function memoryProof() {
       return nativeMemory ? desktopMemorySession : (readBrowserCookie(MEMORY_CSRF_COOKIE) || undefined);
     }
-    async function ensureMemorySession(rejected) {
+    async function ensureMemorySession(rejected, signal) {
+      signal?.throwIfAborted();
       const current = memoryProof();
       if (current && current !== rejected) return current;
-      memorySessionPromise ??= fetch(new URL('marshal/memory/session', document.baseURI), {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: { 'x-marshal-memory': '1', ...(nativeMemory ? { 'x-marshal-desktop': '1' } : {}) },
-      }).then(async response => {
-        const data = await readJson(response);
-        if (!response.ok || data?.ok !== true) throw requestError(response, data, true);
-        if (nativeMemory) {
-          if (typeof data.sessionToken === 'string' && typeof data.csrf === 'string') {
-            desktopMemorySession = { 'x-marshal-desktop': '1', 'x-marshal-session': data.sessionToken, 'x-marshal-csrf': data.csrf };
-          } else {
-            desktopMemorySession = undefined;
+      if (!memorySessionFlight) {
+        const flight = { controller: new AbortController(), waiters: 0 };
+        memorySessionFlight = flight;
+        flight.promise = fetch(new URL('marshal/memory/session', document.baseURI), {
+          method: 'POST',
+          credentials: 'same-origin',
+          signal: flight.controller.signal,
+          headers: { 'x-marshal-memory': '1', ...(nativeMemory ? { 'x-marshal-desktop': '1' } : {}) },
+        }).then(async response => {
+          const data = await readJson(response);
+          flight.controller.signal.throwIfAborted();
+          if (!response.ok || data?.ok !== true) throw requestError(response, data, true);
+          if (nativeMemory) {
+            if (typeof data.sessionToken === 'string' && typeof data.csrf === 'string') {
+              desktopMemorySession = { 'x-marshal-desktop': '1', 'x-marshal-session': data.sessionToken, 'x-marshal-csrf': data.csrf };
+            } else {
+              desktopMemorySession = undefined;
+            }
           }
+          const proof = memoryProof();
+          if (!proof) throw Object.assign(new Error('记忆会话凭证不可用。'), { code: 'memory-session-invalid' });
+          if (typeof resumeDeniedMarshalSse === 'function') resumeDeniedMarshalSse(true);
+          return proof;
+        }).finally(() => {
+          if (memorySessionFlight === flight) memorySessionFlight = undefined;
+        });
+      }
+      const flight = memorySessionFlight;
+      flight.waiters++;
+      let onAbort;
+      try {
+        if (!signal) return await flight.promise;
+        return await Promise.race([flight.promise, new Promise((_, reject) => {
+          onAbort = () => reject(signal.reason);
+          signal.addEventListener('abort', onAbort, { once: true });
+        })]);
+      } finally {
+        if (onAbort) signal.removeEventListener('abort', onAbort);
+        // One consumer leaving must not cancel a handshake still needed by another.
+        if (--flight.waiters === 0 && memorySessionFlight === flight) {
+          memorySessionFlight = undefined;
+          flight.controller.abort();
         }
-        const proof = memoryProof();
-        if (!proof) throw Object.assign(new Error('记忆会话凭证不可用。'), { code: 'memory-session-invalid' });
-        if (typeof resumeDeniedMarshalSse === 'function') resumeDeniedMarshalSse(true);
-        return proof;
-      }).finally(() => { memorySessionPromise = undefined; });
-      return memorySessionPromise;
+      }
     }
-    async function fetchJson(path, body, workspaceAuth = false, signal) {
+    async function fetchJson(path, body, workspaceAuth = false, signal, beforeSend) {
       const memory = String(path).startsWith('marshal/memory') && !String(path).startsWith('marshal/memory/session');
       const authenticated = memory || workspaceAuth;
       const url = new URL(path, document.baseURI);
       const send = proof => {
         signal?.throwIfAborted();
+        // Credential acquisition can yield; check again at the actual send.
+        beforeSend?.();
         return fetch(url, {
           credentials: 'same-origin',
           ...(signal ? { signal } : {}),
@@ -125,12 +152,13 @@
         });
       };
       signal?.throwIfAborted();
-      const proof = authenticated ? await ensureMemorySession() : undefined;
+      const proof = authenticated ? await ensureMemorySession(undefined, signal) : undefined;
       let response = await send(proof);
       let data = await readJson(response);
       if (authenticated && (response.status === 401 || data?.code === 'memory-csrf-mismatch')) {
         signal?.throwIfAborted();
-        response = await send(await ensureMemorySession(proof));
+        beforeSend?.();
+        response = await send(await ensureMemorySession(proof, signal));
         data = await readJson(response);
       }
       if (!response.ok || data?.ok === false) throw requestError(response, data, authenticated);

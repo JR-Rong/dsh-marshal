@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import { runInNewContext } from 'node:vm';
 
 const readClient = name => readFileSync(new URL(`../client/${name}.js`, import.meta.url), 'utf8');
-const source = ['00-core-bootstrap', '30-ui-kit', '32-sse-client', '40-groups', '42-task-room-shared', '45-trace-and-markdown', '50-tasks']
+const source = ['00-core-bootstrap', '15-sidebar-left', '30-ui-kit', '32-sse-client', '40-groups', '42-task-room-shared', '45-trace-and-markdown', '48-ticket-room-vnext', '50-tasks', '20-memory']
     .map(name => readClient(`src/${name}`)).concat(readClient('setup')).join('\n');
 const flush = () => new Promise(resolve => setImmediate(resolve));
 const encoder = new TextEncoder();
@@ -25,8 +25,8 @@ function harness(t, baseURI = 'dsh-app://app/', { session, route, React } = {}) 
         addEventListener: windowEvents.addEventListener.bind(windowEvents),
         removeEventListener: windowEvents.removeEventListener.bind(windowEvents),
     };
-    const api = runInNewContext(source + '\n({ subscribeMarshalEvents, disposeAllMarshalSse, CrossGroupsPage, TaskRoomsPage, marshalSetup })', {
-        URL, URLSearchParams, AbortController, TextDecoder, document, window, React, h: React?.createElement,
+    const api = runInNewContext(source + '\n({ subscribeMarshalEvents, disposeAllMarshalSse, CrossGroupsPage, mvTicketConversation, MemoryPage, marshalSetup })', {
+        URL, URLSearchParams, AbortController, AbortSignal, DOMException, TextDecoder, document, window, React, h: React?.createElement,
         Math: Object.create(Math, { random: { value: () => 0.5 } }),
         setTimeout(fn, delay) { timers.set(++nextTimer, { fn, delay }); return nextTimer; },
         clearTimeout(id) { timers.delete(id); },
@@ -35,7 +35,7 @@ function harness(t, baseURI = 'dsh-app://app/', { session, route, React } = {}) 
             if (String(url).endsWith('/marshal/memory/session')) {
                 sessions.push(init);
                 const n = sessions.length;
-                if (session) return session(n);
+                if (session) return session(n, init);
                 return Promise.resolve(Response.json({ ok: true, sessionToken: 'session-' + n, csrf: 'csrf-' + n }));
             }
             if (!String(url).endsWith('/marshal/events')) return route?.(new URL(url), init);
@@ -269,13 +269,13 @@ test('shipped bundle has no legacy injected header or high-frequency network int
 
 // Render the actual page functions and commit their hooks without requiring the DSH host.
 function pageHooks() {
-    const slots = [];
+    let slots = [];
     let index, dirty, effects, tree;
     const React = {
         Fragment: Symbol('Fragment'),
         createElement: (type, props, ...children) => ({ type, props, children }),
         useState(initial) {
-            const slot = slots[index++] ??= { value: initial };
+            const slot = slots[index++] ??= { value: typeof initial === 'function' ? initial() : initial };
             return [slot.value, update => {
                 const value = typeof update === 'function' ? update(slot.value) : update;
                 if (!Object.is(slot.value, value)) dirty = true;
@@ -319,7 +319,7 @@ function pageHooks() {
                     }
                     return [...nodes(tree)].find(predicate);
                 },
-                unmount() { for (const slot of slots) slot.cleanup?.(); },
+                unmount() { for (const slot of slots) slot.cleanup?.(); slots = []; },
             };
         },
     };
@@ -392,8 +392,8 @@ function mountRoom(t, readPage) {
         }
     } });
     h.document.cookie = 'marshal-memory-csrf=proof';
-    const page = hooks.mount(h.TaskRoomsPage, { task: { taskRoom: { id: 'a', workspaceId: 'ws' } } });
-    return { ...h, reads, page };
+    const mount = (roomId = 'a') => hooks.mount(h.mvTicketConversation, { roomId, workspace: 'ws' });
+    return { ...h, reads, page: mount(), mount };
 }
 
 const roomPage = ({ id = 'a', seqs = [], ...rest } = {}) => Response.json({
@@ -406,7 +406,7 @@ const roomPage = ({ id = 'a', seqs = [], ...rest } = {}) => Response.json({
 test('running room refreshes thinking, steps and streaming text multiple times in the same phase without SSE', async t => {
     let progress = 1, running = true, finish;
     const response = () => roomPage({
-        runState: running ? 'running' : 'done',
+        busy: running, runState: running ? 'running' : 'done',
         liveBubbles: running ? [{ id: 'live', actor: 'Coder', phase: 'coding',
             thinking: `thinking ${progress}`, steps: [{ label: `step ${progress}` }], text: `stream ${progress}` }] : [],
     });
@@ -452,7 +452,7 @@ test('non-originating open task room converges on cross-device messages at 12s a
     seqs = [1, 2];
     await h.fire(crossDelay);
     await h.page.settle();
-    assert.ok(h.page.find(node => node.children.some(child => typeof child === 'string' && child.includes('record-2'))));
+    assert.ok(h.page.find(node => node.props?.text?.includes('record-2')));
 
     closed = true;
     await h.fire(crossDelay);
@@ -484,13 +484,13 @@ test('reconnect ready drains newer room pages serially, stopping on failure or a
     await h.page.settle();
     assert.deepEqual(h.reads.map(read => read.after), [null, '2', '4', '6']);
     for (const seq of [2, 3, 4, 5, 6, 7]) {
-        assert.ok(h.page.find(node => node.children.some(child => typeof child === 'string' && child.includes(`record-${seq}`))));
+        assert.ok(h.page.find(node => node.props?.text?.includes(`record-${seq}`)));
     }
-    h.page.find(buttonNamed('刷新')).props.onClick();
+    h.page.find(node => node.props?.label === '刷新').props.onClick();
     await h.page.settle();
     assert.deepEqual(h.reads.map(read => read.after), [null, '2', '4', '6', '7', '8']);
     assert.ok(h.page.find(node => node.children.includes('Room read failed')));
-    h.page.find(buttonNamed('刷新')).props.onClick();
+    h.page.find(node => node.props?.label === '刷新').props.onClick();
     await h.page.settle();
     assert.deepEqual(h.reads.map(read => read.after), [null, '2', '4', '6', '7', '8', '8']);
     h.page.unmount();
@@ -503,13 +503,14 @@ test('switching rooms or unmounting aborts pagination and ignores stale response
     pending[0](roomPage({ seqs: [1], hasNewer: true }));
     await h.page.settle();
     assert.deepEqual(h.reads.map(read => [read.id, read.after]), [['a', null], ['a', '1']]);
-    h.page.find(node => node.type === 'button' && node.props?.key === 'b').props.onClick();
-    await h.page.settle();
+    h.page.unmount();
+    const next = h.mount('b'); // The archive selector remounts the keyed conversation.
+    await next.settle();
     assert.equal(h.reads[1].signal.aborted, true);
     pending[1](roomPage({ seqs: [2], hasNewer: true }));
     await h.page.settle();
     assert.deepEqual(h.reads.map(read => [read.id, read.after]), [['a', null], ['a', '1'], ['b', null]]);
-    h.page.unmount();
+    next.unmount();
     assert.equal(h.reads[2].signal.aborted, true);
     pending[2](roomPage({ id: 'b', seqs: [1], hasNewer: true }));
     await flush();
@@ -521,7 +522,7 @@ test('an initially empty room catches up from sequence zero instead of jumping t
     const h = mountRoom(t, (_, n) => n === 1 ? roomPage()
         : n === 2 ? roomPage({ seqs: [1], hasNewer: true }) : roomPage({ seqs: [2] }));
     await h.page.settle();
-    h.page.find(buttonNamed('刷新')).props.onClick();
+    h.page.find(node => node.props?.label === '刷新').props.onClick();
     await h.page.settle();
     assert.deepEqual(h.reads.map(read => read.after), [null, '0', '1']);
     h.page.unmount();
@@ -555,4 +556,609 @@ test('pre-auth setup checks immediately on focus, backs off on failure and stops
     assert.equal(h.timers.size, 0);
     page.unmount();
     assert.equal(signals.at(-1).aborted, true);
+});
+
+test('memory.changed refreshes the visible memory workbench and unmount aborts graph and SSE reads', async t => {
+    const hooks = pageHooks();
+    let calls = 0, resolveGraph;
+    const signals = [];
+    const h = harness(t, 'https://marshal.test/', { React: hooks.React, route(url, init) {
+        const name = url.pathname.split('/').at(-1);
+        switch (name) {
+            case 'graph': {
+                assert.equal(init.headers['x-marshal-csrf'], 'proof');
+                assert.equal(url.searchParams.get('scope'), 'global');
+                signals.push(init.signal);
+                if (++calls === 2) return new Promise(resolve => { resolveGraph = resolve; });
+                return Response.json({ graph: { nodes: [], edges: [] } });
+            }
+            case 'state': return Response.json({ teams: [] });
+            case 'workspaces': return Response.json({ workspaces: [] });
+            case 'get': return Response.json({});
+            case 'health': return Response.json({ health: [] });
+            case 'proposals': return Response.json({ proposals: [] });
+            default: throw new Error(`unexpected route: ${url}`);
+        }
+    } });
+    h.document.cookie = 'marshal-memory-csrf=proof';
+    let closes = 0;
+    const page = hooks.mount(h.MemoryPage, { closeMemorySidebar: () => { closes++; } });
+    await page.settle();
+    assert.equal(calls, 1);
+    assert.equal(closes, 1);
+    page.find(buttonNamed('暂停漂移')).props.onClick();
+    await page.settle();
+    assert.equal(page.find(node => node.type?.name === 'MemoryGalaxy').props.paused, true);
+    page.find(buttonNamed('恢复漂移')).props.onClick();
+    await page.settle();
+    assert.equal(page.find(node => node.type?.name === 'MemoryGalaxy').props.paused, false);
+    h.respond(0).send('event: memory.changed\ndata: {}\n\n');
+    await flush();
+    assert.equal(calls, 2);
+    page.unmount();
+    assert.equal(signals[1].aborted, true);
+    assert.equal(h.requests[0].init.signal.aborted, true);
+    resolveGraph(Response.json({ graph: { nodes: [], edges: [] } }));
+    await flush();
+    assert.equal(h.timers.size, 0);
+});
+
+test('unmount cancels the cold memory handshake without waiting for a response', async t => {
+    const hooks = pageHooks();
+    let librarySignal;
+    const h = harness(t, undefined, { React: hooks.React, session: (_, { signal }) =>
+        new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true })),
+    route(url, { signal }) {
+        assert.equal(url.pathname, '/dsh-agents/api/state');
+        librarySignal = signal;
+        return Response.json({ teams: [] });
+    } });
+    const page = hooks.mount(h.MemoryPage);
+    await page.settle();
+    assert.equal(h.sessions.length, 1, 'graph, workbench and SSE share the handshake');
+    assert.equal(h.sessions[0].signal.aborted, false);
+    assert.ok(librarySignal instanceof AbortSignal);
+    page.unmount();
+    assert.equal(librarySignal.aborted, true);
+    await flush();
+    assert.equal(h.sessions[0].signal.aborted, true);
+    assert.equal(h.requests.length, 0);
+});
+
+test('full canvas merges all accessible scopes and closes editing controls', async t => {
+    const hooks = pageHooks();
+    const nodes = ['global', 'workspace', 'agent'].map(scope => ({ id: scope, title: scope, scope, kind: 'fact' }));
+    const h = harness(t, 'https://marshal.test/', { React: hooks.React, route(url) {
+        const scope = url.searchParams.get('scope');
+        switch (url.pathname) {
+            case '/dsh-agents/api/state': return Response.json({ teams: [{ name: 'marshal-agent:test', members: [{ id: 'a' }] }] });
+            case '/marshal/task-rooms/workspaces': return Response.json({ workspaces: [{ id: 'w', path: '/project' }] });
+            case '/marshal/memory/graph':
+            case '/marshal/memory/list':
+            case '/marshal/memory/get':
+                assert.equal(url.searchParams.get('workspaceId'), scope === 'workspace' ? 'w' : null);
+                assert.equal(url.searchParams.get('agentId'), scope === 'agent' ? 'a' : null);
+                if (url.pathname.endsWith('/list')) {
+                    assert.equal(url.searchParams.get('query'), '匹配');
+                    return Response.json({ items: nodes });
+                }
+                if (url.pathname.endsWith('/get')) {
+                    assert.equal(url.searchParams.get('id'), scope);
+                    return Response.json({ item: { ...nodes.find(node => node.scope === scope), content: '正文' } });
+                }
+                return Response.json({ graph: { nodes } });
+            default: return Response.json({ settings: {} });
+        }
+    } });
+    h.document.cookie = 'marshal-memory-csrf=proof';
+    let closes = 0;
+    const page = hooks.mount(h.MemoryPage, { closeMemorySidebar: () => { closes++; } });
+    const galaxy = () => page.find(el => el.type?.name === 'MemoryGalaxy').props;
+    const scopes = () => Array.from(galaxy().graph.nodes, node => node.scope);
+    await page.settle();
+    assert.deepEqual(scopes(), ['global']);
+    page.find(buttonNamed('＋ 记忆')).props.onClick();
+    page.find(buttonNamed('设置')).props.onClick();
+    await page.settle();
+    assert.ok(page.find(buttonNamed('取消')));
+    page.find(buttonNamed('全画布')).props.onClick();
+    await page.settle();
+    assert.equal(closes, 2);
+    assert.deepEqual(scopes(), ['global', 'workspace', 'agent']);
+    assert.equal(page.find(buttonNamed('＋ 记忆')), undefined);
+    assert.equal(page.find(buttonNamed('设置')), undefined);
+    page.find(el => el.props?.placeholder === '搜索全域记忆…').props.onChange({ target: { value: '匹配' } });
+    await page.settle();
+    page.find(buttonNamed('搜索')).props.onClick();
+    await page.settle();
+    assert.deepEqual(scopes(), ['global', 'workspace', 'agent']);
+    await galaxy().onSelect(nodes[1]);
+    await page.settle();
+    assert.ok(page.find(el => el.type === 'p' && el.children.includes('正文')));
+    page.find(buttonNamed('退出全画布')).props.onClick();
+    await page.settle();
+    assert.deepEqual(scopes(), ['global']);
+    assert.ok(page.find(buttonNamed('设置')));
+    assert.equal(page.find(buttonNamed('取消')), undefined);
+    assert.equal(page.find(el => el.props?.placeholder === 'empty = 本地'), undefined);
+    page.unmount();
+});
+
+test('galaxy drifts slowly, brakes on hover and drag, pauses, and releases its canvas resources', () => {
+    const refs = [], listeners = new Map(), frames = new Map(), effects = [];
+    let hook, effect, nextFrame = 0, cancelled = 0, point, selected, captured, schemeChange;
+    let ink = '#303030', paintedInk, hostThemeChange;
+    let resize, resizeDisconnects = 0;
+    const host = {};
+    const ctx = {
+        setTransform() {}, clearRect() {}, beginPath() {}, fill() {}, fillText() { paintedInk = this.fillStyle; },
+        arc(x, y) { point = { clientX: x, clientY: y }; },
+    };
+    const canvas = {
+        clientWidth: 600, clientHeight: 480, style: {}, parentElement: host, getContext: () => ctx,
+        getBoundingClientRect: () => ({ left: 0, top: 0 }),
+        addEventListener: (type, fn) => listeners.set(type, fn),
+        removeEventListener(type, fn) { assert.equal(listeners.get(type), fn); listeners.delete(type); },
+        setPointerCapture(id) { captured = id; },
+        hasPointerCapture(id) { return captured === id; },
+        releasePointerCapture() { captured = undefined; },
+    };
+    const Galaxy = runInNewContext(readClient('src/20-memory') + '\nMemoryGalaxy', {
+        React: {
+            useRef(value) { return refs[hook++] ??= { current: value }; },
+            useMemo(run) { return run(); },
+            useEffect(run, deps) {
+                const index = effect++;
+                const previous = effects[index];
+                if (previous && deps.every((dep, i) => Object.is(dep, previous.deps[i]))) return;
+                previous?.cleanup?.();
+                effects[index] = { deps, cleanup: run() };
+            },
+        },
+        h: () => null,
+        dswTheme: { layer: 'transparent', layer3: 'transparent' },
+        window: {
+            getComputedStyle: () => ({ color: ink, getPropertyValue: () => '' }),
+            matchMedia: () => ({
+                addEventListener(type, fn) { assert.equal(type, 'change'); schemeChange = fn; },
+                removeEventListener(type, fn) { assert.equal(fn, schemeChange); schemeChange = undefined; },
+            }),
+        },
+        MutationObserver: class {
+            constructor(fn) { hostThemeChange = fn; }
+            observe(target, options) {
+                assert.equal(target, host);
+                assert.ok(options.attributeFilter.includes('data-theme'));
+            }
+            disconnect() { hostThemeChange = undefined; }
+        },
+        ResizeObserver: class {
+            constructor(fn) { resize = fn; }
+            observe(target) { assert.equal(target, canvas); }
+            disconnect() { resizeDisconnects++; }
+        },
+        requestAnimationFrame(fn) { frames.set(++nextFrame, fn); return nextFrame; },
+        cancelAnimationFrame(id) { cancelled++; frames.delete(id); },
+    });
+    const graph = { nodes: [{ id: 'a', title: '记忆', scope: 'global', kind: 'fact' }] };
+    refs[0] = { current: canvas };
+    const render = (paused, data = graph) => { hook = effect = 0; Galaxy({ graph: data, paused, onSelect: node => { selected = node.id; } }); };
+    const frame = () => {
+        const [[id, draw]] = frames;
+        frames.delete(id);
+        const before = refs[2].current.yaw;
+        draw();
+        return refs[2].current.yaw - before;
+    };
+    const fire = (type, props = {}) => listeners.get(type)({ ...point, button: 0, pointerId: 1, type, ...props });
+    render(false);
+    assert.ok(Math.abs(frame() - 0.00028) < 1e-12);
+    fire('pointermove');
+    const hoverStep = frame();
+    assert.ok(hoverStep > 0 && hoverStep < 0.00028);
+    render(false, { nodes: [{ ...graph.nodes[0], title: '刷新' }] });
+    assert.ok(frame() < hoverStep);
+    fire('pointerdown');
+    fire('pointerleave');
+    const dragStep = frame();
+    assert.ok(dragStep > 0 && dragStep < hoverStep);
+    render(false, { ...graph });
+    assert.equal(captured, 1);
+    assert.ok(frame() < dragStep);
+    fire('pointerup');
+    assert.equal(selected, 'a');
+    fire('pointerleave');
+    render(true);
+    assert.equal(frame(), 0);
+    assert.equal(frames.size, 0, 'paused galaxy does not queue another frame');
+    resize();
+    assert.equal(frames.size, 1);
+    assert.equal(frame(), 0);
+    assert.equal(frames.size, 0, 'a resize paints once without restarting paused drift');
+    ink = '#eeeeee';
+    hostThemeChange();
+    schemeChange();
+    assert.equal(frames.size, 1);
+    assert.equal(frame(), 0);
+    assert.equal(paintedInk, ink);
+    assert.equal(frames.size, 0, 'a theme change does not restart drift');
+    const yaw = refs[2].current.yaw;
+    fire('pointerdown');
+    fire('pointermove', { clientX: point.clientX + 20 });
+    assert.ok(refs[2].current.yaw > yaw, 'manual orbit still works while paused');
+    fire('pointercancel');
+    assert.equal(frame(), 0);
+    assert.equal(frames.size, 0, 'paused interaction paints only one frame');
+    render(false);
+    assert.ok(frame() > 0);
+    fire('pointermove');
+    for (let i = 0; frames.size && i < 100; i++) frame();
+    assert.equal(frames.size, 0, 'hover stops scheduling once braking is complete');
+    schemeChange();
+    assert.equal(frame(), 0);
+    assert.equal(frames.size, 0, 'theme change preserves hover braking');
+    fire('pointerleave');
+    assert.ok(frame() > 0, 'leaving the node restarts drift');
+    fire('pointerdown');
+    for (const entry of effects) entry.cleanup?.();
+    assert.equal(captured, undefined);
+    assert.equal(cancelled, 1);
+    assert.equal(frames.size, 0);
+    assert.equal(listeners.size, 0);
+    assert.equal(schemeChange, undefined);
+    assert.equal(hostThemeChange, undefined);
+    assert.equal(resizeDisconnects, 1);
+});
+
+test('memory bundle keeps ordering, workspace TDZ, and the main panel error boundary', () => {
+    const bundle = readClient('index');
+    const start = bundle.indexOf('function MemoryPage(');
+    const end = bundle.indexOf('function AgentDirectChatsView(');
+    assert.ok(start >= 0 && end > start);
+    const page = bundle.slice(start, end);
+    assert.equal(page.indexOf('realWorkspaces'), page.indexOf('const realWorkspaces = React.useMemo') + 'const '.length);
+    assert.match(page, /isPseudoAgentWorkspace\(ws\)/);
+    for (const label of ['全局记忆与审批', '智能体私有记忆', '工作区共享记忆']) assert.ok(page.includes(label));
+    assert.match(readClient('src/60-agents'), /function SafeMarshalPanel\(props\)\s*\{\s*return h\(MarshalErrorBoundary, \{ resetKey: 'marshal-panel-root' \}, h\(MarshalPanel, props\)\);/);
+    assert.match(readClient('src/70-plugin-register'), /h\(SafeMarshalPanel, props\)/);
+    assert.doesNotMatch(bundle, /\b(?:AgentsPage|TaskRoomsPage)\b/);
+    assert.match(bundle, /function TaskBoardPage\(/);
+    assert.match(readClient('src/56-hub-agents'), /fetchJson\('marshal\/rosters\/save'/);
+    assert.doesNotMatch(readClient('src/20-memory'), /\p{Extended_Pictographic}|\bsetInterval\b|\brequire\s*\(/u);
+});
+
+test('memory search filters the galaxy, resolves node details and keeps global proposal decisions usable', async t => {
+    const hooks = pageHooks();
+    const node = { id: 'a', title: '工作偏好', scope: 'global', kind: 'profile' };
+    const decisions = [], proposals = ['approve-me', 'reject-me'].map(id => ({ id, title: id, content: '记忆' }));
+    let resolveSearch, resolveDetail, resolveCatalog, resolveFailedSearch;
+    let detailSignal;
+    let holdDetail = false, reads = 0, detailReads = 0, writes = 0, remoteText = '已读取正文';
+    const h = harness(t, 'https://marshal.test/', { React: hooks.React, route(url, init) {
+        switch (url.pathname) {
+            case '/dsh-agents/api/state': return Response.json({
+                teams: [{ id: 'team', name: 'marshal-agent:team', members: [{ id: 'agent', name: '智能体' }] }],
+            });
+            case '/marshal/task-rooms/workspaces': return new Promise(resolve => { resolveCatalog = resolve; });
+            case '/marshal/memory/settings/get': return Response.json({});
+            case '/marshal/memory/health': return Response.json({});
+            case '/marshal/memory/proposals': return Response.json({ proposals: proposals.filter(item => !decisions.some(d => d.id === item.id)) });
+            case '/marshal/memory/graph': return Response.json({ graph: { nodes: [node, { ...node, id: 'b' }], edges: [] } });
+            case '/marshal/memory/list':
+                if (url.searchParams.get('query') === '失败查询') return new Promise(resolve => { resolveFailedSearch = resolve; });
+                assert.equal(url.searchParams.get('query'), '偏好');
+                if (++reads === 2 || reads === 3) return new Promise(resolve => { resolveSearch = resolve; });
+                return Response.json({ items: [node, { ...node, id: 'foreign', scope: 'workspace' }] });
+            case '/marshal/memory/get':
+                assert.equal(url.searchParams.get('id'), 'a');
+                detailSignal = init.signal;
+                detailReads++;
+                if (holdDetail) return new Promise(resolve => { resolveDetail = resolve; });
+                return remoteText === null
+                    ? Response.json({ code: 'not-found' }, { status: 404 })
+                    : Response.json({ item: { ...node, content: remoteText } });
+            case '/marshal/memory/global/update':
+                writes++;
+                remoteText = JSON.parse(init.body).text;
+                return Response.json({ item: { ...node, content: remoteText } });
+            case '/marshal/memory/proposals/approve':
+            case '/marshal/memory/proposals/reject':
+                assert.equal(init.headers['x-marshal-csrf'], 'proof');
+                assert.ok(init.signal instanceof AbortSignal);
+                decisions.push(JSON.parse(init.body));
+                return Response.json({ ok: true });
+            default: throw new Error(`unexpected route: ${url}`);
+        }
+    } });
+    h.document.cookie = 'marshal-memory-csrf=proof';
+    const page = hooks.mount(h.MemoryPage);
+    const galaxy = () => page.find(el => el.type?.name === 'MemoryGalaxy').props;
+    await page.settle();
+    assert.equal(galaxy().graph.nodes.length, 2);
+    page.find(el => el.props?.placeholder === '搜索当前层级记忆…').props.onChange({ target: { value: '偏好' } });
+    await page.settle();
+    page.find(buttonNamed('搜索')).props.onClick();
+    await page.settle();
+    assert.equal(galaxy().graph.nodes.length, 1);
+    page.find(el => el.props?.placeholder === '搜索当前层级记忆…').props.onChange({ target: { value: '失败查询' } });
+    await page.settle();
+    assert.equal(galaxy().graph.nodes.length, 1, 'typing does not replace the displayed search');
+    page.find(buttonNamed('搜索')).props.onClick();
+    await page.settle();
+    assert.equal(galaxy().graph.nodes.length, 1, 'pending search keeps the displayed search');
+    resolveFailedSearch(Response.json({}, { status: 500 }));
+    await page.settle();
+    assert.equal(galaxy().graph.nodes.length, 1, 'failed search keeps the displayed search');
+    page.find(el => el.props?.placeholder === '搜索当前层级记忆…').props.onChange({ target: { value: '偏好' } });
+    await page.settle();
+    await galaxy().onSelect(node);
+    await page.settle();
+    const textarea = () => page.find(el => el.type === 'textarea' && el.props?.rows === 6);
+    const alert = () => page.find(el => el.props?.role === 'alert');
+    const stream = h.respond(0);
+    const emit = async type => {
+        stream.send(`event: ${type}\ndata: {}\n\n`);
+        await page.settle();
+    };
+    assert.equal(textarea().props.value, remoteText);
+    remoteText = '未编辑时的新正文';
+    await emit('memory.changed');
+    assert.equal(reads, 2);
+    assert.equal(detailReads, 2);
+    assert.equal(textarea().props.value, remoteText);
+    assert.equal(galaxy().graph.nodes.length, 1, 'old results remain until the new search returns');
+    assert.equal(page.find(el => el.props?.placeholder === '搜索当前层级记忆…').props.value, '偏好');
+    resolveSearch(Response.json({ items: [node] }));
+    await page.settle();
+    textarea().props.onChange({ target: { value: '未保存草稿' } });
+    await page.settle();
+    await emit('incidents.changed');
+    assert.equal(reads, 3);
+    assert.equal(galaxy().graph.nodes.length, 1, 'incident refresh keeps the current search list while pending');
+    assert.equal(textarea().props.value, '未保存草稿');
+    assert.equal(alert(), undefined);
+    remoteText = '与草稿冲突的新版本';
+    const staleSave = page.find(buttonNamed('保存全局记忆')).props.onClick;
+    holdDetail = true;
+    const beforeConflictRead = detailReads;
+    await emit('memory.changed');
+    assert.equal(reads, 3, 'the earlier search is still pending');
+    assert.equal(detailReads, beforeConflictRead + 1, 'detail verification starts independently of search');
+    assert.equal(page.find(buttonNamed('保存全局记忆')).props.disabled, true);
+    staleSave();
+    await page.settle();
+    assert.equal(writes, 0, 'save handler cannot bypass an in-flight detail read');
+    resolveDetail(Response.json({}, { status: 500 }));
+    await page.settle();
+    assert.equal(page.find(buttonNamed('保存全局记忆')).props.disabled, true, 'failed verification keeps save blocked');
+    staleSave();
+    assert.equal(writes, 0);
+    holdDetail = false;
+    await emit('memory.changed');
+    assert.ok(alert(), 'conflict is already visible before the search returns');
+    resolveSearch(Response.json({ items: [node] }));
+    await page.settle();
+    assert.equal(galaxy().graph.nodes.length, 1);
+    assert.equal(textarea().props.value, '未保存草稿');
+    assert.ok(alert());
+    const save = page.find(buttonNamed('保存全局记忆'));
+    assert.equal(save.props.disabled, true);
+    save.props.onClick();
+    await page.settle();
+    assert.equal(writes, 0);
+    assert.ok(page.find(buttonNamed('覆盖保存')));
+    const staleLoad = page.find(buttonNamed('载入最新版本')).props.onClick;
+    remoteText = '更新的远端版本 C';
+    holdDetail = true;
+    const beforeLatestRead = detailReads;
+    await emit('memory.changed');
+    const load = page.find(buttonNamed('载入最新版本'));
+    assert.equal(load.props.disabled, true);
+    assert.equal(page.find(buttonNamed('覆盖保存')).props.disabled, true);
+    load.props.onClick();
+    staleLoad();
+    await page.settle();
+    assert.equal(detailReads, beforeLatestRead + 1, 'stale handlers do not duplicate an in-flight check');
+    assert.ok(alert());
+    assert.equal(textarea().props.value, '未保存草稿');
+    await emit('memory.changed');
+    assert.equal(detailReads, beforeLatestRead + 1, 'new invalidations queue behind the in-flight check');
+    resolveDetail(Response.json({ item: { ...node, content: '已过期的核验回包' } }));
+    await page.settle();
+    assert.equal(detailReads, beforeLatestRead + 2);
+    assert.equal(page.find(buttonNamed('载入最新版本')).props.disabled, true, 'a superseded response cannot unlock the conflict');
+    holdDetail = false;
+    resolveDetail(Response.json({ item: { ...node, content: remoteText } }));
+    await page.settle();
+    assert.equal(page.find(buttonNamed('载入最新版本')).props.disabled, false);
+    page.find(buttonNamed('载入最新版本')).props.onClick();
+    await page.settle();
+    assert.equal(textarea().props.value, remoteText);
+    assert.equal(alert(), undefined);
+    textarea().props.onChange({ target: { value: '明确覆盖的草稿' } });
+    await page.settle();
+    remoteText = '再次更新的远端正文';
+    await emit('memory.changed');
+    page.find(buttonNamed('覆盖保存')).props.onClick();
+    await page.settle();
+    assert.equal(writes, 1);
+    assert.equal(remoteText, '明确覆盖的草稿');
+    assert.equal(alert(), undefined);
+    textarea().props.onChange({ target: { value: '远端删除时也保留' } });
+    await page.settle();
+    remoteText = null;
+    await emit('memory.changed');
+    assert.ok(alert());
+    assert.equal(textarea().props.value, '远端删除时也保留');
+    assert.equal(page.find(buttonNamed('覆盖保存')), undefined);
+    page.find(buttonNamed('载入最新版本')).props.onClick();
+    await page.settle();
+    assert.equal(page.find(el => el.type === 'aside'), undefined);
+    page.find(buttonNamed('同意')).props.onClick();
+    await page.settle();
+    assert.equal(page.find(el => el.type === 'input' && el.props?.value === 'approve-me'), undefined);
+    page.find(buttonNamed('拒绝')).props.onClick();
+    await page.settle();
+    assert.deepEqual(decisions, [{ id: 'approve-me', title: 'approve-me', text: '记忆', visibility: 'no-group' }, { id: 'reject-me' }]);
+    assert.equal(page.find(buttonNamed('拒绝')), undefined);
+    page.find(buttonNamed('全画布')).props.onClick();
+    await page.settle();
+    remoteText = '目录载入前打开的正文';
+    await galaxy().onSelect(node);
+    await page.settle();
+    textarea().props.onChange({ target: { value: '目录载入前的草稿' } });
+    await page.settle();
+    resolveCatalog(Response.json({ workspaces: [{ id: 'project', title: '项目' }] }));
+    await page.settle();
+    assert.equal(page.find(el => el.props?.['aria-label'] === '项目工作区').props.value, 'project');
+    assert.equal(page.find(el => el.props?.['aria-label'] === '智能体').props.value, 'agent');
+    assert.equal(galaxy().selectedId, node.id);
+    assert.equal(textarea().props.value, '目录载入前的草稿');
+    holdDetail = true;
+    page.find(buttonNamed('刷新')).props.onClick();
+    await page.settle();
+    assert.equal(detailSignal.aborted, false);
+    page.unmount();
+    assert.equal(detailSignal.aborted, true);
+});
+
+function mountGlobalMemory(t, { node, session, get, update }) {
+    const hooks = pageHooks();
+    const h = harness(t, undefined, { React: hooks.React, session, route(url, init) {
+        switch (url.pathname) {
+            case '/dsh-agents/api/state': return Response.json({ teams: [] });
+            case '/marshal/task-rooms/workspaces': return Response.json({ workspaces: [] });
+            case '/marshal/memory/settings/get':
+            case '/marshal/memory/health':
+            case '/marshal/memory/proposals': return Response.json({});
+            case '/marshal/memory/graph': return Response.json({ graph: { nodes: [node], edges: [] } });
+            case '/marshal/memory/get': return get(url.searchParams.get('id'));
+            case '/marshal/memory/global/update': return update(init);
+            default: throw new Error(`unexpected route: ${url}`);
+        }
+    } });
+    const page = hooks.mount(h.MemoryPage);
+    t.after(() => page.unmount());
+    return { h, page,
+        select: item => page.find(el => el.type?.name === 'MemoryGalaxy').props.onSelect(item),
+        save: () => page.find(buttonNamed('保存全局记忆')),
+        textarea: () => page.find(el => el.type === 'textarea' && el.props?.rows === 6),
+    };
+}
+
+for (const cached of [false, true]) {
+    test(`initial detail verification rejects a superseded /get (${cached ? 'cached body' : 'metadata only'})`, async t => {
+        const node = { id: 'current', scope: 'global', title: '当前记忆', ...(cached ? { content: '缓存 A' } : {}) };
+        const previous = { id: 'previous', scope: 'global', title: '上条记忆', content: '已核验' };
+        const pending = [], writes = [];
+        const { h, page, select, save, textarea } = mountGlobalMemory(t, { node,
+            get: id => id === previous.id ? Response.json({ item: previous }) : new Promise(resolve => pending.push(resolve)),
+            update: init => { writes.push(JSON.parse(init.body)); return Response.json({ item: node }); },
+        });
+        await page.settle();
+        await select(previous);
+        await page.settle();
+        const staleSave = save().props.onClick;
+        const stream = h.respond(0);
+        void select(node);
+        staleSave();
+        await page.settle();
+        assert.equal(pending.length, 1, 'cached content cannot skip the initial GET');
+        assert.equal(save(), undefined, 'editing remains unavailable during the initial GET');
+        assert.deepEqual(writes, []);
+
+        stream.send('event: memory.changed\ndata: {}\n\n');
+        await page.settle();
+        assert.equal(pending.length, 1, 'invalidation queues rather than starting a parallel GET');
+        pending[0](Response.json({ item: { ...node, content: '迟到的 A' } }));
+        await page.settle();
+        assert.equal(pending.length, 2);
+        assert.equal(textarea(), undefined, 'superseded GET cannot open an editor with stale content');
+        staleSave();
+        await page.settle();
+        assert.deepEqual(writes, []);
+
+        pending[1](Response.json({ item: { ...node, content: '远端 B' } }));
+        await page.settle();
+        assert.equal(textarea().props.value, '远端 B');
+        assert.equal(save().props.disabled, false);
+    });
+}
+
+for (const [status, code] of [[401, 'session-expired'], [403, 'memory-csrf-mismatch']]) {
+    test(`global save rechecks its baseline after credential refresh (${code})`, async t => {
+        const node = { id: 'a', scope: 'global', title: '记忆' };
+        let remote = '远端 A', finishSession, detailReads = 0;
+        const writes = [];
+        const proof = n => Response.json({ ok: true, sessionToken: `session-${n}`, csrf: `csrf-${n}` });
+        const { h, page, select, save, textarea } = mountGlobalMemory(t, { node,
+            session: n => n === 2 ? new Promise(resolve => { finishSession = () => resolve(proof(n)); }) : proof(n),
+            get: () => { detailReads++; return Response.json({ item: { ...node, content: remote } }); },
+            update: init => {
+                writes.push(JSON.parse(init.body).text);
+                if (writes.length === 1) return Response.json({ code }, { status });
+                remote = writes.at(-1);
+                return Response.json({ item: { ...node, content: remote } });
+            },
+        });
+        await page.settle();
+        await select(node);
+        await page.settle();
+        const stream = h.respond(0);
+        textarea().props.onChange({ target: { value: '本地草稿' } });
+        await page.settle();
+        save().props.onClick();
+        await page.settle();
+        assert.deepEqual(writes, ['本地草稿']);
+        assert.equal(typeof finishSession, 'function', 'retry is waiting for fresh credentials');
+
+        remote = '远端 B';
+        stream.send('event: memory.changed\ndata: {}\n\n');
+        await page.settle();
+        assert.equal(save().props.disabled, true);
+        finishSession();
+        await page.settle();
+        assert.deepEqual(writes, ['本地草稿'], 'the transport must not retry the stale write');
+        assert.equal(remote, '远端 B');
+        assert.equal(detailReads, 2, 'the canceled save immediately resumes detail verification');
+        assert.equal(textarea().props.value, '本地草稿');
+        assert.ok(page.find(el => el.props?.role === 'alert'));
+        assert.equal(save().props.disabled, true);
+        page.find(buttonNamed('载入最新版本')).props.onClick();
+        await page.settle();
+        assert.equal(textarea().props.value, '远端 B');
+    });
+}
+
+test('global save response arriving after memory.changed preserves draft and detects conflict', async t => {
+    const node = { id: 'a', scope: 'global', title: '记忆' };
+    let remote = '远端 A', finishUpdate, detailReads = 0;
+    const { h, page, select, save, textarea } = mountGlobalMemory(t, { node,
+        session: () => Response.json({ ok: true, sessionToken: 'session-1', csrf: 'csrf-1' }),
+        get: () => { detailReads++; return Response.json({ item: { ...node, content: remote } }); },
+        update: () => new Promise(resolve => { finishUpdate = resolve; }),
+    });
+    await page.settle();
+    await select(node);
+    await page.settle();
+    const stream = h.respond(0);
+    textarea().props.onChange({ target: { value: '本地保存草稿' } });
+    await page.settle();
+    save().props.onClick();
+    await page.settle();
+    assert.equal(typeof finishUpdate, 'function', 'update request is in flight');
+
+    remote = '另一窗口更新 B';
+    stream.send('event: memory.changed\ndata: {}\n\n');
+    await page.settle();
+    finishUpdate(Response.json({ item: { ...node, content: '本地保存草稿' } }));
+    await page.settle();
+
+    assert.equal(detailReads >= 2, true);
+    assert.equal(textarea().props.value, '本地保存草稿');
+    assert.ok(page.find(el => el.props?.role === 'alert'));
+    assert.equal(save().props.disabled, true);
+    page.find(buttonNamed('载入最新版本')).props.onClick();
+    await page.settle();
+    assert.equal(textarea().props.value, '另一窗口更新 B');
 });

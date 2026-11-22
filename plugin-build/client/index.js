@@ -847,186 +847,229 @@ window.__ModuleLoader__.load({
           h('textarea', { className: 'mv-field', rows: 2, 'aria-label': '群聊消息', value: text, onChange: event => setText(event.target.value) }),
           h('div', null, h(MvButton, { icon: 'send', label: busy ? '正在发送…' : '发送消息', type: 'submit', disabled: !group || !text.trim() || busy }))));
     }
-    function MemoryGalaxy({ graph, selectedId, onSelect }) {
+    function MemoryGalaxy({ graph, selectedId, onSelect, paused }) {
       const canvasRef = React.useRef(null);
-      const stateRef = React.useRef(null);
+      const pausedRef = React.useRef(paused);
+      pausedRef.current = paused;
+      const cameraRef = React.useRef({ yaw: 0.35, pitch: -0.16, zoom: 1 });
       const selectRef = React.useRef(onSelect);
       selectRef.current = onSelect;
       const selectedRef = React.useRef(selectedId);
       selectedRef.current = selectedId;
+      const kinds = ['profile', 'decision', 'fact', 'episode', 'handoff', 'scene'];
+      const layout = React.useMemo(() => {
+        const domains = new Set((graph.nodes || []).map(node => node.scope));
+        const hash = value => {
+          let h = 2166136261;
+          for (const character of value) h = Math.imul(h ^ character.codePointAt(0), 16777619);
+          return h >>> 0;
+        };
+        const nodes = (graph.nodes || []).slice(0, 420).map((node, index) => {
+          const seed = hash(String(node.id ?? index));
+          const domain = ({ global: 0, workspace: 1, agent: 2 })[node.scope] ?? 0;
+          const orbit = Math.max(0, kinds.indexOf(node.kind)) * Math.PI / 3;
+          const angle = seed / 0x100000000 * Math.PI * 2;
+          const radius = 12 + (hash('radius:' + seed) % 1000) / 1000 * 42;
+          return { ...node,
+            x: (domains.size > 1 ? (domain - 1) * 160 : 0) + Math.cos(orbit) * 78 + Math.cos(angle) * radius,
+            y: Math.sin(orbit) * 78 + Math.sin(angle) * radius,
+            z: (hash('depth:' + seed) % 1000) / 1000 * 140 - 70,
+          };
+        });
+        const ids = new Set(nodes.map(node => node.id));
+        const edges = (graph.edges || []).filter(edge => ids.has(edge.source) && ids.has(edge.target) && edge.source !== edge.target).slice(0, 1400);
+        return { nodes, edges };
+      }, [graph]);
+      const layoutRef = React.useRef(layout);
+      layoutRef.current = layout;
+      const scheduleRef = React.useRef(null);
       React.useEffect(() => {
         const canvas = canvasRef.current;
-        if (!canvas || !graph) return undefined;
-        const nodes = (graph.nodes || []).slice(0, 420).map((node, index) => {
-          const hash = (value) => { let h = 2166136261; for (let i = 0; i < value.length; i++) { h ^= value.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; };
-          const h = hash(node.id || String(index));
-          const angle = (h % 1000) / 1000 * Math.PI * 2;
-          const radius = 70 + ((h >>> 10) % 1000) / 1000 * 300;
-          return { ...node, x: Math.cos(angle) * radius, y: ((h >>> 20) % 1000) / 1000 * 420 - 210, z: Math.sin(angle) * radius, vx: 0, vy: 0, vz: 0 };
-        });
-        const ids = new Map(nodes.map((node, index) => [node.id, index]));
-        const edges = (graph.edges || []).map(edge => ({ ...edge, a: ids.get(edge.source), b: ids.get(edge.target) })).filter(edge => edge.a !== undefined && edge.b !== undefined && edge.a !== edge.b).slice(0, 1400);
-        for (let iteration = 0; iteration < 110; iteration++) {
-          for (let i = 0; i < nodes.length; i++) {
-            const a = nodes[i];
-            for (let j = i + 1; j < nodes.length; j++) {
-              const b = nodes[j];
-              let dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
-              let d2 = dx * dx + dy * dy + dz * dz + 12;
-              const force = 5200 / d2;
-              const d = Math.sqrt(d2);
-              dx /= d; dy /= d; dz /= d;
-              a.vx += dx * force; a.vy += dy * force; a.vz += dz * force;
-              b.vx -= dx * force; b.vy -= dy * force; b.vz -= dz * force;
-            }
-            a.vx -= a.x * 0.0007; a.vy -= a.y * 0.0007; a.vz -= a.z * 0.0007;
-          }
-          for (const edge of edges) {
-            const a = nodes[edge.a], b = nodes[edge.b];
-            const dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
-            const d = Math.sqrt(dx * dx + dy * dy + dz * dz) + 0.01;
-            const force = (d - 170) * 0.008 * (0.4 + Number(edge.weight || 0.4));
-            const fx = dx / d * force, fy = dy / d * force, fz = dz / d * force;
-            a.vx += fx; a.vy += fy; a.vz += fz;
-            b.vx -= fx; b.vy -= fy; b.vz -= fz;
-          }
-          for (const node of nodes) { node.vx *= 0.72; node.vy *= 0.72; node.vz *= 0.72; node.x += node.vx; node.y += node.vy; node.z += node.vz; }
-        }
-        let maxRadius = 1;
-        for (const node of nodes) maxRadius = Math.max(maxRadius, Math.hypot(node.x, node.y, node.z));
-        const spread = nodes.length <= 4 ? 360 : 300;
-        for (const node of nodes) { const factor = spread / maxRadius; node.x *= factor; node.y *= factor; node.z *= factor; }
-        const stars = Array.from({ length: 220 }, (_, index) => ({ x: (index * 73 % 997) / 997, y: (index * 151 % 991) / 991, r: (index % 7) / 7 * 1.2 + 0.2, phase: index }));
-        const labelIds = new Set([...nodes].sort((a, b) => (Number(b.pinned) - Number(a.pinned)) || (Number(b.importance) - Number(a.importance))).slice(0, 8).map(node => node.id));
-        const camera = { yaw: 0.35, pitch: -0.16, zoom: 1, auto: true, dragging: false, moved: false, lastX: 0, lastY: 0, hover: undefined };
-        stateRef.current = { nodes, edges, stars, camera, width: 0, height: 0 };
-        let raf = 0;
+        if (!canvas) return undefined;
+        const tokens = ['state-warning-primary', 'marshal-accent', 'marshal-success',
+          'label-secondary', 'marshal-danger', 'state-info-primary'];
+        const fallbackHues = [38, 215, 155, 265, 5, 185];
+        const stars = Array.from({ length: 120 }, (_, index) => ({ x: (index * 73 % 997) / 997, y: (index * 151 % 991) / 991, r: (index % 7) / 7 + 0.2 }));
+        const camera = cameraRef.current;
+        let width = 0, height = 0, pointerId = null;
+        let rotY = camera.yaw;
+        let drift = 1;
+        let hover, dragging = false, moved = false, lastX, lastY, startX, startY;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return undefined;
+        let raf = null;
         let disposed = false;
         const toScreen = (node, width, height) => {
-          const cy = Math.cos(camera.yaw), sy = Math.sin(camera.yaw);
+          const cy = Math.cos(rotY), sy = Math.sin(rotY);
           const cp = Math.cos(camera.pitch), sp = Math.sin(camera.pitch);
           let x = node.x * cy - node.z * sy;
           let z = node.x * sy + node.z * cy;
           let y = node.y * cp - z * sp;
           z = node.y * sp + z * cp;
           const focal = 900;
-          const scale = focal / (focal + z) * camera.zoom;
+          const scale = focal / (focal + z) * camera.zoom * Math.min(1.2, width / 560, height / 340);
           return { x: width / 2 + x * scale, y: height / 2 + y * scale, scale, depth: z };
         };
         const draw = () => {
           if (disposed) return;
           const dpr = Math.min(2, window.devicePixelRatio || 1);
-          const width = canvas.clientWidth || 600, height = canvas.clientHeight || 480;
+          width = canvas.clientWidth || 600; height = canvas.clientHeight || 480;
           if (canvas.width !== Math.round(width * dpr) || canvas.height !== Math.round(height * dpr)) {
             canvas.width = Math.round(width * dpr); canvas.height = Math.round(height * dpr);
           }
-          stateRef.current.width = width; stateRef.current.height = height;
-          const ctx = canvas.getContext('2d');
           ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-          const gradient = ctx.createRadialGradient(width * 0.5, height * 0.45, 20, width * 0.5, height * 0.5, Math.max(width, height) * 0.75);
-          gradient.addColorStop(0, '#111827'); gradient.addColorStop(1, '#05070d');
-          ctx.fillStyle = gradient; ctx.fillRect(0, 0, width, height);
+          ctx.clearRect(0, 0, width, height);
+          const theme = window.getComputedStyle(canvas);
+          const ink = theme.color;
+          const colors = tokens.map((token, index) => theme.getPropertyValue('--dsw-alias-' + token).trim() || 'hsl(' + fallbackHues[index] + ' 48% 48%)');
+          ctx.globalAlpha = 0.16; ctx.fillStyle = ink;
           for (const star of stars) {
-            const alpha = 0.18 + 0.35 * (0.5 + 0.5 * Math.sin((performance.now() / 2400) + star.phase));
-            ctx.fillStyle = 'rgba(180,210,255,' + alpha + ')';
             ctx.beginPath(); ctx.arc(star.x * width, star.y * height, star.r, 0, Math.PI * 2); ctx.fill();
           }
-          if (camera.auto && !camera.dragging) camera.yaw += 0.00045;
+          const { nodes, edges } = layoutRef.current;
+          if (!dragging && hover !== undefined && !nodes.some(node => node.id === hover)) {
+            hover = undefined;
+            canvas.style.cursor = 'grab';
+          }
+          const target = hover !== undefined || dragging ? 0 : 1;
+          drift += (target - drift) * 0.09;
+          if (Math.abs(drift - target) < 0.001) drift = target;
+          if (!pausedRef.current) {
+            if (drift === 1) rotY += 0.00028;
+            else rotY += 0.00028 * drift;
+          }
+          camera.yaw = rotY;
           const projected = nodes.map(node => ({ node, ...toScreen(node, width, height) })).sort((a, b) => b.depth - a.depth);
+          const points = new Map(projected.map(entry => [entry.node.id, entry]));
+          ctx.globalAlpha = 0.13; ctx.strokeStyle = ink; ctx.lineWidth = 0.7;
           for (const edge of edges) {
-            const a = projected.find(entry => entry.node === nodes[edge.a]);
-            const b = projected.find(entry => entry.node === nodes[edge.b]);
+            const a = points.get(edge.source), b = points.get(edge.target);
             if (!a || !b) continue;
-            ctx.strokeStyle = edge.relation === 'session' ? 'rgba(120,180,255,0.10)' : 'rgba(160,140,255,0.13)';
-            ctx.lineWidth = 0.7;
             ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
           }
-          let hover = undefined;
           for (const entry of projected) {
             const node = entry.node;
-            const base = 3.2 + Math.sqrt(Math.max(0.01, Number(node.importance))) * 8 + Math.log1p(Number(node.accessCount || 0)) * 1.6;
+            const base = 3.2 + Math.sqrt(Math.max(0.01, (Number(node.importance) || 0))) * 8 + Math.log1p(Math.max(0, Number(node.accessCount) || 0)) * 1.6;
             const radius = Math.max(2, base * entry.scale);
             const clarityAlpha = node.clarity === 'fuzzy' ? 0.5 : node.clarity === 'trace' ? 0.28 : node.clarity === 'clear' ? 0.85 : 1;
             const alpha = Math.max(0.12, Math.min(1, 1 - (entry.depth + 350) / 900)) * clarityAlpha;
-            const colors = { profile: '#f6c35c', decision: '#5aa7ff', fact: '#4fd1c5', episode: '#b18cff', handoff: '#ff9f5a', scene: '#7bd88f' };
-            const color = colors[node.kind] || '#8fb4ff';
-            if (selectedRef.current === node.id) {
-              ctx.strokeStyle = 'rgba(255,255,255,0.85)'; ctx.lineWidth = 1.4;
-              ctx.beginPath(); ctx.arc(entry.x, entry.y, radius + 5, 0, Math.PI * 2); ctx.stroke();
+            const color = colors[kinds.indexOf(node.kind)] || ink;
+            if (selectedRef.current === node.id || node.pinned) {
+              ctx.globalAlpha = 0.85; ctx.strokeStyle = ink; ctx.lineWidth = 1.2;
+              ctx.beginPath(); ctx.arc(entry.x, entry.y, radius + 4, 0, Math.PI * 2); ctx.stroke();
             }
-            const glow = ctx.createRadialGradient(entry.x, entry.y, 0, entry.x, entry.y, radius * 3.2);
-            glow.addColorStop(0, color); glow.addColorStop(0.24, color + '55'); glow.addColorStop(1, 'rgba(0,0,0,0)');
-            ctx.globalAlpha = alpha * 0.55; ctx.fillStyle = glow;
-            ctx.beginPath(); ctx.arc(entry.x, entry.y, radius * 3.2, 0, Math.PI * 2); ctx.fill();
             ctx.globalAlpha = alpha; ctx.fillStyle = color;
             ctx.beginPath(); ctx.arc(entry.x, entry.y, radius, 0, Math.PI * 2); ctx.fill();
-            if (node.pinned) { ctx.strokeStyle = 'rgba(255,220,150,0.8)'; ctx.lineWidth = 1; ctx.beginPath(); ctx.arc(entry.x, entry.y, radius + 3, 0, Math.PI * 2); ctx.stroke(); }
-            if (camera.hover === node.id || selectedRef.current === node.id || labelIds.has(node.id)) {
-              hover = entry;
-              ctx.globalAlpha = 0.95; ctx.fillStyle = '#e8edf7'; ctx.font = '11px sans-serif';
+            if (hover === node.id || selectedRef.current === node.id) {
+              ctx.globalAlpha = 1; ctx.fillStyle = ink; ctx.font = '12px sans-serif';
               const label = String(node.title || '').slice(0, 42);
               ctx.fillText(label, entry.x + radius + 7, entry.y + 3);
             }
           }
           ctx.globalAlpha = 1;
-          ctx.fillStyle = 'rgba(200,215,235,0.55)'; ctx.font = '11px sans-serif';
-          ctx.fillText(nodes.length + ' memories · ' + edges.length + ' links · drag to orbit · wheel to zoom', 14, height - 14);
-          raf = requestAnimationFrame(draw);
+          ctx.fillStyle = ink; ctx.font = '12px sans-serif';
+          ctx.fillText('拖拽旋转 · 滚轮缩放 · 点击查看记忆', 14, height - 14);
+          return !pausedRef.current && ((hover === undefined && !dragging) || drift > 0.001);
         };
-        const onPointerDown = event => { camera.dragging = true; camera.moved = false; camera.lastX = event.clientX; camera.lastY = event.clientY; canvas.setPointerCapture?.(event.pointerId); canvas.style.cursor = 'grabbing'; };
-        const onPointerMove = event => {
-          if (camera.dragging) {
-            const dx = event.clientX - camera.lastX, dy = event.clientY - camera.lastY;
-            if (Math.abs(dx) + Math.abs(dy) > 2) camera.moved = true;
-            camera.yaw += dx * 0.008; camera.pitch = Math.max(-1.2, Math.min(1.2, camera.pitch + dy * 0.008));
-            camera.lastX = event.clientX; camera.lastY = event.clientY;
-            return;
-          }
+        const schedule = () => {
+          if (disposed || raf !== null) return;
+          raf = requestAnimationFrame(() => {
+            raf = null;
+            if (draw()) schedule();
+          });
+        };
+        const hit = event => {
           const rect = canvas.getBoundingClientRect();
-          const mx = event.clientX - rect.left, my = event.clientY - rect.top;
-          let best; let bestDistance = 18;
-          for (const node of nodes) {
-            const p = toScreen(node, stateRef.current.width, stateRef.current.height);
-            const distance = Math.hypot(p.x - mx, p.y - my);
-            if (distance < bestDistance) { best = node; bestDistance = distance; }
+          let best, distance = 18;
+          for (const node of layoutRef.current.nodes) {
+            const p = toScreen(node, width, height);
+            const d = Math.hypot(p.x - (event.clientX - rect.left), p.y - (event.clientY - rect.top));
+            if (d < distance) { best = node; distance = d; }
           }
-          camera.hover = best?.id;
-          canvas.style.cursor = best ? 'pointer' : 'grab';
+          return best;
         };
-        const onPointerUp = event => {
-          if (camera.dragging && !camera.moved) {
-            const rect = canvas.getBoundingClientRect();
-            const mx = event.clientX - rect.left, my = event.clientY - rect.top;
-            let best; let bestDistance = 24;
-            for (const node of nodes) { const p = toScreen(node, stateRef.current.width, stateRef.current.height); const distance = Math.hypot(p.x - mx, p.y - my); if (distance < bestDistance) { best = node; bestDistance = distance; } }
-            if (best) selectRef.current?.(best);
+        const onPointerDown = event => {
+          if (pointerId !== null || event.button !== 0) return;
+          pointerId = event.pointerId; dragging = true; moved = false;
+          startX = lastX = event.clientX; startY = lastY = event.clientY;
+          canvas.setPointerCapture?.(pointerId); canvas.style.cursor = 'grabbing';
+          schedule();
+        };
+        const onPointerMove = event => {
+          schedule();
+          if (dragging) {
+            if (event.pointerId !== pointerId) return;
+            moved ||= Math.hypot(event.clientX - startX, event.clientY - startY) > 3;
+            if (!moved) return;
+            rotY += (event.clientX - lastX) * 0.008;
+            camera.yaw = rotY;
+            camera.pitch = Math.max(-1.2, Math.min(1.2, camera.pitch + (event.clientY - lastY) * 0.008));
+            lastX = event.clientX; lastY = event.clientY;
+          } else {
+            hover = hit(event)?.id;
+            canvas.style.cursor = hover === undefined ? 'grab' : 'pointer';
           }
-          camera.dragging = false; canvas.style.cursor = 'grab';
         };
-        const onWheel = event => { event.preventDefault(); camera.zoom = Math.max(0.35, Math.min(2.8, camera.zoom * (event.deltaY > 0 ? 0.92 : 1.08))); };
-        canvas.addEventListener('pointerdown', onPointerDown);
-        canvas.addEventListener('pointermove', onPointerMove);
-        canvas.addEventListener('pointerup', onPointerUp);
-        canvas.addEventListener('pointerleave', () => { camera.dragging = false; });
-        canvas.addEventListener('wheel', onWheel, { passive: false });
-        const observer = new ResizeObserver(() => {});
-        observer.observe(canvas);
-        raf = requestAnimationFrame(draw);
-        return () => { disposed = true; cancelAnimationFrame(raf); observer.disconnect(); canvas.removeEventListener('pointerdown', onPointerDown); canvas.removeEventListener('pointermove', onPointerMove); canvas.removeEventListener('pointerup', onPointerUp); canvas.removeEventListener('wheel', onWheel); };
-      }, [graph]);
-      return h('canvas', { ref: canvasRef, style: { width: '100%', height: '100%', display: 'block', borderRadius: 14, background: '#05070d', cursor: 'grab', touchAction: 'none' } });
+        const finishPointer = event => {
+          if (!dragging || event.pointerId !== pointerId) return;
+          pointerId = null; dragging = false;
+          const node = event.type === 'pointerup' ? hit(event) : undefined;
+          hover = event.pointerType === 'touch' ? undefined : node?.id;
+          canvas.style.cursor = hover === undefined ? 'grab' : 'pointer';
+          schedule();
+          if (!moved && node) selectRef.current?.(node);
+        };
+        const onPointerLeave = () => { hover = undefined; if (!dragging) canvas.style.cursor = 'grab'; schedule(); };
+        const onWheel = event => { event.preventDefault(); camera.zoom = Math.max(0.35, Math.min(2.8, camera.zoom * (event.deltaY > 0 ? 0.92 : 1.08))); schedule(); };
+        const listeners = { pointerdown: onPointerDown, pointermove: onPointerMove, pointerup: finishPointer,
+          pointercancel: finishPointer, lostpointercapture: finishPointer, pointerleave: onPointerLeave, wheel: onWheel };
+        for (const [type, listener] of Object.entries(listeners)) canvas.addEventListener(type, listener, type === 'wheel' ? { passive: false } : undefined);
+        const observer = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(schedule) : null;
+        observer?.observe(canvas);
+        const colorScheme = window.matchMedia?.('(prefers-color-scheme: dark)');
+        colorScheme?.addEventListener?.('change', schedule);
+        const themeObserver = typeof MutationObserver !== 'undefined' ? new MutationObserver(schedule) : null;
+        for (let parent = canvas.parentElement; parent; parent = parent.parentElement) {
+          themeObserver?.observe(parent, { attributes: true, attributeFilter: [
+            'class', 'style', 'data-theme', 'data-ds-dark-theme', 'data-ds-light-theme', 'data-ds-theme-source',
+          ] });
+        }
+        scheduleRef.current = schedule;
+        schedule();
+        return () => {
+          disposed = true;
+          scheduleRef.current = null;
+          if (raf !== null) cancelAnimationFrame(raf);
+          observer?.disconnect();
+          themeObserver?.disconnect();
+          colorScheme?.removeEventListener?.('change', schedule);
+          for (const [type, listener] of Object.entries(listeners)) canvas.removeEventListener(type, listener);
+          if (pointerId !== null && canvas.hasPointerCapture?.(pointerId)) canvas.releasePointerCapture?.(pointerId);
+          canvas.style.cursor = 'grab';
+        };
+      }, []);
+      React.useEffect(() => { scheduleRef.current?.(); }, [graph, selectedId, paused]);
+      return h('canvas', { ref: canvasRef, 'aria-label': '3D 记忆星系', role: 'img', style: { width: '100%', height: '100%', display: 'block', borderRadius: 14, background: 'radial-gradient(ellipse at center, ' + dswTheme.layer + ', ' + dswTheme.layer3 + ')', cursor: 'grab', touchAction: 'none' } });
     }
 
-    function MemoryPage({ initialAgentId = '', initialLayer = '', mvOpenDirect } = {}) {
+    function MemoryPage({ initialAgentId = '', initialLayer = '', mvOpenDirect, closeMemorySidebar } = {}) {
       const [layer, setLayer] = React.useState(() => (initialLayer === 'agent' || initialLayer === 'workspace' || initialLayer === 'global') ? initialLayer : (initialAgentId ? 'agent' : 'global'));
       const [library, setLibrary] = React.useState(null);
       const [extraWorkspaces, setExtraWorkspaces] = React.useState([]);
       const [agentId, setAgentId] = React.useState(initialAgentId || '');
       const [workspaceId, setWorkspaceId] = React.useState('');
-      const [graph, setGraph] = React.useState({ nodes: [], edges: [] });
+      const [loadedGraph, setGraph] = React.useState(null);
+      const [paused, setPaused] = React.useState(() => window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches ?? false);
+      const [fullCanvas, setFullCanvas] = React.useState(false);
+      const closeSidebar = () => {
+        try { void Promise.resolve(closeMemorySidebar?.()).catch(() => {}); } catch { /* optional host service */ }
+      };
+      React.useEffect(closeSidebar, []);
       const [privateBackend, setPrivateBackend] = React.useState('');
       const [allowTaskRecall, setAllowTaskRecall] = React.useState(false);
       const [selected, setSelected] = React.useState(null);
+      const [detailConflict, setDetailConflict] = React.useState(null);
+      const [detailLoading, setDetailLoading] = React.useState(false);
       const [error, setError] = React.useState('');
       const [query, setQuery] = React.useState('');
       const [results, setResults] = React.useState(null);
@@ -1067,8 +1110,6 @@ window.__ModuleLoader__.load({
 
       React.useEffect(() => {
         setScope(layer);
-        setSelected(null);
-        setResults(null);
       }, [layer]);
 
       React.useEffect(() => {
@@ -1080,18 +1121,76 @@ window.__ModuleLoader__.load({
       const activeAgentId = layer === 'agent' ? agentId : '';
       const mvDirectAgent = agents.find(row => row.id === activeAgentId);
       const activeWorkspaceId = layer === 'workspace' ? workspaceId : '';
-      const view = JSON.stringify([layer, activeAgentId, activeWorkspaceId]);
+      const domains = (fullCanvas ? ['global', 'workspace', 'agent'] : [layer]).filter(domain =>
+        domain === 'global' || (domain === 'agent' ? agentId : workspaceId));
+      const view = JSON.stringify([layer, fullCanvas, fullCanvas ? agentId : activeAgentId, fullCanvas ? workspaceId : activeWorkspaceId]);
       const currentView = React.useRef(view);
       currentView.current = view;
-      const graphRequest = React.useRef(0);
-      const queryRequest = React.useRef(0);
+      const graph = React.useMemo(() => loadedGraph?.view === view ? loadedGraph : { nodes: [], edges: [] }, [loadedGraph, view]);
+      const searchActive = results?.view === view;
+      const visibleResults = searchActive ? results.items : null;
+      const visibleGraph = React.useMemo(() => {
+        if (visibleResults === null) return graph;
+        const ids = new Set(visibleResults.map(item => item.id));
+        return { nodes: visibleResults, edges: graph.edges.filter(edge => ids.has(edge.source) && ids.has(edge.target)) };
+      }, [graph, visibleResults]);
+      const lifetime = React.useRef(null);
+      const refreshRef = React.useRef(null);
+      const detailSelection = React.useRef(0);
+      const [detailCheck, setDetailCheck] = React.useState(null);
+      const checkingDetail = React.useRef(null);
+      const requiredEventSeq = React.useRef(0);
+      const verifiedEventSeq = React.useRef(0);
+      const detailVerifyFailed = React.useRef(false);
+      const verifyLatestDetail = React.useRef(null);
+      const detailVerified = () => !checkingDetail.current && !detailVerifyFailed.current
+        && verifiedEventSeq.current >= requiredEventSeq.current;
+      const savingDetail = React.useRef(false);
+      const [saving, setSaving] = React.useState(false);
+      const conflictRef = React.useRef(null);
+      const updateConflict = conflict => {
+        conflictRef.current = conflict;
+        setDetailConflict(conflict);
+      };
+      const searchRequest = React.useRef(null);
+      const requestMemory = async (path, body, signal = lifetime.current?.signal, beforeSend) => {
+        if (!signal) throw new DOMException('Memory view is not mounted', 'AbortError');
+        const data = await fetchJson(path, body, true, signal, beforeSend);
+        signal.throwIfAborted();
+        return data;
+      };
+      const submittedQuery = React.useRef('');
+      const refresh = () => {
+        // Even an initial read with no loaded body can be invalidated.
+        if (selectedRef.current?.id) {
+          requiredEventSeq.current++;
+          void verifyLatestDetail.current();
+        }
+        return refreshRef.current?.request();
+      };
+      const selectedRef = React.useRef(selected);
+      const editTextRef = React.useRef(editText);
+      const editVisibilityRef = React.useRef(editVisibility);
+      selectedRef.current = selected;
+      editTextRef.current = editText;
+      editVisibilityRef.current = editVisibility;
+      const replaceDetail = item => {
+        selectedRef.current = item;
+        editTextRef.current = item?.content || '';
+        editVisibilityRef.current = item?.visibility === 'all' ? 'all' : 'no-group';
+        setSelected(item);
+        setEditText(editTextRef.current);
+        setEditVisibility(editVisibilityRef.current);
+        updateConflict(null);
+      };
 
-      const load = async () => {
+      const load = async signal => {
         try {
           const [data, wsData] = await Promise.all([
-            loadAgentLibrary(),
-            fetchJson('marshal/task-rooms/workspaces', undefined, true).catch(() => ({ workspaces: [] })),
+            loadAgentLibrary(signal),
+            requestMemory('marshal/task-rooms/workspaces', undefined, signal).catch(() => ({ workspaces: [] })),
           ]);
+          if (signal.aborted) return;
           setLibrary(data);
           setExtraWorkspaces(Array.isArray(wsData?.workspaces) ? wsData.workspaces : []);
           setError('');
@@ -1099,43 +1198,99 @@ window.__ModuleLoader__.load({
           const firstReal = [...(data.workspaces || []), ...(wsData?.workspaces || [])].find(ws => ws && ws.id && !isPseudoAgentWorkspace(ws));
           if (firstReal) setWorkspaceId(current => current || firstReal.id);
         }
-        catch (e) { setError(friendlyError(e, '记忆')); }
+        catch (e) { if (!signal.aborted) setError(friendlyError(e, '记忆')); }
       };
 
-      const buildScopeQuery = () => {
-        const parts = [];
-        if (activeAgentId) parts.push('agentId=' + encodeURIComponent(activeAgentId));
-        if (activeWorkspaceId) parts.push('workspaceId=' + encodeURIComponent(activeWorkspaceId));
-        parts.push('scope=' + encodeURIComponent(layer));
-        return '?' + parts.join('&');
+      const buildScopeQuery = domain => {
+        const params = new URLSearchParams({ scope: domain });
+        if (domain === 'agent') params.set('agentId', agentId);
+        if (domain === 'workspace') params.set('workspaceId', workspaceId);
+        return '?' + params;
       };
 
-      const loadGraph = async () => {
-        if (layer === 'agent' && !activeAgentId) { setGraph({ nodes: [], edges: [] }); return; }
-        if (layer === 'workspace' && !activeWorkspaceId) { setGraph({ nodes: [], edges: [] }); return; }
-        const request = ++graphRequest.current;
-        const target = buildScopeQuery();
+      const refreshSelectedDetail = async () => {
+        const current = selectedRef.current;
+        if (!lifetime.current || !current?.id || savingDetail.current || checkingDetail.current) return;
+        const controller = new AbortController();
+        const { signal } = controller;
+        const seq = requiredEventSeq.current;
+        const selection = detailSelection.current;
+        const check = { controller };
+        checkingDetail.current = check;
+        setDetailCheck(check);
+        // Ignore responses superseded by another selection or a saved version.
+        const isCurrent = () => !signal.aborted && currentView.current === view
+          && detailSelection.current === selection && selectedRef.current === current && requiredEventSeq.current === seq;
         try {
-          const [data, nextHealth] = await Promise.all([
-            fetchJson('marshal/memory/graph' + target),
-            fetchJson('marshal/memory/health' + target).catch(() => null),
-          ]);
-          if (currentView.current !== view || request !== graphRequest.current) return;
-          const rawGraph = data.graph || { nodes: [], edges: [] };
-          const nodes = (rawGraph.nodes || []).filter(node => node.scope === layer);
-          const idSet = new Set(nodes.map(n => n.id));
-          const edges = (rawGraph.edges || []).filter(edge => idSet.has(edge.source) && idSet.has(edge.target));
-          setGraph({ nodes, edges });
-          setPrivateBackend(layer === 'global' ? '' : (data.privateBackend ?? ''));
-          setHealth(nextHealth);
-          setError('');
+          let data;
+          try {
+            data = await requestMemory('marshal/memory/get' + buildScopeQuery(current.scope) + '&id=' + encodeURIComponent(current.id), undefined, signal);
+          } catch (error) {
+            if (!isCurrent()) return;
+            if (error.status !== 404) {
+              // Do not unlock a potentially stale save until a retry can verify the remote version.
+              detailVerifyFailed.current = true;
+              setError(friendlyError(error, '核验记忆版本（请刷新后重试保存）'));
+              return;
+            }
+            data = { item: null };
+          }
+          if (!isCurrent()) return;
+          verifiedEventSeq.current = seq;
+          detailVerifyFailed.current = false;
+          const isDirty = current.scope === 'global' && (editTextRef.current !== (current.content || '') || editVisibilityRef.current !== (current.visibility === 'all' ? 'all' : 'no-group'));
+          const remoteItem = data.item || null;
+          const matchesDraft = Boolean(remoteItem && current.scope === 'global'
+            && editTextRef.current === (remoteItem.content || '')
+            && editVisibilityRef.current === (remoteItem.visibility === 'all' ? 'all' : 'no-group'));
+          if (!isDirty || matchesDraft) replaceDetail(remoteItem);
+          else if (!remoteItem || remoteItem.content !== current.content || remoteItem.title !== current.title || remoteItem.visibility !== current.visibility) {
+            updateConflict({ remoteItem, deleted: !remoteItem, verifiedSeq: seq });
+          } else updateConflict(null);
+        } finally {
+          if (checkingDetail.current === check) {
+            checkingDetail.current = null;
+            if (lifetime.current && !signal.aborted) {
+              setDetailCheck(null);
+              // Only the newest invalidation can commit; coalesce any queued ones.
+              if (requiredEventSeq.current > seq || currentView.current !== view) void verifyLatestDetail.current();
+              else setDetailLoading(false);
+            }
+          }
         }
-        catch (e) { if (currentView.current === view && request === graphRequest.current) setError(friendlyError(e, '记忆')); }
+      };
+      verifyLatestDetail.current = refreshSelectedDetail;
+
+      const loadGraph = async signal => {
+        const [graphs, nextHealth] = await Promise.all([
+          Promise.allSettled(domains.map(async domain => ({
+            domain, data: await requestMemory('marshal/memory/graph' + buildScopeQuery(domain), undefined, signal),
+          }))),
+          domains.includes(layer) ? requestMemory('marshal/memory/health' + buildScopeQuery(layer), undefined, signal).catch(() => null) : null,
+        ]);
+        if (signal.aborted || currentView.current !== view) return;
+        const nodes = [], edges = new Map();
+        let backend = '';
+        for (const result of graphs) {
+          if (result.status !== 'fulfilled') continue;
+          const { domain, data } = result.value;
+          const scoped = (data.graph?.nodes || []).filter(node => node.scope === domain);
+          // Reserve space on the canvas for each domain.
+          nodes.push(...(fullCanvas ? scoped.slice(0, 140) : scoped));
+          for (const edge of data.graph?.edges || []) edges.set(JSON.stringify([edge.source, edge.target]), edge);
+          if (domain === layer && domain !== 'global') backend = data.privateBackend ?? '';
+        }
+        const ids = new Set(nodes.map(node => node.id));
+        setGraph({ view, nodes, edges: [...edges.values()].filter(edge => ids.has(edge.source) && ids.has(edge.target)) });
+        setPrivateBackend(backend);
+        setHealth(nextHealth);
+        const failure = graphs.find(result => result.status === 'rejected');
+        if (failure) setError(friendlyError(failure.reason, '记忆'));
       };
 
-      const loadProposals = async () => {
+      const loadProposals = async signal => {
         try {
-          const data = await fetchJson('marshal/memory/proposals');
+          const data = await requestMemory('marshal/memory/proposals', undefined, signal);
           const items = data.proposals || [];
           setProposals(items);
           setDrafts(current => {
@@ -1147,25 +1302,84 @@ window.__ModuleLoader__.load({
           });
         }
         catch (error) {
+          if (signal.aborted) return;
           setProposals([]);
           if (error && (error.code === 'sign-in-to-approve' || String(error.message || '').includes('sign-in-to-approve')))
             setApprovalNotice('请先登录机主账号后再审批全局记忆');
         }
       };
 
-      React.useEffect(() => { void load(); void fetchJson('marshal/memory/settings/get').then(setSettings).catch(() => {}); void loadProposals(); }, []);
-      React.useEffect(() => { void loadGraph(); }, [layer, activeAgentId, activeWorkspaceId]);
-
-      const search = async () => {
-        const request = ++queryRequest.current;
-        if (query.trim() === '') { setResults(null); return; }
-        try {
-          const data = await fetchJson('marshal/memory/list' + buildScopeQuery() + '&query=' + encodeURIComponent(query));
-          if (currentView.current !== view || request !== queryRequest.current) return;
-          setResults((data.items || []).filter(item => item.scope === layer));
+      React.useEffect(() => {
+        const controller = new AbortController();
+        lifetime.current = controller;
+        void load(controller.signal);
+        void requestMemory('marshal/memory/settings/get', undefined, controller.signal).then(setSettings).catch(() => {});
+        return () => {
+          lifetime.current = null;
+          controller.abort();
+          checkingDetail.current?.controller.abort();
+        };
+      }, []);
+      // Catalog defaults change the loading key without changing the user's selection.
+      React.useEffect(() => {
+        void selectMemory(null);
+      }, [layer, fullCanvas, initialAgentId]);
+      React.useEffect(() => {
+        const visible = createVisibleMarshalRefresh(signal => {
           setError('');
+          return Promise.all([
+            loadGraph(signal), loadProposals(signal),
+            submittedQuery.current && !searchRequest.current ? search(submittedQuery.current, signal) : null,
+          ]);
+        });
+        refreshRef.current = visible;
+        const unsubscribe = subscribeMarshalEvents(['ready', 'memory.changed', 'incidents.changed'], () => { void refresh(); });
+        void visible.request();
+        return () => {
+          refreshRef.current = null;
+          unsubscribe();
+          visible.dispose();
+          searchRequest.current?.abort();
+          searchRequest.current = null;
+        };
+      }, [view]);
+
+      const search = async (value, refreshSignal) => {
+        searchRequest.current?.abort();
+        if (value.trim() === '') { searchRequest.current = null; submittedQuery.current = ''; setResults(null); return; }
+        const controller = new AbortController();
+        searchRequest.current = controller;
+        const signal = refreshSignal ? AbortSignal.any([refreshSignal, controller.signal]) : controller.signal;
+        const reads = await Promise.allSettled(domains.map(async domain => {
+          const data = await requestMemory('marshal/memory/list' + buildScopeQuery(domain) + '&query=' + encodeURIComponent(value.trim()), undefined, signal);
+          const scoped = (data.items || []).filter(item => item.scope === domain);
+          return fullCanvas ? scoped.slice(0, 140) : scoped;
+        }));
+        if (searchRequest.current === controller) searchRequest.current = null;
+        if (signal.aborted || currentView.current !== view) return;
+        const failure = reads.find(read => read.status === 'rejected');
+        if (failure) setError(friendlyError(failure.reason, '记忆检索'));
+        else {
+          submittedQuery.current = value;
+          setResults({ view, items: reads.flatMap(read => read.value) });
         }
-        catch (e) { if (currentView.current === view && request === queryRequest.current) setError(friendlyError(e, '记忆检索')); }
+      };
+      const submitSearch = () => {
+        setError('');
+        void search(query.trim());
+      };
+
+      const selectMemory = async item => {
+        detailSelection.current++;
+        checkingDetail.current?.controller.abort();
+        checkingDetail.current = null;
+        setDetailCheck(null);
+        setDetailLoading(!!item);
+        if (!item) { replaceDetail(null); return; }
+        // Search and graph payloads are previews, not verified edit baselines.
+        requiredEventSeq.current++;
+        replaceDetail({ ...item, content: undefined });
+        await verifyLatestDetail.current();
       };
 
       const create = async () => {
@@ -1173,64 +1387,110 @@ window.__ModuleLoader__.load({
         setBusy(true);
         try {
           if (scope === 'global') {
-            await fetchJson('marshal/memory/global', { title: title.trim(), text: text.trim(), kind: 'fact', importance: 0.6, tags: [], visibility: globalVisibility });
+            await requestMemory('marshal/memory/global', { title: title.trim(), text: text.trim(), kind: 'fact', importance: 0.6, tags: [], visibility: globalVisibility });
           }
           else if (scope === 'workspace') {
             if (!workspaceId) throw new Error('请先选择一个项目工作区');
-            await fetchJson('marshal/memory/remember', { workspaceId, scope: 'workspace', title: title.trim(), text: text.trim(), ...(cue.trim() ? { cue: cue.trim() } : {}), kind: 'fact', importance: 0.6, tags: [] });
+            await requestMemory('marshal/memory/remember', { workspaceId, scope: 'workspace', title: title.trim(), text: text.trim(), ...(cue.trim() ? { cue: cue.trim() } : {}), kind: 'fact', importance: 0.6, tags: [] });
           }
           else {
             if (!agentId) throw new Error('请先选择一个智能体');
-            await fetchJson('marshal/memory/remember', {
+            await requestMemory('marshal/memory/remember', {
               agentId, ...(workspaceId ? { workspaceId } : {}), scope: 'agent',
               title: title.trim(), text: text.trim(), ...(cue.trim() ? { cue: cue.trim() } : {}), kind: 'fact', importance: 0.6, tags: [],
               ...(privateBackend === 'mnemon' && workspaceId && allowTaskRecall ? { visibility: 'group-safe' } : {}),
             });
           }
-          setTitle(''); setText(''); setCue(''); setAllowTaskRecall(false); setFormOpen(false); await loadGraph();
+          setTitle(''); setText(''); setCue(''); setAllowTaskRecall(false); setFormOpen(false); await refresh();
         }
-        catch (e) { setError(friendlyError(e, '写入记忆')); }
-        finally { setBusy(false); }
+        catch (e) { if (lifetime.current) setError(friendlyError(e, '写入记忆')); }
+        finally { if (lifetime.current) setBusy(false); }
       };
 
       const forget = async item => {
         if (!item || !window.confirm('删除这条记忆？')) return;
+        const selection = detailSelection.current;
         try {
-          if (item.scope === 'global') await fetchJson('marshal/memory/global/forget', { id: item.id });
-          else await fetchJson('marshal/memory/forget', {
+          if (item.scope === 'global') await requestMemory('marshal/memory/global/forget', { id: item.id });
+          else await requestMemory('marshal/memory/forget', {
             ...(item.scope === 'agent' ? { agentId } : {}),
             ...(item.scope === 'workspace' ? { workspaceId } : {}),
             id: item.id,
           });
-          setSelected(null); setResults(null); await loadGraph();
+          if (detailSelection.current === selection && selectedRef.current?.id === item.id && selectedRef.current.scope === item.scope) {
+            void selectMemory(null);
+          }
+          await refresh();
         }
-        catch (e) { setError(friendlyError(e, '删除记忆')); }
+        catch (e) { if (lifetime.current) setError(friendlyError(e, '删除记忆')); }
       };
 
       const decideProposal = async (item, action) => {
         const draft = drafts[item.id] || { title: item.title, text: item.content, visibility: item.visibility === 'all' ? 'all' : 'no-group' };
         try {
-          if (action === 'reject') await fetchJson('marshal/memory/proposals/reject', { id: item.id });
-          else await fetchJson('marshal/memory/proposals/approve', { id: item.id, title: draft.title, text: draft.text, visibility: draft.visibility });
-          await loadProposals();
-          await loadGraph();
+          if (action === 'reject') await requestMemory('marshal/memory/proposals/reject', { id: item.id });
+          else await requestMemory('marshal/memory/proposals/approve', { id: item.id, title: draft.title, text: draft.text, visibility: draft.visibility });
+          await refresh();
         }
         catch (e) {
+          if (!lifetime.current) return;
           if (e && (e.code === 'sign-in-to-approve' || String(e.message || '').includes('sign-in-to-approve')))
             setApprovalNotice('请先登录机主账号后再审批全局记忆');
           else setError(friendlyError(e, '全局记忆审批'));
         }
       };
 
-      const saveGlobal = async () => {
-        if (!selected || selected.scope !== 'global') return;
-        try {
-          const saved = await fetchJson('marshal/memory/global/update', { id: selected.id, title: selected.title, text: editText, visibility: editVisibility });
-          setSelected(saved.item);
-          await loadGraph();
+      const loadLatestConflict = () => {
+        const conflict = conflictRef.current;
+        if (!conflict) return;
+        if (savingDetail.current || !detailVerified() || conflict.verifiedSeq < requiredEventSeq.current) {
+          void verifyLatestDetail.current();
+          return;
         }
-        catch (e) { setError(friendlyError(e, '编辑全局记忆')); }
+        replaceDetail(conflict.remoteItem);
       };
+
+      const saveGlobal = async (overwrite = false) => {
+        const selection = detailSelection.current;
+        if (savingDetail.current || !detailVerified()) return;
+        const conflict = conflictRef.current;
+        if (overwrite ? !conflict || conflict.deleted || conflict.verifiedSeq < requiredEventSeq.current : !!conflict) return;
+        const current = selectedRef.current;
+        if (!current || current.scope !== 'global' || typeof current.content !== 'string') return;
+        const seq = requiredEventSeq.current;
+        const canSend = () => detailVerified() && requiredEventSeq.current === seq
+          && detailSelection.current === selection && currentView.current === view && selectedRef.current === current;
+        const staleWrite = new DOMException('Memory edit baseline changed', 'AbortError');
+        const text = editTextRef.current, visibility = editVisibilityRef.current;
+        savingDetail.current = true;
+        setSaving(true);
+        let writeCompleted = false;
+        try {
+          if (!canSend()) return;
+          const saved = await requestMemory('marshal/memory/global/update', { id: current.id, title: conflict?.remoteItem?.title ?? current.title, text, visibility }, lifetime.current?.signal, () => {
+            if (!canSend()) throw staleWrite;
+          });
+          writeCompleted = true;
+          if (detailSelection.current === selection && selectedRef.current === current && currentView.current === view && requiredEventSeq.current === seq) {
+            selectedRef.current = saved.item;
+            setSelected(saved.item);
+            if (editTextRef.current === text) setEditText(editTextRef.current = saved.item.content || '');
+            if (editVisibilityRef.current === visibility) setEditVisibility(editVisibilityRef.current = saved.item.visibility === 'all' ? 'all' : 'no-group');
+            updateConflict(null);
+          }
+        }
+        catch (e) { if (lifetime.current && e !== staleWrite) setError(friendlyError(e, '编辑全局记忆')); return; }
+        finally {
+          savingDetail.current = false;
+          if (lifetime.current) {
+            setSaving(false);
+            if (verifiedEventSeq.current < requiredEventSeq.current) void verifyLatestDetail.current();
+          }
+        }
+        if (requiredEventSeq.current === seq) await refresh();
+        else await refreshRef.current?.request();
+      };
+      const saveBlocked = saving || !!detailCheck || !detailVerified();
 
       const layerTabs = [
         ['global', '全局记忆与审批' + (proposals.length > 0 ? ' (' + proposals.length + ')' : '')],
@@ -1246,36 +1506,41 @@ window.__ModuleLoader__.load({
               style: tabStyle(layer === key),
               onClick: () => setLayer(key),
             }, label))),
-          layer === 'agent' && h('select', { value: agentId, disabled: busy, onChange: event => {
-            setAgentId(event.target.value); setSelected(null); setResults(null); setGraph({ nodes: [], edges: [] });
+          (fullCanvas || layer === 'agent') && h('select', { 'aria-label': '智能体', value: agentId, disabled: busy, onChange: event => {
+            setAgentId(event.target.value); void selectMemory(null); setResults(null);
             setPrivateBackend(''); setHealth(null); setAllowTaskRecall(false); setError('');
           }, style: { ...uiInput, width: 170 } },
             agents.length === 0 ? h('option', { value: '' }, '暂无智能体') : agents.map(item => h('option', { key: item.id, value: item.id }, item.name))),
-          layer === 'workspace' && h('select', { value: workspaceId, disabled: busy, onChange: event => {
-            setWorkspaceId(event.target.value); setSelected(null); setResults(null); setGraph({ nodes: [], edges: [] });
+          (fullCanvas || layer === 'workspace') && h('select', { 'aria-label': '项目工作区', value: workspaceId, disabled: busy, onChange: event => {
+            setWorkspaceId(event.target.value); void selectMemory(null); setResults(null);
             setHealth(null); setError('');
           }, style: { ...uiInput, width: 220 } },
             realWorkspaces.length === 0 ? h('option', { value: '' }, '暂无项目工作区') : realWorkspaces.map(ws => h('option', { key: ws.id, value: ws.id }, ws.label))),
           layer !== 'global' && privateBackend === 'mnemon' && h('span', { style: { color: '#10b981', fontSize: 11, padding: '2px 8px', borderRadius: 999, border: '1px solid color-mix(in srgb, #10b981 35%, transparent)', background: 'color-mix(in srgb, #10b981 12%, transparent)' } }, 'Mnemon · 意图图谱 + 推索引引擎'),
-          h('input', { value: query, onChange: event => setQuery(event.target.value), onKeyDown: event => { if (event.key === 'Enter') void search(); }, placeholder: '搜索当前层级记忆…', style: { ...uiInput, width: 190 } }),
-          h('button', { type: 'button', style: uiButton(false), onClick: () => { void search(); } }, '搜索'),
+          h('input', { value: query, onChange: event => setQuery(event.target.value), onKeyDown: event => { if (event.key === 'Enter') submitSearch(); }, placeholder: fullCanvas ? '搜索全域记忆…' : '搜索当前层级记忆…', style: { ...uiInput, width: 190 } }),
+          h('button', { type: 'button', style: uiButton(false), onClick: submitSearch }, '搜索'),
+          h('button', { type: 'button', style: uiButton(false), onClick: () => setPaused(value => !value) }, paused ? '恢复漂移' : '暂停漂移'),
+          h('button', { type: 'button', style: uiButton(false), onClick: () => {
+            if (!fullCanvas) { closeSidebar(); setFormOpen(false); setSettingsOpen(false); }
+            setFullCanvas(!fullCanvas);
+          } }, fullCanvas ? '退出全画布' : '全画布'),
           mvOpenDirect && mvDirectAgent && h(mvDirectLink, { key: activeAgentId, agent: mvDirectAgent, open: mvOpenDirect }),
-          h('button', { type: 'button', style: uiButton(false), onClick: () => { setScope(layer); setFormOpen(value => !value); } }, '＋ 记忆'),
-          h('button', { type: 'button', style: uiButton(false), onClick: () => setSettingsOpen(value => !value) }, '设置'),
-          h('span', { style: { marginLeft: 'auto', fontSize: 11, color: dswTheme.dim } }, graph.nodes.length + ' 个节点 · ' + graph.edges.length + ' 条关联' + (health?.health?.length ? ' · 模糊 ' + health.health.reduce((sum, item) => sum + (item.fuzzy || 0), 0) + ' · 档案 ' + health.health.reduce((sum, item) => sum + (item.archived || 0), 0) : '')),
-          h('button', { type: 'button', style: uiButton(false), onClick: async () => { setSyncNotice('同步中…'); try { const result = await fetchJson('marshal/memory/sync', { ...(activeAgentId ? { agentId: activeAgentId } : {}), ...(activeWorkspaceId ? { workspaceId: activeWorkspaceId } : {}) }); setSyncNotice('推送 ' + (result.pushed ?? 0) + ' · 拉取 ' + (result.pulled ?? 0)); await loadGraph(); } catch (e) { setSyncNotice(String(e.message || e)); } } }, '同步'),
-          layer === 'global' && h('button', { type: 'button', style: uiButton(false), onClick: async () => { setSyncNotice('迁移旧同步…'); try { const result = await fetchJson('marshal/memory/migrate-legacy', {}); setSyncNotice(result.migrated ? '已绑定 ' + result.migrated + ' 条旧记录' : '没有待迁移的旧记录'); } catch (e) { if (e && (e.code === 'sign-in-to-approve' || String(e.message || '').includes('sign-in-to-approve'))) setApprovalNotice('请先登录机主账号后再审批全局记忆'); setSyncNotice(String(e.message || e)); } } }, '迁移旧同步'),
-          h('button', { type: 'button', style: uiButton(false), onClick: () => { void loadGraph(); void loadProposals(); } }, '刷新')),
+          !fullCanvas && h('button', { type: 'button', style: uiButton(false), onClick: () => { setScope(layer); setFormOpen(value => !value); } }, '＋ 记忆'),
+          !fullCanvas && h('button', { type: 'button', style: uiButton(false), onClick: () => setSettingsOpen(value => !value) }, '设置'),
+          h('span', { style: { marginLeft: 'auto', fontSize: 11, color: dswTheme.dim } }, visibleGraph.nodes.length + ' 个节点 · ' + visibleGraph.edges.length + ' 条关联' + (health?.health?.length ? ' · 模糊 ' + health.health.reduce((sum, item) => sum + (item.fuzzy || 0), 0) + ' · 档案 ' + health.health.reduce((sum, item) => sum + (item.archived || 0), 0) : '')),
+          h('button', { type: 'button', style: uiButton(false), onClick: async () => { setSyncNotice('同步中…'); try { const result = await requestMemory('marshal/memory/sync', { ...(activeAgentId ? { agentId: activeAgentId } : {}), ...(activeWorkspaceId ? { workspaceId: activeWorkspaceId } : {}) }); setSyncNotice('推送 ' + (result.pushed ?? 0) + ' · 拉取 ' + (result.pulled ?? 0)); await refresh(); } catch (e) { if (lifetime.current) setSyncNotice(String(e.message || e)); } } }, '同步'),
+          layer === 'global' && h('button', { type: 'button', style: uiButton(false), onClick: async () => { setSyncNotice('迁移旧同步…'); try { const result = await requestMemory('marshal/memory/migrate-legacy', {}); setSyncNotice(result.migrated ? '已绑定 ' + result.migrated + ' 条旧记录' : '没有待迁移的旧记录'); } catch (e) { if (!lifetime.current) return; if (e && (e.code === 'sign-in-to-approve' || String(e.message || '').includes('sign-in-to-approve'))) setApprovalNotice('请先登录机主账号后再审批全局记忆'); setSyncNotice(String(e.message || e)); } } }, '迁移旧同步'),
+          h('button', { type: 'button', style: uiButton(false), onClick: () => { void refresh(); } }, '刷新')),
         syncNotice !== '' && h('div', { style: { padding: '6px 18px', fontSize: 11, color: dswTheme.dim } }, syncNotice),
-        settingsOpen && settings && h('div', { style: { padding: '10px 18px', display: 'flex', gap: 16, flexWrap: 'wrap', fontSize: 12, borderBottom: '1px solid #8883' } },
+        !fullCanvas && settingsOpen && settings && h('div', { style: { padding: '10px 18px', display: 'flex', gap: 16, flexWrap: 'wrap', fontSize: 12, borderBottom: '1px solid #8883' } },
           [['autoSummary', '会话结束自动摘要'], ['autoRecall', '每轮自动召回'], ['allowGroupQuote', '群聊允许引用私有记忆']].map(([key, label]) => h('label', { key, style: { display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' } },
-            h('input', { type: 'checkbox', checked: settings[key] !== false, onChange: async event => { const next = { ...settings, [key]: event.target.checked }; setSettings(next); try { const saved = await fetchJson('marshal/memory/settings', { [key]: event.target.checked }); setSettings(saved.settings); } catch { /* keep local */ } } }), label)),
+            h('input', { type: 'checkbox', checked: settings[key] !== false, onChange: async event => { const next = { ...settings, [key]: event.target.checked }; setSettings(next); try { const saved = await requestMemory('marshal/memory/settings', { [key]: event.target.checked }); setSettings(saved.settings); } catch { /* keep local */ } } }), label)),
           h('span', { style: { color: dswTheme.dim, marginLeft: 'auto' } }, '摘要模型：空 = 本地启发式')),
-        settingsOpen && settings && h('div', { style: { padding: '0 18px 10px', display: 'flex', gap: 12, flexWrap: 'wrap', fontSize: 12, borderBottom: '1px solid #8883' } },
-          h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } }, '摘要 provider', h('input', { defaultValue: settings.summaryProvider ?? '', placeholder: 'empty = 本地', onBlur: async event => { const value = event.target.value.trim(); try { const saved = await fetchJson('marshal/memory/settings', { summaryProvider: value }); setSettings(saved.settings); } catch { /* keep local */ } }, style: { ...uiInput, width: 150 } })),
-          h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } }, '摘要模型', h('input', { defaultValue: settings.summaryModel ?? '', placeholder: 'empty = 本地', onBlur: async event => { const value = event.target.value.trim(); try { const saved = await fetchJson('marshal/memory/settings', { summaryModel: value }); setSettings(saved.settings); } catch { /* keep local */ } }, style: { ...uiInput, width: 180 } }))),
+        !fullCanvas && settingsOpen && settings && h('div', { style: { padding: '0 18px 10px', display: 'flex', gap: 12, flexWrap: 'wrap', fontSize: 12, borderBottom: '1px solid #8883' } },
+          h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } }, '摘要 provider', h('input', { defaultValue: settings.summaryProvider ?? '', placeholder: 'empty = 本地', onBlur: async event => { const value = event.target.value.trim(); try { const saved = await requestMemory('marshal/memory/settings', { summaryProvider: value }); setSettings(saved.settings); } catch { /* keep local */ } }, style: { ...uiInput, width: 150 } })),
+          h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } }, '摘要模型', h('input', { defaultValue: settings.summaryModel ?? '', placeholder: 'empty = 本地', onBlur: async event => { const value = event.target.value.trim(); try { const saved = await requestMemory('marshal/memory/settings', { summaryModel: value }); setSettings(saved.settings); } catch { /* keep local */ } }, style: { ...uiInput, width: 180 } }))),
         error !== '' && h('div', { style: { padding: '8px 18px', color: dswTheme.danger, fontSize: 12 } }, error),
-        layer === 'global' && h('section', { style: { padding: '10px 18px', borderBottom: '1px solid #8883', display: 'grid', gap: 8 } },
+        !fullCanvas && layer === 'global' && h('section', { style: { maxHeight: '30%', overflow: 'auto', padding: '10px 18px', borderBottom: '1px solid #8883', display: 'grid', gap: 8 } },
           h('div', { style: { fontSize: 13, fontWeight: 600 } }, '全局记忆审批' + (proposals.length > 0 ? ' · ' + proposals.length + ' 条待处理' : '')),
           approvalNotice !== '' && h('div', { style: { fontSize: 12, color: dswTheme.danger } }, approvalNotice),
           proposals.length === 0
@@ -1292,7 +1557,7 @@ window.__ModuleLoader__.load({
                   h('button', { type: 'button', style: uiButton(true), onClick: () => { void decideProposal(item, 'approve'); } }, '同意'),
                   h('button', { type: 'button', style: uiButton(false), onClick: () => { void decideProposal(item, 'reject'); } }, '拒绝')));
             })),
-        formOpen && h('div', { style: { padding: '12px 18px', display: 'grid', gap: 8, borderBottom: '1px solid #8883' } },
+        !fullCanvas && formOpen && h('div', { style: { padding: '12px 18px', display: 'grid', gap: 8, borderBottom: '1px solid #8883' } },
           h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
             h('input', { value: title, onChange: event => setTitle(event.target.value), placeholder: '标题', style: { ...uiInput, flex: 1, minWidth: 180 } }),
             h('select', { value: scope, onChange: event => setScope(event.target.value), style: { ...uiInput, width: 140 } },
@@ -1306,37 +1571,31 @@ window.__ModuleLoader__.load({
             h('input', { type: 'checkbox', checked: allowTaskRecall, onChange: event => setAllowTaskRecall(event.target.checked) }),
             ' 允许本智能体在所选项目工作区的工单中使用这条记忆'),
           h('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8 } }, h('button', { type: 'button', style: uiButton(false), onClick: () => setFormOpen(false) }, '取消'), h('button', { type: 'button', disabled: busy, style: uiButton(true), onClick: () => { void create(); } }, busy ? '保存中…' : '保存'))),
-        results !== null && h('div', { style: { maxHeight: 180, overflow: 'auto', borderBottom: '1px solid #8883', padding: '8px 18px', display: 'grid', gap: 4 } },
-          results.length === 0 ? h('div', { style: { fontSize: 12, color: dswTheme.dim } }, '没有匹配的记忆') : results.map(item => h('button', { key: item.id, type: 'button', onClick: () => { setSelected(item); if (item.scope === 'global') { setEditText(item.content || ''); setEditVisibility(item.visibility === 'all' ? 'all' : 'no-group'); } }, style: { textAlign: 'left', border: 0, background: 'transparent', color: 'inherit', cursor: 'pointer', padding: '5px 0' } }, '[' + item.scope + '] ' + item.title))),
+        visibleResults !== null && h('div', { style: { maxHeight: 180, overflow: 'auto', borderBottom: '1px solid #8883', padding: '8px 18px', display: 'grid', gap: 4 } },
+          visibleResults.length === 0 ? h('div', { style: { fontSize: 12, color: dswTheme.dim } }, '没有匹配的记忆') : visibleResults.map(item => h('button', { key: item.id, type: 'button', onClick: () => { void selectMemory(item); }, style: { textAlign: 'left', border: 0, background: 'transparent', color: 'inherit', cursor: 'pointer', padding: '5px 0' } }, '[' + item.scope + '] ' + item.title))),
         h('div', { style: { flex: 1, minHeight: 0, display: 'flex', padding: 14, gap: 14 } },
-          h('div', { style: { flex: 1, minWidth: 0, minHeight: 0, borderRadius: 14, overflow: 'hidden', border: '1px solid #8883' } }, h(MemoryGalaxy, { graph, selectedId: selected?.id, onSelect: item => {
-            setSelected(item);
-            if (item?.scope !== 'global') return;
-            setEditVisibility(item.visibility === 'all' ? 'all' : 'no-group');
-            if (typeof item.content === 'string' && item.content !== '') { setEditText(item.content); return; }
-            void fetchJson('marshal/memory/get?id=' + encodeURIComponent(item.id) + '&scope=global').then(data => {
-              setSelected(data.item);
-              setEditText(data.item?.content || '');
-              setEditVisibility(data.item?.visibility === 'all' ? 'all' : 'no-group');
-            }).catch(e => setError(friendlyError(e, '读取全局记忆')));
-          } })),
+          h('div', { style: { flex: 1, minWidth: 0, minHeight: 0, borderRadius: 14, overflow: 'hidden', border: '1px solid #8883' } }, h(MemoryGalaxy, { graph: visibleGraph, paused, selectedId: selected?.id, onSelect: selectMemory })),
           selected && h('aside', { style: { width: 300, flexShrink: 0, overflow: 'auto', padding: 16, border: '1px solid #8883', borderRadius: 14, background: 'color-mix(in srgb, currentColor 3%, transparent)' } },
             h('div', { style: { fontSize: 11, color: dswTheme.dim, textTransform: 'uppercase', letterSpacing: '.06em' } }, selected.scope + ' · ' + selected.kind + (selected.scope === 'global' ? ' · ' + (selected.visibility === 'all' ? '所有会话' : '仅单聊') : '')),
             h('h3', { style: { margin: '6px 0 10px', fontSize: 16 } }, selected.title),
             selected.cue && h('div', { style: { fontSize: 11, color: dswTheme.dim, marginBottom: 8, padding: '4px 8px', borderRadius: 6, background: 'color-mix(in srgb, currentColor 6%, transparent)' } }, '触发场景：' + selected.cue),
-            selected.scope === 'global'
+            detailLoading ? h('p', { role: 'status' }, '正在读取记忆…') : selected.scope === 'global'
               ? h('div', { style: { display: 'grid', gap: 8 } },
-                h('textarea', { value: editText || selected.content || '', onChange: event => setEditText(event.target.value), rows: 6, style: { ...uiInput, resize: 'vertical' } }),
-                h('select', { value: editVisibility, onChange: event => setEditVisibility(event.target.value), style: uiInput }, h('option', { value: 'all' }, '所有会话'), h('option', { value: 'no-group' }, '仅单聊')),
-                h('button', { type: 'button', style: uiButton(true), onClick: () => { void saveGlobal(); } }, '保存全局记忆'))
+                h('textarea', { value: editText, onChange: event => setEditText(editTextRef.current = event.target.value), rows: 6, style: { ...uiInput, resize: 'vertical' } }),
+                h('select', { value: editVisibility, onChange: event => setEditVisibility(editVisibilityRef.current = event.target.value), style: uiInput }, h('option', { value: 'all' }, '所有会话'), h('option', { value: 'no-group' }, '仅单聊')),
+                detailConflict && h('div', { role: 'alert' },
+                  h('p', null, detailConflict.deleted ? '远端记忆已被删除，本地草稿仍保留。' : '远端记忆已更新，本地草稿仍保留。'),
+                  h('button', { type: 'button', style: uiButton(false), disabled: saveBlocked, onClick: loadLatestConflict }, '载入最新版本'),
+                  !detailConflict.deleted && h('button', { type: 'button', style: uiButton(false), disabled: saveBlocked, onClick: () => { void saveGlobal(true); } }, '覆盖保存')),
+                h('button', { type: 'button', style: uiButton(true), disabled: saveBlocked || !!detailConflict || typeof selected.content !== 'string', onClick: () => { void saveGlobal(); } }, '保存全局记忆'))
               : h('p', { style: { whiteSpace: 'pre-wrap', fontSize: 13, lineHeight: 1.65 } }, selected.content),
             h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 12 } }, (selected.tags || []).map(tag => h('span', { key: tag, style: { fontSize: 11, padding: '3px 7px', borderRadius: 999, background: 'color-mix(in srgb, currentColor 8%, transparent)' } }, tag))),
             h('div', { style: { marginTop: 14, fontSize: 11, color: dswTheme.dim } }, '清晰度 ' + ({ vivid: '清晰', clear: '清楚', fuzzy: '模糊', trace: '只剩印象' }[selected.clarity] || selected.clarity || '清晰') + ' · 重要性 ' + Math.round((selected.importance || 0) * 100) + '% · 访问 ' + (selected.accessCount || 0) + ' 次' + (selected.pinned ? ' · 已固定' : '')),
             h('div', { style: { display: 'flex', gap: 8, marginTop: 16 } },
               h('button', { type: 'button', style: uiButton(false), onClick: () => { void forget(selected); } }, '删除'),
-              h('button', { type: 'button', style: uiButton(false), onClick: () => setSelected(null) }, '关闭')))),
-        graph.nodes.length === 0 && results === null && h('div', { style: { padding: '0 18px 18px', fontSize: 12, color: dswTheme.dim } },
-          layer === 'global' ? '还没有全局记忆。可点“＋ 记忆”写入，或审批智能体提交的偏好。'
+              h('button', { type: 'button', style: uiButton(false), onClick: () => { void selectMemory(null); } }, '关闭')))),
+        graph.nodes.length === 0 && !searchActive && h('div', { style: { padding: '0 18px 18px', fontSize: 12, color: dswTheme.dim } },
+          fullCanvas ? '当前没有可显示的记忆。' : layer === 'global' ? '还没有全局记忆。可点“＋ 记忆”写入，或审批智能体提交的偏好。'
             : layer === 'workspace' ? '所选项目工作区还没有共享记忆。工单总结会自动沉淀到这里，也可手动写入。'
               : '该智能体还没有私有记忆。会话结束后会自动生成摘要，也可点“＋ 记忆”手动写入。'));
     }
@@ -2394,7 +2653,7 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function MarshalPanel({ marshalContext, openSession, openPanel, mvOpenDirect, mvStartVoice, SessionProvider, renderSlot }) {
+    function MarshalPanel({ marshalContext, openSession, openPanel, mvOpenDirect, mvStartVoice, closeMemorySidebar, SessionProvider, renderSlot }) {
       React.useEffect(ensureMarshalVnextStyles, []);
       const [attempt, retry] = React.useState(0);
       const initialNav = React.useMemo(() => {
@@ -2733,7 +2992,7 @@ window.__ModuleLoader__.load({
           h(MarshalHubMonitorView, { openTaskRoom, onOpenMemory: openAgentMemory, onOpenDirect: mvOpenDirect })),
         tab === 'memory' && h('div', { className: 'mv-room-fill' },
           h(MarshalErrorBoundary, { resetKey: 'memory' },
-            h(MemoryPage, { initialAgentId: memoryTarget.agentId, initialLayer: memoryTarget.layer, mvOpenDirect }))),
+            h(MemoryPage, { initialAgentId: memoryTarget.agentId, initialLayer: memoryTarget.layer, mvOpenDirect, closeMemorySidebar }))),
         h(DeviceStatusDrawer, {
           open: deviceDrawerOpen,
           onClose: () => setDeviceDrawerOpen(false),
@@ -2809,7 +3068,7 @@ window.__ModuleLoader__.load({
     const MEMORY_CSRF_COOKIE = 'marshal-memory-csrf';
     const nativeMemory = window.location.protocol === 'dsh-app:' && window.location.hostname === 'app';
     let desktopMemorySession;
-    let memorySessionPromise;
+    let memorySessionFlight;
     function readBrowserCookie(name) {
       const parts = String(document.cookie || '').split(';');
       for (const part of parts) {
@@ -2828,36 +3087,63 @@ window.__ModuleLoader__.load({
     function memoryProof() {
       return nativeMemory ? desktopMemorySession : (readBrowserCookie(MEMORY_CSRF_COOKIE) || undefined);
     }
-    async function ensureMemorySession(rejected) {
+    async function ensureMemorySession(rejected, signal) {
+      signal?.throwIfAborted();
       const current = memoryProof();
       if (current && current !== rejected) return current;
-      memorySessionPromise ??= fetch(new URL('marshal/memory/session', document.baseURI), {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: { 'x-marshal-memory': '1', ...(nativeMemory ? { 'x-marshal-desktop': '1' } : {}) },
-      }).then(async response => {
-        const data = await readJson(response);
-        if (!response.ok || data?.ok !== true) throw requestError(response, data, true);
-        if (nativeMemory) {
-          if (typeof data.sessionToken === 'string' && typeof data.csrf === 'string') {
-            desktopMemorySession = { 'x-marshal-desktop': '1', 'x-marshal-session': data.sessionToken, 'x-marshal-csrf': data.csrf };
-          } else {
-            desktopMemorySession = undefined;
+      if (!memorySessionFlight) {
+        const flight = { controller: new AbortController(), waiters: 0 };
+        memorySessionFlight = flight;
+        flight.promise = fetch(new URL('marshal/memory/session', document.baseURI), {
+          method: 'POST',
+          credentials: 'same-origin',
+          signal: flight.controller.signal,
+          headers: { 'x-marshal-memory': '1', ...(nativeMemory ? { 'x-marshal-desktop': '1' } : {}) },
+        }).then(async response => {
+          const data = await readJson(response);
+          flight.controller.signal.throwIfAborted();
+          if (!response.ok || data?.ok !== true) throw requestError(response, data, true);
+          if (nativeMemory) {
+            if (typeof data.sessionToken === 'string' && typeof data.csrf === 'string') {
+              desktopMemorySession = { 'x-marshal-desktop': '1', 'x-marshal-session': data.sessionToken, 'x-marshal-csrf': data.csrf };
+            } else {
+              desktopMemorySession = undefined;
+            }
           }
+          const proof = memoryProof();
+          if (!proof) throw Object.assign(new Error('记忆会话凭证不可用。'), { code: 'memory-session-invalid' });
+          if (typeof resumeDeniedMarshalSse === 'function') resumeDeniedMarshalSse(true);
+          return proof;
+        }).finally(() => {
+          if (memorySessionFlight === flight) memorySessionFlight = undefined;
+        });
+      }
+      const flight = memorySessionFlight;
+      flight.waiters++;
+      let onAbort;
+      try {
+        if (!signal) return await flight.promise;
+        return await Promise.race([flight.promise, new Promise((_, reject) => {
+          onAbort = () => reject(signal.reason);
+          signal.addEventListener('abort', onAbort, { once: true });
+        })]);
+      } finally {
+        if (onAbort) signal.removeEventListener('abort', onAbort);
+        // One consumer leaving must not cancel a handshake still needed by another.
+        if (--flight.waiters === 0 && memorySessionFlight === flight) {
+          memorySessionFlight = undefined;
+          flight.controller.abort();
         }
-        const proof = memoryProof();
-        if (!proof) throw Object.assign(new Error('记忆会话凭证不可用。'), { code: 'memory-session-invalid' });
-        if (typeof resumeDeniedMarshalSse === 'function') resumeDeniedMarshalSse(true);
-        return proof;
-      }).finally(() => { memorySessionPromise = undefined; });
-      return memorySessionPromise;
+      }
     }
-    async function fetchJson(path, body, workspaceAuth = false, signal) {
+    async function fetchJson(path, body, workspaceAuth = false, signal, beforeSend) {
       const memory = String(path).startsWith('marshal/memory') && !String(path).startsWith('marshal/memory/session');
       const authenticated = memory || workspaceAuth;
       const url = new URL(path, document.baseURI);
       const send = proof => {
         signal?.throwIfAborted();
+        // Credential acquisition can yield; check again at the actual send.
+        beforeSend?.();
         return fetch(url, {
           credentials: 'same-origin',
           ...(signal ? { signal } : {}),
@@ -2869,12 +3155,13 @@ window.__ModuleLoader__.load({
         });
       };
       signal?.throwIfAborted();
-      const proof = authenticated ? await ensureMemorySession() : undefined;
+      const proof = authenticated ? await ensureMemorySession(undefined, signal) : undefined;
       let response = await send(proof);
       let data = await readJson(response);
       if (authenticated && (response.status === 401 || data?.code === 'memory-csrf-mismatch')) {
         signal?.throwIfAborted();
-        response = await send(await ensureMemorySession(proof));
+        beforeSend?.();
+        response = await send(await ensureMemorySession(proof, signal));
         data = await readJson(response);
       }
       if (!response.ok || data?.ok === false) throw requestError(response, data, authenticated);
@@ -3085,7 +3372,7 @@ window.__ModuleLoader__.load({
     }
 
     async function refreshMarshalSseProof(connection) {
-      const proof = await ensureMemorySession(connection.rejectedProof);
+      const proof = await ensureMemorySession(connection.rejectedProof, connection.controller.signal);
       connection.auth = 'refreshed';
       connection.rejectedProof = undefined;
       connection.refreshedProof = proof;
@@ -3154,7 +3441,7 @@ window.__ModuleLoader__.load({
         const proof = connection.auth === 'refreshing'
           ? await refreshMarshalSseProof(connection)
           : connection.auth === 'refreshed' ? memoryProof() ?? connection.refreshedProof
-          : nativeMemory ? await ensureMemorySession() : memoryProof();
+          : nativeMemory ? await ensureMemorySession(undefined, signal) : memoryProof();
         if (signal.aborted) return;
         const response = await fetch(connection.address + '/marshal/events', {
           headers: {
@@ -4096,11 +4383,11 @@ window.__ModuleLoader__.load({
         members.map(member => chip(member.id || mvChatMemberId(member), member.name, member.role)), all && chip('all', '全体'));
     }
 
-    function mvChatMessage({ mine, name, at, phase, text, trace, live, streaming, messageId, children }) {
+    function mvChatMessage({ mine, name, at, phase, text, trace, live, streaming, messageId, accent, children }) {
       const u = trace?.usage;
       const total = Number(u?.totalTokens) || Number(u?.inputTokens || 0) + Number(u?.outputTokens || 0);
       return h('article', { key: messageId, className: 'mv-room-message', style: { marginInlineStart: mine ? 'var(--mv-xl)' : undefined,
-        marginInlineEnd: mine ? undefined : 'var(--mv-xl)', background: mine ? 'var(--dsw-alias-marshal-tint)' : undefined } },
+        borderInlineStart: !mine && accent ? '2px solid ' + accent : undefined, marginInlineEnd: mine ? undefined : 'var(--mv-xl)', background: mine ? 'var(--dsw-alias-marshal-tint)' : undefined } },
         h('div', { className: 'mv-actions mv-muted' }, h('strong', null, mine ? '我' : name),
           at != null && h('time', null, new Date(at).toLocaleTimeString()),
           phase && taskPhases[phase] && h('span', null, taskPhases[phase]),
@@ -5343,6 +5630,7 @@ window.__ModuleLoader__.load({
       const projectedTask = { ...task, id: taskId, title: room?.title || task?.title,
         workflow, status: visible?.cardStatus ?? task?.status, taskRoom: room };
       const participants = visible?.participants ?? [];
+      const colorMap = React.useMemo(() => buildRoomColorMap(visible?.records, visible?.participants), [visible?.records, visible?.participants]);
       const reviewing = visible?.origin && !room?.closed && (visible.cardStatus === 'review' || visible.runState === 'review-blocked');
       const runningRevision = visible?.origin && !room?.closed && (visible.busy || visible.cardStatus === 'running');
       const actionPending = Boolean(pending || visible?.chatBusy);
@@ -5586,7 +5874,7 @@ window.__ModuleLoader__.load({
             taskId && h(MvButton, { label: '定位 DAG 节点', disabled: locating, onClick: () => locate(record, handoff.nodeId) })),
           handoff.summary && h(RichMarkdown, { text: handoff.summary }));
         const target = artifact && room?.id && patchTarget({ record, artifact });
-        return h(mvChatMessage, { key: record.seq, mine: record.kind === 'user', name: record.actor, text: artifact?.body ?? text,
+        return h(mvChatMessage, { key: record.seq, mine: record.kind === 'user', accent: colorMap.get(record.actor), name: record.actor, text: artifact?.body ?? text,
           at: record.at, phase: record.phase, trace }, banner, target && patchControls(target), target && patchContents(target));
       };
       return h('div', { className: 'mv-room-fill' },
@@ -5609,7 +5897,7 @@ window.__ModuleLoader__.load({
           } }, visible?.hasOlder && h(MvButton, { label: '加载更早消息', disabled: paging, onClick: older }),
           !rows.length && !(visible?.liveBubbles?.length) && h('p', { className: 'mv-muted' }, room ? '还没有消息。' : '正在读取工单群…'),
           rows.map(renderRow), visible && (visible.liveBubbles ?? []).map(live => h(mvChatMessage, { key: 'live-' + live.id,
-            name: live.actor, phase: live.phase, text: live.text, trace: live, live: true })),
+            name: live.actor, accent: colorMap.get(live.actor), phase: live.phase, text: live.text, trace: live, live: true })),
           workflow?.reportId && taskId && h(TaskReviewReport, { key: workflow.reportId, taskId, development: Boolean(workflow.development) })),
           visible?.origin && room && h('footer', { className: 'mv-composer-dock' },
             h(mvChatMentions, { members: participants, usage, all: true, input, setText: setDraft }),
@@ -8138,657 +8426,6 @@ window.__ModuleLoader__.load({
         renderDrawer(),
         renderParseModal());
     }
-    function TaskRoomsPage({ task, openBoard }) {
-      const bound = task?.taskRoom;
-      const [workspace, setWorkspace] = React.useState(bound?.workspaceId ?? task?.workflow?.workspaceId ?? '');
-      const [workspaces, setWorkspaces] = React.useState([]);
-      const [leaders, setLeaders] = React.useState([]);
-      const [rooms, setRooms] = React.useState([]);
-      const [id, setId] = React.useState(bound?.id ?? '');
-      const [view, setView] = React.useState(null);
-      const [peers, setPeers] = React.useState([]);
-      const [notice, setNotice] = React.useState('');
-      const [error, setError] = React.useState('');
-      const [busy, setBusy] = React.useState(false);
-      const [sendingChat, setSendingChat] = React.useState(false);
-      const [uploadingAtt, setUploadingAtt] = React.useState(false);
-      const [leader, setLeader] = React.useState('');
-      const [remote, setRemote] = React.useState('');
-      const [draft, setDraft] = React.useState('');
-      const cursor = React.useRef(null);
-      const selection = React.useRef('');
-      const roomRefreshRef = React.useRef(null);
-      const streamRef = React.useRef(null);
-      const inputRef = React.useRef(null);
-      const stickBottomRef = React.useRef(true);
-      const prevLastSeqRef = React.useRef(0);
-      const roomPreviewUrlsRef = React.useRef(new Map());
-      React.useEffect(() => () => {
-        for (const blobUrl of roomPreviewUrlsRef.current.values()) {
-          try { URL.revokeObjectURL(blobUrl); } catch {}
-        }
-        roomPreviewUrlsRef.current.clear();
-      }, []);
-      const viewKey = workspace + '/' + id;
-      selection.current = viewKey;
-      const prefix = 'marshal/task-rooms/';
-      const query = values => '?' + new URLSearchParams(values);
-      const url = prefix + 'page' + query({ roomId: id, workspaceId: workspace });
-      const loadList = () => workspace ? fetchJson(prefix + 'list' + query({ workspaceId: workspace }), undefined, true) : Promise.resolve({ rooms: [] });
-
-      React.useEffect(() => {
-        ensureTaskBoardStyles();
-        ensureTaskRoomStyles();
-        let alive = true;
-        void fetchJson(prefix + 'workspaces', undefined, true).then(data => {
-          if (!alive) return;
-          const filteredWs = (data.workspaces || []).filter(ws => !isPseudoAgentWorkspace(ws) || ws.id === (bound?.workspaceId ?? task?.workflow?.workspaceId));
-          setWorkspaces(filteredWs);
-          setWorkspace(current => current || (filteredWs.length === 1 ? filteredWs[0].id : ''));
-        }).catch(e => { if (alive) setError(e.message); });
-        void fetchJson('marshal/tasks/orchestration', undefined, true)
-          .then(data => { if (alive) setLeaders(data.leaders ?? []); }).catch(() => {});
-        return () => { alive = false; };
-      }, []);
-
-      React.useEffect(() => {
-        let alive = true;
-        setRooms([]);
-        setNotice('');
-        void loadList().then(data => {
-          if (!alive) return;
-          setRooms(data.rooms);
-          if (!id && data.rooms?.length > 0 && !task) setId(data.rooms[0].id);
-          setNotice(data.hubError ? 'Hub 群聊暂不可读取。' : '');
-        }).catch(e => { if (alive) setError(e.message); });
-        return () => { alive = false; };
-      }, [workspace]);
-
-      const mergePage = (data, key, history = false) => {
-        if (selection.current !== key) return;
-        setView(previous => {
-          if (history && previous?.key !== key) return previous;
-          const records = new Map((previous?.key === key ? previous.records : []).map(record => [record.seq, record]));
-          for (const record of data.records) {
-            if (!history || !records.has(record.seq)) records.set(record.seq, record);
-          }
-          return { ...(history ? previous : data), key, records: [...records.values()].sort((a, b) => a.seq - b.seq) };
-        });
-      };
-
-      const failedRead = (e, key) => {
-        if (selection.current !== key) return;
-        if (['forbidden', 'workspace-forbidden', 'unauthorized', 'task-room-not-found'].includes(e.code)) {
-          cursor.current = null;
-          setView(null);
-        }
-        setError(e.message);
-      };
-
-      const loadRoom = () => roomRefreshRef.current?.request();
-
-      React.useEffect(() => {
-        cursor.current = null;
-        prevLastSeqRef.current = 0;
-        stickBottomRef.current = true;
-        setView(null);
-        setPeers([]);
-        setDraft('');
-        setLeader('');
-        setRemote('');
-        if (!id || !workspace) return;
-        const refresh = createVisibleMarshalRefresh(async signal => {
-          const active = () => !signal.aborted && selection.current === viewKey;
-          try {
-            while (active()) {
-              const after = cursor.current;
-              const data = await fetchJson(url + (after === null ? '' : '&after=' + after), undefined, true, signal);
-              if (!active()) return;
-              const next = data.records.at(-1)?.seq ?? after ?? 0;
-              mergePage(data, viewKey);
-              // Only the initial read defaults to the latest page; an empty room has a real cursor of 0.
-              cursor.current = Math.max(after ?? 0, next);
-              if (!data.hasNewer || next <= (after ?? 0)) return;
-            }
-          } catch (e) { if (active()) failedRead(e, viewKey); }
-        }, 5_000);
-        roomRefreshRef.current = refresh;
-        const unsubscribe = subscribeMarshalEvents(['ready', 'tasks.changed', 'incidents.changed', 'agents.changed', 'room.message'],
-          refresh.request, { initial: true, debounceMs: 80 });
-        return () => {
-          roomRefreshRef.current = null;
-          refresh.dispose();
-          unsubscribe();
-        };
-      }, [id, workspace]);
-
-      const visible = view?.key === viewKey ? view : null;
-      const room = visible?.room;
-      const isWorkflowRunning = visible?.runState === 'running' || visible?.cardStatus === 'running';
-      const roomExecuting = Boolean(room && !room.closed && (isWorkflowRunning || visible.busy || visible.chatBusy));
-      const roomOpen = Boolean(room && !room.closed);
-      const roomPollMs = roomExecuting ? 5_000 : 12_000;
-      // Live thinking/steps/text need ~5s refresh while running; open non-closed rooms keep a 12s cross-device fallback.
-      React.useEffect(() => { roomRefreshRef.current?.setPolling(roomOpen, roomPollMs); }, [id, workspace, roomOpen, roomPollMs]);
-      const lastSeq = visible?.records?.at(-1)?.seq ?? 0;
-      const liveSig = (visible?.liveBubbles ?? []).map(b => b.id + ':' + (b.updatedAt || 0) + ':' + (b.thinking?.length || 0) + ':' + (b.text?.length || 0) + ':' + (b.steps?.length || 0)).join('|');
-
-      React.useEffect(() => {
-        const el = streamRef.current;
-        if (!el || (!lastSeq && !liveSig)) return;
-        if (stickBottomRef.current || prevLastSeqRef.current === 0) {
-          requestAnimationFrame(() => {
-            if (streamRef.current) streamRef.current.scrollTop = streamRef.current.scrollHeight;
-          });
-        }
-        if (lastSeq) prevLastSeqRef.current = lastSeq;
-      }, [lastSeq, liveSig, sendingChat]);
-
-      React.useEffect(() => {
-        if (!visible?.origin) return;
-        let alive = true;
-        void fetchJson(prefix + 'peers' + query({ roomId: id }), undefined, true)
-          .then(data => { if (alive) setPeers(data.peers ?? []); }).catch(() => {});
-        return () => { alive = false; };
-      }, [id, visible?.origin]);
-
-      const bind = async () => {
-        if (!workspace || !task) return;
-        setBusy(true);
-        setError('');
-        try {
-          const result = await fetchJson(prefix + 'open', { taskId: task.id, workspaceId: workspace }, true);
-          setId(result.room.id);
-          setRooms(current => current.some(item => item.id === result.room.id) ? current : [result.room, ...current]);
-        }
-        catch (e) { setError(e.message); }
-        finally { setBusy(false); }
-      };
-
-      // Lifecycle actions (confirm, revise, close, reopen, retry, reassign)
-      const act = async (action, data = {}) => {
-        if (!room || busy) return;
-        setBusy(true);
-        setError('');
-        setNotice('');
-        const key = viewKey;
-        const refresh = roomRefreshRef.current;
-        try {
-          const res = await fetchJson(prefix + 'action', { roomId: room.id, action, ...data }, true);
-          if (action === 'revise' && selection.current === key) {
-            setDraft('');
-            setNotice('已按群内最新讨论启动继续执行。');
-          } else if (action === 'confirm' && selection.current === key) {
-            setDraft('');
-            setNotice(res.patchApplied ? '已将补丁应用到工作区并确认工单完成。' : '已确认验收完成并归档。');
-          }
-          stickBottomRef.current = true;
-          await refresh?.request();
-        }
-        catch (e) { failedRead(e, key); }
-        finally { setBusy(false); }
-      };
-
-      // Non-blocking live chat send: works at ANY time (even while workflow is running or room was closed!)
-      const sendChat = async () => {
-        const messageText = draft.trim();
-        if (!room || !messageText || sendingChat) return;
-        setSendingChat(true);
-        setError('');
-        const key = viewKey;
-        const refresh = roomRefreshRef.current;
-        try {
-          if (room.closed) {
-            await fetchJson(prefix + 'action', { roomId: room.id, action: 'reopen' }, true);
-          }
-          setDraft('');
-          stickBottomRef.current = true;
-          await fetchJson(prefix + 'action', { roomId: room.id, action: 'send', text: messageText, ...(room.closed ? { autoReopen: true } : {}) }, true);
-          await refresh?.request();
-        }
-        catch (e) {
-          if (selection.current === key) setDraft(prev => prev || messageText);
-          failedRead(e, key);
-        }
-        finally { setSendingChat(false); }
-      };
-
-      const insertMention = name => {
-        const token = '@' + name + ' ';
-        setDraft(cur => (cur.includes('@' + name) ? cur : (cur ? cur.replace(/\s*$/, ' ') + token : token)));
-        requestAnimationFrame(() => inputRef.current?.focus());
-      };
-
-      const older = async () => {
-        if (!visible?.records[0] || busy) return;
-        const refresh = roomRefreshRef.current;
-        setBusy(true);
-        stickBottomRef.current = false;
-        try {
-          const data = await fetchJson(url + '&before=' + visible.records[0].seq, undefined, true);
-          if (roomRefreshRef.current === refresh) mergePage(data, viewKey, true);
-        }
-        catch (e) { if (roomRefreshRef.current === refresh) setError(e.message); }
-        finally { setBusy(false); }
-      };
-
-      const button = (label, onClick, disabled = false, primary = false) =>
-        h('button', { type: 'button', style: { ...uiButton(primary), opacity: disabled ? .52 : 1 }, onClick, disabled }, label);
-
-      const parsePatchRecordClient = text => {
-        const prefix = '<!--marshal-patch-artifact:';
-        if (typeof text !== 'string' || !text.startsWith(prefix)) return { meta: null, body: String(text || '') };
-        const end = text.indexOf('-->', prefix.length);
-        if (end === -1) return { meta: null, body: text };
-        try {
-          const meta = JSON.parse(text.slice(prefix.length, end).trim());
-          return { meta, body: text.slice(end + 3).replace(/^\n+/, '') };
-        } catch {
-          return { meta: null, body: text };
-        }
-      };
-
-      const downloadPatch = async record => {
-        const parsed = parsePatchRecordClient(record.text);
-        let content = record.text;
-        if (parsed.meta?.stored && room?.id) {
-          try {
-            const qs = 'roomId=' + encodeURIComponent(room.id)
-              + (parsed.meta.digest ? '&digest=' + encodeURIComponent(parsed.meta.digest) : '')
-              + (record.seq ? '&seq=' + encodeURIComponent(String(record.seq)) : '');
-            const res = await fetchJson(prefix + 'patch?' + qs, undefined, true);
-            if (typeof res?.patch === 'string' && res.patch) content = res.patch;
-          } catch (e) {
-            setError(e?.message || '读取完整补丁失败，将下载预览片段。');
-          }
-        }
-        const blobUrl = URL.createObjectURL(new Blob([content], { type: 'text/x-diff' }));
-        const link = document.createElement('a');
-        link.href = blobUrl;
-        link.download = 'development-' + ((parsed.meta?.digest || record.ref)?.slice(0, 12) ?? record.seq) + '.patch';
-        link.click();
-        setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
-      };
-
-      const runLabel = { start: '首次运行', retry: '重试运行', reassign: '改派执行', revise: '按意见修正', conversation: '群聊讨论', 'auto-dispatch': '自动派单', backfill: '历史补记' };
-      const controlsLocked = busy || visible?.busy === true;
-      const chatLocked = sendingChat || visible?.chatBusy === true;
-      const participants = Array.isArray(visible?.participants) ? visible.participants : [];
-      const colorMap = React.useMemo(() => buildRoomColorMap(visible?.records, participants), [visible?.records, participants]);
-      const roomTokenStats = React.useMemo(() => {
-        const byActor = new Map();
-        let totalTokens = 0;
-        let inputTokens = 0;
-        let outputTokens = 0;
-        const addUsage = (actor, u) => {
-          if (!actor || !u || typeof u !== 'object') return;
-          const inT = Number(u.inputTokens || 0);
-          const outT = Number(u.outputTokens || 0);
-          const tot = Number(u.totalTokens || (inT + outT));
-          if (tot <= 0) return;
-          totalTokens += tot;
-          inputTokens += inT;
-          outputTokens += outT;
-          const cur = byActor.get(actor) ?? { totalTokens: 0, inputTokens: 0, outputTokens: 0 };
-          cur.totalTokens += tot;
-          cur.inputTokens += inT;
-          cur.outputTokens += outT;
-          byActor.set(actor, cur);
-        };
-        for (const rec of visible?.records ?? []) {
-          if (rec?.kind !== 'agent') continue;
-          const dec = decodeAgentTraceClient(rec.text);
-          if (dec.trace?.usage) addUsage(rec.actor, dec.trace.usage);
-        }
-        for (const live of visible?.liveBubbles ?? []) {
-          if (live?.usage) addUsage(live.actor, live.usage);
-        }
-        const breakdownTitle = [...byActor.entries()]
-          .map(([actor, st]) => actor + ': ' + st.totalTokens.toLocaleString() + ' (入 ' + st.inputTokens.toLocaleString() + ' / 出 ' + st.outputTokens.toLocaleString() + ')')
-          .join(' ｜ ');
-        return { totalTokens, inputTokens, outputTokens, byActor, breakdownTitle };
-      }, [visible?.records, visible?.liveBubbles]);
-      const roleOfActor = actorName => participants.find(p => p.name === actorName)?.role || '';
-      const isInReview = Boolean(visible?.origin && !room?.closed && (visible?.cardStatus === 'review' || visible?.runState === 'review-blocked'));
-
-      const renderRecord = record => {
-        const timeStr = new Date(record.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-        // 1) Batch / Closed / Reopened -> compact centered timeline pill
-        if (record.kind === 'batch' || record.kind === 'closed' || record.kind === 'reopened') {
-          const badge = record.kind === 'batch'
-            ? '── 批次 ' + (record.runId?.slice(0, 8) ?? '') + ' · ' + (runLabel[record.phase] ?? record.phase ?? '运行') + (record.text ? ' · ' + record.text : '') + ' ──'
-            : (record.kind === 'closed' ? '✓ ' : '↻ ') + record.text;
-          return h('div', { key: record.seq, className: 'mtr-sys-row' },
-            h('span', { className: 'mtr-sys-pill', title: new Date(record.at).toLocaleString() }, badge));
-        }
-
-        // 2) Initial auto-injected ticket brief -> clean collapsible summary card
-        if (record.kind === 'user' && record.phase === 'brief') {
-          return h('details', { key: record.seq, className: 'mtr-brief-card', open: (visible?.records?.length ?? 0) <= 6 },
-            h('summary', { style: { cursor: 'pointer', fontWeight: 600, fontSize: 12, color: dswTheme.dim } },
-              '📋 工单原始需求说明 · ' + timeStr),
-            h('div', { style: { marginTop: 8 } }, h(RichMarkdown, { text: record.text, phase: record.phase })));
-        }
-
-        // 3) Human operator message -> right-aligned bubble
-        if (record.kind === 'user') {
-          const phaseHint = record.phase === 'steering' ? '运行中插话'
-            : record.phase === 'revision' ? '补充修正意见'
-              : record.phase === 'confirm' ? '验收备注' : '';
-          return h('div', { key: record.seq, className: 'mtr-msg-row', 'data-side': 'right' },
-            h('span', {
-              className: 'mtr-avatar',
-              style: {
-                background: 'color-mix(in srgb, var(--dsw-alias-brand-primary, #4f46e5) 24%, transparent)',
-                color: 'var(--dsw-alias-brand-primary, #6366f1)',
-                border: '1px solid color-mix(in srgb, var(--dsw-alias-brand-primary, #6366f1) 42%, transparent)',
-              },
-            }, '我'),
-            h('div', { className: 'mtr-msg-col' },
-              h('div', { className: 'mtr-msg-meta' },
-                h('strong', { style: { color: dswTheme.text } }, '我'),
-                phaseHint && h('span', { className: 'mtr-role-badge' }, phaseHint),
-                h('span', null, timeStr)),
-              h('div', { className: 'mtr-bubble mtr-bubble-user' },
-                h(RichMarkdown, { text: record.text, phase: record.phase }))));
-        }
-
-        // 4) Development patch card
-        if (record.phase === 'development-patch') {
-          const parsedPatch = parsePatchRecordClient(record.text);
-          const meta = parsedPatch.meta;
-          const fileCount = meta?.fileCount ?? (parsedPatch.body.match(/^diff --git /gm) || []).length;
-          const sizeLabel = meta?.bytes ? ((meta.bytes / 1024).toFixed(1) + ' KiB') : '';
-          const diffStats = (typeof meta?.additions === 'number' || typeof meta?.deletions === 'number')
-            ? ('+' + (meta.additions || 0) + ' / -' + (meta.deletions || 0))
-            : '';
-          return h('div', { key: record.seq, className: 'mtr-patch-card' },
-            h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' } },
-              h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 12.5, fontWeight: 600, flexWrap: 'wrap' } },
-                '📦 隔离工作树代码补丁',
-                fileCount > 0 && h('span', { style: uiMuted }, fileCount + ' 个文件变更'),
-                sizeLabel && h('span', { style: uiMuted }, sizeLabel),
-                diffStats && h('span', { style: uiMuted }, diffStats),
-                (meta?.digest || record.ref) && h('code', { className: 'mtr-inline-code' }, (meta?.digest || record.ref).slice(0, 10))),
-              h('div', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
-                h('span', { style: uiMuted }, timeStr),
-                button('下载 .patch', () => { void downloadPatch(record); }))),
-            h('details', { style: { marginTop: 8 } },
-              h('summary', { style: { cursor: 'pointer', fontSize: 12, color: dswTheme.dim } },
-                meta?.stored ? '展开查看补丁变更摘要与前段预览（完整版已持久化）' : '展开查看 Git Diff 补丁明细'),
-              h(CodeFenceBlock, { language: 'diff', code: parsedPatch.body })));
-        }
-
-        // 5) Assignment configuration card or short Marshal status pill
-        if (record.kind === 'status') {
-          if (record.phase === 'assignment') {
-            return h('div', { key: record.seq, className: 'mtr-brief-card' },
-              h(RichMarkdown, { text: record.text, phase: 'assignment' }));
-          }
-          const tone = record.phase === 'failed' ? 'danger' : record.phase === 'review' ? 'review' : undefined;
-          const prefixActor = record.actor && record.actor !== 'Marshal' ? record.actor + '：' : '';
-          return h('div', { key: record.seq, className: 'mtr-sys-row' },
-            h('span', { className: 'mtr-sys-pill', 'data-tone': tone, title: new Date(record.at).toLocaleString() },
-              prefixActor + record.text));
-        }
-
-        // 6) Agent speech bubble -> left-aligned with distinct per-agent color + embedded thinking/processing trace!
-        const accent = agentBubbleAccent(record.actor, colorMap);
-        const roleTag = roleOfActor(record.actor);
-        const stageLabel = taskPhases[record.phase] || '';
-        const badgeText = [roleTag, stageLabel].filter(Boolean).join(' · ');
-        const decoded = decodeAgentTraceClient(record.text);
-        const hasCleanBody = Boolean(decoded.text && decoded.text.trim());
-        return h('div', { key: record.seq, className: 'mtr-msg-row', 'data-side': 'left', style: { '--mtr-agent-c': accent } },
-          h('span', {
-            className: 'mtr-avatar',
-            style: {
-              background: 'color-mix(in srgb, ' + accent + ' 20%, var(--dsw-alias-bg-layer-2, #1f2430))',
-              color: accent,
-              border: '1px solid color-mix(in srgb, ' + accent + ' 40%, transparent)',
-            },
-          }, agentInitial(record.actor)),
-          h('div', { className: 'mtr-msg-col' },
-            h('div', { className: 'mtr-msg-meta' },
-              h('strong', { style: { color: accent, fontSize: 12.5 } }, record.actor),
-              badgeText && h('span', { className: 'mtr-role-badge' }, badgeText),
-              decoded.trace?.usage && h(AgentUsageBadge, { usage: decoded.trace.usage }),
-              h('span', null, timeStr)),
-            h('div', { className: 'mtr-bubble mtr-bubble-agent' },
-              decoded.trace && h(AgentTracePanel, { trace: decoded.trace, live: false, hasBody: hasCleanBody }),
-              hasCleanBody && h(RichMarkdown, { text: decoded.text, phase: record.phase }))));
-      };
-
-      const renderLiveBubble = live => {
-        const accent = agentBubbleAccent(live.actor, colorMap);
-        const roleTag = roleOfActor(live.actor);
-        const stageLabel = taskPhases[live.phase] || (live.phase === 'handoff' ? '常驻会话执行' : '');
-        const badgeText = [roleTag, stageLabel].filter(Boolean).join(' · ');
-        const elapsedSec = Math.max(1, Math.round(((live.updatedAt || Date.now()) - (live.startedAt || Date.now())) / 1000));
-        const hasLiveBody = Boolean(live.text && live.text.trim());
-        return h('div', { key: 'live-' + live.id, className: 'mtr-msg-row', 'data-side': 'left', style: { '--mtr-agent-c': accent } },
-          h('span', {
-            className: 'mtr-avatar',
-            style: {
-              background: 'color-mix(in srgb, ' + accent + ' 22%, var(--dsw-alias-bg-layer-2, #1f2430))',
-              color: accent,
-              border: '1px solid color-mix(in srgb, ' + accent + ' 52%, transparent)',
-            },
-          }, agentInitial(live.actor)),
-          h('div', { className: 'mtr-msg-col' },
-            h('div', { className: 'mtr-msg-meta' },
-              h('strong', { style: { color: accent, fontSize: 12.5 } }, live.actor),
-              badgeText && h('span', { className: 'mtr-role-badge' }, badgeText),
-              live.usage && h(AgentUsageBadge, { usage: live.usage }),
-              h('span', { className: 'mtr-live-badge' },
-                h('span', { className: 'mtr-live-dot', 'aria-hidden': 'true' }),
-                '思考/处理中 · ' + elapsedSec + 's')),
-            h('div', { className: 'mtr-bubble mtr-bubble-agent mtr-bubble-live' },
-              h(AgentTracePanel, { trace: live, live: true, hasBody: hasLiveBody }),
-              hasLiveBody && h(RichMarkdown, { text: live.text, phase: live.phase }))));
-      };
-
-      const localLeaderChoices = leaders.filter(item => item.global || item.workspaceId === workspace);
-      const primaryParticipants = participants.filter(p => p.primary);
-      const mentionTargets = primaryParticipants.length > 0 ? primaryParticipants : participants.slice(0, 6);
-      const roomTaskId = visible?.taskId || room?.taskId || task?.id || '';
-      const roomAttachments = Array.isArray(visible?.attachments) ? visible.attachments : (Array.isArray(task?.attachments) ? task.attachments : []);
-      const uploadRoomAttachments = async pickedFiles => {
-        const files = Array.from(pickedFiles || []).slice(0, 8);
-        if (!roomTaskId || files.length === 0 || uploadingAtt) return;
-        setUploadingAtt(true);
-        setError('');
-        const key = viewKey;
-        const refresh = roomRefreshRef.current;
-        try {
-          const uploaded = await uploadAttachmentFiles(files, roomPreviewUrlsRef.current);
-          if (uploaded.length === 0) return;
-          const existingIds = new Set(roomAttachments.map(a => a.attachmentId));
-          const merged = [
-            ...roomAttachments.map(serializeAttachmentForWire),
-            ...uploaded.filter(a => !existingIds.has(a.attachmentId)),
-          ].slice(0, 8);
-          await fetchJson('marshal/tasks/update', { taskId: roomTaskId, attachments: merged, ...(isWorkflowRunning ? { steerNow: true } : {}) }, true);
-          await refresh?.request();
-          if (selection.current === key) {
-            setNotice('已上传 ' + uploaded.length + ' 个工单附件：' + uploaded.map(item => item.name).join('、') + (isWorkflowRunning ? '（已作为实时插话同步给运行中的 Agent）' : ''));
-          }
-        } catch (e) {
-          if (selection.current === key) setError('上传附件失败：' + (e.message || e));
-        } finally {
-          setUploadingAtt(false);
-        }
-      };
-
-      return h('section', { 'aria-label': '工单群', className: 'mtr-shell' },
-        h('aside', { className: 'mtr-side' },
-          h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between' } },
-            h('h2', { style: { fontSize: 15, margin: 0 } }, '工单群'),
-            h('span', { style: uiMuted }, rooms.length + ' 个群')),
-          h(Field, { label: '工作区' }, h('select', { value: workspace, style: uiInput,
-            onChange: event => { setWorkspace(event.target.value); setId(''); setError(''); } },
-            h('option', { value: '' }, '选择工作区'),
-            workspaces.map(item => h('option', { key: item.id, value: item.id }, item.name)))),
-          notice && !room && h('p', { style: uiMuted }, notice),
-          rooms.length === 0 && workspace && h('p', { style: { ...uiMuted, margin: '8px 2px' } }, '该工作区暂无工单群记录。'),
-          rooms.map(item => h('button', {
-            key: item.id,
-            type: 'button',
-            className: 'mtr-room-item',
-            'aria-pressed': id === item.id,
-            'data-active': id === item.id ? 'true' : undefined,
-            onClick: () => { setError(''); setNotice(''); setId(item.id); },
-          },
-            h('span', { style: { fontSize: 12.5, fontWeight: id === item.id ? 600 : 500, overflowWrap: 'anywhere', lineHeight: 1.4 } }, item.title),
-            h('span', { style: { fontSize: 11, color: dswTheme.faint } }, (item.closed ? '已归档' : '活跃中') + ' · ' + (item.lastSeq || 0) + ' 条记录')))),
-
-        h('main', { className: 'mtr-main' },
-          h('header', { className: 'mtr-header' },
-            button('← 回任务看板', () => openBoard(visible?.origin ? room?.taskId : task?.id)),
-            id && workspace && button('刷新', () => { void loadRoom(); }),
-            h('strong', { style: { fontSize: 14, flex: 1, minWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
-              room?.title ?? task?.title ?? '工单群聊'),
-            isWorkflowRunning && h('span', { style: { fontSize: 11.5, color: '#3b82f6', fontWeight: 600 } }, '● 编排执行中（可随时发言参与讨论）'),
-            isInReview && h('span', { style: { fontSize: 11.5, color: '#a78bfa', fontWeight: 600 } }, '● 待确认'),
-            roomTokenStats.totalTokens > 0 && h('span', {
-              className: 'mtr-tok-badge',
-              title: '各 Agent 累计消耗 — ' + roomTokenStats.breakdownTitle,
-            }, '🪙 累计 ' + formatTokenCount(roomTokenStats.totalTokens) + ' tok'),
-            room && h('span', { style: uiMuted }, (room.storage === 'hub' ? 'Hub 归档' : room.storage === 'moving' ? '转存中' : '本机归档') + (room.closed ? ' · 已关单' : '')),
-            visible?.runState === 'interrupted' && h('span', { style: { fontSize: 11.5, color: '#f59e0b' } }, '上次运行已中断'),
-            visible?.origin && room && button(room.closed ? '重开工单' : '关单归档', () => { void act(room.closed ? 'reopen' : 'close'); }, controlsLocked),
-            visible?.origin && room && !isWorkflowRunning && button('重跑编排', () => { void act('retry'); }, controlsLocked)),
-
-          error && h('div', { role: 'alert', style: { padding: '8px 18px', fontSize: 12, color: dswTheme.danger, borderBottom: '1px solid ' + dswTheme.border } }, error),
-          notice && room && h('div', { role: 'status', style: { padding: '7px 18px', fontSize: 12, color: '#10b981', borderBottom: '1px solid ' + dswTheme.border } }, notice),
-
-          isInReview && (() => {
-            const reviewMeta = describeReviewState(task, visible?.workflow, '', false);
-            return h('div', { className: 'mtr-review-bar' },
-              h('div', { style: { display: 'grid', gap: 3, flex: '1 1 260px', minWidth: 0 } },
-                h('strong', { style: { fontSize: 12.5, color: '#a78bfa' } }, reviewMeta.badge),
-                h('span', { style: { fontSize: 12, color: dswTheme.dim, overflowWrap: 'anywhere' } }, reviewMeta.summary)),
-              h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' } },
-                visible?.patchAvailable && button('✓ 应用补丁到工作区并完成', () => { void act('confirm', { applyPatch: true, ...(draft.trim() ? { note: draft.trim() } : {}) }); }, busy, true),
-                button(visible?.patchAvailable ? '仅确认完成' : '✓ 确认验收完成', () => { void act('confirm', { applyPatch: false, ...(draft.trim() ? { note: draft.trim() } : {}) }); }, busy, !visible?.patchAvailable),
-                button('↻ 按群内意见继续执行', () => { void act('revise', draft.trim() ? { text: draft.trim() } : {}); }, busy)));
-          })(),
-
-          room && roomAttachments.length > 0 && h('div', { className: 'mtr-att-bar' },
-            h('span', { style: { fontSize: 11.5, fontWeight: 600, color: dswTheme.dim } }, '📎 工单附件 (' + roomAttachments.length + ')：'),
-            h('div', { className: 'mtb-att-list' },
-              roomAttachments.map(att => {
-                const href = attachmentHref(roomTaskId, att, roomPreviewUrlsRef.current);
-                const fallbackImgSrc = resolveClientApiUrl('api/task-board/attachments/image?id=' + encodeURIComponent(att.attachmentId));
-                const imgSrc = roomPreviewUrlsRef.current.get(att.attachmentId) || (roomTaskId ? href : fallbackImgSrc);
-                return h('div', { key: att.attachmentId, className: 'mtb-att-card', title: att.name + ' (' + formatBytes(att.bytes) + ')' },
-                  att.kind === 'image'
-                    ? h('img', { className: 'mtb-att-thumb', src: imgSrc, alt: att.name })
-                    : h('span', { style: { fontSize: 14 }, 'aria-hidden': 'true' }, '📄'),
-                  href
-                    ? h('a', { className: 'mtb-att-link', href, target: '_blank', rel: 'noreferrer', download: att.kind === 'file' ? att.name : undefined }, att.name)
-                    : h('span', { style: { fontWeight: 500 } }, att.name),
-                  h('span', { style: { fontSize: 10.5, color: dswTheme.dim } }, formatBytes(att.bytes)));
-              }))),
-
-          !id && task && h('div', { style: { padding: 18 } }, button('开启此工单群聊', () => { void bind(); }, !workspace || busy, true)),
-          !room && !task && h('div', { style: { ...uiMuted, padding: 24, margin: 'auto', textAlign: 'center' } }, '从左侧选择一个工单群，即可查看智能体协作过程并随时参与讨论。'),
-
-          room && h('section', {
-            ref: streamRef,
-            'aria-label': '群聊记录',
-            className: 'mtr-stream',
-            onScroll: event => {
-              const el = event.currentTarget;
-              stickBottomRef.current = (el.scrollHeight - el.scrollTop - el.clientHeight) < 80;
-            },
-          },
-            visible.records[0]?.seq > 1 && h('div', { className: 'mtr-sys-row' }, button('↑ 加载更早消息', () => { void older(); }, busy)),
-            visible.records.length === 0 && !(visible.liveBubbles?.length > 0) && h('div', { style: { ...uiMuted, margin: 'auto', textAlign: 'center', lineHeight: 1.8 } },
-              '工单群已就绪，还没有消息。', h('br'), '您可以直接在下方输入要求、@指定角色讨论，或点击「按意见继续执行」启动编排。'),
-            visible.records.map(renderRecord),
-            (visible.liveBubbles || []).map(renderLiveBubble),
-            sendingChat && !(visible.liveBubbles?.length > 0) && h('div', { className: 'mtr-msg-row', 'data-side': 'left' },
-              h('span', { className: 'mtr-avatar', style: { background: 'color-mix(in srgb, currentColor 12%, transparent)', fontSize: 12 } }, '…'),
-              h('div', { className: 'mtr-msg-col' },
-                h('div', { className: 'mtr-bubble mtr-bubble-agent', style: { opacity: .75, fontSize: 12 } }, '正在结合工单上下文生成回复…')))),
-
-          visible?.origin && room && h('footer', { className: 'mtr-composer' },
-            h('div', { className: 'mtr-chip-row' },
-              h('span', { style: { fontSize: 11, color: dswTheme.faint } }, '点按 @角色讨论：'),
-              mentionTargets.map(member => {
-                const c = agentBubbleAccent(member.name, colorMap);
-                const actorStat = roomTokenStats.byActor.get(member.name);
-                return h('button', {
-                  key: member.id,
-                  type: 'button',
-                  className: 'mtr-mention-chip',
-                  style: { '--mtr-chip-c': c },
-                  title: actorStat ? formatUsageTitle(actorStat) : undefined,
-                  onClick: () => insertMention(member.name),
-                },
-                  h('span', { style: { color: c, fontWeight: 600 } }, '@' + member.name),
-                  member.role && h('span', { style: { opacity: .72 } }, '· ' + member.role),
-                  actorStat && actorStat.totalTokens > 0 && h('span', { style: { opacity: .82, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 10 } }, '· 🪙' + formatTokenCount(actorStat.totalTokens)));
-              }),
-              mentionTargets.length > 1 && h('button', {
-                type: 'button',
-                className: 'mtr-mention-chip',
-                onClick: () => insertMention('全体'),
-              }, '@全体'),
-              roomTaskId && roomAttachments.length < 8 && h('label', {
-                className: 'mtr-mention-chip',
-                style: { cursor: uploadingAtt ? 'wait' : 'pointer' },
-              },
-                uploadingAtt ? '附件上传中…' : '📎 补充附件',
-                h('input', {
-                  type: 'file', multiple: true, style: { display: 'none' }, disabled: uploadingAtt || busy,
-                  onChange: ev => {
-                    const picked = Array.from(ev.target.files || []);
-                    ev.target.value = '';
-                    void uploadRoomAttachments(picked);
-                  },
-                })),
-              room.closed && h('span', { style: { fontSize: 11, color: '#f59e0b', marginLeft: 'auto' } }, '工单已归档，发送消息将自动重开讨论')),
-
-            h('div', { style: { display: 'flex', alignItems: 'flex-end', gap: 8 } },
-              h('textarea', {
-                ref: inputRef,
-                'aria-label': '工单群消息',
-                value: draft,
-                onChange: event => setDraft(event.target.value),
-                onKeyDown: event => {
-                  if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
-                    event.preventDefault();
-                    void sendChat();
-                  }
-                },
-                rows: 2,
-                placeholder: isWorkflowRunning
-                  ? '编排运行中也可随时发言讨论或补充指示（⌘/Ctrl+Enter 发送讨论；点「按意见继续执行」立即中断并按新意见重跑）…'
-                  : '输入问题或修正意见（不 @ 默认由 Leader 回复；⌘/Ctrl+Enter 发送讨论）…',
-                style: { ...uiInput, flex: 1, resize: 'vertical', lineHeight: 1.55, minHeight: 46 },
-              }),
-              h('div', { style: { display: 'flex', gap: 6, flexShrink: 0 } },
-                button(chatLocked ? '发送中…' : '发送讨论', () => { void sendChat(); }, chatLocked || !draft.trim(), true),
-                button(isWorkflowRunning ? '↻ 中断并按意见重跑' : '↻ 按意见继续执行', () => { void act('revise', draft.trim() ? { text: draft.trim() } : {}); }, busy))),
-
-            (localLeaderChoices.length > 0 || peers.length > 0) && h('details', { style: { fontSize: 11.5 } },
-              h('summary', { style: { cursor: 'pointer', color: dswTheme.faint, userSelect: 'none' } }, '高级操作：改派负责 Leader 或跨设备调度'),
-              h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 6 } },
-                h('select', { 'aria-label': '改派 Leader', value: leader, style: { ...uiInput, width: 'auto', minWidth: 160 }, onChange: event => { setLeader(event.target.value); setRemote(''); } },
-                  h('option', { value: '' }, '选择本机 Leader'),
-                  localLeaderChoices.map(item => h('option', { key: item.id, value: item.id }, item.name + (item.global ? '（全局）' : '')))),
-                peers.length > 0 && h('select', { 'aria-label': '改派到其它设备', value: remote, style: { ...uiInput, width: 'auto', minWidth: 200 },
-                  onChange: event => { setRemote(event.target.value); setLeader(''); } },
-                  h('option', { value: '' }, '选择跨设备 Agent'),
-                  peers.flatMap(peer => peer.models.map(model => h('option',
-                    { key: peer.id + '/' + model.id, value: JSON.stringify({ deviceId: peer.id, modelId: model.id }) },
-                    peer.name + ' · ' + model.agent + ' · ' + model.model)))),
-                button('改派并运行', () => { void act('reassign', remote ? { remote: JSON.parse(remote) } : { leaderId: leader }); },
-                  controlsLocked || (!leader && !remote)))))));
-    }
-
     const MV_HUB_TASK_TOPICS = ['ready', 'tasks.changed', 'incidents.changed'];
     const MV_HUB_INCIDENTS = signal => fetchJson('marshal/incidents/summary', undefined, true, signal);
     const MV_HUB_KANBAN_READS = {
@@ -9324,492 +8961,6 @@ window.__ModuleLoader__.load({
         h(DeviceStatusDrawer, { open: drawer, onClose: () => setDrawer(false), status: { ...deviceStatus, deviceId: localId, devices: [...devices.values()] },
           onRefresh: refresh, onOpenRemote: () => { window.dispatchEvent(new CustomEvent('marshal:tab', { detail: 'remote' })); } }));
     }
-    function AgentsPage({ onOpenChats, onOpenMemory, openSession, mvOpenDirect, workspaceService, initialSubTab = 'pool' }) {
-      const [subTab, setSubTab] = React.useState(initialSubTab === 'rosters' ? 'rosters' : 'pool');
-      const [library, setLibrary] = React.useState(null);
-      const [extraWorkspaces, setExtraWorkspaces] = React.useState([]);
-      const [sessions, setSessions] = React.useState([]);
-      const [rosters, setRosters] = React.useState({});
-      const [selectedAgentId, setSelectedAgentId] = React.useState('');
-      const [selectedWsId, setSelectedWsId] = React.useState('');
-      const [chatSearch, setChatSearch] = React.useState('');
-      const [dispatchWsId, setDispatchWsId] = React.useState('');
-      const [rosterDraft, setRosterDraft] = React.useState({ leaderId: '', coderId: '', reviewerId: '', members: [] });
-      const [rosterNotice, setRosterNotice] = React.useState('');
-      const [error, setError] = React.useState('');
-      const [formOpen, setFormOpen] = React.useState(false);
-      const [editingId, setEditingId] = React.useState('');
-      const [saving, setSaving] = React.useState(false);
-      const [confirmId, setConfirmId] = React.useState('');
-      const [name, setName] = React.useState('');
-      const [preset, setPreset] = React.useState('');
-      const [permission, setPermission] = React.useState('workspace-write');
-      const [model, setModel] = React.useState('');
-      const [brief, setBrief] = React.useState('');
-      const [workspacePath, setWorkspacePath] = React.useState('');
-      const [creatingWorkspace, setCreatingWorkspace] = React.useState(false);
-      const [quick, setQuick] = React.useState('');
-      const [quickBusy, setQuickBusy] = React.useState(false);
-      const [chatBusy, setChatBusy] = React.useState(false);
-      const [renamingSessionId, setRenamingSessionId] = React.useState('');
-      const [renameSessionDraft, setRenameSessionDraft] = React.useState('');
-      const [summarizingSessionId, setSummarizingSessionId] = React.useState('');
-
-      React.useEffect(() => {
-        if (initialSubTab === 'rosters' || initialSubTab === 'pool') setSubTab(initialSubTab);
-      }, [initialSubTab]);
-
-      const agents = library && Array.isArray(library.agents) ? library.agents : [];
-      const presets = (library && library.presets) || [];
-      const models = (library && library.models) || [];
-      const realWorkspaces = React.useMemo(() => {
-        const map = new Map();
-        for (const ws of [...((library && library.workspaces) || []), ...extraWorkspaces]) {
-          if (!ws || !ws.id || isPseudoAgentWorkspace(ws)) continue;
-          if (!map.has(ws.id)) {
-            map.set(ws.id, {
-              id: ws.id,
-              title: ws.title || ws.name || (ws.path ? String(ws.path).split('/').pop() : ws.id),
-              path: ws.path || '',
-            });
-          }
-        }
-        return [...map.values()];
-      }, [library, extraWorkspaces]);
-
-      const load = async () => {
-        try {
-          const [lib, sessData, wsData, rosterData] = await Promise.all([
-            loadAgentLibrary(),
-            fetchJson('marshal/agents/sessions').catch(() => ({ sessions: [] })),
-            fetchJson('marshal/task-rooms/workspaces', undefined, true).catch(() => ({ workspaces: [] })),
-            fetchJson('marshal/rosters/state').catch(() => ({ rosters: {} })),
-          ]);
-          setLibrary(lib);
-          setSessions(Array.isArray(sessData?.sessions) ? sessData.sessions : []);
-          setExtraWorkspaces(Array.isArray(wsData?.workspaces) ? wsData.workspaces : []);
-          setRosters(rosterData?.rosters || {});
-          setSelectedAgentId(cur => (cur && (lib.agents || []).some(a => a.id === cur)) ? cur : (lib.agents?.[0]?.id || ''));
-          const mergedReal = [...(lib.workspaces || []), ...(wsData?.workspaces || [])].filter(ws => ws && ws.id && !isPseudoAgentWorkspace(ws));
-          if (mergedReal.length > 0) {
-            setSelectedWsId(cur => (cur && mergedReal.some(w => w.id === cur)) ? cur : mergedReal[0].id);
-            setDispatchWsId(cur => cur || mergedReal[0].id);
-          }
-          setError('');
-        }
-        catch (e) { setError(friendlyError(e, '智能体')); }
-      };
-      React.useEffect(() => { void load(); }, []);
-
-      React.useEffect(() => {
-        if (!selectedWsId) return;
-        const r = rosters[selectedWsId] || {};
-        setRosterDraft({
-          leaderId: r.leaderId || '',
-          coderId: r.coderId || '',
-          reviewerId: r.reviewerId || '',
-          members: Array.isArray(r.members) ? r.members : [],
-        });
-        setRosterNotice('');
-      }, [selectedWsId, rosters]);
-
-      const selectedAgent = agents.find(a => a.id === selectedAgentId) || agents[0] || null;
-      const agentFullId = agent => agent.squadId + '/' + agent.id;
-
-      const agentSessions = React.useMemo(() => {
-        if (!selectedAgent) return [];
-        const q = chatSearch.trim().toLowerCase();
-        return sessions.filter(item => {
-          const match = item.memberId === selectedAgent.id || (item.teamId === selectedAgent.squadId && item.agentName === selectedAgent.name);
-          if (!match) return false;
-          if (q && !String(item.title || '').toLowerCase().includes(q) && !String(item.sessionId || '').toLowerCase().includes(q)) return false;
-          return true;
-        });
-      }, [sessions, selectedAgent, chatSearch]);
-
-      const createWorkspace = async () => {
-        const path = workspacePath.trim();
-        if (!path.startsWith('/')) { setError('项目工作区路径必须是绝对路径'); return; }
-        const service = typeof workspaceService === 'function' ? workspaceService() : workspaceService;
-        if (!service || typeof service.create !== 'function') { setError('当前 DSH 版本不支持从插件新建工作区'); return; }
-        setCreatingWorkspace(true);
-        setError('');
-        try {
-          await fetchJson('marshal/workspaces/prepare', { path });
-          const created = await service.create({ path });
-          setWorkspacePath('');
-          await load();
-          if (created && created.workspaceId) setSelectedWsId(created.workspaceId);
-        }
-        catch (e) { setError('新建项目工作区失败：' + (e.message || e)); }
-        finally { setCreatingWorkspace(false); }
-      };
-
-      const resetForm = () => {
-        setEditingId('');
-        setName('');
-        setPreset('');
-        setPermission('workspace-write');
-        setModel('');
-        setBrief('');
-        setFormOpen(false);
-      };
-
-      const openEdit = agent => {
-        setEditingId(agent.id);
-        setName(agent.name || '');
-        setPreset(agent.preset || '');
-        setPermission(agent.permission || 'workspace-write');
-        setModel(agent.model || '');
-        setBrief(agent.brief || '');
-        setFormOpen(true);
-      };
-
-      const saveAgent = async () => {
-        if (!name.trim()) { setError('请填写名称'); return; }
-        if (!library) return;
-        setSaving(true);
-        setError('');
-        try {
-          const current = editingId ? agents.find(agent => agent.id === editingId) : undefined;
-          const member = { name: name.trim() };
-          if (preset) member.preset = preset;
-          if (permission) member.permission = permission;
-          if (model) member.model = model;
-          if (brief.trim()) member.brief = brief.trim();
-          let teamId;
-          if (current !== undefined) {
-            teamId = current.squadId;
-            member.id = current.id;
-          }
-          else {
-            const team = await createAgentTeam(name.trim());
-            teamId = team.id;
-          }
-          const saved = await fetchJson('dsh-agents/api/member', { teamId, member });
-          const created = ((saved.team && saved.team.members) || []).find(item => item.name === name.trim());
-          resetForm();
-          await load();
-          if (created) setSelectedAgentId(created.id);
-        }
-        catch (e) { setError((editingId ? '保存失败：' : '创建失败：') + (e.message || e)); }
-        finally { setSaving(false); }
-      };
-
-      const quickCreate = async () => {
-        if (!quick.trim()) { setError('先写一句话描述'); return; }
-        if (!library) return;
-        setQuickBusy(true);
-        setError('');
-        try {
-          const defaultModel = (library.models || [])[0];
-          const data = await fetchJson('marshal/agents/draft', {
-            text: quick.trim(),
-            ...(defaultModel && defaultModel.provider && defaultModel.model
-              ? { provider: defaultModel.provider, model: defaultModel.model }
-              : {}),
-          });
-          const draft = (data && data.draft) || {};
-          const agentName = (draft.name || quick.trim().slice(0, 12)).slice(0, 40);
-          const team = await createAgentTeam(agentName);
-          const member = {
-            name: agentName,
-            permission: draft.permission || 'workspace-write',
-          };
-          if (draft.brief) member.brief = draft.brief;
-          const saved = await fetchJson('dsh-agents/api/member', { teamId: team.id, member });
-          const created = ((saved.team && saved.team.members) || []).find(item => item.name === agentName);
-          setQuick('');
-          await load();
-          if (created) setSelectedAgentId(created.id);
-        }
-        catch (e) { setError('一句话创建失败：' + (e.message || e)); }
-        finally { setQuickBusy(false); }
-      };
-
-      const saveSessionRename = async sessionId => {
-        if (!sessionId) return;
-        setError('');
-        try {
-          await fetchJson('marshal/agents/sessions/rename', { sessionId, title: renameSessionDraft.trim() });
-          setRenamingSessionId('');
-          setRenameSessionDraft('');
-          await load();
-        }
-        catch (e) { setError('重命名失败：' + (e.message || e)); }
-      };
-      const summarizeSessionTitle = async sessionId => {
-        if (!sessionId || summarizingSessionId) return;
-        setSummarizingSessionId(sessionId);
-        setError('');
-        try {
-          await fetchJson('marshal/agents/sessions/summarize', { sessionId, clearCustom: true });
-          await load();
-        }
-        catch (e) { setError('总结标题失败：' + (e.message || e)); }
-        finally { setSummarizingSessionId(''); }
-      };
-      const startCasualChat = async (agent) => {
-        if (!agent || chatBusy) return;
-        setChatBusy(true);
-        setError('');
-        try {
-          const data = await fetchJson('dsh-agents/api/run', { teamId: agent.squadId, memberId: agent.id });
-          const sessionId = data && data.run && data.run.sessionId;
-          if (!sessionId) throw new Error('no-session');
-          await load();
-          openSession && openSession(sessionId);
-        }
-        catch (e) { setError('新建闲聊失败：' + (e.message || e)); }
-        finally { setChatBusy(false); }
-      };
-
-      const workIn = async (agent, targetWsId) => {
-        if (!agent || !targetWsId) return;
-        setError('');
-        try {
-          const team = await createTaskTeam(agent.name, targetWsId);
-          const cappedPerm = agent.permission === 'read-only' ? 'read-only' : 'workspace-write';
-          const member = { name: agent.name, permission: cappedPerm };
-          if (agent.preset) member.preset = agent.preset;
-          if (agent.model) member.model = agent.model;
-          if (agent.brief) member.brief = agent.brief;
-          const saved = await fetchJson('dsh-agents/api/member', { teamId: team.id, member });
-          const created = (saved.team && saved.team.members || []).find(item => item.name === agent.name) || (saved.team && saved.team.members || [])[0];
-          if (!created) throw new Error('no-member');
-          const data = await fetchJson('dsh-agents/api/run', { teamId: team.id, memberId: created.id });
-          const sessionId = data && data.run && data.run.sessionId;
-          if (!sessionId) throw new Error('no-session');
-          await load();
-          openSession && openSession(sessionId);
-        }
-        catch (e) { setError('派驻到工作区失败：' + (e.message || e)); }
-      };
-
-      const remove = async (agent) => {
-        if (confirmId !== agent.id) { setConfirmId(agent.id); return; }
-        if (!library) return;
-        try {
-          if (agent.legacy) await fetchJson('dsh-agents/api/member/delete', { teamId: agent.squadId, memberId: agent.id });
-          else await fetchJson('dsh-agents/api/team/delete', { teamId: agent.squadId });
-          setConfirmId('');
-          await load();
-        }
-        catch (e) { setError('删除失败：' + (e.message || e)); }
-      };
-
-      const saveRoster = async () => {
-        if (!selectedWsId) return;
-        setSaving(true);
-        setError('');
-        setRosterNotice('');
-        try {
-          const res = await fetchJson('marshal/rosters/save', {
-            workspaceId: selectedWsId,
-            leaderId: rosterDraft.leaderId || undefined,
-            coderId: rosterDraft.coderId || undefined,
-            reviewerId: rosterDraft.reviewerId || undefined,
-            members: rosterDraft.members,
-          });
-          setRosters(res?.rosters || {});
-          setRosterNotice('已保存该工作区默认班底');
-        }
-        catch (e) { setError('保存班底失败：' + (e.message || e)); }
-        finally { setSaving(false); }
-      };
-
-      const toggleRosterMember = fullId => {
-        setRosterDraft(cur => {
-          const exists = cur.members.includes(fullId);
-          return { ...cur, members: exists ? cur.members.filter(x => x !== fullId) : [...cur.members, fullId] };
-        });
-      };
-
-      const agentSessionCount = agent => sessions.filter(s => s.memberId === agent.id || (s.teamId === agent.squadId && s.agentName === agent.name)).length;
-      const agentNameByFullId = fullId => {
-        if (!fullId) return '';
-        const found = agents.find(a => agentFullId(a) === fullId || a.id === fullId);
-        return found ? found.name : fullId;
-      };
-
-      return h('section', { style: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', background: dswTheme.bg, color: dswTheme.text } },
-        h('header', { style: { padding: '12px 20px', borderBottom: '1px solid ' + dswTheme.border, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexShrink: 0, flexWrap: 'wrap' } },
-          h('div', { style: { display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' } },
-            h('div', { role: 'tablist', 'aria-label': '智能体视图', style: { display: 'flex', gap: 4, padding: 3, borderRadius: 10, border: '1px solid ' + dswTheme.border, background: dswTheme.layer } },
-              h('button', { type: 'button', role: 'tab', 'aria-selected': subTab === 'pool', style: tabStyle(subTab === 'pool'), onClick: () => setSubTab('pool') }, '全部智能体（人才库 · ' + agents.length + '）'),
-              h('button', { type: 'button', role: 'tab', 'aria-selected': subTab === 'rosters', style: tabStyle(subTab === 'rosters'), onClick: () => setSubTab('rosters') }, '工作区班底（' + realWorkspaces.length + '）'))),
-          h('div', { style: { display: 'flex', gap: 8 } },
-            onOpenChats && h('button', { type: 'button', style: uiButton(false), onClick: onOpenChats }, '去会话'),
-            subTab === 'pool' && h('button', { type: 'button', style: uiButton(true), onClick: () => { if (formOpen) resetForm(); else { setEditingId(''); setFormOpen(true); } } }, formOpen ? '收起' : '＋ 新建智能体'))),
-        error && h('div', { style: { padding: '8px 20px', fontSize: 12, color: dswTheme.danger } }, error),
-
-        subTab === 'pool' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' } },
-          h('div', { style: { margin: '12px 20px 0', padding: '10px 14px', border: '1px solid ' + dswTheme.border, borderRadius: 12, background: dswTheme.layer, display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 } },
-            h('input', { value: quick, onChange: event => setQuick(event.target.value), onKeyDown: event => { if (event.key === 'Enter') void quickCreate(); }, placeholder: '一句话新建全局智能体（不创建假工作区），如：严谨的代码审查员，先查边界条件', style: { ...uiInput, flex: 1 } }),
-            h('button', { type: 'button', disabled: quickBusy, style: { ...uiButton(true), opacity: quickBusy ? .6 : 1, whiteSpace: 'nowrap' }, onClick: () => { void quickCreate(); } }, quickBusy ? '生成中…' : '一句话创建')),
-          formOpen && h('div', { style: { margin: '12px 20px 0', padding: 16, border: '1px solid ' + dswTheme.border, borderRadius: 12, background: dswTheme.layer, display: 'grid', gap: 10, flexShrink: 0 } },
-            h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between' } },
-              h('div', { style: { fontSize: 13, fontWeight: 600 } }, editingId ? '编辑智能体' : '新建全局智能体'),
-              h('div', { style: uiMuted }, '全局独立实体 · 不创建假工作区，可自由派驻任意项目')),
-            h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: 10 } },
-              h(Field, { label: '名称' }, h('input', { value: name, onChange: event => setName(event.target.value), placeholder: '例如：工部尚书', style: uiInput })),
-              h(Field, { label: '预设' }, h('select', { value: preset, onChange: event => setPreset(event.target.value), style: uiInput },
-                h('option', { value: '' }, '默认预设'),
-                presets.map(item => {
-                  const id = typeof item === 'string' ? item : item.id;
-                  const label = typeof item === 'string' ? item : (item.name || item.id);
-                  return h('option', { key: id, value: id }, label);
-                }))),
-              h(Field, { label: '单聊默认权限' }, h('select', { value: permission, onChange: event => setPermission(event.target.value), style: uiInput },
-                h('option', { value: 'read-only' }, '只读'),
-                h('option', { value: 'workspace-write' }, '可写工作区（推荐）'),
-                h('option', { value: 'danger-full-access' }, '完全访问（派驻工作区自动收紧为工作区可写）'))),
-              h(Field, { label: '模型' }, h('select', { value: model, onChange: event => setModel(event.target.value), style: uiInput },
-                h('option', { value: '' }, '默认模型'),
-                models.map(item => {
-                  const value = item.provider && item.model ? item.provider + '/' + item.model : (item.id || '');
-                  return h('option', { key: value, value }, item.label || value);
-                })))),
-            h(Field, { label: '简报（人设与职责说明）' }, h('textarea', { value: brief, onChange: event => setBrief(event.target.value), rows: 3, placeholder: '它擅长什么、用什么语气、注意什么…', style: { ...uiInput, resize: 'vertical', lineHeight: 1.6 } })),
-            h('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8 } },
-              h('button', { type: 'button', style: uiButton(false), onClick: () => resetForm() }, '取消'),
-              h('button', { type: 'button', disabled: saving, style: { ...uiButton(true), opacity: saving ? .6 : 1 }, onClick: () => { void saveAgent(); } }, saving ? '保存中…' : editingId ? '保存修改' : '创建智能体'))),
-          agents.length === 0
-            ? h('div', { style: { flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 } },
-                h(EmptyState, { title: '还没有智能体', hint: '智能体独立于项目工作区存在，可单聊、拉群，也可派驻到任意真实项目工作区。', action: '新建智能体', onAction: () => setFormOpen(true) }))
-            : h('div', { style: { flex: 1, minHeight: 0, display: 'flex', marginTop: 12, borderTop: '1px solid ' + dswTheme.border, overflow: 'hidden' } },
-                h('aside', { style: { width: 250, flexShrink: 0, borderRight: '1px solid ' + dswTheme.border, overflow: 'auto', padding: 12, display: 'flex', flexDirection: 'column', gap: 6 } },
-                  agents.map(agent => {
-                    const active = selectedAgent && selectedAgent.id === agent.id;
-                    const count = agentSessionCount(agent);
-                    return h('button', {
-                      key: agent.id, type: 'button',
-                      style: { ...tabStyle(active), textAlign: 'left', padding: '9px 10px', display: 'flex', alignItems: 'center', gap: 10 },
-                      onClick: () => { setSelectedAgentId(agent.id); setConfirmId(''); },
-                    },
-                      h(Avatar, { name: agent.name, size: 28 }),
-                      h('div', { style: { flex: 1, minWidth: 0 } },
-                        h('div', { style: { fontSize: 13, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, agent.name),
-                        h('div', { style: { fontSize: 10, opacity: .65, marginTop: 2 } }, (agent.model || '默认模型') + ' · ' + count + ' 次闲聊')));
-                  })),
-                selectedAgent && h('div', { style: { flex: 1, minWidth: 0, overflow: 'auto', padding: 20, display: 'grid', gap: 16, alignContent: 'start' } },
-                  h('div', { style: { padding: 16, borderRadius: 12, border: '1px solid ' + dswTheme.border, background: dswTheme.layer, display: 'grid', gap: 10 } },
-                    h('div', { style: { display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' } },
-                      h(Avatar, { name: selectedAgent.name, size: 40 }),
-                      h('div', { style: { flex: 1, minWidth: 0 } },
-                        h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
-                          h('span', { style: { fontSize: 16, fontWeight: 600 } }, selectedAgent.name),
-                          h('span', { style: { fontSize: 10, color: dswTheme.faint, border: '1px solid ' + dswTheme.border2, borderRadius: 999, padding: '2px 8px' } }, '全局智能体'),
-                          h('span', { style: { fontSize: 10, color: dswTheme.faint, border: '1px solid ' + dswTheme.border2, borderRadius: 999, padding: '2px 8px' } }, selectedAgent.permission || 'workspace-write')),
-                        h('div', { style: { fontSize: 11, color: dswTheme.faint, marginTop: 4 } }, [selectedAgent.preset || '默认预设', selectedAgent.model || '默认模型'].join(' · '))),
-                      h('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap' } },
-                        mvOpenDirect && h(mvDirectLink, { key: selectedAgent.id, agent: selectedAgent, open: mvOpenDirect }),
-                        onOpenMemory && h('button', { type: 'button', style: uiButton(false), onClick: () => onOpenMemory(selectedAgent.id) }, '私有记忆'),
-                        h('button', { type: 'button', style: uiButton(false), onClick: () => openEdit(selectedAgent) }, '编辑'),
-                        h('button', { type: 'button', style: { ...uiButton(false), color: confirmId === selectedAgent.id ? dswTheme.danger : undefined }, onClick: () => { void remove(selectedAgent); } }, confirmId === selectedAgent.id ? '确认删除' : '删除'))),
-                    selectedAgent.brief && h('div', { style: { fontSize: 12, color: dswTheme.dim, lineHeight: 1.65, whiteSpace: 'pre-wrap' } }, selectedAgent.brief)),
-
-                  h('div', { style: { padding: 14, borderRadius: 12, border: '1px solid ' + dswTheme.border, background: dswTheme.layer, display: 'grid', gap: 8 } },
-                    h('div', { style: { fontSize: 13, fontWeight: 600 } }, '派驻到真实项目工作区'),
-                    h('div', { style: { fontSize: 11, color: dswTheme.faint } }, '被派驻到工作区时自动限制为「工作区可写」权限；如需在看板按模板协同，可在「工作区班底」配置默认班底。'),
-                    realWorkspaces.length === 0
-                      ? h('div', { style: { fontSize: 12, color: dswTheme.dim } }, '还没有真实项目工作区，请切到上方「工作区班底」新建一个项目工作区。')
-                      : h('div', { style: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' } },
-                          h('select', { value: dispatchWsId, onChange: event => setDispatchWsId(event.target.value), style: { ...uiInput, flex: 1, minWidth: 200 } },
-                            realWorkspaces.map(ws => h('option', { key: ws.id, value: ws.id }, ws.title + (ws.path ? ' · ' + ws.path : '')))),
-                          h('button', { type: 'button', style: uiButton(false), onClick: () => { void workIn(selectedAgent, dispatchWsId); } }, '派驻并开启会话'))),
-
-                  h('div', { style: { padding: 14, borderRadius: 12, border: '1px solid ' + dswTheme.border, background: dswTheme.layer, display: 'grid', gap: 10 } },
-                    h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
-                      h('div', { style: { fontSize: 13, fontWeight: 600 } }, '闲聊会话历史（' + agentSessions.length + '）'),
-                      h('input', { value: chatSearch, onChange: event => setChatSearch(event.target.value), placeholder: '搜索历史闲聊…', style: { ...uiInput, width: 190, marginLeft: 'auto' } }),
-                      h('button', { type: 'button', disabled: chatBusy, style: uiButton(true), onClick: () => { void startCasualChat(selectedAgent); } }, chatBusy ? '创建中…' : '＋ 新建闲聊')),
-                    agentSessions.length === 0
-                      ? h('div', { style: { fontSize: 12, color: dswTheme.faint, padding: '8px 0' } }, '还没有与「' + selectedAgent.name + '」的闲聊历史，点“＋ 新建闲聊”立即开始。')
-                      : h('div', { style: { display: 'grid', gap: 6, maxHeight: 320, overflow: 'auto' } },
-                          agentSessions.map(item => h('div', {
-                            key: item.sessionId,
-                            style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '8px 10px', borderRadius: 8, border: '1px solid ' + dswTheme.border, cursor: renamingSessionId === item.sessionId ? 'default' : 'pointer' },
-                            onClick: () => { if (renamingSessionId !== item.sessionId) openSession && openSession(item.sessionId); },
-                          },
-                            h('div', { style: { flex: 1, minWidth: 0 } },
-                              renamingSessionId === item.sessionId
-                                ? h('div', { style: { display: 'flex', gap: 6, alignItems: 'center' }, onClick: e => e.stopPropagation() },
-                                    h('input', {
-                                      value: renameSessionDraft,
-                                      autoFocus: true,
-                                      placeholder: '输入新标题（留空恢复自动标题）',
-                                      style: { ...uiInput, flex: 1, padding: '4px 8px', fontSize: 12 },
-                                      onChange: e => setRenameSessionDraft(e.target.value),
-                                      onKeyDown: e => { if (e.key === 'Enter') void saveSessionRename(item.sessionId); if (e.key === 'Escape') setRenamingSessionId(''); },
-                                    }),
-                                    h('button', { type: 'button', style: { ...uiButton(true), padding: '4px 8px', fontSize: 11 }, onClick: () => { void saveSessionRename(item.sessionId); } }, '保存'),
-                                    h('button', { type: 'button', style: { ...uiButton(false), padding: '4px 7px', fontSize: 11 }, onClick: () => setRenamingSessionId('') }, '取消'))
-                                : h('div', { style: { display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 } },
-                                    h('span', { style: { fontSize: 12, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: item.title }, item.title || '历史闲聊'),
-                                    item.titleSource === 'custom' && h('span', { style: { fontSize: 10, color: dswTheme.faint, border: '1px solid ' + dswTheme.border, borderRadius: 999, padding: '0 5px', flexShrink: 0 } }, '已重命名'),
-                                    item.titleSource === 'auto' && h('span', { style: { fontSize: 10, color: dswTheme.faint, border: '1px solid ' + dswTheme.border, borderRadius: 999, padding: '0 5px', flexShrink: 0 } }, '自动总结'),
-                                    item.legacyReadOnly && h('span', { title: '原独立工作区已迁出清壳，仅作历史查阅；继续对话请点「新建闲聊」', style: { fontSize: 10, color: '#f59e0b', border: '1px solid color-mix(in srgb, #f59e0b 45%, transparent)', background: 'color-mix(in srgb, #f59e0b 10%, transparent)', borderRadius: 999, padding: '0 5px', flexShrink: 0 } }, '历史只读')),
-                              h('div', { style: { fontSize: 10, color: dswTheme.faint, marginTop: 2 } }, [formatSessionTime(item.updatedAt || item.createdAt), item.sessionId.slice(0, 8)].filter(Boolean).join(' · '))),
-                            renamingSessionId !== item.sessionId && h('div', { style: { display: 'flex', gap: 5, flexShrink: 0 }, onClick: e => e.stopPropagation() },
-                              h('button', { type: 'button', title: '重命名', style: { ...uiButton(false), padding: '4px 7px', fontSize: 11 }, onClick: () => { setRenamingSessionId(item.sessionId); setRenameSessionDraft(item.title || ''); } }, '重命名'),
-                              h('button', { type: 'button', title: '总结标题', disabled: summarizingSessionId === item.sessionId, style: { ...uiButton(false), padding: '4px 7px', fontSize: 11 }, onClick: () => { void summarizeSessionTitle(item.sessionId); } }, summarizingSessionId === item.sessionId ? '…' : '✨'),
-                              h('button', { type: 'button', style: { ...uiButton(false), padding: '4px 9px', fontSize: 11 }, onClick: () => openSession && openSession(item.sessionId) }, '打开'))))))))),
-
-        subTab === 'rosters' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' } },
-          h('div', { style: { margin: '12px 20px 0', padding: '10px 14px', border: '1px solid ' + dswTheme.border, borderRadius: 12, background: dswTheme.layer, display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 } },
-            h('input', { value: workspacePath, onChange: event => setWorkspacePath(event.target.value), placeholder: '新建真实项目工作区（输入绝对路径，例如 /Users/you/projects/app）', style: { ...uiInput, flex: 1 } }),
-            h('button', { type: 'button', disabled: creatingWorkspace, style: { ...uiButton(false), whiteSpace: 'nowrap' }, onClick: () => { void createWorkspace(); } }, creatingWorkspace ? '创建中…' : '＋ 新建项目工作区')),
-          realWorkspaces.length === 0
-            ? h('div', { style: { flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 } },
-                h(EmptyState, { title: '还没有项目工作区', hint: '在上方输入项目目录绝对路径，即可创建真实项目工作区并配置默认班底。' }))
-            : h('div', { style: { flex: 1, minHeight: 0, display: 'flex', marginTop: 12, borderTop: '1px solid ' + dswTheme.border, overflow: 'hidden' } },
-                h('aside', { style: { width: 250, flexShrink: 0, borderRight: '1px solid ' + dswTheme.border, overflow: 'auto', padding: 12, display: 'flex', flexDirection: 'column', gap: 6 } },
-                  realWorkspaces.map(ws => {
-                    const active = selectedWsId === ws.id;
-                    const r = rosters[ws.id];
-                    return h('button', {
-                      key: ws.id, type: 'button',
-                      style: { ...tabStyle(active), textAlign: 'left', padding: '9px 10px', display: 'grid', gap: 3 },
-                      onClick: () => setSelectedWsId(ws.id),
-                    },
-                      h('div', { style: { fontSize: 13, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, ws.title),
-                      h('div', { style: { fontSize: 10, opacity: .65, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, r?.leaderId ? 'Leader: ' + agentNameByFullId(r.leaderId) : (ws.path || '尚未配置默认班底')));
-                  })),
-                selectedWsId && h('div', { style: { flex: 1, minWidth: 0, overflow: 'auto', padding: 20, display: 'grid', gap: 14, alignContent: 'start' } },
-                  h('div', null,
-                    h('div', { style: { fontSize: 15, fontWeight: 600 } }, (realWorkspaces.find(w => w.id === selectedWsId)?.title || selectedWsId) + ' · 工作区班底'),
-                    h('div', { style: { fontSize: 11, color: dswTheme.faint, marginTop: 4 } }, realWorkspaces.find(w => w.id === selectedWsId)?.path || '')),
-                  h('div', { style: { padding: 12, borderRadius: 10, border: '1px solid ' + dswTheme.border, background: dswTheme.layer, fontSize: 12, color: dswTheme.dim, lineHeight: 1.6 } },
-                    '在任务看板选择该工作区时，将自动套用这里的默认 Leader。派驻到工作区执行时默认授予「工作区可写」权限并开启 Leader 自动审核；如遇权限受阻，工单会自动转入「待确认」列等待确认。'),
-                  h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 12 } },
-                    h(Field, { label: '默认 Leader（统筹与自动审核）' },
-                      h('select', { value: rosterDraft.leaderId, style: uiInput, onChange: event => setRosterDraft(cur => ({ ...cur, leaderId: event.target.value })) },
-                        h('option', { value: '' }, '不预设'),
-                        agents.map(a => h('option', { key: a.id, value: agentFullId(a) }, a.name)))),
-                    h(Field, { label: '默认 Coder（主力开发）' },
-                      h('select', { value: rosterDraft.coderId, style: uiInput, onChange: event => setRosterDraft(cur => ({ ...cur, coderId: event.target.value })) },
-                        h('option', { value: '' }, '不预设'),
-                        agents.map(a => h('option', { key: a.id, value: agentFullId(a) }, a.name)))),
-                    h(Field, { label: '默认 Reviewer（独立审查）' },
-                      h('select', { value: rosterDraft.reviewerId, style: uiInput, onChange: event => setRosterDraft(cur => ({ ...cur, reviewerId: event.target.value })) },
-                        h('option', { value: '' }, '不预设'),
-                        agents.map(a => h('option', { key: a.id, value: agentFullId(a) }, a.name))))),
-                  h(Field, { label: '常驻协作班底成员（点击切换）' },
-                    h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 8 } },
-                      agents.map(a => {
-                        const fid = agentFullId(a);
-                        const on = rosterDraft.members.includes(fid);
-                        return h('button', {
-                          key: a.id, type: 'button',
-                          style: { ...tabStyle(on), border: '1px solid ' + (on ? dswTheme.brand : dswTheme.border), padding: '6px 12px' },
-                          onClick: () => toggleRosterMember(fid),
-                        }, (on ? '✓ ' : '＋ ') + a.name);
-                      }))),
-                  h('div', { style: { display: 'flex', alignItems: 'center', gap: 12 } },
-                    h('button', { type: 'button', disabled: saving, style: uiButton(true), onClick: () => { void saveRoster(); } }, saving ? '保存中…' : '保存工作区班底'),
-                    rosterNotice && h('span', { style: { fontSize: 12, color: '#10b981' } }, rosterNotice))))));
-    }
     function SafeMarshalPanel(props) {
       return h(MarshalErrorBoundary, { resetKey: 'marshal-panel-root' }, h(MarshalPanel, props));
     }
@@ -9936,6 +9087,11 @@ window.__ModuleLoader__.load({
             marshalContext: desktopContext ?? nativeContext ?? ctx,
             openSession: sessionId => openSessionRef.current?.(sessionId),
             mvOpenDirect: agent => mvNativeDirect?.(agent),
+            closeMemorySidebar: () => {
+              const sidebarRight = service(desktopContext, 'sidebarRight') ?? service(ctx, 'sidebarRight');
+              if (typeof sidebarRight?.closeTab === 'function') return sidebarRight.closeTab();
+              return sidebarRight?.close?.();
+            },
             mvStartVoice: agent => mvStartVoice?.(agent),
             openPanel,
             workspaceService: () => {

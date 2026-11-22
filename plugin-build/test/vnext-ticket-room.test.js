@@ -5,6 +5,7 @@ import { test } from 'node:test';
 import { runInNewContext } from 'node:vm';
 
 const shard = name => readFileSync(new URL(`../client/src/${name}.js`, import.meta.url), 'utf8');
+const roomColors = shard('42-task-room-shared').split('    function ensureTaskRoomStyles')[0];
 const roomSource = shard('48-ticket-room-vnext');
 const groupsSource = shard('40-groups');
 const sidebarSource = shard('15-sidebar-left');
@@ -25,6 +26,7 @@ function harness(route, globals = {}) {
             const slot = slots[i] ??= { value: typeof initial === 'function' ? initial() : initial };
             return [slot.value, update => { slot.value = typeof update === 'function' ? update(slot.value) : update; }];
         },
+        useMemo(fn) { current.index++; return fn(); },
         useRef(initial) { return current.slots[current.index++] ??= { current: initial }; },
         useEffect(fn, deps) {
             const slot = current.slots[current.index++] ??= {};
@@ -80,7 +82,7 @@ function harness(route, globals = {}) {
     };
     // Execute the production refresh scheduler, while controlling the SSE transport.
     const scheduler = shard('32-sse-client').split('    function createVisibleMarshalRefresh')[1];
-    const api = runInNewContext(`function createVisibleMarshalRefresh${scheduler}\n${shard('35-cascade-picker')}\n${groupHelpers}\n${groupsSource}\n${roomSource}\n({ MarshalTicketRoomView, GroupsPage, CrossGroupsPage })`, context);
+    const api = runInNewContext(`function createVisibleMarshalRefresh${scheduler}\n${shard('35-cascade-picker')}\n${roomColors}\n${groupHelpers}\n${groupsSource}\n${roomSource}\n({ MarshalTicketRoomView, GroupsPage, CrossGroupsPage })`, context);
     function render() {
         effects = []; visited = new Set(); tree = expand(root);
         for (const [id, instance] of instances) if (!visited.has(id)) { dispose(instance); instances.delete(id); }

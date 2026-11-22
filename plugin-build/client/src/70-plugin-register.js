@@ -120,6 +120,11 @@
             marshalContext: desktopContext ?? nativeContext ?? ctx,
             openSession: sessionId => openSessionRef.current?.(sessionId),
             mvOpenDirect: agent => mvNativeDirect?.(agent),
+            closeMemorySidebar: () => {
+              const sidebarRight = service(desktopContext, 'sidebarRight') ?? service(ctx, 'sidebarRight');
+              if (typeof sidebarRight?.closeTab === 'function') return sidebarRight.closeTab();
+              return sidebarRight?.close?.();
+            },
             mvStartVoice: agent => mvStartVoice?.(agent),
             openPanel,
             workspaceService: () => {

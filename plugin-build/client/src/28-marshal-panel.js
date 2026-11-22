@@ -1,4 +1,4 @@
-    function MarshalPanel({ marshalContext, openSession, openPanel, mvOpenDirect, mvStartVoice, SessionProvider, renderSlot }) {
+    function MarshalPanel({ marshalContext, openSession, openPanel, mvOpenDirect, mvStartVoice, closeMemorySidebar, SessionProvider, renderSlot }) {
       React.useEffect(ensureMarshalVnextStyles, []);
       const [attempt, retry] = React.useState(0);
       const initialNav = React.useMemo(() => {
@@ -337,7 +337,7 @@
           h(MarshalHubMonitorView, { openTaskRoom, onOpenMemory: openAgentMemory, onOpenDirect: mvOpenDirect })),
         tab === 'memory' && h('div', { className: 'mv-room-fill' },
           h(MarshalErrorBoundary, { resetKey: 'memory' },
-            h(MemoryPage, { initialAgentId: memoryTarget.agentId, initialLayer: memoryTarget.layer, mvOpenDirect }))),
+            h(MemoryPage, { initialAgentId: memoryTarget.agentId, initialLayer: memoryTarget.layer, mvOpenDirect, closeMemorySidebar }))),
         h(DeviceStatusDrawer, {
           open: deviceDrawerOpen,
           onClose: () => setDeviceDrawerOpen(false),

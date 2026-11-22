@@ -6,7 +6,7 @@
     }
 
     async function refreshMarshalSseProof(connection) {
-      const proof = await ensureMemorySession(connection.rejectedProof);
+      const proof = await ensureMemorySession(connection.rejectedProof, connection.controller.signal);
       connection.auth = 'refreshed';
       connection.rejectedProof = undefined;
       connection.refreshedProof = proof;
@@ -75,7 +75,7 @@
         const proof = connection.auth === 'refreshing'
           ? await refreshMarshalSseProof(connection)
           : connection.auth === 'refreshed' ? memoryProof() ?? connection.refreshedProof
-          : nativeMemory ? await ensureMemorySession() : memoryProof();
+          : nativeMemory ? await ensureMemorySession(undefined, signal) : memoryProof();
         if (signal.aborted) return;
         const response = await fetch(connection.address + '/marshal/events', {
           headers: {

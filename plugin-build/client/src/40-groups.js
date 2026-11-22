@@ -362,11 +362,11 @@
         members.map(member => chip(member.id || mvChatMemberId(member), member.name, member.role)), all && chip('all', '全体'));
     }
 
-    function mvChatMessage({ mine, name, at, phase, text, trace, live, streaming, messageId, children }) {
+    function mvChatMessage({ mine, name, at, phase, text, trace, live, streaming, messageId, accent, children }) {
       const u = trace?.usage;
       const total = Number(u?.totalTokens) || Number(u?.inputTokens || 0) + Number(u?.outputTokens || 0);
       return h('article', { key: messageId, className: 'mv-room-message', style: { marginInlineStart: mine ? 'var(--mv-xl)' : undefined,
-        marginInlineEnd: mine ? undefined : 'var(--mv-xl)', background: mine ? 'var(--dsw-alias-marshal-tint)' : undefined } },
+        borderInlineStart: !mine && accent ? '2px solid ' + accent : undefined, marginInlineEnd: mine ? undefined : 'var(--mv-xl)', background: mine ? 'var(--dsw-alias-marshal-tint)' : undefined } },
         h('div', { className: 'mv-actions mv-muted' }, h('strong', null, mine ? '我' : name),
           at != null && h('time', null, new Date(at).toLocaleTimeString()),
           phase && taskPhases[phase] && h('span', null, taskPhases[phase]),

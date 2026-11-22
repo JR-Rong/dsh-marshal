@@ -486,7 +486,7 @@ test('full development + Codex sub-agent slot overrides (model + reasoningEffort
     });
 });
 
-test('shipped client/index.js renders per-agent model/thinking switchers in TaskBoardView and token badges in TaskRoomsPage, and interactive switching triggers /marshal/tasks/agent-configs', async () => {
+test('shipped client/index.js renders per-agent model/thinking switchers in TaskBoardView and token badges in MarshalTicketRoomView, and interactive switching triggers /marshal/tasks/agent-configs', async () => {
     const source = readFileSync(new URL('../client/index.js', import.meta.url), 'utf8');
 
     // Minimal stateful React hooks runtime to execute and inspect real component VDOM trees
@@ -873,7 +873,7 @@ test('shipped client/index.js renders per-agent model/thinking switchers in Task
         agentConfigs: { reviewer: { reasoningEffort: 'off' } },
     });
 
-    // 2. Click "进入工单群" button in Drawer to navigate to TaskRoomsPage and verify per-agent token badges render!
+    // 2. Click "进入工单群" button in Drawer to navigate to MarshalTicketRoomView and verify per-agent token badges render!
     const enterRoomBtn = collectAll(tree, n => n.tag === 'button' && textOf(n) === '进入工单群')[0];
     assert.ok(enterRoomBtn, 'Drawer must have 进入工单群 button');
     enterRoomBtn.props.onClick();

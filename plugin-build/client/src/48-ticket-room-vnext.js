@@ -282,6 +282,7 @@
       const projectedTask = { ...task, id: taskId, title: room?.title || task?.title,
         workflow, status: visible?.cardStatus ?? task?.status, taskRoom: room };
       const participants = visible?.participants ?? [];
+      const colorMap = React.useMemo(() => buildRoomColorMap(visible?.records, visible?.participants), [visible?.records, visible?.participants]);
       const reviewing = visible?.origin && !room?.closed && (visible.cardStatus === 'review' || visible.runState === 'review-blocked');
       const runningRevision = visible?.origin && !room?.closed && (visible.busy || visible.cardStatus === 'running');
       const actionPending = Boolean(pending || visible?.chatBusy);
@@ -525,7 +526,7 @@
             taskId && h(MvButton, { label: '定位 DAG 节点', disabled: locating, onClick: () => locate(record, handoff.nodeId) })),
           handoff.summary && h(RichMarkdown, { text: handoff.summary }));
         const target = artifact && room?.id && patchTarget({ record, artifact });
-        return h(mvChatMessage, { key: record.seq, mine: record.kind === 'user', name: record.actor, text: artifact?.body ?? text,
+        return h(mvChatMessage, { key: record.seq, mine: record.kind === 'user', accent: colorMap.get(record.actor), name: record.actor, text: artifact?.body ?? text,
           at: record.at, phase: record.phase, trace }, banner, target && patchControls(target), target && patchContents(target));
       };
       return h('div', { className: 'mv-room-fill' },
@@ -548,7 +549,7 @@
           } }, visible?.hasOlder && h(MvButton, { label: '加载更早消息', disabled: paging, onClick: older }),
           !rows.length && !(visible?.liveBubbles?.length) && h('p', { className: 'mv-muted' }, room ? '还没有消息。' : '正在读取工单群…'),
           rows.map(renderRow), visible && (visible.liveBubbles ?? []).map(live => h(mvChatMessage, { key: 'live-' + live.id,
-            name: live.actor, phase: live.phase, text: live.text, trace: live, live: true })),
+            name: live.actor, accent: colorMap.get(live.actor), phase: live.phase, text: live.text, trace: live, live: true })),
           workflow?.reportId && taskId && h(TaskReviewReport, { key: workflow.reportId, taskId, development: Boolean(workflow.development) })),
           visible?.origin && room && h('footer', { className: 'mv-composer-dock' },
             h(mvChatMentions, { members: participants, usage, all: true, input, setText: setDraft }),
