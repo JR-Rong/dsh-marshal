@@ -1096,3 +1096,152 @@ select.mini-select:disabled { opacity: .45; }
 .chat-add { min-width: var(--tap-min); }
 .chat-welcome button { min-height: var(--tap-min); min-width: var(--tap-min); text-align: start; }
 .chat-sheet input { min-height: var(--tap-min); }
+
+/* Tab 2 session detail: content stays opaque; the sheet reuses the modal backdrop. */
+.screen-session {
+  --session-bubble-radius: 20px;
+  --session-bubble-width: 82%;
+  --session-composer-radius: 24px;
+  height: 100vh;
+  height: 100dvh;
+  min-height: 0;
+  padding-bottom: calc(var(--safe-bottom) + var(--space-2));
+}
+.screen-session > :not(.transcript) { flex-shrink: 0; }
+.session-pending {
+  max-height: 34dvh;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+}
+.screen-session .transcript {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  overflow-anchor: none;
+  gap: var(--space-2);
+}
+.screen-session .transcript > * { flex-shrink: 0; }
+.history-indicator {
+  min-height: 1lh;
+  font-size: var(--font-caption);
+  color: var(--secondary);
+  text-align: center;
+}
+.screen-session .msg-user {
+  max-width: var(--session-bubble-width);
+  border-radius: var(--session-bubble-radius);
+  box-shadow: none;
+}
+.screen-session :is(.msg-assistant, .msg-reason, .msg-tool) {
+  align-self: stretch;
+  max-width: none;
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+.screen-session .msg-assistant .msg-role { font-weight: 600; }
+.screen-session .msg-assistant .msg-body { font-size: inherit; }
+.screen-session :is(.msg-reason, .msg-tool) .msg-body {
+  margin-inline-start: var(--space-2);
+  padding-inline-start: var(--space-2);
+  border-inline-start: 1px solid var(--separator);
+  font-style: normal;
+}
+.screen-session :is(.msg-copy, .msg-disclosure) {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  gap: var(--space-1);
+  min-height: var(--tap-min);
+  min-width: var(--tap-min);
+  padding: 0 var(--space-2);
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--secondary);
+  font-size: var(--font-caption);
+  text-align: start;
+  overflow-wrap: anywhere;
+}
+.screen-session .msg-tool .msg-disclosure { background: var(--fill); }
+.session-composer {
+  margin-top: var(--space-2);
+  padding: var(--space-2);
+  border: 1px solid var(--separator);
+  border-radius: var(--session-composer-radius);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+.session-composer > input[type="text"] {
+  width: 100%;
+  min-height: var(--tap-min);
+  margin-bottom: var(--space-1);
+  border: 0;
+  background: transparent;
+}
+.session-composer .attach-row { max-height: 25dvh; overflow-y: auto; }
+.composer-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+.composer-toolbar > button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-1);
+  min-height: var(--tap-min);
+  min-width: var(--tap-min);
+  padding: 0 var(--space-2);
+  border: 0;
+  border-radius: var(--radius-pill);
+  font-size: var(--font-caption);
+}
+.composer-toolbar .composer-model { min-width: 0; }
+.composer-model > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.composer-toolbar .composer-effort { white-space: nowrap; }
+.composer-effort.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.composer-toolbar :is(.composer-add, .composer-action) { flex: 0 0 var(--tap-min); padding: 0; }
+.composer-action { margin-inline-start: auto; }
+.composer-toolbar svg, .msg-copy svg, .msg-disclosure svg {
+  flex-shrink: 0;
+  width: var(--space-4);
+  height: var(--space-4);
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.composer-action.stopping svg { fill: currentColor; }
+.composer-options { grid-template-columns: minmax(0, 1fr); gap: var(--space-2); }
+.composer-options .composer-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-4);
+  text-align: start;
+  background: var(--fill);
+  color: var(--text);
+  border: 1px solid transparent;
+}
+.composer-options .composer-option[aria-pressed="true"] {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+.composer-option-copy { display: grid; min-width: 0; }
+.composer-option-copy > span, .composer-current { font-size: var(--font-caption); color: var(--secondary); }
+.composer-current {
+  flex: none;
+  padding: var(--space-1) var(--space-2);
+  background: var(--surface);
+  border-radius: var(--radius-pill);
+}

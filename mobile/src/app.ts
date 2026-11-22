@@ -35,7 +35,9 @@ import { APP_TITLE, APP_VERSION, CLIENT_ONLY_NOTE } from './lib/version.ts'
 
 import { filterSessionsByCategory, initialWizardState, moveWizardStep, selectWizardHost, validateWizardState,
   sessionCenterRoute, groupBackCategory, roomRetryId, beginCreateAttempt, finishCreateAttempt, canCloseCreateSheet,
-  isWelcomeEmpty, isUnconfirmedEmpty, fillWelcomeStarter,
+  isWelcomeEmpty, isUnconfirmedEmpty, fillWelcomeStarter, shouldTriggerOlderHistory, preserveScrollAnchor,
+  mergeTranscriptSnapshot, appendTranscriptDelta, historyPageProgress, transcriptMessageKey,
+  EFFORT_META, buildEffortSheetOptions, formatThoughtSummary,
   WELCOME_STARTERS, type HistoryStatus, type SessionCategory, type WizardStep } from './lib/chat-ui.ts'
 
 import { TICKET_TEMPLATES, filterTickets, ticketFilter, ticketStageIndex, parseDiffPreview, reduceTicketNavigation,
@@ -52,6 +54,12 @@ interface Message {
   text: string
   open: boolean
   at: number
+  endedAt?: number
+  snapshotText?: string
+  snapshotPrefix?: string
+  streamText?: string
+  completed?: boolean
+  toolTitle?: string
   failed?: boolean
   retryKey?: string
 }
@@ -149,6 +157,7 @@ const state: UiState = {
 let stream: StreamHandle | null = null
 let subscriptionId: string | null = null
 let lastSeq = 0
+let lastNodeEpoch: unknown
 let pendingInputs = createPendingInputs()
 let inputRecovery = 0
 let disposeBack: (() => void) | null = null
@@ -175,6 +184,12 @@ function tabIcon(kind: string): SVGElement {
   svg.setAttribute('aria-hidden', 'true')
   const paths: Record<string, string> = {
     plus: 'M12 5v14 M5 12h14',
+    down: 'm6 9 6 6 6-6',
+    thought: 'M12 3l2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5Z',
+    send: 'M12 20V4 M5 11l7-7 7 7',
+    stop: 'M7 7h10v10H7Z',
+    terminal: 'M3 5h18v14H3Z M7 9l3 3-3 3 M13 15h4',
+    copy: 'M8 8h12v13H8Z M16 4H4v13',
     device: 'M8 3.5h8a2 2 0 0 1 2 2v13a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2v-13a2 2 0 0 1 2-2Z M10.5 17.5h3',
     chat: 'M4.5 6.5A2.5 2.5 0 0 1 7 4h10a2.5 2.5 0 0 1 2.5 2.5v6A2.5 2.5 0 0 1 17 15H9l-4.5 3.5v-12Z',
     board: 'M4.5 5.5h15v6h-15z M4.5 15h7v4h-7z M14.5 15h5v4h-5z',
@@ -234,13 +249,25 @@ function switchTab(view: View): void {
   }
 }
 
-function render(): void {
+function render(prependHistory = false): void {
+  if (composerSheet && (state.view !== 'session' || composerSheet.session !== sessionGeneration)) composerSheet.close()
   if (chatSheet && state.view !== chatSheet.view) chatSheet.dismiss()
   if (appConfirmation && (appLocked() || state.view !== appConfirmation.view)) appConfirmation.cancel()
   if (state.view !== 'groupRoom' && state.view !== 'ticketGroup') stopGroupPoll()
   if (!showingMemory()) clearTimeout(memoryPoll)
   const app = rootNode()
   const restoreSegment = document.activeElement?.matches('.chat-segments [aria-pressed="true"]') && app.contains(document.activeElement)
+  const previous = state.view === 'session' && renderedSession === sessionGeneration
+    ? app.querySelector<HTMLElement>('.transcript') : null
+  const prevTop = previous?.scrollTop ?? 0
+  const prevHeight = previous?.scrollHeight ?? 0
+  const followBottom = previous && prevHeight - previous.clientHeight - prevTop <= 24
+  const anchor = prependHistory && previous ? [...previous.querySelectorAll<HTMLElement>('[data-msg]')]
+    .find(node => node.getBoundingClientRect().bottom > previous.getBoundingClientRect().top) : null
+  const anchorY = anchor && previous ? anchor.getBoundingClientRect().top - previous.getBoundingClientRect().top : 0
+  const activeInput = previous && app.querySelector<HTMLInputElement>('.session-composer input[type="text"]')
+  const selection = activeInput && activeInput === document.activeElement
+    ? [activeInput.selectionStart, activeInput.selectionEnd] as const : null
   clear(app)
   const withTabs = TAB_VIEWS.has(state.view) || state.view === 'ticketGroup' || state.view === 'groups'
   app.className = 'app screen-' + state.view + (withTabs ? ' has-tabs' : '')
@@ -248,6 +275,22 @@ function render(): void {
     // 浏览器 append(null) 会渲染出 "null" 字样，必须先过滤空槽位。
     if (child === null || child === undefined || child === false) continue
     app.append(child as Node)
+  }
+  const transcript = state.view === 'session' ? app.querySelector<HTMLElement>('.transcript') : null
+  if (transcript) {
+    const nextAnchor = anchor && [...transcript.querySelectorAll<HTMLElement>('[data-msg]')]
+      .find(node => node.dataset.msg === anchor.dataset.msg)
+    transcript.scrollTop = prependHistory && previous
+      ? nextAnchor ? nextAnchor.getBoundingClientRect().top - transcript.getBoundingClientRect().top - anchorY
+        : preserveScrollAnchor(prevHeight, transcript.scrollHeight, prevTop)
+      : !previous || followBottom ? transcript.scrollHeight : prevTop
+    bindHistoryScroll(transcript)
+    renderedSession = sessionGeneration
+    if (selection) {
+      const input = app.querySelector<HTMLInputElement>('.session-composer input[type="text"]')
+      input?.focus({ preventScroll: true })
+      input?.setSelectionRange(...selection)
+    }
   }
   if (withTabs) app.append(tabBar())
   if (restoreSegment) app.querySelector<HTMLElement>('.chat-segments [aria-pressed="true"]')?.focus()
@@ -413,6 +456,7 @@ async function registerBackButton(): Promise<void> {
   disposeBack?.()
   disposeBack = await watchBackButton(() => {
     if (appConfirmation) { appConfirmation.cancel(); return true }
+    if (composerSheet) { composerSheet.close(); return true }
     if (chatSheet) { chatSheet.close(); return true }
     if (state.view === 'groupRoom' || state.view === 'groupNew') { returnToGroups(); return true }
     const ticketBack = ticketBackAction(Boolean(rootNode().querySelector('.ticket-sheet[open]')), state.view === 'ticketGroup')
@@ -438,6 +482,8 @@ async function enterApp(): Promise<void> {
   state.api = new MarshalApi(config)
   roster = []
   state.session = null
+  sessionGeneration++
+  olderRequest = null
   pendingInputs = createPendingInputs()
   state.devices = []
   state.sessions = []
@@ -554,6 +600,18 @@ let historyStatus: HistoryStatus = 'loading'
 let historyItemCount = 0
 let historyError = ''
 let historyRequest = 0
+let olderRequest: object | null = null
+let sessionGeneration = 0
+let renderedSession = -1
+let reachedHistoryStart = false
+let historyPageNotice = ''
+const visitedHistoryCursors = new Set<string>()
+const transcriptChunks = new Map<string, Map<number, string>>()
+const expandedMessages = new Set<string>()
+const historyScrollPositions = new WeakMap<HTMLElement, number>()
+let composerSheet: { session: number; close: () => void } | null = null
+let receivedLiveCapability = false
+let receivedLiveRunning = false
 
 async function openSession(deviceId: string, row: SessionRow): Promise<void> {
   const api = state.api
@@ -566,11 +624,20 @@ async function openSession(deviceId: string, row: SessionRow): Promise<void> {
   const opened = state.session = { ...row, deviceId }
   state.capability = row.capability
   state.running = row.running
+  receivedLiveCapability = false
+  receivedLiveRunning = false
   state.messages = []
   state.historyCursor = null
   historyStatus = 'loading'
   historyItemCount = 0
   historyRequest++
+  sessionGeneration++
+  olderRequest = null
+  reachedHistoryStart = false
+  historyPageNotice = ''
+  visitedHistoryCursors.clear()
+  transcriptChunks.clear()
+  expandedMessages.clear()
   state.controls = null
   state.modelChoice = ''
   state.effortChoice = ''
@@ -578,6 +645,7 @@ async function openSession(deviceId: string, row: SessionRow): Promise<void> {
   state.uploading = false
   state.busy = false
   lastSeq = 0
+  lastNodeEpoch = undefined
   draft = ''
   state.view = 'session'
   state.statusText = '正在订阅…'
@@ -609,8 +677,8 @@ async function openSession(deviceId: string, row: SessionRow): Promise<void> {
     const fresh = sessions.data.find((item) => item.agent === row.agent && item.sessionId === row.sessionId)
     if (fresh) {
       state.session = { ...fresh, deviceId: row.deviceId }
-      state.capability = fresh.capability
-      state.running = fresh.running
+      if (!receivedLiveCapability) state.capability = fresh.capability
+      if (!receivedLiveRunning) state.running = fresh.running
     }
   }
   render()
@@ -623,18 +691,39 @@ function targetOf(row: SessionRow): Target {
 export function historyToMessage(item: { kind: string; payload?: Record<string, unknown>; seq?: number; ts?: number }): Message | null {
   const payload = item.payload ?? {}
   const at = typeof item.ts === 'number' ? item.ts : Date.now()
-  const id = (typeof payload.itemId === 'string' ? payload.itemId : 'seq-' + String(item.seq ?? Math.random()))
+  const stableId = payload.itemId ?? (item.kind.startsWith('tool.') ? payload.callId : payload.turnId)
+  const id = typeof stableId === 'string' ? stableId : 'seq-' + String(item.seq ?? Math.random())
   const text = typeof payload.text === 'string' ? payload.text : ''
   switch (item.kind) {
     case 'user.message': return { id, role: 'user', text, open: false, at }
-    case 'message.delta':
-    case 'message.completed': return text ? { id, role: 'assistant', text, open: false, at } : null
+    case 'message.delta': return text ? { id, role: 'assistant', text, open: false, at } : null
+    case 'message.completed': return text ? { id, role: 'assistant', text, open: false, at, completed: true } : null
     case 'reasoning.delta': return text ? { id, role: 'reason', text, open: false, at } : null
-    case 'tool.started': return { id, role: 'tool', text: '开始：' + String(payload.name ?? payload.tool ?? 'tool'), open: false, at }
-    case 'tool.completed': return { id, role: 'tool', text: (payload.isError === true ? '失败：' : '完成：') + String(payload.content ?? '').slice(0, 400), open: false, at }
+    case 'tool.started': return { id, role: 'tool', text: '开始：' + String(payload.name ?? payload.tool ?? '工具'), toolTitle: String(payload.name ?? payload.tool ?? '工具调用'), open: false, at }
+    case 'tool.completed': return { id, role: 'tool', text: (payload.isError === true || payload.status === 'error' ? '失败：' : '完成：') + String(payload.content ?? '').slice(0, 400), toolTitle: String(payload.name ?? payload.tool ?? '工具结果'), open: false, at, completed: true }
     case 'turn.completed': return { id, role: 'system', text: '回合完成（' + String(payload.state ?? 'completed') + '）', open: false, at }
     default: return null
   }
+}
+
+function historyMessages(items: Parameters<typeof historyToMessage>[0][]): Message[] {
+  const messages = new Map<string, Message>()
+  for (const item of items) {
+    const message = historyToMessage(item)
+    if (!message) continue
+    const key = transcriptMessageKey(message)
+    const previous = messages.get(key)
+    if (previous && (item.kind === 'reasoning.delta' || item.kind === 'message.delta'
+      || ((item.kind === 'user.message' || item.kind === 'message.completed') && Number(item.payload?.chunkIndex) > 0))) {
+      previous.text += message.text
+      if (message.role === 'reason' && typeof item.ts === 'number') previous.endedAt = item.ts
+    } else {
+      if (previous) message.at = previous.at
+      if (previous?.toolTitle && message.toolTitle === '工具结果') message.toolTitle = previous.toolTitle
+      messages.set(key, message)
+    }
+  }
+  return [...messages.values()]
 }
 
 async function loadPendingInputs(api: MarshalApi, target: Target, isCurrent?: () => boolean): Promise<boolean> {
@@ -678,7 +767,6 @@ async function recoverPendingInputs(api: MarshalApi): Promise<void> {
 
 async function onFrame(frame: StreamFrame): Promise<void> {
   if (frame.event === 'reset') {
-    lastSeq = 0
     if (state.api && !appLocked()) void recoverPendingInputs(state.api)
     if (state.view === 'session') void reloadTranscript()
     await refreshDevices()
@@ -726,63 +814,110 @@ async function onFrame(frame: StreamFrame): Promise<void> {
   }
   if (!target) return
   if (event.deviceId !== target.deviceId || event.agent !== target.agent || event.sessionId !== target.sessionId) return
+  if (event.nodeEpoch !== lastNodeEpoch) {
+    lastNodeEpoch = event.nodeEpoch
+    lastSeq = 0
+    transcriptChunks.clear()
+  }
   const seq = acceptEventSeq(lastSeq, event.seq)
   if (!seq.accept) return
   lastSeq = seq.lastSeq
+  const ts = typeof event.ts === 'number' ? event.ts : undefined
+  const transcriptEvent = { kind, payload, ts, seq: typeof event.seq === 'number' ? event.seq : undefined }
+  if ((kind === 'user.message' || kind === 'message.completed')
+    && typeof payload.itemId === 'string' && typeof payload.text === 'string'
+    && typeof payload.chunkCount === 'number' && payload.chunkCount > 1
+    && typeof payload.chunkIndex === 'number' && payload.chunkIndex >= 0 && payload.chunkIndex < payload.chunkCount) {
+    const key = `${kind}:${payload.itemId}`
+    const parts = payload.chunkIndex === 0 ? new Map<number, string>() : transcriptChunks.get(key)
+    if (!parts) return
+    parts.set(payload.chunkIndex, payload.text)
+    if (parts.size < payload.chunkCount) { transcriptChunks.set(key, parts); return }
+    transcriptChunks.delete(key)
+    transcriptEvent.payload = { ...payload, text: [...parts.entries()].sort(([a], [b]) => a - b).map(([, part]) => part).join('') }
+  }
   switch (kind) {
     case 'capability.changed':
+      receivedLiveCapability = true
       state.capability = payload as unknown as Capability
+      if (state.view === 'session') render()
       return
     case 'message.delta':
     case 'reasoning.delta': {
       const text = typeof payload.text === 'string' ? payload.text : ''
       if (!text) return
-      appendDelta(String(payload.itemId ?? event.seq ?? 'd'), kind === 'reasoning.delta' ? 'reason' : 'assistant', text)
+      const id = typeof payload.itemId === 'string' ? payload.itemId : 'seq-' + String(event.seq ?? 'd')
+      appendDelta(id, kind === 'reasoning.delta' ? 'reason' : 'assistant', text, ts ?? Date.now())
       return
     }
-    case 'message.completed': closeOpenMessages(); return
-    case 'turn.started': state.running = true; void showLive('运行中', 'run-start', typeof event.sessionId === 'string' ? event.sessionId : 'run'); render(); return
-    case 'turn.completed': state.running = false; closeOpenMessages(); void showLive('已结束', 'run-finish', typeof event.sessionId === 'string' ? event.sessionId : 'run', true); render(); return
-    case 'tool.started':
-      state.messages.push({ id: String(event.seq), role: 'tool', text: '开始：' + String(payload.name ?? payload.tool ?? 'tool'), open: false, at: Date.now() })
-      render(); return
-    case 'tool.completed':
-      state.messages.push({ id: String(event.seq), role: 'tool', text: String(payload.content ?? '').slice(0, 400), open: false, at: Date.now() })
-      render(); return
-    case 'user.message': {
-      const text = typeof payload.text === 'string' ? payload.text : ''
-      if (text && !state.messages.some((m) => m.role === 'user' && m.text === text)) {
-        state.messages.push({ id: String(event.seq), role: 'user', text, open: false, at: Date.now() })
-        render()
+    case 'message.completed': {
+      const message = historyToMessage(transcriptEvent)
+      if (message) {
+        const current = state.messages.find(entry => transcriptMessageKey(entry) === transcriptMessageKey(message))
+        message.completed = true
+        if (current) Object.assign(current, message, { at: current.at, snapshotText: undefined, streamText: undefined })
+        else state.messages = mergeTranscriptSnapshot([message], state.messages)
       }
+      closeOpenMessages()
+      if (state.view === 'session') render()
+      return
+    }
+    case 'turn.started':
+    case 'turn.completed': {
+      receivedLiveRunning = true
+      const running = state.running = kind === 'turn.started'
+      if (!running) closeOpenMessages()
+      void showLive(running ? '运行中' : '已结束', running ? 'run-start' : 'run-finish', target.sessionId ?? 'run', !running)
+      if (state.view === 'session') render()
+      return
+    }
+    case 'tool.started':
+    case 'tool.completed':
+    case 'user.message': {
+      const message = historyToMessage(transcriptEvent)
+      if (!message || !message.text) return
+      if (message.role === 'tool') {
+        const current = state.messages.find(entry => transcriptMessageKey(entry) === transcriptMessageKey(message))
+        if (current) {
+          if (message.completed || !current.completed) current.text = message.text
+          if (message.completed) current.completed = true
+          if (message.toolTitle !== '工具结果') current.toolTitle = message.toolTitle
+        } else state.messages = mergeTranscriptSnapshot([message], state.messages, { liveEvent: true })
+      } else state.messages = mergeTranscriptSnapshot([message], state.messages, { liveEvent: true })
+      if (state.view === 'session') render()
       return
     }
     default: return
   }
 }
 
-function appendDelta(id: string, role: Role, text: string): void {
+function appendDelta(id: string, role: Role, text: string, at: number): void {
   const existing = state.messages.find((m) => m.id === id && m.role === role)
   if (existing) {
-    existing.text += text
-    existing.open = true
+    if (existing.completed) return
+    Object.assign(existing, appendTranscriptDelta(existing, text))
   } else {
-    state.messages.push({ id, role, text, open: true, at: Date.now() })
+    state.messages = mergeTranscriptSnapshot([{ id, role, text, open: true, at, streamText: text }], state.messages)
   }
-  const body = document.querySelector('[data-msg="' + cssEscape(id) + '"] .msg-body')
-  if (body && existing) {
+  if (state.view !== 'session') return
+  const transcript = rootNode().querySelector<HTMLElement>('.transcript')
+  const key = transcriptMessageKey({ id, role })
+  const node = existing && transcript && [...transcript.querySelectorAll<HTMLElement>('[data-msg]')]
+    .find(entry => entry.dataset.msg === key)
+  const body = node && node.querySelector('.msg-body')
+  if (body && existing && transcript && node?.classList.contains('streaming')) {
+    const follow = transcript.scrollHeight - transcript.clientHeight - transcript.scrollTop <= 24
     body.textContent = existing.text
-    return
-  }
-  if (state.view === 'session') render()
-}
-
-function cssEscape(value: string): string {
-  return typeof CSS !== 'undefined' && typeof CSS.escape === 'function' ? CSS.escape(value) : value.replace(/"/g, '')
+    if (follow) transcript.scrollTop = transcript.scrollHeight
+  } else render()
 }
 
 function closeOpenMessages(): void {
-  for (const message of state.messages) message.open = false
+  const now = Date.now()
+  for (const message of state.messages) {
+    if (message.open) message.endedAt = now
+    message.open = false
+  }
 }
 
 async function reloadTranscript(): Promise<void> {
@@ -790,38 +925,88 @@ async function reloadTranscript(): Promise<void> {
   const session = state.session
   if (!api || !session) return
   const request = ++historyRequest
+  const generation = sessionGeneration
+  olderRequest = null
   historyStatus = 'loading'
   state.statusText = ''
   if (state.view === 'session') render()
-  const target = targetOf(session)
-  const result = await api.history(target, 40)
-  if (request !== historyRequest || state.api !== api || !state.session || !sameTarget(target, state.session)) return
+  const result = await api.history(targetOf(session), 40)
+  if (request !== historyRequest || generation !== sessionGeneration || state.api !== api) return
   if (result.ok) {
     historyItemCount = result.data.items.length
-    state.messages = result.data.items.map(historyToMessage).filter((m): m is Message => m !== null)
+    state.messages = mergeTranscriptSnapshot(historyMessages(result.data.items), state.messages)
     state.historyCursor = result.data.nextCursor ?? null
+    visitedHistoryCursors.clear()
+    historyPageNotice = ''
+    reachedHistoryStart = result.data.completeness === 'complete' && !state.historyCursor && state.messages.length > 0
   }
-  const unconfirmedEmpty = result.ok && isUnconfirmedEmpty(result.data.completeness, historyItemCount, Boolean(state.historyCursor))
+  const unconfirmedEmpty = result.ok && state.messages.length === 0
+    && isUnconfirmedEmpty(result.data.completeness, historyItemCount, Boolean(state.historyCursor))
   historyStatus = result.ok && !unconfirmedEmpty ? 'ready' : 'error'
   historyError = !result.ok ? result.message : unconfirmedEmpty ? '暂时无法确认会话历史。' : ''
   if (state.view === 'session') render()
 }
 
+function bindHistoryScroll(transcript: HTMLElement): void {
+  historyScrollPositions.set(transcript, transcript.scrollTop)
+  let touchY: number | undefined
+  const check = (gesture: { prevScrollTop?: number; deltaY?: number; touchPullDy?: number }) => {
+    if (!transcript.isConnected || !shouldTriggerOlderHistory({ ...gesture, scrollTop: transcript.scrollTop,
+      loading: olderRequest !== null || historyStatus === 'loading', hasCursor: Boolean(state.historyCursor) })) return
+    touchY = undefined
+    void loadOlder()
+  }
+  transcript.addEventListener('scroll', () => {
+    const prevScrollTop = historyScrollPositions.get(transcript)
+    historyScrollPositions.set(transcript, transcript.scrollTop)
+    check({ prevScrollTop })
+  }, { passive: true })
+  transcript.addEventListener('wheel', event => check({ deltaY: event.deltaY * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? transcript.clientHeight : 1) }), { passive: true })
+  transcript.addEventListener('touchstart', event => { touchY = event.touches[0]?.clientY }, { passive: true })
+  transcript.addEventListener('touchmove', event => {
+    if (touchY !== undefined && event.touches.length === 1) check({ touchPullDy: event.touches[0]!.clientY - touchY })
+  }, { passive: true })
+}
+
 async function loadOlder(): Promise<void> {
   const api = state.api
-  if (!api || !state.session || !state.historyCursor) return
-  const result = await api.history(targetOf(state.session), 40, state.historyCursor)
-  if (!result.ok) { toast(result.message, 'error'); return }
-  const older = result.data.items.map(historyToMessage).filter((m): m is Message => m !== null)
-  state.messages = [...older, ...state.messages]
-  state.historyCursor = result.data.nextCursor ?? null
-  render()
+  const session = state.session
+  const cursor = state.historyCursor
+  if (!api || !session || !cursor || olderRequest || historyStatus === 'loading' || state.view !== 'session') return
+  const request = olderRequest = {}
+  const generation = sessionGeneration
+  const current = () => olderRequest === request && generation === sessionGeneration && state.api === api
+  const indicator = rootNode().querySelector('.history-indicator')
+  if (indicator) indicator.textContent = '正在同步更早对话…'
+  let inserted = false
+  try {
+    const result = await api.history(targetOf(session), 40, cursor)
+    if (!current()) return
+    if (!result.ok) {
+      if (state.view === 'session') toast(result.message, 'error')
+      return
+    }
+    const older = historyMessages(result.data.items)
+    state.messages = mergeTranscriptSnapshot(older, state.messages, { prepend: true })
+    const progress = historyPageProgress(cursor, result.data.nextCursor, result.data.completeness, visitedHistoryCursors)
+    visitedHistoryCursors.add(cursor)
+    state.historyCursor = progress.cursor
+    reachedHistoryStart = progress.reachedStart
+    historyPageNotice = progress.notice
+    inserted = true
+  } finally {
+    if (current()) {
+      olderRequest = null
+      if (state.view === 'session') render(inserted)
+    }
+  }
 }
 
 async function sendPrompt(reuseKey?: string): Promise<void> {
   const api = state.api
   const session = state.session
   if (!api || !session || state.busy) return
+  const generation = sessionGeneration
   const text = draft.trim()
   if (!text) return
   if (state.attachments.some((entry) => entry.status === 'uploading')) {
@@ -837,7 +1022,7 @@ async function sendPrompt(reuseKey?: string): Promise<void> {
   }
   const args = buildPromptArgs(text, options, attachmentIds)
   const pending: Message = {
-    id: 'local-' + Date.now(), role: 'user', text, open: false, at: Date.now(),
+    id: 'local-' + newIdempotencyKey(), role: 'user', text, open: false, at: Date.now(),
     retryKey: reuseKey || newIdempotencyKey(),
   }
   draft = ''
@@ -845,16 +1030,18 @@ async function sendPrompt(reuseKey?: string): Promise<void> {
   state.messages.push(pending)
   render()
   const result = await api.command('prompt', targetOf(session), args, pending.retryKey)
+  if (generation !== sessionGeneration || state.api !== api) return
   state.busy = false
-  if (!result.ok) {
-    pending.failed = true
+  const entry = state.messages.find(message => message.id === pending.id)
+  // A remote echo (live or snapshot) confirms the send even if its RPC failed.
+  if (!result.ok && entry) {
+    entry.failed = true
     if (!draft) draft = text
     toast(result.message, 'error')
     render()
     return
   }
-  pending.failed = false
-  pending.retryKey = undefined
+  if (entry) { entry.failed = false; entry.retryKey = undefined }
   state.attachments = []
   state.uploading = false
   render()
@@ -876,6 +1063,8 @@ async function handleFiles(files: FileList | File[] | null): Promise<void> {
   const api = state.api
   const session = state.session
   if (!api || !session || !files || files.length === 0) return
+  const generation = sessionGeneration
+  const current = () => generation === sessionGeneration && state.api === api
   const room = 8 - state.attachments.length
   if (room <= 0) {
     toast('最多 8 个附件', 'error')
@@ -893,7 +1082,9 @@ async function handleFiles(files: FileList | File[] | null): Promise<void> {
     render()
     try {
       const bytes = new Uint8Array(await file.arrayBuffer())
+      if (!current()) return
       const result = await api.upload(targetOf(session), { name: file.name, mime, bytes })
+      if (!current()) return
       if (result.ok) {
         updateAttachment(key, { status: 'ready', attachmentId: result.data.attachmentId })
       } else {
@@ -901,6 +1092,7 @@ async function handleFiles(files: FileList | File[] | null): Promise<void> {
         toast(result.message, 'error')
       }
     } catch (error) {
+      if (!current()) return
       updateAttachment(key, { status: 'error', error: error instanceof Error ? error.message : '上传失败' })
       toast('附件上传失败', 'error')
     }
@@ -921,15 +1113,16 @@ function shortModelLabel(label: string): string {
 }
 
 function effortLabel(effort: string): string {
-  const labels: Record<string, string> = { off: '关闭', low: '低', medium: '中', high: '高', max: '最高' }
-  return labels[effort] ?? effort
+  return Object.hasOwn(EFFORT_META, effort) ? EFFORT_META[effort]!.label : effort
 }
 
 async function refreshControls(notify = false): Promise<void> {
   const api = state.api
   const session = state.session
   if (!api || !session) return
+  const generation = sessionGeneration
   const result = await api.controls(targetOf(session))
+  if (generation !== sessionGeneration || state.api !== api) return
   if (result.ok) {
     state.controls = result.data
     if (state.modelChoice && !result.data?.models.some((model) => model.id === state.modelChoice)) {
@@ -1475,21 +1668,63 @@ function sessionsView(): Child[] {
   ]
 }
 
+function chatIconButton(icon: string, label: string, action: () => void, props: Parameters<typeof button>[2] = {}): HTMLButtonElement {
+  const node = button('', action, { type: 'button', 'aria-label': label, ...props })
+  node.append(tabIcon(icon))
+  return node
+}
+
+async function copyReply(text: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(text)
+    toast('已复制回复')
+  } catch {
+    toast('无法访问剪贴板，可长按回复手动复制', 'error')
+  }
+}
+
 function messageNode(message: Message): HTMLElement {
-  const cls = 'msg msg-' + message.role + (message.failed ? ' failed' : '')
-  return el('div', { class: cls + (message.open ? ' streaming' : ''), 'data-msg': message.id },
-    el('div', { class: 'msg-role', text: ({
-      user: '我', assistant: '智能体', reason: '思考', tool: '工具', system: '系统',
-    } as const)[message.role] }),
-    el('div', { class: 'msg-body', text: message.text }),
-    message.failed
-      ?         button('重试', () => {
-          const key = message.retryKey
-          draft = message.text
-          state.messages = state.messages.filter((entry) => entry.id !== message.id)
-          void sendPrompt(key)
-        }, { class: 'danger' })
-      : null,
+  const key = transcriptMessageKey(message)
+  const cls = 'msg msg-' + message.role + (message.failed ? ' failed' : '') + (message.open ? ' streaming' : '')
+  const body = el('div', { class: 'msg-body', text: message.text })
+  if (message.role === 'reason' || message.role === 'tool') {
+    const isReason = message.role === 'reason'
+    const label = el('span')
+    const toggle = button('', () => {
+      const transcript = toggle.closest<HTMLElement>('.transcript')
+      const top = transcript?.scrollTop ?? 0
+      if (expandedMessages.has(key)) expandedMessages.delete(key)
+      else expandedMessages.add(key)
+      update()
+      if (transcript) {
+        transcript.scrollTop = top
+        // A shorter panel may clamp scrollTop; that isn't an upward gesture.
+        historyScrollPositions.set(transcript, transcript.scrollTop)
+      }
+    }, { type: 'button', class: 'msg-disclosure' })
+    toggle.append(tabIcon(isReason ? 'thought' : 'terminal'), label)
+    function update(): void {
+      const expanded = expandedMessages.has(key)
+      toggle.setAttribute('aria-expanded', String(expanded))
+      body.hidden = !expanded
+      if (isReason) {
+        const summary = formatThoughtSummary(message)
+        label.textContent = expanded ? summary.replace(/ ›$/, '') + ' ▾' : summary
+      } else label.textContent = `${message.toolTitle ?? '工具调用'} ${expanded ? '▴' : '▾'}`
+    }
+    update()
+    return el('div', { class: cls, 'data-msg': key }, toggle, body)
+  }
+  const role = message.role === 'assistant' ? agentLabel(state.session?.agent ?? '') : message.role === 'user' ? '我' : '系统'
+  return el('div', { class: cls, 'data-msg': key },
+    el('div', { class: 'msg-role', text: role }), body,
+    message.role === 'assistant' && !message.open ? chatIconButton('copy', '复制回复', () => { void copyReply(message.text) }, { class: 'msg-copy' }) : null,
+    message.failed ? button('重试', () => {
+      if (state.busy || state.uploading) return
+      draft = message.text
+      state.messages = state.messages.filter(entry => entry !== message)
+      void sendPrompt(message.retryKey)
+    }, { class: 'danger' }) : null,
   )
 }
 
@@ -1580,43 +1815,63 @@ function statRow(label: string, value: number | undefined): HTMLElement | null {
   )
 }
 
+function openComposerSheet(title: string, trigger: string, options: (close: () => void) => Child[]): void {
+  if (composerSheet) return
+  const dialog = el('dialog', { class: 'ticket-sheet composer-sheet', 'aria-labelledby': 'composer-sheet-title' })
+  const close = () => {
+    composerSheet = null
+    dialog.close()
+    dialog.remove()
+    rootNode().querySelector<HTMLElement>(`.${trigger}`)?.focus({ preventScroll: true })
+  }
+  composerSheet = { session: sessionGeneration, close }
+  dialog.addEventListener('cancel', event => { event.preventDefault(); close() })
+  dialog.addEventListener('click', event => { if (event.target === dialog) close() })
+  dialog.append(el('div', {},
+    el('div', { class: 'ticket-sheet-header row-between' },
+      el('h2', { id: 'composer-sheet-title', text: title }), button('关闭', close, { class: 'ghost' })),
+    el('div', { class: 'ticket-sheet-body composer-options' }, ...options(close)),
+  ))
+  document.body.append(dialog)
+  dialog.showModal()
+}
+
+function composerOption(label: string, description: string, badge: string, action: () => void): HTMLButtonElement {
+  return el('button', { type: 'button', class: 'composer-option', 'aria-pressed': badge ? true : undefined, onClick: action },
+    el('span', { class: 'composer-option-copy' }, el('strong', { text: label }),
+      description ? el('span', { text: description }) : null),
+    badge ? el('span', { class: 'composer-current', text: badge }) : null,
+  )
+}
+
 function sessionView(): Child[] {
   const session = state.session
   if (!session) { state.view = 'sessions'; return sessionsView() }
+  const generation = sessionGeneration
   const cards = pendingInputs.cards(session)
   const header = topbar(sessionTitle(session), agentLabel(session.agent) + ' · ' + (state.running ? '运行中' : '空闲'), [
-    button('控制', () => { openControls() }, { class: 'icon-button' }),
-    can(state.capability, 'interrupt')
-      ? button('中断', () => { void interrupt() }, { class: 'icon-button danger' })
-      : null,
+    button('控制', openControls, { class: 'icon-button' }),
   ], backButton('sessions'))
-
   const controls = state.controls
-  const modelSelect = el('select', { class: 'mini-select', 'aria-label': '本次发送模型' }) as HTMLSelectElement
-  modelSelect.append(optionNode('', '沿用会话模型'))
-  for (const model of controls?.models ?? []) modelSelect.append(optionNode(model.id, shortModelLabel(model.label)))
-  modelSelect.value = state.modelChoice
-  modelSelect.addEventListener('change', () => {
-    state.modelChoice = modelSelect.value
-    const allowed = effectiveEfforts(state.controls, state.modelChoice)
-    if (state.effortChoice && !allowed.includes(state.effortChoice)) state.effortChoice = ''
-    render()
-  })
-
+  const currentModel = state.modelChoice || controls?.current.model || ''
+  const modelLabel = shortModelLabel(controls?.models.find(model => model.id === currentModel)?.label || currentModel || '会话模型')
   const efforts = effectiveEfforts(controls, state.modelChoice)
-  const effortSelect = el('select', { class: 'mini-select', 'aria-label': '本次发送思考强度' }) as HTMLSelectElement
-  effortSelect.append(optionNode('', '默认思考'))
-  for (const effort of efforts) effortSelect.append(optionNode(effort, effortLabel(effort)))
-  effortSelect.value = state.effortChoice
-  effortSelect.disabled = efforts.length === 0
-  effortSelect.addEventListener('change', () => { state.effortChoice = effortSelect.value })
+  const currentEffort = state.effortChoice || (state.modelChoice && state.modelChoice !== controls?.current.model ? '' : controls?.current.reasoning ?? '')
+  const effortActive = Boolean(currentEffort && currentEffort !== 'off' && efforts.includes(currentEffort))
+  const stop = state.running && can(state.capability, 'interrupt')
 
-  const fileInput = el('input', { type: 'file', multiple: true, hidden: true, accept: '*/*' }) as HTMLInputElement
-  fileInput.addEventListener('change', () => {
-    // 先拷成普通数组再清空 input；FileList 是活引用，清空 value 会把它一起清掉。
-    const files = fileInput.files ? Array.from(fileInput.files) : []
-    fileInput.value = ''
-    void handleFiles(files)
+  const filePickers = [
+    { label: '相册图片', description: '', accept: 'image/*', multiple: true },
+    { label: '拍照识别', description: '拍摄并作为图片发送', accept: 'image/*', capture: 'environment' },
+    { label: '本地文件', description: '分片上传，每个文件最多 10 MB', accept: '*/*', multiple: true },
+  ].map(({ label, description, ...attributes }, index) => {
+    const input = el('input', { type: 'file', hidden: true, 'data-attachment-picker': index, ...attributes })
+    input.addEventListener('change', () => {
+      const files = Array.from(input.files ?? [])
+      input.value = ''
+      if (generation === sessionGeneration && state.view === 'session') void handleFiles(files)
+    })
+    return { label, description, input }
   })
 
   const attachmentChips = state.attachments.length > 0
@@ -1632,48 +1887,77 @@ function sessionView(): Child[] {
       )]
     : []
 
-  const tools = el('div', { class: 'composer-tools' },
-    modelSelect,
-    effortSelect,
-    button(state.uploading ? '上传中…' : '附件', () => { fileInput.click() }, {
-      class: 'icon-button', disabled: state.uploading || state.attachments.length >= 8,
-    }),
-    fileInput,
-    controls === null ? button('读取模型', () => { void refreshControls(true) }, { class: 'icon-button' }) : null,
-  )
+  const plus = chatIconButton('plus', '添加附件', () => openComposerSheet('添加附件', 'composer-add', close =>
+    filePickers.map(({ label, description }, index) => composerOption(label, description, '', () => {
+      close()
+      rootNode().querySelector<HTMLInputElement>(`[data-attachment-picker="${index}"]`)?.click()
+    }))), { class: 'composer-add', 'aria-haspopup': 'dialog', disabled: state.uploading || state.attachments.length >= 8 || state.busy })
+  const model = button('', () => openComposerSheet('本次发送模型', 'composer-model', close => {
+    const models = controls?.models ?? []
+    if (models.length === 0) return [button('读取模型', () => { close(); void refreshControls(true) }, { class: 'ghost' })]
+    return [
+      ...models.map(entry => composerOption(shortModelLabel(entry.label), '', entry.id === currentModel ? '当前' : '', () => {
+        state.modelChoice = entry.id
+        if (!entry.efforts.includes(state.effortChoice)) state.effortChoice = ''
+        close()
+        render()
+        rootNode().querySelector<HTMLElement>('.composer-model')?.focus({ preventScroll: true })
+      })),
+      state.modelChoice ? button('沿用会话模型', () => {
+        state.modelChoice = ''
+        state.effortChoice = ''
+        close()
+        render()
+        rootNode().querySelector<HTMLElement>('.composer-model')?.focus({ preventScroll: true })
+      }, { class: 'ghost' }) : null,
+    ]
+  }), { class: 'composer-model', 'aria-haspopup': 'dialog', 'aria-label': `选择模型：${modelLabel}` })
+  model.append(el('span', { text: modelLabel }), tabIcon('down'))
+  const effort = button('', () => openComposerSheet('深度思考强度', 'composer-effort', close =>
+    buildEffortSheetOptions(efforts, currentEffort).map(option => composerOption(option.label, option.description, option.badge, () => {
+      state.effortChoice = option.id
+      close()
+      render()
+      rootNode().querySelector<HTMLElement>('.composer-effort')?.focus({ preventScroll: true })
+    }))), { class: 'composer-effort' + (effortActive ? ' active' : ''), 'aria-haspopup': 'dialog', disabled: efforts.length === 0 })
+  effort.append(tabIcon('thought'), el('span', { text: effortActive ? `思考 · ${effortLabel(currentEffort)}` : '深度思考' }))
 
   const input = el('input', {
-    type: 'text', placeholder: '发消息给 ' + agentLabel(session.agent) + '…', value: draft,
+    type: 'text', placeholder: '发消息给 ' + agentLabel(session.agent) + '…', value: draft, 'aria-label': '消息',
     onInput: (event: Event) => { draft = (event.target as HTMLInputElement).value },
-  }) as HTMLInputElement
-  input.addEventListener('keydown', (event) => {
-    if ((event as KeyboardEvent).key === 'Enter') { void sendPrompt(); render() }
   })
-
-  const send = button(state.busy ? '发送中…' : '发送', () => { void sendPrompt() }, {
-    class: 'primary', disabled: state.busy || state.uploading,
+  input.addEventListener('keydown', event => {
+    if (event.key === 'Enter' && !event.isComposing && event.keyCode !== 229 && !stop && !state.uploading) {
+      event.preventDefault()
+      void sendPrompt()
+    }
   })
+  const send = chatIconButton(stop ? 'stop' : 'send', stop ? '停止生成' : '发送消息', () => {
+    if (stop) void interrupt()
+    else void sendPrompt()
+  }, { class: 'primary composer-action' + (stop ? ' stopping' : ''), disabled: !stop && (state.busy || state.uploading) })
 
   return [
     header,
     ...sessionStatChips(),
-    cards.length > 0 ? el('div', {}, ...cards.map(cardNode)) : null,
-    el('div', { class: 'transcript' },
-      state.historyCursor ? button('加载更早消息', () => { void loadOlder() }, { class: 'block ghost' }) : null,
+    cards.length > 0 ? el('div', { class: 'session-pending' }, ...cards.map(cardNode)) : null,
+    el('div', { class: 'transcript', tabindex: 0, 'aria-label': '对话记录' },
+      el('p', { role: 'status', class: 'history-indicator', text: olderRequest ? '正在同步更早对话…' : historyPageNotice || (reachedHistoryStart ? '已加载全部历史' : '') }),
       ...state.messages.map(messageNode),
       historyStatus === 'loading' ? el('p', { role: 'status', class: 'notice', text: '正在读取历史…' }) : null,
       historyStatus === 'error' ? el('div', { class: 'card' },
         el('p', { role: 'status', class: 'banner error', text: historyError }),
         button('重试读取历史', () => { void reloadTranscript() }, { class: 'block' })) : null,
-      ...(isWelcomeEmpty(historyStatus, historyItemCount, state.messages.length, Boolean(state.historyCursor)) ? [el('div', { class: 'chat-welcome card' },
+      ...(!historyPageNotice && isWelcomeEmpty(historyStatus, historyItemCount, state.messages.length, Boolean(state.historyCursor)) ? [el('div', { class: 'chat-welcome card' },
         el('h2', { text: '开始对话' }), ...WELCOME_STARTERS.map(starter => button(starter, () => {
           draft = fillWelcomeStarter(input, starter)
         })))] : []),
     ),
-    el('div', { class: 'composer-wrap' },
+    el('div', { class: 'session-composer' },
       ...attachmentChips,
-      tools,
-      el('div', { class: 'composer' }, input, send),
+      input,
+      el('div', { class: 'composer-toolbar' }, plus, model, effort, send),
+      ...filePickers.map(picker => picker.input),
     ),
   ]
 }
@@ -1698,7 +1982,7 @@ function controlsView(): Child[] {
       el('h2', { text: '本次发送' }),
       el('p', { class: 'empty', text: '模型：' + (state.modelChoice || current.model || '沿用会话默认') }),
       el('p', { class: 'empty', text: '思考强度：' + (state.effortChoice || current.reasoning || '默认') }),
-      el('p', { class: 'notice', text: '模型与思考强度按「本次发送」生效；回会话页用下拉选择。' }),
+      el('p', { class: 'notice', text: '模型与思考强度按「本次发送」生效；回会话页选择。' }),
     ),
     el('div', { class: 'card' },
       el('h2', { text: '模型目录（' + (controls?.models.length ?? 0) + '）' }),
