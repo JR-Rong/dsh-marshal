@@ -1,5 +1,7 @@
     return {
       inject: ['slots'],
+      // Reusable UI exposed as components on the dsh-marshal/client module.
+      components: Object.freeze({ ...mvCascadePicker, ...mvDagSidebar }),
       apply(ctx) {
         const disposers = [];
         const track = (handle, list = disposers) => {
