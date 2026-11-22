@@ -1034,7 +1034,7 @@ select.mini-select:disabled { opacity: .45; }
 .ticket-sheet-body [role="status"]:empty { display: none; }
 .ticket-sheet-actions { padding-top: var(--space-2); border-top: 1px solid var(--separator); }
 .ticket-sheet-actions .choices { margin: 0; }
-.ticket-sheet button, .ticket-sheet-actions .choices button, .screen-ticketGroup .icon-button { min-height: var(--tap-min); }
+.ticket-sheet button, .ticket-sheet-actions .choices button, .screen-ticketGroup .icon-button { min-height: var(--tap-min); min-width: var(--tap-min); }
 .ticket-stages { padding: 0; margin: 0; list-style: none; }
 .ticket-stages li { border-top: var(--space-1) solid var(--separator); padding-top: var(--space-2); color: var(--secondary); }
 .ticket-stages li.reached { border-color: var(--accent); }
@@ -1067,3 +1067,32 @@ select.mini-select:disabled { opacity: .45; }
 @media (prefers-reduced-transparency: reduce) {
   .ticket-sheet::backdrop { -webkit-backdrop-filter: none; backdrop-filter: none; }
 }
+
+/* 会话中心：沿用工单 Sheet 的安全区与原生模态行为。 */
+.chat-segments {
+  display: flex;
+  gap: var(--space-1);
+  padding: var(--space-1);
+  border-radius: var(--radius-control);
+  background: var(--fill);
+}
+.chat-segments button {
+  flex: 1 1 0;
+  min-width: var(--tap-min);
+  min-height: var(--tap-min);
+  padding: var(--space-1);
+  border-radius: var(--radius-control);
+  font-size: var(--font-caption);
+  color: var(--secondary);
+  background: transparent;
+}
+.chat-segments [aria-pressed="true"] {
+  color: var(--text);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  font-weight: 600;
+}
+.chat-welcome { display: grid; gap: var(--space-2); }
+.chat-add { min-width: var(--tap-min); }
+.chat-welcome button { min-height: var(--tap-min); min-width: var(--tap-min); text-align: start; }
+.chat-sheet input { min-height: var(--tap-min); }

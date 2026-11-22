@@ -16,6 +16,7 @@ type Tab = 'agents' | 'sessions' | 'board' | 'groups' | 'memory'
 
 interface WorkbenchOptions {
   onClose: () => void
+  requestUnpair: () => Promise<boolean>
   onOpenHubGroups: () => void
   onHubPairLink?: (raw: string) => void
   onUnifiedPairLink?: (raw: string) => void
@@ -60,9 +61,8 @@ function injectStyle(): void {
     '.bw-head button{border:1px solid #30363d;border-radius:9px;background:#1a1f24;color:#dfe5ea;padding:6px 10px;font:inherit;font-size:12px}',
     '.bw-main{flex:1;overflow:auto;padding:12px 14px 84px}',
     '.bw-nav{position:absolute;left:0;right:0;bottom:0;display:flex;border-top:1px solid #262b31;background:#12161a;padding:6px 4px calc(6px + env(safe-area-inset-bottom))}',
-    '.bw-nav button{flex:1;border:0;background:transparent;color:#8a95a1;font:inherit;font-size:11px;padding:6px 2px;display:flex;flex-direction:column;align-items:center;gap:3px}',
+    '.bw-nav button{flex:1;min-height:var(--tap-min);border:0;background:transparent;color:#8a95a1;font:inherit;font-size:11px;padding:6px 2px}',
     '.bw-nav button.active{color:var(--accent)}',
-    '.bw-nav button b{font-size:17px;font-weight:400}',
     '.bw-card{background:#171c21;border:1px solid #262e36;border-radius:13px;padding:13px;margin-bottom:10px}',
     '.bw-card h3{margin:0 0 3px;font-size:14px}',
     '.bw-card p{margin:0;color:#8a95a1;font-size:12px}',
@@ -102,10 +102,8 @@ function injectStyle(): void {
     '.bw-tabs button.active{background:var(--accent-soft);border-color:var(--accent-border);color:var(--accent)}',
     '.bw-back{display:inline-flex;align-items:center;gap:4px;color:var(--accent);font-size:12px;margin-bottom:8px;background:none;border:0;padding:0}',
     '.bw-agent-head{display:flex;gap:10px;align-items:flex-start;margin-bottom:10px}',
-    '.bw-agent-head .bw-avatar{width:38px;height:38px;border-radius:12px;background:var(--accent-soft);color:var(--accent);display:flex;align-items:center;justify-content:center;font-size:18px;flex:none}',
     '.bw-agent-head h3{margin:0;font-size:16px}',
     '.bw-pair-hero{text-align:center}',
-    '.bw-pair-icon{width:64px;height:64px;border-radius:20px;background:var(--accent-soft);color:var(--accent);display:flex;align-items:center;justify-content:center;font-size:30px;margin:4px auto 12px}',
     '.bw-pair-hero h3{font-size:18px;margin-bottom:4px}',
     '.bw-pair-hero p{color:var(--muted,#8a95a1);font-size:12px;margin:0 0 14px}',
     '.bw-pair-hero .bw-btn.primary{min-height:50px;font-size:15px}',
@@ -303,7 +301,9 @@ class Workbench {
     const subtitle = this.#status || (this.#device ? '远程桥 · ' + bridgeHost(this.#device.url) : '智能体 / 会话 / 任务看板')
     const actions: HTMLElement[] = []
     if (this.#client) actions.push(h('button', { text: '刷新', onclick: () => { void this.connect() } }))
-    if (this.#device) actions.push(h('button', { text: '解除', onclick: () => { if (confirm('解除这台手机的 DSH 配对？')) this.unpair() } }))
+    if (this.#device) actions.push(h('button', { text: '解除', onclick: async () => {
+      if (await this.#options.requestUnpair() && this.#root.isConnected) await this.unpair()
+    } }))
     actions.push(h('button', { text: '关闭', onclick: () => this.close() }))
     return h('div', { class: 'bw-head' },
       h('div', { class: 'bw-title' }, h('strong', { text: title }), h('span', { text: subtitle })),
@@ -313,17 +313,17 @@ class Workbench {
 
   nav(): HTMLElement {
     if (!this.#device) return h('div')
-    const items: { id: Tab; icon: string; label: string }[] = [
-      { id: 'agents', icon: '🤖', label: '智能体' },
-      { id: 'sessions', icon: '💬', label: '会话' },
-      { id: 'board', icon: '🗂', label: '任务' },
-      { id: 'groups', icon: '👥', label: '群聊' },
-      { id: 'memory', icon: '🧠', label: '记忆' },
+    const items: { id: Tab; label: string }[] = [
+      { id: 'agents', label: '智能体' },
+      { id: 'sessions', label: '会话' },
+      { id: 'board', label: '任务' },
+      { id: 'groups', label: '群聊' },
+      { id: 'memory', label: '记忆' },
     ]
     return h('div', { class: 'bw-nav' }, ...items.map((item) => h('button', {
       class: item.id === this.#tab ? 'active' : '',
       onclick: () => { this.#tab = item.id; this.#agentId = null; this.#sessionId = null; this.render() },
-    }, h('b', { text: item.icon }), h('span', { text: item.label }))))
+    }, h('span', { text: item.label }))))
   }
 
   render(): void {
@@ -372,7 +372,6 @@ class Workbench {
     return [
       h('div', { class: 'bw-pair' },
         h('div', { class: 'bw-card bw-pair-hero' },
-          h('div', { class: 'bw-pair-icon', text: '📷' }),
           h('h3', { text: '配对 DSH 工作台' }),
           h('p', { text: '扫电脑「跨设备」页的二维码' }),
           h('button', { class: 'bw-btn primary block', text: '扫码配对', onclick: () => this.scanPair() }),
@@ -455,7 +454,6 @@ class Workbench {
     const nodes: (Node | string)[] = [
       h('button', { class: 'bw-back', text: '‹ 智能体', onclick: () => { this.#agentId = null; this.render() } }),
       h('div', { class: 'bw-agent-head' },
-        h('div', { class: 'bw-avatar', text: '🤖' }),
         h('div', {}, h('h3', { text: prettyAgentName(squad.name), title: squad.name ?? '' }), h('p', { text: squad.description ?? '' })),
       ),
     ]

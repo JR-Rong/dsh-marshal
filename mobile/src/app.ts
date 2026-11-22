@@ -33,6 +33,11 @@ import { computeTabBadges, formatTabBadge, scheduleBoardPoll } from './lib/tab-b
 import { createPendingInputs, inputTarget, inputTargetKey } from './lib/pending-inputs.ts'
 import { APP_TITLE, APP_VERSION, CLIENT_ONLY_NOTE } from './lib/version.ts'
 
+import { filterSessionsByCategory, initialWizardState, moveWizardStep, selectWizardHost, validateWizardState,
+  sessionCenterRoute, groupBackCategory, roomRetryId, beginCreateAttempt, finishCreateAttempt, canCloseCreateSheet,
+  isWelcomeEmpty, isUnconfirmedEmpty, fillWelcomeStarter,
+  WELCOME_STARTERS, type HistoryStatus, type SessionCategory, type WizardStep } from './lib/chat-ui.ts'
+
 import { TICKET_TEMPLATES, filterTickets, ticketFilter, ticketStageIndex, parseDiffPreview, reduceTicketNavigation,
   TicketWrites, ticketBackAction, ticketWriteBlocked, ticketWriteKey,
   type Ticket, type TicketRef, type TicketFilter, type TicketNavigation, type TicketWriteState } from './lib/tickets.ts'
@@ -185,7 +190,7 @@ function tabBar(): HTMLElement {
   const badges = computeTabBadges(boardTasks, pendingInputs.waitingCounts(), state.online && !hubUnavailable)
   return el('nav', { class: 'tabbar', 'aria-label': '主导航' },
     ...TAB_ITEMS.map(({ view, label, icon }) => {
-      const active = view === state.view || (view === 'sessions' && state.view === 'ticketGroup')
+      const active = view === state.view || (view === 'sessions' && (state.view === 'groups' || state.view === 'ticketGroup'))
       const count = view === 'board' ? badges.board : view === 'sessions' ? badges.sessions : 0
       const offline = view === 'home' && badges.home
       return el('button', {
@@ -217,10 +222,7 @@ function switchTab(view: View): void {
   }
   if (view === 'home') { state.view = 'home'; render(); void refreshDevices(); return }
   if (view === 'sessions') {
-    state.view = 'sessions'
-    render()
-    const first = state.devices.find((entry) => !entry.stale)
-    if (!state.deviceId && first) void openDevice(first)
+    showSessionCategory(sessionCategory)
     return
   }
   if (view === 'board') { state.view = 'board'; render(); void loadBoard(); return }
@@ -233,11 +235,14 @@ function switchTab(view: View): void {
 }
 
 function render(): void {
+  if (chatSheet && state.view !== chatSheet.view) chatSheet.dismiss()
+  if (appConfirmation && (appLocked() || state.view !== appConfirmation.view)) appConfirmation.cancel()
   if (state.view !== 'groupRoom' && state.view !== 'ticketGroup') stopGroupPoll()
   if (!showingMemory()) clearTimeout(memoryPoll)
   const app = rootNode()
+  const restoreSegment = document.activeElement?.matches('.chat-segments [aria-pressed="true"]') && app.contains(document.activeElement)
   clear(app)
-  const withTabs = TAB_VIEWS.has(state.view) || state.view === 'ticketGroup'
+  const withTabs = TAB_VIEWS.has(state.view) || state.view === 'ticketGroup' || state.view === 'groups'
   app.className = 'app screen-' + state.view + (withTabs ? ' has-tabs' : '')
   for (const child of screenChildren()) {
     // 浏览器 append(null) 会渲染出 "null" 字样，必须先过滤空槽位。
@@ -245,6 +250,7 @@ function render(): void {
     app.append(child as Node)
   }
   if (withTabs) app.append(tabBar())
+  if (restoreSegment) app.querySelector<HTMLElement>('.chat-segments [aria-pressed="true"]')?.focus()
   if (state.view === 'board') { refreshTicketList(); updateTicketSheet() }
 }
 
@@ -352,8 +358,8 @@ function backChevron(): SVGElement {
 }
 
 /** iOS 导航栏返回：左侧圆形 chevron，语义标签「返回」。 */
-function backButton(to: View): HTMLButtonElement {
-  const node = button('', () => { state.view = to; render() }, { class: 'back-button', 'aria-label': '返回' })
+function backButton(to: View | (() => void)): HTMLButtonElement {
+  const node = button('', typeof to === 'function' ? to : () => { state.view = to; render() }, { class: 'back-button', 'aria-label': '返回' })
   node.append(backChevron())
   return node
 }
@@ -406,11 +412,14 @@ export async function start(): Promise<void> {
 async function registerBackButton(): Promise<void> {
   disposeBack?.()
   disposeBack = await watchBackButton(() => {
+    if (appConfirmation) { appConfirmation.cancel(); return true }
+    if (chatSheet) { chatSheet.close(); return true }
+    if (state.view === 'groupRoom' || state.view === 'groupNew') { returnToGroups(); return true }
     const ticketBack = ticketBackAction(Boolean(rootNode().querySelector('.ticket-sheet[open]')), state.view === 'ticketGroup')
     if (ticketBack === 'close-sheet') { closeTicketSheet(); return true }
     if (ticketBack === 'return-to-ticket') { returnToTicket(); return true }
     const parent: Partial<Record<View, View>> = {
-      settings: 'home', sessions: 'home', session: 'sessions', controls: 'session', groups: groupsParent, groupRoom: 'groups', groupNew: 'groups', memory: 'home',
+      settings: 'home', sessions: 'home', session: 'sessions', controls: 'session', groups: groupsParent, memory: 'home',
     }
     const to = parent[state.view]
     if (to) { state.view = to; render(); return true }
@@ -524,6 +533,7 @@ async function refreshDevices(): Promise<void> {
 async function openDevice(device: DeviceRow): Promise<void> {
   const api = state.api
   if (!api) return
+  sessionCategory = 'single'
   state.deviceId = device.id
   state.sessions = []
   state.view = 'sessions'
@@ -540,6 +550,11 @@ async function openDevice(device: DeviceRow): Promise<void> {
 
 /* ------------------------------ 会话 ------------------------------ */
 
+let historyStatus: HistoryStatus = 'loading'
+let historyItemCount = 0
+let historyError = ''
+let historyRequest = 0
+
 async function openSession(deviceId: string, row: SessionRow): Promise<void> {
   const api = state.api
   if (!api) return
@@ -548,11 +563,14 @@ async function openSession(deviceId: string, row: SessionRow): Promise<void> {
     void api.unsubscribe(targetOf(previous), subscriptionId)
     void api.unwatchSession(targetOf(previous))
   }
-  state.session = { ...row, deviceId }
+  const opened = state.session = { ...row, deviceId }
   state.capability = row.capability
   state.running = row.running
   state.messages = []
   state.historyCursor = null
+  historyStatus = 'loading'
+  historyItemCount = 0
+  historyRequest++
   state.controls = null
   state.modelChoice = ''
   state.effortChoice = ''
@@ -568,32 +586,26 @@ async function openSession(deviceId: string, row: SessionRow): Promise<void> {
   const target = targetOf(state.session)
   void api.watchSession(target)
   const subscribed = await api.subscribe(target)
-  if (state.api !== api || !state.session || !sameTarget(target, state.session)) {
+  if (state.api !== api || state.session !== opened) {
     if (subscribed.ok) void api.unsubscribe(target, subscribed.data)
     return
   }
   subscriptionId = subscribed.ok ? subscribed.data : null
 
-  const [history, , controls] = await Promise.all([
-    api.history(target, 40),
+  const [, , controls] = await Promise.all([
+    reloadTranscript(),
     loadPendingInputs(api, target),
     api.controls(target),
   ])
-  if (state.api !== api || !state.session || !sameTarget(target, state.session)) return
-  if (!history.ok) {
-    state.statusText = history.message
-  } else {
-    state.messages = history.data.items.map(historyToMessage).filter((m): m is Message => m !== null)
-    state.historyCursor = history.data.nextCursor ?? null
-    state.statusText = ''
-  }
+  if (state.api !== api || state.session !== opened) return
   if (controls.ok) {
     state.controls = controls.data
   }
   // 能力文档以 sessions 列表为准，读一次刷新。
   const sessions = await api.sessions(deviceId)
-  if (state.api !== api || !state.session || !sameTarget(target, state.session)) return
+  if (state.api !== api || state.session !== opened) return
   if (sessions.ok) {
+    if (state.deviceId === deviceId) state.sessions = sessions.data
     const fresh = sessions.data.find((item) => item.agent === row.agent && item.sessionId === row.sessionId)
     if (fresh) {
       state.session = { ...fresh, deviceId: row.deviceId }
@@ -618,8 +630,8 @@ export function historyToMessage(item: { kind: string; payload?: Record<string, 
     case 'message.delta':
     case 'message.completed': return text ? { id, role: 'assistant', text, open: false, at } : null
     case 'reasoning.delta': return text ? { id, role: 'reason', text, open: false, at } : null
-    case 'tool.started': return { id, role: 'tool', text: '▶ ' + String(payload.name ?? payload.tool ?? 'tool'), open: false, at }
-    case 'tool.completed': return { id, role: 'tool', text: (payload.isError === true ? '✗ ' : '✓ ') + String(payload.content ?? '').slice(0, 400), open: false, at }
+    case 'tool.started': return { id, role: 'tool', text: '开始：' + String(payload.name ?? payload.tool ?? 'tool'), open: false, at }
+    case 'tool.completed': return { id, role: 'tool', text: (payload.isError === true ? '失败：' : '完成：') + String(payload.content ?? '').slice(0, 400), open: false, at }
     case 'turn.completed': return { id, role: 'system', text: '回合完成（' + String(payload.state ?? 'completed') + '）', open: false, at }
     default: return null
   }
@@ -732,7 +744,7 @@ async function onFrame(frame: StreamFrame): Promise<void> {
     case 'turn.started': state.running = true; void showLive('运行中', 'run-start', typeof event.sessionId === 'string' ? event.sessionId : 'run'); render(); return
     case 'turn.completed': state.running = false; closeOpenMessages(); void showLive('已结束', 'run-finish', typeof event.sessionId === 'string' ? event.sessionId : 'run', true); render(); return
     case 'tool.started':
-      state.messages.push({ id: String(event.seq), role: 'tool', text: '▶ ' + String(payload.name ?? payload.tool ?? 'tool'), open: false, at: Date.now() })
+      state.messages.push({ id: String(event.seq), role: 'tool', text: '开始：' + String(payload.name ?? payload.tool ?? 'tool'), open: false, at: Date.now() })
       render(); return
     case 'tool.completed':
       state.messages.push({ id: String(event.seq), role: 'tool', text: String(payload.content ?? '').slice(0, 400), open: false, at: Date.now() })
@@ -777,12 +789,22 @@ async function reloadTranscript(): Promise<void> {
   const api = state.api
   const session = state.session
   if (!api || !session) return
-  const result = await api.history(targetOf(session), 40)
-  if (result.ok && state.api === api && state.session === session && state.view === 'session') {
+  const request = ++historyRequest
+  historyStatus = 'loading'
+  state.statusText = ''
+  if (state.view === 'session') render()
+  const target = targetOf(session)
+  const result = await api.history(target, 40)
+  if (request !== historyRequest || state.api !== api || !state.session || !sameTarget(target, state.session)) return
+  if (result.ok) {
+    historyItemCount = result.data.items.length
     state.messages = result.data.items.map(historyToMessage).filter((m): m is Message => m !== null)
     state.historyCursor = result.data.nextCursor ?? null
-    render()
   }
+  const unconfirmedEmpty = result.ok && isUnconfirmedEmpty(result.data.completeness, historyItemCount, Boolean(state.historyCursor))
+  historyStatus = result.ok && !unconfirmedEmpty ? 'ready' : 'error'
+  historyError = !result.ok ? result.message : unconfirmedEmpty ? '暂时无法确认会话历史。' : ''
+  if (state.view === 'session') render()
 }
 
 async function loadOlder(): Promise<void> {
@@ -1088,10 +1110,10 @@ async function saveSetup(hubInput: HTMLInputElement, tokenInput: HTMLInputElemen
 function openDshWorkbench(): void {
   openBridgeWorkbench({
     onClose: () => { /* 覆盖层自己移除；底层保持原界面 */ },
+    requestUnpair: () => confirmInApp('解除配对', '解除这台手机的 DSH 配对？', '解除'),
     onOpenHubGroups: () => {
       if (!state.account) { toast('请先配对 Hub 群聊账号', 'error'); return }
-      state.view = 'groups'
-      void loadRooms()
+      openGroups('home')
     },
     onHubPairLink: (raw) => { void handleDeepLink(raw) },
     onUnifiedPairLink: (raw) => { void handleDeepLink(raw) },
@@ -1240,33 +1262,178 @@ let memoryEntries: Array<{ id: string; deviceId: string; layer: string; agent: s
 let groupKey = ''
 let groupsParent: 'home' | 'sessions' = 'home'
 
+let sessionCategory: SessionCategory = 'single'
+let chatSheet: { view: View; close: () => void; dismiss: () => void } | null = null
+
 function openGroups(from: typeof groupsParent): void {
-  groupsParent = from
-  state.view = 'groups'
-  render()
-  void loadRooms()
+  showSessionCategory('group', from)
 }
 
+function returnToGroups(): void {
+  if (state.view !== 'groupRoom' && state.view !== 'groupNew') return
+  showSessionCategory(groupBackCategory(state.view, sessionCategory))
+}
 
-async function startDeviceSession(deviceId: string, agent: string): Promise<void> {
-  const api = state.api
-  if (!api) return
-  const device = state.devices.find(entry => entry.id === deviceId && !entry.stale && entry.agents.includes(agent))
-  if (!device) { toast('该设备上的会话入口当前不可用', 'error'); return }
-  const result = await api.command('create', { deviceId, agent, sessionId: null }, {})
-  if (state.api !== api) return
-  if (!result.ok) { toast(agentLabel(agent) + '：' + result.message, 'error'); return }
-  await openDevice(device)
+function setSessionCenterRoute(category: SessionCategory): void {
+  const route = sessionCenterRoute(category)
+  sessionCategory = route.category
+  state.view = route.view
+}
+
+function showSessionCategory(category: SessionCategory, from = groupsParent): void {
+  groupsParent = from
+  setSessionCenterRoute(category)
+  render()
+  if (category === 'single' && !state.deviceId) {
+    const first = state.devices.find(device => !device.stale) ?? state.devices[0]
+    if (first) void openDevice(first)
+  } else if (category === 'group') {
+    void loadRooms()
+    if (!boardLoaded) void loadBoard(true)
+  }
+  else if (category === 'ticketRoom') void loadBoard()
+}
+
+function chatSegments<T extends string>(label: string, choices: ReadonlyArray<readonly [T, string]>, selected: T,
+  select: (value: T) => void, disabled = false): HTMLElement {
+  return el('div', { class: 'chat-segments', role: 'group', 'aria-label': label }, ...choices.map(([value, text]) =>
+    button(text, () => select(value), { type: 'button', 'aria-pressed': value === selected, disabled })))
+}
+
+function chatCenterHeader(subtitle: string): Child[] {
+  const add = button('', openChatSheet, { class: 'primary ticket-add chat-add', 'aria-label': '新建会话', 'aria-haspopup': 'dialog' })
+  add.append(tabIcon('plus'))
+  return [topbar('会话中心', subtitle, [add], backButton(state.view === 'groups' ? groupsParent : 'home')),
+    chatSegments('会话类型', [['single', '单聊'], ['group', 'Agent 群聊'], ['ticketRoom', '工单群']], sessionCategory, category => {
+      if (category === sessionCategory) return
+      showSessionCategory(category)
+      rootNode().querySelector<HTMLElement>('.chat-segments [aria-pressed="true"]')?.focus()
+    })]
+}
+
+// Ambiguous receipts can be retried with the same key even after reopening the Sheet.
+const unconfirmedCreates = new WeakMap<MarshalApi, Map<string, string>>()
+
+function openChatSheet(): void {
+  let wizard = initialWizardState(sessionCategory === 'group' ? 'group' : 'single')
+  let attempt = { key: '', busy: false }
+  let notice = ''
+  const dialog = el('dialog', { class: 'ticket-sheet chat-sheet', 'aria-labelledby': 'chat-sheet-title' })
+  const dismiss = () => {
+    chatSheet = null
+    dialog.close()
+    dialog.remove()
+    rootNode().querySelector<HTMLElement>('.chat-add')?.focus()
+  }
+  const close = () => { if (canCloseCreateSheet(attempt)) dismiss() }
+  chatSheet = { view: state.view, close, dismiss }
+  dialog.addEventListener('cancel', event => { event.preventDefault(); close() })
+  dialog.addEventListener('click', event => { if (event.target === dialog) close() })
+
+  function draw(focus?: string): void {
+    const busy = attempt.busy
+    const modes = chatSegments('新建类型', [['single', '新建单聊会话'], ['group', '多智能体群聊']], wizard.mode, mode => {
+      if (mode === wizard.mode) return
+      wizard = initialWizardState(mode)
+      notice = ''
+      draw('.chat-segments [aria-pressed="true"]')
+    }, busy)
+    const body = el('div', { class: 'ticket-sheet-body' }, modes)
+    if (wizard.mode === 'group') {
+      const ready = !!phoneApi() && accountUsable()
+      body.append(button(ready ? '继续选择群成员' : '去设置登录或配对', () => {
+        close()
+        if (ready) {
+          groupsParent = 'home'
+          openGroupNew()
+        } else { state.view = 'settings'; render() }
+      }, { class: 'primary block' }))
+    } else {
+      const { step, deviceId, engineOrAgentId } = wizard
+      const hosts = state.devices.filter(device => !device.stale)
+      const host = hosts.find(device => device.id === deviceId)
+      const title = step === 'host' ? '1. 选择运行主机' : step === 'agent' ? '2. 选择可用引擎或智能体' : '3. 工作目录（可选）'
+      const field = el('div', { class: 'ticket-field' }, el('h3', { id: 'chat-wizard-step', tabindex: '-1', text: title }))
+      const stepTo = (next: WizardStep) => {
+        wizard = moveWizardStep(wizard, next)
+        notice = ''
+        draw('#chat-wizard-step')
+      }
+      if (step !== 'host') field.append(el('p', { class: 'notice', text: [host?.name,
+        step === 'cwd' ? agentLabel(engineOrAgentId) : ''].filter(Boolean).join(' · ') }))
+      if (step !== 'cwd') {
+        const choices = step === 'host' ? hosts.map(device => [device.id, device.name] as const)
+          : (host?.agents ?? []).map(agent => [agent, agentLabel(agent)] as const)
+        if (!choices.length) field.append(el('p', { class: 'empty', text: step === 'host' ? '暂无可用主机。' : '该主机暂无可用引擎或智能体。' }),
+          button('重新读取主机', () => { void refreshDevices().then(() => { if (dialog.open) draw('#chat-wizard-step') }) }))
+        for (const [id, label] of choices) field.append(button(label, () => {
+          if (wizard.mode !== 'single') return
+          wizard = step === 'host' ? selectWizardHost(wizard, id) : { ...wizard, engineOrAgentId: id }
+          stepTo(step === 'host' ? 'agent' : 'cwd')
+        }))
+      } else {
+        const cwd = el('input', { type: 'text', value: wizard.cwd ?? '', maxlength: 4096, placeholder: '留空使用主机默认目录',
+          'aria-label': title, disabled: busy, onInput: () => {
+            if (wizard.mode === 'single') wizard = { ...wizard, cwd: cwd.value }
+          } })
+        field.append(cwd, button(busy ? '正在创建…' : '创建会话', () => { void create() }, { class: 'primary block', disabled: busy }))
+      }
+      if (step !== 'host') field.append(button('上一步', () => stepTo(step === 'agent' ? 'host' : 'agent'), { disabled: busy }))
+      body.append(field)
+    }
+    body.append(el('p', { role: 'status', text: notice }))
+    dialog.replaceChildren(el('header', { class: 'ticket-sheet-header' }, el('div', { class: 'ticket-handle', 'aria-hidden': 'true' }),
+      el('div', { class: 'row-between' }, el('h2', { id: 'chat-sheet-title', text: '新建会话' }), button('关闭', close, { disabled: !canCloseCreateSheet(attempt) }))), body)
+    if (focus) dialog.querySelector<HTMLElement>(focus)?.focus()
+  }
+
+  async function create(): Promise<void> {
+    const api = state.api
+    if (!api || wizard.mode !== 'single' || attempt.busy) return
+    const { deviceId, engineOrAgentId: agent, cwd } = wizard
+    const error = Object.values(validateWizardState(wizard))[0]
+    const host = state.devices.find(device => device.id === deviceId && !device.stale && device.agents.includes(agent))
+    if (error || !host) { notice = error ?? '所选主机或引擎当前不可用，请重新选择。'; draw('#chat-wizard-step'); return }
+    const signature = JSON.stringify([deviceId, agent, cwd?.trim() ?? ''])
+    const keys = unconfirmedCreates.get(api) ?? new Map<string, string>()
+    unconfirmedCreates.set(api, keys)
+    attempt = beginCreateAttempt(keys, signature, newIdempotencyKey)
+    notice = ''
+    draw('#chat-wizard-step')
+    const result = await api.command('create', { deviceId, agent, sessionId: null }, cwd?.trim() ? { cwd: cwd.trim() } : {}, attempt.key)
+    const receipt = result.ok ? result.data.result as { sessionId?: unknown } | undefined : undefined
+    const sessionId = receipt?.sessionId
+    const created = typeof sessionId === 'string' && sessionId !== ''
+    const definiteReject = !result.ok && result.error === 'rejected' && result.code !== 'pending-confirmation' && result.code !== 'outcome-unknown'
+    attempt = finishCreateAttempt(keys, signature, attempt, created || definiteReject)
+    if (!dialog.open) return
+    if (state.api !== api) { dismiss(); return }
+    if (!result.ok) { notice = result.message; draw('#chat-wizard-step'); return }
+    close()
+    if (!created) {
+      toast('未收到新会话编号，请在会话列表查看。')
+      void openDevice(host)
+      return
+    }
+    sessionCategory = 'single'
+    state.deviceId = deviceId
+    state.sessions = []
+    void openSession(deviceId, { deviceId, agent, sessionId, running: false, updatedAt: Date.now(), blank: true })
+  }
+
+  draw()
+  document.body.append(dialog)
+  dialog.showModal()
 }
 
 function sessionsView(): Child[] {
-  const device = state.devices.find((entry) => entry.id === state.deviceId)
-  const header = topbar(device?.name ?? '会话', '选择会话', [
-    button('群聊', () => openGroups('sessions'), { class: 'icon-button' }),
-  ], backButton('home'))
-  const newRow = (device?.agents ?? []).map((agent) => button('新会话 · ' + agentLabel(agent), () => {
-    if (device) void startDeviceSession(device.id, agent)
-  }, { class: 'icon-button' }))
+  if (sessionCategory !== 'single') return groupsView()
+  const device = state.devices.find(entry => entry.id === state.deviceId)
+  const host = el('select', { 'aria-label': '会话列表主机', onChange: () => {
+    const selected = state.devices.find(entry => entry.id === host.value)
+    if (selected) void openDevice(selected)
+  } }, ...state.devices.map(entry => optionNode(entry.id, entry.name)))
+  if (device) host.value = device.id
   const search = el('input', {
     type: 'search', placeholder: '搜索会话', value: sessionQuery,
     onInput: (event: Event) => { sessionQuery = (event.target as HTMLInputElement).value; sessionLimit = SESSION_PAGE_SIZE; render() },
@@ -1302,8 +1469,8 @@ function sessionsView(): Child[] {
   }
   if (page.hasMore) sections.push(button('加载更多', () => { sessionLimit += SESSION_PAGE_SIZE; render() }, { class: 'block' }))
   return [
-    header,
-    newRow.length > 0 ? el('div', { class: 'quick-row' }, ...newRow) : null,
+    ...chatCenterHeader(device?.name ?? '暂无运行主机'),
+    state.devices.length > 1 ? host : null,
     el('div', { class: 'card' }, ...sections),
   ]
 }
@@ -1494,7 +1661,14 @@ function sessionView(): Child[] {
     el('div', { class: 'transcript' },
       state.historyCursor ? button('加载更早消息', () => { void loadOlder() }, { class: 'block ghost' }) : null,
       ...state.messages.map(messageNode),
-      ...(state.messages.length === 0 ? [el('p', { class: 'empty', text: '暂无消息。' })] : []),
+      historyStatus === 'loading' ? el('p', { role: 'status', class: 'notice', text: '正在读取历史…' }) : null,
+      historyStatus === 'error' ? el('div', { class: 'card' },
+        el('p', { role: 'status', class: 'banner error', text: historyError }),
+        button('重试读取历史', () => { void reloadTranscript() }, { class: 'block' })) : null,
+      ...(isWelcomeEmpty(historyStatus, historyItemCount, state.messages.length, Boolean(state.historyCursor)) ? [el('div', { class: 'chat-welcome card' },
+        el('h2', { text: '开始对话' }), ...WELCOME_STARTERS.map(starter => button(starter, () => {
+          draft = fillWelcomeStarter(input, starter)
+        })))] : []),
     ),
     el('div', { class: 'composer-wrap' },
       ...attachmentChips,
@@ -1646,6 +1820,35 @@ function appLocked(): boolean {
   return state.view === 'lock' || (state.view === 'booting' && !!state.config?.lock)
 }
 
+let appConfirmation: { view: View; cancel: () => void } | null = null
+
+function confirmInApp(title: string, message: string, label = '继续'): Promise<boolean> {
+  if (appConfirmation || chatSheet || appLocked()) return Promise.resolve(false)
+  return new Promise(resolve => {
+    const dialog = el('dialog', { class: 'ticket-sheet', 'aria-labelledby': 'app-confirm-title', 'aria-describedby': 'app-confirm-message' })
+    const finish = (accepted: boolean) => {
+      appConfirmation = null
+      dialog.close()
+      dialog.remove()
+      resolve(accepted && !appLocked())
+    }
+    const cancel = () => finish(false)
+    appConfirmation = { view: state.view, cancel }
+    dialog.addEventListener('cancel', event => { event.preventDefault(); cancel() })
+    dialog.addEventListener('click', event => { if (event.target === dialog) cancel() })
+    dialog.append(
+      el('header', { class: 'ticket-sheet-header' },
+        el('h2', { id: 'app-confirm-title', text: title })),
+      el('div', { class: 'ticket-sheet-body' },
+        el('p', { id: 'app-confirm-message', text: message }),
+        el('div', { class: 'choices' }, button('取消', cancel, { autofocus: true }),
+          button(label, () => finish(true), { class: label === '解除' ? 'danger' : 'primary' }))),
+    )
+    document.body.append(dialog)
+    dialog.showModal()
+  })
+}
+
 async function readPinState(): Promise<{ failures: number; until: number }> {
   const raw = await readPinGuard()
   if (!raw) return { failures: 0, until: 0 }
@@ -1679,7 +1882,7 @@ async function handleDeepLink(raw: string): Promise<void> {
       const prompt = decision.action === 'confirm'
         ? '把 Hub 换成 ' + host + '？已保存的令牌会被清掉。'
         : '连接到 ' + host + ' 并兑换这个配对码？'
-      if (!window.confirm(prompt)) return
+      if (!await confirmInApp('确认配对', prompt)) return
     }
     await redeemPairingCode(pairing.hubUrl, pairing.code)
     return
@@ -1691,7 +1894,7 @@ async function handleDeepLink(raw: string): Promise<void> {
   if (decision.action !== 'prefill' && decision.action !== 'confirm' && decision.action !== 'same') return
   if (decision.action === 'confirm') {
     const host = new URL(decision.hubUrl).host
-    if (!window.confirm('把 Hub 换成 ' + host + '？已保存的令牌会被清掉。')) return
+    if (!await confirmInApp('确认配对', '把 Hub 换成 ' + host + '？已保存的令牌会被清掉。')) return
   }
   const hub = decision.action === 'same' ? state.config?.hubUrl : decision.hubUrl
   if (!hub) return
@@ -1764,9 +1967,7 @@ async function loginTicket(ticket: string): Promise<boolean> {
   state.config = next
   state.account = result.data
   toast('群聊账号已登录')
-  state.view = 'groups'
-  render()
-  await loadRooms()
+  openGroups('home')
   return true
 }
 
@@ -1819,6 +2020,7 @@ async function loadBoard(quiet = false): Promise<void> {
   boardPoll = scheduleBoardPoll(boardReceipts.some(receipt => receipt.state === 'queued'),
     () => state.api === api && !appLocked() && state.view !== 'setup' && !document.hidden && state.online,
     () => { void loadBoard(true) }, setTimeout)
+  if (state.view === 'groups') render()
   if (state.view === 'board') {
     refreshTicketList()
     if (!quiet || !rootNode().querySelector('.modal-drawer :is(input, textarea, select):focus')) updateTicketSheet()
@@ -2270,18 +2472,25 @@ async function loadRooms(notify = false): Promise<void> {
   if (state.view === 'groups') render()
 }
 
-async function openRoom(roomId: string): Promise<void> {
+let roomOpen = 0
+let requestedRoomId: string | null = null
+
+async function openRoom(roomId: string, category: 'group' | 'ticketRoom'): Promise<void> {
   const api = phoneApi()
   if (!api) return
   stopGroupPoll()
+  requestedRoomId = roomId
+  sessionCategory = category
   state.room = null
   state.groupError = ''
   state.groupDraft = ''
   groupKey = ''
+  const request = ++roomOpen
   state.view = 'groupRoom'
   state.groupBusy = true
   render()
   const result = await api.discussion(roomId)
+  if (state.api !== api || state.view !== 'groupRoom' || request !== roomOpen) return
   state.groupBusy = false
   if (!result.ok) {
     state.groupError = result.message
@@ -2292,15 +2501,20 @@ async function openRoom(roomId: string): Promise<void> {
     render()
     return
   }
-  state.room = parseRoom(result.data)
+  const room = parseRoom(result.data)
+  state.room = room?.id === roomId ? room : null
+  if (!state.room) state.groupError = '未能读取群聊。'
   render()
-  startGroupPoll()
+  if (state.room) startGroupPoll()
 }
 
 async function refreshRoom(silent = false): Promise<void> {
   const api = phoneApi()
   const room = state.room
-  if (!api || !room || state.groupBusy) return
+  if (!api) return
+  const retry = !silent && state.view === 'groupRoom' ? roomRetryId(room, requestedRoomId, state.groupBusy) : null
+  if (retry) { await openRoom(retry, sessionCategory === 'ticketRoom' ? 'ticketRoom' : 'group'); return }
+  if (!room || state.groupBusy) return
   const generation = groupPollGeneration
   const view = state.view
   if (!silent) state.groupBusy = true
@@ -2382,27 +2596,40 @@ async function stopRoom(): Promise<void> {
 function groupsView(): Child[] {
   const config = state.config
   if (!config) { state.view = 'setup'; return setupView() }
-  const account = state.account
-  const header = topbar('群聊', phoneApi() ? '手机凭证' : (account?.name || '未配对'), [
-    button('刷新', () => { void loadRooms(true) }, { class: 'icon-button' }),
-    phoneApi() ? button('新建', () => { openGroupNew() }, { class: 'icon-button' }) : null,
-  ], backButton(groupsParent))
-  if (!account || account.expiresAt <= Date.now()) {
+  if (sessionCategory === 'single') return sessionsView()
+  const ticketRooms = new Map(boardTasks.flatMap(task => task.roomId ? [[task.roomId, task] as const] : []))
+  if (sessionCategory === 'ticketRoom') {
+    const rooms = filterSessionsByCategory([...ticketRooms].map(([id, task]) => ({
+      kind: 'group' as const, ticketRoom: true, id, task,
+    })), 'ticketRoom')
     return [
-      header,
+      ...chatCenterHeader('工单关联会话'),
+      el('section', { class: 'card' },
+        boardError ? el('p', { class: 'banner error', text: boardError }) : null,
+        ...rooms.map(({ id, task }) => button(task.title, () => { void openRoom(id, 'ticketRoom') }, { class: 'session' })),
+        rooms.length ? null : el('p', { class: 'empty', text: !phoneApi() ? '请先扫描电脑配对码。'
+          : !boardLoaded && !boardError ? '正在读取工单群…' : '暂无已关联群聊的工单。' }),
+        phoneApi() ? button('刷新工单群', () => { void loadBoard() }, { class: 'block' }) : null),
+    ]
+  }
+  const account = state.account
+  const header = chatCenterHeader(phoneApi() ? '手机凭证' : '未配对')
+  if (!phoneApi() || !account || !accountUsable()) {
+    return [
+      ...header,
       el('div', { class: 'card' },
-        el('h2', { text: '需要账号 ticket' }),
-        el('p', { class: 'empty', text: state.groupError || '群聊接口只认账号 cookie。请在电脑上运行 npm run ticket，手机扫码或粘贴 ticket。' }),
-        button('去设置登录', () => { state.view = 'settings'; render() }, { class: 'primary block' }),
+        el('h2', { text: '需要手机配对凭证' }),
+        el('p', { class: 'empty', text: state.groupError || '请扫描电脑上的配对码，或在设置中登录。' }),
+        button('去设置', () => { state.view = 'settings'; render() }, { class: 'primary block' }),
       ),
-      el('p', { class: 'notice', text: 'ticket 由电脑端 DSH 用当前账号向 Hub 换取，60 秒有效、只能用一次。' }),
     ]
   }
   const banners: Child[] = []
   if (state.groupError) banners.push(el('div', { class: 'banner error', text: state.groupError }))
-  const rooms = state.roomList.map((room) => el('button', {
+  const listed = filterSessionsByCategory(state.roomList.map(room => ({ ...room, kind: 'group' as const, ticketRoom: ticketRooms.has(room.id) })), 'group')
+  const rooms = listed.map((room) => el('button', {
     class: 'session',
-    onClick: () => { void openRoom(room.id) },
+    onClick: () => { void openRoom(room.id, 'group') },
   },
   el('span', { class: 'dot' + (room.state === 'running' ? ' online' : '') }),
   el('span', { class: 'copy' },
@@ -2412,11 +2639,12 @@ function groupsView(): Child[] {
   el('span', { class: 'state' + (room.state === 'running' ? ' running' : ''), text: groupStateLabel(room.state) }),
   ))
   return [
-    header,
+    ...header,
     ...banners,
     el('div', { class: 'card' },
-      el('h2', { text: '房间（' + state.roomList.length + '）' }),
+      el('h2', { text: '房间（' + rooms.length + '）' }),
       ...(rooms.length > 0 ? rooms : [el('p', { class: 'empty', text: state.groupBusy ? '读取群聊…' : '暂无群聊房间。' })]),
+      button('刷新群聊', () => { void loadRooms(true) }, { class: 'block' }),
     ),
     el('p', { class: 'notice', text: '账号会话到期：' + new Date(account.expiresAt).toLocaleString('zh-CN') + '；到期后重新生成 ticket。' }),
   ]
@@ -2456,16 +2684,16 @@ function groupRoomView(ticketHeader?: HTMLElement): Child[] {
   const room = state.room
   const config = state.config
   const account = state.account
-  if (!ticketHeader && (!config || !account || !accountUsable())) {
-    state.view = 'groups'
+  if (!ticketHeader && sessionCategory !== 'ticketRoom' && (!config || !account || !accountUsable())) {
+    setSessionCenterRoute('group')
     return groupsView()
   }
-  const header = ticketHeader ?? topbar(room ? room.title : '群聊', room ? groupProgress(room) : '读取中…', [
-    button('刷新', () => { void refreshRoom() }, { class: 'icon-button' }),
+  const header = ticketHeader ?? topbar(room ? room.title : '群聊', room ? groupProgress(room) : state.groupError ? '读取失败' : '读取中…', [
+    button('刷新', () => { void refreshRoom() }, { class: 'icon-button', disabled: !room && state.groupBusy }),
     room && room.state !== 'closed' ? button('停止', () => { void stopRoom() }, { class: 'icon-button danger' }) : null,
-  ], backButton('groups'))
+  ], backButton(returnToGroups))
   if (!room) {
-    return [header, el('div', { class: 'card' }, el('p', { class: 'empty', text: state.groupError || '读取群聊…' }))]
+    return [header, el('div', { class: 'card' }, el('p', { class: state.groupError ? 'banner error' : 'empty', role: 'status', text: state.groupError || '读取群聊…' }))]
   }
   if (!ticketHeader) header.querySelector('.title span')?.setAttribute('data-group-progress', '')
   const members = room.members.map((member) => el('span', {
@@ -2508,6 +2736,7 @@ function openGroupNew(): void {
   state.groupSelected = []
   state.groupPreview = null
   state.groupError = ''
+  sessionCategory = 'group'
   state.view = 'groupNew'
   render()
   if (state.catalog.length === 0) {
@@ -2584,6 +2813,7 @@ async function createGroup(): Promise<void> {
     return
   }
   state.room = parseRoom(result.data.room)
+  requestedRoomId = state.room?.id ?? null
   state.groupPreview = null
   state.view = 'groupRoom'
   state.groupDraft = ''
@@ -2595,10 +2825,10 @@ async function createGroup(): Promise<void> {
 
 function groupNewView(): Child[] {
   if (!phoneApi()) {
-    state.view = 'groups'
+    setSessionCenterRoute('group')
     return groupsView()
   }
-  const header = topbar('新建群聊', '手机凭证 · 讨论模式', [], backButton('groups'))
+  const header = topbar('新建群聊', '手机凭证 · 讨论模式', [], backButton(returnToGroups))
   const titleInput = el('input', {
     type: 'text', value: state.groupTitle, placeholder: '群聊标题', maxlength: 200,
     onInput: (event: Event) => { state.groupTitle = (event.target as HTMLInputElement).value; state.groupPreview = null },
@@ -2611,12 +2841,12 @@ function groupNewView(): Child[] {
   const catalogRows = state.catalog.map((item) => {
     const picked = state.groupSelected.includes(item.id)
     return el('button', {
-      class: 'session' + (picked ? ' picked' : ''),
+      class: 'session' + (picked ? ' picked' : ''), 'aria-pressed': picked,
       onClick: () => { toggleGroupChoice(item.id) },
     },
     el('span', { class: 'dot' + (picked ? ' online' : '') }),
     el('span', { class: 'copy' },
-      el('strong', { text: (picked ? '✓ ' : '') + item.deviceName + ' · ' + agentLabel(item.agent) }),
+      el('strong', { text: item.deviceName + ' · ' + agentLabel(item.agent) }),
       el('span', { text: item.model + (item.reasoningEfforts.length > 0 ? ' · 思考：' + item.reasoningEfforts.map(effortLabel).join(' / ') : '') }),
     ),
     )
