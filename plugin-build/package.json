@@ -1,6 +1,6 @@
 {
   "name": "dsh-marshal",
-  "version": "0.2.0-agent-groups.4",
+  "version": "0.2.0-agent-groups.35",
   "description": "Cross-device agent groups with resident DSH sessions, task board and memory.",
   "icon": "icon.svg",
   "type": "module",
@@ -12,6 +12,7 @@
     "./locale/zh.json": "./locale/zh.json",
     "./package.json": "./package.json"
   },
+  "bin": { "marshal-hub": "./lib/src/bin/hub.js" },
   "files": ["lib", "client", "locale", "cordis.patch.yml", "icon.svg", "README.md", "INSTALL.md"],
   "dsh": {
     "bundle": { "patch": "cordis.patch.yml" },

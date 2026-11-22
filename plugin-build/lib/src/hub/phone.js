@@ -83,13 +83,18 @@ export function createPhoneHub(options) {
     const codes = new Map();
     const tasks = new Map();
     const queued = new Map();
+    const receipts = new Map();
     const memory = new Map();
     const roster = new Map();
     const streams = new Map();
     const boardRevision = new Map();
+    const boardConnection = new Map();
     const watched = new Map();
     const MAX_WATCHED = 32;
     const MAX_COMMANDS = 32;
+    const MAX_RECEIPTS = 64;
+    const COMMAND_TTL_MS = 2 * 60_000;
+    const MEMORY_TTL_MS = 45_000;
     const MAX_CARDS = 64;
     const CARD_TTL_MS = 15 * 60_000;
     const DEVICE_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,79}$/;
@@ -181,6 +186,46 @@ export function createPhoneHub(options) {
             return { ok: false, code: 'revoked' };
         return { ok: true, device: row };
     }
+    function recordReceipt(pending, state, code) {
+        const { id, deviceId, action } = pending.command;
+        const history = receipts.get(pending.phoneId) ?? new Map();
+        history.delete(id);
+        history.set(id, { id, deviceId, action, state, ...(code === undefined ? {} : { code }) });
+        if (history.size > MAX_RECEIPTS) {
+            const oldest = history.keys().next().value;
+            if (oldest !== undefined)
+                history.delete(oldest);
+        }
+        receipts.set(pending.phoneId, history);
+    }
+    function currentQueue(deviceId) {
+        const queue = queued.get(deviceId) ?? [];
+        if (queue.length === 0)
+            return queue;
+        const at = now();
+        const active = queue.filter((pending) => {
+            if (pending.expiresAt > at)
+                return true;
+            recordReceipt(pending, 'unconfirmed', 'expired');
+            return false;
+        });
+        if (active.length === 0)
+            queued.delete(deviceId);
+        else if (active.length !== queue.length)
+            queued.set(deviceId, active);
+        return active;
+    }
+    function memoryGrant(id) {
+        const device = options.store.findById(id);
+        const connectionId = options.nodeConnection?.(id);
+        if (!device || !connectionId || device.revoked || device.role === 'phone' || !device.allowContent
+            || options.store.isRecoveryRequired(id))
+            return undefined;
+        const accountHash = options.accountOwnerForNode?.(device) ?? device.accountHash ?? options.ownerHash;
+        if (!accountHash)
+            return undefined;
+        return { device, connectionId, accountHash };
+    }
     return {
         authenticate,
         authenticateNode,
@@ -227,6 +272,14 @@ export function createPhoneHub(options) {
         },
         revoke(id) {
             options.store.revoke(id);
+            receipts.delete(id);
+            for (const [deviceId, queue] of queued) {
+                const active = queue.filter(pending => pending.phoneId !== id);
+                if (active.length === 0)
+                    queued.delete(deviceId);
+                else if (active.length !== queue.length)
+                    queued.set(deviceId, active);
+            }
             const open = streams.get(id);
             streams.delete(id);
             open?.forEach((close) => close());
@@ -310,46 +363,68 @@ export function createPhoneHub(options) {
             return [...tasks.values()].flat();
         },
         commandsFor(deviceId) {
-            return queued.get(deviceId) ?? [];
+            return currentQueue(deviceId).map(pending => pending.command);
+        },
+        receiptsFor(auth) {
+            if (!auth.ok)
+                return [];
+            for (const deviceId of queued.keys())
+                currentQueue(deviceId);
+            return [...(receipts.get(auth.phone.id)?.values() ?? [])].reverse();
         },
         writeTasks(auth, body) {
             if (!auth.ok)
                 throw Object.assign(new Error('unauthorized'), { code: 'unauthorized' });
             if ('device' in auth) {
-                if (body.read !== true)
-                    return { tasks: tasks.get(auth.device.id) ?? [], conflict: false };
-                if (typeof body.revision === 'number' && Number.isInteger(body.revision) && body.revision >= 0) {
-                    boardRevision.set(auth.device.id, body.revision);
+                const deviceId = auth.device.id;
+                const connectionId = options.nodeConnection?.(deviceId);
+                const connectionChanged = connectionId !== undefined && boardConnection.get(deviceId) !== undefined && boardConnection.get(deviceId) !== connectionId;
+                const head = connectionChanged ? undefined : boardRevision.get(deviceId);
+                const revision = boardRevisionOf(body.revision);
+                // A failed read leaves the last snapshot intact. An actual empty snapshot still replaces it.
+                if (body.read === true && Array.isArray(body.tasks) && (head === undefined || (revision !== undefined && revision >= head))) {
+                    if (connectionId !== undefined)
+                        boardConnection.set(deviceId, connectionId);
+                    if (revision !== undefined)
+                        boardRevision.set(deviceId, revision);
+                    else if (connectionChanged)
+                        boardRevision.delete(deviceId);
+                    tasks.set(deviceId, normalizeTasks(body.tasks, deviceId, revision));
                 }
-                const next = normalizeTasks(body.tasks, auth.device.id, boardRevision.get(auth.device.id));
-                tasks.set(auth.device.id, next);
-                const drop = new Set();
+                const outcomes = new Map();
                 if (Array.isArray(body.applied)) {
                     for (const id of body.applied)
                         if (typeof id === 'string')
-                            drop.add(id);
+                            outcomes.set(id, undefined);
                 }
                 if (Array.isArray(body.rejected)) {
                     for (const item of body.rejected) {
-                        if (typeof item === 'object' && item !== null && typeof item.id === 'string') {
-                            drop.add(item.id);
-                        }
+                        if (typeof item !== 'object' || item === null || typeof item.id !== 'string')
+                            continue;
+                        const code = item.code;
+                        outcomes.set(item.id, code === 'unsupported' || code === 'conflict' ? code : 'unavailable');
                     }
                 }
-                if (drop.size > 0) {
-                    queued.set(auth.device.id, (queued.get(auth.device.id) ?? []).filter((command) => !drop.has(command.id)));
-                }
-                return { tasks: next, conflict: false };
+                const remaining = currentQueue(deviceId).filter((pending) => {
+                    const { id } = pending.command;
+                    if (!outcomes.has(id))
+                        return true;
+                    const code = outcomes.get(id);
+                    recordReceipt(pending, code === undefined ? 'applied' : code === 'unavailable' ? 'unconfirmed' : 'rejected', code);
+                    return false;
+                });
+                if (remaining.length === 0)
+                    queued.delete(deviceId);
+                else
+                    queued.set(deviceId, remaining);
+                return { tasks: tasks.get(deviceId) ?? [], conflict: false };
             }
             const deviceId = typeof body.deviceId === 'string' ? body.deviceId : '';
             if (!DEVICE_ID.test(deviceId))
                 throw Object.assign(new Error('invalid'), { code: 'invalid' });
             const current = tasks.get(deviceId) ?? [];
-            const head = boardRevision.get(deviceId);
-            if (head === undefined)
-                return { tasks: current, conflict: true };
-            const base = typeof body.baseRevision === 'number' ? body.baseRevision : head;
-            if (base !== head)
+            const base = boardRevisionOf(body.baseRevision);
+            if (base === undefined || base !== boardRevision.get(deviceId))
                 return { tasks: current, conflict: true };
             const action = body.action;
             if (action !== 'create' && action !== 'edit' && action !== 'move' && action !== 'delete') {
@@ -364,21 +439,51 @@ export function createPhoneHub(options) {
                 ...(typeof body.taskId === 'string' ? { taskId: body.taskId } : {}),
                 ...(body.status === 'todo' || body.status === 'doing' || body.status === 'done' ? { status: body.status } : {}),
             };
-            const queue = queued.get(deviceId) ?? [];
+            const queue = currentQueue(deviceId);
             if (queue.length >= MAX_COMMANDS)
                 throw Object.assign(new Error('size-limit'), { code: 'size-limit' });
-            queued.set(deviceId, [...queue, command]);
-            return { tasks: current, conflict: false };
+            const pending = { command, phoneId: auth.phone.id, expiresAt: now() + COMMAND_TTL_MS };
+            queued.set(deviceId, [...queue, pending]);
+            recordReceipt(pending, 'queued');
+            return { tasks: current, conflict: false, commandId: command.id };
         },
-        readMemory(deviceId) {
-            return deviceId ? (memory.get(deviceId) ?? []) : [...memory.values()].flat();
+        readMemory(auth) {
+            if (!auth.ok)
+                return [];
+            const at = now();
+            const entries = [];
+            for (const [id, snapshot] of memory) {
+                const grant = memoryGrant(id);
+                if (!grant || snapshot.connectionId !== grant.connectionId || snapshot.accountHash !== grant.accountHash
+                    || snapshot.policyRevision !== grant.device.policyRevision || snapshot.expiresAt <= at) {
+                    memory.delete(id);
+                    continue;
+                }
+                if (grant.accountHash !== auth.phone.accountHash)
+                    continue;
+                entries.push(...snapshot.entries);
+            }
+            return entries;
         },
-        writeMemory(auth, entries) {
+        writeMemory(auth, snapshot) {
             if (!auth.ok)
                 throw Object.assign(new Error('unauthorized'), { code: 'unauthorized' });
-            const next = normalizeMemory(entries, auth.device.id);
-            memory.set(auth.device.id, next);
-            return next;
+            const id = auth.device.id;
+            const grant = memoryGrant(id);
+            if (!grant || snapshot.code === 'withheld') {
+                memory.delete(id);
+                return;
+            }
+            const { device, connectionId } = grant;
+            if (device.tokenDigest !== auth.device.tokenDigest || device.policyRevision !== auth.device.policyRevision
+                || snapshot.connectionId !== connectionId || snapshot.policyRevision !== device.policyRevision)
+                return;
+            if (snapshot.code === undefined && Array.isArray(snapshot.entries)) {
+                memory.set(id, {
+                    entries: normalizeMemory(snapshot.entries, id), connectionId, accountHash: grant.accountHash,
+                    policyRevision: device.policyRevision, expiresAt: now() + MEMORY_TTL_MS,
+                });
+            }
         },
         readRoster(deviceId) {
             return deviceId ? (roster.get(deviceId) ?? []) : [...roster.values()].flat();
@@ -396,6 +501,9 @@ export function createPhoneHub(options) {
             options.store.setPhonePush(auth.phone.id, target);
         },
     };
+}
+function boardRevisionOf(value) {
+    return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 }
 function normalizeTasks(raw, deviceId, boardRevision) {
     if (!Array.isArray(raw))
@@ -432,13 +540,13 @@ function normalizeMemory(raw, deviceId) {
         if (typeof item.text !== 'string' || !item.text)
             continue;
         const text = item.text.slice(0, 2000);
-        used += text.length;
+        used += Buffer.byteLength(text);
         if (used > 24_000)
             break;
         entries.push({
             id: typeof item.id === 'string' ? item.id.slice(0, 80) : 'mem-' + String(entries.length),
             deviceId,
-            layer: item.layer === 'workspace' ? 'workspace' : 'private',
+            layer: item.layer === 'workspace' || item.layer === 'global' ? item.layer : 'private',
             agent: typeof item.agent === 'string' ? item.agent.slice(0, 80) : '',
             text,
         });
@@ -449,17 +557,18 @@ function normalizeRoster(raw, deviceId) {
     if (!Array.isArray(raw))
         return [];
     const agents = [];
+    const seen = new Set();
     for (const row of raw) {
         if (typeof row !== 'object' || row === null)
             continue;
         const item = row;
         if (typeof item.name !== 'string' || !item.name.trim())
             continue;
-        agents.push({
-            deviceId,
-            agent: typeof item.agent === 'string' ? item.agent.slice(0, 80) : 'dsh',
-            name: item.name.trim().slice(0, 80),
-        });
+        const id = typeof item.id === 'string' ? item.id : item.agent === 'dsh' ? undefined : item.agent;
+        if (typeof id !== 'string' || id.trim() === '' || id.length > 80 || seen.has(id))
+            continue;
+        seen.add(id);
+        agents.push({ deviceId, id, name: item.name.trim().slice(0, 80) });
     }
     return agents;
 }

@@ -4,6 +4,8 @@ import { atomicWriteFile, withFileLock } from '../hub/state-file.js';
 import { homedir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import { MemoryStore } from './sqlite-store.js';
+import { createMnemonNative, storeNameFor } from './mnemon-native.js';
+import { readRegisteredWorkspaces } from './http-auth.js';
 import { specToJsonSchema } from '../tools/schema.js';
 import { createMemorySyncClient } from './sync-client.js';
 import { clarityLine, neutralizeMemory, scoreCandidate, shouldStore, topicSimilarity } from './lifecycle.js';
@@ -124,8 +126,37 @@ function findMember(teams, name) {
     return undefined;
 }
 
-function workspaceKey(cwd) {
+export function workspaceKey(cwd) {
     return 'ws_' + createHash('sha256').update(resolve(cwd)).digest('hex').slice(0, 24);
+}
+
+export function isPseudoAgentWorkspace(ws) {
+    if (!ws || typeof ws !== 'object') return false;
+    const title = String(ws.title ?? '').trim();
+    const path = String(ws.path ?? '').trim();
+    if (/^Agent\s*·\s*/.test(title)) return true;
+    if (/\/\.dsh-marshal\/agents\/Agent\s*·\s*/.test(path)) return true;
+    return false;
+}
+
+export function resolveWorkspaceIdForCwd(cwd, workspaces) {
+    if (typeof cwd !== 'string' || cwd.trim() === '') return undefined;
+    const absolute = resolve(cwd);
+    const list = Array.isArray(workspaces) ? workspaces : [];
+    let bestId;
+    let bestLen = -1;
+    for (const ws of list) {
+        if (!ws || typeof ws.id !== 'string' || ws.id === '' || typeof ws.path !== 'string' || ws.path.trim() === '') continue;
+        if (isPseudoAgentWorkspace(ws)) continue;
+        const wsPath = resolve(ws.path);
+        if (absolute === wsPath || absolute.startsWith(wsPath + sep)) {
+            if (wsPath.length > bestLen) {
+                bestLen = wsPath.length;
+                bestId = ws.id;
+            }
+        }
+    }
+    return bestId ?? workspaceKey(absolute);
 }
 
 export function resolveMemoryIdentity(context, options = {}) {
@@ -136,6 +167,7 @@ export function resolveMemoryIdentity(context, options = {}) {
     const run = Array.isArray(ledger.runs) ? ledger.runs.find(entry => entry?.sessionId === sessionId) : undefined;
     let team = run === undefined ? undefined : (ledger.teams ?? []).find(entry => entry?.id === run.teamId);
     let member = team === undefined ? undefined : (team.members ?? []).find(entry => entry?.id === run.memberId);
+    const registeredAgent = member !== undefined;
     let name = member?.name;
     if (member === undefined && cwd !== '') {
         const root = resolve(options.agentsRoot ?? join(homedir(), '.dsh-marshal', 'agents'));
@@ -150,9 +182,13 @@ export function resolveMemoryIdentity(context, options = {}) {
         }
     }
     const agentId = member?.id ?? (name === undefined ? undefined : 'legacy:' + name);
-    const workspaceId = team?.workspaceId ?? (cwd === '' ? undefined : workspaceKey(cwd));
+    const workspaces = Array.isArray(options.workspaces)
+        ? options.workspaces
+        : (options.ledger === undefined ? readRegisteredWorkspaces() : []);
+    const workspaceId = team?.workspaceId ?? (cwd === '' ? undefined : resolveWorkspaceIdForCwd(cwd, workspaces));
     return {
         agentId,
+        registeredAgent,
         agentName: name,
         workspaceId,
         workspacePath: cwd === '' ? undefined : cwd,
@@ -188,23 +224,60 @@ function sessionEvents(session) {
     catch { return []; }
 }
 
-function recentDialog(session) {
+function dialogFor(events) {
     const messages = [];
-    for (const event of sessionEvents(session)) {
+    for (const event of events) {
+        if (event?.surfaceOp !== undefined && event.surfaceOp !== 'append') continue;
         if (event?.type === 'user/message') messages.push({ role: 'user', text: textOfContent(event.data?.content) });
         else if (event?.type === 'assistant/message') messages.push({ role: 'assistant', text: textOfContent(event.data?.message?.content) });
     }
     return messages.filter(message => message.text.trim() !== '').slice(-16);
 }
 
-function heuristicSummary(session) {
-    const dialog = recentDialog(session);
+function completedDialog(session, endEvent) {
+    const events = sessionEvents(session);
+    const isEnd = event => event?.type === 'turn/end';
+    const succeeded = event => event.data?.reason == null || event.data.reason === 'completed';
+    if (endEvent !== undefined && !succeeded(endEvent)) return [];
+    let end = events.findLastIndex(event => isEnd(event) && (endEvent === undefined
+        ? succeeded(event)
+        : event === endEvent
+            || (Number.isSafeInteger(endEvent.seq) && endEvent.seq === event.seq)
+            || (endEvent.data?.turn !== undefined && endEvent.data.turn === event.data?.turn)));
+    if (end === -1) {
+        if (endEvent !== undefined) {
+            // Some hosts emit the end hook before adding the terminal record to the session.
+            if (!Number.isSafeInteger(endEvent.seq) || events.some(event => !Number.isSafeInteger(event?.seq))) return [];
+            end = events.findIndex(event => event.seq >= endEvent.seq);
+            if (end === -1) end = events.length;
+        } else {
+            if (events.some(isEnd)) return [];
+            // Older logs may lack turn markers. Exclude any still-unanswered tail.
+            const assistant = events.findLastIndex(event => event?.type === 'assistant/message');
+            return assistant < 0 ? [] : dialogFor(events.slice(0, assistant + 1));
+        }
+    }
+    const before = events.slice(0, end);
+    const previous = before.findLastIndex(isEnd);
+    const turn = (endEvent ?? events[end])?.data?.turn;
+    const dialog = dialogFor(before.slice(previous + 1)
+        .filter(event => turn === undefined || event?.data?.turn === undefined || event.data.turn === turn));
+    return dialog.at(-1)?.role === 'assistant' ? dialog : [];
+}
+
+function captureSummary(service, session, endEvent) {
+    const dialog = completedDialog(session, endEvent);
     if (dialog.length === 0) return undefined;
-    const user = [...dialog].reverse().find(message => message.role === 'user');
-    const assistant = [...dialog].reverse().find(message => message.role === 'assistant');
+    const { agentId, sessionId } = service.identity({ session });
+    return agentId === undefined ? undefined : { agentId, sessionId, dialog };
+}
+
+function heuristicSummary(dialog) {
+    const users = dialog.filter(message => message.role === 'user').map(message => message.text.trim()).filter(Boolean);
+    const assistants = dialog.filter(message => message.role === 'assistant').map(message => message.text.trim()).filter(Boolean);
     const content = [
-        user === undefined ? '' : '用户目标：' + user.text.slice(0, 1200),
-        assistant === undefined ? '' : '结论：' + assistant.text.slice(0, 2200),
+        users.length === 0 ? '' : '用户目标：' + users.join(' / ').slice(0, 1200),
+        assistants.length === 0 ? '' : '结论：' + assistants.join('\n').slice(0, 2200),
     ].filter(Boolean).join('\n\n');
     return {
         kind: 'episode',
@@ -229,9 +302,9 @@ function memoryBlock(service, identity) {
             try { service.store.decay(target.scope, target.ownerId); service.lastDecay.set(key, Date.now()); } catch { /* decay must not break injection */ }
         }
     }
-    const lastUser = recentDialog(identity.session).filter(message => message.role === 'user').at(-1);
+    const lastUser = dialogFor(sessionEvents(identity.session)).filter(message => message.role === 'user').at(-1);
     const query = lastUser?.text ?? '';
-    const cacheKey = (identity.sessionId ?? 'global') + (group ? ':group' : ':direct');
+    const cacheKey = JSON.stringify([identity.sessionId, identity.agentId, identity.workspaceId, group]);
     const cached = service.blockCache.get(cacheKey);
     if (cached !== undefined && cached.version === service.cacheVersion && topicSimilarity(cached.query, query) >= 0.65 && Date.now() - cached.at < 10 * 60_000) return cached.text;
     const entries = [];
@@ -239,8 +312,11 @@ function memoryBlock(service, identity) {
     const stable = item => item.kind === 'profile' || item.kind === 'handoff';
     const fileText = typeof service.fileText === 'function' ? service.fileText(identity) : '';
     const visible = items => dedupeMemories(fileText, items.filter(item => globalMemoryVisible(item, group)));
-    const agentItems = visible(identity.agentId === undefined ? [] : service.store.list('agent', identity.agentId, { limit: 24 }));
-    const workspaceItems = visible(identity.workspaceId === undefined ? [] : service.store.list('workspace', identity.workspaceId, { limit: 16 }));
+    const agentNative = identity.registeredAgent === true && service.usesMnemonFor?.('agent', identity.agentId) === true;
+    const workspaceNative = service.usesMnemonFor?.('workspace', identity.workspaceId) === true;
+    const sqlScopes = scopes.filter(target => !(target.scope === 'agent' && agentNative) && !(target.scope === 'workspace' && workspaceNative));
+    const agentItems = (identity.agentId === undefined || agentNative) ? [] : visible(service.store.list('agent', identity.agentId, { limit: 24 }));
+    const workspaceItems = (identity.workspaceId === undefined || workspaceNative) ? [] : visible(service.store.list('workspace', identity.workspaceId, { limit: 16 }));
     const globalItems = visible(service.store.list('global', 'global', { limit: 24 }));
     for (const item of agentItems.filter(stable)) add('【Agent】' + item.title + '：' + clarityLine(item), 120);
     for (const item of workspaceItems.filter(stable)) add('【Workspace】' + item.title + '：' + clarityLine(item), 100);
@@ -249,8 +325,8 @@ function memoryBlock(service, identity) {
     for (const item of agentItems.filter(item => !stable(item)).slice(0, 8)) add('【Agent 相关】' + item.title + '：' + clarityLine(item), 50);
     for (const item of workspaceItems.filter(item => !stable(item)).slice(0, 6)) add('【Workspace 相关】' + item.title + '：' + clarityLine(item), 40);
     for (const item of agentItems.filter(item => item.kind === 'episode').sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 2)) add('【最近·' + item.title + '】' + clarityLine(item), 30);
-    if (query.trim() !== '' && service.settings.autoRecall !== false) {
-        for (const item of visible(service.store.recall(scopes, query, { k: 6 }))) {
+    if (query.trim() !== '' && service.settings.autoRecall !== false && sqlScopes.length > 0) {
+        for (const item of visible(service.store.recall(sqlScopes, query, { k: 6 }))) {
             if (stable(item)) continue;
             add('【召回·' + item.scope + '】' + item.title + '：' + clarityLine(item), 60);
         }
@@ -301,10 +377,8 @@ function parseMemoryArray(text) {
     catch { return undefined; }
 }
 
-async function refineSession(service, session) {
-    const dialog = recentDialog(session).slice(-12);
-    if (dialog.length === 0) return [];
-    const text = dialog.map(message => (message.role === 'user' ? '用户：' : '助手：') + message.text.slice(0, 1600)).join('\n');
+async function refineDialog(service, dialog) {
+    const text = dialog.slice(-12).map(message => (message.role === 'user' ? '用户：' : '助手：') + message.text.slice(0, 1600)).join('\n');
     const cap = Number(service.settings.dailyTokenCap);
     const at = typeof service.now === 'function' ? service.now() : Date.now();
     if (Number.isFinite(cap) && cap > 0 && service.llm !== undefined && service.settings.summaryProvider !== '' && service.settings.summaryModel !== '') {
@@ -325,8 +399,8 @@ async function refineSession(service, session) {
             }
         }
     }
-    const summary = heuristicSummary(session);
-    return summary === undefined ? [] : [{ kind: 'event', title: summary.title, content: summary.content, importance: 45, tags: summary.tags }];
+    const summary = heuristicSummary(dialog);
+    return [{ kind: 'event', title: summary.title, content: summary.content, importance: 45, tags: summary.tags }];
 }
 
 function normalizeRefined(entry) {
@@ -346,7 +420,7 @@ export function agentMemoryTool(service) {
         description: 'Agent 私有/工作区/全局长期记忆。会话开始自动注入；需要细节时 recall；用户说记住时 remember；结束前 handoff。'
             + ' scope=global 不会直接写入，只会提交一条待审批提案。全局可见性只有 all（所有会话）和 no-group（仅单聊）。',
         parameters: {
-            action: { type: 'string', required: true, enum: ['status', 'remember', 'recall', 'forget', 'list', 'handoff', 'summarize', 'graph'] },
+            action: { type: 'string', required: true, enum: ['status', 'remember', 'recall', 'get', 'link', 'forget', 'list', 'handoff', 'summarize', 'graph'] },
             scope: { type: 'string', enum: ['all', 'agent', 'workspace', 'global'] },
             query: { type: 'string' },
             title: { type: 'string' },
@@ -356,6 +430,10 @@ export function agentMemoryTool(service) {
             tags: { type: 'array', items: { type: 'string' } },
             visibility: { type: 'string', enum: ['private', 'group-safe', 'never-group', 'all', 'no-group'] },
             id: { type: 'string' },
+            targetId: { type: 'string' },
+            edgeType: { type: 'string', enum: ['causal', 'entity', 'semantic', 'supersedes', 'temporal'] },
+            cue: { type: 'string' },
+            intent: { type: 'string', enum: ['WHY', 'WHEN', 'ENTITY', 'GENERAL'] },
             limit: { type: 'integer' },
         },
         output: {
@@ -372,17 +450,20 @@ export function agentMemoryTool(service) {
             render: (_args, value) => [{ type: 'text', text: value.text }],
         },
         async execute(args, exec) {
-            const identity = resolveMemoryIdentity(exec?.agent, { deviceId: service.deviceId, ledger: service.ledger });
+            const identity = service.identity(exec?.agent);
             const scopes = scopeList(identity, args.scope ?? 'all');
             const action = args.action;
             const group = service.isGroup(identity);
             const keep = item => globalMemoryVisible(item, group);
             if (action === 'status') {
-                const stats = service.store.stats(scopes);
+                const stats = await service.statsFor(scopes);
                 const text = stats.map(stat => stat.scope + ' ' + stat.ownerId + '：' + stat.total + ' 条，置顶 ' + stat.pinned).join('\n') || '当前会话没有可用的记忆作用域';
                 return { ok: true, action, text, items: stats };
             }
             if (action === 'remember' || action === 'handoff') {
+                if (identity.unboundPilot && (!args.scope || args.scope === 'all' || args.scope === 'agent')) {
+                    throw new Error('请从此 Agent 已绑定的会话写入私有记忆。');
+                }
                 const target = scopes.find(scope => scope.scope === (args.scope === 'all' ? 'agent' : args.scope)) ?? scopes[0];
                 if (target === undefined) throw new Error('no memory scope for this session');
                 const kind = action === 'handoff' ? 'handoff' : (args.kind ?? 'fact');
@@ -394,28 +475,53 @@ export function agentMemoryTool(service) {
                     }, { agentId: identity.agentId });
                     return { ok: true, action, text: '已提交全局记忆审批，机主同意前不会写入，也不会进入提示词：' + proposal.title, proposal };
                 }
-                const memory = service.store.remember(target.scope, target.ownerId, {
+                const memory = await service.rememberEntry(target.scope, target.ownerId, {
                     kind, title, content: args.text ?? '', importance: kind === 'handoff' ? 0.9 : args.importance,
                     tags: args.tags ?? [], visibility: args.visibility ?? 'private',
-                }, { sessionId: identity.sessionId, deviceId: identity.deviceId });
-                service.cacheVersion++;
-                return { ok: true, action, text: '已记住：' + memory.title, memory };
+                    ...(typeof args.cue === 'string' && args.cue.trim() ? { cue: args.cue.trim() } : {}),
+                }, { sessionId: identity.sessionId, deviceId: identity.deviceId, workspaceId: identity.workspaceId });
+                return memory ? { ok: true, action, text: '已记住：' + memory.title, memory }
+                    : { ok: false, action, text: '这条记忆已归档。' };
             }
             if (action === 'recall') {
-                const items = service.store.recall(scopes, String(args.query ?? ''), { k: args.limit ?? 8 }).filter(keep);
+                const items = (await service.recallFor(scopes, String(args.query ?? ''), args.limit ?? 8, { group, workspaceId: identity.workspaceId, intent: args.intent })).filter(keep);
                 return { ok: true, action, items, text: items.length === 0 ? '没有找到相关记忆' : items.map(item => formatItem(item)).join('\n\n') };
             }
+            if (action === 'get') {
+                const needle = String(args.id ?? '').trim();
+                if (!needle) throw new Error('get needs id');
+                for (const target of scopes) {
+                    const direct = await service.getFor(target.scope, target.ownerId, needle);
+                    if (direct && keep(direct)) {
+                        return { ok: true, action, memory: direct, text: formatItem(direct) };
+                    }
+                    if (needle.length >= 6 && needle.length < 36) {
+                        const rows = await service.listScope(target, 100, { group, workspaceId: identity.workspaceId });
+                        const hit = rows.find(item => item.id.startsWith(needle) && keep(item));
+                        if (hit) return { ok: true, action, memory: hit, text: formatItem(hit) };
+                    }
+                }
+                return { ok: false, action, text: '未找到指定 ID 的记忆：' + needle };
+            }
+            if (action === 'link') {
+                const sourceId = String(args.id ?? '').trim();
+                const targetId = String(args.targetId ?? '').trim();
+                if (!sourceId || !targetId) throw new Error('link needs id and targetId');
+                const linked = await service.linkFor(scopes, sourceId, targetId, { type: args.edgeType ?? 'semantic', reason: args.text });
+                return { ok: Boolean(linked), action, text: linked ? '已建立记忆关联（' + (args.edgeType ?? 'semantic') + '）' : '当前作用域未启用 Mnemon 图谱关联' };
+            }
             if (action === 'list') {
-                const items = [];
-                for (const target of scopes) items.push(...service.store.list(target.scope, target.ownerId, { limit: args.limit ?? 30, kinds: args.kind === undefined ? undefined : [args.kind] }).filter(keep));
+                const kinds = args.kind === undefined ? undefined : [args.kind];
+                const rows = await Promise.all(scopes.map(target => service.listScope(target, args.limit ?? 30, { group, kinds, workspaceId: identity.workspaceId })));
+                const items = rows.flat().filter(keep);
                 return { ok: true, action, items, text: items.length === 0 ? '记忆为空' : items.map(item => formatItem(item)).join('\n\n') };
             }
             if (action === 'forget') {
                 if (args.scope === 'global') return { ok: false, action, text: '全局记忆只能由机主在记忆页删除' };
                 if (typeof args.id !== 'string' || args.id === '') throw new Error('forget needs id');
-                let removed = false;
-                for (const target of scopes.filter(scope => scope.scope !== 'global')) removed = service.store.forget(target.scope, target.ownerId, args.id) || removed;
-                if (removed) service.cacheVersion++;
+                const agentId = scopes.find(target => target.scope === 'agent')?.ownerId;
+                const workspaceId = scopes.find(target => target.scope === 'workspace')?.ownerId;
+                const removed = await service.forgetFor({ agentId, workspaceId, id: args.id });
                 return { ok: true, action, text: removed ? '已归档记忆' : '没有找到这条记忆' };
             }
             if (action === 'summarize') {
@@ -423,7 +529,7 @@ export function agentMemoryTool(service) {
                 return { ok: true, action, text: written === 0 ? '当前会话没有值得长期记住的内容' : '已写入 ' + written + ' 条会话记忆' };
             }
             if (action === 'graph') {
-                const graph = service.store.graph(scopes, { limit: args.limit ?? 400 });
+                const graph = await service.graphScopes(scopes, args.limit ?? 400, { group, workspaceId: identity.workspaceId });
                 graph.nodes = graph.nodes.filter(keep);
                 const ids = new Set(graph.nodes.map(node => node.id));
                 graph.edges = graph.edges.filter(edge => ids.has(edge.source) && ids.has(edge.target));
@@ -434,8 +540,120 @@ export function agentMemoryTool(service) {
     };
 }
 
-export function createAgentMemoryService({ root, logger, deviceId, hubUrl, token, passphrase, now = Date.now, ledger, groupsFile, groupsRoot, fileText, fileMemory, fetchImpl } = {}) {
+async function writeSummary(service, snapshot) {
+    if (snapshot === undefined) return 0;
+    const entries = await refineDialog(service, snapshot.dialog);
+    let written = 0;
+    for (const raw of entries) {
+        const entry = normalizeRefined(raw);
+        if (entry === undefined) continue;
+        const stored = await service.rememberEntry('agent', snapshot.agentId, entry, {
+            sessionId: snapshot.sessionId, deviceId: service.deviceId,
+        });
+        if (stored !== undefined) written++;
+    }
+    return written;
+}
+
+export function createAgentMemoryService({ root, logger, deviceId, hubUrl, token, passphrase, now = Date.now, ledger, workspaces, groupsFile, groupsRoot, fileText, fileMemory, fetchImpl, mnemonPilot } = {}) {
     const store = new MemoryStore({ root, logger, now });
+    const fleetMode = mnemonPilot?.agentId === '*';
+    const nativePool = new Map();
+    const migratedScopes = new Set();
+    const currentWorkspaces = () => Array.isArray(workspaces)
+        ? workspaces
+        : (ledger === undefined ? readRegisteredWorkspaces() : []);
+    const workspaceLegacyAliases = workspaceId => {
+        if (typeof workspaceId !== 'string' || workspaceId === '') return [];
+        const aliases = [];
+        for (const ws of currentWorkspaces()) {
+            if (!ws || ws.id !== workspaceId || typeof ws.path !== 'string' || ws.path.trim() === '' || isPseudoAgentWorkspace(ws)) continue;
+            const hashed = workspaceKey(ws.path);
+            if (hashed !== workspaceId && !aliases.includes(hashed)) aliases.push(hashed);
+        }
+        return aliases;
+    };
+    const useNative = (scope, ownerId) => {
+        if (!mnemonPilot || typeof ownerId !== 'string' || ownerId === '') return false;
+        if (fleetMode) return scope === 'agent' || (scope === 'workspace' && mnemonPilot.scopes !== 'agents');
+        return scope === 'agent' && mnemonPilot.agentId === ownerId;
+    };
+    const isNativeAuthoritative = (scope, ownerId) =>
+        fleetMode && useNative(scope, ownerId) && migratedScopes.has(scope + ':' + ownerId);
+    const nativeFor = (scope, ownerId) => {
+        if (!useNative(scope, ownerId)) return undefined;
+        const key = scope + ':' + ownerId;
+        let inst = nativePool.get(key);
+        if (!inst) {
+            inst = createMnemonNative({
+                scope,
+                ownerId,
+                agentId: scope === 'agent' ? ownerId : undefined,
+                executable: mnemonPilot.executable,
+                root: store.root,
+            });
+            nativePool.set(key, inst);
+        }
+        return inst;
+    };
+    const ensureMigrated = async (scope, ownerId) => {
+        if (!fleetMode || !useNative(scope, ownerId)) return false;
+        const key = scope + ':' + ownerId;
+        if (migratedScopes.has(key)) return true;
+        const marker = join(store.root, 'mnemon-native', '.migrated-v2-' + createHash('sha256').update(key).digest('hex').slice(0, 12));
+        if (existsSync(marker)) {
+            migratedScopes.add(key);
+            return true;
+        }
+        const inst = nativeFor(scope, ownerId);
+        if (!inst) return false;
+        migratedScopes.add(key);
+        try {
+            const toMigrate = [];
+            const seen = new Set();
+            const collect = rows => {
+                for (const row of Array.isArray(rows) ? rows : []) {
+                    if (!row || row.archived) continue;
+                    const sig = JSON.stringify([row.title, row.content]);
+                    if (seen.has(sig)) continue;
+                    seen.add(sig);
+                    toMigrate.push(row);
+                }
+            };
+            collect(store.list(scope, ownerId, { limit: 300 }));
+            if (scope === 'workspace') {
+                for (const alias of workspaceLegacyAliases(ownerId)) {
+                    collect(store.list('workspace', alias, { limit: 300 }));
+                    const aliasStoreName = storeNameFor('workspace', alias);
+                    if (existsSync(join(store.root, 'mnemon-native', 'data', aliasStoreName))) {
+                        try {
+                            const aliasInst = createMnemonNative({
+                                scope: 'workspace',
+                                ownerId: alias,
+                                executable: mnemonPilot.executable,
+                                root: store.root,
+                            });
+                            collect(await aliasInst.list({ limit: 300 }));
+                        } catch { /* ignore unreadable legacy alias store */ }
+                    }
+                }
+            }
+            for (const row of toMigrate) {
+                try {
+                    await inst.remember({
+                        kind: row.kind, title: row.title, content: row.content,
+                        importance: row.importance, tags: row.tags, pinned: row.pinned, visibility: row.visibility,
+                        ...(typeof row.cue === 'string' && row.cue ? { cue: row.cue } : {}),
+                    }, { workspaceId: scope === 'workspace' ? ownerId : row.allowedWorkspaceId });
+                } catch { /* skip single malformed legacy row */ }
+            }
+            writeFileSync(marker, new Date().toISOString() + '\n');
+            return true;
+        } catch {
+            migratedScopes.delete(key);
+            return false;
+        }
+    };
     const sync = createMemorySyncClient({ hubUrl, token, passphrase, deviceId, fetchImpl });
     const resolvedGroupsFile = groupsFile ?? join(groupsRoot ?? join(homedir(), '.dsh-marshal', 'groups'), 'groups.json');
     const service = {
@@ -451,19 +669,20 @@ export function createAgentMemoryService({ root, logger, deviceId, hubUrl, token
         if (typeof fileMemory?.store?.promptText === 'function') return fileMemory.store.promptText(cwd) ?? '';
         return '';
     };
-    service.summarizeSession = async session => {
-        const identity = resolveMemoryIdentity({ session }, { deviceId, ledger: service.ledger });
-        if (identity.agentId === undefined) return 0;
-        const entries = await refineSession(service, session);
-        let written = 0;
-        for (const raw of entries) {
-            const entry = normalizeRefined(raw);
-            if (entry === undefined) continue;
-            service.store.remember('agent', identity.agentId, entry, { sessionId: identity.sessionId, deviceId });
-            written++;
+    service.summarizeSession = session => writeSummary(service, captureSummary(service, session));
+    service.readPhone = ({ allowContent, capBytes }) => {
+        if (!allowContent) return { code: 'withheld' };
+        const entries = [];
+        let remaining = Number.isSafeInteger(capBytes) ? Math.max(0, Math.min(24_000, capBytes)) : 0;
+        for (const item of store.list('global', 'global', { visibility: 'all', limit: 24 })) {
+            const text = (item.title + '\n' + item.content)
+                .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '').slice(0, 2000);
+            const size = Buffer.byteLength(text);
+            if (size === 0 || size > remaining) continue;
+            entries.push({ id: item.id, layer: 'global', agent: '', text });
+            remaining -= size;
         }
-        if (written > 0) service.cacheVersion++;
-        return written;
+        return { entries };
     };
     service.saveSettings = patch => {
         const next = { ...service.settings, ...(patch !== null && typeof patch === 'object' ? patch : {}) };
@@ -473,32 +692,212 @@ export function createAgentMemoryService({ root, logger, deviceId, hubUrl, token
         writeFileSync(join(store.root, 'settings.json'), JSON.stringify(service.settings, null, 2) + '\n');
         return service.settings;
     };
-    service.identity = context => resolveMemoryIdentity(context, { deviceId });
+    const nativeVisible = (items, scope, group, workspaceId) => {
+        if (scope === 'workspace' || group !== true) return items;
+        return items.filter(item => item.visibility === 'group-safe' && Boolean(workspaceId) && item.allowedWorkspaceId === workspaceId);
+    };
+    const merge = (first, second) => {
+        const seen = new Set();
+        return [...first, ...second].filter(item => {
+            const key = JSON.stringify([item.scope, item.ownerId, item.title, item.content]);
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        });
+    };
+    const indexLine = item => {
+        const tags = Array.isArray(item.tags) && item.tags.length > 0 ? ' [' + item.tags.slice(0, 4).join(' ') + ']' : '';
+        const cue = item.cue ? ' 触发:' + item.cue : '';
+        return '- ' + item.id.slice(0, 8) + ' | ' + item.scope + '/' + item.kind + ' | ' + item.title + tags + cue;
+    };
+    service.identity = context => {
+        const identity = resolveMemoryIdentity(context, { deviceId, ledger, ...(workspaces !== undefined ? { workspaces } : {}) });
+        return !fleetMode && useNative('agent', identity.agentId) && !identity.registeredAgent
+            ? { ...identity, agentId: undefined, unboundPilot: true } : identity;
+    };
     service.scopes = (identity, scope = 'all') => scopeList(identity, scope);
     service.block = identity => memoryBlock(service, identity);
+    service.usesMnemonFor = (scope, ownerId) => useNative(scope, ownerId);
+    service.usesMnemon = (agentId, workspaceId) => useNative('agent', agentId) || useNative('workspace', workspaceId);
+    service.recallFor = async (scopes, query, limit = 8, { group, workspaceId, intent } = {}) => {
+        const nativeTargets = scopes.filter(target => useNative(target.scope, target.ownerId));
+        if (nativeTargets.length === 0) return store.recall(scopes, query, { k: limit });
+        const nativeBatches = await Promise.all(nativeTargets.map(async target => {
+            await ensureMigrated(target.scope, target.ownerId);
+            const inst = nativeFor(target.scope, target.ownerId);
+            const rows = await inst.recall(query, { k: limit, intent });
+            return nativeVisible(rows, target.scope, group, workspaceId);
+        }));
+        const sqlScopes = scopes.filter(target => !isNativeAuthoritative(target.scope, target.ownerId));
+        const legacy = sqlScopes.length > 0 ? store.recall(sqlScopes, query, { k: limit }) : [];
+        const matches = nativeBatches.flat().sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+        if (legacy.length === 0) return matches.slice(0, limit);
+        const combined = matches.flatMap((item, index) => legacy[index] ? [item, legacy[index]] : [item]);
+        return merge(combined, legacy.slice(matches.length)).slice(0, limit);
+    };
+    service.listScope = async ({ scope, ownerId }, limit, { group, kinds, workspaceId } = {}) => {
+        if (!useNative(scope, ownerId)) return store.list(scope, ownerId, { limit, kinds });
+        await ensureMigrated(scope, ownerId);
+        const inst = nativeFor(scope, ownerId);
+        const items = nativeVisible(await inst.list({ limit }), scope, group, workspaceId).filter(item => !kinds || kinds.includes(item.kind));
+        if (isNativeAuthoritative(scope, ownerId)) {
+            return items.sort((a, b) => b.updatedAt - a.updatedAt).slice(0, limit);
+        }
+        const legacy = store.list(scope, ownerId, { limit, kinds });
+        return merge(items, legacy).sort((a, b) => b.updatedAt - a.updatedAt).slice(0, limit);
+    };
+    service.graphScopes = async (scopes, limit, { group, workspaceId } = {}) => {
+        const nativeTargets = scopes.filter(target => useNative(target.scope, target.ownerId));
+        if (nativeTargets.length === 0) return store.graph(scopes, { limit });
+        await Promise.all(nativeTargets.map(target => ensureMigrated(target.scope, target.ownerId)));
+        const sqlScopes = scopes.filter(target => !isNativeAuthoritative(target.scope, target.ownerId));
+        const graph = sqlScopes.length > 0 ? store.graph(sqlScopes, { limit }) : { nodes: [], edges: [] };
+        const edgeKeys = new Set(graph.edges.map(e => e.source + '->' + e.target));
+        const nativeNodes = [];
+        const pendingEdges = [];
+        for (const target of nativeTargets) {
+            const inst = nativeFor(target.scope, target.ownerId);
+            const items = nativeVisible(await inst.list({ limit }), target.scope, group, workspaceId);
+            nativeNodes.push(...items);
+            try {
+                const edges = await inst.graphEdges();
+                pendingEdges.push(...edges);
+            } catch {
+                // Best-effort fallback if viz is unavailable
+                const relsList = await Promise.all(items.slice(0, 12).map(async item => {
+                    try {
+                        const rels = await inst.related(item.id, { depth: 1 });
+                        return rels.map(rel => ({ source: item.id, target: rel.targetId, weight: rel.weight, kind: rel.edgeType }));
+                    } catch { return []; }
+                }));
+                pendingEdges.push(...relsList.flat());
+            }
+        }
+        // Keep Mnemon nodes FIRST so Mnemon UUIDs win over any unmigrated SQLite rows and match graph edges!
+        graph.nodes = merge(nativeNodes, graph.nodes);
+        const idSet = new Set(graph.nodes.map(n => n.id));
+        for (const edge of pendingEdges) {
+            if (!idSet.has(edge.source) || !idSet.has(edge.target)) continue;
+            const k = edge.source + '->' + edge.target;
+            if (edgeKeys.has(k)) continue;
+            edgeKeys.add(k);
+            graph.edges.push({ source: edge.source, target: edge.target, weight: edge.weight, kind: edge.kind });
+        }
+        return graph;
+    };
     service.graphFor = ({ agentId, workspaceId, limit = 400, includeGlobal = true }) => {
         const scopes = [];
         if (typeof agentId === 'string' && agentId !== '') scopes.push({ scope: 'agent', ownerId: agentId });
         if (typeof workspaceId === 'string' && workspaceId !== '') scopes.push({ scope: 'workspace', ownerId: workspaceId });
         if (includeGlobal) scopes.push({ scope: 'global', ownerId: 'global' });
-        return store.graph(scopes, { limit });
+        return service.graphScopes(scopes, limit);
     };
-    service.listFor = ({ agentId, workspaceId, limit = 100, query, scope = 'all', includeGlobal = true }) => {
+    service.statsFor = async scopes => {
+        const stats = store.stats(scopes);
+        const out = [];
+        for (const item of stats) {
+            if (!useNative(item.scope, item.ownerId)) { out.push(item); continue; }
+            await ensureMigrated(item.scope, item.ownerId);
+            const inst = nativeFor(item.scope, item.ownerId);
+            const additional = await inst.stats();
+            const total = isNativeAuthoritative(item.scope, item.ownerId) ? additional : item.total + additional;
+            out.push({ ...item, total, backend: 'mnemon' });
+        }
+        return out;
+    };
+    service.getFor = (scope, ownerId, id) => {
+        if (useNative(scope, ownerId)) {
+            return ensureMigrated(scope, ownerId).then(async () => {
+                const found = await nativeFor(scope, ownerId).get(id);
+                if (found !== undefined) return found;
+                return isNativeAuthoritative(scope, ownerId) ? undefined : store.get(scope, ownerId, id);
+            });
+        }
+        return store.get(scope, ownerId, id);
+    };
+    service.linkFor = async (scopes, sourceId, targetId, options = {}) => {
+        for (const target of scopes) {
+            if (!useNative(target.scope, target.ownerId)) continue;
+            const inst = nativeFor(target.scope, target.ownerId);
+            if (await inst.get(sourceId) && await inst.get(targetId)) {
+                await inst.link(sourceId, targetId, options);
+                service.cacheVersion++;
+                return true;
+            }
+        }
+        return false;
+    };
+    service.nativePrompt = async (identity, signal) => {
+        if (service.settings.autoRecall === false) return '';
+        const group = service.isGroup(identity);
+        const activeTargets = [];
+        if (identity.registeredAgent && useNative('agent', identity.agentId)) activeTargets.push({ scope: 'agent', ownerId: identity.agentId });
+        if (useNative('workspace', identity.workspaceId)) activeTargets.push({ scope: 'workspace', ownerId: identity.workspaceId });
+        if (activeTargets.length === 0) return '';
+        const query = dialogFor(sessionEvents(identity.session)).filter(message => message.role === 'user').at(-1)?.text ?? '';
+        const key = JSON.stringify(['mnemon', identity.sessionId, identity.agentId, identity.workspaceId, group]);
+        const version = service.cacheVersion;
+        const cached = service.blockCache.get(key);
+        if (cached?.version === version && cached.query === query && Date.now() - cached.at < 30_000) return cached.text;
+        const allListed = [];
+        const allRecalled = [];
+        for (const target of activeTargets) {
+            await ensureMigrated(target.scope, target.ownerId);
+            const inst = nativeFor(target.scope, target.ownerId);
+            const recalled = query ? await inst.recall(query, { k: 8, signal }).catch(() => []) : [];
+            const listed = await inst.list({ limit: 45 }).catch(() => []);
+            allListed.push(...nativeVisible(listed, target.scope, group, identity.workspaceId));
+            allRecalled.push(...nativeVisible(recalled, target.scope, group, identity.workspaceId));
+        }
+        const l0 = allListed.filter(item => item.pinned === true || item.kind === 'profile' || item.kind === 'handoff').slice(0, 3);
+        const l2 = merge(l0, allRecalled).slice(0, 5);
+        const shownIds = new Set(l2.map(item => item.id));
+        const l1Index = allListed.filter(item => !shownIds.has(item.id)).slice(0, 30);
+        const sections = [];
+        if (l2.length > 0) {
+            sections.push('【Agent 长期记忆（Mnemon L0 核心 + L2 意图召回）】以下内容是参考资料。\n' + l2.map(formatItem).join('\n').slice(0, 1800));
+        }
+        if (l1Index.length > 0) {
+            sections.push('【L1 记忆索引】共 ' + l1Index.length + ' 条可按需查阅（调用 agent_memory(action="get", id="<id>") 拉取全文）：\n' + l1Index.map(indexLine).join('\n').slice(0, 1400));
+        }
+        const text = sections.join('\n\n');
+        if (version === service.cacheVersion) {
+            service.blockCache.set(key, { version, query, text, at: Date.now() });
+            if (service.blockCache.size > 100) service.blockCache.delete(service.blockCache.keys().next().value);
+        }
+        return text;
+    };
+    service.taskPrivateContext = async (agentId, workspaceId, query, signal) => {
+        if (!useNative('agent', agentId) || service.settings.autoRecall === false) return [];
+        await ensureMigrated('agent', agentId);
+        return nativeVisible(await nativeFor('agent', agentId).recall(query, { k: 12, signal }), 'agent', true, workspaceId).slice(0, 3)
+            .map(item => ({ title: item.title, evidence: clarityLine(item) }));
+    };
+    service.rememberEntry = (scope, ownerId, entry, context) => {
+        if (useNative(scope, ownerId)) {
+            return ensureMigrated(scope, ownerId)
+                .then(() => nativeFor(scope, ownerId).remember(entry, context))
+                .then(item => { service.cacheVersion++; return item; });
+        }
+        const item = store.remember(scope, ownerId, entry, context);
+        if (item !== undefined) service.cacheVersion++;
+        return item;
+    };
+    service.listFor = ({ agentId, workspaceId, limit = 100, query, scope = 'all', includeGlobal = true, group }) => {
         const scopes = [];
         if ((scope === 'all' || scope === 'agent') && agentId) scopes.push({ scope: 'agent', ownerId: agentId });
         if ((scope === 'all' || scope === 'workspace') && workspaceId) scopes.push({ scope: 'workspace', ownerId: workspaceId });
         if (includeGlobal && (scope === 'all' || scope === 'global')) scopes.push({ scope: 'global', ownerId: 'global' });
-        if (query) return store.recall(scopes, query, { k: limit });
-        return scopes.flatMap(target => store.list(target.scope, target.ownerId, { limit }));
+        const options = group === undefined ? undefined : { group, workspaceId };
+        if (query) return service.recallFor(scopes, query, limit, options);
+        return Promise.all(scopes.map(target => service.listScope(target, limit, options))).then(rows => rows.flat());
     };
-    service.rememberFor = ({ agentId, workspaceId, scope, title, text, kind, importance, tags, visibility }) => {
+    service.rememberFor = ({ agentId, workspaceId, scope, title, text, kind, importance, tags, visibility, cue }) => {
         const target = scope === 'global'
             ? { scope: 'global', ownerId: 'global' }
             : scope === 'workspace' ? { scope: 'workspace', ownerId: workspaceId } : { scope: 'agent', ownerId: agentId };
         if (target.ownerId === undefined) throw new Error('memory owner is missing');
-        const item = store.remember(target.scope, target.ownerId, { kind, title, content: text, importance, tags, visibility });
-        if (item !== undefined) service.cacheVersion++;
-        return item;
+        return service.rememberEntry(target.scope, target.ownerId, { kind, title, content: text, importance, tags, visibility, ...(cue ? { cue } : {}) }, { workspaceId });
     };
     service.listProposals = () => store.listProposals('pending');
     service.approveProposal = (id, edits) => {
@@ -537,11 +936,31 @@ export function createAgentMemoryService({ root, logger, deviceId, hubUrl, token
         }
         return sync.migrate();
     };
-    service.forgetFor = ({ agentId, workspaceId, id }) => {
+    service.forgetFor = async ({ agentId, workspaceId, id }) => {
         const scopes = [];
         if (agentId) scopes.push({ scope: 'agent', ownerId: agentId });
         if (workspaceId) scopes.push({ scope: 'workspace', ownerId: workspaceId });
-        const removed = scopes.some(target => store.forget(target.scope, target.ownerId, id));
+        let removed = scopes.some(target => store.forget(target.scope, target.ownerId, id));
+        for (const target of scopes) {
+            if (!useNative(target.scope, target.ownerId)) continue;
+            await ensureMigrated(target.scope, target.ownerId);
+            const inst = nativeFor(target.scope, target.ownerId);
+            const doomed = await inst.get(id).catch(() => undefined);
+            if (await inst.forget(id)) {
+                removed = true;
+                // Also remove any pre-migration SQLite twin (same title+content) so it can never resurrect
+                if (doomed) {
+                    const owners = [target.ownerId, ...(target.scope === 'workspace' ? workspaceLegacyAliases(target.ownerId) : [])];
+                    for (const oid of owners) {
+                        for (const row of store.list(target.scope, oid, { limit: 300 })) {
+                            if (row.title === doomed.title && row.content === doomed.content) {
+                                store.forget(target.scope, oid, row.id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if (removed) service.cacheVersion++;
         return removed;
     };
@@ -550,18 +969,30 @@ export function createAgentMemoryService({ root, logger, deviceId, hubUrl, token
 
 export function mountAgentMemory(ctx, config, options = {}) {
     const service = createAgentMemoryService({
-        root: config.memoryRoot, logger: options.logger ?? ctx.logger, deviceId: config.deviceId,
+        root: config.memoryRoot, logger: options.logger ?? ctx.logger, deviceId: config.deviceId, ledger: options.ledger,
         hubUrl: config.hubUrl, token: config.token, passphrase: process.env.DSH_MARSHAL_MEMORY_SYNC_KEY,
         fileMemory: options.fileMemory, groupsFile: options.groupsFile,
         groupsRoot: options.groupsRoot ?? config.groupsRoot, fileText: options.fileText,
+        mnemonPilot: config.mnemonPilot,
     });
     try { service.llm = ctx.get?.('llm'); } catch { /* llm is optional; local heuristic remains */ }
     ctx.inject(['systemPrompt'], scoped => {
         scoped.effect(() => scoped.systemPrompt.section({
             name: 'marshal:agent-memory',
             order: 5,
-            text: context => service.block(resolveMemoryIdentity(context, { deviceId: config.deviceId })),
+            text: context => service.block(service.identity(context)),
+            interpolate: false,
         }), 'marshal: agent memory prompt');
+        if (config.mnemonPilot) scoped.effect(() => scoped.on('system-prompt/assemble', async (assembly, context, next) => {
+            let text = '';
+            try { text = await service.nativePrompt(service.identity(context), context.signal); }
+            catch (error) {
+                if (context.signal?.aborted) context.signal.throwIfAborted();
+                (options.logger ?? ctx.logger)?.warn?.('marshal: Mnemon prompt recall unavailable');
+            }
+            if (text) assembly.contexts.push({ name: 'marshal:mnemon-private', text, interpolate: false });
+            return next();
+        }), 'marshal: Mnemon prompt recall');
     });
     ctx.inject(['tools'], scoped => {
         scoped.effect(() => {
@@ -570,29 +1001,43 @@ export function mountAgentMemory(ctx, config, options = {}) {
             return scoped.tools.register(definition);
         }, 'marshal: agent memory tool');
     });
-    // Session-end capture. A configured summary model refines the dialog through the
-    // shared prepareCall wrapper until dailyTokenCap is spent; otherwise the local heuristic runs.
+    // Capture each completed turn with its owner while the terminal event is current.
+    // Rapid turns for the same owner merge during the debounce window instead of dropping
+    // the earlier turn; an owner change flushes the previous owner's pending turns first.
     const timers = new Map();
+    const pending = new Map();
+    const flushSummary = snapshot => {
+        if (service.settings.autoSummary === false) return;
+        void writeSummary(service, snapshot).catch(error => (options.logger ?? ctx.logger)?.warn?.('marshal memory: session summary failed: ' + (error?.message ?? error)));
+    };
     try {
         ctx.effect(() => {
             const off = ctx.on?.('session/event', (session, event) => {
                 if (event?.type !== 'turn/end' || service.settings.autoSummary === false) return;
-                const id = session?.id;
-                if (typeof id !== 'string') return;
-                const old = timers.get(id);
-                if (old !== undefined) clearTimeout(old);
+                const captured = captureSummary(service, session, event);
+                if (captured === undefined || typeof captured.sessionId !== 'string') return;
+                const id = captured.sessionId;
+                const previous = pending.get(id);
+                clearTimeout(timers.get(id));
+                let next = captured;
+                if (previous !== undefined) {
+                    if (previous.agentId === captured.agentId) {
+                        next = { ...captured, dialog: [...previous.dialog, ...captured.dialog].slice(-16) };
+                    }
+                    else {
+                        flushSummary(previous);
+                    }
+                }
+                pending.set(id, next);
                 const timer = setTimeout(() => {
                     timers.delete(id);
-                    try {
-                        const identity = resolveMemoryIdentity({ session }, { deviceId: config.deviceId });
-                        if (identity.agentId === undefined) return;
-                        void service.summarizeSession(session).catch(error => (options.logger ?? ctx.logger)?.warn?.('marshal memory: session summary failed: ' + (error?.message ?? error)));
-                    }
-                    catch (error) { (options.logger ?? ctx.logger)?.warn?.('marshal memory: session summary failed: ' + (error?.message ?? error)); }
+                    const batch = pending.get(id);
+                    pending.delete(id);
+                    if (batch !== undefined) flushSummary(batch);
                 }, 60_000);
                 timers.set(id, timer);
             });
-            return () => { if (typeof off === 'function') off(); for (const timer of timers.values()) clearTimeout(timer); timers.clear(); };
+            return () => { if (typeof off === 'function') off(); for (const timer of timers.values()) clearTimeout(timer); timers.clear(); pending.clear(); };
         }, 'marshal: agent memory session capture');
     }
     catch (error) { (options.logger ?? ctx.logger)?.warn?.('marshal memory: session capture unavailable: ' + (error?.message ?? error)); }

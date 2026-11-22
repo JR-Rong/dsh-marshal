@@ -6,9 +6,10 @@
  */
 import { SecureStorage } from '@aparajita/capacitor-secure-storage'
 import { Capacitor } from '@capacitor/core'
-import { parseConfig, type MarshalConfig } from './config.ts'
+import { MOBILE_THEMES, normalizeTheme, parseConfig, normalizeDailySummaryCapK, tightenPrivacyMode, type MarshalConfig, type MobileTheme } from './config.ts'
 
 const STORE_KEY = 'dsh-marshal-mobile.config'
+const THEME_KEY = 'dsh-marshal-mobile.theme'
 const BRIDGE_KEY = 'dsh-marshal-mobile.bridge'
 const PIN_KEY = 'dsh-marshal-mobile.pin-guard'
 
@@ -30,30 +31,89 @@ function webStorage(): Storage | null {
   }
 }
 
-export async function readConfig(): Promise<MarshalConfig | null> {
-  let raw: string | null = null
-  if (isNativeRuntime()) {
-    try {
-      raw = await SecureStorage.getItem(STORE_KEY)
-    } catch {
-      raw = null
-    }
+export type ConfigReadResult = { status: 'ok'; config: MarshalConfig }
+  | { status: 'missing' }
+  | { status: 'error'; error: ConfigReadError }
+
+export class ConfigReadError extends Error {
+  constructor(cause: unknown) {
+    super('无法读取本机配置，未覆盖已保存的数据。请恢复本机存储后重试。', { cause })
   }
-  if (raw === null) {
-    const fallback = webStorage()
-    raw = fallback ? fallback.getItem(STORE_KEY) : null
-  }
-  if (!raw) return null
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(raw)
-  } catch {
-    return null
-  }
-  return parseConfig(parsed)
 }
 
-export async function writeConfig(config: MarshalConfig): Promise<void> {
+export async function readConfig(): Promise<ConfigReadResult> {
+  try {
+    let raw = isNativeRuntime() ? await SecureStorage.getItem(STORE_KEY) : null
+    // Legacy web fallback is only safe after a confirmed native miss.
+    if (raw === null) raw = window.localStorage.getItem(STORE_KEY)
+    if (raw === null) return { status: 'missing' }
+    const config = parseConfig(JSON.parse(raw))
+    if (!config) throw new Error('Invalid config')
+    return { status: 'ok', config }
+  } catch (error) {
+    return { status: 'error', error: new ConfigReadError(error) }
+  }
+}
+
+let configWrites = Promise.resolve()
+
+function queueConfigWrite<T>(action: () => Promise<T>): Promise<T> {
+  const next = configWrites.then(action)
+  configWrites = next.then(() => {}, () => {})
+  return next
+}
+
+export function readTheme(config?: MarshalConfig | null): MobileTheme {
+  if (config?.theme !== undefined) return normalizeTheme(config.theme)
+  let saved: string | null | undefined
+  try { saved = webStorage()?.getItem(THEME_KEY) } catch { /* use config */ }
+  return MOBILE_THEMES.find((theme) => theme === saved) ?? normalizeTheme(undefined)
+}
+
+export function writeTheme(theme: MobileTheme): Promise<void> {
+  return queueConfigWrite(async () => {
+    // Paired config is authoritative; the non-secret cache is only for early/unpaired preview.
+    const config = await changeConfig(current => current && { ...current, theme, updatedAt: Date.now() })
+    try {
+      const storage = webStorage()
+      if (!storage) throw new Error('本机存储不可用')
+      storage.setItem(THEME_KEY, theme)
+    } catch (error) {
+      if (!config) throw error
+    }
+  })
+}
+
+async function changeConfig<T extends MarshalConfig | null>(change: (current: Readonly<MarshalConfig> | null) => T): Promise<T> {
+  const result = await readConfig()
+  if (result.status === 'error') throw result.error
+  const current = result.status === 'ok' ? result.config : null
+  const privacy = current?.privacyMode
+  const next = change(current)
+  if (next) {
+    if (privacy === 'metadata' || next.privacyMode === 'metadata') next.privacyMode = tightenPrivacyMode(privacy)
+    await storeConfig(next)
+  }
+  return next
+}
+
+export function updateConfig(change: (current: Readonly<MarshalConfig> | null) => MarshalConfig): Promise<MarshalConfig> {
+  return queueConfigWrite(() => changeConfig(current => {
+    const next = change(current)
+    return { ...next, theme: next.theme ?? readTheme(current) }
+  }))
+}
+
+export function writeNodePreference(change: { tightenPrivacy: true } | { dailySummaryCapK: number }): Promise<MarshalConfig> {
+  return updateConfig(current => {
+    if (!current) throw new Error('未找到本机配置')
+    return { ...current, updatedAt: Date.now(), ...('tightenPrivacy' in change
+      ? { privacyMode: tightenPrivacyMode(current.privacyMode) }
+      : { dailySummaryCapK: normalizeDailySummaryCapK(change.dailySummaryCapK) }) }
+  })
+}
+
+async function storeConfig(config: MarshalConfig): Promise<void> {
   const serialized = JSON.stringify(config)
   if (isNativeRuntime()) {
     await SecureStorage.setItem(STORE_KEY, serialized)
@@ -117,7 +177,11 @@ export async function writePinGuard(value: string | null): Promise<void> {
   } catch { /* 浏览器预览记不住也只影响这一页 */ }
 }
 
-export async function removeConfig(): Promise<void> {
+export function removeConfig(): Promise<void> {
+  return queueConfigWrite(clearConfig)
+}
+
+async function clearConfig(): Promise<void> {
   if (isNativeRuntime()) {
     try {
       await SecureStorage.removeItem(STORE_KEY)
@@ -126,4 +190,5 @@ export async function removeConfig(): Promise<void> {
     }
   }
   webStorage()?.removeItem(STORE_KEY)
+  webStorage()?.removeItem(THEME_KEY)
 }

@@ -10,6 +10,23 @@ export const DEFAULT_HUB = ''
 export const CONSOLE_PATH = '/marshal'
 export const MIN_TOKEN_LENGTH = 16
 
+export const MOBILE_THEMES = ['system', 'deepseek', 'white', 'dark', 'codex'] as const
+export type MobileTheme = typeof MOBILE_THEMES[number]
+export type PrivacyMode = 'content' | 'metadata'
+
+export function tightenPrivacyMode(_current?: PrivacyMode): 'metadata' {
+  return 'metadata'
+}
+
+export function normalizeDailySummaryCapK(raw: unknown): number {
+  return typeof raw === 'number' && Number.isFinite(raw)
+    ? Math.min(200, Math.max(10, Math.round(raw))) : 50
+}
+
+export function normalizeTheme(raw: unknown): MobileTheme {
+  return MOBILE_THEMES.find((theme) => theme === raw) ?? 'system'
+}
+
 export interface AppLock {
   salt: string
   hash: string
@@ -46,6 +63,9 @@ export interface MarshalConfig {
   lanBridge?: boolean
   /** 群聊账号会话；null/缺省表示未用 ticket 登录。 */
   account?: AccountSession | null
+  theme?: MobileTheme
+  privacyMode?: PrivacyMode
+  dailySummaryCapK?: number
   updatedAt: number
 }
 
@@ -141,6 +161,7 @@ export function parseConfig(raw: unknown): MarshalConfig | null {
   const token = typeof value.token === 'string' ? value.token : ''
   const lock = parseLock(value.lock)
   const account = parseAccount(value.account)
+  const theme = MOBILE_THEMES.find((theme) => theme === value.theme)
   return {
     version: CONFIG_VERSION,
     hubUrl: normalized.value,
@@ -149,6 +170,9 @@ export function parseConfig(raw: unknown): MarshalConfig | null {
     lock,
     ...(value.lanBridge === true ? { lanBridge: true } : {}),
     ...(account === null ? {} : { account }),
+    ...(theme === undefined ? {} : { theme }),
+    ...(value.privacyMode === 'content' || value.privacyMode === 'metadata' ? { privacyMode: value.privacyMode } : {}),
+    ...(value.dailySummaryCapK === undefined ? {} : { dailySummaryCapK: normalizeDailySummaryCapK(value.dailySummaryCapK) }),
     updatedAt: typeof value.updatedAt === 'number' && Number.isFinite(value.updatedAt) ? value.updatedAt : Date.now(),
   }
 }

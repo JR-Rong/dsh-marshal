@@ -23,6 +23,7 @@ export interface StreamOptions {
   url: string
   token: string
   onFrame: (frame: StreamFrame) => void
+  onOpen?: () => void
   onError?: (message: string) => void
   /** 断开后是否自动重连，默认 true。 */
   reconnect?: boolean
@@ -49,7 +50,7 @@ function parseData(raw: string): unknown {
 }
 
 export async function openEventStream(options: StreamOptions): Promise<StreamHandle> {
-  const { url, token, onFrame, onError, reconnect = true } = options
+  const { url, token, onFrame, onOpen, onError, reconnect = true } = options
   const id = options.id ?? 's' + String(++streamSerial)
 
   if (!isNative()) {
@@ -58,6 +59,7 @@ export async function openEventStream(options: StreamOptions): Promise<StreamHan
       onFrame({ event, data: parseData(String(message.data)) })
     }
     source.onmessage = forward('message')
+    source.onopen = () => onOpen?.()
     source.addEventListener('reset', forward('reset'))
     source.onerror = () => onError?.('SSE 断开')
     return { close: () => source.close() }
@@ -71,15 +73,16 @@ export async function openEventStream(options: StreamOptions): Promise<StreamHan
 
   const start = async (): Promise<void> => {
     if (closed) return
-    handle = await MarshalStream.addListener('message', (message) => {
-      if (message.streamId && message.streamId !== id) return
+    const listener = await MarshalStream.addListener('message', (message) => {
+      if (closed || (message.streamId && message.streamId !== id)) return
       if (message.event === 'open') {
         attempt = noteStreamOpen()
+        onOpen?.()
         return
       }
-      if (shouldReconnectStream({ event: message.event, closed, reconnect })) {
-        if (message.event === 'error') onError?.(message.data || 'SSE 断开')
-        scheduleReconnect()
+      if (message.event === 'end' || message.event === 'error') {
+        onError?.(message.event === 'error' && message.data ? message.data : 'SSE 断开')
+        if (shouldReconnectStream({ event: message.event, closed, reconnect })) scheduleReconnect()
         return
       }
       const frame: StreamFrame = {
@@ -90,6 +93,8 @@ export async function openEventStream(options: StreamOptions): Promise<StreamHan
       lastEventId = nextResumeCursor(lastEventId, frame)
       onFrame(frame)
     })
+    if (closed) { await listener.remove(); return }
+    handle = listener
     await MarshalStream.open({
       url,
       token,
@@ -111,14 +116,16 @@ export async function openEventStream(options: StreamOptions): Promise<StreamHan
         } catch {
           /* 清干净即可 */
         }
-        await start()
+        try { await start() } catch {
+          if (closed) return
+          onError?.('未能重连事件流')
+          scheduleReconnect()
+        }
       })()
     }, next.delayMs)
   }
 
-  await start()
-
-  return {
+  const connection = {
     close() {
       closed = true
       if (retryTimer) clearTimeout(retryTimer)
@@ -126,4 +133,9 @@ export async function openEventStream(options: StreamOptions): Promise<StreamHan
       void MarshalStream.close({ id })
     },
   }
+  try { await start() } catch (error) {
+    connection.close()
+    throw error
+  }
+  return connection
 }

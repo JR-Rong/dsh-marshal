@@ -7,6 +7,7 @@
  */
 import { Capacitor, CapacitorHttp } from '@capacitor/core'
 import type { MarshalConfig } from './config.ts'
+import { ticketFilter, type Ticket } from './tickets.ts'
 
 export const TOKEN_HEADER = 'x-marshal-token'
 
@@ -128,6 +129,20 @@ export interface HistoryItem {
   ts?: number
   kind: string
   payload?: Record<string, unknown>
+}
+
+export interface RosterEntry {
+  id: string
+  deviceId: string
+  name: string
+}
+
+export interface BoardReceipt {
+  id: string
+  deviceId: string
+  action: 'create' | 'edit' | 'move' | 'delete'
+  state: 'queued' | 'applied' | 'rejected' | 'unconfirmed'
+  code?: string
 }
 
 export type ApiFailure =
@@ -308,7 +323,7 @@ export class MarshalApi {
     return { ok: true, data: parseDevices(result.data) }
   }
 
-  async sessions(deviceId: string): Promise<ApiResult<SessionRow[]>> {
+  async sessions(deviceId = ''): Promise<ApiResult<SessionRow[]>> {
     const result = await this.request<{ sessions?: unknown }>(
       '/marshal/api/sessions?device=' + encodeURIComponent(deviceId),
     )
@@ -398,24 +413,22 @@ export class MarshalApi {
     return this.request<Record<string, unknown>>('/marshal/api/command-status?' + query.toString())
   }
 
-  async roster(): Promise<ApiResult<Array<{ deviceId: string; agent: string; name: string }>>> {
+  async roster(): Promise<ApiResult<RosterEntry[]>> {
     const result = await this.request<{ agents?: unknown }>('/marshal/api/roster')
     if (!result.ok) return result
     const agents = Array.isArray(result.data?.agents) ? result.data.agents.flatMap((row) => {
       if (typeof row !== 'object' || row === null) return []
       const item = row as Record<string, unknown>
-      if (typeof item.name !== 'string' || !item.name) return []
-      return [{
-        deviceId: typeof item.deviceId === 'string' ? item.deviceId : '',
-        agent: typeof item.agent === 'string' ? item.agent : 'dsh',
-        name: item.name,
-      }]
+      const id = typeof item.id === 'string' ? item.id : item.agent === 'dsh' ? undefined : item.agent
+      if (typeof id !== 'string' || !id || typeof item.deviceId !== 'string' || !item.deviceId
+        || typeof item.name !== 'string' || !item.name) return []
+      return [{ id, deviceId: item.deviceId, name: item.name }]
     }) : []
     return { ok: true, data: agents }
   }
 
-  async board(): Promise<ApiResult<{ tasks: Array<{ id: string; deviceId: string; title: string; detail: string; status: string; revision: number }>; revisions: Record<string, number> }>> {
-    const result = await this.request<{ tasks?: unknown; revisions?: unknown }>('/marshal/api/board')
+  async board(): Promise<ApiResult<{ tasks: Ticket[]; revisions: Record<string, number>; receipts: BoardReceipt[] }>> {
+    const result = await this.request<{ tasks?: unknown; revisions?: unknown; receipts?: unknown }>('/marshal/api/board')
     if (!result.ok) return result
     const revisions: Record<string, number> = {}
     if (typeof result.data?.revisions === 'object' && result.data.revisions !== null) {
@@ -432,11 +445,22 @@ export class MarshalApi {
         deviceId: typeof item.deviceId === 'string' ? item.deviceId : '',
         title: item.title,
         detail: typeof item.detail === 'string' ? item.detail : '',
-        status: item.status === 'doing' || item.status === 'done' ? item.status : 'todo',
+        ...(typeof item.template === 'string' ? { template: item.template } : {}),
+        ...(typeof item.roomId === 'string' && item.roomId ? { roomId: item.roomId } : {}),
+        status: typeof item.status === 'string' && ticketFilter(item.status) ? item.status : 'todo',
         revision: typeof item.revision === 'number' ? item.revision : 0,
       }]
     }) : []
-    return { ok: true, data: { tasks, revisions } }
+    const receipts = Array.isArray(result.data?.receipts)
+      ? result.data.receipts.flatMap((row): BoardReceipt[] => {
+        if (typeof row !== 'object' || row === null) return []
+        const { id, deviceId, action, state, code } = row as Record<string, unknown>
+        if (typeof id !== 'string' || typeof deviceId !== 'string'
+          || (action !== 'create' && action !== 'edit' && action !== 'move' && action !== 'delete')
+          || (state !== 'queued' && state !== 'applied' && state !== 'rejected' && state !== 'unconfirmed')) return []
+        return [{ id, deviceId, action, state, ...(typeof code === 'string' ? { code } : {}) }]
+      }) : []
+    return { ok: true, data: { tasks, revisions, receipts } }
   }
 
   async unwatchSession(target: Target): Promise<ApiResult<Record<string, unknown>>> {
@@ -445,33 +469,27 @@ export class MarshalApi {
     })
   }
 
-  async boardWrite(body: Record<string, unknown>): Promise<ApiResult<Record<string, unknown>>> {
+  async boardWrite(body: Record<string, unknown>): Promise<ApiResult<{ commandId?: string }>> {
     const result = await this.request<Record<string, unknown>>('/marshal/api/board', { body })
     if (!result.ok) return result
     const payload = result.data ?? {}
-    if (payload.ok === false || payload.code === 'conflict') {
+    if (payload.code === 'conflict') {
       return { ok: false, error: 'conflict', message: '看板已被别的修改抢先，请刷新后再改', code: 'conflict' }
     }
-    if (payload.code === 'queued' || payload.code === 'unsupported') {
-      return { ok: true, data: payload }
+    if (payload.code !== 'queued' || payload.ok === false) {
+      const code = typeof payload.code === 'string' ? payload.code : 'invalid'
+      return { ok: false, error: 'rejected', message: describeFailure('rejected', code), code }
     }
-    return { ok: true, data: payload }
+    return { ok: true, data: typeof payload.commandId === 'string' ? { commandId: payload.commandId } : {} }
   }
 
-  async memory(): Promise<ApiResult<Array<{ id: string; deviceId: string; layer: string; agent: string; text: string }>>> {
+  async memory(): Promise<ApiResult<Record<string, unknown>[]>> {
     const result = await this.request<{ entries?: unknown }>('/marshal/api/memory')
     if (!result.ok) return result
     const entries = Array.isArray(result.data?.entries) ? result.data.entries.flatMap((row) => {
       if (typeof row !== 'object' || row === null) return []
-      const item = row as Record<string, unknown>
-      if (typeof item.text !== 'string') return []
-      return [{
-        id: typeof item.id === 'string' ? item.id : '',
-        deviceId: typeof item.deviceId === 'string' ? item.deviceId : '',
-        layer: item.layer === 'workspace' ? 'workspace' : 'private',
-        agent: typeof item.agent === 'string' ? item.agent : '',
-        text: item.text,
-      }]
+      // Preserve optional snapshot metadata for the mobile galaxy normalizer.
+      return [row as Record<string, unknown>]
     }) : []
     return { ok: true, data: entries }
   }
@@ -494,9 +512,12 @@ export class MarshalApi {
   }
 
   async inputs(target: Target): Promise<ApiResult<InputCard[]>> {
-    const result = await this.request<{ cards?: unknown }>('/marshal/api/inputs', { body: { target } })
+    const result = await this.request<{ cards?: unknown; code?: string }>('/marshal/api/inputs', { body: { target } })
     if (!result.ok) return result
-    return { ok: true, data: parseCards((result.data as { cards?: unknown })?.cards) }
+    if (!Array.isArray(result.data?.cards)) {
+      return { ok: false, error: 'server', message: '待答快照暂不可用', code: result.data?.code }
+    }
+    return { ok: true, data: parseCards(result.data.cards) }
   }
 
   async history(target: Target, limit = 40, cursor?: string): Promise<ApiResult<{ items: HistoryItem[]; completeness: string; nextCursor?: string }>> {

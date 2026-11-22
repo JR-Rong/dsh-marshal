@@ -3,7 +3,7 @@ import { AccountLoginError } from "./account.js";
 import { controllerCommandAllowed, createPhoneHub, onceDecisionIds, parseBearer } from "./phone.js";
 import { DeviceStateError } from "./devices.js";
 import { DiscussionError } from "../discussions/types.js";
-import { handleMemorySyncMigrate, handleMemorySyncPull, handleMemorySyncPush } from "./memory-sync.js";
+import { accountOwnerForDevice, handleMemorySyncMigrate, handleMemorySyncPull, handleMemorySyncPush } from "./memory-sync.js";
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { COMMAND_OPS } from "../wire/frames.js";
 import { parseCommandArgs } from "../wire/commands.js";
@@ -388,6 +388,8 @@ export function registerMarshalRoutes(options) {
         ? createPhoneHub({
             now,
             store: options.deviceStore,
+            nodeConnection: id => registry.get(id)?.connectionId,
+            accountOwnerForNode: accountOwnerForDevice,
             findNode: (tokenDigest) => {
                 const row = options.deviceStore?.findByTokenDigest(tokenDigest);
                 return row !== undefined && row.role !== 'phone' ? row : undefined;
@@ -880,6 +882,20 @@ export function registerMarshalRoutes(options) {
             json(res, 400, { ok: false, code: error instanceof Error ? error.message : 'send-failed' });
         }
     }));
+    register('/marshal/api/task-rooms', guard(async (req, res) => {
+        if (req.method !== 'POST') { methodNotAllowed(res, 'POST'); return; }
+        const device = deviceFromBearer(req);
+        if (!device) { deny(res, 401, 'unauthorized'); return; }
+        if (!options.taskRooms) { deny(res, 503, 'task-rooms-unavailable'); return; }
+        const read = await readJsonBody(req, res, 512 * 1024);
+        if (!read.ok) return;
+        try { json(res, 200, { ok: true, ...await options.taskRooms.handle(device, read.value) }); }
+        catch (error) {
+            const code = typeof error?.code === 'string' && /^[a-z-]{2,64}$/.test(error.code) ? error.code : 'invalid-task-room';
+            const httpStatus = code === 'workspace-forbidden' ? 403 : code === 'task-room-not-found' ? 404 : 400;
+            json(res, httpStatus, { ok: false, code, message: code === 'invalid-task-room' ? '工单群请求或存储不可用。' : error.message });
+        }
+    }));
     register('/marshal/api/memory-sync/push', guard(async (req, res) => {
         await handleMemorySyncPush(req, res, { memorySync, deviceFromRequest: deviceFromBearer, operatorId });
     }));
@@ -1014,7 +1030,7 @@ export function registerMarshalRoutes(options) {
                 deny(res, 401, 'unauthorized');
                 return;
             }
-            json(res, 200, { ok: true, tasks: phone.tasksFor(), revisions: phone.revisions() });
+            json(res, 200, { ok: true, tasks: phone.tasksFor(), revisions: phone.revisions(), receipts: phone.receiptsFor(auth) });
             return;
         }
         if (req.method !== 'POST') {
@@ -1040,8 +1056,17 @@ export function registerMarshalRoutes(options) {
             deny(res, 401, 'unauthorized');
             return;
         }
-        const result = phone.writeTasks(auth, body);
-        json(res, result.conflict ? 409 : 202, { ok: !result.conflict, code: result.conflict ? 'conflict' : 'queued', tasks: result.tasks });
+        try {
+            const result = phone.writeTasks(auth, body);
+            json(res, result.conflict ? 409 : 202, {
+                ok: !result.conflict, code: result.conflict ? 'conflict' : 'queued',
+                tasks: result.tasks, revisions: phone.revisions(), commandId: result.commandId,
+            });
+        }
+        catch (error) {
+            const code = typeof error === 'object' && error !== null && error.code;
+            json(res, code === 'size-limit' ? 429 : 400, { ok: false, code: code === 'size-limit' ? 'size-limit' : 'invalid-args' });
+        }
     }));
     register('/marshal/api/memory', guard(async (req, res) => {
         if (phone === undefined) {
@@ -1054,11 +1079,12 @@ export function registerMarshalRoutes(options) {
             return;
         }
         if (req.method === 'GET') {
-            if (parsed.kind !== 'phone' || !phone.authenticate(parsed.token).ok) {
+            const auth = parsed.kind === 'phone' ? phone.authenticate(parsed.token) : undefined;
+            if (!auth?.ok) {
                 deny(res, 401, 'unauthorized');
                 return;
             }
-            json(res, 200, { ok: true, entries: phone.readMemory() });
+            json(res, 200, { ok: true, entries: phone.readMemory(auth) });
             return;
         }
         if (req.method !== 'POST' || parsed.kind !== 'node') {
@@ -1073,7 +1099,8 @@ export function registerMarshalRoutes(options) {
         const read = await readJsonBody(req, res, 65_536);
         if (!read.ok)
             return;
-        json(res, 200, { ok: true, entries: phone.writeMemory(auth, asRecord(read.value)?.entries) });
+        phone.writeMemory(auth, asRecord(read.value) ?? {});
+        json(res, 200, { ok: true });
     }));
     register('/marshal/api/roster', guard(async (req, res) => {
         if (phone === undefined) {

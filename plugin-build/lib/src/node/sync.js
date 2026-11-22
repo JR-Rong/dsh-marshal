@@ -52,8 +52,13 @@ export function createNodeSync(options) {
     /** 每个会话最近一次增量事件时间；用于阻止旧扫描覆盖更新的运行态/删除。 */
     const lastEventTs = new Map();
     const report = (error) => {
-        const name = error instanceof Error && error.name !== '' ? error.name : 'error';
-        options.logger?.warn(`marshal: sync failed: ${name}`);
+        const name = error === SYNC_TIMEOUT
+            ? 'sync-timeout'
+            : error instanceof Error && error.name !== '' ? error.name : 'error';
+        try {
+            options.logger?.warn(`marshal: sync failed: ${name}`);
+        }
+        catch { }
     };
     /** 能力文档只能声明本源 agent 或配置里的 agent；其它名字整份丢弃。 */
     const capabilityAgent = (agent, source) => {
@@ -65,15 +70,27 @@ export function createNodeSync(options) {
      * 采集有硬期限：超过 10s 不求部分结果，直接按 SYNC_TIMEOUT 处理。
      * 单个源的异常只把该 agent 标记为不可用，不让其它 agent 一起失败。
      */
-    const gather = async (timeoutMs) => {
+    const gather = async (timeoutMs, parentSignal) => {
         const abort = new AbortController();
         let timer;
+        let onParentAbort;
         const deadline = new Promise((_resolve, reject) => {
+            if (parentSignal?.aborted) {
+                abort.abort();
+                reject(SYNC_TIMEOUT);
+                return;
+            }
+            onParentAbort = () => {
+                abort.abort();
+                reject(SYNC_TIMEOUT);
+            };
+            parentSignal?.addEventListener('abort', onParentAbort, { once: true });
             timer = setTimeout(() => {
                 abort.abort();
                 reject(SYNC_TIMEOUT);
             }, timeoutMs);
         });
+        deadline.catch(() => { });
         try {
             const sources = await Promise.race([
                 Promise.all(options.sources.map(async (source) => {
@@ -94,6 +111,8 @@ export function createNodeSync(options) {
         finally {
             if (timer !== undefined)
                 clearTimeout(timer);
+            if (onParentAbort !== undefined)
+                parentSignal?.removeEventListener('abort', onParentAbort);
         }
     };
     const clearScan = () => {
@@ -217,47 +236,54 @@ export function createNodeSync(options) {
         }
         return { rows, capabilities };
     };
-    const waitAck = (syncId) => new Promise((resolve, reject) => {
-        waiter = { syncId, resolve, reject };
-        const current = infight;
-        if (current !== undefined) {
-            current.ackTimer = setTimeout(() => {
+    const waitAck = (syncId) => {
+        const promise = new Promise((resolve, reject) => {
+            waiter = { syncId, resolve, reject };
+            const current = infight;
+            if (current !== undefined) {
+                current.ackTimer = setTimeout(() => {
+                    if (waiter?.syncId === syncId)
+                        waiter = undefined;
+                    reject(SYNC_TIMEOUT);
+                }, ackTimeoutMs);
+            }
+            else {
                 waiter = undefined;
                 reject(SYNC_TIMEOUT);
-            }, ackTimeoutMs);
-        }
-        else {
-            reject(SYNC_TIMEOUT);
-        }
-    });
+            }
+        });
+        // Guard against synchronous sendControl failures rejecting ackPromise before `await ackPromise`.
+        promise.catch(() => { });
+        return promise;
+    };
     const run = async (syncId, flowVersion, signal) => {
-        const gathered = await gather(scanTimeoutMs);
-        if (disposed || signal.signal.aborted || infight?.syncId !== syncId)
-            return;
-        // 可达源自身列表不完整时仍不能提交，否则会把未列出的会话当成删除。
-        // 单源失败不同：该 agent 以不可用能力占位，其它 agent 仍可正常同步。
-        const listingIncomplete = gathered.sources.some(item => item.snapshot !== undefined && item.snapshot.completeness !== 'complete');
-        if (listingIncomplete) {
-            fail('sync-incomplete');
-            return;
-        }
-        const binding = link.handshake;
-        if (binding === undefined || link.state !== 'syncing') {
-            fail('sync-incomplete');
-            return;
-        }
-        const projected = projectGathered(gathered);
-        const chunks = buildSyncChunks(projected.rows);
-        const sessions = chunks.flat().filter(isSessionRow)
-            .flatMap(row => typeof row.sessionId === 'string' ? [row.sessionId] : []);
-        const begin = {
-            v: 2, type: 'sync.begin', syncId,
-            nodeEpoch: binding.nodeEpoch, connectionId: binding.connectionId,
-            scope: { agents: [...options.agents], sessions: [...new Set(sessions)] },
-            version: flowVersion, chunkCount: chunks.length,
-            highWatermark: options.highWatermark?.() ?? 0,
-        };
         try {
+            const gathered = await gather(scanTimeoutMs, signal.signal);
+            if (disposed || signal.signal.aborted || infight?.syncId !== syncId)
+                return;
+            // 可达源自身列表不完整时仍不能提交，否则会把未列出的会话当成删除。
+            // 单源失败不同：该 agent 以不可用能力占位，其它 agent 仍可正常同步。
+            const listingIncomplete = gathered.sources.some(item => item.snapshot !== undefined && item.snapshot.completeness !== 'complete');
+            if (listingIncomplete) {
+                fail('sync-incomplete');
+                return;
+            }
+            const binding = link.handshake;
+            if (binding === undefined || link.state !== 'syncing') {
+                fail('sync-incomplete');
+                return;
+            }
+            const projected = projectGathered(gathered);
+            const chunks = buildSyncChunks(projected.rows);
+            const sessions = chunks.flat().filter(isSessionRow)
+                .flatMap(row => typeof row.sessionId === 'string' ? [row.sessionId] : []);
+            const begin = {
+                v: 2, type: 'sync.begin', syncId,
+                nodeEpoch: binding.nodeEpoch, connectionId: binding.connectionId,
+                scope: { agents: [...options.agents], sessions: [...new Set(sessions)] },
+                version: flowVersion, chunkCount: chunks.length,
+                highWatermark: options.highWatermark?.() ?? 0,
+            };
             link.sendControl(encodeFrame(begin));
             for (const [index, rows] of chunks.entries()) {
                 link.sendControl(encodeFrame({
@@ -273,7 +299,7 @@ export function createNodeSync(options) {
                 checksum: syncChecksum(chunks),
             }));
             const ack = await ackPromise;
-            if (disposed || infight?.syncId !== syncId)
+            if (disposed || signal.signal.aborted || infight?.syncId !== syncId)
                 return;
             if (!ack.accepted) {
                 fail('sync-rejected');
@@ -306,7 +332,7 @@ export function createNodeSync(options) {
             startScan();
         }
         catch (error) {
-            if (disposed || infight?.syncId !== syncId)
+            if (disposed || signal.signal.aborted || infight?.syncId !== syncId)
                 return;
             // 超时/发送失败/ACK 丢失都不得放开写入。
             if (error === SYNC_TIMEOUT)
@@ -334,7 +360,7 @@ export function createNodeSync(options) {
             infight = undefined;
             return;
         }
-        void run(syncId, version, abort);
+        void run(syncId, version, abort).catch(report);
     };
     const scan = async () => {
         if (disposed || scanning || !link.online)
@@ -473,7 +499,7 @@ export function createNodeSync(options) {
     };
     function startScan() {
         clearScan();
-        const timer = setInterval(() => { void scan(); }, scanMs);
+        const timer = setInterval(() => { void scan().catch(report); }, scanMs);
         timer.unref();
         scanTimer = timer;
     }

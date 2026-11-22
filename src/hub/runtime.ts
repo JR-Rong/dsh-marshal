@@ -51,6 +51,7 @@ export function mountHub(webServer: WebServerLike, config: MarshalConfig, logger
       now: Date.now,
       ...(config.dshAccountHash === undefined ? {} : { ownerHash: config.dshAccountHash }),
       store: install.store,
+      nodeConnection: id => registry.get(id)?.connectionId,
       findNode: (tokenDigest) => {
         const row = install.store.findByTokenDigest(tokenDigest)
         return row !== undefined && row.role !== 'phone' ? row : undefined

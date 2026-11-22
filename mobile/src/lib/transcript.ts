@@ -23,8 +23,8 @@ export function historyToMessage(item: {
     case 'message.delta':
     case 'message.completed': return text ? { id, role: 'assistant', text, open: false, at } : null
     case 'reasoning.delta': return text ? { id, role: 'reason', text, open: false, at } : null
-    case 'tool.started': return { id, role: 'tool', text: '▶ ' + String(payload.name ?? payload.tool ?? 'tool'), open: false, at }
-    case 'tool.completed': return { id, role: 'tool', text: (payload.isError === true ? '✗ ' : '✓ ') + String(payload.content ?? '').slice(0, 400), open: false, at }
+    case 'tool.started': return { id, role: 'tool', text: '开始：' + String(payload.name ?? payload.tool ?? 'tool'), open: false, at }
+    case 'tool.completed': return { id, role: 'tool', text: (payload.isError === true ? '失败：' : '完成：') + String(payload.content ?? '').slice(0, 400), open: false, at }
     case 'turn.completed': return { id, role: 'system', text: '回合完成（' + String(payload.state ?? 'completed') + '）', open: false, at }
     default: return null
   }

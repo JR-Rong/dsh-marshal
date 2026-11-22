@@ -1,6 +1,6 @@
-# DSH 需要给手机中继补的接口
+# 手机中继使用的 DSH 接口
 
-节点已经按这份契约调用。方法不存在，或 `capabilities()` 没有声明对应写入时，节点不上报空数据，也不把写入当成成功。DSH 加上这些方法之后，下一次中继周期会自动开始用。
+节点按宿主实际提供的能力转发。写操作需要宿主声明对应操作及修订检查。
 
 服务名是 Cordis 服务：`taskBoard`、`memory`、`roster`。节点用 `ctx.get(name)` 取到对象。
 
@@ -18,7 +18,7 @@ snapshot(): {
 }
 ```
 
-`revision` 是这块看板的单调整数。没有这个字段时，节点仍转发任务正文，但拒绝任何写入。
+`revision` 是这块看板的单调非负安全整数。没有这个字段时，手机可以展示初始只读快照。缺失或过期的快照会保留 Hub 已有视图，实际空板仍用 `tasks: []` 上报。
 
 ## taskBoard.capabilities
 
@@ -29,7 +29,7 @@ capabilities(): {
 }
 ```
 
-节点只调用 `apply` 数组里列出的 kind。没有 `capabilities` 时，一个 kind 都不会调用。现在的 `apply` 遇到不认识的 kind 会原样返回快照，所以不能靠试调来判断。
+节点在 `revision: true` 且 `apply` 列出对应 kind 时才调用写入。宿主必须返回比 `baseRevision` 更高的修订才能确认成功。
 
 ## taskBoard.apply
 
@@ -55,14 +55,16 @@ apply(requestId: string, action): Promise<snapshot>
 
 ```
 readPhone({ allowContent: boolean, capBytes: number }): Promise<
-  | { entries: Array<{ id: string, layer: 'private' | 'workspace', agent: string, text: string }> }
+  | { entries: Array<{ id: string, layer: 'private' | 'workspace' | 'global', agent: string, text: string }> }
   | { code: 'withheld' | 'unavailable' }
 >
 ```
 
-`allowContent` 为 false，或内容共享关着时，返回 `{ code: 'withheld' }`，不要返回空数组。节点看到空数组会把它当成「这块记忆确实是空的」并覆盖 Hub 上的旧正文。读失败返回 `{ code: 'unavailable' }`。`capBytes` 是正文字节上限，超出的部分由 DSH 截断，节点不再发明内容。
+`allowContent` 为 false 或宿主撤回共享时返回 `{ code: 'withheld' }`，Hub 随即清除旧正文。读失败返回 `{ code: 'unavailable' }`，之前获授权的快照最多缓存 45 秒。`{ entries: [] }` 表示成功读到空集合。`capBytes` 是正文的 UTF-8 字节上限。
 
-`layer: 'private'` 对应全局 `rules` / `profile`。`layer: 'workspace'` 对应工作区 `handoff` / `notes`。`agent` 没有归属时用空串。
+节点只在 WebSocket 完成同步且握手同意内容共享时上报正文，并绑定当前 `connectionId` 与 `policyRevision`。Hub 在写入和读取时复核这两个值、设备的当前授权和所属账户。账户绑定可以来自配对登记或 Hub 显式配置的机主。历史客户端缺少这两个字段时无法发布正文。
+
+已装配的 Marshal 插件在宿主缺少 `memory.readPhone` 时提供 SQLite 投影。投影只读取可见性为 `all` 的当前全局记忆，标为 `global`。Agent 私有库、工作区正文、待审提案和 `no-group` 条目保留在原有存储和加密同步路径。
 
 ## roster.list
 
@@ -70,4 +72,4 @@ readPhone({ allowContent: boolean, capBytes: number }): Promise<
 list(): { agents: Array<{ id: string, name: string }> } | { code: 'unavailable' }
 ```
 
-`name` 是花名册里的显示名，例如「丞相」。账本不存在时返回 `{ code: 'unavailable' }`，不要编一个名字。节点在这个方法出现之前不会从别的文件猜花名册。
+`id` 是稳定的成员身份，`name` 是显示名。手机只读展示成员及其所属设备，通用新会话从设备的引擎入口发起。安装包开启 groups 时可以从现有 `dsh-agents` 账本提供队伍内成员，只上报身份和名字。账本缺失或读失败返回 `{ code: 'unavailable' }`。

@@ -6,7 +6,7 @@ import { encodeFrame, type CommandFrame, type DiscussionResultFrame } from '../w
 import { DISCUSSION_TURN_MS, WORK_TURN_MS, DISCUSSION_OUTPUT_BYTES, DiscussionTurnSchema,
   DiscussionStopSchema, DiscussionUsageSchema, DiscussionProgressSchema, discussionCode, type DiscussionProgress, type DiscussionPort, type DiscussionModel, type DiscussionTurn, type DiscussionUsage } from './types.ts'
 
-export function createNodeDiscussions(options: { port: DiscussionPort; journal: Journal; link(): NodeLink; enabled: boolean; now?: () => number }) {
+export function createNodeDiscussions(options: { port: DiscussionPort; journal: Journal; link(): NodeLink; enabled: boolean; now?: () => number; allowsTaskWorkspace?: (workspaceId: string) => boolean }) {
   const now = options.now ?? Date.now
   const jobs = new Map<string, { request: DiscussionTurn; abort: AbortController }>()
   let models: readonly DiscussionModel[] = []
@@ -36,9 +36,11 @@ export function createNodeDiscussions(options: { port: DiscussionPort; journal: 
       }
       const args = DiscussionTurnSchema.parse(raw)
       const link = options.link(); const binding = link.binding; const handshake = link.handshake
+      const workspaceAuthorized = () => args.taskWorkspaceId === undefined || options.allowsTaskWorkspace?.(args.taskWorkspaceId) === true
       if (!authorized() || !link.online || binding === undefined || handshake === undefined) throw new PreCallRejection('unsupported')
       if (frame.target.sessionId !== args.roomId) throw new PreCallRejection('session-purpose-conflict')
       if (args.policyRevision !== binding.policyRevision) throw new PreCallRejection('revision-conflict')
+      if (args.taskWorkspaceId !== undefined && (args.work !== undefined || !workspaceAuthorized())) throw new PreCallRejection('invalid-args')
       const remaining = args.expiresAt - (now() + handshake.serverTimeOffset)
       if (remaining <= 0 || remaining > (args.work ? WORK_TURN_MS : DISCUSSION_TURN_MS) + 1000) throw new PreCallRejection('expired')
       const model = models.find(m => m.id === args.modelId && m.agent === frame.target.agent)
@@ -61,7 +63,7 @@ export function createNodeDiscussions(options: { port: DiscussionPort; journal: 
           if (progressTimer) clearTimeout(progressTimer)
           progressTimer = undefined
           const current = options.link().handshake
-          if (!progress || abort.signal.aborted || !authorized() || !link.online || options.link().binding !== binding
+          if (!progress || abort.signal.aborted || !authorized() || !workspaceAuthorized() || !link.online || options.link().binding !== binding
             || current?.connectionId !== handshake.connectionId || current.nodeEpoch !== handshake.nodeEpoch) return
           // Full snapshots tolerate skipped intermediate frames without replaying text.
           link.sendControl(encodeFrame({ v: 2, type: 'discussion.progress', connectionId: handshake.connectionId,
@@ -70,12 +72,16 @@ export function createNodeDiscussions(options: { port: DiscussionPort; journal: 
           lastSent = performance.now(); progress = undefined
         }
         try {
-          if (!authorized() || options.link().binding !== binding) abort.abort()
+          if (!authorized() || !workspaceAuthorized() || options.link().binding !== binding) abort.abort()
           const text = await options.port.run(model, args.text, abort.signal, args.work, args.reasoning, value => {
             const parsed = DiscussionUsageSchema.safeParse(value)
             if (parsed.success) usage = parsed.data
           }, value => {
-            const parsed = DiscussionProgressSchema.safeParse(value)
+            const parsed = DiscussionProgressSchema.safeParse({
+              text: value?.text,
+              durationMs: value?.durationMs,
+              ...(value?.usage === undefined ? {} : { usage: value.usage }),
+            })
             if (!parsed.success) return
             progress = parsed.data
             if (progress.usage) usage = progress.usage
@@ -83,6 +89,7 @@ export function createNodeDiscussions(options: { port: DiscussionPort; journal: 
             else if (!progressTimer) { progressTimer = setTimeout(flush, 200); progressTimer.unref() }
           })
           if (Buffer.byteLength(text) > DISCUSSION_OUTPUT_BYTES) throw new Error('oversize')
+          if (!workspaceAuthorized()) throw new Error('workspace-revoked')
           result = { ...result, state: 'completed', text, checksum: createHash('sha256').update(text).digest('hex') }
         } catch (error) {
           result = { ...result, state: abort.signal.aborted ? 'cancelled' : 'failed', code: discussionCode(error) }

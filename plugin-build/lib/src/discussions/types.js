@@ -3,20 +3,24 @@ export const DISCUSSION_FEATURE = 'discussion-moderated-v1';
 export const DISCUSSION_INPUT_BYTES = 64 * 1024;
 export const DISCUSSION_OUTPUT_BYTES = 16 * 1024;
 export const DISCUSSION_TURN_MS = 120_000;
-export const WORK_TURN_MS = 10 * 60_000;
-export const WORK_ROOM_MS = 60 * 60_000;
+export const WORK_TURN_MS = 20 * 60_000;
+export const WORK_ROOM_MS = 90 * 60_000;
 export const DISCUSSION_ROOM_MS = 15 * 60_000;
 const id = z.string().min(1).max(128);
 export const DiscussionModelSchema = z.object({
     id, agent: z.enum(['dsh', 'codex', 'claude']), model: id, provider: id, work: z.boolean().optional(),
     reasoningEfforts: z.array(z.string().min(1).max(32)).max(12).optional(),
 }).strict();
-export const WorkScopeSchema = z.object({ workspace: z.string().min(2).max(2048).startsWith('/').refine(p => !/[\x00-\x1f]/.test(p)) }).strict();
+export const WorkScopeSchema = z.object({
+    workspace: z.string().min(2).max(2048).startsWith('/').refine(p => !/[\x00-\x1f]/.test(p)),
+    readOnly: z.boolean().optional(),
+}).strict();
 export const DiscussionTurnSchema = z.object({
     roomId: id, memberId: id, turnId: id, modelId: id,
     text: z.string().min(1).refine(text => Buffer.byteLength(text) <= DISCUSSION_INPUT_BYTES),
     expiresAt: z.number().int().positive(), policyRevision: z.number().int().nonnegative(),
     work: WorkScopeSchema.optional(),
+    taskWorkspaceId: z.string().min(1).max(256).optional(),
     reasoning: z.string().min(1).max(32).optional(),
 }).strict();
 export const DiscussionStopSchema = z.object({ roomId: id, memberId: id, turnId: id }).strict();

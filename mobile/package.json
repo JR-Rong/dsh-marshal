@@ -1,12 +1,12 @@
 {
   "name": "dsh-marshal-mobile",
-  "version": "0.6.0",
+  "version": "0.7.6",
   "private": true,
   "type": "module",
   "description": "调度官手机端 node（Android / iOS）：自绘界面直连 dsh-marshal Hub，不承载 hub、不监听端口",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "build": "tsc --noEmit && vite build --configLoader runner",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "test": "node --experimental-strip-types --test tests/*.test.ts",
