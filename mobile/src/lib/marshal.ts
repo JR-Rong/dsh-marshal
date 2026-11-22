@@ -7,7 +7,7 @@
  */
 import { Capacitor, CapacitorHttp } from '@capacitor/core'
 import type { MarshalConfig } from './config.ts'
-import { isActiveBoardStatus } from './tab-badges.ts'
+import { ticketFilter, type Ticket } from './tickets.ts'
 
 export const TOKEN_HEADER = 'x-marshal-token'
 
@@ -427,7 +427,7 @@ export class MarshalApi {
     return { ok: true, data: agents }
   }
 
-  async board(): Promise<ApiResult<{ tasks: Array<{ id: string; deviceId: string; title: string; detail: string; status: string; revision: number }>; revisions: Record<string, number>; receipts: BoardReceipt[] }>> {
+  async board(): Promise<ApiResult<{ tasks: Ticket[]; revisions: Record<string, number>; receipts: BoardReceipt[] }>> {
     const result = await this.request<{ tasks?: unknown; revisions?: unknown; receipts?: unknown }>('/marshal/api/board')
     if (!result.ok) return result
     const revisions: Record<string, number> = {}
@@ -445,7 +445,9 @@ export class MarshalApi {
         deviceId: typeof item.deviceId === 'string' ? item.deviceId : '',
         title: item.title,
         detail: typeof item.detail === 'string' ? item.detail : '',
-        status: typeof item.status === 'string' && (isActiveBoardStatus(item.status) || item.status === 'done') ? item.status : 'todo',
+        ...(typeof item.template === 'string' ? { template: item.template } : {}),
+        ...(typeof item.roomId === 'string' && item.roomId ? { roomId: item.roomId } : {}),
+        status: typeof item.status === 'string' && ticketFilter(item.status) ? item.status : 'todo',
         revision: typeof item.revision === 'number' ? item.revision : 0,
       }]
     }) : []

@@ -681,12 +681,12 @@ select.mini-select:disabled { opacity: .45; }
 }
 .tab-badge.offline { min-width: var(--dot-size); min-height: var(--dot-size); padding: 0; }
 
-.theme-options, .segments, .board-title-actions {
+.theme-options, .segments {
   display: flex;
   gap: var(--space-2);
 }
 .theme-options { flex-wrap: wrap; }
-.theme-options button, .segments button, .board-title-actions button, .screen-board .choices button {
+.theme-options button, .segments button {
   min-height: var(--tap-min);
 }
 .theme-options button[aria-pressed="true"], .segments button[aria-pressed="true"] {
@@ -701,8 +701,6 @@ select.mini-select:disabled { opacity: .45; }
   margin-bottom: var(--space-4);
 }
 .segments button { flex: 1; }
-.board-title-editor, .board-create button { margin-top: var(--space-2); }
-.board-title-actions { margin-top: var(--space-2); }
 
 /* ------------------------------ 对话 ------------------------------ */
 
@@ -914,32 +912,158 @@ select.mini-select:disabled { opacity: .45; }
   * { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
 }
 
-.modal-drawer {
-  background: var(--surface);
-  color: var(--text);
-  border: 1px solid var(--separator);
-  border-radius: var(--radius-card) var(--radius-card) 0 0;
-  max-height: 80vh;
-  width: min(100%, 560px);
-  max-width: 100%;
-  margin: auto auto 0;
-  padding: 0 0 var(--safe-bottom);
-}
-.modal-drawer::backdrop { background: rgba(0, 0, 0, .42); }
-.modal-drawer-header, .modal-drawer-body { padding: var(--space-4); }
-.modal-drawer-header { position: sticky; top: 0; }
-.modal-drawer-body { background: var(--surface); }
-
-.topbar, .tabbar, .modal-drawer-header {
+.topbar, .tabbar {
   background: var(--glass);
   backdrop-filter: blur(24px) saturate(180%);
   -webkit-backdrop-filter: blur(24px) saturate(180%);
 }
 
 @media (prefers-reduced-transparency: reduce) {
-  .topbar, .tabbar, .modal-drawer-header {
+  .topbar, .tabbar {
     backdrop-filter: none;
     -webkit-backdrop-filter: none;
     background: var(--surface);
   }
+}
+
+/* PR7 · 工单中心：内容实底，只有抽屉遮罩使用磨砂。 */
+.ticket-revision { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ticket-add {
+  display: grid;
+  place-items: center;
+  width: var(--tap-min);
+  height: var(--tap-min);
+  min-height: var(--tap-min);
+  padding: 0;
+  border-radius: var(--radius-pill);
+}
+.ticket-add svg, .ticket-group-back svg {
+  width: var(--tab-icon-size);
+  height: var(--tab-icon-size);
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  flex: none;
+}
+.ticket-filters, .ticket-stages {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--space-1);
+}
+.ticket-filters {
+  margin-block: var(--space-2) var(--space-4);
+  padding: var(--space-1);
+  border-radius: var(--radius-control);
+  background: var(--fill);
+}
+.ticket-filters button {
+  min-height: var(--tap-min);
+  padding: var(--space-1);
+  border-radius: var(--radius-control);
+  font-size: var(--font-caption);
+  color: var(--secondary);
+  background: transparent;
+}
+.ticket-filters [aria-pressed="true"] { color: var(--text); background: var(--surface); box-shadow: var(--shadow); font-weight: 600; }
+.ticket-list { display: grid; gap: var(--space-2); }
+.ticket-list .ticket-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  justify-items: start;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+  padding: var(--space-4);
+  text-align: start;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--separator);
+}
+.ticket-list .ticket-card:active { opacity: 1; background: var(--surface-2); }
+.ticket-card strong, .ticket-card-footer { grid-column: 1 / -1; overflow-wrap: anywhere; }
+.ticket-card .ticket-revision { grid-column: 2; grid-row: 1; }
+.ticket-card .ticket-revision, .ticket-meta, .ticket-field label, .ticket-sheet-body [role="status"] { color: var(--secondary); }
+.ticket-card:focus-visible, .ticket-add:focus-visible {
+  outline: var(--focus-ring-width, 2px) solid var(--accent);
+  outline-offset: var(--space-1);
+}
+.ticket-card-footer, .ticket-card .ticket-revision, .ticket-meta, .ticket-stages { font-size: var(--font-caption); }
+.ticket-card-footer { color: var(--accent); }
+.ticket-status.attention { background: var(--warning-soft); color: var(--orange); }
+.ticket-status.running { background: var(--accent-soft); color: var(--accent); }
+.ticket-status.done { background: var(--fill); color: var(--text); }
+.ticket-sheet {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--separator);
+  border-radius: var(--radius-card) var(--radius-card) 0 0;
+  max-height: 80vh;
+  max-height: 85dvh;
+  width: min(100%, 560px);
+  max-width: 100%;
+  margin: auto auto 0;
+  padding: 0 0 var(--safe-bottom);
+  overscroll-behavior: contain;
+}
+.ticket-sheet::backdrop {
+  background: color-mix(in srgb, var(--toast-bg) 50%, transparent);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+}
+.ticket-sheet-header {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--surface);
+  padding: var(--space-2) var(--space-4) 0;
+  border-bottom: 1px solid var(--separator);
+}
+.ticket-sheet-header .row-between { padding: 0; }
+.ticket-sheet-header h2 { font-size: inherit; }
+.ticket-handle {
+  width: var(--tap-min);
+  height: var(--space-1);
+  margin: 0 auto var(--space-1);
+  border-radius: var(--radius-pill);
+  background: var(--separator);
+}
+.ticket-sheet-body, .ticket-sheet-actions, .ticket-field { display: grid; gap: var(--space-2); min-width: 0; }
+.ticket-sheet-body { padding: var(--space-4); gap: var(--space-4); overflow-wrap: anywhere; }
+.ticket-sheet-body h3 { font-size: inherit; margin: 0; }
+.ticket-sheet-body [role="status"]:empty { display: none; }
+.ticket-sheet-actions { padding-top: var(--space-2); border-top: 1px solid var(--separator); }
+.ticket-sheet-actions .choices { margin: 0; }
+.ticket-sheet button, .ticket-sheet-actions .choices button, .screen-ticketGroup .icon-button { min-height: var(--tap-min); }
+.ticket-stages { padding: 0; margin: 0; list-style: none; }
+.ticket-stages li { border-top: var(--space-1) solid var(--separator); padding-top: var(--space-2); color: var(--secondary); }
+.ticket-stages li.reached { border-color: var(--accent); }
+.ticket-stages li[aria-current] { color: var(--text); font-weight: 700; }
+.ticket-requirements { white-space: pre-wrap; }
+.ticket-diff {
+  margin: var(--space-2) 0 0;
+  max-height: 28vh;
+  overflow: auto;
+  padding: var(--space-2);
+  font-size: var(--font-caption);
+  border-radius: var(--radius-control);
+  background: var(--fill);
+}
+.ticket-diff span { display: inline-block; min-width: 100%; }
+.ticket-diff .diff-add { background: var(--accent-soft); color: var(--accent); }
+.ticket-diff .diff-remove { background: var(--danger-soft); color: var(--red); }
+.ticket-diff .diff-hunk, .ticket-diff .diff-file { font-weight: 700; }
+.ticket-group-link, .ticket-group-back { color: var(--accent); background: var(--accent-soft); }
+.ticket-group-back {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-height: var(--tap-min);
+  padding: var(--space-1) var(--space-2);
+  font-size: var(--font-caption);
+  white-space: nowrap;
+}
+.screen-ticketGroup .topbar .title strong { font-size: inherit; }
+@media (prefers-reduced-transparency: reduce) {
+  .ticket-sheet::backdrop { -webkit-backdrop-filter: none; backdrop-filter: none; }
 }

@@ -33,7 +33,11 @@ import { computeTabBadges, formatTabBadge, scheduleBoardPoll } from './lib/tab-b
 import { createPendingInputs, inputTarget, inputTargetKey } from './lib/pending-inputs.ts'
 import { APP_TITLE, APP_VERSION, CLIENT_ONLY_NOTE } from './lib/version.ts'
 
-type View = 'booting' | 'setup' | 'lock' | 'home' | 'sessions' | 'session' | 'controls' | 'groups' | 'groupRoom' | 'groupNew' | 'settings' | 'board' | 'agents' | 'memory'
+import { TICKET_TEMPLATES, filterTickets, ticketFilter, ticketStageIndex, parseDiffPreview, reduceTicketNavigation,
+  TicketWrites, ticketBackAction, ticketWriteBlocked, ticketWriteKey,
+  type Ticket, type TicketRef, type TicketFilter, type TicketNavigation, type TicketWriteState } from './lib/tickets.ts'
+
+type View = 'booting' | 'setup' | 'lock' | 'home' | 'sessions' | 'session' | 'controls' | 'groups' | 'groupRoom' | 'ticketGroup' | 'groupNew' | 'settings' | 'board' | 'agents' | 'memory'
 
 type Role = 'user' | 'assistant' | 'reason' | 'tool' | 'system'
 
@@ -165,6 +169,7 @@ function tabIcon(kind: string): SVGElement {
   svg.setAttribute('viewBox', '0 0 24 24')
   svg.setAttribute('aria-hidden', 'true')
   const paths: Record<string, string> = {
+    plus: 'M12 5v14 M5 12h14',
     device: 'M8 3.5h8a2 2 0 0 1 2 2v13a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2v-13a2 2 0 0 1 2-2Z M10.5 17.5h3',
     chat: 'M4.5 6.5A2.5 2.5 0 0 1 7 4h10a2.5 2.5 0 0 1 2.5 2.5v6A2.5 2.5 0 0 1 17 15H9l-4.5 3.5v-12Z',
     board: 'M4.5 5.5h15v6h-15z M4.5 15h7v4h-7z M14.5 15h5v4h-5z',
@@ -180,7 +185,7 @@ function tabBar(): HTMLElement {
   const badges = computeTabBadges(boardTasks, pendingInputs.waitingCounts(), state.online && !hubUnavailable)
   return el('nav', { class: 'tabbar', 'aria-label': '主导航' },
     ...TAB_ITEMS.map(({ view, label, icon }) => {
-      const active = view === state.view
+      const active = view === state.view || (view === 'sessions' && state.view === 'ticketGroup')
       const count = view === 'board' ? badges.board : view === 'sessions' ? badges.sessions : 0
       const offline = view === 'home' && badges.home
       return el('button', {
@@ -204,6 +209,12 @@ function refreshTabBar(): void {
 
 function switchTab(view: View): void {
   if (view === state.view) return
+  if (state.view === 'ticketGroup') {
+    ticketGroupOpen++
+    ticketNav = reduceTicketNavigation(ticketNav, { type: 'close' })
+    state.room = null
+    state.groupBusy = false
+  }
   if (view === 'home') { state.view = 'home'; render(); void refreshDevices(); return }
   if (view === 'sessions') {
     state.view = 'sessions'
@@ -222,11 +233,11 @@ function switchTab(view: View): void {
 }
 
 function render(): void {
-  if (state.view !== 'groupRoom') stopGroupPoll()
+  if (state.view !== 'groupRoom' && state.view !== 'ticketGroup') stopGroupPoll()
   if (!showingMemory()) clearTimeout(memoryPoll)
   const app = rootNode()
   clear(app)
-  const withTabs = TAB_VIEWS.has(state.view)
+  const withTabs = TAB_VIEWS.has(state.view) || state.view === 'ticketGroup'
   app.className = 'app screen-' + state.view + (withTabs ? ' has-tabs' : '')
   for (const child of screenChildren()) {
     // 浏览器 append(null) 会渲染出 "null" 字样，必须先过滤空槽位。
@@ -234,6 +245,7 @@ function render(): void {
     app.append(child as Node)
   }
   if (withTabs) app.append(tabBar())
+  if (state.view === 'board') { refreshTicketList(); updateTicketSheet() }
 }
 
 function screenChildren(): Child[] {
@@ -247,6 +259,7 @@ function screenChildren(): Child[] {
     case 'controls': return controlsView()
     case 'groups': return groupsView()
     case 'groupRoom': return groupRoomView()
+    case 'ticketGroup': return ticketGroupView()
     case 'groupNew': return groupNewView()
     case 'settings': return settingsView()
     case 'board': return boardView()
@@ -376,6 +389,7 @@ export async function start(): Promise<void> {
     const reconnected = online && !state.online
     state.online = online
     if (state.view === 'home') render()
+    else if (state.view === 'board') { refreshTicketList(); refreshTabBar() }
     else refreshTabBar()
     if (reconnected && state.api && !appLocked()) {
       void refreshDevices()
@@ -392,6 +406,9 @@ export async function start(): Promise<void> {
 async function registerBackButton(): Promise<void> {
   disposeBack?.()
   disposeBack = await watchBackButton(() => {
+    const ticketBack = ticketBackAction(Boolean(rootNode().querySelector('.ticket-sheet[open]')), state.view === 'ticketGroup')
+    if (ticketBack === 'close-sheet') { closeTicketSheet(); return true }
+    if (ticketBack === 'return-to-ticket') { returnToTicket(); return true }
     const parent: Partial<Record<View, View>> = {
       settings: 'home', sessions: 'home', session: 'sessions', controls: 'session', groups: groupsParent, groupRoom: 'groups', groupNew: 'groups', memory: 'home',
     }
@@ -417,7 +434,7 @@ async function enterApp(): Promise<void> {
   state.sessions = []
   state.deviceId = null
   hubUnavailable = false
-  boardEdit = null
+  resetTicketBoard()
   agentsSegment = 'members'
   boardTasks = []
   boardRevisions = {}
@@ -500,7 +517,7 @@ async function refreshDevices(): Promise<void> {
     return
   }
   if (state.view === 'home' || (state.view === 'agents' && agentsSegment === 'members')) render()
-  else if (state.view === 'board' && !boardEdit && !rootNode().querySelector('.modal-drawer[open], .board-create input:focus')) render()
+  else if (state.view === 'board') { refreshTicketList(); updateTicketSheet(); refreshTabBar() }
   else refreshTabBar()
 }
 
@@ -1212,7 +1229,7 @@ let hubUnavailable = false
 let sessionQuery = ''
 let sessionLimit = SESSION_PAGE_SIZE
 let roster: RosterEntry[] = []
-let boardTasks: Array<{ id: string; deviceId: string; title: string; detail: string; status: string; revision: number }> = []
+let boardTasks: Ticket[] = []
 let boardRevisions: Record<string, number> = {}
 let boardReceipts: BoardReceipt[] = []
 let boardPoll: ReturnType<typeof setTimeout> | undefined
@@ -1567,8 +1584,10 @@ function controlsView(): Child[] {
 /* ------------------------------ 群聊（账号 ticket） ------------------------------ */
 
 let groupPoll: ReturnType<typeof setInterval> | null = null
+let groupPollGeneration = 0
 
 function stopGroupPoll(): void {
+  groupPollGeneration++
   groupStream?.close()
   groupStream = null
   if (groupPoll) { clearInterval(groupPoll); groupPoll = null }
@@ -1577,6 +1596,7 @@ function stopGroupPoll(): void {
 let groupStream: StreamHandle | null = null
 function startGroupPoll(): void {
   stopGroupPoll()
+  const generation = groupPollGeneration
   const api = phoneApi()
   if (api) {
     void openEventStream({
@@ -1584,10 +1604,13 @@ function startGroupPoll(): void {
       token: api.token,
       id: 'groups',
       onFrame: () => { void refreshRoom(true) },
-    }).then((handle) => { groupStream = handle })
+    }).then((handle) => {
+      if (generation === groupPollGeneration) groupStream = handle
+      else handle.close()
+    })
   }
   groupPoll = setInterval(() => {
-    if (state.view === 'groupRoom') void refreshRoom(true)
+    if (state.view === 'groupRoom' || state.view === 'ticketGroup') void refreshRoom(true)
   }, 4_000)
 }
 
@@ -1785,20 +1808,22 @@ async function loadBoard(quiet = false): Promise<void> {
   const load = ++boardLoad
   const result = await api.board()
   if (load !== boardLoad || state.api !== api || appLocked()) return
-  const beforeEdit = boardEdit && boardEditorStatus(boardEdit)
   if (result.ok) {
     boardTasks = result.data.tasks
     boardRevisions = result.data.revisions
     boardReceipts = result.data.receipts
-    reconcileBoardEdit()
-  } else if (!quiet && state.view === 'board') toast(result.message, 'error')
-  const queued = Boolean(boardEdit?.commandId) || boardReceipts.some(receipt => receipt.state === 'queued')
-  boardPoll = scheduleBoardPoll(queued,
+    ticketWrites.refreshed()
+    boardError = ''
+  } else if (!quiet || !boardTasks.length) boardError = result.message
+  boardLoaded = true
+  boardPoll = scheduleBoardPoll(boardReceipts.some(receipt => receipt.state === 'queued'),
     () => state.api === api && !appLocked() && state.view !== 'setup' && !document.hidden && state.online,
     () => { void loadBoard(true) }, setTimeout)
-  if (state.view === 'board' && !rootNode().querySelector('.modal-drawer[open], .board-create input:focus')
-    && (!boardEdit || beforeEdit !== boardEditorStatus(boardEdit))) renderBoardEditor()
-  else refreshTabBar()
+  if (state.view === 'board') {
+    refreshTicketList()
+    if (!quiet || !rootNode().querySelector('.modal-drawer :is(input, textarea, select):focus')) updateTicketSheet()
+  }
+  refreshTabBar()
 }
 
 function scheduleBoardRefresh(): void {
@@ -1807,184 +1832,380 @@ function scheduleBoardRefresh(): void {
   void loadBoard(true)
 }
 
-async function writeBoard(body: Record<string, unknown>, onAccepted?: () => void): Promise<void> {
-  const api = phoneApi()
-  if (!api) return
-  const result = await api.boardWrite(body)
-  if (state.api !== api || state.view !== 'board') return
-  if (!result.ok) { toast(result.message, 'error'); return }
-  onAccepted?.()
-  toast(result.data.commandId ? '已排队，等待电脑回执' : '已排队，请刷新看板确认结果')
-  await loadBoard()
-}
-
 const BOARD_RECEIPT_ACTION = { create: '新建', edit: '修改', move: '移动', delete: '删除' }
 const BOARD_RECEIPT_STATE = { queued: '等待回执', applied: '已应用', rejected: '已拒绝', unconfirmed: '结果未确认' }
 const BOARD_RECEIPT_REASON: Record<string, string> = {
-  conflict: '看板修订冲突',
-  unsupported: '电脑未启用该操作',
-  unavailable: '电脑未返回有效修订',
-  expired: '未在时限内收到回执',
+  conflict: '看板修订冲突', unsupported: '电脑未启用该操作',
+  unavailable: '电脑未返回有效修订', expired: '未在时限内收到回执',
 }
 const BOARD_STATUS_LABELS: Record<string, string> = {
-  todo: '待办', doing: '进行中', done: '完成', attention: '待确认', 'pending-confirmation': '待确认',
+  todo: '待办', doing: '执行中', running: '执行中', review: '审查中', done: '已验收',
+  attention: '待确认', 'pending-confirmation': '待确认', '待确认': '待确认',
 }
+const TICKET_STAGES = ['设计拆分', '隔离编码', '交叉审查', '机主验收']
+const TICKET_FILTERS = { all: '全部', attention: '待确认', running: '执行中', done: '已验收' } as const
 
-interface BoardEdit {
+let ticketNav: TicketNavigation = { view: 'list' }
+let boardFilter: TicketFilter = 'all'
+let boardQuery = ''
+let boardLoaded = false
+let boardError = ''
+let ticketGroupError = ''
+let ticketGroupOpen = 0
+let ticketReturnFocus: HTMLElement | null = null
+interface TicketDraft {
+  notice: string
+  editTitle?: string
+  editRevision?: number
+  editCommandId?: string
+  deleteRevision?: number
+}
+interface CreateTicketDraft extends TicketDraft {
   deviceId: string
-  taskId: string
+  template: string
   title: string
-  baseRevision: number
-  saving: boolean
-  conflict?: boolean
+  detail: string
   commandId?: string
-  notice?: string
 }
-let boardEdit: BoardEdit | null = null
+let ticketDraft: TicketDraft = { notice: '' }
+let createTicketDraft: CreateTicketDraft | null = null
+const ticketWrites = new TicketWrites()
+const ticketKey = (ticket: TicketRef) => ticketWriteKey(ticket.deviceId, ticket.id)
+const boardReceipt = (id?: string) => boardReceipts.find(row => row.id === id)
+const deviceName = (id: string) => state.devices.find(device => device.id === id)?.name ?? id
+const rev = (revision: number | undefined) => el('span', { class: 'ticket-revision', text: `rev #${revision ?? '—'}` })
 
-function editedTask(edit: BoardEdit) {
-  return boardTasks.find(task => task.deviceId === edit.deviceId && task.id === edit.taskId)
+function resetTicketBoard(): void {
+  ticketNav = { view: 'list' }
+  ticketDraft = { notice: '' }
+  createTicketDraft = null
+  ticketReturnFocus = null
+  ticketWrites.clear()
+  boardLoaded = false
+  boardError = boardQuery = ''
+  boardFilter = 'all'
 }
 
-function reconcileBoardEdit(): void {
-  const edit = boardEdit
-  if (!edit?.commandId) return
-  const receipt = boardReceipts.find(row => row.id === edit.commandId)
-  if (!receipt || receipt.state === 'queued') return
-  edit.commandId = undefined
-  if (receipt.state === 'applied') { boardEdit = null; return }
-  edit.conflict = receipt.code === 'conflict'
-  edit.notice = BOARD_RECEIPT_REASON[receipt.code ?? ''] ?? BOARD_RECEIPT_STATE[receipt.state]
+function selectedTicket(): Ticket | undefined {
+  const nav = ticketNav
+  return nav.view === 'list' ? undefined : boardTasks.find(task => ticketKey(task) === ticketKey(nav.ticket))
 }
 
-function boardEditorStatus(edit: BoardEdit): string {
-  const task = editedTask(edit)
-  const revision = boardRevisions[edit.deviceId]
-  if (!task) return '工单已不在当前看板。草稿仍可复制。'
-  if (edit.commandId) return '已排队，等待电脑回执。'
-  if (edit.conflict || revision !== edit.baseRevision) {
-    return `看板修订冲突 · 当前修订 ${revision ?? '未知'} · 当前标题「${task.title}」`
-      + (revision === undefined || edit.conflict && revision === edit.baseRevision ? '。等待最新修订。' : '。确认后可用该修订重试。')
+function receiptLabel(commandId?: string, deviceId?: string): string {
+  const receipt = boardReceipt(commandId)
+  if (!receipt) {
+    // Server receipts do not expose task IDs. Label a device-level fallback explicitly.
+    const latest = !commandId && boardReceipts.find(row => row.deviceId === deviceId)
+    if (latest) return '本机最近操作：' + receiptLabel(latest.id)
+    return commandId ? '未找到回执。请核对当前看板再操作。' : '暂无回执'
   }
-  return edit.notice ?? ''
+  const reason = receipt.code && BOARD_RECEIPT_REASON[receipt.code]
+  return `${BOARD_RECEIPT_ACTION[receipt.action]} · ${BOARD_RECEIPT_STATE[receipt.state]}${reason ? `（${reason}）` : ''}`
 }
 
-function renderBoardEditor(): void {
-  const active = document.activeElement
-  const input = active instanceof HTMLInputElement && active.closest('.board-title-editor') ? active : null
-  render()
-  if (input && boardEdit) {
-    const next = rootNode().querySelector<HTMLInputElement>('.board-title-editor input')
-    next?.focus()
-    next?.setSelectionRange(input.selectionStart, input.selectionEnd)
+function writeStatus(write?: TicketWriteState, deviceId?: string): string {
+  if (write?.phase === 'submitting') return '正在提交…'
+  if (write?.phase === 'refreshing') return [write.notice, '请同步看板以核对结果。'].filter(Boolean).join(' ')
+  return write?.notice || receiptLabel(write?.commandId, deviceId)
+}
+
+function retryTicketSync(write?: TicketWriteState): HTMLElement | null {
+  return write?.phase === 'refreshing'
+    ? button('同步看板', () => { void loadBoard() }, { id: 'ticket-sync', type: 'button' }) : null
+}
+
+async function writeBoard(
+  draft: TicketDraft,
+  body: { deviceId: string; baseRevision: number; action: BoardReceipt['action']; taskId?: string; [key: string]: unknown },
+  onAccepted: (commandId?: string) => void,
+): Promise<void> {
+  const api = phoneApi()
+  if (!api) return
+  const key = ticketWriteKey(body.deviceId, body.taskId)
+  if (boardRevisions[body.deviceId] !== body.baseRevision) {
+    draft.notice = '看板修订已更新，请核对后重试。'
+    draft.deleteRevision = undefined
+    updateTicketSheet(true)
+    return
   }
+  const attempt = ticketWrites.begin(key, boardReceipt(ticketWrites.get(key)?.commandId)?.state)
+  if (!attempt) return
+  draft.notice = ''
+  updateTicketSheet(true)
+  const result = await api.boardWrite(body)
+  if (state.api !== api) return
+  ticketWrites.finish(key, attempt, result.ok
+    ? { commandId: result.data.commandId, notice: result.data.commandId ? undefined : '未收到回执编号。请核对当前看板。' }
+    : { notice: result.error === 'conflict' ? '看板已被别的修改抢先，请核对后再改。'
+      : (result.code && BOARD_RECEIPT_REASON[result.code]) || result.message })
+  if (result.ok) {
+    onAccepted(result.data.commandId)
+  }
+  updateTicketSheet()
+  await loadBoard(true)
 }
 
-function boardTitleEditor(edit: BoardEdit): HTMLElement {
-  const revision = boardRevisions[edit.deviceId]
-  const changed = edit.conflict || revision !== edit.baseRevision
-  const blocked = !editedTask(edit) || revision === undefined || edit.conflict && revision === edit.baseRevision
-  const input = el('input', {
-    type: 'text', value: edit.title, required: true, 'aria-label': '新工单标题',
-    readonly: edit.saving || edit.commandId ? true : undefined, onInput: () => { edit.title = input.value },
-  })
-  const save = el('button', { type: 'submit', disabled: blocked || edit.saving || Boolean(edit.commandId),
-    class: 'primary', text: changed ? '确认并重试' : '保存标题' })
-  return el('form', { class: 'board-title-editor', onSubmit: (event) => {
-    event.preventDefault()
-    const title = edit.title.trim()
-    const api = phoneApi()
-    if (!api || !title || save.disabled || revision === undefined) return
-    // Only use the revision actually shown to the user; a newer one needs its own confirmation.
-    if (revision !== boardRevisions[edit.deviceId] || !editedTask(edit)) { renderBoardEditor(); return }
-    edit.baseRevision = revision
-    edit.saving = save.disabled = input.readOnly = true
-    void api.boardWrite({ deviceId: edit.deviceId, taskId: edit.taskId, baseRevision: revision, action: 'edit', title }).then(async result => {
-      if (state.api !== api || boardEdit !== edit) return
-      edit.saving = false
-      if (result.ok) {
-        edit.commandId = result.data.commandId
-        edit.conflict = false
-        edit.notice = edit.commandId ? undefined : '已排队，但未收到回执编号。请先核对看板。'
-      } else {
-        edit.conflict = result.error === 'conflict' || result.code === 'conflict'
-        edit.notice = result.message
-      }
-      if (state.view === 'board') renderBoardEditor()
-      await loadBoard(true)
-    })
-  } }, input, el('p', { role: 'status', text: boardEditorStatus(edit) }),
-  el('div', { class: 'board-title-actions' }, save, button('取消', () => {
-    boardEdit = null
-    render()
-  }, { type: 'button', disabled: edit.saving })))
+function boardHost(): string {
+  const selected = state.deviceId
+  const id = selected && boardRevisions[selected] !== undefined ? selected
+    : Object.keys(boardRevisions)[0] ?? selected ?? state.devices[0]?.id
+  return id || ''
 }
 
-function confirmBoardDelete(task: typeof boardTasks[number]): void {
-  const revision = boardRevisions[task.deviceId]
-  if (revision === undefined) return
-  const dialog = el('dialog', { class: 'modal-drawer', 'aria-labelledby': 'delete-board-title' },
-    el('header', { class: 'modal-drawer-header' }, el('h2', { id: 'delete-board-title', text: '删除工单？' })),
-    el('div', { class: 'modal-drawer-body' }, el('p', { text: task.title }),
-      el('div', { class: 'choices' }, button('取消', () => dialog.close(), { autofocus: true }),
-        button('删除', () => {
-          dialog.close()
-          void writeBoard({ deviceId: task.deviceId, action: 'delete', taskId: task.id, baseRevision: revision })
-        }, { class: 'danger' }))))
-  dialog.addEventListener('close', () => { dialog.remove(); if (state.view === 'board') refreshTabBar() })
-  rootNode().append(dialog)
-  dialog.showModal()
+function refreshTicketList(): void {
+  const list = rootNode().querySelector('.ticket-list')
+  if (!list) return
+  const ids = Object.keys(boardRevisions)
+  const host = boardHost()
+  const summary = rootNode().querySelector('.ticket-summary')
+  summary?.replaceChildren(document.createTextNode(host ? `工作区 · ${deviceName(host)}${ids.length > 1 ? ` · ${ids.length} 台主机` : ''} · ` : '工作区 · 暂无主机 · '), rev(boardRevisions[host]))
+  const rows = filterTickets(boardTasks, boardFilter, boardQuery)
+  const focusedKey = (document.activeElement as HTMLElement | null)?.dataset.ticketKey
+  list.replaceChildren()
+  if (!phoneApi()) list.append(el('p', { class: 'banner', text: '请在节点页扫描电脑配对码，以管理工单。' }))
+  else if (!state.online) list.append(el('p', { class: 'banner', text: '当前离线，显示最近同步的工单。' }))
+  if (boardError) list.append(el('div', { class: 'banner error' }, el('p', { text: boardError }), button('重试', () => { void loadBoard() })))
+  for (const task of rows) {
+    const card = el('button', { type: 'button', class: 'card ticket-card', 'data-ticket-key': ticketKey(task),
+      onClick: () => openTicket(task, card) },
+      el('span', { class: `chip ticket-status ${ticketFilter(task.status) ?? ''}`, text: BOARD_STATUS_LABELS[task.status] ?? task.status }),
+      el('strong', { text: task.title }), rev(task.revision),
+      el('span', { class: 'ticket-card-footer', text: '工单详情 / 工单群 ›' }))
+    list.append(card)
+    if (focusedKey === ticketKey(task)) card.focus({ preventScroll: true })
+  }
+  if (phoneApi() && !rows.length && !boardError) list.append(el('p', { class: 'empty', text:
+    !boardLoaded ? '正在读取工单…' : boardTasks.length ? '没有符合条件的工单。' : '暂无工单。' }))
 }
 
 function boardView(): Child[] {
-  const title = el('input', { type: 'text', placeholder: '新工单标题', 'aria-label': '新工单标题' })
-  const deviceId = state.deviceId || boardTasks[0]?.deviceId || Object.keys(boardRevisions)[0] || state.devices[0]?.id || ''
-  const head = boardRevisions[deviceId]
-  return [
-    topbar('工单', '任务看板', [button('刷新', () => { void loadBoard() }, { class: 'icon-button' })]),
-    !phoneApi() ? el('p', { class: 'banner', text: '请在节点页扫描电脑配对码，以管理工单。' }) : null,
-    el('div', { class: 'card board-create' },
-      title,
-      button('新建', () => {
-        const revision = boardRevisions[deviceId]
-        if (revision === undefined || !deviceId) { toast('这台电脑还没有上报看板修订', 'error'); return }
-        const text = title.value.trim()
-        if (!text) { title.focus(); return }
-        void writeBoard({ deviceId, action: 'create', title: text, baseRevision: revision }, () => { title.value = '' })
-      }, { class: 'primary', disabled: head === undefined }),
-      head === undefined ? el('p', { class: 'empty', text: '还没有这台电脑的看板修订。空看板也会带修订号，收到之后才能新建。' }) : null,
-    ),
-    ...(boardReceipts.length > 0 ? [el('section', { class: 'card' },
-      el('h2', { text: '最近操作' }),
-      ...boardReceipts.slice(0, 8).map(receipt => {
-        const device = state.devices.find(item => item.id === receipt.deviceId)
-        const reason = receipt.code === undefined ? '' : BOARD_RECEIPT_REASON[receipt.code]
-        return el('p', { role: 'status', text: (device?.name ?? receipt.deviceId) + ' · '
-          + BOARD_RECEIPT_ACTION[receipt.action] + ' · ' + BOARD_RECEIPT_STATE[receipt.state]
-          + (reason ? '（' + reason + '）' : '') })
-      }),
-    )] : []),
-    ...boardTasks.map((task) => el('div', { class: 'card' },
-      el('h2', { text: task.title }),
-      el('p', { class: 'empty', text: BOARD_STATUS_LABELS[task.status] ?? '待办' }),
-      boardEdit && boardEdit.deviceId === task.deviceId && boardEdit.taskId === task.id
-        ? boardTitleEditor(boardEdit) : el('div', { class: 'choices' },
-        button('待办', () => { const revision = boardRevisions[task.deviceId]; if (revision === undefined) return; void writeBoard({ deviceId: task.deviceId, action: 'move', taskId: task.id, status: 'todo', baseRevision: revision }) }),
-        button('进行中', () => { const revision = boardRevisions[task.deviceId]; if (revision === undefined) return; void writeBoard({ deviceId: task.deviceId, action: 'move', taskId: task.id, status: 'doing', baseRevision: revision }) }),
-        button('完成', () => { const revision = boardRevisions[task.deviceId]; if (revision === undefined) return; void writeBoard({ deviceId: task.deviceId, action: 'move', taskId: task.id, status: 'done', baseRevision: revision }) }),
-        button('改标题', () => {
-          const baseRevision = boardRevisions[task.deviceId]
-          if (baseRevision === undefined || boardEdit) return
-          boardEdit = { deviceId: task.deviceId, taskId: task.id, title: task.title, baseRevision, saving: false }
-          render()
-          rootNode().querySelector<HTMLInputElement>('.board-title-editor input')?.focus()
-        }, { disabled: Boolean(boardEdit) }),
-        button('删除', () => confirmBoardDelete(task), { class: 'danger' }),
-      ),
-    )),
-    boardEdit && !editedTask(boardEdit) ? el('div', { class: 'card' }, boardTitleEditor(boardEdit)) : null,
-    boardTasks.length === 0 ? el('p', { class: 'empty', text: '电脑还没有上报看板。空列表不会当成“已经清空”。' }) : null,
-  ]
+  const create = button('', () => openCreateTicket(create), { class: 'primary ticket-add', 'aria-label': '新建编排工单' })
+  create.append(tabIcon('plus'))
+  const search = el('input', { type: 'search', value: boardQuery, placeholder: '搜索工单', 'aria-label': '搜索工单',
+    onInput: () => { boardQuery = search.value; refreshTicketList() } })
+  const filters = el('div', { class: 'ticket-filters', role: 'group', 'aria-label': '筛选工单' },
+    ...(Object.keys(TICKET_FILTERS) as TicketFilter[]).map(key => {
+      const item = button(TICKET_FILTERS[key], () => {
+        boardFilter = key
+        filters.querySelector('[aria-pressed="true"]')?.setAttribute('aria-pressed', 'false')
+        item.setAttribute('aria-pressed', 'true')
+        refreshTicketList()
+      }, { 'aria-pressed': key === boardFilter })
+      return item
+    }))
+  const header = topbar('工单', '', [create])
+  header.querySelector('.title span')?.classList.add('ticket-summary')
+  return [header, search, filters, el('section', { class: 'ticket-list', 'aria-label': '工单列表' })]
+}
+
+function openTicket(task: Ticket, trigger: HTMLElement): void {
+  ticketReturnFocus = trigger
+  ticketDraft = { notice: '' }
+  ticketNav = reduceTicketNavigation(ticketNav, { type: 'open', ticket: { deviceId: task.deviceId, id: task.id } })
+  updateTicketSheet()
+}
+
+function openCreateTicket(trigger: HTMLElement): void {
+  ticketReturnFocus = trigger
+  const host = boardHost()
+  createTicketDraft = { deviceId: boardRevisions[host] === undefined ? Object.keys(boardRevisions)[0] ?? '' : host,
+    template: TICKET_TEMPLATES[0].id, title: '', detail: '', notice: '' }
+  updateTicketSheet()
+}
+
+function closeTicketSheet(): void {
+  ticketNav = reduceTicketNavigation(ticketNav, { type: 'close' })
+  createTicketDraft = null
+  const dialog = rootNode().querySelector<HTMLDialogElement>('.ticket-sheet')
+  dialog?.close()
+  dialog?.remove()
+  if (ticketReturnFocus?.isConnected) ticketReturnFocus.focus()
+  else {
+    const key = ticketReturnFocus?.dataset.ticketKey
+    const card = Array.from(rootNode().querySelectorAll<HTMLElement>('.ticket-card')).find(node => node.dataset.ticketKey === key)
+    const fallback = card ?? rootNode().querySelector<HTMLElement>('.ticket-add')
+    fallback?.focus()
+  }
+  ticketReturnFocus = null
+}
+
+let sheetSnapshot = ''
+function updateTicketSheet(force = false): void {
+  if (state.view !== 'board' || (!createTicketDraft && ticketNav.view !== 'detail')) return
+  const task = selectedTicket()
+  const create = createTicketDraft
+  const deviceId = create?.deviceId ?? (ticketNav.view !== 'list' ? ticketNav.ticket.deviceId : '')
+  const write = ticketWrites.get(ticketWriteKey(deviceId, create || ticketNav.view === 'list' ? undefined : ticketNav.ticket.id))
+  const receipt = boardReceipt(write?.commandId)
+  const snapshot = JSON.stringify(create ? [boardRevisions, state.devices.map(d => d.name), write, receipt]
+    : [task, boardRevisions[deviceId], deviceName(deviceId), write, receipt, writeStatus(write, deviceId)])
+  let dialog = rootNode().querySelector<HTMLDialogElement>('.ticket-sheet')
+  if (dialog && !force && snapshot === sheetSnapshot) return
+  sheetSnapshot = snapshot
+  const active = dialog?.contains(document.activeElement) ? document.activeElement as HTMLElement : null
+  const selection = active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement ? [active.selectionStart, active.selectionEnd] : null
+  const scroll = dialog?.scrollTop ?? 0
+  if (!dialog) {
+    dialog = el('dialog', { class: 'ticket-sheet', 'aria-labelledby': 'ticket-sheet-title' })
+    dialog.addEventListener('cancel', event => { event.preventDefault(); closeTicketSheet() })
+    dialog.addEventListener('click', event => { if (event.target === dialog) closeTicketSheet() })
+    rootNode().append(dialog)
+  }
+  dialog.replaceChildren(
+    el('header', { class: 'ticket-sheet-header' }, el('div', { class: 'ticket-handle', 'aria-hidden': 'true' }),
+      el('div', { class: 'row-between' }, el('h2', { id: 'ticket-sheet-title', text: create ? '新建编排工单' : '工单详情' }),
+        button('关闭', closeTicketSheet, { id: 'ticket-sheet-close', autofocus: true }))),
+    create ? createTicketForm(create, write) : ticketDetails(task, write),
+  )
+  if (!dialog.open) dialog.showModal()
+  else if (active) {
+    const next = active.id ? document.getElementById(active.id) : null
+    const focus = next && !(next as HTMLInputElement).disabled ? next : dialog.querySelector<HTMLElement>('#ticket-sheet-close')
+    focus?.focus({ preventScroll: true })
+    if (selection && (focus instanceof HTMLInputElement || focus instanceof HTMLTextAreaElement)) focus.setSelectionRange(selection[0], selection[1])
+  }
+  dialog.scrollTop = scroll
+}
+
+function createTicketForm(draft: CreateTicketDraft, write?: TicketWriteState): HTMLElement {
+  const revision = boardRevisions[draft.deviceId]
+  const disabled = ticketWriteBlocked(write, boardReceipt(write?.commandId)?.state)
+    || boardReceipt(draft.commandId)?.state === 'applied'
+  const device = el('select', { id: 'ticket-device', disabled: write?.phase === 'submitting', onChange: () => {
+    draft.deviceId = device.value; draft.commandId = undefined; draft.notice = ''; updateTicketSheet(true)
+  } },
+    ...Object.keys(boardRevisions).map(id => el('option', { value: id, text: deviceName(id) })))
+  device.value = draft.deviceId
+  const template = el('select', { id: 'ticket-template', disabled, onChange: () => { draft.template = template.value } },
+    ...TICKET_TEMPLATES.map(item => el('option', { value: item.id, text: `${item.label} · ${item.roles}` })))
+  template.value = draft.template
+  const title = el('input', { id: 'ticket-title', type: 'text', value: draft.title, required: true, maxlength: 120, disabled, onInput: () => { draft.title = title.value } })
+  const detail = el('textarea', { id: 'ticket-description', value: draft.detail, maxlength: 2000, disabled, onInput: () => { draft.detail = detail.value } })
+  const field = (label: string, control: HTMLElement) => el('label', { class: 'ticket-field' }, label, control)
+  return el('form', { class: 'ticket-sheet-body', onSubmit: event => {
+    event.preventDefault()
+    if (disabled || revision === undefined || !draft.title.trim()) return
+    void writeBoard(draft, { action: 'create', deviceId: draft.deviceId, baseRevision: revision,
+      template: draft.template, title: draft.title.trim(), detail: draft.detail.trim() }, id => { draft.commandId = id })
+  } }, field('目标设备', device), rev(revision), field('编排模板', template), field('工单标题', title), field('需求描述', detail),
+  el('p', { class: 'notice', text: '当前看板仅同步标题，不保存模板或需求描述，也不会自动建群。' }),
+  el('p', { role: 'status', text: draft.notice || (write ? writeStatus(write) : revision === undefined ? '等待设备上报看板修订。' : '') }),
+  retryTicketSync(write),
+  el('button', { type: 'submit', class: 'primary', disabled: disabled || revision === undefined, text: '创建工单' }))
+}
+
+function ticketDetails(task: Ticket | undefined, write?: TicketWriteState): HTMLElement {
+  const draft = ticketDraft
+  const ref = ticketNav.view === 'list' ? undefined : ticketNav.ticket
+  const receipt = boardReceipt(write?.commandId)
+  const status = draft.notice || writeStatus(write, ref?.deviceId)
+  if (!task) return el('div', { class: 'ticket-sheet-body' }, el('p', { text: '该工单已不在当前看板。' }), el('p', { role: 'status', text: status }))
+  const revision = boardRevisions[task.deviceId]
+  const blocked = revision === undefined || ticketWriteBlocked(write, receipt?.state)
+  const send = (action: 'move' | 'edit' | 'delete', fields: Record<string, unknown> = {}) => {
+    if (blocked || revision === undefined) return
+    void writeBoard(draft, { ...fields, action, deviceId: task.deviceId, taskId: task.id, baseRevision: revision }, id => {
+      if (action === 'edit') draft.editCommandId = id
+      draft.deleteRevision = undefined
+    })
+  }
+  const stage = ticketStageIndex(task.status)
+  const preview = parseDiffPreview(task.detail)
+  const diff = el('pre', { class: 'ticket-diff', tabindex: '0', 'aria-label': '补丁预览' })
+  for (const [index, line] of preview.lines.entries()) {
+    if (index) diff.append('\n')
+    diff.append(el('span', { class: `diff-${line.type}`, text: line.text }))
+  }
+  if (draft.editCommandId && receipt && receipt.id === draft.editCommandId && receipt.state !== 'queued') {
+    if (receipt.state === 'applied') draft.editTitle = undefined
+    draft.editCommandId = undefined
+  }
+  const editing = draft.editTitle !== undefined
+  const deleting = draft.deleteRevision !== undefined && draft.deleteRevision === revision
+  const title = el('input', { id: 'ticket-edit-title', type: 'text', value: draft.editTitle, maxlength: 120, required: true,
+    disabled: blocked, 'aria-label': '新工单标题', onInput: () => { draft.editTitle = title.value } })
+  return el('div', { class: 'ticket-sheet-body' },
+    el('h3', { text: task.title }), el('div', { class: 'ticket-meta' }, `${deviceName(task.deviceId)} · ${task.id} · `, rev(task.revision)),
+    el('ol', { class: 'ticket-stages', 'aria-label': '执行阶段' }, ...TICKET_STAGES.map((label, index) =>
+      el('li', { class: index <= stage ? 'reached' : '', 'aria-current': index === stage ? 'step' : undefined, text: label }))),
+    el('section', {}, el('h3', { text: '需求详情' }), el('p', { class: 'ticket-requirements', text: task.detail || '暂无需求描述。' })),
+    preview.lines.length || preview.truncated ? el('section', {}, el('h3', { text: '补丁 / Diff 预览' }), diff,
+      preview.truncated ? el('p', { class: 'notice', text: '补丁预览已截断。' }) : null) : null,
+    el('p', { role: 'status', text: '最近回执 · ' + status }),
+    retryTicketSync(write),
+    button(task.roomId ? '进入工单群查看各 Agent 讨论 ›' : '查看工单讨论 · 尚未关联群聊 ›',
+      () => enterTicketGroup(task), { class: 'ticket-group-link block' }),
+    el('footer', { class: 'ticket-sheet-actions' },
+      el('p', { class: 'ticket-meta' }, '看板修订 · ', rev(revision)),
+      button('确认完成', () => send('move', { status: 'done' }), { id: 'ticket-done', class: 'primary block', disabled: blocked || task.status === 'done' }),
+      el('div', { class: 'choices' },
+        button('移回进行中', () => send('move', { status: 'doing' }), { id: 'ticket-doing', disabled: blocked }),
+        button('移回待办', () => send('move', { status: 'todo' }), { id: 'ticket-todo', disabled: blocked })),
+      editing ? el('form', { class: 'ticket-field', onSubmit: event => {
+        event.preventDefault()
+        const text = draft.editTitle?.trim()
+        if (text) send('edit', { title: text })
+      } }, title, draft.editRevision !== revision ? el('p', { class: 'notice', text: '看板已更新，请核对当前标题再保存。' }) : null,
+      el('div', { class: 'choices' }, el('button', { type: 'submit', id: 'ticket-save', text: draft.editRevision !== revision ? '确认新修订并保存' : '保存标题', disabled: blocked }),
+        button('取消编辑', () => { draft.editTitle = undefined; updateTicketSheet(true) }, { type: 'button' }))) :
+        button('编辑标题', () => { draft.editTitle = task.title; draft.editRevision = revision; draft.deleteRevision = undefined; updateTicketSheet(true); document.getElementById('ticket-edit-title')?.focus() }, { disabled: blocked }),
+      el('div', { class: 'choices' }, button(deleting ? '确认删除工单' : '删除工单', () => {
+        if (deleting) send('delete')
+        else { draft.deleteRevision = revision; updateTicketSheet(true) }
+      }, { id: 'ticket-delete', class: 'danger', disabled: blocked }),
+      deleting ? button('取消删除', () => { draft.deleteRevision = undefined; updateTicketSheet(true) }) : null)))
+}
+
+function enterTicketGroup(task: Ticket): void {
+  ticketNav = reduceTicketNavigation(ticketNav, { type: 'enter-group' })
+  state.view = 'ticketGroup'
+  state.room = null
+  state.groupDraft = state.groupError = groupKey = ''
+  state.groupBusy = false
+  ticketGroupError = ''
+  render()
+  void loadTicketGroup(task)
+}
+
+function returnToTicket(): void {
+  ticketGroupOpen++
+  state.room = null
+  state.groupBusy = false
+  state.view = 'board'
+  ticketDraft.deleteRevision = undefined
+  ticketNav = reduceTicketNavigation(ticketNav, { type: 'back' })
+  render()
+}
+
+async function loadTicketGroup(task: Ticket): Promise<void> {
+  // Current Hub snapshots do not serialize roomId. Never infer a room from
+  // its title or a coincidentally equal ID in a separate namespace.
+  if (!task.roomId) return
+  const api = phoneApi()
+  if (!api) return
+  const request = ++ticketGroupOpen
+  const current = () => state.view === 'ticketGroup' && request === ticketGroupOpen && state.api === api
+  ticketGroupError = '正在查找关联的工单群…'
+  render()
+  const result = await api.discussion(task.roomId)
+  if (!current()) return
+  const room = result.ok ? parseRoom(result.data) : null
+  state.room = room?.id === task.roomId ? room : null
+  ticketGroupError = result.ok ? '未能读取关联的群聊。' : result.message
+  render()
+  if (state.room) startGroupPoll()
+}
+
+function ticketGroupView(): Child[] {
+  const task = selectedTicket()
+  const back = button('工单详情', returnToTicket, { class: 'ticket-group-back' })
+  back.prepend(backChevron())
+  const header = topbar('工单群', task ? `${task.id} · ${task.title}` : '会话',
+    [button('确认操作', returnToTicket, { class: 'icon-button' })], back)
+  if (state.room) return groupRoomView(header)
+  return [header, el('section', { class: 'card' }, el('h2', { text: task?.title ?? '该工单已不在当前看板' }),
+    el('p', { role: 'status', text: task ? ticketGroupError || '该工单没有已同步的群聊关联，暂无法查看 Agent 讨论。' : '请返回工单列表。' }),
+    task?.roomId && !ticketGroupError.startsWith('正在') ? button('重试读取群聊', () => { void loadTicketGroup(task) }) : null)]
 }
 
 async function loadMemory(): Promise<void> {
@@ -2080,21 +2301,35 @@ async function refreshRoom(silent = false): Promise<void> {
   const api = phoneApi()
   const room = state.room
   if (!api || !room || state.groupBusy) return
-  if (!silent) { state.groupBusy = true; render() }
+  const generation = groupPollGeneration
+  const view = state.view
+  if (!silent) state.groupBusy = true
   const result = await api.discussion(room.id)
+  if (state.api !== api || state.room?.id !== room.id || groupPollGeneration !== generation || state.view !== view) return
   if (!silent) state.groupBusy = false
   if (!result.ok) {
+    if (state.view === 'ticketGroup') {
+      if (result.error === 'unauthorized') {
+        state.room = null
+        stopGroupPoll()
+        ticketGroupError = result.message
+        rootNode().querySelector('[data-group-transcript]')?.replaceChildren(
+          el('p', { class: 'banner error', role: 'status', text: ticketGroupError }))
+        rootNode().querySelector<HTMLButtonElement>('[data-group-send]')?.setAttribute('disabled', '')
+      }
+      return
+    }
     if (result.error === 'unauthorized') {
       await clearAccount('账号会话已失效，请重新生成 ticket')
       return
     }
-    if (!silent) { toast(result.message, 'error'); render() }
+    if (!silent) toast(result.message, 'error')
     return
   }
   const updated = parseRoom(result.data)
-  if (updated && state.room?.id === updated.id) {
+  if (updated && state.room?.id === updated.id && updated.revision >= state.room.revision) {
     state.room = updated
-    if (state.view === 'groupRoom') render()
+    if (view === 'ticketGroup' || view === 'groupRoom') updateGroupMessages(updated)
   }
 }
 
@@ -2112,6 +2347,7 @@ async function sendGroupMessage(): Promise<void> {
   state.groupBusy = true
   render()
   const result = await api.discussionAction(buildSendPayload(room.id, text, groupKey, room.moderatorId))
+  if (state.api !== api || state.room?.id !== room.id) return
   state.groupBusy = false
   if (!result.ok) {
     toast(result.message + '。这次发送会沿用同一个幂等键。', 'error')
@@ -2133,6 +2369,7 @@ async function stopRoom(): Promise<void> {
   state.groupBusy = true
   render()
   const result = await api.discussionAction({ action: 'stop', roomId: room.id })
+  if (state.api !== api || state.room?.id !== room.id) return
   state.groupBusy = false
   if (!result.ok) { toast(result.message, 'error'); render(); return }
   const updated = result.data.room ? parseRoom(result.data.room) : null
@@ -2195,50 +2432,68 @@ function groupMessageNode(room: DiscussionRoom, message: DiscussionRoom['message
   )
 }
 
-function groupRoomView(): Child[] {
+function groupMessageNodes(room: DiscussionRoom): HTMLElement[] {
+  return room.messages.length ? room.messages.map(message => groupMessageNode(room, message))
+    : [el('p', { class: 'empty', text: '暂无群聊消息。' })]
+}
+
+const canComposeGroup = (room: DiscussionRoom) => room.state === 'idle' && !room.cleared && room.rounds < 3
+const groupRetention = (room: DiscussionRoom) => '内容保留至 ' + (room.expiresAt ? new Date(room.expiresAt).toLocaleTimeString('zh-CN') : '—') + (room.cleared ? ' · 正文已清除' : '')
+const groupProgress = (room: DiscussionRoom) => groupStateLabel(room.state) + ' · 第 ' + room.rounds + '/3 轮'
+
+function updateGroupMessages(room: DiscussionRoom): void {
+  const app = rootNode()
+  app.querySelector('[data-group-transcript]')?.replaceChildren(...groupMessageNodes(room))
+  const send = app.querySelector<HTMLButtonElement>('[data-group-send]')
+  if (send) send.disabled = !canComposeGroup(room)
+  const retention = app.querySelector('[data-group-retention]')
+  if (retention) retention.textContent = groupRetention(room)
+  const progress = app.querySelector('[data-group-progress]')
+  if (progress) progress.textContent = groupProgress(room)
+}
+
+function groupRoomView(ticketHeader?: HTMLElement): Child[] {
   const room = state.room
   const config = state.config
   const account = state.account
-  if (!config || !account || !accountUsable()) {
+  if (!ticketHeader && (!config || !account || !accountUsable())) {
     state.view = 'groups'
     return groupsView()
   }
-  const header = topbar(room ? room.title : '群聊', room ? groupStateLabel(room.state) + ' · 第 ' + room.rounds + '/3 轮' : '读取中…', [
+  const header = ticketHeader ?? topbar(room ? room.title : '群聊', room ? groupProgress(room) : '读取中…', [
     button('刷新', () => { void refreshRoom() }, { class: 'icon-button' }),
     room && room.state !== 'closed' ? button('停止', () => { void stopRoom() }, { class: 'icon-button danger' }) : null,
   ], backButton('groups'))
   if (!room) {
     return [header, el('div', { class: 'card' }, el('p', { class: 'empty', text: state.groupError || '读取群聊…' }))]
   }
+  if (!ticketHeader) header.querySelector('.title span')?.setAttribute('data-group-progress', '')
   const members = room.members.map((member) => el('span', {
     class: 'chip' + (member.id === room.moderatorId ? ' on' : ''),
     text: member.name + ' · ' + member.model.agent + (member.id === room.moderatorId ? ' · 主持' : ''),
   }))
-  const composable = room.state === 'idle' && !room.cleared && room.rounds < 3
+  const composable = canComposeGroup(room)
   const input = el('input', {
     type: 'text',
-    placeholder: room.cleared ? '正文已清除，不可发送' : room.state !== 'idle' ? '群聊进行中，等汇总后可继续' : room.rounds >= 3 ? '已达 3 轮上限' : '补充问题，由主持人继续组织…',
+    placeholder: '补充问题，由主持人继续组织…',
     value: state.groupDraft,
-    disabled: !composable,
     maxlength: 8192,
     onInput: (event: Event) => { state.groupDraft = (event.target as HTMLInputElement).value },
   }) as HTMLInputElement
   input.addEventListener('keydown', (event) => {
-    if ((event as KeyboardEvent).key === 'Enter' && composable) void sendGroupMessage()
+    if (event.key === 'Enter' && !event.isComposing && event.keyCode !== 229) void sendGroupMessage()
   })
   const send = button(state.groupBusy ? '发送中…' : '发送', () => { void sendGroupMessage() }, {
     class: 'primary',
+    'data-group-send': '',
     disabled: !composable || state.groupBusy,
   })
   return [
     header,
     ...(state.groupError ? [el('div', { class: 'banner error', text: state.groupError })] : []),
     el('div', { class: 'stat-row' }, ...members),
-    el('p', { class: 'notice', text: '内容保留至 ' + (room.expiresAt ? new Date(room.expiresAt).toLocaleTimeString('zh-CN') : '—') + (room.cleared ? ' · 正文已清除' : '') }),
-    el('div', { class: 'transcript' },
-      ...room.messages.map((message) => groupMessageNode(room, message)),
-      ...(room.messages.length === 0 ? [el('p', { class: 'empty', text: '暂无群聊消息。' })] : []),
-    ),
+    el('p', { class: 'notice', 'data-group-retention': '', text: groupRetention(room) }),
+    el('div', { class: 'transcript', 'data-group-transcript': '' }, ...groupMessageNodes(room)),
     el('div', { class: 'composer-wrap' },
       el('div', { class: 'composer' }, input, send),
     ),
@@ -2572,7 +2827,7 @@ async function wipeData(): Promise<void> {
   state.config = null
   applyTheme('system')
   state.api = null
-  boardEdit = null
+  resetTicketBoard()
   pendingInputs = createPendingInputs()
   state.devices = []
   state.sessions = []
