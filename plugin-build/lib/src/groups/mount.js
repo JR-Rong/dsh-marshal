@@ -405,6 +405,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
         root: groupsRootDir, rosters, ticketNumbers, sessionTitles, sessionController, config, llm, readDefaultModel,
         workspacePath, webOrigin, getAttachmentStore, resolveAttachments, surface: dshSurface, moveCardStatus,
         taskOverrides: injectedTaskOverrides, patchStore: injectedPatchStore, eventBus, eventStreams, collectPlainIncidents,
+        workspaceRegistry,
     } = extras;
     const writeMutation = (res, value, ...topics) => {
         write(res, 200, value);
@@ -2198,6 +2199,41 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             const saved = sessionTitles.setCustom(sessionId, title);
             write(res, 200, { ok: true, sessionId, title: saved.custom ?? saved.auto ?? '', titleSource: saved.custom ? 'custom' : 'auto' });
         }),
+        exact('POST', '/marshal/agents/session-workspace', async (req, res) => {
+            // The agents plugin creates a member session without a Host Workspace, so the
+            // composer asks which one to bind. Attach it the way the Host's own "new
+            // session" resolves one: an explicit pick, else the most recent Workspace.
+            const body = await readBody(req);
+            const sessionId = typeof body?.sessionId === 'string' ? body.sessionId.trim() : '';
+            if (!sessionId) { write(res, 400, { ok: false, code: 'invalid-session' }); return; }
+            const registry = workspaceRegistry;
+            if (!registry || typeof registry.list !== 'function') {
+                write(res, 200, { ok: true, attachedWorkspaceId: null, reason: 'workspace-registry-unavailable' });
+                return;
+            }
+            const idOf = workspace => workspace?.id ?? workspace?.workspaceId ?? '';
+            const stamp = workspace => {
+                const value = workspace?.updatedAt;
+                return typeof value === 'number' ? value : (typeof value === 'string' ? Date.parse(value) || 0 : 0);
+            };
+            let items;
+            try { items = registry.list() ?? []; } catch { items = []; }
+            const holder = items.find(workspace => Array.isArray(workspace?.sessionIds) && workspace.sessionIds.includes(sessionId));
+            if (holder) { write(res, 200, { ok: true, attachedWorkspaceId: idOf(holder), already: true }); return; }
+            const requested = typeof body?.workspaceId === 'string' ? body.workspaceId.trim() : '';
+            const preferred = requested ? items.find(workspace => idOf(workspace) === requested) : undefined;
+            const target = preferred ?? [...items].sort((a, b) => stamp(b) - stamp(a))[0];
+            if (!target) { write(res, 200, { ok: true, attachedWorkspaceId: null, reason: 'no-workspace' }); return; }
+            try {
+                const workspace = typeof registry.get === 'function' ? registry.get(idOf(target)) ?? target : target;
+                if (typeof workspace?.attachSession !== 'function') throw Error('attachSession-unavailable');
+                await workspace.attachSession(sessionId);
+                write(res, 200, { ok: true, attachedWorkspaceId: idOf(target) });
+            } catch (error) {
+                options.logger?.warn?.(`marshal: attach session workspace failed: ${error instanceof Error ? error.message : String(error)}`);
+                write(res, 200, { ok: true, attachedWorkspaceId: null, reason: error instanceof Error ? error.message : String(error) });
+            }
+        }),
         exact('POST', '/marshal/agents/sessions/summarize', async (req, res) => {
             if (!sessionTitles) { write(res, 503, { ok: false, code: 'titles-unavailable' }); return; }
             const body = await readBody(req);
@@ -2390,6 +2426,9 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
     ];
 }
 
+const lookupWorkspaceRegistry = (ctx) => {
+    try { return ctx.get?.('workspaceRegistry') ?? ctx.workspaceRegistry; } catch { return undefined; }
+};
 export function mountGroups(ctx, config, options = {}) {
     const eventBus = options.eventBus ?? createMarshalEventBus();
     const eventStreams = new Set();
@@ -2918,6 +2957,7 @@ export function mountGroups(ctx, config, options = {}) {
                 config, llm, readDefaultModel, workspacePath: agents.workspace,
                 webOrigin: resolveWebOrigin, getAttachmentStore, resolveAttachments: resolveTicketAttachments,
                 surface, moveCardStatus, taskOverrides, patchStore, eventBus, eventStreams, collectPlainIncidents,
+                workspaceRegistry: lookupWorkspaceRegistry(ctx),
             }).map((route) => scoped.webServer.register(route));
             return () => {
                 closeEventStreams();

@@ -755,5 +755,8 @@ test('a strict agents host refuses run purpose and the 1:1 open retries without 
     assert.equal(attempts[0].body.purpose, 'direct');
     assert.equal('purpose' in attempts[1].body, false, 'the retry speaks the older host contract');
     assert.deepEqual(attempts[1].body, { teamId: agent.teamId, memberId: agent.agentId });
+    const attach = host.requests.find(req => req.path === '/marshal/agents/session-workspace');
+    assert.deepEqual(attach?.body, { sessionId: 'new-native' }, 'the session joins a Workspace before the Host opens it');
+    assert.equal(attach.auth, 'test');
     assert.deepEqual(host.calls, [['panel', null], ['session', 'new-native'], ['tab', 'marshal-agent-tasks']]);
 });

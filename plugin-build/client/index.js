@@ -1945,6 +1945,15 @@ window.__ModuleLoader__.load({
     const mvTaskTypes = { casual: '闲聊记录', direct: '直连任务', ticket: '关联工单' };
     const mvTaskStatuses = { queued: '待处理', running: '进行中', review: '待验收', done: '已完成', failed: '失败' };
     const mvRead = (path, signal) => fetchJson('marshal/' + path, undefined, true, signal);
+    // A member session created by the agents plugin has no Host Workspace, which makes
+    // the composer ask for one before the first message. Attach it server-side first.
+    async function mvAttachSessionWorkspace(sessionId, signal) {
+      if (!sessionId || signal?.aborted) return undefined;
+      try {
+        const result = await fetchJson('marshal/agents/session-workspace', { sessionId }, true, signal);
+        return result?.attachedWorkspaceId ?? undefined;
+      } catch { return undefined; }
+    }
     // A host that installs the standalone @linxin666/dsh-agents plugin serves its
     // own /api/run, whose body refuses any field it does not read. Only the bundled
     // build records `purpose`, so retry once without it rather than failing the open.
@@ -2027,6 +2036,10 @@ window.__ModuleLoader__.load({
         const id = typeof resolved === 'string' ? resolved : resolved?.sessionId;
         if (signal?.aborted) return;
         if (typeof id !== 'string' || !id.trim()) return '暂无 1:1 直连会话。';
+        if (signal?.aborted) return;
+        // Bind a Workspace before the Host opens the composer, so it never asks.
+        await mvAttachSessionWorkspace(id, signal);
+        if (signal?.aborted) return;
         if (!await openSession(id)) return signal?.aborted ? undefined : '宿主无法打开 1:1 直连会话。';
         if (signal?.aborted) return;
         mvFocusedAgentStore?.set({ ...agent, agentKey: resolved?.agentKey ?? agent.agentKey, navigationSessionId: id });
@@ -2625,6 +2638,8 @@ window.__ModuleLoader__.load({
           const data = await fetchJson('dsh-agents/api/run', { teamId: agent.squadId, memberId: agent.id });
           const sessionId = data?.run?.sessionId;
           if (!sessionId) throw new Error('未能创建会话');
+          // Bind a Workspace first: an unbound session makes the composer ask for one.
+          await mvAttachSessionWorkspace(sessionId);
           await load();
           openSession && openSession(sessionId);
         }
