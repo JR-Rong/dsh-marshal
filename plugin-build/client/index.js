@@ -322,10 +322,43 @@ window.__ModuleLoader__.load({
 .mv-scope{color:var(--dsw-alias-marshal-text);font-size:var(--mv-font);line-height:var(--mv-leading)}
 .mv-entry,.mv-line,.mv-actions{display:flex;align-items:center;gap:var(--mv-sm);min-width:0}
 .mv-entry{position:relative;display:inline-flex}
-.mv-entry .mv-badge{position:absolute;inset-block-start:calc(-1 * var(--mv-xs));inset-inline-start:100%;pointer-events:none}
+/* The host paints this entry as one icon in a narrow rail: anchor the count on the
+   icon's own top-end corner so it never drifts over the rail edge or the label. */
+.mv-entry .mv-badge{position:absolute;z-index:1;inset-block-start:calc(-1 * var(--mv-xs));inset-inline-end:calc(-1 * var(--mv-xs));min-width:var(--mv-md);text-align:center;line-height:1.35;pointer-events:none}
 .mv-badge,.mv-model{font-size:var(--mv-font-small);border-radius:var(--mv-pill);padding-inline:var(--mv-xs)}
 .mv-badge{color:var(--dsw-alias-marshal-danger);background:var(--dsw-alias-marshal-surface);font-weight:var(--mv-weight);box-shadow:0 0 0 1px var(--dsw-alias-marshal-border)}
 .mv-model{color:var(--dsw-alias-marshal-muted);background:var(--dsw-alias-marshal-layer);display:block;width:fit-content;max-width:100%;box-sizing:border-box}
+/* Tone palette: one variable drives lane dots, card rails, chips and incident cards,
+   so a lane reads the same colour in the board, the drawer and the monitor. */
+:is(.mv-scope,.mv-entry) [data-tone="queued"]{--mv-tone:#4e93e8}
+:is(.mv-scope,.mv-entry) [data-tone="running"]{--mv-tone:#2ea36a}
+:is(.mv-scope,.mv-entry) [data-tone="review"]{--mv-tone:#d08a2a}
+:is(.mv-scope,.mv-entry) [data-tone="failed"]{--mv-tone:#cf5f7a}
+:is(.mv-scope,.mv-entry) [data-tone="done"]{--mv-tone:#4a9fb5}
+:is(.mv-scope,.mv-entry) [data-tone="critical"]{--mv-tone:#cf5f7a}
+:is(.mv-scope,.mv-entry) [data-tone="warning"]{--mv-tone:#d08a2a}
+:is(.mv-scope,.mv-entry) [data-tone="info"]{--mv-tone:#4e93e8}
+:is(.mv-scope,.mv-entry) [data-tone="memory"]{--mv-tone:#b456c8}
+:is(.mv-scope,.mv-entry) [data-tone="neutral"]{--mv-tone:#8b93a1}
+.mv-lane-head{display:flex;align-items:center;gap:var(--mv-xs);margin:0 0 var(--mv-xs);font-size:var(--mv-font-title)}
+.mv-tone-dot{flex:none;width:8px;height:8px;border-radius:var(--mv-pill);background:var(--mv-tone,var(--dsw-alias-marshal-muted));box-shadow:0 0 0 3px color-mix(in srgb,var(--mv-tone,transparent) 20%,transparent)}
+.mv-tone-count{margin-inline-start:auto;color:var(--dsw-alias-marshal-muted);font-size:var(--mv-font-small);font-variant-numeric:tabular-nums}
+.mv-agent-card[data-tone]{border-inline-start:3px solid var(--mv-tone,var(--dsw-alias-marshal-border));background:linear-gradient(180deg,color-mix(in srgb,var(--mv-tone,transparent) 8%,var(--dsw-alias-marshal-surface)),var(--dsw-alias-marshal-surface) 68%)}
+.mv-tone-chip{display:inline-flex;align-items:center;gap:var(--mv-xs);max-width:100%;box-sizing:border-box;border-radius:var(--mv-pill);padding:2px var(--mv-sm);font-size:var(--mv-font-small);line-height:1.5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--mv-tone,var(--dsw-alias-marshal-muted));border:1px solid color-mix(in srgb,var(--mv-tone,var(--dsw-alias-marshal-muted)) 42%,transparent);background:color-mix(in srgb,var(--mv-tone,var(--dsw-alias-marshal-muted)) 15%,transparent)}
+.mv-tone-chip[data-solid="true"]{font-weight:var(--mv-weight);background:color-mix(in srgb,var(--mv-tone,var(--dsw-alias-marshal-danger)) 24%,transparent)}
+.mv-metric[data-tone]{border-inline-start:3px solid var(--mv-tone,var(--dsw-alias-marshal-border));padding-inline-start:var(--mv-sm)}
+.mv-metric dd{margin:0;font-size:calc(var(--mv-font) + 3px);font-weight:var(--mv-weight);font-variant-numeric:tabular-nums}
+.mv-tag-row{display:flex;flex-wrap:wrap;gap:var(--mv-xs);align-items:center;min-width:0}
+.mv-toolbar-group{gap:var(--mv-xs);padding:3px;border-radius:calc(var(--mv-radius) - 2px);background:color-mix(in srgb,currentColor 4%,transparent);border:1px solid var(--dsw-alias-marshal-border)}
+.mv-toolbar-group .mv-btn{border-color:transparent;min-height:calc(var(--mv-control) - 4px)}
+.mv-memory-detail{flex:none;display:flex;flex-direction:column;gap:var(--mv-sm);width:min(320px,100%);box-sizing:border-box;overflow:auto;padding:var(--mv-md);border:1px solid var(--dsw-alias-marshal-border);border-radius:var(--mv-radius);background:var(--dsw-alias-marshal-surface);box-shadow:var(--dsw-alias-marshal-shadow)}
+.mv-memory-head{display:grid;gap:calc(var(--mv-xs) + 2px);padding-block-end:var(--mv-sm);border-block-end:1px solid var(--dsw-alias-marshal-border)}
+.mv-memory-title{margin:0;font-size:calc(var(--mv-font-title) + 2px);line-height:1.35;overflow-wrap:anywhere}
+.mv-memory-meta{font-size:var(--mv-font-small);color:var(--dsw-alias-marshal-muted);font-variant-numeric:tabular-nums}
+.mv-memory-cue{padding:var(--mv-xs) var(--mv-sm);border-radius:var(--mv-sm);font-size:var(--mv-font-small);color:var(--dsw-alias-marshal-muted);background:var(--dsw-alias-marshal-layer);border-inline-start:2px solid var(--dsw-alias-marshal-accent);overflow-wrap:anywhere}
+.mv-memory-body{margin:0;white-space:pre-wrap;font-size:var(--mv-font);line-height:1.7;overflow-wrap:anywhere}
+.mv-memory-conflict{display:grid;gap:var(--mv-sm);padding:var(--mv-sm);border-radius:var(--mv-radius);background:color-mix(in srgb,#d08a2a 12%,var(--dsw-alias-marshal-surface));border:1px solid color-mix(in srgb,#d08a2a 38%,transparent)}
+.mv-memory-conflict p{margin:0;font-size:var(--mv-font-small)}
 .mv-stack,.mv-sections,.mv-agent-card{display:grid;gap:var(--mv-sm);min-width:0}
 .mv-sections{padding:var(--mv-sm) var(--mv-md)}
 .mv-session-actions{flex:1;min-width:0}.mv-native-session{display:flex;align-items:center;gap:var(--mv-xs);min-width:0}
@@ -878,7 +911,11 @@ window.__ModuleLoader__.load({
         });
         const ids = new Set(nodes.map(node => node.id));
         const edges = (graph.edges || []).filter(edge => ids.has(edge.source) && ids.has(edge.target) && edge.source !== edge.target).slice(0, 1400);
-        return { nodes, edges };
+        // Keep a few landmark titles readable without labelling every node.
+        const labelIds = new Set([...nodes]
+          .sort((a, b) => (Number(b.pinned) - Number(a.pinned)) || (Number(b.importance) || 0) - (Number(a.importance) || 0))
+          .slice(0, nodes.length > 40 ? 5 : 8).map(node => node.id));
+        return { nodes, edges, labelIds };
       }, [graph]);
       const layoutRef = React.useRef(layout);
       layoutRef.current = layout;
@@ -922,11 +959,21 @@ window.__ModuleLoader__.load({
           const theme = window.getComputedStyle(canvas);
           const ink = theme.color;
           const colors = tokens.map((token, index) => theme.getPropertyValue('--dsw-alias-' + token).trim() || 'hsl(' + fallbackHues[index] + ' 48% 48%)');
+          // A very soft vignette keeps the canvas from reading as a flat empty box.
+          if (typeof ctx.createRadialGradient === 'function' && typeof ctx.fillRect === 'function') {
+            try {
+              const vignette = ctx.createRadialGradient(width / 2, height * 0.46, Math.min(width, height) * 0.12,
+                width / 2, height / 2, Math.max(width, height) * 0.72);
+              vignette.addColorStop(0, ink);
+              vignette.addColorStop(1, 'transparent');
+              ctx.globalAlpha = 0.06; ctx.fillStyle = vignette; ctx.fillRect(0, 0, width, height);
+            } catch { /* A host colour the canvas cannot parse simply skips the wash. */ }
+          }
           ctx.globalAlpha = 0.16; ctx.fillStyle = ink;
           for (const star of stars) {
             ctx.beginPath(); ctx.arc(star.x * width, star.y * height, star.r, 0, Math.PI * 2); ctx.fill();
           }
-          const { nodes, edges } = layoutRef.current;
+          const { nodes, edges, labelIds } = layoutRef.current;
           if (!dragging && hover !== undefined && !nodes.some(node => node.id === hover)) {
             hover = undefined;
             canvas.style.cursor = 'grab';
@@ -941,12 +988,16 @@ window.__ModuleLoader__.load({
           camera.yaw = rotY;
           const projected = nodes.map(node => ({ node, ...toScreen(node, width, height) })).sort((a, b) => b.depth - a.depth);
           const points = new Map(projected.map(entry => [entry.node.id, entry]));
-          ctx.globalAlpha = 0.13; ctx.strokeStyle = ink; ctx.lineWidth = 0.7;
+          ctx.lineWidth = 0.7;
           for (const edge of edges) {
             const a = points.get(edge.source), b = points.get(edge.target);
             if (!a || !b) continue;
+            const depth = Math.max(0.12, Math.min(1, 1 - (a.depth + 350) / 900));
+            ctx.globalAlpha = 0.05 + depth * 0.12;
+            ctx.strokeStyle = ink;
             ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
           }
+          const focusId = hover ?? selectedRef.current;
           for (const entry of projected) {
             const node = entry.node;
             const base = 3.2 + Math.sqrt(Math.max(0.01, (Number(node.importance) || 0))) * 8 + Math.log1p(Math.max(0, Number(node.accessCount) || 0)) * 1.6;
@@ -954,16 +1005,31 @@ window.__ModuleLoader__.load({
             const clarityAlpha = node.clarity === 'fuzzy' ? 0.5 : node.clarity === 'trace' ? 0.28 : node.clarity === 'clear' ? 0.85 : 1;
             const alpha = Math.max(0.12, Math.min(1, 1 - (entry.depth + 350) / 900)) * clarityAlpha;
             const color = colors[kinds.indexOf(node.kind)] || ink;
+            const active = focusId === node.id;
+            // Landmarks and the focused node glow; the rest stay flat so a dense
+            // workspace graph never turns into a bloom storm.
+            if ((active || node.pinned || labelIds.has(node.id)) && typeof ctx.createRadialGradient === 'function' && radius > 3) {
+              try {
+                const halo = ctx.createRadialGradient(entry.x, entry.y, radius * 0.6, entry.x, entry.y, radius * 3.4);
+                halo.addColorStop(0, color);
+                halo.addColorStop(1, 'transparent');
+                ctx.globalAlpha = Math.min(0.42, alpha * 0.5); ctx.fillStyle = halo;
+                ctx.beginPath(); ctx.arc(entry.x, entry.y, radius * 3.4, 0, Math.PI * 2); ctx.fill();
+              } catch { /* Unparsable host colour: fall back to the solid node. */ }
+            }
             if (selectedRef.current === node.id || node.pinned) {
               ctx.globalAlpha = 0.85; ctx.strokeStyle = ink; ctx.lineWidth = 1.2;
               ctx.beginPath(); ctx.arc(entry.x, entry.y, radius + 4, 0, Math.PI * 2); ctx.stroke();
             }
             ctx.globalAlpha = alpha; ctx.fillStyle = color;
             ctx.beginPath(); ctx.arc(entry.x, entry.y, radius, 0, Math.PI * 2); ctx.fill();
-            if (hover === node.id || selectedRef.current === node.id) {
-              ctx.globalAlpha = 1; ctx.fillStyle = ink; ctx.font = '12px sans-serif';
+            if (active || labelIds.has(node.id)) {
               const label = String(node.title || '').slice(0, 42);
-              ctx.fillText(label, entry.x + radius + 7, entry.y + 3);
+              if (label) {
+                ctx.globalAlpha = active ? 1 : Math.min(0.72, alpha + 0.18);
+                ctx.fillStyle = ink; ctx.font = active ? '600 12px sans-serif' : '11px sans-serif';
+                ctx.fillText(label, entry.x + radius + 7, entry.y + 4);
+              }
             }
           }
           ctx.globalAlpha = 1;
@@ -1050,6 +1116,17 @@ window.__ModuleLoader__.load({
       }, []);
       React.useEffect(() => { scheduleRef.current?.(); }, [graph, selectedId, paused]);
       return h('canvas', { ref: canvasRef, 'aria-label': '3D 记忆星系', role: 'img', style: { width: '100%', height: '100%', display: 'block', borderRadius: 14, background: 'radial-gradient(ellipse at center, ' + dswTheme.layer + ', ' + dswTheme.layer3 + ')', cursor: 'grab', touchAction: 'none' } });
+    }
+
+    const MV_MEMORY_SCOPES = { global: ['全局', '#4e93e8'], agent: ['智能体私有', '#2ea36a'], workspace: ['工作区共享', '#d08a2a'] };
+    const MV_MEMORY_KINDS = { profile: ['偏好', '#4e93e8'], decision: ['决策', '#2ea36a'], fact: ['事实', '#4a9fb5'],
+      episode: ['片段', '#d08a2a'], handoff: ['交接', '#b456c8'], scene: ['场景', '#cf5f7a'] };
+    const mvMemoryScopeLabel = scope => (MV_MEMORY_SCOPES[scope] ?? [scope || '记忆', '#8b93a1']);
+    const mvMemoryKindLabel = kind => (MV_MEMORY_KINDS[kind] ?? [kind || '记忆', '#8b93a1']);
+    const mvMemoryClarity = clarity => ({ vivid: '清晰', clear: '清楚', fuzzy: '模糊', trace: '只剩印象' }[clarity] || clarity || '清晰');
+    function mvMemoryChip(label, color, key, solid = false) {
+      return h('span', { className: 'mv-tone-chip', key, 'data-solid': solid ? 'true' : undefined,
+        style: { '--mv-tone': color } }, label);
     }
 
     function MemoryPage({ initialAgentId = '', initialLayer = '', mvOpenDirect, closeMemorySidebar } = {}) {
@@ -1519,18 +1596,23 @@ window.__ModuleLoader__.load({
           layer !== 'global' && privateBackend === 'mnemon' && h('span', { style: { color: '#10b981', fontSize: 11, padding: '2px 8px', borderRadius: 999, border: '1px solid color-mix(in srgb, #10b981 35%, transparent)', background: 'color-mix(in srgb, #10b981 12%, transparent)' } }, 'Mnemon · 意图图谱 + 推索引引擎'),
           h('input', { value: query, onChange: event => setQuery(event.target.value), onKeyDown: event => { if (event.key === 'Enter') submitSearch(); }, placeholder: fullCanvas ? '搜索全域记忆…' : '搜索当前层级记忆…', style: { ...uiInput, width: 190 } }),
           h('button', { type: 'button', style: uiButton(false), onClick: submitSearch }, '搜索'),
-          h('button', { type: 'button', style: uiButton(false), onClick: () => setPaused(value => !value) }, paused ? '恢复漂移' : '暂停漂移'),
-          h('button', { type: 'button', style: uiButton(false), onClick: () => {
-            if (!fullCanvas) { closeSidebar(); setFormOpen(false); setSettingsOpen(false); }
-            setFullCanvas(!fullCanvas);
-          } }, fullCanvas ? '退出全画布' : '全画布'),
-          mvOpenDirect && mvDirectAgent && h(mvDirectLink, { key: activeAgentId, agent: mvDirectAgent, open: mvOpenDirect }),
-          !fullCanvas && h('button', { type: 'button', style: uiButton(false), onClick: () => { setScope(layer); setFormOpen(value => !value); } }, '＋ 记忆'),
-          !fullCanvas && h('button', { type: 'button', style: uiButton(false), onClick: () => setSettingsOpen(value => !value) }, '设置'),
-          h('span', { style: { marginLeft: 'auto', fontSize: 11, color: dswTheme.dim } }, visibleGraph.nodes.length + ' 个节点 · ' + visibleGraph.edges.length + ' 条关联' + (health?.health?.length ? ' · 模糊 ' + health.health.reduce((sum, item) => sum + (item.fuzzy || 0), 0) + ' · 档案 ' + health.health.reduce((sum, item) => sum + (item.archived || 0), 0) : '')),
-          h('button', { type: 'button', style: uiButton(false), onClick: async () => { setSyncNotice('同步中…'); try { const result = await requestMemory('marshal/memory/sync', { ...(activeAgentId ? { agentId: activeAgentId } : {}), ...(activeWorkspaceId ? { workspaceId: activeWorkspaceId } : {}) }); setSyncNotice('推送 ' + (result.pushed ?? 0) + ' · 拉取 ' + (result.pulled ?? 0)); await refresh(); } catch (e) { if (lifetime.current) setSyncNotice(String(e.message || e)); } } }, '同步'),
-          layer === 'global' && h('button', { type: 'button', style: uiButton(false), onClick: async () => { setSyncNotice('迁移旧同步…'); try { const result = await requestMemory('marshal/memory/migrate-legacy', {}); setSyncNotice(result.migrated ? '已绑定 ' + result.migrated + ' 条旧记录' : '没有待迁移的旧记录'); } catch (e) { if (!lifetime.current) return; if (e && (e.code === 'sign-in-to-approve' || String(e.message || '').includes('sign-in-to-approve'))) setApprovalNotice('请先登录机主账号后再审批全局记忆'); setSyncNotice(String(e.message || e)); } } }, '迁移旧同步'),
-          h('button', { type: 'button', style: uiButton(false), onClick: () => { void refresh(); } }, '刷新')),
+          h('div', { className: 'mv-actions mv-toolbar-group' },
+            h('button', { type: 'button', style: uiButton(false), onClick: () => setPaused(value => !value) }, paused ? '恢复漂移' : '暂停漂移'),
+            h('button', { type: 'button', style: uiButton(false), onClick: () => {
+              if (!fullCanvas) { closeSidebar(); setFormOpen(false); setSettingsOpen(false); }
+              setFullCanvas(!fullCanvas);
+            } }, fullCanvas ? '退出全画布' : '全画布'),
+            mvOpenDirect && mvDirectAgent && h(mvDirectLink, { key: activeAgentId, agent: mvDirectAgent, open: mvOpenDirect }),
+            !fullCanvas && h('button', { type: 'button', style: uiButton(false), onClick: () => { setScope(layer); setFormOpen(value => !value); } }, '＋ 记忆'),
+            !fullCanvas && h('button', { type: 'button', style: uiButton(false), onClick: () => setSettingsOpen(value => !value) }, '设置')),
+          h('div', { className: 'mv-actions mv-toolbar-group' },
+            h('button', { type: 'button', style: uiButton(false), onClick: async () => { setSyncNotice('同步中…'); try { const result = await requestMemory('marshal/memory/sync', { ...(activeAgentId ? { agentId: activeAgentId } : {}), ...(activeWorkspaceId ? { workspaceId: activeWorkspaceId } : {}) }); setSyncNotice('推送 ' + (result.pushed ?? 0) + ' · 拉取 ' + (result.pulled ?? 0)); await refresh(); } catch (e) { if (lifetime.current) setSyncNotice(String(e.message || e)); } } }, '同步'),
+            layer === 'global' && h('button', { type: 'button', style: uiButton(false), onClick: async () => { setSyncNotice('迁移旧同步…'); try { const result = await requestMemory('marshal/memory/migrate-legacy', {}); setSyncNotice(result.migrated ? '已绑定 ' + result.migrated + ' 条旧记录' : '没有待迁移的旧记录'); } catch (e) { if (!lifetime.current) return; if (e && (e.code === 'sign-in-to-approve' || String(e.message || '').includes('sign-in-to-approve'))) setApprovalNotice('请先登录机主账号后再审批全局记忆'); setSyncNotice(String(e.message || e)); } } }, '迁移旧同步'),
+            h('button', { type: 'button', style: uiButton(false), onClick: () => { void refresh(); } }, '刷新')),
+          h('span', { className: 'mv-tone-chip', 'aria-label': '星系统计',
+            style: { '--mv-tone': '#8b93a1', marginLeft: 'auto' } },
+            visibleGraph.nodes.length + ' 节点 · ' + visibleGraph.edges.length + ' 关联' +
+            (health?.health?.length ? ' · 模糊 ' + health.health.reduce((sum, item) => sum + (item.fuzzy || 0), 0) + ' · 档案 ' + health.health.reduce((sum, item) => sum + (item.archived || 0), 0) : ''))),
         syncNotice !== '' && h('div', { style: { padding: '6px 18px', fontSize: 11, color: dswTheme.dim } }, syncNotice),
         !fullCanvas && settingsOpen && settings && h('div', { style: { padding: '10px 18px', display: 'flex', gap: 16, flexWrap: 'wrap', fontSize: 12, borderBottom: '1px solid #8883' } },
           [['autoSummary', '会话结束自动摘要'], ['autoRecall', '每轮自动召回'], ['allowGroupQuote', '群聊允许引用私有记忆']].map(([key, label]) => h('label', { key, style: { display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' } },
@@ -1575,23 +1657,34 @@ window.__ModuleLoader__.load({
           visibleResults.length === 0 ? h('div', { style: { fontSize: 12, color: dswTheme.dim } }, '没有匹配的记忆') : visibleResults.map(item => h('button', { key: item.id, type: 'button', onClick: () => { void selectMemory(item); }, style: { textAlign: 'left', border: 0, background: 'transparent', color: 'inherit', cursor: 'pointer', padding: '5px 0' } }, '[' + item.scope + '] ' + item.title))),
         h('div', { style: { flex: 1, minHeight: 0, display: 'flex', padding: 14, gap: 14 } },
           h('div', { style: { flex: 1, minWidth: 0, minHeight: 0, borderRadius: 14, overflow: 'hidden', border: '1px solid #8883' } }, h(MemoryGalaxy, { graph: visibleGraph, paused, selectedId: selected?.id, onSelect: selectMemory })),
-          selected && h('aside', { style: { width: 300, flexShrink: 0, overflow: 'auto', padding: 16, border: '1px solid #8883', borderRadius: 14, background: 'color-mix(in srgb, currentColor 3%, transparent)' } },
-            h('div', { style: { fontSize: 11, color: dswTheme.dim, textTransform: 'uppercase', letterSpacing: '.06em' } }, selected.scope + ' · ' + selected.kind + (selected.scope === 'global' ? ' · ' + (selected.visibility === 'all' ? '所有会话' : '仅单聊') : '')),
-            h('h3', { style: { margin: '6px 0 10px', fontSize: 16 } }, selected.title),
-            selected.cue && h('div', { style: { fontSize: 11, color: dswTheme.dim, marginBottom: 8, padding: '4px 8px', borderRadius: 6, background: 'color-mix(in srgb, currentColor 6%, transparent)' } }, '触发场景：' + selected.cue),
-            detailLoading ? h('p', { role: 'status' }, '正在读取记忆…') : selected.scope === 'global'
+          selected && h('aside', { className: 'mv-memory-detail', 'aria-label': '记忆详情' },
+            h('div', { className: 'mv-memory-head' },
+              h('div', { className: 'mv-tag-row' },
+                mvMemoryChip(mvMemoryScopeLabel(selected.scope)[0], mvMemoryScopeLabel(selected.scope)[1], 'scope', true),
+                mvMemoryChip(mvMemoryKindLabel(selected.kind)[0], mvMemoryKindLabel(selected.kind)[1], 'kind'),
+                selected.scope === 'global' && mvMemoryChip(selected.visibility === 'all' ? '所有会话' : '仅单聊',
+                  selected.visibility === 'all' ? '#2ea36a' : '#8b93a1', 'visibility'),
+                selected.pinned && mvMemoryChip('已固定', '#d08a2a', 'pinned')),
+              h('h3', { className: 'mv-memory-title' }, selected.title),
+              h('div', { className: 'mv-memory-meta' },
+                '清晰度 ' + mvMemoryClarity(selected.clarity),
+                ' · 重要性 ' + Math.round((selected.importance || 0) * 100) + '%',
+                ' · 访问 ' + (selected.accessCount || 0) + ' 次')),
+            selected.cue && h('div', { className: 'mv-memory-cue' }, '触发场景 · ' + selected.cue),
+            detailLoading ? h('p', { role: 'status', className: 'mv-muted' }, '正在读取记忆…') : selected.scope === 'global'
               ? h('div', { style: { display: 'grid', gap: 8 } },
-                h('textarea', { value: editText, onChange: event => setEditText(editTextRef.current = event.target.value), rows: 6, style: { ...uiInput, resize: 'vertical' } }),
-                h('select', { value: editVisibility, onChange: event => setEditVisibility(editVisibilityRef.current = event.target.value), style: uiInput }, h('option', { value: 'all' }, '所有会话'), h('option', { value: 'no-group' }, '仅单聊')),
-                detailConflict && h('div', { role: 'alert' },
+                h('textarea', { value: editText, 'aria-label': '记忆正文', onChange: event => setEditText(editTextRef.current = event.target.value), rows: 6, style: { ...uiInput, resize: 'vertical' } }),
+                h('select', { value: editVisibility, 'aria-label': '记忆可见性', onChange: event => setEditVisibility(editVisibilityRef.current = event.target.value), style: uiInput }, h('option', { value: 'all' }, '所有会话'), h('option', { value: 'no-group' }, '仅单聊')),
+                detailConflict && h('div', { role: 'alert', className: 'mv-memory-conflict' },
                   h('p', null, detailConflict.deleted ? '远端记忆已被删除，本地草稿仍保留。' : '远端记忆已更新，本地草稿仍保留。'),
-                  h('button', { type: 'button', style: uiButton(false), disabled: saveBlocked, onClick: loadLatestConflict }, '载入最新版本'),
-                  !detailConflict.deleted && h('button', { type: 'button', style: uiButton(false), disabled: saveBlocked, onClick: () => { void saveGlobal(true); } }, '覆盖保存')),
+                  h('div', { className: 'mv-actions' },
+                    h('button', { type: 'button', style: uiButton(false), disabled: saveBlocked, onClick: loadLatestConflict }, '载入最新版本'),
+                    !detailConflict.deleted && h('button', { type: 'button', style: uiButton(false), disabled: saveBlocked, onClick: () => { void saveGlobal(true); } }, '覆盖保存'))),
                 h('button', { type: 'button', style: uiButton(true), disabled: saveBlocked || !!detailConflict || typeof selected.content !== 'string', onClick: () => { void saveGlobal(); } }, '保存全局记忆'))
-              : h('p', { style: { whiteSpace: 'pre-wrap', fontSize: 13, lineHeight: 1.65 } }, selected.content),
-            h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 12 } }, (selected.tags || []).map(tag => h('span', { key: tag, style: { fontSize: 11, padding: '3px 7px', borderRadius: 999, background: 'color-mix(in srgb, currentColor 8%, transparent)' } }, tag))),
-            h('div', { style: { marginTop: 14, fontSize: 11, color: dswTheme.dim } }, '清晰度 ' + ({ vivid: '清晰', clear: '清楚', fuzzy: '模糊', trace: '只剩印象' }[selected.clarity] || selected.clarity || '清晰') + ' · 重要性 ' + Math.round((selected.importance || 0) * 100) + '% · 访问 ' + (selected.accessCount || 0) + ' 次' + (selected.pinned ? ' · 已固定' : '')),
-            h('div', { style: { display: 'flex', gap: 8, marginTop: 16 } },
+              : h('p', { className: 'mv-memory-body' }, selected.content),
+            h('div', { className: 'mv-tag-row', style: { marginTop: 12 } }, (selected.tags || []).map(tag =>
+              mvMemoryChip(tag, '#8b93a1', 'tag-' + tag))),
+            h('div', { className: 'mv-actions', style: { marginTop: 16 } },
               h('button', { type: 'button', style: uiButton(false), onClick: () => { void forget(selected); } }, '删除'),
               h('button', { type: 'button', style: uiButton(false), onClick: () => { void selectMemory(null); } }, '关闭')))),
         graph.nodes.length === 0 && !searchActive && h('div', { style: { padding: '0 18px 18px', fontSize: 12, color: dswTheme.dim } },
@@ -1851,6 +1944,19 @@ window.__ModuleLoader__.load({
     const mvTaskTypes = { casual: '闲聊记录', direct: '直连任务', ticket: '关联工单' };
     const mvTaskStatuses = { queued: '待处理', running: '进行中', review: '待验收', done: '已完成', failed: '失败' };
     const mvRead = (path, signal) => fetchJson('marshal/' + path, undefined, true, signal);
+    // A host that installs the standalone @linxin666/dsh-agents plugin serves its
+    // own /api/run, whose body refuses any field it does not read. Only the bundled
+    // build records `purpose`, so retry once without it rather than failing the open.
+    async function mvRunDirectSession(agent, signal) {
+      const body = { teamId: agent.teamId, memberId: agent.agentId, purpose: 'direct' };
+      try {
+        return await fetchJson('dsh-agents/api/run', body, false, signal);
+      } catch (error) {
+        if (signal?.aborted || error?.status !== 400 || error?.code !== 'invalid-request') throw error;
+        const { purpose, ...compatible } = body;
+        return await fetchJson('dsh-agents/api/run', compatible, false, signal);
+      }
+    }
     const mvAgentQuery = (path, agentKey) => path + '?' + new URLSearchParams({ agentKey });
     const mvSessionId = row => row?.sessionId ?? row?.id;
     const mvReadOnlyTask = task => task.id.startsWith('ticket:');
@@ -6179,6 +6285,21 @@ window.__ModuleLoader__.load({
     }
 
     const MV_HUB_LANES = [['queued', '待办'], ['running', '运行中'], ['review', '待验收'], ['failed', '阻塞失败'], ['done', '已完成']];
+    // One compact palette shared by tag pills, priority chips and card rails so a
+    // ticket keeps the same colour in the lane, the drawer and the incident card.
+    const MV_HUB_TONE_COLORS = ['#4e93e8', '#2ea36a', '#d08a2a', '#b456c8', '#cf5f7a', '#4a9fb5'];
+    const MV_HUB_PRIORITY_COLORS = ['#cf5f7a', '#d08a2a', '#4e93e8', '#8b93a1'];
+    function mvHubToneColor(name) {
+      const tone = taskTagTone(name);
+      return tone[0] === 'p' ? MV_HUB_PRIORITY_COLORS[Number(tone[1])] : MV_HUB_TONE_COLORS[Number(tone)] || MV_HUB_TONE_COLORS[0];
+    }
+    function mvHubToneChip(label, name, key, solid = false) {
+      return h('span', { className: 'mv-tone-chip', key, 'data-solid': solid ? 'true' : undefined,
+        style: { '--mv-tone': mvHubToneColor(name) } }, label);
+    }
+    const mvHubPriority = row => row.priority || row.tags?.find(tag => /^P[0-3]$/.test(tag.name))?.name;
+    const mvHubPhase = (row, label) => taskPhases[row.workflow?.phase] || row.workflow?.phase || label;
+    const mvHubTagNames = row => (row.tags ?? []).map(tag => tag.name).filter(name => name && !/^P[0-3]$/i.test(name)).slice(0, 3);
     const mvHubWorkspace = task => task.taskRoom?.workspaceId || task.workflow?.workspaceId || task.workspaceId || '';
     function mvHubLane(task) {
       const state = task.workflow?.state;
@@ -6333,12 +6454,15 @@ window.__ModuleLoader__.load({
         h('div', { className: 'mv-room-fill', style: { flexWrap: 'wrap', alignContent: 'start', gap: 'var(--mv-md)' } },
           h('div', { className: 'mv-copy', style: { display: 'grid', flex: '1 1 var(--mv-float-width)', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, calc(10 * var(--mv-lg))), 1fr))', gap: 'var(--mv-sm)', alignItems: 'start' } },
             lanes.map(([id, label, rows]) => h('section', { key: id, 'aria-label': label },
-              h('h3', { className: 'mv-voice-title' }, label),
-              rows.map(row => h('article', { id: 'marshal-ticket-' + row.id, key: row.id, className: 'mv-agent-card', onClick: () => chooseTask(row) },
+              h('h3', { className: 'mv-lane-head' }, h('span', { className: 'mv-tone-dot', 'data-tone': id }),
+                label, h('span', { className: 'mv-tone-count' }, rows.length)),
+              rows.map(row => h('article', { id: 'marshal-ticket-' + row.id, key: row.id, className: 'mv-agent-card',
+                'data-tone': id, onClick: () => chooseTask(row) },
                 h('button', { type: 'button', className: 'mv-row', 'aria-pressed': task?.id === row.id, onClick: event => { event.stopPropagation(); chooseTask(row); } }, row.title),
-                h('div', { className: 'mv-actions' }, h('span', { className: 'mv-muted' }, row.ticketNo || row.id),
-                  [row.priority || row.tags?.find(tag => /^P[0-3]$/.test(tag.name))?.name, taskPhases[row.workflow?.phase] || row.workflow?.phase || label].filter(Boolean)
-                    .map((text, index) => h('span', { className: 'mv-model', key: index }, text))),
+                h('div', { className: 'mv-tag-row' }, h('span', { className: 'mv-muted' }, row.ticketNo || row.id),
+                  [mvHubPriority(row), mvHubPhase(row, label)].filter(Boolean)
+                    .map((text, index) => mvHubToneChip(text, text, 'state-' + index, index === 0)),
+                  mvHubTagNames(row).map((name, index) => mvHubToneChip(name, name, 'tag-' + index))),
                 h(MvButton, { label: '工单群', 'aria-label': '进入工单群 · ' + row.title, onClick: event => { event.stopPropagation(); openTaskRoom(row); } })))))),
           task && h('aside', { className: 'mv-drawer mv-stack', style: { flex: '1 1 var(--mv-float-width)', height: 'auto', boxSizing: 'border-box', overflowWrap: 'anywhere' }, 'aria-label': '工单详情' },
             h('div', { className: 'mv-actions' }, h('strong', { className: 'mv-copy' }, task.title), h(MvButton, { label: '关闭', onClick: () => { select(''); setEdit(null); } })),
@@ -6490,6 +6614,9 @@ window.__ModuleLoader__.load({
       health: signal => fetchJson('marshal/health', undefined, true, signal) };
     const MV_HUB_MONITOR_READS = { overview: MV_HUB_OVERVIEW, incidents: MV_HUB_INCIDENTS, board: MV_HUB_KANBAN_READS.board };
     const MV_HUB_INCIDENT_KINDS = [['review-blocked', '待人工裁决'], ['failed', '执行失败或受阻'], ['tool-anomaly', '工具异常'], ['memory-proposal', '待审记忆提案']];
+    const MV_HUB_INCIDENT_TONES = { 'review-blocked': 'review', failed: 'critical', 'tool-anomaly': 'warning', 'memory-proposal': 'memory' };
+    const MV_HUB_METRIC_TONES = [['工单总数', 'info'], ['智能体总数', 'running'], ['严重告警数', 'critical'],
+      ['待审记忆提案数', 'memory'], ['主机', 'neutral']];
 
     function MarshalHubMonitorView({ openTaskRoom, onOpenMemory, onOpenDirect }) {
       const [data, refresh] = mvUseHubSnapshot(MV_HUB_MONITOR_TOPICS, MV_HUB_MONITOR_READS);
@@ -6511,22 +6638,29 @@ window.__ModuleLoader__.load({
       };
       return h('section', { className: 'mv-scope mv-room', 'aria-label': '问题监控' },
         h('header', { className: 'mv-actions' }, h('h2', { className: 'mv-copy mv-voice-title' }, '问题监控'), h(MvButton, { label: '刷新', onClick: refresh })),
-        h('dl', { className: 'mv-actions', 'aria-label': '系统总览' }, metrics.map(([label, value]) =>
-          h('div', { className: 'mv-mini', key: label }, h('dt', { className: 'mv-muted' }, label), h('dd', { style: { margin: 0 } }, value ?? '—')))),
+        h('dl', { className: 'mv-actions', 'aria-label': '系统总览' }, metrics.map(([label, value], index) =>
+          h('div', { className: 'mv-mini mv-metric', key: label, 'data-tone': MV_HUB_METRIC_TONES[index]?.[1] },
+            h('dt', { className: 'mv-muted' }, label), h('dd', null, value ?? '—')))),
         data.loading && h('p', { role: 'status' }, '正在读取告警…'),
         data.error && h('p', { role: 'alert' }, data.error),
         action.notice && h('p', { role: 'status' }, action.notice),
         MV_HUB_INCIDENT_KINDS.map(([kind, label]) => {
           const rows = (summary?.items ?? []).filter(row => row.kind === kind);
-          return h('section', { key: kind, 'aria-label': label }, h('h3', { className: 'mv-voice-title' }, label + ' · ' + (summary?.countsByKind?.[kind] ?? rows.length)),
+          const tone = MV_HUB_INCIDENT_TONES[kind];
+          return h('section', { key: kind, 'aria-label': label },
+            h('h3', { className: 'mv-lane-head' }, h('span', { className: 'mv-tone-dot', 'data-tone': tone }),
+              label, h('span', { className: 'mv-tone-count' }, summary?.countsByKind?.[kind] ?? rows.length)),
             rows.map(row => {
               const task = tasks.get(row.targetId);
               const actionable = mvHubIsTaskIncident(row);
               const plain = task && !task.workflow;
               const blocked = mvHubHasPermissionBlock(task, row, data.board?.sessionDefaultPermission);
-              return h('article', { key: row.id, className: 'mv-agent-card' },
+              return h('article', { key: row.id, className: 'mv-agent-card',
+                'data-tone': row.severity === 'critical' ? 'critical' : tone },
                 h('div', { className: 'mv-actions' }, h('strong', { className: 'mv-copy' }, row.title),
-                  h('span', { className: row.severity === 'critical' ? 'mv-badge' : 'mv-model' }, row.severity === 'critical' ? '严重' : '待处理')),
+                  h('span', { className: 'mv-tone-chip', 'data-solid': 'true',
+                    style: { '--mv-tone': row.severity === 'critical' ? '#cf5f7a' : '#d08a2a' } },
+                    row.severity === 'critical' ? '严重' : '待处理')),
                 h('div', { className: 'mv-muted', style: { overflowWrap: 'anywhere' } }, row.subtitle),
                 h('div', { className: 'mv-actions' }, h(MvButton, { label: kind === 'memory-proposal' ? '查看记忆提案' : row.targetType === 'agent' ? '打开智能体' : '进入工单群处理',
                   disabled: row.targetType === 'agent' && (!onOpenDirect || !agents.has(row.targetId)), onClick: () => handle(row) }),
@@ -6736,9 +6870,7 @@ window.__ModuleLoader__.load({
             const result = await mvRead(mvAgentQuery('agent-direct-sessions', key), signal);
             if (result?.mainSession !== null || !agent.teamId || !agent.agentId || !canOpen()) return result?.mainSession &&
               { sessionId: mvSessionId(result.mainSession), agentKey: result.agentKey };
-            const created = await fetchJson('dsh-agents/api/run', {
-              teamId: agent.teamId, memberId: agent.agentId, purpose: 'direct',
-            }, false, signal);
+            const created = await mvRunDirectSession(agent, signal);
             return { sessionId: created?.run?.sessionId, agentKey: result.agentKey };
           };
           const request = resolve().finally(() => mvDirectLookups.delete(key));

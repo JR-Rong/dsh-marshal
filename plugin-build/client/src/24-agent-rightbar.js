@@ -5,6 +5,19 @@
     const mvTaskTypes = { casual: '闲聊记录', direct: '直连任务', ticket: '关联工单' };
     const mvTaskStatuses = { queued: '待处理', running: '进行中', review: '待验收', done: '已完成', failed: '失败' };
     const mvRead = (path, signal) => fetchJson('marshal/' + path, undefined, true, signal);
+    // A host that installs the standalone @linxin666/dsh-agents plugin serves its
+    // own /api/run, whose body refuses any field it does not read. Only the bundled
+    // build records `purpose`, so retry once without it rather than failing the open.
+    async function mvRunDirectSession(agent, signal) {
+      const body = { teamId: agent.teamId, memberId: agent.agentId, purpose: 'direct' };
+      try {
+        return await fetchJson('dsh-agents/api/run', body, false, signal);
+      } catch (error) {
+        if (signal?.aborted || error?.status !== 400 || error?.code !== 'invalid-request') throw error;
+        const { purpose, ...compatible } = body;
+        return await fetchJson('dsh-agents/api/run', compatible, false, signal);
+      }
+    }
     const mvAgentQuery = (path, agentKey) => path + '?' + new URLSearchParams({ agentKey });
     const mvSessionId = row => row?.sessionId ?? row?.id;
     const mvReadOnlyTask = task => task.id.startsWith('ticket:');

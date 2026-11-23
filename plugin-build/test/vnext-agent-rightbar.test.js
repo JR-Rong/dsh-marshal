@@ -17,7 +17,8 @@ const tasksSlot = 'sidebar.right.pane.tab', dockSlot = 'conversation.input.dock'
 
 function fixture(t, { lite = false, mountedRightbar = false, ticketRows = [ticket], directoryAgent = agent,
     directoryTeams = [{ id: 'team', name: 'marshal-agent:coder', members: [{ id: 'coder' }] }],
-    workspaces = [], openTaskRoom, directMain = { sessionId: 'direct' }, directChildren = [{ id: 'actual-child' }] } = {}) {
+    workspaces = [], openTaskRoom, directMain = { sessionId: 'direct' }, directChildren = [{ id: 'actual-child' }],
+    strictRun = false } = {}) {
     const slots = new Map(), registry = new Map(), effects = [], calls = [], requests = [], timers = new Map();
     const directDeliveries = [];
     let loaded, api, frame, index, timerId = 0, stream, taskRows = [personal, synthetic];
@@ -75,6 +76,11 @@ function fixture(t, { lite = false, mountedRightbar = false, ticketRows = [ticke
             if (path === '/marshal/agent-tasks/delete') {
                 taskRows = taskRows.filter(task => task.id !== body.id);
                 return Response.json({ ok: true });
+            }
+            if (path === '/dsh-agents/api/run' && strictRun && body?.purpose !== undefined) {
+                // The standalone agents plugin refuses a field its own build does not read.
+                return Response.json({ ok: false, code: 'invalid-request',
+                    error: 'the run request does not name one member of one team' }, { status: 400 });
             }
             if (path === '/marshal/task-rooms/open' && openTaskRoom) return openTaskRoom(body);
             if (path === '/marshal/agents/guidance-sync' && !body.targetTicketId) {
@@ -737,4 +743,17 @@ test('unlinked casual guidance requires a target and SSE invalidations refresh a
     assert.ok(domain.length > 4 && domain.every(req => req.auth === 'test'));
     host.dispose();
     assert.ok(domain.every(req => req.signal.aborted));
+});
+
+test('a strict agents host refuses run purpose and the 1:1 open retries without it', async t => {
+    const host = fixture(t, { directMain: null, strictRun: true });
+    const render = host.mount('sidebar.session.action', { wide: true });
+    await settle(render);
+    await byText(render(), '1:1 直连').props.onClick();
+    const attempts = host.requests.filter(req => req.path === '/dsh-agents/api/run');
+    assert.equal(attempts.length, 2, 'the refused body is retried once, not looped');
+    assert.equal(attempts[0].body.purpose, 'direct');
+    assert.equal('purpose' in attempts[1].body, false, 'the retry speaks the older host contract');
+    assert.deepEqual(attempts[1].body, { teamId: agent.teamId, memberId: agent.agentId });
+    assert.deepEqual(host.calls, [['panel', null], ['session', 'new-native'], ['tab', 'marshal-agent-tasks']]);
 });

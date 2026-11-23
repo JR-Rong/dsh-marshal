@@ -66,6 +66,21 @@
     }
 
     const MV_HUB_LANES = [['queued', '待办'], ['running', '运行中'], ['review', '待验收'], ['failed', '阻塞失败'], ['done', '已完成']];
+    // One compact palette shared by tag pills, priority chips and card rails so a
+    // ticket keeps the same colour in the lane, the drawer and the incident card.
+    const MV_HUB_TONE_COLORS = ['#4e93e8', '#2ea36a', '#d08a2a', '#b456c8', '#cf5f7a', '#4a9fb5'];
+    const MV_HUB_PRIORITY_COLORS = ['#cf5f7a', '#d08a2a', '#4e93e8', '#8b93a1'];
+    function mvHubToneColor(name) {
+      const tone = taskTagTone(name);
+      return tone[0] === 'p' ? MV_HUB_PRIORITY_COLORS[Number(tone[1])] : MV_HUB_TONE_COLORS[Number(tone)] || MV_HUB_TONE_COLORS[0];
+    }
+    function mvHubToneChip(label, name, key, solid = false) {
+      return h('span', { className: 'mv-tone-chip', key, 'data-solid': solid ? 'true' : undefined,
+        style: { '--mv-tone': mvHubToneColor(name) } }, label);
+    }
+    const mvHubPriority = row => row.priority || row.tags?.find(tag => /^P[0-3]$/.test(tag.name))?.name;
+    const mvHubPhase = (row, label) => taskPhases[row.workflow?.phase] || row.workflow?.phase || label;
+    const mvHubTagNames = row => (row.tags ?? []).map(tag => tag.name).filter(name => name && !/^P[0-3]$/i.test(name)).slice(0, 3);
     const mvHubWorkspace = task => task.taskRoom?.workspaceId || task.workflow?.workspaceId || task.workspaceId || '';
     function mvHubLane(task) {
       const state = task.workflow?.state;
@@ -220,12 +235,15 @@
         h('div', { className: 'mv-room-fill', style: { flexWrap: 'wrap', alignContent: 'start', gap: 'var(--mv-md)' } },
           h('div', { className: 'mv-copy', style: { display: 'grid', flex: '1 1 var(--mv-float-width)', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, calc(10 * var(--mv-lg))), 1fr))', gap: 'var(--mv-sm)', alignItems: 'start' } },
             lanes.map(([id, label, rows]) => h('section', { key: id, 'aria-label': label },
-              h('h3', { className: 'mv-voice-title' }, label),
-              rows.map(row => h('article', { id: 'marshal-ticket-' + row.id, key: row.id, className: 'mv-agent-card', onClick: () => chooseTask(row) },
+              h('h3', { className: 'mv-lane-head' }, h('span', { className: 'mv-tone-dot', 'data-tone': id }),
+                label, h('span', { className: 'mv-tone-count' }, rows.length)),
+              rows.map(row => h('article', { id: 'marshal-ticket-' + row.id, key: row.id, className: 'mv-agent-card',
+                'data-tone': id, onClick: () => chooseTask(row) },
                 h('button', { type: 'button', className: 'mv-row', 'aria-pressed': task?.id === row.id, onClick: event => { event.stopPropagation(); chooseTask(row); } }, row.title),
-                h('div', { className: 'mv-actions' }, h('span', { className: 'mv-muted' }, row.ticketNo || row.id),
-                  [row.priority || row.tags?.find(tag => /^P[0-3]$/.test(tag.name))?.name, taskPhases[row.workflow?.phase] || row.workflow?.phase || label].filter(Boolean)
-                    .map((text, index) => h('span', { className: 'mv-model', key: index }, text))),
+                h('div', { className: 'mv-tag-row' }, h('span', { className: 'mv-muted' }, row.ticketNo || row.id),
+                  [mvHubPriority(row), mvHubPhase(row, label)].filter(Boolean)
+                    .map((text, index) => mvHubToneChip(text, text, 'state-' + index, index === 0)),
+                  mvHubTagNames(row).map((name, index) => mvHubToneChip(name, name, 'tag-' + index))),
                 h(MvButton, { label: '工单群', 'aria-label': '进入工单群 · ' + row.title, onClick: event => { event.stopPropagation(); openTaskRoom(row); } })))))),
           task && h('aside', { className: 'mv-drawer mv-stack', style: { flex: '1 1 var(--mv-float-width)', height: 'auto', boxSizing: 'border-box', overflowWrap: 'anywhere' }, 'aria-label': '工单详情' },
             h('div', { className: 'mv-actions' }, h('strong', { className: 'mv-copy' }, task.title), h(MvButton, { label: '关闭', onClick: () => { select(''); setEdit(null); } })),

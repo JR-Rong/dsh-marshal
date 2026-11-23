@@ -492,6 +492,29 @@ test('task creation preserves legacy input and persists sanitized vNext metadata
     } finally { app.close(); }
 });
 
+test('a host that cannot record run purpose still resolves the agent direct session', async () => {
+    // The standalone @linxin666/dsh-agents plugin refuses an unknown `purpose` field,
+    // so every run it records is bare. The board scan alone separates ticket sessions.
+    const runs = [
+        { teamId: 'squad', memberId: 'coder', sessionId: 'main', createdAt: 10 },
+        { teamId: 'squad', memberId: 'coder', sessionId: 'gone', createdAt: 5, status: 'failed' },
+    ];
+    const app = fixture({ runs });
+    try {
+        const headers = await app.signIn();
+        const sessions = () => app.request('GET', '/marshal/agent-direct-sessions?agentKey=coder', undefined, headers);
+        assert.equal((await sessions()).body.mainSession.id, 'main', 'a bare run is the direct session when the host cannot tag purpose');
+        const create = async sessionId => (await app.request('POST', '/marshal/agent-tasks/create', { ...draft, sessionId }, headers)).body.task.id;
+        const send = id => app.request('POST', '/marshal/agents/guidance-sync', { agentKey, taskIds: [id], guidanceText: 'Continue' }, headers);
+        assert.equal((await send(await create(undefined))).status, 200);
+        // A purpose-aware ledger keeps the stricter rule: bare runs only prove ownership.
+        const file = join(app.root, 'dsh-agents/ledger.json');
+        writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file)),
+            runs: [...runs, { teamId: 'squad', memberId: 'coder', sessionId: 'ticket', createdAt: 50, purpose: 'ticket' }] }));
+        assert.equal((await sessions()).body.mainSession, null);
+    } finally { app.close(); }
+});
+
 test('latest handoff and unclassified runs are not direct guidance destinations', async () => {
     const runs = [
         { teamId: 'squad', memberId: 'coder', sessionId: 'main', createdAt: 10, purpose: 'direct' },

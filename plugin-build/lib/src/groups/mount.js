@@ -896,13 +896,18 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
         finally { clearTimeout(timer); }
     };
     const directSessions = async (agent, ledger) => {
-        // Older member runs have no purpose and prove ownership, not 1:1 intent.
-        const excluded = new Set((ledger.runs ?? []).filter(run => run?.purpose !== 'direct' || run.status === 'failed').map(run => run?.sessionId));
+        // A host that runs the standalone agents plugin cannot record `purpose` on a
+        // run, so every row is bare there. The board scan below still separates the
+        // 1:1 sessions from ticket and orchestration runs in that build.
+        const recordsPurpose = (ledger.runs ?? []).some(run => run && run.purpose !== undefined);
+        const isDirect = run => run?.purpose === 'direct' || (!recordsPurpose && run?.purpose === undefined);
+        // Bare runs in a purpose-aware ledger only prove ownership, not 1:1 intent.
+        const excluded = new Set((ledger.runs ?? []).filter(run => !isDirect(run) || run.status === 'failed').map(run => run?.sessionId));
         for (const card of getBoard()?.snapshot()?.tasks ?? []) {
             const workflow = orchestration?.view(boardSource(), card.id);
             for (const id of [workflow?.sessionId, card.sessionId, ...(card.executions ?? []).map(run => run?.sessionId)]) excluded.add(id);
         }
-        const runs = agentRuns(agent, ledger).filter(run => run.purpose === 'direct' && run.status !== 'failed' && !excluded.has(run.sessionId));
+        const runs = agentRuns(agent, ledger).filter(run => isDirect(run) && run.status !== 'failed' && !excluded.has(run.sessionId));
         const sessions = new Map();
         let complete = false;
         if (runs.length && typeof sessionController?.list === 'function') {

@@ -84,9 +84,7 @@
             const result = await mvRead(mvAgentQuery('agent-direct-sessions', key), signal);
             if (result?.mainSession !== null || !agent.teamId || !agent.agentId || !canOpen()) return result?.mainSession &&
               { sessionId: mvSessionId(result.mainSession), agentKey: result.agentKey };
-            const created = await fetchJson('dsh-agents/api/run', {
-              teamId: agent.teamId, memberId: agent.agentId, purpose: 'direct',
-            }, false, signal);
+            const created = await mvRunDirectSession(agent, signal);
             return { sessionId: created?.run?.sessionId, agentKey: result.agentKey };
           };
           const request = resolve().finally(() => mvDirectLookups.delete(key));

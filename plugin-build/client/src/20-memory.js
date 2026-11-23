@@ -29,7 +29,11 @@
         });
         const ids = new Set(nodes.map(node => node.id));
         const edges = (graph.edges || []).filter(edge => ids.has(edge.source) && ids.has(edge.target) && edge.source !== edge.target).slice(0, 1400);
-        return { nodes, edges };
+        // Keep a few landmark titles readable without labelling every node.
+        const labelIds = new Set([...nodes]
+          .sort((a, b) => (Number(b.pinned) - Number(a.pinned)) || (Number(b.importance) || 0) - (Number(a.importance) || 0))
+          .slice(0, nodes.length > 40 ? 5 : 8).map(node => node.id));
+        return { nodes, edges, labelIds };
       }, [graph]);
       const layoutRef = React.useRef(layout);
       layoutRef.current = layout;
@@ -73,11 +77,21 @@
           const theme = window.getComputedStyle(canvas);
           const ink = theme.color;
           const colors = tokens.map((token, index) => theme.getPropertyValue('--dsw-alias-' + token).trim() || 'hsl(' + fallbackHues[index] + ' 48% 48%)');
+          // A very soft vignette keeps the canvas from reading as a flat empty box.
+          if (typeof ctx.createRadialGradient === 'function' && typeof ctx.fillRect === 'function') {
+            try {
+              const vignette = ctx.createRadialGradient(width / 2, height * 0.46, Math.min(width, height) * 0.12,
+                width / 2, height / 2, Math.max(width, height) * 0.72);
+              vignette.addColorStop(0, ink);
+              vignette.addColorStop(1, 'transparent');
+              ctx.globalAlpha = 0.06; ctx.fillStyle = vignette; ctx.fillRect(0, 0, width, height);
+            } catch { /* A host colour the canvas cannot parse simply skips the wash. */ }
+          }
           ctx.globalAlpha = 0.16; ctx.fillStyle = ink;
           for (const star of stars) {
             ctx.beginPath(); ctx.arc(star.x * width, star.y * height, star.r, 0, Math.PI * 2); ctx.fill();
           }
-          const { nodes, edges } = layoutRef.current;
+          const { nodes, edges, labelIds } = layoutRef.current;
           if (!dragging && hover !== undefined && !nodes.some(node => node.id === hover)) {
             hover = undefined;
             canvas.style.cursor = 'grab';
@@ -92,12 +106,16 @@
           camera.yaw = rotY;
           const projected = nodes.map(node => ({ node, ...toScreen(node, width, height) })).sort((a, b) => b.depth - a.depth);
           const points = new Map(projected.map(entry => [entry.node.id, entry]));
-          ctx.globalAlpha = 0.13; ctx.strokeStyle = ink; ctx.lineWidth = 0.7;
+          ctx.lineWidth = 0.7;
           for (const edge of edges) {
             const a = points.get(edge.source), b = points.get(edge.target);
             if (!a || !b) continue;
+            const depth = Math.max(0.12, Math.min(1, 1 - (a.depth + 350) / 900));
+            ctx.globalAlpha = 0.05 + depth * 0.12;
+            ctx.strokeStyle = ink;
             ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
           }
+          const focusId = hover ?? selectedRef.current;
           for (const entry of projected) {
             const node = entry.node;
             const base = 3.2 + Math.sqrt(Math.max(0.01, (Number(node.importance) || 0))) * 8 + Math.log1p(Math.max(0, Number(node.accessCount) || 0)) * 1.6;
@@ -105,16 +123,31 @@
             const clarityAlpha = node.clarity === 'fuzzy' ? 0.5 : node.clarity === 'trace' ? 0.28 : node.clarity === 'clear' ? 0.85 : 1;
             const alpha = Math.max(0.12, Math.min(1, 1 - (entry.depth + 350) / 900)) * clarityAlpha;
             const color = colors[kinds.indexOf(node.kind)] || ink;
+            const active = focusId === node.id;
+            // Landmarks and the focused node glow; the rest stay flat so a dense
+            // workspace graph never turns into a bloom storm.
+            if ((active || node.pinned || labelIds.has(node.id)) && typeof ctx.createRadialGradient === 'function' && radius > 3) {
+              try {
+                const halo = ctx.createRadialGradient(entry.x, entry.y, radius * 0.6, entry.x, entry.y, radius * 3.4);
+                halo.addColorStop(0, color);
+                halo.addColorStop(1, 'transparent');
+                ctx.globalAlpha = Math.min(0.42, alpha * 0.5); ctx.fillStyle = halo;
+                ctx.beginPath(); ctx.arc(entry.x, entry.y, radius * 3.4, 0, Math.PI * 2); ctx.fill();
+              } catch { /* Unparsable host colour: fall back to the solid node. */ }
+            }
             if (selectedRef.current === node.id || node.pinned) {
               ctx.globalAlpha = 0.85; ctx.strokeStyle = ink; ctx.lineWidth = 1.2;
               ctx.beginPath(); ctx.arc(entry.x, entry.y, radius + 4, 0, Math.PI * 2); ctx.stroke();
             }
             ctx.globalAlpha = alpha; ctx.fillStyle = color;
             ctx.beginPath(); ctx.arc(entry.x, entry.y, radius, 0, Math.PI * 2); ctx.fill();
-            if (hover === node.id || selectedRef.current === node.id) {
-              ctx.globalAlpha = 1; ctx.fillStyle = ink; ctx.font = '12px sans-serif';
+            if (active || labelIds.has(node.id)) {
               const label = String(node.title || '').slice(0, 42);
-              ctx.fillText(label, entry.x + radius + 7, entry.y + 3);
+              if (label) {
+                ctx.globalAlpha = active ? 1 : Math.min(0.72, alpha + 0.18);
+                ctx.fillStyle = ink; ctx.font = active ? '600 12px sans-serif' : '11px sans-serif';
+                ctx.fillText(label, entry.x + radius + 7, entry.y + 4);
+              }
             }
           }
           ctx.globalAlpha = 1;
@@ -201,6 +234,17 @@
       }, []);
       React.useEffect(() => { scheduleRef.current?.(); }, [graph, selectedId, paused]);
       return h('canvas', { ref: canvasRef, 'aria-label': '3D 记忆星系', role: 'img', style: { width: '100%', height: '100%', display: 'block', borderRadius: 14, background: 'radial-gradient(ellipse at center, ' + dswTheme.layer + ', ' + dswTheme.layer3 + ')', cursor: 'grab', touchAction: 'none' } });
+    }
+
+    const MV_MEMORY_SCOPES = { global: ['全局', '#4e93e8'], agent: ['智能体私有', '#2ea36a'], workspace: ['工作区共享', '#d08a2a'] };
+    const MV_MEMORY_KINDS = { profile: ['偏好', '#4e93e8'], decision: ['决策', '#2ea36a'], fact: ['事实', '#4a9fb5'],
+      episode: ['片段', '#d08a2a'], handoff: ['交接', '#b456c8'], scene: ['场景', '#cf5f7a'] };
+    const mvMemoryScopeLabel = scope => (MV_MEMORY_SCOPES[scope] ?? [scope || '记忆', '#8b93a1']);
+    const mvMemoryKindLabel = kind => (MV_MEMORY_KINDS[kind] ?? [kind || '记忆', '#8b93a1']);
+    const mvMemoryClarity = clarity => ({ vivid: '清晰', clear: '清楚', fuzzy: '模糊', trace: '只剩印象' }[clarity] || clarity || '清晰');
+    function mvMemoryChip(label, color, key, solid = false) {
+      return h('span', { className: 'mv-tone-chip', key, 'data-solid': solid ? 'true' : undefined,
+        style: { '--mv-tone': color } }, label);
     }
 
     function MemoryPage({ initialAgentId = '', initialLayer = '', mvOpenDirect, closeMemorySidebar } = {}) {
@@ -670,18 +714,23 @@
           layer !== 'global' && privateBackend === 'mnemon' && h('span', { style: { color: '#10b981', fontSize: 11, padding: '2px 8px', borderRadius: 999, border: '1px solid color-mix(in srgb, #10b981 35%, transparent)', background: 'color-mix(in srgb, #10b981 12%, transparent)' } }, 'Mnemon · 意图图谱 + 推索引引擎'),
           h('input', { value: query, onChange: event => setQuery(event.target.value), onKeyDown: event => { if (event.key === 'Enter') submitSearch(); }, placeholder: fullCanvas ? '搜索全域记忆…' : '搜索当前层级记忆…', style: { ...uiInput, width: 190 } }),
           h('button', { type: 'button', style: uiButton(false), onClick: submitSearch }, '搜索'),
-          h('button', { type: 'button', style: uiButton(false), onClick: () => setPaused(value => !value) }, paused ? '恢复漂移' : '暂停漂移'),
-          h('button', { type: 'button', style: uiButton(false), onClick: () => {
-            if (!fullCanvas) { closeSidebar(); setFormOpen(false); setSettingsOpen(false); }
-            setFullCanvas(!fullCanvas);
-          } }, fullCanvas ? '退出全画布' : '全画布'),
-          mvOpenDirect && mvDirectAgent && h(mvDirectLink, { key: activeAgentId, agent: mvDirectAgent, open: mvOpenDirect }),
-          !fullCanvas && h('button', { type: 'button', style: uiButton(false), onClick: () => { setScope(layer); setFormOpen(value => !value); } }, '＋ 记忆'),
-          !fullCanvas && h('button', { type: 'button', style: uiButton(false), onClick: () => setSettingsOpen(value => !value) }, '设置'),
-          h('span', { style: { marginLeft: 'auto', fontSize: 11, color: dswTheme.dim } }, visibleGraph.nodes.length + ' 个节点 · ' + visibleGraph.edges.length + ' 条关联' + (health?.health?.length ? ' · 模糊 ' + health.health.reduce((sum, item) => sum + (item.fuzzy || 0), 0) + ' · 档案 ' + health.health.reduce((sum, item) => sum + (item.archived || 0), 0) : '')),
-          h('button', { type: 'button', style: uiButton(false), onClick: async () => { setSyncNotice('同步中…'); try { const result = await requestMemory('marshal/memory/sync', { ...(activeAgentId ? { agentId: activeAgentId } : {}), ...(activeWorkspaceId ? { workspaceId: activeWorkspaceId } : {}) }); setSyncNotice('推送 ' + (result.pushed ?? 0) + ' · 拉取 ' + (result.pulled ?? 0)); await refresh(); } catch (e) { if (lifetime.current) setSyncNotice(String(e.message || e)); } } }, '同步'),
-          layer === 'global' && h('button', { type: 'button', style: uiButton(false), onClick: async () => { setSyncNotice('迁移旧同步…'); try { const result = await requestMemory('marshal/memory/migrate-legacy', {}); setSyncNotice(result.migrated ? '已绑定 ' + result.migrated + ' 条旧记录' : '没有待迁移的旧记录'); } catch (e) { if (!lifetime.current) return; if (e && (e.code === 'sign-in-to-approve' || String(e.message || '').includes('sign-in-to-approve'))) setApprovalNotice('请先登录机主账号后再审批全局记忆'); setSyncNotice(String(e.message || e)); } } }, '迁移旧同步'),
-          h('button', { type: 'button', style: uiButton(false), onClick: () => { void refresh(); } }, '刷新')),
+          h('div', { className: 'mv-actions mv-toolbar-group' },
+            h('button', { type: 'button', style: uiButton(false), onClick: () => setPaused(value => !value) }, paused ? '恢复漂移' : '暂停漂移'),
+            h('button', { type: 'button', style: uiButton(false), onClick: () => {
+              if (!fullCanvas) { closeSidebar(); setFormOpen(false); setSettingsOpen(false); }
+              setFullCanvas(!fullCanvas);
+            } }, fullCanvas ? '退出全画布' : '全画布'),
+            mvOpenDirect && mvDirectAgent && h(mvDirectLink, { key: activeAgentId, agent: mvDirectAgent, open: mvOpenDirect }),
+            !fullCanvas && h('button', { type: 'button', style: uiButton(false), onClick: () => { setScope(layer); setFormOpen(value => !value); } }, '＋ 记忆'),
+            !fullCanvas && h('button', { type: 'button', style: uiButton(false), onClick: () => setSettingsOpen(value => !value) }, '设置')),
+          h('div', { className: 'mv-actions mv-toolbar-group' },
+            h('button', { type: 'button', style: uiButton(false), onClick: async () => { setSyncNotice('同步中…'); try { const result = await requestMemory('marshal/memory/sync', { ...(activeAgentId ? { agentId: activeAgentId } : {}), ...(activeWorkspaceId ? { workspaceId: activeWorkspaceId } : {}) }); setSyncNotice('推送 ' + (result.pushed ?? 0) + ' · 拉取 ' + (result.pulled ?? 0)); await refresh(); } catch (e) { if (lifetime.current) setSyncNotice(String(e.message || e)); } } }, '同步'),
+            layer === 'global' && h('button', { type: 'button', style: uiButton(false), onClick: async () => { setSyncNotice('迁移旧同步…'); try { const result = await requestMemory('marshal/memory/migrate-legacy', {}); setSyncNotice(result.migrated ? '已绑定 ' + result.migrated + ' 条旧记录' : '没有待迁移的旧记录'); } catch (e) { if (!lifetime.current) return; if (e && (e.code === 'sign-in-to-approve' || String(e.message || '').includes('sign-in-to-approve'))) setApprovalNotice('请先登录机主账号后再审批全局记忆'); setSyncNotice(String(e.message || e)); } } }, '迁移旧同步'),
+            h('button', { type: 'button', style: uiButton(false), onClick: () => { void refresh(); } }, '刷新')),
+          h('span', { className: 'mv-tone-chip', 'aria-label': '星系统计',
+            style: { '--mv-tone': '#8b93a1', marginLeft: 'auto' } },
+            visibleGraph.nodes.length + ' 节点 · ' + visibleGraph.edges.length + ' 关联' +
+            (health?.health?.length ? ' · 模糊 ' + health.health.reduce((sum, item) => sum + (item.fuzzy || 0), 0) + ' · 档案 ' + health.health.reduce((sum, item) => sum + (item.archived || 0), 0) : ''))),
         syncNotice !== '' && h('div', { style: { padding: '6px 18px', fontSize: 11, color: dswTheme.dim } }, syncNotice),
         !fullCanvas && settingsOpen && settings && h('div', { style: { padding: '10px 18px', display: 'flex', gap: 16, flexWrap: 'wrap', fontSize: 12, borderBottom: '1px solid #8883' } },
           [['autoSummary', '会话结束自动摘要'], ['autoRecall', '每轮自动召回'], ['allowGroupQuote', '群聊允许引用私有记忆']].map(([key, label]) => h('label', { key, style: { display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' } },
@@ -726,23 +775,34 @@
           visibleResults.length === 0 ? h('div', { style: { fontSize: 12, color: dswTheme.dim } }, '没有匹配的记忆') : visibleResults.map(item => h('button', { key: item.id, type: 'button', onClick: () => { void selectMemory(item); }, style: { textAlign: 'left', border: 0, background: 'transparent', color: 'inherit', cursor: 'pointer', padding: '5px 0' } }, '[' + item.scope + '] ' + item.title))),
         h('div', { style: { flex: 1, minHeight: 0, display: 'flex', padding: 14, gap: 14 } },
           h('div', { style: { flex: 1, minWidth: 0, minHeight: 0, borderRadius: 14, overflow: 'hidden', border: '1px solid #8883' } }, h(MemoryGalaxy, { graph: visibleGraph, paused, selectedId: selected?.id, onSelect: selectMemory })),
-          selected && h('aside', { style: { width: 300, flexShrink: 0, overflow: 'auto', padding: 16, border: '1px solid #8883', borderRadius: 14, background: 'color-mix(in srgb, currentColor 3%, transparent)' } },
-            h('div', { style: { fontSize: 11, color: dswTheme.dim, textTransform: 'uppercase', letterSpacing: '.06em' } }, selected.scope + ' · ' + selected.kind + (selected.scope === 'global' ? ' · ' + (selected.visibility === 'all' ? '所有会话' : '仅单聊') : '')),
-            h('h3', { style: { margin: '6px 0 10px', fontSize: 16 } }, selected.title),
-            selected.cue && h('div', { style: { fontSize: 11, color: dswTheme.dim, marginBottom: 8, padding: '4px 8px', borderRadius: 6, background: 'color-mix(in srgb, currentColor 6%, transparent)' } }, '触发场景：' + selected.cue),
-            detailLoading ? h('p', { role: 'status' }, '正在读取记忆…') : selected.scope === 'global'
+          selected && h('aside', { className: 'mv-memory-detail', 'aria-label': '记忆详情' },
+            h('div', { className: 'mv-memory-head' },
+              h('div', { className: 'mv-tag-row' },
+                mvMemoryChip(mvMemoryScopeLabel(selected.scope)[0], mvMemoryScopeLabel(selected.scope)[1], 'scope', true),
+                mvMemoryChip(mvMemoryKindLabel(selected.kind)[0], mvMemoryKindLabel(selected.kind)[1], 'kind'),
+                selected.scope === 'global' && mvMemoryChip(selected.visibility === 'all' ? '所有会话' : '仅单聊',
+                  selected.visibility === 'all' ? '#2ea36a' : '#8b93a1', 'visibility'),
+                selected.pinned && mvMemoryChip('已固定', '#d08a2a', 'pinned')),
+              h('h3', { className: 'mv-memory-title' }, selected.title),
+              h('div', { className: 'mv-memory-meta' },
+                '清晰度 ' + mvMemoryClarity(selected.clarity),
+                ' · 重要性 ' + Math.round((selected.importance || 0) * 100) + '%',
+                ' · 访问 ' + (selected.accessCount || 0) + ' 次')),
+            selected.cue && h('div', { className: 'mv-memory-cue' }, '触发场景 · ' + selected.cue),
+            detailLoading ? h('p', { role: 'status', className: 'mv-muted' }, '正在读取记忆…') : selected.scope === 'global'
               ? h('div', { style: { display: 'grid', gap: 8 } },
-                h('textarea', { value: editText, onChange: event => setEditText(editTextRef.current = event.target.value), rows: 6, style: { ...uiInput, resize: 'vertical' } }),
-                h('select', { value: editVisibility, onChange: event => setEditVisibility(editVisibilityRef.current = event.target.value), style: uiInput }, h('option', { value: 'all' }, '所有会话'), h('option', { value: 'no-group' }, '仅单聊')),
-                detailConflict && h('div', { role: 'alert' },
+                h('textarea', { value: editText, 'aria-label': '记忆正文', onChange: event => setEditText(editTextRef.current = event.target.value), rows: 6, style: { ...uiInput, resize: 'vertical' } }),
+                h('select', { value: editVisibility, 'aria-label': '记忆可见性', onChange: event => setEditVisibility(editVisibilityRef.current = event.target.value), style: uiInput }, h('option', { value: 'all' }, '所有会话'), h('option', { value: 'no-group' }, '仅单聊')),
+                detailConflict && h('div', { role: 'alert', className: 'mv-memory-conflict' },
                   h('p', null, detailConflict.deleted ? '远端记忆已被删除，本地草稿仍保留。' : '远端记忆已更新，本地草稿仍保留。'),
-                  h('button', { type: 'button', style: uiButton(false), disabled: saveBlocked, onClick: loadLatestConflict }, '载入最新版本'),
-                  !detailConflict.deleted && h('button', { type: 'button', style: uiButton(false), disabled: saveBlocked, onClick: () => { void saveGlobal(true); } }, '覆盖保存')),
+                  h('div', { className: 'mv-actions' },
+                    h('button', { type: 'button', style: uiButton(false), disabled: saveBlocked, onClick: loadLatestConflict }, '载入最新版本'),
+                    !detailConflict.deleted && h('button', { type: 'button', style: uiButton(false), disabled: saveBlocked, onClick: () => { void saveGlobal(true); } }, '覆盖保存'))),
                 h('button', { type: 'button', style: uiButton(true), disabled: saveBlocked || !!detailConflict || typeof selected.content !== 'string', onClick: () => { void saveGlobal(); } }, '保存全局记忆'))
-              : h('p', { style: { whiteSpace: 'pre-wrap', fontSize: 13, lineHeight: 1.65 } }, selected.content),
-            h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 12 } }, (selected.tags || []).map(tag => h('span', { key: tag, style: { fontSize: 11, padding: '3px 7px', borderRadius: 999, background: 'color-mix(in srgb, currentColor 8%, transparent)' } }, tag))),
-            h('div', { style: { marginTop: 14, fontSize: 11, color: dswTheme.dim } }, '清晰度 ' + ({ vivid: '清晰', clear: '清楚', fuzzy: '模糊', trace: '只剩印象' }[selected.clarity] || selected.clarity || '清晰') + ' · 重要性 ' + Math.round((selected.importance || 0) * 100) + '% · 访问 ' + (selected.accessCount || 0) + ' 次' + (selected.pinned ? ' · 已固定' : '')),
-            h('div', { style: { display: 'flex', gap: 8, marginTop: 16 } },
+              : h('p', { className: 'mv-memory-body' }, selected.content),
+            h('div', { className: 'mv-tag-row', style: { marginTop: 12 } }, (selected.tags || []).map(tag =>
+              mvMemoryChip(tag, '#8b93a1', 'tag-' + tag))),
+            h('div', { className: 'mv-actions', style: { marginTop: 16 } },
               h('button', { type: 'button', style: uiButton(false), onClick: () => { void forget(selected); } }, '删除'),
               h('button', { type: 'button', style: uiButton(false), onClick: () => { void selectMemory(null); } }, '关闭')))),
         graph.nodes.length === 0 && !searchActive && h('div', { style: { padding: '0 18px 18px', fontSize: 12, color: dswTheme.dim } },
