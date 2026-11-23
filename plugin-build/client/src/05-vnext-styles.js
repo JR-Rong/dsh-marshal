@@ -32,10 +32,11 @@
 }
 .mv-scope{color:var(--dsw-alias-marshal-text);font-size:var(--mv-font);line-height:var(--mv-leading)}
 .mv-entry,.mv-line,.mv-actions{display:flex;align-items:center;gap:var(--mv-sm);min-width:0}
-.mv-entry{position:relative;display:inline-flex}
-/* The host paints this entry as one icon in a narrow rail: anchor the count on the
-   icon's own top-end corner so it never drifts over the rail edge or the label. */
-.mv-entry .mv-badge{position:absolute;z-index:1;inset-block-start:calc(-1 * var(--mv-xs));inset-inline-end:calc(-1 * var(--mv-xs));min-width:var(--mv-md);text-align:center;line-height:1.35;pointer-events:none}
+.mv-entry{position:relative;display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;flex:none}
+/* The host paints this entry as one icon in a narrow rail, so the count rides the
+   icon's own top-end corner inside a box this rule sizes. That keeps it off the
+   glyph and out of the label's gutter whatever the host row does. */
+.mv-entry .mv-badge{position:absolute;z-index:1;inset-block-start:-7px;inset-inline-start:9px;min-width:14px;text-align:center;line-height:1.3;pointer-events:none}
 .mv-badge,.mv-model{font-size:var(--mv-font-small);border-radius:var(--mv-pill);padding-inline:var(--mv-xs)}
 .mv-badge{color:var(--dsw-alias-marshal-danger);background:var(--dsw-alias-marshal-surface);font-weight:var(--mv-weight);box-shadow:0 0 0 1px var(--dsw-alias-marshal-border)}
 .mv-model{color:var(--dsw-alias-marshal-muted);background:var(--dsw-alias-marshal-layer);display:block;width:fit-content;max-width:100%;box-sizing:border-box}
