@@ -49,24 +49,8 @@ function fixture({ tasks = [], workflows = [], proposals = [], host = undefined,
         routes.set(route.path, route);
         return () => routes.delete(route.path);
     } }, ...(host ? { taskBoard: host } : {}) };
-    const attached = [];
-    const workspaceRows = [
-        { id: 'ws-old', title: 'Older', path: '/tmp/ws-old', updatedAt: 10, sessionIds: ['other'] },
-        { id: 'ws-new', title: 'Newer', path: '/tmp/ws-new', updatedAt: 40, sessionIds: ['main'] },
-    ];
-    const workspaceRegistry = {
-        list: () => workspaceRows,
-        get: id => {
-            const row = workspaceRows.find(candidate => candidate.id === id);
-            return row === undefined ? undefined : { ...row, async attachSession(sessionId) {
-                attached.push([id, sessionId]);
-                if (!row.sessionIds.includes(sessionId)) row.sessionIds.push(sessionId);
-            } };
-        },
-    };
     const ctx = {
-        effect, workspaceRegistry,
-        inject([name], register) { if (services[name]) register({ effect, [name]: services[name] }); },
+        effect, inject([name], register) { if (services[name]) register({ effect, [name]: services[name] }); },
         get(name) {
             if (name === 'deepseekAccount') return { getPlatformSession: async () => ({ userId: owner, origin: DSH_ACCOUNT_ORIGIN }) };
         },
@@ -100,7 +84,7 @@ function fixture({ tasks = [], workflows = [], proposals = [], host = undefined,
         const cookies = res.headers['set-cookie'].map(value => value.split(';')[0]);
         return { cookie: cookies.join('; '), 'x-marshal-csrf': cookies[1].split('=')[1] };
     };
-    return { root, rooms, events, calls, attached, request, signIn, remount() { unmount(); mount(); }, close() {
+    return { root, rooms, events, calls, request, signIn, remount() { unmount(); mount(); }, close() {
         unmount(); rooms.close();
         if (savedHome === undefined) delete process.env.DSH_HOME;
         else process.env.DSH_HOME = savedHome;
@@ -914,39 +898,5 @@ test('un-roomed plain card hitting permission error on tasks/revise persists blo
         assert.equal(card.status, 'running');
         const cleared = await app.request('GET', '/marshal/incidents/summary', undefined, headers);
         assert.equal(cleared.body.totalCount, 0);
-    } finally { app.close(); }
-});
-
-test('a member session joins a Workspace so the composer never asks for one', async () => {
-    const app = fixture();
-    try {
-        const headers = await app.signIn();
-        const bind = body => app.request('POST', '/marshal/agents/session-workspace', body, headers);
-        const fresh = await bind({ sessionId: 'session-fresh' });
-        assert.equal(fresh.status, 200);
-        assert.equal(fresh.body.attachedWorkspaceId, 'ws-new', 'falls back to the most recently used Workspace: ' + JSON.stringify(fresh.body));
-        assert.deepEqual(app.attached, [['ws-new', 'session-fresh']], 'the Host registry records the attachment');
-        const again = await bind({ sessionId: 'session-fresh' });
-        assert.deepEqual([again.body.already, again.body.attachedWorkspaceId], [true, 'ws-new'], 'an attached session is not moved twice');
-        const pinned = await bind({ sessionId: 'session-pinned', workspaceId: 'ws-old' });
-        assert.equal(pinned.body.attachedWorkspaceId, 'ws-old', 'an explicit pick wins over recency');
-        assert.equal((await bind({ sessionId: '' })).status, 400);
-        assert.deepEqual(app.attached, [['ws-new', 'session-fresh'], ['ws-old', 'session-pinned']]);
-    } finally { app.close(); }
-});
-
-test('a legacy only unbound run is not offered as the 1:1 home', async () => {
-    // Every run here proves ownership but belongs to no Workspace; opening one would
-    // leave the composer inert, so the route reports none and a bound one is composed.
-    const runs = [{ teamId: 'squad', memberId: 'coder', sessionId: 'legacy', createdAt: 10, purpose: 'direct' }];
-    const app = fixture({ runs });
-    try {
-        const headers = await app.signIn();
-        const direct = await app.request('GET', '/marshal/agent-direct-sessions?agentKey=coder', undefined, headers);
-        assert.equal(direct.status, 200);
-        assert.equal(direct.body.mainSession, null, 'an unbound session is never a 1:1 home');
-        assert.deepEqual(direct.body.subSessions, []);
-        // A session the Host lists and accounts inside a Workspace is still offered,
-        // which is what the fixture's other runs prove in the attach tests above.
     } finally { app.close(); }
 });

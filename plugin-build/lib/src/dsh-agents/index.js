@@ -8,7 +8,6 @@ import { defineTool } from "@deepseek-ai/dsh-tools";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { agentWorkspacePath } from "./workspace-path.js";
 import { chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 //#region src/core/errors.ts
 /** A refusal this plugin decided, carrying its stable machine code. */
@@ -1574,11 +1573,6 @@ function createHostRunGateway(faces) {
 		async modelCatalog() {
 			return await call("session", "modelCatalog", {});
 		},
-		async ensureWorkspace(path) {
-			const result = await call("workspace", "create", { path });
-			const id = result?.workspace?.workspaceId ?? result?.workspaceId;
-			return typeof id === "string" && id !== "" ? id : void 0;
-		},
 		async createSession(input) {
 			const created = await call("session", "create", {
 				...input.workspaceId === void 0 ? {} : { workspaceId: input.workspaceId },
@@ -2605,9 +2599,7 @@ var AgentsHostService = class {
 		if (team === void 0) throw new AgentsError("team-not-found", "no team has the id \"" + request.teamId + "\"");
 		const member = findMember(team, request.memberId);
 		if (member === void 0) throw new AgentsError("member-not-found", "no member has the id \"" + request.memberId + "\" in team \"" + request.teamId + "\"");
-		const workspaceId = team.workspaceId === void 0
-			? (await this.agentWorkspaceId(member) ?? this.recentWorkspaceId())
-			: this.resolveWorkspacePin(team);
+		const workspaceId = this.resolveWorkspacePin(team);
 		const route = parseModelPin(member.model);
 		if (member.model !== void 0 && route === void 0) throw new AgentsError("model-pin-invalid", "member \"" + member.name + "\" pins the model \"" + member.model + "\" which is not a usable route");
 		const agentPreset = await resolvePinnedPreset(this.gateway, member.preset);
@@ -2661,60 +2653,11 @@ var AgentsHostService = class {
 	*/
 	resolveWorkspacePin(team) {
 		const workspaceId = team.workspaceId;
-		if (workspaceId === void 0) return this.recentWorkspaceId();
+		if (workspaceId === void 0) return void 0;
 		const registry = this.workspaces?.();
 		if (registry === void 0) throw new AgentsError("workspace-unavailable", "this deployment serves no workspace registry, so the pinned workspace cannot be validated");
 		if (!registry.list().some((workspace) => workspace.id === workspaceId)) throw new AgentsError("workspace-unknown", "the host workspace registry has no workspace \"" + workspaceId + "\"");
 		return workspaceId;
-	}
-	/**
-	* Register the member's own Workspace and return its id.
-	*
-	* A member is a resident assistant, not a project checkout: its 1:1 sessions
-	* belong in one stable directory that its private notes and scratch files can
-	* share. The Host resolves an existing Workspace over the same path instead of
-	* creating a second one, so the id is stable across restarts.
-	* @param member - the member definition the session is composed from.
-	* @returns the Workspace id, or undefined when the Host has no workspace service.
-	*/
-	async agentWorkspaceId(member) {
-		if (typeof this.gateway?.ensureWorkspace !== "function") return void 0;
-		const path = agentWorkspacePath(member?.name ?? member?.id ?? "agent");
-		try {
-			mkdirSync(path, { recursive: true });
-		} catch {
-			return void 0;
-		}
-		try {
-			return await this.gateway.ensureWorkspace(path);
-		} catch {
-			return void 0;
-		}
-	}
-	/**
-	* The Workspace a member session should join when its team pins none.
-	*
-	* A session created without one lands on the deployment default cwd and is
-	* attached to no Workspace, which makes the Host composer demand a binding
-	* before the first message. Mirror the Host's own new-session rule instead and
-	* use the most recently touched Workspace, so chatting never asks.
-	* @returns the recent Workspace id, or undefined when none is registered.
-	*/
-	recentWorkspaceId() {
-		const registry = this.workspaces?.();
-		if (registry === void 0 || typeof registry.list !== "function") return void 0;
-		let items;
-		try {
-			items = registry.list() ?? [];
-		} catch {
-			return void 0;
-		}
-		const stamp = (workspace) => {
-			const value = workspace?.updatedAt;
-			return typeof value === "number" ? value : (typeof value === "string" ? Date.parse(value) || 0 : 0);
-		};
-		const newest = [...items].sort((left, right) => stamp(right) - stamp(left))[0];
-		return typeof newest?.id === "string" && newest.id !== "" ? newest.id : void 0;
 	}
 	/**
 	* Whether one live session leads a squad run this Host started.
@@ -3157,21 +3100,13 @@ function apply(ctx, config) {
 				warn(ctx, "[dsh-agents] the squad ledger is unusable; every route answers with its named failure and the file is left untouched", error);
 			}
 			for (const route of makeAgentsRoutes(service)) disposers.push(ctx.webServer.register(route));
-			// The prompt seam is a nicety; the HTTP routes are the contract every agent
-			// view depends on. A Host whose prompt registry refuses this build's section
-			// must not tear the route table down with it, so it fails on its own.
-			try {
-				const systemPrompt = resolveSystemPrompt(ctx);
-				if (systemPrompt !== void 0) {
-					disposers.push(registerMemberPromptSeam(systemPrompt, () => service.promptView()));
-					const squadRegistry = systemPrompt;
-					if (typeof squadRegistry.context === "function") disposers.push(registerSquadPromptContext(squadRegistry, (sessionId) => service.squadContext(sessionId)));
-					else warn(ctx, "[dsh-agents] this deployment serves no systemPrompt.context; a squad Lead stays unaware of its roster");
-				} else warn(ctx, "[dsh-agents] this deployment serves no systemPrompt service; member briefs and the squad context stay un-injected");
-			} catch (error) {
-				try { globalThis[Symbol.for("marshal.dshAgentsMountState.v1")] = "mounted-brief-skipped"; } catch { /* diagnostics only */ }
-				warn(ctx, "[dsh-agents] the member brief seam was refused; the squad routes stay served without it", error);
-			}
+			const systemPrompt = resolveSystemPrompt(ctx);
+			if (systemPrompt !== void 0) {
+				disposers.push(registerMemberPromptSeam(systemPrompt, () => service.promptView()));
+				const squadRegistry = systemPrompt;
+				if (typeof squadRegistry.context === "function") disposers.push(registerSquadPromptContext(squadRegistry, (sessionId) => service.squadContext(sessionId)));
+				else warn(ctx, "[dsh-agents] this deployment serves no systemPrompt.context; a squad Lead stays unaware of its roster");
+			} else warn(ctx, "[dsh-agents] this deployment serves no systemPrompt service; member briefs and the squad context stay un-injected");
 		} catch (error) {
 			for (const dispose of disposers.splice(0)) dispose();
 			service.dispose();
@@ -3231,4 +3166,4 @@ function apply(ctx, config) {
 	sync();
 }
 //#endregion
-export { AGENTS_TOOL_SECTION_NAME, Config, agentWorkspacePath, DEFAULT_ANNOUNCE_TO_AGENT, DEFAULT_ENABLED, SQUAD_CONTEXT_NAME, SQUAD_CONTEXT_ORDER, agentsHomeDirectory, apply, inject, registerSquadPromptContext, resolveAgents, resolveCommandDispatcher, resolveLlm, resolveTeamMode, resolveToolRegistry, resolveWorkspaceRegistry };
+export { AGENTS_TOOL_SECTION_NAME, Config, DEFAULT_ANNOUNCE_TO_AGENT, DEFAULT_ENABLED, SQUAD_CONTEXT_NAME, SQUAD_CONTEXT_ORDER, agentsHomeDirectory, apply, inject, registerSquadPromptContext, resolveAgents, resolveCommandDispatcher, resolveLlm, resolveTeamMode, resolveToolRegistry, resolveWorkspaceRegistry };

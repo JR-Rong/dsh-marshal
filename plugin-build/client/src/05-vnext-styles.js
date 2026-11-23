@@ -35,7 +35,13 @@
 .mv-entry{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;flex:none}
 /* A panellist entry is one positioned row holding [glyph][label], so the count
    anchors to that row: it rides the sidebar's trailing edge instead of the glyph. */
-.mv-entry .mv-badge{position:absolute;z-index:1;inset-block-start:50%;inset-inline-end:8px;transform:translateY(-50%);min-width:18px;text-align:center;line-height:1.45;pointer-events:none}
+.mv-entry .mv-badge{position:absolute;z-index:1;inset-block-start:50%;inset-inline-end:6px;transform:translateY(-50%);min-width:18px;box-sizing:border-box;text-align:center;line-height:1.45;pointer-events:none;transition:opacity .12s}
+/* The host shows its unpin button in that same trailing slot on hover/focus:
+   step the count aside so the two never stack. */
+[class*="panelEntry"]:is(:hover,:focus-within) .mv-entry .mv-badge{opacity:0}
+/* Collapsed rail: the 36px tile has no trailing slot, so pin the count to its corner. */
+[class*="panelEntry"]:not([class*="panelEntryWide"]) .mv-entry .mv-badge{inset-block-start:0;inset-inline-end:0;transform:none;min-width:16px;font-size:10px;line-height:16px;padding-inline:3px}
+[class*="panelEntry"]:not([class*="panelEntryWide"]):is(:hover,:focus-within) .mv-entry .mv-badge{opacity:1}
 .mv-badge,.mv-model{font-size:var(--mv-font-small);border-radius:var(--mv-pill);padding-inline:var(--mv-xs)}
 .mv-badge{color:var(--dsw-alias-marshal-danger);background:var(--dsw-alias-marshal-surface);font-weight:var(--mv-weight);box-shadow:0 0 0 1px var(--dsw-alias-marshal-border)}
 .mv-model{color:var(--dsw-alias-marshal-muted);background:var(--dsw-alias-marshal-layer);display:block;width:fit-content;max-width:100%;box-sizing:border-box}

@@ -450,24 +450,21 @@ function applyNode(ctx, config) {
     }
     if (config.groups) {
         try {
-            // Register in this bootstrap turn, like every other plugin: the host's
-            // route table stops accepting entries once it starts listening, so a
-            // probe-then-mount silently loses every squad route and leaves the agent
-            // views empty. A host that already serves /dsh-agents makes the duplicate
-            // registration throw, which the catch reports instead of crashing.
-            ctx.inject(['webServer'], (scoped) => {
-                void import('./dsh-agents/index.js').then((mod) => {
-                    try {
-                        mod.apply(scoped, {});
-                        markAgentsMount('mounted');
-                    }
-                    catch (error) {
-                        markAgentsMount('error: ' + describeAgentsMountError(error));
-                        ctx.logger.warn(`marshal: embedded dsh-agents skipped: ${describeAgentsMountError(error)}`);
-                    }
+            ctx.inject(['systemPrompt', 'typertGateway', 'webServer'], (scoped) => {
+                const origin = typeof scoped.webServer?.getOrigin === 'function'
+                    ? scoped.webServer.getOrigin()
+                    : typeof scoped.webServer?.port === 'number' ? 'http://127.0.0.1:' + scoped.webServer.port : '';
+                const probe = origin
+                    ? fetch(origin + '/dsh-agents/api/state', { signal: AbortSignal.timeout(600) })
+                        .then(res => res.status !== 404).catch(() => false)
+                    : Promise.resolve(false);
+                void probe.then(async (alreadyMounted) => {
+                    if (alreadyMounted) return;
+                    const mod = await import('./dsh-agents/index.js');
+                    try { mod.apply(scoped, {}); }
+                    catch (error) { ctx.logger.warn(`marshal: embedded dsh-agents skipped: ${errorName(error)}`); }
                 }).catch((error) => {
-                    markAgentsMount('error: ' + describeAgentsMountError(error));
-                    ctx.logger.warn(`marshal: embedded dsh-agents unavailable: ${describeAgentsMountError(error)}`);
+                    ctx.logger.warn(`marshal: embedded dsh-agents unavailable: ${errorName(error)}`);
                 });
             });
         }
@@ -553,35 +550,6 @@ function applyNode(ctx, config) {
     }, 'marshal: node link');
     link.start();
 }
-/**
-* Record why the embedded squad service did or did not mount.
-*
-* `/dsh-agents/api/*` is either served by this build, by another installed agents
-* plugin, or not at all — and a silent third case leaves every agent view empty.
-* The state rides a global so `/marshal/health` can report it without threading a
-* value through the route factory.
-*/
-function markAgentsMount(state) {
-    globalThis[AGENTS_MOUNT_STATE_KEY] = state;
-}
-function agentsMountState() {
-    try { return globalThis[AGENTS_MOUNT_STATE_KEY]; } catch { return undefined; }
-}
-/**
-* Describe a failed embedded mount in one line the health body can carry.
-*
-* `errorName` alone reports a bare `Error`, which says nothing about which host
-* service refused the registration. The message and the first plugin frame name
-* the failing call without dumping a stack into `/marshal/health`.
-*/
-function describeAgentsMountError(error) {
-    const message = typeof error?.message === 'string' && error.message !== '' ? ': ' + error.message.slice(0, 160) : '';
-    const frame = String(error?.stack ?? '').split('\n').map(line => line.trim())
-        .find(line => line.includes('dsh-agents/index.js') || line.includes('marshal/lib/src/index.js')) ?? '';
-    const where = frame === '' ? '' : ' @ ' + frame.replace(/^at\s+/, '').slice(0, 120);
-    return errorName(error) + message + where;
-}
-const AGENTS_MOUNT_STATE_KEY = Symbol.for('marshal.dshAgentsMountState.v1');
 function lookupService(ctx, name) {
     const bag = ctx;
     if (typeof bag.get !== 'function') return undefined;
