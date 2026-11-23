@@ -152,6 +152,7 @@ function exact(method, path, handler, open = false) {
 }
 
 export function buildHealthBody(req, info) {
+    const agentsMount = globalThis[Symbol.for('marshal.dshAgentsMountState.v1')] ?? 'unknown';
     return {
         ok: true,
         name: 'dsh-marshal',
@@ -161,6 +162,7 @@ export function buildHealthBody(req, info) {
             groups: true,
             agents: info.agents,
             agentsCode: info.agentsCode ?? null,
+            agentsMount,
             taskBoard: true,
             taskBoardSource: info.taskBoardSource,
             crossGroups: info.crossGroups,

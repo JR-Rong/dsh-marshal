@@ -450,7 +450,15 @@ function applyNode(ctx, config) {
     }
     if (config.groups) {
         try {
-            ctx.inject(['systemPrompt', 'typertGateway', 'webServer'], (scoped) => {
+            // Only the route table is needed to reach this callback: waiting on every
+            // service the squad module uses keeps it from mounting at all when one of
+            // them is provided elsewhere in the tree. The module resolves the rest,
+            // and a delayed attempt on the plugin context covers a callback that
+            // never fires, which otherwise leaves every agent view silently empty.
+            let attempted = false;
+            const mountEmbeddedAgents = scoped => {
+                if (attempted || agentsMountState() !== undefined) return;
+                attempted = true;
                 const origin = typeof scoped.webServer?.getOrigin === 'function'
                     ? scoped.webServer.getOrigin()
                     : typeof scoped.webServer?.port === 'number' ? 'http://127.0.0.1:' + scoped.webServer.port : '';
@@ -459,14 +467,31 @@ function applyNode(ctx, config) {
                         .then(res => res.status !== 404).catch(() => false)
                     : Promise.resolve(false);
                 void probe.then(async (alreadyMounted) => {
-                    if (alreadyMounted) return;
+                    if (alreadyMounted) { markAgentsMount('served-elsewhere'); return; }
                     const mod = await import('./dsh-agents/index.js');
-                    try { mod.apply(scoped, {}); }
-                    catch (error) { ctx.logger.warn(`marshal: embedded dsh-agents skipped: ${errorName(error)}`); }
+                    try {
+                        mod.apply(scoped, {});
+                        markAgentsMount('mounted');
+                    }
+                    catch (error) {
+                        markAgentsMount('error: ' + errorName(error));
+                        ctx.logger.warn(`marshal: embedded dsh-agents skipped: ${errorName(error)}`);
+                    }
                 }).catch((error) => {
+                    markAgentsMount('error: ' + errorName(error));
                     ctx.logger.warn(`marshal: embedded dsh-agents unavailable: ${errorName(error)}`);
                 });
-            });
+            };
+            try { ctx.inject(['webServer'], mountEmbeddedAgents); } catch (error) {
+                ctx.logger.warn(`marshal: embedded dsh-agents inject skipped: ${errorName(error)}`);
+            }
+            try {
+                ctx.effect(() => {
+                    const timer = setTimeout(() => { if (agentsMountState() === undefined) mountEmbeddedAgents(ctx); }, 1500);
+                    timer.unref?.();
+                    return () => clearTimeout(timer);
+                }, 'marshal: embedded dsh-agents fallback');
+            } catch { /* no effect scheduler: the inject above still tries */ }
         }
         catch (error) {
             ctx.logger.warn(`marshal: embedded dsh-agents inject skipped: ${errorName(error)}`);
@@ -550,6 +575,21 @@ function applyNode(ctx, config) {
     }, 'marshal: node link');
     link.start();
 }
+/**
+* Record why the embedded squad service did or did not mount.
+*
+* `/dsh-agents/api/*` is either served by this build, by another installed agents
+* plugin, or not at all — and a silent third case leaves every agent view empty.
+* The state rides a global so `/marshal/health` can report it without threading a
+* value through the route factory.
+*/
+function markAgentsMount(state) {
+    globalThis[AGENTS_MOUNT_STATE_KEY] = state;
+}
+function agentsMountState() {
+    try { return globalThis[AGENTS_MOUNT_STATE_KEY]; } catch { return undefined; }
+}
+const AGENTS_MOUNT_STATE_KEY = Symbol.for('marshal.dshAgentsMountState.v1');
 function lookupService(ctx, name) {
     const bag = ctx;
     if (typeof bag.get !== 'function') return undefined;
