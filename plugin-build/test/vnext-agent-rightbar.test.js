@@ -96,6 +96,7 @@ function fixture(t, { lite = false, mountedRightbar = false, ticketRows = [ticke
                 '/marshal/agent-direct-sessions': { agentKey: agent.agentKey, mainSession: directMain, subSessions: directChildren },
                 '/dsh-agents/api/run': { run: { sessionId: 'new-native' } },
                 '/dsh-agents/api/state': { teams: directoryTeams },
+                '/marshal/agents/agent-workspace': { ok: true, workspaceId: 'agent-ws' },
             };
             return Response.json(data[path] ?? { ok: true });
         },
@@ -755,8 +756,15 @@ test('a strict agents host refuses run purpose and the 1:1 open retries without 
     assert.equal(attempts[0].body.purpose, 'direct');
     assert.equal('purpose' in attempts[1].body, false, 'the retry speaks the older host contract');
     assert.deepEqual(attempts[1].body, { teamId: agent.teamId, memberId: agent.agentId });
-    const attach = host.requests.find(req => req.path === '/marshal/agents/session-workspace');
-    assert.deepEqual(attach?.body, { sessionId: 'new-native' }, 'the session joins a Workspace before the Host opens it');
-    assert.equal(attach.auth, 'test');
+    const ensure = host.requests.findIndex(req => req.path === '/marshal/agents/agent-workspace');
+    assert.ok(ensure >= 0, 'the agent Workspace is ensured before the run');
+    assert.deepEqual(host.requests[ensure].body, { name: 'Coder' });
+    assert.equal(host.requests[ensure].auth, 'test');
+    assert.ok(ensure < host.requests.findIndex(req => req.path === '/dsh-agents/api/run'), 'pinned before the session exists');
+    assert.equal(host.requests.some(req => req.path === '/marshal/agents/session-workspace'), false);
+    const pin = host.requests.find(req => req.path === '/dsh-agents/api/team');
+    assert.deepEqual(pin?.body, { team: { id: 'team', name: 'marshal-agent:coder', workspaceId: 'agent-ws' } },
+        'the squad is pinned to the agent Workspace, keeping its other fields');
+    assert.ok(host.requests.indexOf(pin) < host.requests.findIndex(req => req.path === '/dsh-agents/api/run'));
     assert.deepEqual(host.calls, [['panel', null], ['session', 'new-native'], ['tab', 'marshal-agent-tasks']]);
 });

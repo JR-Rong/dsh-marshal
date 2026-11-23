@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
@@ -405,6 +405,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
         root: groupsRootDir, rosters, ticketNumbers, sessionTitles, sessionController, config, llm, readDefaultModel,
         workspacePath, webOrigin, getAttachmentStore, resolveAttachments, surface: dshSurface, moveCardStatus,
         taskOverrides: injectedTaskOverrides, patchStore: injectedPatchStore, eventBus, eventStreams, collectPlainIncidents,
+        workspaceRegistry,
     } = extras;
     const writeMutation = (res, value, ...topics) => {
         write(res, 200, value);
@@ -932,7 +933,19 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             } catch { /* Ledger still proves ownership of the resident sessions. */ }
         }
         const roots = new Set(runs.filter(run => !complete || sessions.has(run.sessionId)).map(run => run.sessionId));
-        const latest = runs.find(run => roots.has(run.sessionId));
+        // A session that belongs to no Workspace leaves the Host composer inert until
+        // the operator picks one, so a legacy unbound run is no 1:1 home: prefer a
+        // bound run, and report none so the caller starts one in the agent Workspace.
+        let hosted;
+        if (workspaceRegistry && typeof workspaceRegistry.list === 'function') {
+            try {
+                hosted = new Set();
+                for (const workspace of workspaceRegistry.list() ?? []) {
+                    for (const id of Array.isArray(workspace?.sessionIds) ? workspace.sessionIds : []) hosted.add(id);
+                }
+            } catch { hosted = undefined; }
+        }
+        const latest = runs.find(run => roots.has(run.sessionId) && (hosted === undefined || hosted.has(run.sessionId)));
         const children = new Map();
         for (const [id, row] of sessions) {
             const values = row.projections?.values;
@@ -2198,6 +2211,30 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             const saved = sessionTitles.setCustom(sessionId, title);
             write(res, 200, { ok: true, sessionId, title: saved.custom ?? saved.auto ?? '', titleSource: saved.custom ? 'custom' : 'auto' });
         }),
+        exact('POST', '/marshal/agents/agent-workspace', async (req, res) => {
+            // Each resident agent owns ~/.dsh-marshal/agents/<name>. Make sure that
+            // directory exists and is a Host Workspace, so the client can pin it on the
+            // agent's squad and every new 1:1 session starts bound (no picker).
+            const body = await readBody(req);
+            const name = typeof body?.name === 'string' ? body.name.trim() : '';
+            if (!name || name.length > 120) { write(res, 400, { ok: false, code: 'invalid-name' }); return; }
+            const registry = workspaceRegistry;
+            if (!registry || typeof registry.list !== 'function' || typeof registry.create !== 'function') {
+                write(res, 200, { ok: true, workspaceId: null, reason: 'workspace-registry-unavailable' });
+                return;
+            }
+            const path = agentWorkspacePath(name);
+            try {
+                mkdirSync(path, { recursive: true });
+                const canonical = realpathSync(path);
+                const known = (registry.list() ?? []).find(workspace => workspace?.path === canonical || workspace?.path === path);
+                const workspace = known ?? await registry.create(path);
+                write(res, 200, { ok: true, workspaceId: workspace?.id ?? workspace?.workspaceId ?? null, path: canonical, created: !known });
+            } catch (error) {
+                // The reason travels in the body; the client falls back to the picker.
+                write(res, 200, { ok: true, workspaceId: null, reason: error instanceof Error ? error.message : String(error) });
+            }
+        }),
         exact('POST', '/marshal/agents/sessions/summarize', async (req, res) => {
             if (!sessionTitles) { write(res, 503, { ok: false, code: 'titles-unavailable' }); return; }
             const body = await readBody(req);
@@ -2390,6 +2427,17 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
     ];
 }
 
+/**
+ * The stable directory a resident agent owns. The display name is sanitised and
+ * bounded so it can never escape ~/.dsh-marshal/agents.
+ */
+export function agentWorkspacePath(name) {
+    const safe = String(name).replace(/[\\/:*?"<>|\u0000-\u001f]+/g, '-').replace(/^\.+/, '').trim().slice(0, 60) || 'agent';
+    return join(homedir(), '.dsh-marshal', 'agents', safe);
+}
+const lookupWorkspaceRegistry = (ctx) => {
+    try { return ctx.get?.('workspaceRegistry') ?? ctx.workspaceRegistry; } catch { return undefined; }
+};
 export function mountGroups(ctx, config, options = {}) {
     const eventBus = options.eventBus ?? createMarshalEventBus();
     const eventStreams = new Set();
@@ -2918,6 +2966,7 @@ export function mountGroups(ctx, config, options = {}) {
                 config, llm, readDefaultModel, workspacePath: agents.workspace,
                 webOrigin: resolveWebOrigin, getAttachmentStore, resolveAttachments: resolveTicketAttachments,
                 surface, moveCardStatus, taskOverrides, patchStore, eventBus, eventStreams, collectPlainIncidents,
+                workspaceRegistry: lookupWorkspaceRegistry(ctx),
             }).map((route) => scoped.webServer.register(route));
             return () => {
                 closeEventStreams();

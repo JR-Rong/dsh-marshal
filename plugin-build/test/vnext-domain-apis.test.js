@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createAgentTaskStore } from '../lib/src/groups/agent-tasks-store.js';
@@ -21,7 +21,7 @@ const owner = 'vnext-owner';
 const ownerId = dshAccountHash(owner);
 const draft = { agentKey, type: 'direct', title: 'Verify release checklist', sessionId: 'main' };
 
-function fixture({ tasks = [], workflows = [], proposals = [], host = undefined, prompt, history, runs, memory = {} } = {}) {
+function fixture({ tasks = [], workflows = [], proposals = [], host = undefined, prompt, history, runs, memory = {}, workspaceRegistry } = {}) {
     const root = mkdtempSync(join(tmpdir(), 'marshal-vnext-'));
     const savedHome = process.env.DSH_HOME;
     process.env.DSH_HOME = root;
@@ -53,6 +53,7 @@ function fixture({ tasks = [], workflows = [], proposals = [], host = undefined,
         effect, inject([name], register) { if (services[name]) register({ effect, [name]: services[name] }); },
         get(name) {
             if (name === 'deepseekAccount') return { getPlatformSession: async () => ({ userId: owner, origin: DSH_ACCOUNT_ORIGIN }) };
+            if (name === 'workspaceRegistry') return workspaceRegistry;
         },
         sessionController: {
             ...(history ? { async *follow({ address }) {
@@ -899,4 +900,37 @@ test('un-roomed plain card hitting permission error on tasks/revise persists blo
         const cleared = await app.request('GET', '/marshal/incidents/summary', undefined, headers);
         assert.equal(cleared.body.totalCount, 0);
     } finally { app.close(); }
+});
+
+test('each agent gets its own registered Workspace and an unbound run is not the 1:1 home', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'marshal-home-'));
+    const savedHome = process.env.HOME;
+    process.env.HOME = home;
+    const items = [{ id: 'project', path: '/elsewhere', sessionIds: [] }];
+    const workspaceRegistry = {
+        list: () => items,
+        async create(path) { const workspace = { id: 'agent-ws', path: realpathSync(path), sessionIds: [] }; items.push(workspace); return workspace; },
+    };
+    const app = fixture({ workspaceRegistry });
+    try {
+        const headers = await app.signIn();
+        const ensure = name => app.request('POST', '/marshal/agents/agent-workspace', { name }, headers);
+        const first = await ensure('丞相');
+        assert.equal(first.status, 200);
+        assert.equal(first.body.workspaceId, 'agent-ws');
+        assert.equal(first.body.created, true);
+        assert.equal(first.body.path, realpathSync(join(home, '.dsh-marshal', 'agents', '丞相')));
+        const again = await ensure('丞相');
+        assert.deepEqual([again.body.workspaceId, again.body.created, items.length], ['agent-ws', false, 2]);
+        assert.equal((await ensure('')).status, 400);
+        assert.equal((await ensure('../escape')).body.path, realpathSync(join(home, '.dsh-marshal', 'agents', '-escape')));
+        const sessions = () => app.request('GET', '/marshal/agent-direct-sessions?agentKey=coder', undefined, headers);
+        assert.equal((await sessions()).body.mainSession, null);
+        items[1].sessionIds.push('main');
+        assert.equal((await sessions()).body.mainSession.id, 'main');
+    } finally {
+        app.close();
+        if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
+        rmSync(home, { recursive: true, force: true });
+    }
 });

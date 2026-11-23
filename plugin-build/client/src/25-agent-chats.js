@@ -70,11 +70,11 @@
         setBusy(true);
         setError('');
         try {
+          // Pin the agent's own Workspace first: an unbound session makes the composer ask.
+          await mvEnsureAgentWorkspace(agent.squadId, agent.name);
           const data = await fetchJson('dsh-agents/api/run', { teamId: agent.squadId, memberId: agent.id });
           const sessionId = data?.run?.sessionId;
           if (!sessionId) throw new Error('未能创建会话');
-          // Bind a Workspace first: an unbound session makes the composer ask for one.
-          await mvAttachSessionWorkspace(sessionId);
           await load();
           openSession && openSession(sessionId);
         }
