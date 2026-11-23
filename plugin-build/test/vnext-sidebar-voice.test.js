@@ -446,7 +446,7 @@ test('pending cross-groups do not block core UI or member writes; browser refres
     const status = find(card(), node => node.props?.['aria-label'] === '智能体运行中');
     assert.equal(status.props.className, 'mv-online');
     assert.equal(status.props.title, '智能体运行中');
-    const direct = button(card(), '1:1 直连'), voice = button(card(), '语音通话 · ' + name);
+    const direct = button(card(), '1:1 直连 · ' + name), voice = button(card(), '语音通话 · ' + name);
     assert.ok(direct && !direct.props.disabled);
     assert.ok(voice && !voice.props.disabled);
     assert.equal(crossReads().length, 2);
@@ -581,7 +581,7 @@ test('primary agent status uses overview and direct errors with matching accessi
         await flush();
         check(color, label);
     }
-    await button(render(), '1:1 直连').props.onClick();
+    await button(render(), '1:1 直连 · 主智能体').props.onClick();
     check('mv-danger', '直连异常：暂无 1:1 直连会话。');
 });
 
@@ -745,7 +745,7 @@ test('a new primary agent can open its first direct session and sync a saved voi
     const sidebar = host.mount('sidebar.session.action', { wide: true });
     const overlay = host.mount('shell.overlay');
     await flush();
-    assert.equal(button(sidebar(), '1:1 直连'), undefined);
+    assert.equal(button(sidebar(), '1:1 直连 · ' + agent.name), undefined);
     await host.fetchJson('dsh-agents/api/member', { teamId: team.id, member: { name: agent.name } });
     await flush();
     button(sidebar(), '语音通话 · ' + agent.name).props.onClick();
@@ -759,13 +759,13 @@ test('a new primary agent can open its first direct session and sync a saved voi
     await flush();
     assert.match(text(overlay()), /请先建立智能体的 1:1 直连会话/);
 
-    await button(sidebar(), '1:1 直连').props.onClick();
+    await button(sidebar(), '1:1 直连 · ' + agent.name).props.onClick();
     await flush();
     assert.deepEqual(opened, ['first-direct']);
     button(overlay(), '汇总同步指导').props.onClick();
     await flush();
     assert.match(text(overlay()), /已同步指导/);
-    await button(sidebar(), '1:1 直连').props.onClick();
+    await button(sidebar(), '1:1 直连 · ' + agent.name).props.onClick();
     assert.deepEqual(opened, ['first-direct', 'first-direct']);
     assert.equal(host.requests.filter(req => req.url.pathname === '/dsh-agents/api/run').length, 1);
 });

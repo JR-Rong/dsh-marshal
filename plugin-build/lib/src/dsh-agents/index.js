@@ -8,6 +8,7 @@ import { defineTool } from "@deepseek-ai/dsh-tools";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { agentWorkspacePath } from "./workspace-path.js";
 import { chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 //#region src/core/errors.ts
 /** A refusal this plugin decided, carrying its stable machine code. */
@@ -1573,6 +1574,11 @@ function createHostRunGateway(faces) {
 		async modelCatalog() {
 			return await call("session", "modelCatalog", {});
 		},
+		async ensureWorkspace(path) {
+			const result = await call("workspace", "create", { path });
+			const id = result?.workspace?.workspaceId ?? result?.workspaceId;
+			return typeof id === "string" && id !== "" ? id : void 0;
+		},
 		async createSession(input) {
 			const created = await call("session", "create", {
 				...input.workspaceId === void 0 ? {} : { workspaceId: input.workspaceId },
@@ -2599,7 +2605,9 @@ var AgentsHostService = class {
 		if (team === void 0) throw new AgentsError("team-not-found", "no team has the id \"" + request.teamId + "\"");
 		const member = findMember(team, request.memberId);
 		if (member === void 0) throw new AgentsError("member-not-found", "no member has the id \"" + request.memberId + "\" in team \"" + request.teamId + "\"");
-		const workspaceId = this.resolveWorkspacePin(team);
+		const workspaceId = team.workspaceId === void 0
+			? (await this.agentWorkspaceId(member) ?? this.recentWorkspaceId())
+			: this.resolveWorkspacePin(team);
 		const route = parseModelPin(member.model);
 		if (member.model !== void 0 && route === void 0) throw new AgentsError("model-pin-invalid", "member \"" + member.name + "\" pins the model \"" + member.model + "\" which is not a usable route");
 		const agentPreset = await resolvePinnedPreset(this.gateway, member.preset);
@@ -2658,6 +2666,30 @@ var AgentsHostService = class {
 		if (registry === void 0) throw new AgentsError("workspace-unavailable", "this deployment serves no workspace registry, so the pinned workspace cannot be validated");
 		if (!registry.list().some((workspace) => workspace.id === workspaceId)) throw new AgentsError("workspace-unknown", "the host workspace registry has no workspace \"" + workspaceId + "\"");
 		return workspaceId;
+	}
+	/**
+	* Register the member's own Workspace and return its id.
+	*
+	* A member is a resident assistant, not a project checkout: its 1:1 sessions
+	* belong in one stable directory that its private notes and scratch files can
+	* share. The Host resolves an existing Workspace over the same path instead of
+	* creating a second one, so the id is stable across restarts.
+	* @param member - the member definition the session is composed from.
+	* @returns the Workspace id, or undefined when the Host has no workspace service.
+	*/
+	async agentWorkspaceId(member) {
+		if (typeof this.gateway?.ensureWorkspace !== "function") return void 0;
+		const path = agentWorkspacePath(member?.name ?? member?.id ?? "agent");
+		try {
+			mkdirSync(path, { recursive: true });
+		} catch {
+			return void 0;
+		}
+		try {
+			return await this.gateway.ensureWorkspace(path);
+		} catch {
+			return void 0;
+		}
 	}
 	/**
 	* The Workspace a member session should join when its team pins none.
@@ -3191,4 +3223,4 @@ function apply(ctx, config) {
 	sync();
 }
 //#endregion
-export { AGENTS_TOOL_SECTION_NAME, Config, DEFAULT_ANNOUNCE_TO_AGENT, DEFAULT_ENABLED, SQUAD_CONTEXT_NAME, SQUAD_CONTEXT_ORDER, agentsHomeDirectory, apply, inject, registerSquadPromptContext, resolveAgents, resolveCommandDispatcher, resolveLlm, resolveTeamMode, resolveToolRegistry, resolveWorkspaceRegistry };
+export { AGENTS_TOOL_SECTION_NAME, Config, agentWorkspacePath, DEFAULT_ANNOUNCE_TO_AGENT, DEFAULT_ENABLED, SQUAD_CONTEXT_NAME, SQUAD_CONTEXT_ORDER, agentsHomeDirectory, apply, inject, registerSquadPromptContext, resolveAgents, resolveCommandDispatcher, resolveLlm, resolveTeamMode, resolveToolRegistry, resolveWorkspaceRegistry };

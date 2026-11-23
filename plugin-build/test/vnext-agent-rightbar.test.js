@@ -195,7 +195,7 @@ test('Plan A opens a resident DSH session before the right tab and records focus
     const host = fixture(t);
     const render = host.mount('sidebar.session.action', { wide: true });
     await settle(render);
-    await byText(render(), '1:1 直连').props.onClick();
+    await byText(render(), '1:1 直连 · Coder').props.onClick();
     assert.deepEqual(host.calls, [['panel', null], ['session', 'direct'], ['tab', 'marshal-agent-tasks']]);
     const lookup = host.requests.find(req => req.path === '/marshal/agent-direct-sessions');
     assert.equal(lookup.url.searchParams.get('agentKey'), agent.agentKey);
@@ -219,7 +219,7 @@ test('rightbar without a screen query waits for the destination dock and retries
     };
     const side = host.mount('sidebar.session.action', { wide: true });
     await settle(side);
-    await byText(side(), '1:1 直连').props.onClick();
+    await byText(side(), '1:1 直连 · Coder').props.onClick();
     assert.deepEqual(host.calls, [['panel', null], ['session', 'direct']]);
     host.mount(dockSlot, { sessionId: 'previous' })();
     host.runTimers(0);
@@ -242,7 +242,7 @@ test('native navigation waits for the late rightbar and never opens a tab on the
     delete host.ctx.sidebarRight;
     const side = host.mount('sidebar.session.action', { wide: true });
     await settle(side);
-    const navigating = byText(side(), '1:1 直连').props.onClick();
+    const navigating = byText(side(), '1:1 直连 · Coder').props.onClick();
     await tick();
     assert.deepEqual(host.calls, [['panel', null], ['session', 'direct']]);
     host.ctx.sidebarRight = rightbar;
@@ -293,7 +293,7 @@ test('plugin disposal cancels native rightbar retries before they can open on an
     host.ctx.sidebarRight.openTab = kind => { host.calls.push(['tab', kind]); return false; };
     const side = host.mount('sidebar.session.action', { wide: true });
     await settle(side);
-    const navigating = byText(side(), '1:1 直连').props.onClick();
+    const navigating = byText(side(), '1:1 直连 · Coder').props.onClick();
     await tick();
     assert.deepEqual(host.calls, [['panel', null], ['session', 'direct'], ['tab', 'marshal-agent-tasks']]);
     host.dispose();
@@ -654,7 +654,7 @@ test('new native session is not bound until the direct sessions API confirms it'
     const host = fixture(t, { directMain: null });
     const side = host.mount('sidebar.session.action', { wide: true });
     await settle(side);
-    await byText(side(), '1:1 直连').props.onClick();
+    await byText(side(), '1:1 直连 · Coder').props.onClick();
     assert.deepEqual(host.calls, [['panel', null], ['session', 'new-native'], ['tab', 'marshal-agent-tasks']]);
     const pane = host.mount(tasksSlot, { sessionId: 'new-native' });
     await settle(pane);
@@ -693,7 +693,7 @@ test('ordinary sessions hide stale focus; the call dock opens tasks only after n
     await settle(side);
     assert.match(text(await settle(ordinaryPane)), /当前会话没有关联的智能体。/);
     assert.equal(byText(ordinaryPane(), '打开该智能体 1:1 会话'), undefined);
-    await byText(side(), '1:1 直连').props.onClick();
+    await byText(side(), '1:1 直连 · Coder').props.onClick();
     await settle(pane);
     destination();
     host.runTimers(0);
@@ -749,7 +749,7 @@ test('a strict agents host refuses run purpose and the 1:1 open retries without 
     const host = fixture(t, { directMain: null, strictRun: true });
     const render = host.mount('sidebar.session.action', { wide: true });
     await settle(render);
-    await byText(render(), '1:1 直连').props.onClick();
+    await byText(render(), '1:1 直连 · Coder').props.onClick();
     const attempts = host.requests.filter(req => req.path === '/dsh-agents/api/run');
     assert.equal(attempts.length, 2, 'the refused body is retried once, not looped');
     assert.equal(attempts[0].body.purpose, 'direct');

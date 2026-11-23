@@ -32,11 +32,10 @@
 }
 .mv-scope{color:var(--dsw-alias-marshal-text);font-size:var(--mv-font);line-height:var(--mv-leading)}
 .mv-entry,.mv-line,.mv-actions{display:flex;align-items:center;gap:var(--mv-sm);min-width:0}
-.mv-entry{position:relative;display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;flex:none}
-/* The host paints this entry as one icon in a narrow rail, so the count rides the
-   icon's own top-end corner inside a box this rule sizes. That keeps it off the
-   glyph and out of the label's gutter whatever the host row does. */
-.mv-entry .mv-badge{position:absolute;z-index:1;inset-block-start:-7px;inset-inline-start:9px;min-width:14px;text-align:center;line-height:1.3;pointer-events:none}
+.mv-entry{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;flex:none}
+/* A panellist entry is one positioned row holding [glyph][label], so the count
+   anchors to that row: it rides the sidebar's trailing edge instead of the glyph. */
+.mv-entry .mv-badge{position:absolute;z-index:1;inset-block-start:50%;inset-inline-end:8px;transform:translateY(-50%);min-width:18px;text-align:center;line-height:1.45;pointer-events:none}
 .mv-badge,.mv-model{font-size:var(--mv-font-small);border-radius:var(--mv-pill);padding-inline:var(--mv-xs)}
 .mv-badge{color:var(--dsw-alias-marshal-danger);background:var(--dsw-alias-marshal-surface);font-weight:var(--mv-weight);box-shadow:0 0 0 1px var(--dsw-alias-marshal-border)}
 .mv-model{color:var(--dsw-alias-marshal-muted);background:var(--dsw-alias-marshal-layer);display:block;width:fit-content;max-width:100%;box-sizing:border-box}
@@ -76,6 +75,14 @@
 .mv-session-actions{flex:1;min-width:0}.mv-native-session{display:flex;align-items:center;gap:var(--mv-xs);min-width:0}
 .mv-agent-card,.mv-mini{margin-block:var(--mv-xs);padding:var(--mv-sm);border:1px solid var(--dsw-alias-marshal-border);border-radius:var(--mv-radius);background:var(--dsw-alias-marshal-surface)}
 .mv-agent-card[data-compact="true"]{justify-items:center;padding:var(--mv-xs)}
+.mv-agent-card[data-compact="true"] .mv-agent-main{flex-direction:column;gap:var(--mv-xs)}
+.mv-agent-row{gap:var(--mv-xs)}
+.mv-agent-main{display:flex;align-items:center;gap:var(--mv-sm);min-width:0}
+.mv-agent-open{display:flex;align-items:center;gap:var(--mv-sm);flex:1;min-width:0;padding:var(--mv-xs);margin:calc(-1 * var(--mv-xs));border:0;border-radius:var(--mv-sm);background:transparent;color:inherit;font:inherit;text-align:start;cursor:pointer}
+.mv-agent-open:hover:not(:disabled){background:var(--dsw-alias-marshal-hover)}
+.mv-agent-open:disabled{cursor:default;-webkit-text-fill-color:currentColor}
+.mv-agent-open:focus-visible{outline:2px solid var(--dsw-alias-marshal-accent);outline-offset:1px}
+.mv-agent-lines{display:grid;gap:2px;min-width:0}
 .mv-agent-card[data-compact="true"] .mv-actions{flex-direction:column;justify-content:center;gap:var(--mv-xs)}
 .mv-copy{min-width:0;flex:1}.mv-truncate{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
 .mv-muted{color:var(--dsw-alias-marshal-muted);font-size:var(--mv-font-small)}
