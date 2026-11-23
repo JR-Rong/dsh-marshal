@@ -2653,11 +2653,36 @@ var AgentsHostService = class {
 	*/
 	resolveWorkspacePin(team) {
 		const workspaceId = team.workspaceId;
-		if (workspaceId === void 0) return void 0;
+		if (workspaceId === void 0) return this.recentWorkspaceId();
 		const registry = this.workspaces?.();
 		if (registry === void 0) throw new AgentsError("workspace-unavailable", "this deployment serves no workspace registry, so the pinned workspace cannot be validated");
 		if (!registry.list().some((workspace) => workspace.id === workspaceId)) throw new AgentsError("workspace-unknown", "the host workspace registry has no workspace \"" + workspaceId + "\"");
 		return workspaceId;
+	}
+	/**
+	* The Workspace a member session should join when its team pins none.
+	*
+	* A session created without one lands on the deployment default cwd and is
+	* attached to no Workspace, which makes the Host composer demand a binding
+	* before the first message. Mirror the Host's own new-session rule instead and
+	* use the most recently touched Workspace, so chatting never asks.
+	* @returns the recent Workspace id, or undefined when none is registered.
+	*/
+	recentWorkspaceId() {
+		const registry = this.workspaces?.();
+		if (registry === void 0 || typeof registry.list !== "function") return void 0;
+		let items;
+		try {
+			items = registry.list() ?? [];
+		} catch {
+			return void 0;
+		}
+		const stamp = (workspace) => {
+			const value = workspace?.updatedAt;
+			return typeof value === "number" ? value : (typeof value === "string" ? Date.parse(value) || 0 : 0);
+		};
+		const newest = [...items].sort((left, right) => stamp(right) - stamp(left))[0];
+		return typeof newest?.id === "string" && newest.id !== "" ? newest.id : void 0;
 	}
 	/**
 	* Whether one live session leads a squad run this Host started.
