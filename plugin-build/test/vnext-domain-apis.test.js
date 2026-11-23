@@ -934,3 +934,19 @@ test('a member session joins a Workspace so the composer never asks for one', as
         assert.deepEqual(app.attached, [['ws-new', 'session-fresh'], ['ws-old', 'session-pinned']]);
     } finally { app.close(); }
 });
+
+test('a legacy only unbound run is not offered as the 1:1 home', async () => {
+    // Every run here proves ownership but belongs to no Workspace; opening one would
+    // leave the composer inert, so the route reports none and a bound one is composed.
+    const runs = [{ teamId: 'squad', memberId: 'coder', sessionId: 'legacy', createdAt: 10, purpose: 'direct' }];
+    const app = fixture({ runs });
+    try {
+        const headers = await app.signIn();
+        const direct = await app.request('GET', '/marshal/agent-direct-sessions?agentKey=coder', undefined, headers);
+        assert.equal(direct.status, 200);
+        assert.equal(direct.body.mainSession, null, 'an unbound session is never a 1:1 home');
+        assert.deepEqual(direct.body.subSessions, []);
+        // A session the Host lists and accounts inside a Workspace is still offered,
+        // which is what the fixture's other runs prove in the attach tests above.
+    } finally { app.close(); }
+});

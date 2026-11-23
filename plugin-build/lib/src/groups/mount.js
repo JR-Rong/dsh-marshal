@@ -933,7 +933,21 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             } catch { /* Ledger still proves ownership of the resident sessions. */ }
         }
         const roots = new Set(runs.filter(run => !complete || sessions.has(run.sessionId)).map(run => run.sessionId));
-        const latest = runs.find(run => roots.has(run.sessionId));
+        // A session that belongs to no Workspace leaves the Host composer inert until
+        // the operator picks one, so a legacy unbound run is not a 1:1 home any more:
+        // prefer a bound run, and report none so the caller composes a bound one.
+        let hosted;
+        if (workspaceRegistry && typeof workspaceRegistry.list === 'function') {
+            try {
+                hosted = new Set();
+                for (const workspace of workspaceRegistry.list() ?? []) {
+                    for (const id of Array.isArray(workspace?.sessionIds) ? workspace.sessionIds : []) hosted.add(id);
+                }
+            } catch { hosted = undefined; }
+        }
+        const latest = hosted === undefined
+            ? runs.find(run => roots.has(run.sessionId))
+            : runs.find(run => roots.has(run.sessionId) && hosted.has(run.sessionId));
         const children = new Map();
         for (const [id, row] of sessions) {
             const values = row.projections?.values;
