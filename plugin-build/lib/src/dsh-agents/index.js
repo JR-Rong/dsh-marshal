@@ -3157,13 +3157,21 @@ function apply(ctx, config) {
 				warn(ctx, "[dsh-agents] the squad ledger is unusable; every route answers with its named failure and the file is left untouched", error);
 			}
 			for (const route of makeAgentsRoutes(service)) disposers.push(ctx.webServer.register(route));
-			const systemPrompt = resolveSystemPrompt(ctx);
-			if (systemPrompt !== void 0) {
-				disposers.push(registerMemberPromptSeam(systemPrompt, () => service.promptView()));
-				const squadRegistry = systemPrompt;
-				if (typeof squadRegistry.context === "function") disposers.push(registerSquadPromptContext(squadRegistry, (sessionId) => service.squadContext(sessionId)));
-				else warn(ctx, "[dsh-agents] this deployment serves no systemPrompt.context; a squad Lead stays unaware of its roster");
-			} else warn(ctx, "[dsh-agents] this deployment serves no systemPrompt service; member briefs and the squad context stay un-injected");
+			// The prompt seam is a nicety; the HTTP routes are the contract every agent
+			// view depends on. A Host whose prompt registry refuses this build's section
+			// must not tear the route table down with it, so it fails on its own.
+			try {
+				const systemPrompt = resolveSystemPrompt(ctx);
+				if (systemPrompt !== void 0) {
+					disposers.push(registerMemberPromptSeam(systemPrompt, () => service.promptView()));
+					const squadRegistry = systemPrompt;
+					if (typeof squadRegistry.context === "function") disposers.push(registerSquadPromptContext(squadRegistry, (sessionId) => service.squadContext(sessionId)));
+					else warn(ctx, "[dsh-agents] this deployment serves no systemPrompt.context; a squad Lead stays unaware of its roster");
+				} else warn(ctx, "[dsh-agents] this deployment serves no systemPrompt service; member briefs and the squad context stay un-injected");
+			} catch (error) {
+				try { globalThis[Symbol.for("marshal.dshAgentsMountState.v1")] = "mounted-brief-skipped"; } catch { /* diagnostics only */ }
+				warn(ctx, "[dsh-agents] the member brief seam was refused; the squad routes stay served without it", error);
+			}
 		} catch (error) {
 			for (const dispose of disposers.splice(0)) dispose();
 			service.dispose();
