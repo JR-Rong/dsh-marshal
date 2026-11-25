@@ -1,3 +1,4 @@
+import { MarshalStream } from 'marshal-stream'
 import {
   el, clear, button, toast, formatTime, type Child,
 } from './lib/dom.ts'
@@ -10,7 +11,7 @@ import {
   type BoardReceipt, type Capability, type DeviceRow, type InputCard, type RosterEntry, type SessionRow, type Target, type SessionControls,
 } from './lib/marshal.ts'
 import {
-  AccountApi, buildPreviewInput, buildSendPayload, extractTicket, loginWithTicket, parseOnboardLink, parsePreview, parseRoom, parseRoomList,
+  buildPreviewInput, buildSendPayload, createAccountLoginGuard, extractTicket, loginWithTicket, parseOnboardLink, parsePreview, parseRoom, parseRoomList,
   type DiscussionCatalogItem, type DiscussionRoom, type GroupPreview, type RoomSummary,
 } from './lib/account.ts'
 import type { AccountSession } from './lib/config.ts'
@@ -20,7 +21,7 @@ import { acceptEventSeq } from './lib/transcript.ts'
 import { hasStoredBridge, loadBridgeDevice, openBridgeWorkbench, saveBridgeDevice } from './bridge/workbench.ts'
 import { classifyPairing, pairBridge, parsePairPayload, parseUnifiedPairing } from './lib/bridge.ts'
 import { openQrScanner } from './lib/scanner.ts'
-import { ConfigReadError, installationId, readConfig, readPinGuard, removeConfig, updateConfig, writePinGuard, readTheme, writeTheme, writeNodePreference } from './lib/storage.ts'
+import { ConfigReadError, installationId, readConfig, readPinGuard, writePinGuard, readTheme, writeTheme, writeNodePreference } from './lib/storage.ts'
 import { createConnectivity } from './lib/connectivity.ts'
 import { createSummaryCapDraft, renderSummaryCap } from './lib/summary-cap.ts'
 import { buildMemoryGraph, CLARITY_LABELS, GALAXY_NODE_LIMIT, layoutMemoryGalaxy, MEMORY_KIND_META, MEMORY_LAYERS,
@@ -39,7 +40,7 @@ import { createPendingInputs, inputTarget, inputTargetKey } from './lib/pending-
 import { APP_TITLE, APP_VERSION, CLIENT_ONLY_NOTE } from './lib/version.ts'
 
 import { filterSessionsByCategory, initialWizardState, moveWizardStep, selectWizardHost, validateWizardState,
-  sessionCenterRoute, groupBackCategory, roomRetryId, beginCreateAttempt, finishCreateAttempt, canCloseCreateSheet,
+  sessionCenterRoute, groupBackCategory, roomRetryId, createGroupRequests, beginCreateAttempt, finishCreateAttempt, canCloseCreateSheet,
   isWelcomeEmpty, isUnconfirmedEmpty, fillWelcomeStarter, shouldTriggerOlderHistory, preserveScrollAnchor,
   mergeTranscriptSnapshot, appendTranscriptDelta, historyPageProgress, transcriptMessageKey,
   EFFORT_META, buildEffortSheetOptions, formatThoughtSummary,
@@ -238,7 +239,7 @@ function switchTab(view: View): void {
     ticketGroupOpen++
     ticketNav = reduceTicketNavigation(ticketNav, { type: 'close' })
     state.room = null
-    state.groupBusy = false
+    groupRequests.invalidate()
   }
   if (view === 'home') { state.view = 'home'; render(); void refreshDevices(); return }
   if (view === 'sessions') {
@@ -497,7 +498,8 @@ export async function start(): Promise<void> {
     void bindNetwork()
     if (wasOnline && state.online) void refreshDevices()
   })
-  await bindNetwork()
+  // A stalled native network bridge must not block setup or the lock screen.
+  void bindNetwork()
   if (!config) {
     state.view = 'setup'
     render()
@@ -544,6 +546,7 @@ async function enterApp(): Promise<void> {
   if (!config) { state.view = 'setup'; render(); return }
   closeMainStream()
   subscriptionId = null
+  resetGroups()
   state.api = new MarshalApi(config)
   roster = []
   state.session = null
@@ -579,8 +582,7 @@ async function registerDevicePush(): Promise<void> {
   const api = phoneApi()
   if (!api) return
   try {
-    const plugin = await import('marshal-stream')
-    const events = plugin.MarshalStream as unknown as { addListener(name: string, cb: () => void): Promise<unknown>; pushToken?: () => Promise<{ ok?: boolean; provider?: string; token?: string; liveToken?: string; liveTokens?: Record<string, string> }> }
+    const events = MarshalStream as unknown as { addListener(name: string, cb: () => void): Promise<unknown>; pushToken?: () => Promise<{ ok?: boolean; provider?: string; token?: string; liveToken?: string; liveTokens?: Record<string, string> }> }
     if (!pushListening) {
       pushListening = true
       await events.addListener('pushToken', () => { void registerDevicePush() })
@@ -596,8 +598,7 @@ let pushListening = false
 
 async function showLive(title: string, phase: string, session = phase, end = false): Promise<void> {
   try {
-    const plugin = await import('marshal-stream')
-    const native = plugin.MarshalStream as unknown as { startLiveActivity?: (options: { title: string; phase: string; session: string; end: boolean }) => Promise<void> }
+    const native = MarshalStream as unknown as { startLiveActivity?: (options: { title: string; phase: string; session: string; end: boolean }) => Promise<void> }
     await native.startLiveActivity?.({ title, phase, session, end })
   } catch { /* 浏览器没有 Live Activity */ }
 }
@@ -1442,7 +1443,6 @@ async function saveSetup(hubInput: HTMLInputElement, tokenInput: HTMLInputElemen
     return
   }
   adoptConfig(config)
-  state.account = config.account ?? null
   await enterApp()
 }
 
@@ -1592,11 +1592,7 @@ function reportConfigReadError(error: unknown): void {
 
 async function saveConfigPatch(patch: Partial<MarshalConfig>, initialize?: MarshalConfig): Promise<MarshalConfig> {
   try {
-    return await updateConfig(current => {
-      const base = current ?? initialize
-      if (!base) throw new Error('未找到本机配置')
-      return { ...base, ...patch, updatedAt: Date.now() }
-    })
+    return await accountLogin.save(patch, initialize)
   } catch (error) {
     reportConfigReadError(error)
     throw error
@@ -1605,6 +1601,13 @@ async function saveConfigPatch(patch: Partial<MarshalConfig>, initialize?: Marsh
 
 function adoptConfig(next: MarshalConfig): void {
   clearConfigReadError()
+  const previous = state.config
+  next = accountLogin.adopt(next)
+  if (previous && (previous.hubUrl !== next.hubUrl || previous.token !== next.token)) {
+    resetGroups()
+    closeMainStream()
+    state.api = null
+  }
   state.config = { ...next,
     privacyMode: state.config?.privacyMode === 'metadata' ? 'metadata' : next.privacyMode }
   if (state.config.privacyMode === 'metadata') {
@@ -2391,6 +2394,17 @@ function controlsView(): Child[] {
 
 let groupPoll: ReturnType<typeof setInterval> | null = null
 let groupPollGeneration = 0
+const groupRequests = createGroupRequests(state, stopGroupPoll)
+
+const withGroupBusy = (work: Parameters<typeof groupRequests.run>[0]) => groupRequests.run(work, render)
+
+function acceptRoom(result: Parameters<typeof groupRequests.accept>[0]): boolean {
+  return groupRequests.accept(result, message => {
+    if (state.view === 'ticketGroup') ticketGroupError = message
+    else state.groupError = message
+    render()
+  })
+}
 
 function stopGroupPoll(): void {
   groupPollGeneration++
@@ -2409,7 +2423,7 @@ function startGroupPoll(): void {
       url: api.discussionStreamUrl(),
       token: api.token,
       id: 'groups',
-      onFrame: () => { void refreshRoom(true) },
+      onFrame: () => { if (generation === groupPollGeneration) void refreshRoom(true) },
     }).then((handle) => {
       if (generation === groupPollGeneration) groupStream = handle
       else handle.close()
@@ -2536,7 +2550,6 @@ async function handleDeepLink(raw: string): Promise<void> {
     next = await saveConfigPatch({ hubUrl: hub, ...(hubChanged ? { token: '', account: null } : {}) }, makeConfig({ hubUrl: hub }))
   } catch { toast('配对信息保存失败', 'error'); return }
   adoptConfig(next)
-  state.account = next.account ?? null
   state.view = next.token ? state.view : 'setup'
   render()
   toast(hubChanged ? '已更换 Hub，请重新配对' : '已填入 Hub 地址')
@@ -2544,6 +2557,7 @@ async function handleDeepLink(raw: string): Promise<void> {
 }
 
 async function redeemPairingCode(hubUrl: string, code: string): Promise<void> {
+  if (state.config?.hubUrl !== hubUrl) accountLogin.invalidate()
   let response: Response
   try {
     response = await fetch(hubUrl + '/marshal/api/pairing/redeem', {
@@ -2574,53 +2588,43 @@ async function redeemPairingCode(hubUrl: string, code: string): Promise<void> {
   if (!appLocked()) await enterApp()
 }
 
+const accountLogin = createAccountLoginGuard(state)
+
 async function loginTicket(ticket: string): Promise<boolean> {
   const config = state.config
   if (!config) { toast('请先配置 Hub 地址', 'error'); return false }
   if (state.accountBusy) return false
+  const { current, persist } = accountLogin.begin(config.hubUrl)
   state.accountBusy = true
   if (state.view === 'settings') render()
-  const result = await loginWithTicket(config.hubUrl, ticket)
-  state.accountBusy = false
-  if (!result.ok) {
-    toast(result.message, 'error')
-    if (state.view === 'settings') render()
-    return false
-  }
   try {
-    adoptConfig(await saveConfigPatch({ account: result.data }))
-  } catch {
-    toast('登录成功，但本机保存失败', 'error')
-  }
-  state.account = result.data
-  toast('群聊账号已登录')
-  openGroups('home')
-  return true
-}
-
-async function clearAccount(message?: string): Promise<void> {
-  const config = state.config
-  state.account = null
-  state.room = null
-  state.roomList = []
-  state.catalog = []
-  stopGroupPoll()
-  if (config?.account) {
-    try { adoptConfig(await saveConfigPatch({ account: null })) } catch {
-      if (state.config) state.config = { ...state.config, account: null }
+    const result = await loginWithTicket(config.hubUrl, ticket)
+    if (!current()) return false
+    if (!result.ok) { toast(result.message, 'error'); return false }
+    const saved = await persist(result.data)
+    if (!saved || !current()) return false
+    adoptConfig(saved)
+    resetGroups()
+    state.account = result.data
+    toast('群聊账号已登录')
+    openGroups('home')
+    return true
+  } catch (error) {
+    if (current()) reportConfigReadError(error)
+    return false
+  } finally {
+    if (current()) {
+      state.accountBusy = false
+      if (state.view === 'settings') render()
     }
   }
-  if (message) toast(message, 'error')
-  if (state.view === 'groups' || state.view === 'groupRoom' || state.view === 'settings') render()
 }
 
 async function logoutAccount(): Promise<void> {
-  const config = state.config
-  const account = state.account
-  if (config && account) {
-    try { await new AccountApi(config.hubUrl, account).logout() } catch { /* 本地退出即可 */ }
-  }
-  await clearAccount()
+  const logout = accountLogin.logout()
+  resetGroups()
+  render()
+  await logout.catch(reportConfigReadError)
   toast('已退出群聊账号')
 }
 
@@ -2986,11 +2990,12 @@ function ticketDetails(task: Ticket | undefined, write?: TicketWriteState): HTML
 }
 
 function enterTicketGroup(task: Ticket): void {
+  stopGroupPoll()
   ticketNav = reduceTicketNavigation(ticketNav, { type: 'enter-group' })
   state.view = 'ticketGroup'
   state.room = null
   state.groupDraft = state.groupError = groupKey = ''
-  state.groupBusy = false
+  groupRequests.invalidate()
   ticketGroupError = ''
   render()
   void loadTicketGroup(task)
@@ -2999,7 +3004,7 @@ function enterTicketGroup(task: Ticket): void {
 function returnToTicket(): void {
   ticketGroupOpen++
   state.room = null
-  state.groupBusy = false
+  groupRequests.invalidate()
   state.view = 'board'
   ticketDraft.deleteRevision = undefined
   ticketNav = reduceTicketNavigation(ticketNav, { type: 'back' })
@@ -3017,7 +3022,7 @@ async function loadTicketGroup(task: Ticket): Promise<void> {
   ticketGroupError = '正在查找关联的工单群…'
   render()
   const result = await api.discussion(task.roomId)
-  if (!current()) return
+  if (!current() || !acceptRoom(result)) return
   const room = result.ok ? parseRoom(result.data) : null
   state.room = room?.id === task.roomId ? room : null
   ticketGroupError = result.ok ? '未能读取关联的群聊。' : result.message
@@ -3152,72 +3157,87 @@ function memoryTypeDot(node: GalaxyNode): HTMLElement {
   return dot
 }
 
+let roomListRequest = 0
+let roomListBusy = false
+let roomListError = ''
+
+function clearRoomList(): void {
+  state.roomList = []
+  state.catalog = []
+  state.groupSelected = []
+  state.groupPreview = null
+}
+
+function resetGroups(): void {
+  roomListRequest++
+  ticketGroupOpen++
+  stopGroupPoll()
+  requestedRoomId = null
+  state.room = null
+  clearRoomList()
+  roomListBusy = false
+  roomListError = ticketGroupError = ''
+  groupRequests.invalidate()
+  state.groupError = state.groupDraft = groupKey = ''
+  state.groupTitle = state.groupText = ''
+}
+
 async function loadRooms(notify = false): Promise<void> {
   const config = state.config
   const api = phoneApi()
+  const request = ++roomListRequest
   if (!config) { state.view = 'setup'; render(); return }
   if (!api) {
-    state.groupError = '群聊使用手机配对凭证。请先扫电脑上的配对码。'
-    state.roomList = []
-    state.catalog = []
+    roomListBusy = false
+    roomListError = '群聊使用手机配对凭证。请先扫电脑上的配对码。'
+    clearRoomList()
     if (state.view === 'groups') render()
     return
   }
-  state.groupBusy = true
-  state.groupError = ''
-  if (state.view === 'groups') render()
+  roomListBusy = true
+  roomListError = ''
+  if (state.view === 'groups' || state.view === 'groupNew') render()
   const result = await api.discussions()
-  state.groupBusy = false
+  if (state.api !== api || request !== roomListRequest) return
+  roomListBusy = false
   if (!result.ok) {
-    state.groupError = result.message
-    if (result.error === 'unauthorized') {
-      await clearAccount('账号会话已失效，请重新生成 ticket')
-      return
-    }
-    if (state.view === 'groups') render()
-    return
+    if (result.error === 'unauthorized') clearRoomList()
+    roomListError = result.message
+  } else {
+    const listed = parseRoomList(result.data)
+    state.roomList = listed.rooms
+    state.catalog = listed.catalog
+    if (notify) toast('群聊已刷新')
   }
-  const listed = parseRoomList(result.data)
-  state.roomList = listed.rooms
-  state.catalog = listed.catalog
-  if (notify) toast('群聊已刷新')
-  if (state.view === 'groups') render()
+  if (state.view === 'groups' || state.view === 'groupNew') render()
 }
 
-let roomOpen = 0
 let requestedRoomId: string | null = null
 
 async function openRoom(roomId: string, category: 'group' | 'ticketRoom'): Promise<void> {
   const api = phoneApi()
   if (!api) return
   stopGroupPoll()
+  const sameRoom = requestedRoomId === roomId
   requestedRoomId = roomId
   sessionCategory = category
   state.room = null
   state.groupError = ''
-  state.groupDraft = ''
-  groupKey = ''
-  const request = ++roomOpen
-  state.view = 'groupRoom'
-  state.groupBusy = true
-  render()
-  const result = await api.discussion(roomId)
-  if (state.api !== api || state.view !== 'groupRoom' || request !== roomOpen) return
-  state.groupBusy = false
-  if (!result.ok) {
-    state.groupError = result.message
-    if (result.error === 'unauthorized') {
-      await clearAccount('账号会话已失效，请重新生成 ticket')
-      return
-    }
-    render()
-    return
+  if (!sameRoom) {
+    state.groupDraft = ''
+    groupKey = ''
   }
-  const room = parseRoom(result.data)
-  state.room = room?.id === roomId ? room : null
-  if (!state.room) state.groupError = '未能读取群聊。'
-  render()
-  if (state.room) startGroupPoll()
+  state.view = 'groupRoom'
+  await withGroupBusy(async current => {
+    render()
+    const result = await api.discussion(roomId)
+    if (!current() || state.api !== api || state.view !== 'groupRoom' || !acceptRoom(result)) return
+    if (!result.ok) { state.groupError = result.message; return }
+    const room = parseRoom(result.data)
+    state.room = room?.id === roomId ? room : null
+    if (state.room) startGroupPoll()
+    else state.groupError = '未能读取群聊。'
+  })
 }
 
 async function refreshRoom(silent = false): Promise<void> {
@@ -3226,43 +3246,30 @@ async function refreshRoom(silent = false): Promise<void> {
   if (!api) return
   const retry = !silent && state.view === 'groupRoom' ? roomRetryId(room, requestedRoomId, state.groupBusy) : null
   if (retry) { await openRoom(retry, sessionCategory === 'ticketRoom' ? 'ticketRoom' : 'group'); return }
-  if (!room || state.groupBusy) return
+  if (!room || (!silent && state.groupBusy)) return
   const generation = groupPollGeneration
   const view = state.view
-  if (!silent) state.groupBusy = true
-  const result = await api.discussion(room.id)
-  if (state.api !== api || state.room?.id !== room.id || groupPollGeneration !== generation || state.view !== view) return
-  if (!silent) state.groupBusy = false
-  if (!result.ok) {
-    if (state.view === 'ticketGroup') {
-      if (result.error === 'unauthorized') {
-        state.room = null
-        stopGroupPoll()
-        ticketGroupError = result.message
-        rootNode().querySelector('[data-group-transcript]')?.replaceChildren(
-          el('p', { class: 'banner error', role: 'status', text: ticketGroupError }))
-        rootNode().querySelector<HTMLButtonElement>('[data-group-send]')?.setAttribute('disabled', '')
-      }
+  const refresh = async (current: () => boolean) => {
+    const result = await api.discussion(room.id)
+    if (!current() || state.api !== api || state.room?.id !== room.id || groupPollGeneration !== generation || state.view !== view) return
+    if (!acceptRoom(result)) return
+    if (!result.ok) {
+      if (!silent && view !== 'ticketGroup') toast(result.message, 'error')
       return
     }
-    if (result.error === 'unauthorized') {
-      await clearAccount('账号会话已失效，请重新生成 ticket')
-      return
+    const updated = parseRoom(result.data)
+    if (updated && updated.id === room.id && updated.revision >= state.room.revision) {
+      state.room = updated
+      if (silent) updateGroupMessages(updated)
     }
-    if (!silent) toast(result.message, 'error')
-    return
   }
-  const updated = parseRoom(result.data)
-  if (updated && state.room?.id === updated.id && updated.revision >= state.room.revision) {
-    state.room = updated
-    if (view === 'ticketGroup' || view === 'groupRoom') updateGroupMessages(updated)
-  }
+  if (silent) await refresh(() => true)
+  else await withGroupBusy(refresh)
 }
 
 async function sendGroupMessage(): Promise<void> {
-  const api = phoneApi()
   const room = state.room
-  if (!api || !room || state.groupBusy) return
+  if (!room || state.groupBusy) return
   const text = state.groupDraft.trim()
   if (!text) return
   if (room.state !== 'idle' || room.cleared || room.rounds >= 3) {
@@ -3270,39 +3277,34 @@ async function sendGroupMessage(): Promise<void> {
     return
   }
   if (!groupKey) groupKey = newIdempotencyKey()
-  state.groupBusy = true
-  render()
-  const result = await api.discussionAction(buildSendPayload(room.id, text, groupKey, room.moderatorId))
-  if (state.api !== api || state.room?.id !== room.id) return
-  state.groupBusy = false
-  if (!result.ok) {
-    toast(result.message + '。这次发送会沿用同一个幂等键。', 'error')
-    render()
-    return
-  }
-  groupKey = ''
-  state.groupDraft = ''
-  const updated = result.data.room ? parseRoom(result.data.room) : null
-  if (updated) state.room = updated
-  else await refreshRoom(true)
-  render()
+  await runRoomAction(buildSendPayload(room.id, text, groupKey, room.moderatorId), true)
 }
 
 async function stopRoom(): Promise<void> {
+  if (state.room) await runRoomAction({ action: 'stop', roomId: state.room.id }, false)
+}
+
+async function runRoomAction(payload: Record<string, unknown>, sending: boolean): Promise<void> {
   const api = phoneApi()
   const room = state.room
-  if (!api || !room) return
-  state.groupBusy = true
-  render()
-  const result = await api.discussionAction({ action: 'stop', roomId: room.id })
-  if (state.api !== api || state.room?.id !== room.id) return
-  state.groupBusy = false
-  if (!result.ok) { toast(result.message, 'error'); render(); return }
-  const updated = result.data.room ? parseRoom(result.data.room) : null
-  if (updated) state.room = updated
-  else await refreshRoom(true)
-  toast('已请求停止')
-  render()
+  if (!api || !room || state.groupBusy) return
+  const view = state.view
+  const generation = groupPollGeneration
+  await withGroupBusy(async current => {
+    render()
+    const result = await api.discussionAction(payload)
+    if (!current() || state.api !== api || state.room?.id !== room.id || state.view !== view || generation !== groupPollGeneration) return
+    if (!acceptRoom(result)) return
+    if (!result.ok) {
+      toast(result.message + (sending ? '。这次发送会沿用同一个幂等键。' : ''), 'error')
+      return
+    }
+    if (sending) groupKey = state.groupDraft = ''
+    else toast('已请求停止')
+    const updated = parseRoom(result.data.room)
+    if (updated?.id === room.id && updated.revision >= state.room.revision) state.room = updated
+    else await refreshRoom(true)
+  })
 }
 
 function groupsView(): Child[] {
@@ -3331,13 +3333,13 @@ function groupsView(): Child[] {
       ...header,
       el('div', { class: 'card' },
         el('h2', { text: '需要手机配对凭证' }),
-        el('p', { class: 'empty', text: state.groupError || '请扫描电脑上的配对码，或在设置中登录。' }),
+        el('p', { class: 'empty', text: roomListError || '请扫描电脑上的配对码，或在设置中登录。' }),
         button('去设置', () => { state.view = 'settings'; render() }, { class: 'primary block' }),
       ),
     ]
   }
   const banners: Child[] = []
-  if (state.groupError) banners.push(el('div', { class: 'banner error', text: state.groupError }))
+  if (roomListError) banners.push(el('div', { class: 'banner error', text: roomListError }))
   const listed = filterSessionsByCategory(state.roomList.map(room => ({ ...room, kind: 'group' as const, ticketRoom: ticketRooms.has(room.id) })), 'group')
   const rooms = listed.map((room) => el('button', {
     class: 'session',
@@ -3355,7 +3357,7 @@ function groupsView(): Child[] {
     ...banners,
     el('div', { class: 'card' },
       el('h2', { text: '房间（' + rooms.length + '）' }),
-      ...(rooms.length > 0 ? rooms : [el('p', { class: 'empty', text: state.groupBusy ? '读取群聊…' : '暂无群聊房间。' })]),
+      ...(rooms.length > 0 ? rooms : [el('p', { class: 'empty', text: roomListBusy ? '读取群聊…' : '暂无群聊房间。' })]),
       button('刷新群聊', () => { void loadRooms(true) }, { class: 'block' }),
     ),
     el('p', { class: 'notice', text: '账号会话到期：' + new Date(account.expiresAt).toLocaleString('zh-CN') + '；到期后重新生成 ticket。' }),
@@ -3401,8 +3403,8 @@ function groupRoomView(ticketHeader?: HTMLElement): Child[] {
     return groupsView()
   }
   const header = ticketHeader ?? topbar(room ? room.title : '群聊', room ? groupProgress(room) : state.groupError ? '读取失败' : '读取中…', [
-    button('刷新', () => { void refreshRoom() }, { class: 'icon-button', disabled: !room && state.groupBusy }),
-    room && room.state !== 'closed' ? button('停止', () => { void stopRoom() }, { class: 'icon-button danger' }) : null,
+    button('刷新', () => { void refreshRoom() }, { class: 'icon-button', disabled: state.groupBusy }),
+    room && room.state !== 'closed' ? button('停止', () => { void stopRoom() }, { class: 'icon-button danger', disabled: state.groupBusy }) : null,
   ], backButton(returnToGroups))
   if (!room) {
     return [header, el('div', { class: 'card' }, el('p', { class: state.groupError ? 'banner error' : 'empty', role: 'status', text: state.groupError || '读取群聊…' }))]
@@ -3443,6 +3445,7 @@ function groupRoomView(ticketHeader?: HTMLElement): Child[] {
 
 function openGroupNew(): void {
   if (!accountUsable()) { toast('请先用账号 ticket 登录', 'error'); return }
+  groupRequests.invalidate()
   state.groupTitle = ''
   state.groupText = ''
   state.groupSelected = []
@@ -3452,7 +3455,7 @@ function openGroupNew(): void {
   state.view = 'groupNew'
   render()
   if (state.catalog.length === 0) {
-    void loadRooms().then(() => { if (state.view === 'groupNew') render() })
+    void loadRooms()
   }
 }
 
@@ -3483,56 +3486,46 @@ async function previewGroup(): Promise<void> {
   const text = state.groupText.trim()
   if (!title) { toast('请填写群聊标题', 'error'); return }
   if (!text) { toast('请填写第一条消息', 'error'); return }
-  state.groupBusy = true
-  render()
-  const input = buildPreviewInput({
-    title,
-    text,
-    members: chosen.map((item) => ({ deviceId: item.deviceId, modelId: item.id })),
-  })
-  const result = await api.discussionAction({ action: 'preview', input })
-  state.groupBusy = false
-  if (!result.ok) {
-    toast(result.message, 'error')
-    if (result.error === 'unauthorized') {
-      await clearAccount('账号会话已失效，请重新生成 ticket')
+  await withGroupBusy(async current => {
+    render()
+    const input = buildPreviewInput({
+      title,
+      text,
+      members: chosen.map((item) => ({ deviceId: item.deviceId, modelId: item.id })),
+    })
+    const result = await api.discussionAction({ action: 'preview', input })
+    if (!current() || state.api !== api || state.view !== 'groupNew') return
+    if (!result.ok) {
+      toast(result.message, 'error')
       return
     }
-    render()
-    return
-  }
-  const preview = parsePreview(result.data.preview)
-  if (!preview) { toast('预览结果无法识别', 'error'); render(); return }
-  state.groupPreview = preview
-  render()
+    const preview = parsePreview(result.data.preview)
+    if (!preview) { toast('预览结果无法识别', 'error'); return }
+    state.groupPreview = preview
+  })
 }
 
 async function createGroup(): Promise<void> {
   const api = phoneApi()
   const preview = state.groupPreview
   if (!api || !preview || state.groupBusy) return
-  state.groupBusy = true
-  render()
-  const result = await api.discussionAction({ action: 'create', digest: preview.digest, key: newIdempotencyKey() })
-  state.groupBusy = false
-  if (!result.ok) {
-    toast(result.message, 'error')
-    if (result.error === 'unauthorized') {
-      await clearAccount('账号会话已失效，请重新生成 ticket')
+  await withGroupBusy(async current => {
+    render()
+    const result = await api.discussionAction({ action: 'create', digest: preview.digest, key: newIdempotencyKey() })
+    if (!current() || state.api !== api || state.view !== 'groupNew') return
+    if (!result.ok) {
+      toast(result.message, 'error')
       return
     }
-    render()
-    return
-  }
-  state.room = parseRoom(result.data.room)
-  requestedRoomId = state.room?.id ?? null
-  state.groupPreview = null
-  state.view = 'groupRoom'
-  state.groupDraft = ''
-  render()
-  startGroupPoll()
-  void loadRooms()
-  toast('群聊已创建')
+    state.room = parseRoom(result.data.room)
+    requestedRoomId = state.room?.id ?? null
+    state.groupPreview = null
+    state.view = 'groupRoom'
+    state.groupDraft = ''
+    if (state.room) startGroupPoll()
+    void loadRooms()
+    toast('群聊已创建')
+  })
 }
 
 function groupNewView(): Child[] {
@@ -3587,7 +3580,7 @@ function groupNewView(): Child[] {
     : null
   return [
     header,
-    ...(state.groupError ? [el('div', { class: 'banner error', text: state.groupError })] : []),
+    ...(roomListError ? [el('div', { class: 'banner error', text: roomListError })] : []),
     el('div', { class: 'card' },
       el('h2', { text: '内容' }),
       el('div', { class: 'form' },
@@ -3597,7 +3590,7 @@ function groupNewView(): Child[] {
     ),
     el('div', { class: 'card' },
       el('h2', { text: '成员（已选 ' + chosen.length + '/4 · 第一项为主持人）' }),
-      ...(catalogRows.length > 0 ? catalogRows : [el('p', { class: 'empty', text: '暂无可用模型；请返回群聊列表刷新。' })]),
+      ...(catalogRows.length > 0 ? catalogRows : [el('p', { class: 'empty', text: roomListBusy ? '读取可用模型…' : '暂无可用模型；请返回群聊列表刷新。' })]),
       el('div', { class: 'choices' },
         button(state.groupBusy ? '读取中…' : '预览范围', () => { void previewGroup() }, {
           class: 'primary', disabled: state.groupBusy || chosen.length < 2,
@@ -3748,17 +3741,16 @@ async function saveSettings(hubInput: HTMLInputElement, tokenInput: HTMLInputEle
     return
   }
   adoptConfig(next)
-  if (hubChanged) state.account = null
   toast('已保存')
   await enterApp()
 }
 
 async function wipeData(): Promise<void> {
-  await removeConfig()
+  await accountLogin.clear()
   summaryCap.reset()
   clearConfigReadError()
   closeMainStream()
-  stopGroupPoll()
+  resetGroups()
   clearTimeout(boardPoll)
   state.config = null
   applyTheme('system')
@@ -3768,10 +3760,6 @@ async function wipeData(): Promise<void> {
   state.devices = []
   state.sessions = []
   state.account = null
-  state.room = null
-  state.roomList = []
-  state.catalog = []
-  state.groupError = ''
   state.view = 'setup'
   render()
   toast('本地数据已清除')

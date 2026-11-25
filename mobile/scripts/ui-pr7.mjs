@@ -13,6 +13,14 @@ let cards = [[], Array.from({ length: 100 }, (_, i) => ({ requestId: `q${i}` }))
 let receipt
 const pendingWrite = Promise.withResolvers()
 let roomMessage = ''
+let rejectRoomList = false
+let roomTitle = '测试讨论室'
+let holdOldRoomList = false
+const oldRoomList = Promise.withResolvers()
+const replacementRoomList = Promise.withResolvers()
+const oldCatalog = [{
+  id: 'codex:old-model', agent: 'codex', model: '旧凭证模型', deviceId: 'node-a', deviceName: '测试电脑',
+}]
 const edits = []
 const errors = []
 
@@ -67,9 +75,21 @@ try {
       case '/marshal/api/history': return json({ result: { items: [] } })
       case '/marshal/api/command': return json({ ok: true, status: 'accepted', result: {} })
       case '/marshal/api/discussions': {
-        const room = { id: 'room', title: '测试讨论室', state: 'idle',
+        const detail = url.searchParams.has('room')
+        if (!detail) {
+          if (route.request().headers().authorization === 'Bearer mph1.replacement-fixture') {
+            await replacementRoomList.promise
+            return route.fulfill({ status: 403, json: { code: 'unauthorized' } })
+          }
+          if (rejectRoomList) return route.fulfill({ status: 401, json: { code: 'unauthorized' } })
+          if (holdOldRoomList) {
+            await oldRoomList.promise
+            return json({ rooms: [{ id: 'stale', title: '旧凭证迟到房间', state: 'idle' }], catalog: oldCatalog })
+          }
+        }
+        const room = { id: 'room', title: roomTitle, state: 'idle',
           messages: roomMessage ? [{ id: 'message', author: 'user', text: roomMessage }] : [] }
-        return json(url.searchParams.has('room') ? { room } : { rooms: [room], catalog: [] })
+        return json(detail ? { room } : { rooms: [room], catalog: oldCatalog })
       }
       case '/marshal/api/memory': return json({ entries: [] })
       case '/': return route.fulfill({ path: 'dist/index.html' })
@@ -190,11 +210,30 @@ try {
     }) })
   })
   await badge('会话', '2')
-  await button('群聊').click()
+  const category = name => page.getByRole('group', { name: '会话类型' }).getByRole('button', { name, exact: true })
+  await category('工单群').click()
+  await page.getByText('暂无已关联群聊的工单。').waitFor()
+  assert.equal(await category('工单群').getAttribute('aria-pressed'), 'true')
+  await category('单聊').click()
+  await screen('sessions')
+  assert.equal(await category('单聊').getAttribute('aria-pressed'), 'true')
+  await category('Agent 群聊').click()
+  assert.equal(await category('Agent 群聊').getAttribute('aria-pressed'), 'true')
   await screen('groups')
-  await page.getByText('测试讨论室', { exact: true }).click()
+  await page.getByText('测试讨论室', { exact: true }).waitFor()
+  rejectRoomList = true
+  await button('刷新群聊').click()
+  await page.getByText(/令牌被 Hub 拒绝/).waitFor()
+  assert.equal(await page.getByText('测试讨论室', { exact: true }).count(), 0)
+  assert.equal(await page.evaluate(() => JSON.parse(localStorage.getItem('dsh-marshal-mobile.config')).account?.csrf), 'mock')
+  rejectRoomList = false
+  roomTitle = '鉴权恢复后的讨论室'
+  await button('刷新群聊').click()
+  await page.getByText(roomTitle, { exact: true }).waitFor()
+  await page.getByText(/令牌被 Hub 拒绝/).waitFor({ state: 'hidden' })
+  await page.getByText(roomTitle, { exact: true }).click()
   await screen('groupRoom')
-  await page.locator('.topbar').getByText('测试讨论室', { exact: true }).waitFor()
+  await page.locator('.topbar').getByText(roomTitle, { exact: true }).waitFor()
   // Current Hub has no ticket-room association. Exercise the composer renderer
   // shared by real discussion rooms and the ticket-group route.
   const composer = page.locator('.composer input')
@@ -209,14 +248,51 @@ try {
     [true, '正在输入的问题', 2, 4])
   await composer.dispatchEvent('compositionend', { data: '工' })
   await page.locator('.topbar').getByRole('button', { name: '返回' }).click()
-  await button('新建').click()
+  await button('新建会话').click()
+  await button('继续选择群成员').click()
   await screen('groupNew')
+  await page.getByText('旧凭证模型', { exact: true }).waitFor()
   await page.locator('.topbar').getByRole('button', { name: '返回' }).click()
-  await page.locator('.topbar').getByRole('button', { name: '返回' }).click()
+  await page.getByText(roomTitle, { exact: true }).waitFor()
+  holdOldRoomList = true
+  const listUrl = `${origin}/marshal/api/discussions`
+  const started = page.waitForRequest(request => request.url() === listUrl)
+  await button('刷新群聊').click()
+  await started
   await tab('节点').click()
-  await page.locator('.row-between', { hasText: '记忆' }).getByRole('button', { name: '打开' }).click()
-  await screen('memory')
+  await button('设置').click()
+  await page.getByText('高级：管理令牌', { exact: true }).click()
+  await page.locator('input[type="password"]').fill('mph1.replacement-fixture')
+  await button('保存').click()
+  await screen('board')
+  await tab('会话').click()
+  await page.getByText('读取群聊…', { exact: true }).waitFor()
+  assert.equal(await page.getByText(roomTitle, { exact: true }).count(), 0)
+  replacementRoomList.resolve()
+  await page.getByText(/拒绝了 App 的来源（403）/).waitFor()
+  await page.getByText('暂无群聊房间。').waitFor()
+  assert.equal(await page.getByText(roomTitle, { exact: true }).count(), 0)
+  const staleResponse = page.waitForResponse(response => response.url() === listUrl && response.status() === 200)
+  oldRoomList.resolve()
+  await (await staleResponse).finished()
+  // Let the app consume the response body before checking the rendered list.
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+  assert.equal(await page.getByText('旧凭证迟到房间', { exact: true }).count(), 0)
+  assert.equal(await page.evaluate(() => JSON.parse(localStorage.getItem('dsh-marshal-mobile.config')).account?.csrf), 'mock')
+  await button('新建会话').click()
+  await button('继续选择群成员').click()
+  await screen('groupNew')
+  await page.getByText('暂无可用模型；请返回群聊列表刷新。').waitFor()
+  assert.equal(await page.getByText('旧凭证模型', { exact: true }).count(), 0)
   await page.locator('.topbar').getByRole('button', { name: '返回' }).click()
+  await screen('groups')
+  await tab('智能体').click()
+  await screen('agents')
+  await button('成员与预设').click()
+  await page.getByRole('button', { name: /测试成员/ }).waitFor()
+  await button('记忆与星系').click()
+  await page.getByRole('button', { name: '记忆与星系', pressed: true }).waitFor()
+  await tab('节点').click()
   await button('设置').click()
   await screen('settings')
   await page.locator('[data-choice="codex"]').click()
@@ -226,7 +302,7 @@ try {
   await screen('board')
   assert.equal(await page.locator('html').getAttribute('data-theme'), 'codex')
   assert.deepEqual(errors, [])
-  console.log('PR7 mock UI: navigation, badges and polling, edit conflict, material fallback and theme persistence passed')
+  console.log('PR7 mock UI assertions passed: navigation, badges, polling, edit conflict, group auth recovery and credential isolation, theme persistence; pageErrors=0')
 } finally {
   await browser.close()
 }

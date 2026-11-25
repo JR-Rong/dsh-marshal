@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import {
-  buildPreviewInput, buildSendPayload, extractSetCookie, extractTicket, matchCookie, parseLoginBody,
+  buildPreviewInput, buildSendPayload, createAccountLoginGuard, extractSetCookie, extractTicket, matchCookie, parseLoginBody,
   parseOnboardLink, ticketFingerprint,
   parsePreview, parseRoom, parseRoomList,
 } from '../src/lib/account.ts'
-import { parseConfig } from '../src/lib/config.ts'
+import { updateConfig } from '../src/lib/storage.ts'
+import { makeConfig, parseConfig } from '../src/lib/config.ts'
 
 test('parseLoginBody 读取 csrf/expiresAt/account', () => {
   assert.deepEqual(parseLoginBody({
@@ -148,4 +149,67 @@ test('ticketFingerprint 稳定且能区分不同 ticket', () => {
   assert.match(a, /^[0-9a-f]{8}$/)
   assert.equal(a, ticketFingerprint('t'.repeat(43)))
   assert.notEqual(a, b)
+})
+
+for (const change of ['pair', 'save', 'clear', 'logout', 'missing', 'unchanged']) {
+  test(`queued ticket login: ${change}`, async t => {
+    const account = { cookies: 'a', csrf: 'a', expiresAt: Date.now() + 60000 }
+    const a = { ...makeConfig({ hubUrl: 'https://a.example' }), account }
+    const hubUrl = 'https://b.example'
+    let raw = null as string | null
+    Object.defineProperty(globalThis, 'window', { configurable: true, value: { localStorage: {
+      getItem: () => raw, setItem: (_key, value) => { raw = value }, removeItem: () => { raw = null },
+    } } })
+    t.after(() => Reflect.deleteProperty(globalThis, 'window'))
+    const fetch = t.mock.method(globalThis, 'fetch', async () => Response.json({ ok: true }))
+    if (change !== 'missing') await updateConfig(() => a)
+    const state = { config: a, account, accountBusy: true }
+    const guard = createAccountLoginGuard(state)
+    const login = guard.begin(a.hubUrl)
+    if (change === 'pair') {
+      state.config = guard.adopt(await guard.save({ hubUrl, token: 'mph1.test' }))
+      assert.equal(state.account, null)
+    }
+    if (change === 'save') await guard.save({ token: 'mph1.new' })
+    if (change === 'clear') await guard.clear()
+    if (change === 'logout') await guard.logout()
+    assert.deepEqual((await login.persist(account))?.account, change === 'unchanged' ? account : undefined)
+    if (change === 'pair') {
+      const saved = JSON.parse(raw!)
+      assert.equal(saved.hubUrl, hubUrl)
+      assert.equal(saved.account, null)
+      await guard.logout()
+      assert.equal(fetch.mock.callCount(), 0)
+    }
+  })
+}
+
+test('in-flight loginTicket write rolls back if same-hub credentials change mid-write', async t => {
+  const staleAccount = { cookies: 'old', csrf: 'old-csrf', expiresAt: Date.now() + 60000 }
+  const initial = makeConfig({ hubUrl: 'https://a.example', token: 'mph1.old' })
+  let raw = JSON.stringify(initial) as string | null
+  let savedCount = 0
+  const state = { config: initial, account: null as typeof staleAccount | null, accountBusy: true }
+  const guard = createAccountLoginGuard(state)
+  let saveTriggered: Promise<unknown> | null = null
+  Object.defineProperty(globalThis, 'window', { configurable: true, value: { localStorage: {
+    getItem: () => raw,
+    setItem: (_key: string, value: string) => {
+      raw = value
+      savedCount++
+      if (savedCount === 1) {
+        // Simulate credentials changing on the same Hub while persist() is mid-write.
+        saveTriggered = guard.save({ token: 'mph1.new' })
+      }
+    },
+    removeItem: () => { raw = null },
+  } } })
+  t.after(() => Reflect.deleteProperty(globalThis, 'window'))
+  const login = guard.begin(initial.hubUrl)
+  const persisted = await login.persist(staleAccount)
+  await saveTriggered
+  assert.equal(persisted, null)
+  const finalConfig = JSON.parse(raw!)
+  assert.equal(finalConfig.token, 'mph1.new')
+  assert.equal(finalConfig.account ?? null, null)
 })
