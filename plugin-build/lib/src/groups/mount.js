@@ -1118,11 +1118,18 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
         domain('GET', 'voice/capabilities', async (_req, res) => {
             write(res, 200, voice.capabilities());
         }),
-        domain('POST', 'voice/prepare', async (req, res) => {
+        domain('POST', 'voice/prepare', async (req, res, access) => {
+            if (!access.session.owner) {
+                write(res, 403, { ok: false, code: 'owner-only', message: '仅机主账号可准备宿主机语音识别模型。' });
+                return;
+            }
             const body = await readBody(req);
+            const source = typeof body?.downloadSource === 'string'
+                ? body.downloadSource
+                : (typeof body?.source === 'string' ? body.source : undefined);
             const result = voice.prepareStt({
                 providerId: typeof body?.providerId === 'string' ? body.providerId : undefined,
-                source: typeof body?.source === 'string' ? body.source : undefined,
+                downloadSource: source,
             });
             write(res, result.ok ? 200 : 503, result);
         }),
@@ -1139,6 +1146,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
                     language: body?.language,
                     providerId: body?.providerId,
                 }, abort.signal);
+                if (abort.signal.aborted || res.destroyed || res.writableEnded) return;
                 write(res, 200, result);
             } finally {
                 req.off?.('aborted', onAbort);
@@ -1150,7 +1158,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             const agent = requireAgent(body?.agentKey, access, ledger);
             const utterance = typeof body?.text === 'string' ? body.text.trim() : '';
             if (!utterance) {
-                write(res, 400, { ok: false, error: 'invalid-text', message: '语音输入内容不能为空。' });
+                write(res, 400, { ok: false, code: 'invalid-text', error: 'invalid-text', message: '语音输入内容不能为空。' });
                 return;
             }
             const member = lookupMember(agent, ledger);
@@ -1178,7 +1186,11 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             });
             const sendEvent = (event, payload) => {
                 if (closed || res.destroyed || res.writableEnded) return;
-                res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
+                try {
+                    res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
+                } catch {
+                    onAbort();
+                }
             };
             try {
                 for await (const item of voice.streamVoiceTurn({
@@ -1187,6 +1199,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
                     text: utterance,
                     history: body?.history,
                     ticketContext,
+                    allowGlobalMemory: access.session.owner === true,
                     signal: abort.signal,
                 })) {
                     if (closed || abort.signal.aborted) break;
@@ -1202,7 +1215,9 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             } finally {
                 req.off?.('aborted', onAbort);
                 res.off?.('close', onResClose);
-                if (!res.destroyed && !res.writableEnded) res.end();
+                if (!res.destroyed && !res.writableEnded) {
+                    try { res.end(); } catch { /* ignore */ }
+                }
             }
         }),
         domain('POST', 'voice/tts', async (req, res) => {
@@ -1225,7 +1240,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
                     'content-type': result.mime,
                     'cache-control': 'no-store',
                     'x-marshal-tts-provider': result.provider,
-                    'x-marshal-tts-voice': encodeURIComponent(String(result.voice ?? '')),
+                    'x-marshal-tts-voice': encodeURIComponent(String(result.voice ?? '').slice(0, 128)),
                     ...(result.fallbackFrom ? { 'x-marshal-tts-fallback': result.fallbackFrom } : {}),
                 });
                 res.end(result.audio);
@@ -1235,7 +1250,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             }
         }),
         domain('POST', 'voice/summarize', async (req, res, access, ledger) => {
-            const body = await readBody(req);
+            const body = await readBody(req, 256 * 1024);
             const agent = requireAgent(body?.agentKey, access, ledger);
             const member = lookupMember(agent, ledger);
             let ticketTitle = '';
@@ -1258,6 +1273,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
                     ticketTitle,
                     signal: abort.signal,
                 });
+                if (abort.signal.aborted || res.destroyed || res.writableEnded) return;
                 write(res, 200, result);
             } finally {
                 req.off?.('aborted', onAbort);

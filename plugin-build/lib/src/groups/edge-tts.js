@@ -18,6 +18,7 @@ const TICKS_PER_SEC = 10000000n;
 const VOICE_NAME_RE = /^[a-z]{2,3}-[A-Z]{2,4}(?:-[a-z]{2,16})?-[A-Za-z0-9]+Neural$/;
 const RATE_RE = /^[+-]?\d{1,3}%$/;
 const AUDIO_SEPARATOR = Buffer.from('Path:audio\r\n');
+const MAX_EDGE_AUDIO_BYTES = 8 * 1024 * 1024;
 
 export const EDGE_DEFAULT_VOICE = 'zh-CN-XiaoxiaoNeural';
 export const EDGE_ZH_VOICES = Object.freeze([
@@ -206,6 +207,7 @@ export function generateSecMsGecV2(unixSeconds = Date.now() / 1000 + clockSkewSe
 
 export function escapeSsml(text) {
     return String(text ?? '')
+        .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '')
         .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, ' ')
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
@@ -255,6 +257,7 @@ function synthesizeOnce({ text, voice, rate, signal, timeoutMs, WebSocketImpl })
             handshakeTimeout: Math.min(timeoutMs, 8000),
         });
         const chunks = [];
+        let totalBytes = 0;
         let settled = false;
         const finish = (err, value) => {
             if (settled) return;
@@ -286,23 +289,37 @@ function synthesizeOnce({ text, voice, rate, signal, timeoutMs, WebSocketImpl })
             }));
         });
         ws.on('open', () => {
+            if (settled) return;
             const stamp = new Date().toUTCString();
             const requestId = randomUUID().replace(/-/g, '');
             const lang = voice.split('-').slice(0, 2).join('-') || 'zh-CN';
             const ssml = `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='${lang}'><voice name='${voice}'><prosody pitch='+0Hz' rate='${rate}' volume='+0%'>${escapeSsml(text)}</prosody></voice></speak>`;
-            ws.send(
-                `X-Timestamp:${stamp}\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n` +
-                '{"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"false"},"outputFormat":"audio-24khz-48kbitrate-mono-mp3"}}}}\r\n',
-            );
-            ws.send(
-                `X-RequestId:${requestId}\r\nContent-Type:application/ssml+xml\r\nX-Timestamp:${stamp}Z\r\nPath:ssml\r\n\r\n${ssml}`,
-            );
+            try {
+                ws.send(
+                    `X-Timestamp:${stamp}\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n` +
+                    '{"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"false"},"outputFormat":"audio-24khz-48kbitrate-mono-mp3"}}}}\r\n',
+                );
+                ws.send(
+                    `X-RequestId:${requestId}\r\nContent-Type:application/ssml+xml\r\nX-Timestamp:${stamp}Z\r\nPath:ssml\r\n\r\n${ssml}`,
+                );
+            } catch (err) {
+                finish(Object.assign(err instanceof Error ? err : new Error(String(err)), { code: 'edge-send-failed' }));
+            }
         });
         ws.on('message', (data, isBinary) => {
+            if (settled) return;
             if (isBinary) {
                 const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
                 const idx = buf.indexOf(AUDIO_SEPARATOR);
-                if (idx >= 0) chunks.push(buf.subarray(idx + AUDIO_SEPARATOR.length));
+                if (idx >= 0) {
+                    const part = buf.subarray(idx + AUDIO_SEPARATOR.length);
+                    totalBytes += part.length;
+                    if (totalBytes > MAX_EDGE_AUDIO_BYTES) {
+                        finish(Object.assign(new Error('edge-tts-audio-too-large'), { code: 'audio-too-large' }));
+                        return;
+                    }
+                    chunks.push(part);
+                }
                 return;
             }
             const msg = String(data);
@@ -318,9 +335,7 @@ function synthesizeOnce({ text, voice, rate, signal, timeoutMs, WebSocketImpl })
         ws.on('error', err => finish(Object.assign(err instanceof Error ? err : new Error(String(err)), { code: 'edge-network' })));
         ws.on('close', () => {
             if (!settled) {
-                const audio = Buffer.concat(chunks);
-                if (audio.length > 0) finish(null, { mime: 'audio/mpeg', audio, provider: 'edge', voice });
-                else finish(Object.assign(new Error('edge-tts-closed'), { code: 'closed' }));
+                finish(Object.assign(new Error('edge-tts-closed'), { code: 'closed' }));
             }
         });
     });
@@ -331,6 +346,7 @@ export async function synthesizeEdgeTts({ text, voice, rate, signal, timeoutMs =
     if (!clean) throw Object.assign(new Error('empty-text'), { code: 'invalid-text' });
     const resolvedVoice = normalizeEdgeVoice(voice);
     const resolvedRate = normalizeEdgeRate(rate);
+    const startedAt = Date.now();
     try {
         return await synthesizeOnce({ text, voice: resolvedVoice, rate: resolvedRate, signal, timeoutMs, WebSocketImpl });
     } catch (error) {
@@ -338,7 +354,8 @@ export async function synthesizeEdgeTts({ text, voice, rate, signal, timeoutMs =
             const parsed = Date.parse(error.serverDate);
             if (Number.isFinite(parsed)) {
                 clockSkewSeconds = parsed / 1000 - Date.now() / 1000;
-                return await synthesizeOnce({ text, voice: resolvedVoice, rate: resolvedRate, signal, timeoutMs, WebSocketImpl });
+                const remainingMs = Math.max(2_000, timeoutMs - (Date.now() - startedAt));
+                return await synthesizeOnce({ text, voice: resolvedVoice, rate: resolvedRate, signal, timeoutMs: remainingMs, WebSocketImpl });
             }
         }
         throw error;

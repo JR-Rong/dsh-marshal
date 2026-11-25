@@ -87,7 +87,17 @@
       signal?.throwIfAborted();
       const proof = await ensureMemorySession(undefined, signal);
       let response = await send(proof);
-      if (response.status === 401 || response.status === 403) {
+      let shouldRefresh = response.status === 401;
+      if (response.status === 403) {
+        let code = '';
+        try {
+          const parsed = typeof response.clone === 'function' ? await response.clone().json().catch(() => null) : null;
+          code = typeof parsed?.code === 'string' ? parsed.code : '';
+        } catch {}
+        shouldRefresh = !code || code === 'unauthorized' || code === 'memory-csrf-mismatch';
+      }
+      if (shouldRefresh) {
+        try { void response.body?.cancel?.().catch?.(() => {}); } catch {}
         signal?.throwIfAborted();
         const refreshed = await ensureMemorySession(proof, signal);
         response = await send(refreshed);
@@ -100,9 +110,11 @@
       if (!reader) return;
       const decoder = new TextDecoder();
       let buffer = '';
-      const onAbort = () => { try { void reader.cancel(); } catch {} };
+      let completed = false;
+      const safeCancel = () => { try { Promise.resolve(reader.cancel()).catch(() => {}); } catch {} };
+      const onAbort = () => safeCancel();
       if (signal) {
-        if (signal.aborted) { onAbort(); return; }
+        if (signal.aborted) { safeCancel(); return; }
         signal.addEventListener('abort', onAbort, { once: true });
       }
       const parseBlock = block => {
@@ -118,7 +130,7 @@
       try {
         while (!signal?.aborted) {
           const { done, value } = await reader.read();
-          if (done) break;
+          if (done) { completed = true; break; }
           buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
           let sep;
           while ((sep = buffer.indexOf('\n\n')) !== -1) {
@@ -137,8 +149,31 @@
         }
       } finally {
         signal?.removeEventListener?.('abort', onAbort);
+        if (!completed) safeCancel();
         try { reader.releaseLock(); } catch {}
       }
+    }
+
+    const mvIsSttPreparing = stt => Boolean(
+      stt?.preparing || ['preparing', 'checking', 'downloading', 'loading', 'waking'].includes(stt?.phase),
+    );
+
+    function mvTrimSummaryTranscript(transcript) {
+      if (!Array.isArray(transcript)) return [];
+      const recent = transcript.slice(-80).map(item => ({
+        speaker: String(item?.speaker || '').slice(0, 80),
+        text: String(item?.text || '').slice(0, 800),
+      })).filter(item => item.text.trim());
+      const out = [];
+      let approxBytes = 0;
+      for (let i = recent.length - 1; i >= 0; i--) {
+        const entry = recent[i];
+        const cost = (entry.speaker.length + entry.text.length) * 3 + 48;
+        if (approxBytes + cost > 48_000 && out.length > 0) break;
+        approxBytes += cost;
+        out.push(entry);
+      }
+      return out.reverse();
     }
 
     // Adapter contract: connect({agent, targetTicketId, signal, onTranscript, onUpdateTranscript, onState}),
@@ -311,8 +346,10 @@
         },
         setTts(providerId, voice) {
           if (get().status !== 'active' || !providerId) return;
-          patch({ ttsProvider: providerId, ...(voice !== undefined ? { ttsVoice: voice } : {}) });
-          adapter.setTts?.({ provider: providerId, voice });
+          const changedProvider = providerId !== get().ttsProvider;
+          const nextVoice = voice !== undefined ? voice : (changedProvider ? '' : undefined);
+          patch({ ttsProvider: providerId, ...(nextVoice !== undefined ? { ttsVoice: nextVoice } : {}) });
+          adapter.setTts?.({ provider: providerId, voice: nextVoice });
         },
         interrupt() {
           if (get().status !== 'active') return;
@@ -395,15 +432,20 @@
       let activeAudio = null;
       let stopActiveAudio = null;
       let playQueue = [];
-      let playingQueue = false;
+      let pendingTts = [];
+      let ttsInflight = 0;
+      const MAX_TTS_INFLIGHT = 2;
+      let drainingSeq = 0;
       let playbackSeq = 0;
       let utteranceSeq = 0;
+      let connectSeq = 0;
 
       // VAD capture buffers
       let preRoll = [];
       let speechChunks = [];
       let inSpeech = false;
       let speechMs = 0;
+      let captureMs = 0;
       let silenceMs = 0;
       let bargeMs = 0;
       let lastLevelEmit = 0;
@@ -411,7 +453,6 @@
 
       const getFetch = () => env.fetch ?? fetch;
       const liveFetchJson = async (path, body, signal) => {
-        if (!env.fetch) return fetchJson(path, body, true, signal);
         const response = await mvVoiceAuthFetch(path, body, signal, getFetch());
         const data = await response.json().catch(() => ({}));
         if (!response.ok) {
@@ -437,7 +478,9 @@
       const stopAudioPlayback = () => {
         playbackSeq += 1;
         playQueue = [];
-        playingQueue = false;
+        const queued = pendingTts;
+        pendingTts = [];
+        for (const item of queued) item.resolve(null);
         const stopFn = stopActiveAudio;
         stopActiveAudio = null;
         if (stopFn) {
@@ -473,6 +516,7 @@
         speechChunks = [];
         inSpeech = false;
         speechMs = 0;
+        captureMs = 0;
         silenceMs = 0;
         bargeMs = 0;
         pttRecording = false;
@@ -511,8 +555,8 @@
       });
 
       const drainPlayQueue = async seq => {
-        if (playingQueue) return;
-        playingQueue = true;
+        if (drainingSeq === seq) return;
+        drainingSeq = seq;
         try {
           while (!disposed && seq === playbackSeq && playQueue.length > 0) {
             const job = playQueue.shift();
@@ -524,30 +568,50 @@
             }
           }
         } finally {
-          playingQueue = false;
-          if (!disposed && seq === playbackSeq && !turnAbort) {
+          if (drainingSeq === seq) drainingSeq = 0;
+          if (!disposed && seq === playbackSeq && !turnAbort && playQueue.length === 0) {
             setPhase(localFallback ? 'notes' : (mode === 'ptt' ? 'ptt' : 'listening'));
           }
         }
       };
 
-      const enqueueTtsSentence = (sentence, seq, signal) => {
-        if (!sentence || disposed || signal.aborted) return;
-        const job = (async () => {
-          try {
-            const response = await mvVoiceAuthFetch('marshal/voice/tts', {
-              provider: ttsProvider,
-              voice: ttsVoice || undefined,
-              text: sentence,
-            }, signal, getFetch());
-            if (!response.ok || signal.aborted || seq !== playbackSeq) return null;
-            const fallback = response.headers?.get?.('x-marshal-tts-fallback');
-            if (fallback) emitState({ message: '网络语音暂不可用，已自动切换本机离线朗读。' });
-            return await response.blob();
-          } catch {
-            return null;
+      const pumpTtsQueue = () => {
+        while (ttsInflight < MAX_TTS_INFLIGHT && pendingTts.length > 0) {
+          const item = pendingTts.shift();
+          if (disposed || item.signal.aborted || item.seq !== playbackSeq) {
+            item.resolve(null);
+            continue;
           }
-        })();
+          ttsInflight += 1;
+          (async () => {
+            try {
+              const response = await mvVoiceAuthFetch('marshal/voice/tts', {
+                provider: ttsProvider,
+                voice: ttsVoice || undefined,
+                text: item.sentence,
+              }, item.signal, getFetch());
+              if (!response.ok || item.signal.aborted || item.seq !== playbackSeq) return null;
+              const fallback = response.headers?.get?.('x-marshal-tts-fallback');
+              if (fallback) emitState({ message: '网络语音暂不可用，已自动切换本机离线朗读。' });
+              return await response.blob();
+            } catch {
+              return null;
+            }
+          })()
+            .then(item.resolve, () => item.resolve(null))
+            .finally(() => {
+              ttsInflight -= 1;
+              pumpTtsQueue();
+            });
+        }
+      };
+
+      const enqueueTtsSentence = (sentence, seq, signal) => {
+        if (!sentence || disposed || signal.aborted || seq !== playbackSeq) return;
+        const job = new Promise(resolve => {
+          pendingTts.push({ sentence, seq, signal, resolve });
+          pumpTtsQueue();
+        });
         playQueue.push(job);
         void drainPlayQueue(seq);
       };
@@ -623,7 +687,7 @@
           }
         } finally {
           if (turnAbort === ctrl) turnAbort = null;
-          if (!disposed && !playingQueue && playQueue.length === 0 && mySeq === playbackSeq) {
+          if (!disposed && drainingSeq !== mySeq && playQueue.length === 0 && mySeq === playbackSeq) {
             setPhase(localFallback ? 'notes' : (mode === 'ptt' ? 'ptt' : 'listening'));
           }
         }
@@ -670,6 +734,7 @@
               speechChunks = preRoll.slice();
               preRoll = [];
               speechMs = bargeMs;
+              captureMs = bargeMs;
               silenceMs = 0;
               bargeMs = 0;
               setPhase('listening');
@@ -687,22 +752,25 @@
             speechChunks = preRoll.slice();
             preRoll = [];
             speechMs = 0;
+            captureMs = 0;
             silenceMs = 0;
           }
           speechChunks.push(copy);
           speechMs += frameMs;
+          captureMs += frameMs;
           silenceMs = 0;
-          if (speechMs >= 25_000) {
+          if (speechMs >= 25_000 || captureMs >= 28_000) {
             const wav = mvEncodePcm16Wav(speechChunks, sampleRate);
-            inSpeech = false; speechChunks = []; speechMs = 0; silenceMs = 0;
+            inSpeech = false; speechChunks = []; speechMs = 0; captureMs = 0; silenceMs = 0;
             void processUtterance(wav);
           }
         } else if (inSpeech) {
           speechChunks.push(copy);
           silenceMs += frameMs;
-          if (silenceMs >= 700) {
+          captureMs += frameMs;
+          if (silenceMs >= 700 || captureMs >= 28_000) {
             const wav = speechMs >= 240 ? mvEncodePcm16Wav(speechChunks, sampleRate) : null;
-            inSpeech = false; speechChunks = []; speechMs = 0; silenceMs = 0;
+            inSpeech = false; speechChunks = []; speechMs = 0; captureMs = 0; silenceMs = 0;
             if (wav) void processUtterance(wav);
           }
         } else {
@@ -719,12 +787,18 @@
           const providers = caps?.tts?.providers ?? [];
           const defaultTts = caps?.tts?.defaultProvider || 'edge';
           const defaultVoice = caps?.tts?.defaultVoice || '';
-          if (!ttsVoice) ttsVoice = defaultVoice;
+          const resolvedProvider = providers.some(p => p.id === ttsProvider) ? ttsProvider : defaultTts;
+          if (resolvedProvider !== ttsProvider) {
+            ttsProvider = resolvedProvider;
+            ttsVoice = resolvedProvider === defaultTts ? defaultVoice : '';
+          } else if (!ttsVoice && resolvedProvider === defaultTts) {
+            ttsVoice = defaultVoice;
+          }
           emitState({
             capabilities: caps,
             sttNeedsPrepare: needsPrepare,
-            preparingStt: stt.phase === 'preparing',
-            ttsProvider: providers.some(p => p.id === ttsProvider) ? ttsProvider : defaultTts,
+            preparingStt: mvIsSttPreparing(stt),
+            ttsProvider: resolvedProvider,
             ttsVoice,
           });
           return caps;
@@ -745,7 +819,7 @@
             emitState({ sttNeedsPrepare: false, preparingStt: false, message: 'SenseVoice 语音模型已就绪，可以直接开口对话。' });
             return;
           }
-          if (caps?.stt?.phase === 'preparing') schedulePrepareWatch();
+          if (mvIsSttPreparing(caps?.stt)) schedulePrepareWatch();
           else emitState({ preparingStt: false });
         }, 1500);
       };
@@ -754,6 +828,7 @@
         local: false,
         async connect({ agent, targetTicketId, signal, onTranscript, onUpdateTranscript, onState }) {
           signal.throwIfAborted();
+          const myConnect = ++connectSeq;
           disposed = false;
           callAbort?.abort();
           callAbort = new AbortController();
@@ -769,9 +844,13 @@
           history = [];
           const caps = await refreshCapabilities(signal);
           signal.throwIfAborted();
-          if (!caps || caps.llmAvailable === false) {
+          if (myConnect !== connectSeq || disposed) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+          if (!caps || caps.llmAvailable === false || caps.stt?.available === false) {
             localFallback = true;
-            emitState({ fallbackLocal: true, phase: 'notes', message: '后端语音服务暂不可用，已切换本地笔记模式。' });
+            const reason = caps && caps.stt?.available === false
+              ? '宿主未启用 SenseVoice 语音识别服务，已切换本地笔记模式。'
+              : '后端语音服务暂不可用，已切换本地笔记模式。';
+            emitState({ fallbackLocal: true, phase: 'notes', message: reason });
             return;
           }
           const requestMic = getMedia();
@@ -781,27 +860,58 @@
             emitState({ fallbackLocal: true, phase: 'notes', message: '当前环境不支持麦克风采集，已切换本地笔记模式。' });
             return;
           }
+          let micStream = null;
+          let localCtx = null;
+          const stopLocalCapture = () => {
+            if (micStream) {
+              for (const track of micStream.getTracks?.() ?? []) { try { track.stop(); } catch {} }
+              micStream = null;
+            }
+            if (localCtx) { try { void localCtx.close?.(); } catch {} localCtx = null; }
+          };
           try {
-            stream = await requestMic({
+            micStream = await requestMic({
               audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
             });
-            if (signal.aborted) { releaseCapture(); signal.throwIfAborted(); }
-            audioCtx = new AudioCtx();
-            sampleRate = audioCtx.sampleRate || 16000;
-            sourceNode = audioCtx.createMediaStreamSource(stream);
-            processorNode = audioCtx.createScriptProcessor(2048, 1, 1);
-            sinkGain = audioCtx.createGain();
-            sinkGain.gain.value = 0;
-            processorNode.onaudioprocess = event => {
+            if (signal.aborted || disposed || myConnect !== connectSeq) {
+              stopLocalCapture();
+              signal.throwIfAborted();
+              throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+            }
+            localCtx = new AudioCtx();
+            const localRate = localCtx.sampleRate || 16000;
+            const localSource = localCtx.createMediaStreamSource(micStream);
+            const localProcessor = localCtx.createScriptProcessor(2048, 1, 1);
+            const localSink = localCtx.createGain();
+            localSink.gain.value = 0;
+            localProcessor.onaudioprocess = event => {
               const data = event?.inputBuffer?.getChannelData?.(0);
               if (data) onAudioFrame(data);
             };
-            sourceNode.connect(processorNode);
-            processorNode.connect(sinkGain);
-            sinkGain.connect(audioCtx.destination);
-            if (typeof audioCtx.resume === 'function') { try { await audioCtx.resume(); } catch {} }
+            localSource.connect(localProcessor);
+            localProcessor.connect(localSink);
+            localSink.connect(localCtx.destination);
+            if (typeof localCtx.resume === 'function') { try { await localCtx.resume(); } catch {} }
+            if (signal.aborted || disposed || myConnect !== connectSeq) {
+              try { localProcessor.onaudioprocess = null; localProcessor.disconnect(); } catch {}
+              try { localSource.disconnect(); } catch {}
+              try { localSink.disconnect(); } catch {}
+              stopLocalCapture();
+              signal.throwIfAborted();
+              throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+            }
+            stream = micStream;
+            audioCtx = localCtx;
+            sampleRate = localRate;
+            sourceNode = localSource;
+            processorNode = localProcessor;
+            sinkGain = localSink;
+            micStream = null;
+            localCtx = null;
             setPhase('listening');
-          } catch {
+          } catch (error) {
+            stopLocalCapture();
+            if (signal.aborted || disposed || myConnect !== connectSeq) throw error;
             releaseCapture();
             localFallback = true;
             emitState({ fallbackLocal: true, phase: 'notes', message: '麦克风未授权或不可用，已切换为本地笔记模式。' });
@@ -809,14 +919,23 @@
         },
         setMuted(nextMuted) {
           muted = Boolean(nextMuted);
+          if (stream) {
+            const tracks = stream.getAudioTracks?.() ?? stream.getTracks?.() ?? [];
+            for (const track of tracks) {
+              try { if ('enabled' in track) track.enabled = !muted; } catch {}
+            }
+          }
           if (muted) {
-            inSpeech = false; speechChunks = []; pttRecording = false;
+            const wasPttRecording = pttRecording;
+            inSpeech = false; speechChunks = []; preRoll = [];
+            speechMs = 0; captureMs = 0; silenceMs = 0; bargeMs = 0; pttRecording = false;
             emitState({ level: 0, pttActive: false });
+            if (wasPttRecording && mode === 'ptt' && phase === 'listening') setPhase('ptt');
           }
         },
         setMode(nextMode) {
           mode = nextMode;
-          inSpeech = false; speechChunks = []; speechMs = 0; silenceMs = 0; pttRecording = false;
+          inSpeech = false; speechChunks = []; speechMs = 0; captureMs = 0; silenceMs = 0; pttRecording = false;
           if (phase !== 'speaking' && phase !== 'thinking' && phase !== 'transcribing') {
             setPhase(nextMode === 'ptt' ? 'ptt' : 'listening');
           }
@@ -824,9 +943,11 @@
         setPttActive(active) {
           if (localFallback || muted || mode !== 'ptt') return;
           if (active) {
+            if (pttRecording) return;
             cancelTurn();
             speechChunks = [];
             speechMs = 0;
+            captureMs = 0;
             pttRecording = true;
             setPhase('listening');
           } else if (pttRecording) {
@@ -834,32 +955,38 @@
             const wav = speechMs >= 160 ? mvEncodePcm16Wav(speechChunks, sampleRate) : null;
             speechChunks = [];
             speechMs = 0;
+            captureMs = 0;
             if (wav) void processUtterance(wav);
             else setPhase('ptt');
           }
         },
         setTts({ provider, voice }) {
+          const changed = Boolean(provider && provider !== ttsProvider);
           if (provider) ttsProvider = provider;
           if (voice !== undefined) ttsVoice = voice;
+          else if (changed) ttsVoice = '';
         },
         interrupt() {
           cancelTurn();
-          inSpeech = false; speechChunks = []; bargeMs = 0;
+          inSpeech = false; speechChunks = []; preRoll = [];
+          speechMs = 0; captureMs = 0; silenceMs = 0; bargeMs = 0;
           setPhase(localFallback ? 'notes' : (mode === 'ptt' ? 'ptt' : 'listening'));
           emitState({ message: '已打断回复。' });
         },
         async prepareStt() {
+          const myCallAbort = callAbort;
           emitState({ preparingStt: true, message: '正在后台准备 SenseVoice 语音模型…' });
           try {
-            const res = await liveFetchJson('marshal/voice/prepare', {}, callAbort?.signal);
-            if (disposed || localFallback) return;
+            const res = await liveFetchJson('marshal/voice/prepare', {}, myCallAbort?.signal);
+            if (disposed || localFallback || myCallAbort?.signal?.aborted) return;
             if (res?.stt?.ready) {
               emitState({ sttNeedsPrepare: false, preparingStt: false, message: 'SenseVoice 已就绪，可以直接说话。' });
             } else {
               schedulePrepareWatch();
             }
           } catch (error) {
-            if (!disposed) emitState({ preparingStt: false, message: error?.message || '触发模型准备失败。' });
+            if (disposed || myCallAbort?.signal?.aborted || error?.name === 'AbortError' || error?.code === 'aborted') return;
+            emitState({ preparingStt: false, message: error?.message || '触发模型准备失败。' });
           }
         },
         switchToLocalNotes() {
@@ -872,22 +999,32 @@
           callAbort = null;
           cancelTurn();
           releaseCapture();
-          if (localFallback || (!transcript?.length && !notes?.trim())) return {};
+          const trimmedTranscript = mvTrimSummaryTranscript(transcript);
+          if ((localFallback && trimmedTranscript.length === 0) || (trimmedTranscript.length === 0 && !notes?.trim())) return {};
+          const timeoutCtrl = new AbortController();
+          const onExternalAbort = () => timeoutCtrl.abort();
+          if (signal?.aborted) timeoutCtrl.abort();
+          else signal?.addEventListener?.('abort', onExternalAbort, { once: true });
+          const timer = setTimeout(() => timeoutCtrl.abort(), 18_000);
           try {
             const res = await liveFetchJson('marshal/voice/summarize', {
               agentKey: agent.agentKey,
               ...(targetTicketId ? { targetTicketId } : {}),
-              transcript,
-              notes,
-            }, signal);
+              transcript: trimmedTranscript,
+              notes: String(notes ?? '').slice(0, 3000),
+            }, timeoutCtrl.signal);
             const summary = typeof res?.summary === 'string' ? res.summary : '';
             return { summary, includesNotes: Boolean(summary.trim()) };
           } catch {
             return {};
+          } finally {
+            clearTimeout(timer);
+            signal?.removeEventListener?.('abort', onExternalAbort);
           }
         },
         dispose() {
           disposed = true;
+          connectSeq += 1;
           callAbort?.abort();
           callAbort = null;
           cancelTurn();
@@ -970,7 +1107,9 @@
         ? mvVoicePhaseLabels[call.phase] : null;
       const label = call.status === 'active' && call.muted ? '已静音' : mvVoiceLabels[call.status];
       const ttsProviders = call.capabilities?.tts?.providers ?? [];
-      const canInterrupt = !isLocal && call.status === 'active' && (call.phase === 'speaking' || call.phase === 'thinking');
+      const canInterrupt = !isLocal && call.status === 'active' && (call.phase === 'speaking' || call.phase === 'thinking' || call.phase === 'transcribing');
+      const sttProgress = typeof call.capabilities?.stt?.progress === 'number'
+        ? Math.round(call.capabilities.stt.progress * 100) : null;
       return h('div', { className: 'mv-scope mv-voice-dock' },
         h(MvButton, { icon: call.expanded ? 'down' : 'phone', label: label, className: 'mv-capsule',
           'aria-expanded': call.expanded, 'aria-controls': call.expanded ? 'marshal-voice-detail' : undefined,
@@ -985,7 +1124,9 @@
             !isLocal && call.status === 'active' && h('div', { className: 'mv-voice-meter', 'aria-hidden': true },
               h('div', { className: 'mv-voice-meter-fill', style: { width: Math.round((call.level || 0) * 100) + '%' } })),
             !isLocal && call.sttNeedsPrepare && h('div', { className: 'mv-voice-banner' },
-              h('span', null, call.preparingStt ? '正在下载 SenseVoice 语音识别模型…' : '首次通话需准备本机 SenseVoice 模型'),
+              h('span', null, call.preparingStt
+                ? ('正在准备 SenseVoice 语音识别模型' + (sttProgress !== null ? '（' + sttProgress + '%）' : '') + '…')
+                : '首次通话需准备本机 SenseVoice 模型'),
               h(MvButton, { label: call.preparingStt ? '准备中…' : '准备模型', disabled: Boolean(call.preparingStt),
                 onClick: () => voice.prepareStt() })),
             !isLocal && call.status === 'active' && h('div', { className: 'mv-voice-controls', role: 'group', 'aria-label': '通话设置' },
@@ -1007,9 +1148,14 @@
               label: call.pttActive ? '松开发送' : '按住说话（或按住空格）',
               disabled: Boolean(call.muted),
               'aria-pressed': Boolean(call.pttActive),
-              onPointerDown: () => voice.setPttActive(true),
+              onPointerDown: event => {
+                try { event?.currentTarget?.setPointerCapture?.(event.pointerId); } catch {}
+                voice.setPttActive(true);
+              },
               onPointerUp: () => voice.setPttActive(false),
               onPointerCancel: () => voice.setPttActive(false),
+              onLostPointerCapture: () => voice.setPttActive(false),
+              onBlur: () => voice.setPttActive(false),
               onKeyDown: event => { if (event.code === 'Space' && !event.repeat) { event.preventDefault(); voice.setPttActive(true); } },
               onKeyUp: event => { if (event.code === 'Space') { event.preventDefault(); voice.setPttActive(false); } },
             }),

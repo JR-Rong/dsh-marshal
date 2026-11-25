@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
-import { escapeSsml, generateSecMsGecV2, normalizeEdgeRate, normalizeEdgeVoice } from '../lib/src/groups/edge-tts.js';
+import { escapeSsml, generateSecMsGecV2, normalizeEdgeRate, normalizeEdgeVoice, synthesizeEdgeTts } from '../lib/src/groups/edge-tts.js';
 import {
     createEdgeTtsProvider,
     createLocalNeuralTtsProvider,
@@ -393,6 +393,11 @@ test('voice engine degrades cleanly when STT/LLM are absent and cancels streamin
         const sys = createSystemTtsProvider({
             async execFileImpl(bin, args) {
                 calls.push({ bin, args });
+                if (bin.endsWith('say') && args.includes('MissingVoice')) {
+                    const err = new Error('Command failed');
+                    err.stderr = "Voice 'MissingVoice' not found.";
+                    throw err;
+                }
                 if (bin.endsWith('afconvert') || bin.endsWith('ffmpeg')) {
                     const out = args[args.length - 1];
                     writeFileSync(out, makeWav(10));
@@ -403,5 +408,199 @@ test('voice engine degrades cleanly when STT/LLM are absent and cancels streamin
         assert.equal(audio.voice, 'Tingting');
         assert.equal(calls[0].args[calls[0].args.length - 2], '--');
         assert.equal(calls[0].args[calls[0].args.length - 1], '-f /etc/passwd');
+
+        // Edge neural voice name must not leak into macOS say
+        const fromEdge = await sys.synthesize({ text: '系统播报测试', voice: 'zh-CN-XiaoxiaoNeural' });
+        assert.equal(fromEdge.voice, 'Tingting');
+
+        // Unknown macOS voice retries automatically with default Tingting
+        const retried = await sys.synthesize({ text: '回退测试', voice: 'MissingVoice' });
+        assert.equal(retried.voice, 'Tingting');
     }
+});
+
+test('voice engine honors DSH SenseVoice standby/downloading phases, multi-turn assistant source, memory isolation, splitter & TTS limits', async () => {
+    // 1. SenseVoice standby & downloading phases + downloadSource option
+    let phase = 'standby';
+    let prepareOpts = null;
+    const stt = {
+        snapshot: () => ({
+            selection: { providerId: 'sensevoice-local' },
+            providers: [{
+                id: 'sensevoice-local',
+                languages: ['auto', 'zh'],
+                preparation: phase === 'downloading'
+                    ? { phase: 'downloading', completedBytes: 50, totalBytes: 100 }
+                    : { phase },
+            }],
+        }),
+        prepare(_id, opts) { prepareOpts = opts; },
+        resolve: req => ({ provider: { id: 'sensevoice-local' }, audio: req.audio, language: req.language }),
+        async transcribe() { return { text: '待机唤醒成功', language: 'zh' }; },
+    };
+    const capturedScopes = [];
+    let capturedMessages = null;
+    const llm = {
+        async prepareCall(cfg) {
+            return {
+                config: cfg,
+                async *stream(args) {
+                    capturedMessages = args.messages;
+                    yield { type: 'text-delta', text: '好的。我已经完成核查，一切正常。' };
+                    yield { type: 'finish', reason: { kind: 'stop' } };
+                },
+            };
+        },
+    };
+    const memory = {
+        async recallFor(scopes) {
+            capturedScopes.push(scopes);
+            return [];
+        },
+    };
+    const engine = createVoiceEngine({
+        getSpeechToText: () => stt,
+        llm,
+        readDefaultModel: () => ({ provider: 'deepseek-account', model: 'deepseek-flash' }),
+        memory,
+    });
+
+    assert.equal(engine.capabilities().stt.ready, true, 'standby phase counts as ready');
+    assert.equal(engine.capabilities().stt.preparing, false);
+    const sttOk = await engine.transcribe({ audioBase64: makeWav().toString('base64') });
+    assert.equal(sttOk.text, '待机唤醒成功');
+
+    engine.prepareStt({ source: 'modelscope' });
+    assert.deepEqual(prepareOpts, { downloadSource: 'modelscope' });
+
+    phase = 'downloading';
+    const dlCaps = engine.capabilities().stt;
+    assert.equal(dlCaps.ready, false);
+    assert.equal(dlCaps.preparing, true);
+    assert.equal(dlCaps.progress, 0.5);
+    await assert.rejects(() => engine.transcribe({ audioBase64: makeWav().toString('base64') }), { code: 'stt-not-ready' });
+
+    // 2. Multi-turn assistant source + owner-gated global memory
+    for await (const _ev of engine.streamVoiceTurn({
+        agent: { name: '丞相', agentId: 'a1', workspaceId: 'ws1' },
+        member: { name: '丞相' },
+        text: '第二轮测试',
+        history: [{ role: 'user', text: '第一轮' }, { role: 'assistant', text: '收到。' }],
+        allowGlobalMemory: false,
+    })) { /* drain */ }
+    assert.equal(capturedScopes[0].some(s => s.scope === 'global'), false, 'non-owner must not read global memory');
+    assert.equal(capturedMessages[1].role, 'assistant');
+    assert.deepEqual(capturedMessages[1].source, { kind: 'model', provider: 'deepseek-account', model: 'deepseek-flash' });
+    assert.ok(capturedMessages[1].id);
+
+    for await (const _ev of engine.streamVoiceTurn({
+        agent: { name: '丞相', agentId: 'a1', workspaceId: 'ws1' },
+        member: { name: '丞相' },
+        text: '机主测试',
+        allowGlobalMemory: true,
+    })) { /* drain */ }
+    assert.equal(capturedScopes[1].some(s => s.scope === 'global'), true, 'owner may read global memory');
+
+    // 3. Sentence splitter short-opener fix & pure punctuation filtering
+    const splitter = createSentenceSplitter({ minChars: 6, maxChars: 140 });
+    assert.deepEqual(splitter.push('好的。'), []);
+    assert.deepEqual(splitter.push('我现在立刻核查移动端工单。'), ['好的。我现在立刻核查移动端工单。']);
+    assert.deepEqual(splitter.push('……！？'), []);
+    assert.deepEqual(splitter.flush(), []);
+
+    // 4. WAV strict PCM16 + non-empty check
+    assert.equal(validateWavBuffer(makeWav(0)).code, 'invalid-audio');
+    const floatWav = makeWav(20);
+    floatWav.writeUInt16LE(3, 20); // IEEE float instead of PCM16
+    assert.equal(validateWavBuffer(floatWav).code, 'invalid-audio');
+
+    // 5. T2 CLI flag injection protection & piper stdin
+    const sherpaCalls = [];
+    const sherpaLocal = createLocalNeuralTtsProvider({
+        modelDir: tmpdir(),
+        detect: () => ({ kind: 'sherpa-onnx', bin: '/usr/local/bin/sherpa-onnx-offline-tts', model: '/m/v.onnx', tokens: '/m/tokens.txt', models: ['/m/v.onnx'] }),
+        async execFileImpl(_bin, args) {
+            sherpaCalls.push(args);
+            const outArg = args.find(a => a.startsWith('--output-filename=')).split('=')[1];
+            writeFileSync(outArg, makeWav(8));
+        },
+    });
+    const t2Res = await sherpaLocal.synthesize({ text: '- --vits-dict-dir=/tmp/evil', voice: 'x'.repeat(200) });
+    assert.equal(sherpaCalls[0].at(-1).startsWith('-'), false);
+    assert.ok(t2Res.voice.length <= 64);
+
+    const piperCalls = [];
+    const piperLocal = createLocalNeuralTtsProvider({
+        modelDir: tmpdir(),
+        detect: () => ({ kind: 'piper', bin: '/usr/local/bin/piper', model: '/m/v.onnx', models: ['/m/v.onnx'] }),
+        async execFileImpl(_bin, args, opts) {
+            piperCalls.push({ args, opts });
+            const outIdx = args.indexOf('--output_file');
+            writeFileSync(args[outIdx + 1], makeWav(8));
+        },
+    });
+    await piperLocal.synthesize({ text: '测试 piper 标准输入' });
+    assert.equal(piperCalls[0].args.includes('--text'), false);
+    assert.equal(piperCalls[0].opts.input, '测试 piper 标准输入');
+
+    // 6. TTS concurrency limiter caps simultaneous synthesis
+    let inflight = 0;
+    let peak = 0;
+    const slowProvider = {
+        id: 'slow',
+        status: () => ({ id: 'slow', ready: true }),
+        listVoices: () => [],
+        async synthesize({ text }) {
+            inflight += 1;
+            peak = Math.max(peak, inflight);
+            await new Promise(r => setTimeout(r, 15));
+            inflight -= 1;
+            return { mime: 'audio/wav', audio: Buffer.from(text), provider: 'slow', voice: 'v' };
+        },
+    };
+    const reg = createTtsRegistry({ extraProviders: [slowProvider], maxConcurrentTts: 2 });
+    await Promise.all(['一', '二', '三', '四', '五'].map(t => reg.synthesize({ provider: 'slow', text: t })));
+    assert.equal(peak, 2);
+
+    // 7. Edge TTS rejects premature close without turn.end and retries on 403 clock skew
+    let attempts = 0;
+    class TruncatedWs extends EventEmitter {
+        constructor() {
+            super();
+            this.readyState = 1;
+            queueMicrotask(() => {
+                this.emit('open');
+                this.emit('message', Buffer.concat([Buffer.from('Path:audio\r\n'), Buffer.from('PARTIAL')]), true);
+                this.emit('close');
+            });
+        }
+        send() {}
+        close() {}
+        terminate() {}
+    }
+    await assert.rejects(() => synthesizeEdgeTts({ text: '截断测试', WebSocketImpl: TruncatedWs }), { code: 'closed' });
+
+    class SkewRetryWs extends EventEmitter {
+        constructor() {
+            super();
+            this.readyState = 1;
+            attempts += 1;
+            const current = attempts;
+            queueMicrotask(() => {
+                if (current === 1) {
+                    this.emit('unexpected-response', {}, { statusCode: 403, headers: { date: new Date().toUTCString() }, resume() {} });
+                    return;
+                }
+                this.emit('open');
+                this.emit('message', Buffer.concat([Buffer.from('Path:audio\r\n'), Buffer.from('FULLMP3')]), true);
+                this.emit('message', 'Path:turn.end\r\n', false);
+            });
+        }
+        send() {}
+        close() {}
+        terminate() {}
+    }
+    const skewOk = await synthesizeEdgeTts({ text: '时钟纠偏测试', WebSocketImpl: SkewRetryWs });
+    assert.equal(attempts, 2);
+    assert.equal(skewOk.audio.toString(), 'FULLMP3');
 });

@@ -1156,6 +1156,7 @@ test('live voice provider runs SenseVoice prepare, VAD turn, SSE streaming, TTS 
 
     assert.equal(transcribeCalls, 3);
     assert.equal(ttsCalls.at(-1).provider, 'system');
+    assert.equal(ttsCalls.at(-1).voice, undefined, 'switching to system TTS must clear stale Edge neural voice');
 
     // Hang up and verify /summarize + full hardware/URL cleanup
     voice.setNotes('手动补充：今天下班前复查');
@@ -1202,4 +1203,106 @@ test('live voice provider gracefully degrades to local notes when mic is denied 
     assert.equal(offline.getSnapshot().fallbackLocal, true);
     assert.match(offline.getSnapshot().message, /本地笔记模式/);
     offline.dispose();
+
+    // Old host without speechToText (stt.available === false, llmAvailable === true) degrades without requesting mic
+    const noStt = host.createLiveVoiceCallProvider({
+        fetch: async () => Response.json({
+            stt: { available: false, ready: false, phase: 'unavailable' },
+            tts: { defaultProvider: 'edge', providers: [{ id: 'edge', ready: true }] },
+            llmAvailable: true,
+        }),
+        getUserMedia: async () => assert.fail('must not request mic when STT is unavailable'),
+        AudioContext: class {},
+    });
+    await noStt.start(agent);
+    assert.equal(noStt.getSnapshot().fallbackLocal, true);
+    assert.match(noStt.getSnapshot().message, /SenseVoice/);
+    noStt.dispose();
+});
+
+test('live voice provider handles cancel/reconnect mic race, SenseVoice downloading/standby, 403 refresh, and mute track toggle', async () => {
+    let sessionRefreshes = 0;
+    const host = harness({
+        fetchOverride(url) {
+            if (url.pathname === '/marshal/memory/session') {
+                sessionRefreshes += 1;
+                host.document.cookie = 'marshal-memory-csrf=refreshed-csrf-' + sessionRefreshes;
+                return Response.json({ ok: true, csrf: 'refreshed-csrf-' + sessionRefreshes });
+            }
+        },
+    });
+    let micCall = 0;
+    let resolveMic1;
+    const stoppedStreams = [];
+    const track2 = { enabled: true, stop() { stoppedStreams.push(2); } };
+    const track1 = { enabled: true, stop() { stoppedStreams.push(1); } };
+    let capsCalls = 0;
+    const seenCsrf = [];
+
+    const voice = host.createLiveVoiceCallProvider({
+        fetch: async (url, init) => {
+            const path = new URL(url, 'http://127.0.0.1:21081').pathname;
+            if (path === '/marshal/voice/capabilities') {
+                capsCalls += 1;
+                seenCsrf.push(init?.headers?.['x-marshal-csrf'] || '');
+                if (capsCalls === 1) {
+                    return Response.json({ ok: false, code: 'unauthorized' }, { status: 403 });
+                }
+                return Response.json({
+                    stt: { available: true, ready: true, preparing: false, phase: 'standby' },
+                    tts: { defaultProvider: 'edge', defaultVoice: 'zh-CN-XiaoxiaoNeural', providers: [{ id: 'edge', ready: true }] },
+                    llmAvailable: true,
+                });
+            }
+            return Response.json({ ok: true });
+        },
+        getUserMedia: () => {
+            micCall += 1;
+            if (micCall === 1) {
+                return new Promise(resolve => { resolveMic1 = () => resolve({ getTracks: () => [track1], getAudioTracks: () => [track1] }); });
+            }
+            return Promise.resolve({ getTracks: () => [track2], getAudioTracks: () => [track2] });
+        },
+        AudioContext: class {
+            constructor() { this.sampleRate = 16000; this.destination = {}; }
+            createMediaStreamSource() { return { connect() {}, disconnect() {} }; }
+            createScriptProcessor() { return { connect() {}, disconnect() {}, onaudioprocess: null }; }
+            createGain() { return { gain: { value: 0 }, connect() {}, disconnect() {} }; }
+            resume() { return Promise.resolve(); }
+            close() { return Promise.resolve(); }
+        },
+    });
+
+    // Call 1 blocks on getUserMedia (after 403 unauthorized auto-refresh succeeds)
+    const start1 = voice.start(agent);
+    for (let i = 0; i < 6; i++) await flush();
+    assert.equal(voice.getSnapshot().status, 'connecting');
+    assert.equal(capsCalls, 2, '403 unauthorized refreshed session and retried');
+    assert.equal(sessionRefreshes, 1);
+    assert.equal(seenCsrf[1], 'refreshed-csrf-1');
+    assert.equal(voice.getSnapshot().sttNeedsPrepare, false, 'standby phase is ready');
+
+    // Cancel Call 1 while getUserMedia is still pending, then immediately start Call 2
+    voice.cancel();
+    await voice.start(agent);
+    assert.equal(voice.getSnapshot().status, 'active');
+    assert.equal(voice.getSnapshot().fallbackLocal, false);
+
+    // Now Call 1's stale getUserMedia resolves: must stop ONLY track1 and leave Call 2 untouched
+    resolveMic1();
+    await start1;
+    await flush();
+    assert.deepEqual(stoppedStreams, [1], 'stale call 1 mic stream stopped immediately');
+    assert.equal(voice.getSnapshot().status, 'active');
+    assert.equal(voice.getSnapshot().fallbackLocal, false);
+
+    // Muting disables audio track hardware capture
+    await voice.toggleMuted();
+    assert.equal(track2.enabled, false);
+    await voice.toggleMuted();
+    assert.equal(track2.enabled, true);
+
+    await voice.end();
+    assert.deepEqual(stoppedStreams, [1, 2]);
+    voice.dispose();
 });

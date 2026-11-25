@@ -8,7 +8,8 @@
  * - Summary: structured post-call summary feeding MarshalVoiceSummaryCard
  */
 import { execFile } from 'node:child_process';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -20,7 +21,72 @@ const MAX_TTS_TEXT_CHARS = 800;
 const MAX_HISTORY_TURNS = 12;
 const DEFAULT_LOCAL_MODEL_DIR = join(homedir(), '.dsh-marshal', 'voice', 'models');
 const SAFE_SAY_VOICE_RE = /^[A-Za-z0-9][A-Za-z0-9 _()-]{0,63}$/;
+const EDGE_NEURAL_VOICE_RE = /-[A-Za-z0-9]+Neural$/i;
+const HAS_SPEAKABLE_CHAR_RE = /[\p{L}\p{N}]/u;
+const STT_READY_PHASES = new Set(['ready', 'standby', 'idle']);
+const STT_PREPARING_PHASES = new Set(['preparing', 'checking', 'downloading', 'loading', 'waking']);
 const DEFAULT_SAY_VOICE = 'Tingting';
+
+function sliceSafeChars(text, maxChars) {
+    const str = String(text ?? '');
+    if (str.length <= maxChars) return str;
+    const end = maxChars;
+    const code = str.charCodeAt(end - 1);
+    return (code >= 0xD800 && code <= 0xDBFF) ? str.slice(0, end - 1) : str.slice(0, end);
+}
+
+function createConcurrencyLimiter(limit = 2) {
+    const cap = Math.max(1, Number(limit) || 2);
+    let active = 0;
+    const queue = [];
+    const pump = () => {
+        while (active < cap && queue.length > 0) {
+            const entry = queue.shift();
+            if (entry.cancelled) continue;
+            active += 1;
+            entry.start();
+        }
+    };
+    return (fn, signal) => new Promise((resolve, reject) => {
+        if (signal?.aborted) {
+            reject(makeVoiceError('aborted', '语音合成已取消。', 499));
+            return;
+        }
+        const entry = {
+            cancelled: false,
+            start() {
+                signal?.removeEventListener('abort', onAbort);
+                Promise.resolve()
+                    .then(fn)
+                    .then(resolve, reject)
+                    .finally(() => {
+                        active -= 1;
+                        pump();
+                    });
+            },
+        };
+        const onAbort = () => {
+            entry.cancelled = true;
+            reject(makeVoiceError('aborted', '语音合成已取消。', 499));
+        };
+        signal?.addEventListener('abort', onAbort, { once: true });
+        queue.push(entry);
+        pump();
+    });
+}
+
+function execFileWithStdin(bin, args, { input, signal, timeout = 20_000 } = {}) {
+    return new Promise((resolve, reject) => {
+        const child = execFile(bin, args, { signal, timeout }, (error, stdout, stderr) => {
+            if (error) reject(error);
+            else resolve({ stdout, stderr });
+        });
+        if (typeof input === 'string' && child.stdin) {
+            child.stdin.on('error', () => { /* ignore EPIPE if process exits early */ });
+            child.stdin.end(input + '\n');
+        }
+    });
+}
 
 export const SYSTEM_ZH_VOICES = Object.freeze([
     { id: 'Tingting', label: '婷婷（macOS 离线中文）', lang: 'zh-CN', gender: 'female' },
@@ -52,32 +118,55 @@ export function stripForSpeech(text) {
  */
 export function createSentenceSplitter({ minChars = 6, maxChars = 140 } = {}) {
     let buffer = '';
+    const pushIfSpeakable = (out, raw) => {
+        const spoken = stripForSpeech(raw);
+        if (spoken && HAS_SPEAKABLE_CHAR_RE.test(spoken)) out.push(spoken);
+    };
+    const hasOpenCodeFence = text => {
+        const fences = text.match(/```/g);
+        return Boolean(fences && fences.length % 2 === 1);
+    };
+    const findSentenceCut = text => {
+        const re = /[。！？；\n]+|[.!?](?=\s|$)/g;
+        let match;
+        while ((match = re.exec(text)) !== null) {
+            const end = match.index + match[0].length;
+            const candidate = text.slice(0, end);
+            if (hasOpenCodeFence(candidate)) continue;
+            if (candidate.trim().length >= minChars) return end;
+        }
+        return -1;
+    };
     const extract = flush => {
         const out = [];
         while (buffer.length > 0) {
-            const match = buffer.match(/^([\s\S]*?(?:[。！？；\n]+|[.!?](?=\s|$)))/);
-            if (match && match[1].trim().length >= minChars) {
-                const raw = match[1];
-                buffer = buffer.slice(raw.length);
-                const spoken = stripForSpeech(raw);
-                if (spoken) out.push(spoken);
+            const cutEnd = findSentenceCut(buffer);
+            if (cutEnd > 0) {
+                const raw = buffer.slice(0, cutEnd);
+                buffer = buffer.slice(cutEnd);
+                pushIfSpeakable(out, raw);
                 continue;
             }
-            if (buffer.length >= maxChars) {
+            if (!hasOpenCodeFence(buffer) && buffer.length >= maxChars) {
                 const soft = buffer.slice(0, maxChars).match(/^([\s\S]*[，,、：:\s])/);
                 const cut = soft && soft[1].trim().length >= minChars ? soft[1].length : maxChars;
                 const raw = buffer.slice(0, cut);
                 buffer = buffer.slice(cut);
-                const spoken = stripForSpeech(raw);
-                if (spoken) out.push(spoken);
+                pushIfSpeakable(out, raw);
+                continue;
+            }
+            if (hasOpenCodeFence(buffer) && buffer.length >= maxChars * 6) {
+                const raw = buffer.slice(0, maxChars);
+                buffer = buffer.slice(maxChars);
+                pushIfSpeakable(out, raw);
                 continue;
             }
             break;
         }
         if (flush && buffer.trim()) {
-            const spoken = stripForSpeech(buffer);
+            const raw = buffer;
             buffer = '';
-            if (spoken) out.push(spoken);
+            pushIfSpeakable(out, raw);
         }
         return out;
     };
@@ -93,7 +182,7 @@ export function createSentenceSplitter({ minChars = 6, maxChars = 140 } = {}) {
 }
 
 export function validateWavBuffer(buffer, maxBytes = MAX_WAV_BYTES) {
-    if (!Buffer.isBuffer(buffer) || buffer.length < 44) {
+    if (!Buffer.isBuffer(buffer) || buffer.length <= 44) {
         return { ok: false, code: 'invalid-audio', message: '音频内容过短或不是有效的 WAV 文件。' };
     }
     if (buffer.length > maxBytes) {
@@ -101,6 +190,35 @@ export function validateWavBuffer(buffer, maxBytes = MAX_WAV_BYTES) {
     }
     if (buffer.subarray(0, 4).toString('ascii') !== 'RIFF' || buffer.subarray(8, 12).toString('ascii') !== 'WAVE') {
         return { ok: false, code: 'invalid-audio', message: '音频必须是标准 WAV（RIFF/WAVE）格式。' };
+    }
+    let offset = 12;
+    let foundFmt = false;
+    let foundData = false;
+    while (offset + 8 <= buffer.length) {
+        const chunkId = buffer.subarray(offset, offset + 4).toString('ascii');
+        const chunkSize = buffer.readUInt32LE(offset + 4);
+        const bodyStart = offset + 8;
+        if (chunkId === 'fmt ') {
+            if (chunkSize < 16 || bodyStart + 16 > buffer.length) {
+                return { ok: false, code: 'invalid-audio', message: 'WAV 音频格式头损坏。' };
+            }
+            const audioFormat = buffer.readUInt16LE(bodyStart);
+            const channels = buffer.readUInt16LE(bodyStart + 2);
+            const sampleRate = buffer.readUInt32LE(bodyStart + 4);
+            const bitsPerSample = buffer.readUInt16LE(bodyStart + 14);
+            if (audioFormat !== 1 || channels < 1 || channels > 2 || sampleRate < 8000 || sampleRate > 48000 || bitsPerSample !== 16) {
+                return { ok: false, code: 'invalid-audio', message: '仅支持 16-bit PCM WAV 音频（8kHz–48kHz，单/双声道）。' };
+            }
+            foundFmt = true;
+        } else if (chunkId === 'data') {
+            if (chunkSize > 0 && bodyStart < buffer.length) foundData = true;
+        }
+        const padded = chunkSize + (chunkSize % 2);
+        if (padded === 0 && chunkId === '\0\0\0\0') break;
+        offset = bodyStart + padded;
+    }
+    if (!foundFmt || !foundData) {
+        return { ok: false, code: 'invalid-audio', message: 'WAV 缺少有效的 PCM 格式头或音频数据。' };
     }
     return { ok: true };
 }
@@ -146,10 +264,13 @@ export function createSystemTtsProvider({ execFileImpl = execFileAsync, platform
             if (!sayBin || (!afconvertBin && !ffmpegBin)) {
                 throw makeVoiceError('tts-system-unavailable', '当前系统不支持离线 say 语音合成。', 503);
             }
-            const spoken = stripForSpeech(text).slice(0, MAX_TTS_TEXT_CHARS);
-            if (!spoken) throw makeVoiceError('invalid-text', '合成文本不能为空。', 400);
-            const selectedVoice = typeof voice === 'string' && SAFE_SAY_VOICE_RE.test(voice.trim())
-                ? voice.trim()
+            const spoken = sliceSafeChars(stripForSpeech(text), MAX_TTS_TEXT_CHARS);
+            if (!spoken || !HAS_SPEAKABLE_CHAR_RE.test(spoken)) {
+                throw makeVoiceError('invalid-text', '合成文本不能为空或仅包含标点。', 400);
+            }
+            const trimmedVoice = typeof voice === 'string' ? voice.trim() : '';
+            let selectedVoice = trimmedVoice && !EDGE_NEURAL_VOICE_RE.test(trimmedVoice) && SAFE_SAY_VOICE_RE.test(trimmedVoice)
+                ? trimmedVoice
                 : DEFAULT_SAY_VOICE;
             const rateNum = typeof rate === 'number' && Number.isFinite(rate)
                 ? Math.max(120, Math.min(320, Math.round(190 * rate)))
@@ -158,10 +279,23 @@ export function createSystemTtsProvider({ execFileImpl = execFileAsync, platform
             const aiffPath = join(dir, 'speech.aiff');
             const wavPath = join(dir, 'speech.wav');
             try {
-                await execFileImpl(sayBin, ['-v', selectedVoice, '-r', String(rateNum), '-o', aiffPath, '--', spoken], {
-                    signal,
-                    timeout: 15_000,
-                });
+                try {
+                    await execFileImpl(sayBin, ['-v', selectedVoice, '-r', String(rateNum), '-o', aiffPath, '--', spoken], {
+                        signal,
+                        timeout: 15_000,
+                    });
+                } catch (err) {
+                    const detail = `${err?.stderr ?? ''} ${err?.message ?? ''}`;
+                    if (!signal?.aborted && selectedVoice !== DEFAULT_SAY_VOICE && /voice .* not found/i.test(detail)) {
+                        selectedVoice = DEFAULT_SAY_VOICE;
+                        await execFileImpl(sayBin, ['-v', selectedVoice, '-r', String(rateNum), '-o', aiffPath, '--', spoken], {
+                            signal,
+                            timeout: 15_000,
+                        });
+                    } else {
+                        throw err;
+                    }
+                }
                 if (afconvertBin) {
                     await execFileImpl(afconvertBin, ['-f', 'WAVE', '-d', 'LEI16@22050', aiffPath, wavPath], {
                         signal,
@@ -173,7 +307,7 @@ export function createSystemTtsProvider({ execFileImpl = execFileAsync, platform
                         timeout: 10_000,
                     });
                 }
-                const audio = readFileSync(wavPath);
+                const audio = await readFile(wavPath);
                 return { mime: 'audio/wav', audio, provider: 'system', voice: selectedVoice };
             } finally {
                 rmSync(dir, { recursive: true, force: true });
@@ -202,8 +336,10 @@ export function createEdgeTtsProvider({ synthesizeEdge = synthesizeEdgeTts, fall
             return [...EDGE_ZH_VOICES];
         },
         async synthesize({ text, voice, rate, signal }) {
-            const spoken = stripForSpeech(text).slice(0, MAX_TTS_TEXT_CHARS);
-            if (!spoken) throw makeVoiceError('invalid-text', '合成文本不能为空。', 400);
+            const spoken = sliceSafeChars(stripForSpeech(text), MAX_TTS_TEXT_CHARS);
+            if (!spoken || !HAS_SPEAKABLE_CHAR_RE.test(spoken)) {
+                throw makeVoiceError('invalid-text', '合成文本不能为空或仅包含标点。', 400);
+            }
             const resolvedVoice = normalizeEdgeVoice(voice);
             try {
                 return await synthesizeEdge({ text: spoken, voice: resolvedVoice, rate, signal });
@@ -279,26 +415,38 @@ export function createLocalNeuralTtsProvider({ modelDir = DEFAULT_LOCAL_MODEL_DI
             if (!found) {
                 throw makeVoiceError('tts-local-not-installed', `尚未安装本地离线神经语音模型（目录：${modelDir}）。`, 503);
             }
-            const spoken = stripForSpeech(text).slice(0, MAX_TTS_TEXT_CHARS);
-            if (!spoken) throw makeVoiceError('invalid-text', '合成文本不能为空。', 400);
+            const spoken = sliceSafeChars(stripForSpeech(text), MAX_TTS_TEXT_CHARS);
+            if (!spoken || !HAS_SPEAKABLE_CHAR_RE.test(spoken)) {
+                throw makeVoiceError('invalid-text', '合成文本不能为空或仅包含标点。', 400);
+            }
+            const safePositionalText = spoken.replace(/^[\s-]+/, '').trim();
+            if (!safePositionalText || !HAS_SPEAKABLE_CHAR_RE.test(safePositionalText)) {
+                throw makeVoiceError('invalid-text', '合成文本不能为空或仅包含标点。', 400);
+            }
             const dir = mkdtempSync(join(tmpdir(), 'marshal-local-tts-'));
             const outPath = join(dir, 'out.wav');
             try {
-                const safeVoice = typeof voice === 'string' && !voice.includes('/') && !voice.includes('\\') && !voice.includes('..') ? voice : '';
+                const safeVoice = typeof voice === 'string' && !voice.includes('/') && !voice.includes('\\') && !voice.includes('..')
+                    ? voice.trim().slice(0, 64)
+                    : '';
                 const selectedModel = (found.models ?? []).find(file => safeVoice && file.endsWith(`/${safeVoice}.onnx`)) ?? found.model;
-                const safePositionalText = spoken.replace(/^-+/, '').trim() || ' ';
                 if (found.kind === 'sherpa-onnx') {
                     const args = [`--vits-model=${selectedModel}`, `--vits-tokens=${found.tokens}`, `--output-filename=${outPath}`, safePositionalText];
                     const lexicon = join(modelDir, 'lexicon.txt');
                     if (existsSync(lexicon)) args.splice(2, 0, `--vits-lexicon=${lexicon}`);
                     await execFileImpl(found.bin, args, { signal, timeout: 20_000 });
                 } else if (found.kind === 'piper') {
-                    await execFileImpl(found.bin, ['--model', selectedModel, '--output_file', outPath, '--text', spoken], { signal, timeout: 20_000 });
+                    const piperArgs = ['--model', selectedModel, '--output_file', outPath];
+                    if (execFileImpl === execFileAsync) {
+                        await execFileWithStdin(found.bin, piperArgs, { input: spoken, signal, timeout: 20_000 });
+                    } else {
+                        await execFileImpl(found.bin, piperArgs, { input: spoken, signal, timeout: 20_000 });
+                    }
                 } else {
-                    await execFileImpl(found.bin, ['--output', outPath, '--text', spoken], { signal, timeout: 20_000 });
+                    await execFileImpl(found.bin, ['--output', outPath, '--text', safePositionalText], { signal, timeout: 20_000 });
                 }
-                const audio = readFileSync(outPath);
-                return { mime: 'audio/wav', audio, provider: 'local', voice: voice || 'local-default' };
+                const audio = await readFile(outPath);
+                return { mime: 'audio/wav', audio, provider: 'local', voice: safeVoice || 'local-default' };
             } finally {
                 rmSync(dir, { recursive: true, force: true });
             }
@@ -319,6 +467,7 @@ export function createTtsRegistry(options = {}) {
     for (const extra of options.extraProviders ?? []) {
         if (extra?.id && typeof extra.synthesize === 'function') providers.set(extra.id, extra);
     }
+    const limitTts = createConcurrencyLimiter(options.maxConcurrentTts ?? 2);
     return {
         defaultProviderId: 'edge',
         registerProvider(provider) {
@@ -339,7 +488,7 @@ export function createTtsRegistry(options = {}) {
         async synthesize({ provider: providerId, text, voice, rate, signal }) {
             const target = providers.get(providerId || 'edge');
             if (!target) throw makeVoiceError('unknown-tts-provider', `不支持的 TTS 引擎：${providerId}`);
-            return await target.synthesize({ text, voice, rate, signal });
+            return await limitTts(() => target.synthesize({ text, voice, rate, signal }), signal);
         },
     };
 }
@@ -352,7 +501,7 @@ function parseModelRoute(value) {
     return { provider: trimmed.slice(0, slash), model: trimmed.slice(slash + 1) };
 }
 
-async function resolveLlmCandidate(llm, readDefaultModel, preferredModel) {
+function collectFastLlmCandidates(readDefaultModel, preferredModel) {
     const candidates = [];
     const seen = new Set();
     const push = (provider, model) => {
@@ -370,24 +519,35 @@ async function resolveLlmCandidate(llm, readDefaultModel, preferredModel) {
             if (def?.provider && def?.model) push(def.provider, def.model);
         } catch { /* ignore unavailable default service */ }
     }
-    if (typeof llm?.listProviders === 'function') {
-        try {
-            for (const entry of llm.listProviders() ?? []) {
-                const provider = typeof entry === 'string' ? entry : entry?.id;
-                if (!provider) continue;
-                try {
-                    const models = await llm.listModels?.(provider);
-                    const first = Array.isArray(models) ? models.find(item => typeof item?.id === 'string' && item.id) : undefined;
-                    if (first) push(provider, first.id);
-                } catch { /* try next provider */ }
-            }
-        } catch { /* ignore catalog errors */ }
-    }
-    return candidates;
+    return { candidates, seen, push };
 }
 
-async function collectAgentMemoryContext(memory, agent, query) {
-    if (!memory) return '';
+async function collectCatalogLlmCandidates(llm, seen, push, signal) {
+    const added = [];
+    if (typeof llm?.listProviders !== 'function') return added;
+    try {
+        for (const entry of llm.listProviders() ?? []) {
+            if (signal?.aborted) break;
+            const provider = typeof entry === 'string' ? entry : entry?.id;
+            if (!provider) continue;
+            try {
+                const models = await llm.listModels?.(provider);
+                const first = Array.isArray(models) ? models.find(item => typeof item?.id === 'string' && item.id) : undefined;
+                if (first) {
+                    const key = `${provider}/${first.id}`;
+                    if (!seen.has(key)) {
+                        push(provider, first.id);
+                        added.push({ provider, model: first.id });
+                    }
+                }
+            } catch { /* try next provider */ }
+        }
+    } catch { /* ignore catalog errors */ }
+    return added;
+}
+
+async function collectAgentMemoryContext(memory, agent, query, { allowGlobal = false, signal } = {}) {
+    if (!memory || signal?.aborted) return '';
     const snippets = [];
     const pushRows = rows => {
         for (const row of Array.isArray(rows) ? rows : []) {
@@ -397,19 +557,29 @@ async function collectAgentMemoryContext(memory, agent, query) {
             if (line && !snippets.includes(line)) snippets.push(line);
         }
     };
-    try {
+    const work = async () => {
         const scopes = [];
         if (agent?.agentId) scopes.push({ scope: 'agent', ownerId: agent.agentId });
         if (agent?.workspaceId) scopes.push({ scope: 'workspace', ownerId: agent.workspaceId });
-        scopes.push({ scope: 'global', ownerId: 'global' });
+        if (allowGlobal) scopes.push({ scope: 'global', ownerId: 'global' });
+        if (scopes.length === 0) return;
         if (query && typeof memory.recallFor === 'function') {
             pushRows(await memory.recallFor(scopes, query, 5, { group: false, workspaceId: agent?.workspaceId }).catch(() => []));
         }
         if (snippets.length < 4 && typeof memory.listScope === 'function') {
             for (const target of scopes.slice(0, 2)) {
+                if (signal?.aborted) break;
                 pushRows(await memory.listScope(target, 4, { group: false, workspaceId: agent?.workspaceId }).catch(() => []));
             }
         }
+    };
+    try {
+        let timer;
+        const timeoutPromise = new Promise(resolve => {
+            timer = setTimeout(resolve, 2500);
+            timer.unref?.();
+        });
+        await Promise.race([work(), timeoutPromise]).finally(() => clearTimeout(timer));
     } catch { /* memory enrichment is best-effort */ }
     return snippets.slice(0, 6).join('\n').slice(0, 1600);
 }
@@ -427,13 +597,29 @@ function buildVoiceSystemPrompt({ agent, member, memoryContext, ticketContext })
     return parts.filter(Boolean).join('\n\n');
 }
 
-function normalizeHistory(history) {
+function normalizeHistory(history, selected) {
     if (!Array.isArray(history)) return [];
     const out = [];
+    let index = 0;
     for (const item of history.slice(-MAX_HISTORY_TURNS)) {
         const role = item?.role === 'assistant' ? 'assistant' : item?.role === 'user' ? 'user' : null;
         const text = typeof item?.text === 'string' ? item.text.trim().slice(0, 1000) : '';
-        if (role && text) out.push({ role, content: [{ type: 'text', text }] });
+        if (!role || !text) continue;
+        index += 1;
+        if (role === 'assistant') {
+            out.push({
+                id: `voice-hist-${index}`,
+                role: 'assistant',
+                source: { kind: 'model', provider: selected.provider, model: selected.model },
+                content: [{ type: 'text', text }],
+            });
+        } else {
+            out.push({
+                id: `voice-hist-${index}`,
+                role: 'user',
+                content: [{ type: 'text', text }],
+            });
+        }
     }
     return out;
 }
@@ -473,12 +659,19 @@ export function createVoiceEngine({
             const providerId = snap?.selection?.providerId || 'sensevoice-local';
             const selected = (snap?.providers ?? []).find(item => item?.id === providerId) ?? snap?.providers?.[0];
             const prep = selected?.preparation ?? { phase: selected ? 'ready' : 'unavailable' };
+            const phase = typeof prep.phase === 'string' ? prep.phase : (selected ? 'ready' : 'unavailable');
+            const progress = typeof prep.progress === 'number' && Number.isFinite(prep.progress)
+                ? Math.min(1, Math.max(0, prep.progress))
+                : (typeof prep.completedBytes === 'number' && typeof prep.totalBytes === 'number' && prep.totalBytes > 0
+                    ? Math.min(1, Math.max(0, prep.completedBytes / prep.totalBytes))
+                    : undefined);
             return {
                 available: Boolean(selected),
-                ready: prep.phase === 'ready',
+                ready: Boolean(selected) && STT_READY_PHASES.has(phase),
+                preparing: Boolean(selected) && STT_PREPARING_PHASES.has(phase),
                 providerId: selected?.id ?? providerId,
-                phase: prep.phase ?? 'idle',
-                progress: typeof prep.progress === 'number' ? prep.progress : undefined,
+                phase,
+                progress,
                 message: typeof prep.message === 'string' ? prep.message : undefined,
                 languages: Array.isArray(selected?.languages) ? selected.languages : ['auto', 'zh', 'en'],
             };
@@ -486,6 +679,7 @@ export function createVoiceEngine({
             return {
                 available: false,
                 ready: false,
+                preparing: false,
                 providerId: null,
                 phase: 'error',
                 languages: [],
@@ -494,15 +688,18 @@ export function createVoiceEngine({
         }
     };
 
-    const prepareStt = ({ providerId, source } = {}) => {
+    const prepareStt = ({ providerId, source, downloadSource } = {}) => {
         const stt = getSpeechToText?.();
         if (!stt || typeof stt.prepare !== 'function') {
             return { ok: false, code: 'stt-unavailable', message: '宿主未启用 SenseVoice 语音识别服务。', stt: getSttCapabilities() };
         }
         const caps = getSttCapabilities();
         const targetId = typeof providerId === 'string' && providerId.trim() ? providerId.trim() : (caps.providerId || 'sensevoice-local');
+        const resolvedSource = typeof downloadSource === 'string' && downloadSource.trim()
+            ? downloadSource.trim()
+            : (typeof source === 'string' && source.trim() ? source.trim() : undefined);
         try {
-            stt.prepare(targetId, source ? { source } : undefined);
+            stt.prepare(targetId, resolvedSource ? { downloadSource: resolvedSource } : undefined);
             return { ok: true, started: true, providerId: targetId, stt: getSttCapabilities() };
         } catch (error) {
             return {
@@ -520,8 +717,12 @@ export function createVoiceEngine({
             throw makeVoiceError('stt-unavailable', '宿主未启用语音识别服务（SenseVoice）。', 503);
         }
         const caps = getSttCapabilities();
-        if (caps.phase !== 'ready' && caps.phase !== 'idle') {
-            throw makeVoiceError('stt-not-ready', caps.phase === 'preparing' ? 'SenseVoice 模型正在准备中，请稍候。' : 'SenseVoice 语音模型尚未就绪，请先点击准备模型。', 503);
+        if (!STT_READY_PHASES.has(caps.phase)) {
+            throw makeVoiceError(
+                'stt-not-ready',
+                STT_PREPARING_PHASES.has(caps.phase) ? 'SenseVoice 模型正在准备中，请稍候。' : 'SenseVoice 语音模型尚未就绪，请先点击准备模型。',
+                503,
+            );
         }
         let buf = audioBuffer;
         if (!buf) {
@@ -554,46 +755,60 @@ export function createVoiceEngine({
         }
     };
 
-    const streamVoiceTurn = async function* ({ agent, member, text, history, ticketContext, signal }) {
+    const tryPrepareCandidates = async (llm, candidates, maxTokens, signal) => {
+        for (const candidate of candidates) {
+            if (signal?.aborted) return null;
+            try {
+                if (typeof llm.prepareCall === 'function') {
+                    const prepared = await llm.prepareCall({
+                        provider: candidate.provider,
+                        model: candidate.model,
+                        maxTokens,
+                    }, signal);
+                    return { prepared, selected: candidate };
+                }
+                return {
+                    prepared: {
+                        config: { provider: candidate.provider, model: candidate.model, maxTokens },
+                        stream: req => llm.stream(req),
+                    },
+                    selected: candidate,
+                };
+            } catch { /* try next candidate */ }
+        }
+        return null;
+    };
+
+    const streamVoiceTurn = async function* ({ agent, member, text, history, ticketContext, allowGlobalMemory = false, signal }) {
         const utterance = typeof text === 'string' ? text.trim().slice(0, 2000) : '';
         if (!utterance) throw makeVoiceError('invalid-text', '语音输入内容不能为空。', 400);
         const llm = resolveLlm();
         if (!llm || (typeof llm.prepareCall !== 'function' && typeof llm.stream !== 'function')) {
             throw makeVoiceError('no-llm', '当前宿主未提供可用的对话模型服务。', 503);
         }
-        const candidates = await resolveLlmCandidate(llm, readDefaultModel, member?.model);
-        if (candidates.length === 0) {
-            throw makeVoiceError('no-model', '未找到可用于语音对话的模型配置。', 503);
+        const { candidates: fastCandidates, seen, push } = collectFastLlmCandidates(readDefaultModel, member?.model);
+        const [memoryContext, fastInit] = await Promise.all([
+            collectAgentMemoryContext(memory, agent, utterance, { allowGlobal: allowGlobalMemory === true, signal }),
+            tryPrepareCandidates(llm, fastCandidates, 2048, signal),
+        ]);
+        if (signal?.aborted) return;
+        let init = fastInit;
+        if (!init) {
+            const catalogCandidates = await collectCatalogLlmCandidates(llm, seen, push, signal);
+            if (signal?.aborted) return;
+            if (fastCandidates.length === 0 && catalogCandidates.length === 0) {
+                throw makeVoiceError('no-model', '未找到可用于语音对话的模型配置。', 503);
+            }
+            init = await tryPrepareCandidates(llm, catalogCandidates, 2048, signal);
         }
-        const memoryContext = await collectAgentMemoryContext(memory, agent, utterance);
+        if (!init) throw makeVoiceError('no-model', '模型初始化失败，请检查当前模型配置。', 503);
+        const { prepared, selected } = init;
         const system = buildVoiceSystemPrompt({ agent, member, memoryContext, ticketContext });
-        const prior = normalizeHistory(history);
+        const prior = normalizeHistory(history, selected);
         const messages = [
             ...prior,
-            { role: 'user', content: [{ type: 'text', text: utterance }] },
+            { id: `voice-user-${prior.length + 1}`, role: 'user', content: [{ type: 'text', text: utterance }] },
         ];
-        let prepared;
-        let selected;
-        for (const candidate of candidates) {
-            if (signal?.aborted) return;
-            try {
-                if (typeof llm.prepareCall === 'function') {
-                    prepared = await llm.prepareCall({
-                        provider: candidate.provider,
-                        model: candidate.model,
-                        maxTokens: 600,
-                    }, signal);
-                } else {
-                    prepared = {
-                        config: { provider: candidate.provider, model: candidate.model, maxTokens: 600 },
-                        stream: req => llm.stream(req),
-                    };
-                }
-                selected = candidate;
-                break;
-            } catch { /* try next candidate */ }
-        }
-        if (!prepared) throw makeVoiceError('no-model', '模型初始化失败，请检查当前模型配置。', 503);
 
         const splitter = createSentenceSplitter();
         let fullText = '';
@@ -654,8 +869,9 @@ export function createVoiceEngine({
 
         const llm = resolveLlm();
         if (llm && typeof llm.prepareCall === 'function') {
+            const totalSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(20_000)]) : AbortSignal.timeout(20_000);
             try {
-                const candidates = await resolveLlmCandidate(llm, readDefaultModel, member?.model);
+                const { candidates: fastCandidates, seen, push } = collectFastLlmCandidates(readDefaultModel, member?.model);
                 const transcriptBlock = cleanTranscript.map(item => `${item.speaker || agentName}：${item.text}`).join('\n');
                 const userPrompt = [
                     `请将以下与「${agentName}」的语音通话整理为简洁清晰的结构化纪要（不超过 800 字），按「核心结论 / 待办事项 / 需同步指导要点」分点输出，不要编造未提及的内容。`,
@@ -664,31 +880,41 @@ export function createVoiceEngine({
                     transcriptBlock ? `通话记录：\n${transcriptBlock.slice(0, 8000)}` : '',
                 ].filter(Boolean).join('\n\n');
 
-                for (const candidate of candidates) {
-                    if (signal?.aborted) break;
-                    try {
-                        const callSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(20_000)]) : AbortSignal.timeout(20_000);
-                        const prepared = await llm.prepareCall({
-                            provider: candidate.provider,
-                            model: candidate.model,
-                            maxTokens: 600,
-                        }, callSignal);
-                        let summary = '';
-                        if (typeof prepared.stream === 'function') {
-                            for await (const chunk of prepared.stream({
-                                ...prepared.config,
-                                signal: callSignal,
-                                tools: [],
-                                messages: [{ role: 'user', content: [{ type: 'text', text: userPrompt }] }],
-                            })) {
-                                if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') summary += chunk.text;
-                                if (chunk?.type === 'finish') break;
+                const trySummarize = async list => {
+                    for (const candidate of list) {
+                        if (totalSignal.aborted) return null;
+                        try {
+                            const prepared = await llm.prepareCall({
+                                provider: candidate.provider,
+                                model: candidate.model,
+                                maxTokens: 1536,
+                            }, totalSignal);
+                            let summary = '';
+                            if (typeof prepared.stream === 'function') {
+                                for await (const chunk of prepared.stream({
+                                    ...prepared.config,
+                                    signal: totalSignal,
+                                    tools: [],
+                                    messages: [{ id: 'voice-summary-1', role: 'user', content: [{ type: 'text', text: userPrompt }] }],
+                                })) {
+                                    if (totalSignal.aborted) break;
+                                    if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') summary += chunk.text;
+                                    if (chunk?.type === 'finish') break;
+                                }
+                            } else if (typeof prepared.text === 'string') {
+                                summary = prepared.text;
                             }
-                        } else if (typeof prepared.text === 'string') {
-                            summary = prepared.text;
-                        }
-                        if (summary.trim()) return { ok: true, summary: summary.trim().slice(0, 3000), source: 'llm' };
-                    } catch { /* try next candidate */ }
+                            if (summary.trim()) return { ok: true, summary: summary.trim().slice(0, 3000), source: 'llm' };
+                        } catch { /* try next candidate */ }
+                    }
+                    return null;
+                };
+                const fastResult = await trySummarize(fastCandidates);
+                if (fastResult) return fastResult;
+                if (!totalSignal.aborted) {
+                    const catalogCandidates = await collectCatalogLlmCandidates(llm, seen, push, totalSignal);
+                    const catalogResult = await trySummarize(catalogCandidates);
+                    if (catalogResult) return catalogResult;
                 }
             } catch { /* fallback below */ }
         }
