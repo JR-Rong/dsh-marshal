@@ -122,6 +122,47 @@ describe('DSH account identity and login', () => {
     signedIn = false
     expect((await status('dsh-app://app')).json()).toEqual({ ok: false, code: 'account-required', accountHash: null })
   })
+  it('local Host issues ephemeral phone pairing QR via Hub account login and logs out immediately', async () => {
+    const web = createMemoryWeb()
+    const calls: Array<{ pathname: string; body: unknown; headers: Record<string, string> | undefined }> = []
+    const ctx: MarshalContext = {
+      webServer: web.webServer,
+      logger: { info() {}, warn() {}, error() {} },
+      deepseekAccount: { async getPlatformSession() { return { origin: DSH_ACCOUNT_ORIGIN, token: 'secret', userId: 'owner-1' } } },
+      inject(_services, callback) { callback(ctx) },
+      effect(setup) { cleanups.push(setup() as () => void) },
+      on() { return () => {} },
+    }
+    mountAccountConnection(ctx, parseConfig({ role: 'node', accountLogin: true, deviceId: 'mac', token: 'device-token-0123456789', hubUrl: 'wss://marshal.example/marshal/uplink' }, 'host'), {
+      async hubPost(_cfg, pathname, body, headers) {
+        calls.push({ pathname, body, headers })
+        if (pathname === '/marshal/account/exchange') {
+          return { statusCode: 200, data: { ok: true, ticket: 'a'.repeat(43), expiresAt: Date.now() + 60_000 }, setCookies: [] }
+        }
+        if (pathname === '/marshal/login') {
+          return { statusCode: 200, data: { ok: true, csrf: 'csrf-1' }, setCookies: ['__Host-marshal-session=sess-1; HttpOnly', '__Host-marshal-csrf=csrf-1'] }
+        }
+        if (pathname === '/marshal/api/pairing') {
+          return { statusCode: 200, data: { ok: true, code: 'new-code', url: 'marshal://pair?code=new-code&hub=https%3A%2F%2Fmarshal.example', expiresAt: Date.now() + 60_000, svg: '<svg></svg>' }, setCookies: [] }
+        }
+        if (pathname === '/marshal/logout') {
+          return { statusCode: 200, data: { ok: true }, setCookies: [] }
+        }
+        return { statusCode: 404, data: {}, setCookies: [] }
+      },
+    })
+    expect((await web.request('/marshal/account/pairing', { method: 'POST', headers: { origin: 'https://evil.example', 'x-marshal-account': '1' } })).statusCode).toBe(403)
+    const res = await web.request('/marshal/account/pairing', {
+      method: 'POST',
+      headers: { origin: 'dsh-app://app', 'x-marshal-account': '1' },
+      body: JSON.stringify({ replace: 'old-code' }),
+    })
+    expect(res.statusCode).toBe(200)
+    expect(res.json()).toMatchObject({ ok: true, accountHash: owner, hubUrl: 'https://marshal.example', code: 'new-code', svg: '<svg></svg>' })
+    expect(calls.map(c => c.pathname)).toEqual(['/marshal/account/exchange', '/marshal/login', '/marshal/api/pairing', '/marshal/logout'])
+    expect(calls[2]!.body).toEqual({ replace: 'old-code' })
+    expect(calls[2]!.headers).toMatchObject({ origin: 'https://marshal.example', 'x-marshal-csrf': 'csrf-1' })
+  })
   it('requires a configured owner on an account-enabled private Hub', () => {
     expect(() => parseConfig({ role: 'hub', accountLogin: true }, 'host')).toThrow()
     expect(() => createAccountLogin('client-supplied-username')).toThrow()

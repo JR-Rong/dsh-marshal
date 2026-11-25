@@ -149,7 +149,7 @@ function harness({ legacy = false, fetchOverride, openSession } = {}) {
     assert.ok(bundle.includes(marker));
     runInNewContext(bundle.replace(marker, `    window.captureVnext({
       createVoiceCallProvider, createLocalVoiceSessionProvider, createLiveVoiceCallProvider, mvEncodePcm16Wav,
-      MarshalVoiceCallOverlay, ensureMarshalVnextStyles, mvVoiceDuration, MarshalSidebarGroupRoom,
+      MarshalVoiceCallOverlay, DeviceStatusDrawer, ensureMarshalVnextStyles, mvVoiceDuration, MarshalSidebarGroupRoom,
       createMarshalSidebarData, fetchJson,
     });\n${marker}`), {
         document, window, URL, URLSearchParams, AbortController, TextDecoder, TextEncoder, CustomEvent, btoa, Blob, Response,
@@ -1305,4 +1305,56 @@ test('live voice provider handles cancel/reconnect mic race, SenseVoice download
     await voice.end();
     assert.deepEqual(stoppedStreams, [1, 2]);
     voice.dispose();
+});
+
+test('DeviceStatusDrawer renders inline auto-rotating phone pairing QR via /marshal/account/pairing and cleans up on close', async () => {
+    const pairBodies = [];
+    const host = harness({
+        fetchOverride(url, init) {
+            if (url.pathname === '/marshal/account/pairing') {
+                assert.equal(init.headers['x-marshal-account'], '1');
+                pairBodies.push(JSON.parse(init.body || '{}'));
+                const code = 'code-' + pairBodies.length;
+                return Response.json({
+                    ok: true,
+                    code,
+                    url: `marshal://pair?code=${code}&hub=https%3A%2F%2Fhub.example`,
+                    expiresAt: Date.now() + 60_000,
+                    svg: '<svg viewBox="0 0 10 10"><rect width="10" height="10"/></svg>',
+                });
+            }
+        },
+    });
+    const renderDrawer = open => host.expand({
+        type: host.DeviceStatusDrawer,
+        props: {
+            open,
+            onClose() {},
+            status: { hubOnline: true, hubConfigured: true, deviceId: 'mac', dashboardUrl: 'https://hub.example/marshal', devices: [] },
+            onRefresh() {},
+            onOpenRemote() {},
+        },
+    });
+    const initial = renderDrawer(true);
+    const showBtn = button(initial, '显示配对二维码');
+    assert.ok(showBtn);
+    showBtn.props.onClick();
+    await flush();
+    await flush();
+    const withQr = renderDrawer(true);
+    const img = find(withQr, node => node.type === 'img' && node.props?.alt === '手机配对二维码');
+    assert.ok(img, 'QR code renders via safe data:image/svg+xml img');
+    assert.ok(img.props.src.startsWith('data:image/svg+xml;charset=utf-8,'));
+    assert.equal(pairBodies.length, 1);
+
+    // Manual rotate passes previous code as replace
+    button(withQr, '立即换码').props.onClick();
+    await flush();
+    await flush();
+    assert.deepEqual(pairBodies[1], { replace: 'code-1' });
+
+    // Closing drawer clears all pairing timers
+    renderDrawer(false);
+    host.unmountReact();
+    assert.equal(host.timers.size, 0);
 });

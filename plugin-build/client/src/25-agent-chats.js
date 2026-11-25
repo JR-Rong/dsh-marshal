@@ -147,8 +147,102 @@
                   h('button', { type: 'button', style: { ...uiButton(false), padding: '5px 10px', fontSize: 11 }, onClick: () => openSession && openSession(item.sessionId) }, '打开')))))));
     }
 
+    function pairingErrorText(code, status) {
+      if (code === 'account-required') return '请先在 DeepSeek Harness 中登录账号后再生成配对码。';
+      if (code === 'account-mismatch') return '当前 DSH 账号与云端 Hub 不匹配，请核对登录账号。';
+      if (code === 'rate-limited') return '配对码申请过于频繁，请稍后再试。';
+      if (code === 'hub-not-configured') return '当前为本机独立模式，未配置云端 Hub。';
+      if (status === 404) return '本机插件尚未加载手机配对接口，请重启一次 DSH Desktop 后重试。';
+      return '暂时无法从云端 Hub 获取手机配对码，请检查 Hub 连接后重试。';
+    }
+
     function DeviceStatusDrawer({ open, onClose, status, onRefresh, onOpenRemote }) {
       const [copied, setCopied] = React.useState(false);
+      const [pairOpen, setPairOpen] = React.useState(false);
+      const [pairBusy, setPairBusy] = React.useState(false);
+      const [pairError, setPairError] = React.useState('');
+      const [pairing, setPairing] = React.useState(null);
+      const [pairLeft, setPairLeft] = React.useState(0);
+      const [pairCopied, setPairCopied] = React.useState(false);
+      const pairAbort = React.useRef(null);
+      const pairTimers = React.useRef({ tick: null, rotate: null });
+      const pairCodeRef = React.useRef('');
+
+      const clearPairTimers = () => {
+        if (pairTimers.current.tick) { clearTimeout(pairTimers.current.tick); pairTimers.current.tick = null; }
+        if (pairTimers.current.rotate) { clearTimeout(pairTimers.current.rotate); pairTimers.current.rotate = null; }
+      };
+
+      const stopPairing = () => {
+        clearPairTimers();
+        pairAbort.current?.abort();
+        pairAbort.current = null;
+        pairCodeRef.current = '';
+        setPairOpen(false);
+        setPairBusy(false);
+        setPairError('');
+        setPairing(null);
+        setPairLeft(0);
+      };
+
+      const requestPairing = async replaceCode => {
+        clearPairTimers();
+        pairAbort.current?.abort();
+        const ctrl = new AbortController();
+        pairAbort.current = ctrl;
+        setPairOpen(true);
+        setPairBusy(true);
+        setPairError('');
+        try {
+          const response = await fetch(new URL('marshal/account/pairing', document.baseURI), {
+            method: 'POST',
+            credentials: 'same-origin',
+            signal: ctrl.signal,
+            headers: { 'content-type': 'application/json', 'x-marshal-account': '1' },
+            body: JSON.stringify(replaceCode ? { replace: replaceCode } : {}),
+          });
+          const data = await response.json().catch(() => ({}));
+          if (ctrl.signal.aborted) return;
+          if (!response.ok || !data?.ok || typeof data.svg !== 'string' || !data.svg.trim().startsWith('<svg') || typeof data.url !== 'string' || !data.url.startsWith('marshal://pair?') || typeof data.expiresAt !== 'number') {
+            setPairError(pairingErrorText(data?.code, response.status));
+            setPairBusy(false);
+            return;
+          }
+          pairCodeRef.current = data.code || '';
+          setPairing({
+            code: data.code || '',
+            url: data.url,
+            expiresAt: data.expiresAt,
+            imgSrc: 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(data.svg),
+          });
+          setPairBusy(false);
+          const scheduleTick = () => {
+            if (ctrl.signal.aborted) return;
+            const left = Math.max(0, Math.round((data.expiresAt - Date.now()) / 1000));
+            setPairLeft(left);
+            if (left > 0) pairTimers.current.tick = setTimeout(scheduleTick, 1000);
+          };
+          scheduleTick();
+          const rotateDelay = Math.max(1000, data.expiresAt - Date.now() - 5000);
+          pairTimers.current.rotate = setTimeout(() => {
+            if (!ctrl.signal.aborted) void requestPairing(data.code || '');
+          }, rotateDelay);
+        } catch (error) {
+          if (ctrl.signal.aborted) return;
+          setPairError(pairingErrorText(error?.code));
+          setPairBusy(false);
+        }
+      };
+
+      React.useEffect(() => {
+        if (!open) stopPairing();
+        return () => {
+          clearPairTimers();
+          pairAbort.current?.abort();
+          pairAbort.current = null;
+        };
+      }, [open]);
+
       if (!open) return null;
       const devices = Array.isArray(status?.devices) ? status.devices : [];
       const onlineCount = devices.filter(d => d && d.online !== false).length;
@@ -156,13 +250,17 @@
         if (!status?.dashboardUrl) return;
         try { navigator.clipboard?.writeText(status.dashboardUrl); setCopied(true); setTimeout(() => setCopied(false), 1800); } catch {}
       };
+      const copyPairUrl = () => {
+        if (!pairing?.url) return;
+        try { navigator.clipboard?.writeText(pairing.url); setPairCopied(true); setTimeout(() => setPairCopied(false), 1800); } catch {}
+      };
       return h('div', {
         style: { position: 'fixed', inset: 0, zIndex: 40, background: 'rgba(0,0,0,.35)', display: 'flex', justifyContent: 'flex-end' },
         onClick: onClose,
       },
         h('aside', {
           'aria-label': '设备与手机状态',
-          style: { width: 360, maxWidth: '92vw', height: '100%', background: 'var(--dsw-alias-bg-base, #14161a)', color: dswTheme.text, borderLeft: '1px solid ' + dswTheme.border2, display: 'flex', flexDirection: 'column', boxShadow: '-8px 0 28px rgba(0,0,0,.28)' },
+          style: { width: 380, maxWidth: '92vw', height: '100%', background: 'var(--dsw-alias-bg-base, #14161a)', color: dswTheme.text, borderLeft: '1px solid ' + dswTheme.border2, display: 'flex', flexDirection: 'column', boxShadow: '-8px 0 28px rgba(0,0,0,.28)' },
           onClick: event => event.stopPropagation(),
         },
           h('div', { style: { padding: '14px 18px', borderBottom: '1px solid ' + dswTheme.border, display: 'flex', alignItems: 'center', justifyContent: 'space-between' } },
@@ -175,6 +273,25 @@
                 status?.hubOnline ? 'Hub 已在线连接' : status?.hubConfigured ? 'Hub 连接中断' : '本机独立模式（未配置 Hub）'),
               status?.deviceId && h('div', { style: { fontSize: 11, color: dswTheme.dim } }, '本机标识：' + status.deviceId),
               status?.error && h('div', { style: { fontSize: 11, color: dswTheme.danger } }, status.error)),
+            h('div', { style: { padding: 12, borderRadius: 10, border: '1px solid ' + dswTheme.border, background: dswTheme.layer, display: 'grid', gap: 10 } },
+              h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 } },
+                h('div', { style: { fontSize: 12, fontWeight: 600 } }, '手机 App 扫码配对'),
+                pairOpen
+                  ? h('button', { type: 'button', style: uiButton(false), onClick: stopPairing }, '收起')
+                  : h('button', { type: 'button', style: uiButton(true), disabled: pairBusy, onClick: () => void requestPairing() }, '显示配对二维码')),
+              !pairOpen && h('div', { style: { fontSize: 11, color: dswTheme.dim, lineHeight: 1.5 } },
+                '打开手机 Marshal App，点击「扫码连接」直接扫描此处二维码。60 秒一次性配对码，到期前自动更换。'),
+              pairOpen && h('div', { style: { display: 'grid', gap: 10, justifyItems: 'center', textAlign: 'center' } },
+                pairError && h('div', { role: 'alert', style: { fontSize: 11, color: dswTheme.danger, width: '100%', textAlign: 'left' } }, pairError),
+                pairing?.imgSrc && h('div', { style: { background: '#ffffff', padding: 12, borderRadius: 12, display: 'inline-flex', boxShadow: '0 2px 10px rgba(0,0,0,.18)' } },
+                  h('img', { src: pairing.imgSrc, alt: '手机配对二维码', width: 220, height: 220, style: { display: 'block', width: 220, height: 220 } })),
+                h('div', { role: 'status', style: { fontSize: 11, color: dswTheme.dim } },
+                  pairBusy ? '正在向云端 Hub 领取配对码…'
+                    : pairing ? (pairLeft > 0 ? '剩余 ' + pairLeft + ' 秒，到期前 5 秒自动更换' : '正在自动更换新配对码…')
+                      : '点击下方按钮重新生成配对码'),
+                h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'center' } },
+                  h('button', { type: 'button', style: uiButton(false), disabled: pairBusy, onClick: () => void requestPairing(pairCodeRef.current) }, '立即换码'),
+                  pairing?.url && h('button', { type: 'button', style: uiButton(false), onClick: copyPairUrl }, pairCopied ? '已复制配对链接' : '复制配对链接')))),
             h('div', { style: { display: 'grid', gap: 8 } },
               h('div', { style: { fontSize: 12, fontWeight: 600, color: dswTheme.dim } }, '在线设备（' + onlineCount + ' / ' + devices.length + '）'),
               devices.length === 0
@@ -185,11 +302,11 @@
                     h('div', { style: { fontSize: 11, color: dswTheme.faint } }, [dev.deviceId || dev.id, dev.platform].filter(Boolean).join(' · '))),
                   h('span', { style: { fontSize: 11, color: dev.online === false ? dswTheme.faint : '#10b981' } }, dev.online === false ? '离线' : '● 在线')))),
             status?.dashboardUrl && h('div', { style: { padding: 12, borderRadius: 10, border: '1px solid ' + dswTheme.border, background: dswTheme.layer, display: 'grid', gap: 8 } },
-              h('div', { style: { fontSize: 12, fontWeight: 600 } }, '手机 / 浏览器控制入口'),
+              h('div', { style: { fontSize: 12, fontWeight: 600 } }, '云端 Hub 地址'),
               h('div', { style: { fontSize: 11, color: dswTheme.dim, wordBreak: 'break-all' } }, status.dashboardUrl),
+              h('div', { style: { fontSize: 11, color: dswTheme.faint } }, 'DSH 账号模式下请直接用上方二维码配对手机，或点击下方「打开远端设备会话」在插件内自动免密登录。'),
               h('div', { style: { display: 'flex', gap: 8 } },
-                h('button', { type: 'button', style: uiButton(false), onClick: copyUrl }, copied ? '已复制链接' : '复制地址'),
-                h('a', { href: status.dashboardUrl, target: '_blank', rel: 'noreferrer', style: { ...uiButton(false), textDecoration: 'none', display: 'inline-flex', alignItems: 'center' } }, '浏览器打开'))),
+                h('button', { type: 'button', style: uiButton(false), onClick: copyUrl }, copied ? '已复制链接' : '复制地址'))),
             h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
               h('button', { type: 'button', style: uiButton(true), onClick: () => { onClose(); onOpenRemote(); } }, '打开远端设备会话 →'),
               h('button', { type: 'button', style: uiButton(false), onClick: onRefresh }, '重新连接')))));
