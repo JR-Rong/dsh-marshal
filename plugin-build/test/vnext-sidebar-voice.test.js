@@ -148,10 +148,11 @@ function harness({ legacy = false, fetchOverride, openSession } = {}) {
     const marker = '    return {\n      inject: [';
     assert.ok(bundle.includes(marker));
     runInNewContext(bundle.replace(marker, `    window.captureVnext({
-      createVoiceCallProvider, createLocalVoiceSessionProvider, MarshalVoiceCallOverlay,
-      ensureMarshalVnextStyles, mvVoiceDuration, MarshalSidebarGroupRoom, createMarshalSidebarData, fetchJson,
+      createVoiceCallProvider, createLocalVoiceSessionProvider, createLiveVoiceCallProvider, mvEncodePcm16Wav,
+      MarshalVoiceCallOverlay, ensureMarshalVnextStyles, mvVoiceDuration, MarshalSidebarGroupRoom,
+      createMarshalSidebarData, fetchJson,
     });\n${marker}`), {
-        document, window, URL, URLSearchParams, AbortController, TextDecoder, CustomEvent,
+        document, window, URL, URLSearchParams, AbortController, TextDecoder, TextEncoder, CustomEvent, btoa, Blob, Response,
         performance: { now: () => now },
         setTimeout(fn, delay) { timers.set(++nextTimer, { fn, delay }); return nextTimer; },
         clearTimeout(id) { clearedTimers.push(id); timers.delete(id); },
@@ -949,4 +950,256 @@ test('vNext shards add no polling, external imports or emoji UI and keep bundle 
     }
     assert.doesNotMatch(read('src/70-plugin-register.js'), /installSidebarWorkspaceSwitch\s*\(/);
     assert.ok(bundle.indexOf('function MemoryPage(') < bundle.indexOf('function AgentDirectChatsView('));
+});
+
+test('mvEncodePcm16Wav resamples 48kHz audio to 16kHz 16-bit mono RIFF WAV', () => {
+    const host = harness();
+    assert.equal(host.mvEncodePcm16Wav([], 48000).length, 0);
+    const input = new Float32Array(4800);
+    for (let i = 0; i < input.length; i++) input[i] = Math.sin((2 * Math.PI * 440 * i) / 48000) * 0.5;
+    const wav = host.mvEncodePcm16Wav([input.subarray(0, 2400), input.subarray(2400)], 48000, 16000);
+    const view = new DataView(wav.buffer, wav.byteOffset, wav.byteLength);
+    assert.equal(new TextDecoder().decode(wav.subarray(0, 4)), 'RIFF');
+    assert.equal(new TextDecoder().decode(wav.subarray(8, 12)), 'WAVE');
+    assert.equal(view.getUint16(22, true), 1);
+    assert.equal(view.getUint32(24, true), 16000);
+    assert.equal(view.getUint16(34, true), 16);
+    assert.equal(view.getUint32(40, true), 1600 * 2);
+    assert.equal(wav.byteLength, 44 + 1600 * 2);
+});
+
+test('live voice provider runs SenseVoice prepare, VAD turn, SSE streaming, TTS queue, Barge-in, PTT, and cleanup', async () => {
+    const host = harness();
+    const encoder = new TextEncoder();
+    let sttReady = false;
+    let transcribeCalls = 0;
+    const ttsCalls = [];
+    const turnBodies = [];
+    let summaryBody = null;
+    let trackStops = 0;
+    let ctxClosed = 0;
+    let audioProcess = null;
+    const createdUrls = [];
+    const revokedUrls = [];
+    const playedAudios = [];
+
+    const sseStream = events => new ReadableStream({
+        start(controller) {
+            for (const { event, data } of events) {
+                controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+            }
+            controller.close();
+        },
+    });
+
+    const mockFetch = async (url, init = {}) => {
+        const pathname = new URL(url).pathname;
+        const body = init.body ? JSON.parse(init.body) : undefined;
+        if (pathname === '/marshal/voice/capabilities') {
+            return Response.json({
+                stt: { available: true, ready: sttReady, phase: sttReady ? 'ready' : 'idle', providerId: 'sensevoice-local' },
+                tts: {
+                    defaultProvider: 'edge',
+                    defaultVoice: 'zh-CN-YunjianNeural',
+                    providers: [
+                        { id: 'edge', label: 'Edge Neural', ready: true },
+                        { id: 'local', label: 'Local Neural', ready: false, installHint: 'place onnx' },
+                        { id: 'system', label: 'macOS say', ready: true },
+                    ],
+                },
+                llmAvailable: true,
+            });
+        }
+        if (pathname === '/marshal/voice/prepare') {
+            sttReady = true;
+            return Response.json({ ok: true, stt: { available: true, ready: true, phase: 'ready' } });
+        }
+        if (pathname === '/marshal/voice/transcribe') {
+            transcribeCalls += 1;
+            assert.ok(typeof body.audioBase64 === 'string' && body.audioBase64.length > 50);
+            const texts = ['查看今天的工单进度', '先停一下，重点看移动端', '按住说一条确认'];
+            return Response.json({ text: texts[transcribeCalls - 1] ?? '收到', language: 'zh' });
+        }
+        if (pathname === '/marshal/voice/turn') {
+            turnBodies.push(body);
+            if (turnBodies.length === 1) {
+                return new Response(sseStream([
+                    { event: 'delta', data: { text: '好的，正在排查。' } },
+                    { event: 'sentence', data: { text: '好的，正在排查。' } },
+                    { event: 'delta', data: { text: '稍后同步结果。' } },
+                    { event: 'sentence', data: { text: '稍后同步结果。' } },
+                    { event: 'done', data: { text: '好的，正在排查。稍后同步结果。' } },
+                ]), { headers: { 'content-type': 'text/event-stream' } });
+            }
+            return new Response(sseStream([
+                { event: 'delta', data: { text: '收到，立刻切到移动端。' } },
+                { event: 'sentence', data: { text: '收到，立刻切到移动端。' } },
+                { event: 'done', data: { text: '收到，立刻切到移动端。' } },
+            ]), { headers: { 'content-type': 'text/event-stream' } });
+        }
+        if (pathname === '/marshal/voice/tts') {
+            ttsCalls.push(body);
+            return new Response(new Uint8Array([0x49, 0x44, 0x33, 0x03]), {
+                headers: { 'content-type': 'audio/mpeg', 'x-marshal-tts-provider': body.provider || 'edge' },
+            });
+        }
+        if (pathname === '/marshal/voice/summarize') {
+            summaryBody = body;
+            return Response.json({ summary: '## 语音纪要\n- 已确认优先处理移动端工单' });
+        }
+        throw Error('unexpected voice endpoint: ' + pathname);
+    };
+
+    class FakeAudioContext {
+        sampleRate = 16000;
+        createMediaStreamSource() { return { connect() {}, disconnect() {} }; }
+        createScriptProcessor() {
+            const node = {
+                set onaudioprocess(fn) { audioProcess = fn; },
+                get onaudioprocess() { return audioProcess; },
+                connect() {},
+                disconnect() {},
+            };
+            return node;
+        }
+        createGain() { return { gain: { value: 1 }, connect() {}, disconnect() {} }; }
+        async resume() {}
+        async close() { ctxClosed += 1; }
+    }
+
+    class FakeAudio {
+        paused = false;
+        constructor(src) { this.src = src; playedAudios.push(this); }
+        play() { return Promise.resolve(); }
+        pause() { this.paused = true; }
+    }
+
+    const fakeUrl = {
+        createObjectURL() {
+            const u = 'blob:voice-' + (createdUrls.length + 1);
+            createdUrls.push(u);
+            return u;
+        },
+        revokeObjectURL(u) { revokedUrls.push(u); },
+    };
+
+    const voice = host.createLiveVoiceCallProvider({
+        fetch: mockFetch,
+        getUserMedia: async constraints => {
+            assert.equal(constraints.audio.echoCancellation, true);
+            assert.equal(constraints.audio.noiseSuppression, true);
+            assert.equal(constraints.audio.autoGainControl, true);
+            return { getTracks: () => [{ stop() { trackStops += 1; } }] };
+        },
+        AudioContext: FakeAudioContext,
+        Audio: FakeAudio,
+        URL: fakeUrl,
+    });
+
+    const pushFrame = (amplitude, count = 1) => {
+        const frame = new Float32Array(2048); // 128ms @ 16kHz
+        frame.fill(amplitude);
+        for (let i = 0; i < count; i++) {
+            audioProcess?.({ inputBuffer: { getChannelData: () => frame } });
+        }
+    };
+
+    await voice.start(agent, { targetTicketId: 'ticket' });
+    assert.equal(voice.getSnapshot().status, 'active');
+    assert.equal(voice.getSnapshot().sttNeedsPrepare, true);
+    assert.match(text(host.expand({ type: host.MarshalVoiceCallOverlay, props: { voice } })), /准备模型/);
+
+    voice.prepareStt();
+    await flush();
+    await flush();
+    assert.equal(voice.getSnapshot().sttNeedsPrepare, false);
+
+    // Speak 384ms (3 frames) + 768ms silence (6 frames) -> triggers VAD endpointing
+    pushFrame(0.08, 3);
+    pushFrame(0, 6);
+    for (let i = 0; i < 12; i++) await flush();
+
+    assert.equal(transcribeCalls, 1);
+    assert.equal(turnBodies.length, 1);
+    assert.equal(turnBodies[0].text, '查看今天的工单进度');
+    assert.equal(turnBodies[0].targetTicketId, 'ticket');
+    assert.equal(ttsCalls.length, 2);
+    assert.equal(ttsCalls[0].provider, 'edge');
+    assert.equal(voice.getSnapshot().phase, 'speaking');
+    assert.equal(playedAudios.length, 1);
+    assert.equal(playedAudios[0].paused, false);
+
+    // Automatic Barge-in while speaking: 3 frames (384ms >= 260ms) above 0.048 threshold
+    pushFrame(0.09, 3);
+    assert.equal(playedAudios[0].paused, true);
+    assert.equal(voice.getSnapshot().phase, 'listening');
+    assert.match(voice.getSnapshot().message, /已打断/);
+    // Finish barge-in utterance with 768ms silence -> submits second turn
+    pushFrame(0, 6);
+    for (let i = 0; i < 12; i++) await flush();
+
+    assert.equal(transcribeCalls, 2);
+    assert.equal(turnBodies[1].text, '先停一下，重点看移动端');
+    assert.equal(voice.getSnapshot().phase, 'speaking');
+
+    // Manual interrupt & switch to PTT + system TTS
+    voice.interrupt();
+    assert.equal(voice.getSnapshot().phase, 'listening');
+    voice.setMode('ptt');
+    voice.setTts('system');
+    assert.equal(voice.getSnapshot().mode, 'ptt');
+    assert.equal(voice.getSnapshot().phase, 'ptt');
+    voice.setPttActive(true);
+    pushFrame(0.06, 2);
+    voice.setPttActive(false);
+    for (let i = 0; i < 12; i++) await flush();
+
+    assert.equal(transcribeCalls, 3);
+    assert.equal(ttsCalls.at(-1).provider, 'system');
+
+    // Hang up and verify /summarize + full hardware/URL cleanup
+    voice.setNotes('手动补充：今天下班前复查');
+    await voice.end();
+    assert.equal(voice.getSnapshot().status, 'summary');
+    assert.equal(voice.getSnapshot().summary, '## 语音纪要\n- 已确认优先处理移动端工单');
+    assert.equal(summaryBody.notes, '手动补充：今天下班前复查');
+    assert.ok(summaryBody.transcript.length >= 4);
+    assert.equal(trackStops, 1);
+    assert.equal(ctxClosed, 1);
+    assert.equal(revokedUrls.length, createdUrls.length);
+    voice.dispose();
+});
+
+test('live voice provider gracefully degrades to local notes when mic is denied or backend is unavailable', async () => {
+    const host = harness();
+    const denied = host.createLiveVoiceCallProvider({
+        fetch: async () => Response.json({
+            stt: { available: true, ready: true },
+            tts: { defaultProvider: 'edge', providers: [{ id: 'edge', ready: true }] },
+            llmAvailable: true,
+        }),
+        getUserMedia: async () => { throw Object.assign(new Error('Permission denied'), { name: 'NotAllowedError' }); },
+        AudioContext: class {},
+    });
+    await denied.start(agent);
+    assert.equal(denied.getSnapshot().status, 'active');
+    assert.equal(denied.getSnapshot().fallbackLocal, true);
+    assert.equal(denied.getSnapshot().phase, 'notes');
+    assert.match(text(host.expand({ type: host.MarshalVoiceCallOverlay, props: { voice: denied } })), /本地笔记模式，不录音/);
+    denied.setNotes('降级笔记内容');
+    await denied.end();
+    assert.equal(denied.getSnapshot().status, 'summary');
+    assert.equal(denied.getSnapshot().summary, '降级笔记内容');
+    denied.dispose();
+
+    const offline = host.createLiveVoiceCallProvider({
+        fetch: async () => new Response('Not Found', { status: 404 }),
+        getUserMedia: async () => assert.fail('must not request mic when backend voice is unavailable'),
+        AudioContext: class {},
+    });
+    await offline.start(agent);
+    assert.equal(offline.getSnapshot().status, 'active');
+    assert.equal(offline.getSnapshot().fallbackLocal, true);
+    assert.match(offline.getSnapshot().message, /本地笔记模式/);
+    offline.dispose();
 });

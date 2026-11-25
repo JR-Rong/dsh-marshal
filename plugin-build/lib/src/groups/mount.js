@@ -28,6 +28,7 @@ import { createTaskOverrides, describeContentSteeringMessage, describePlainConfi
 import { createWorkspaceRosters } from './workspace-rosters.js';
 import { createTicketNumbers, withTicketPrefix } from './ticket-numbers.js';
 import { createSessionTitles, readProjcacheSession, readWorkspaceRegistry, summarizeFirstMessage } from './session-titles.js';
+import { createVoiceEngine } from './voice-engine.js';
 import { dashboardAddress } from '../sidebar.js';
 import { createDiscussionPort } from '../discussions/ports.js';
 import { createAgentsHttpClient, agentToolDefinitions } from './agent-tools.js';
@@ -96,14 +97,15 @@ function errorCode(error) {
         : 'invalid-request';
 }
 
-async function readBody(req) {
+async function readBody(req, limit = BODY_LIMIT) {
     const chunks = [];
     let size = 0;
     for await (const chunk of req) {
         size += chunk.length;
-        if (size > BODY_LIMIT) {
+        if (size > limit) {
             const error = new Error('marshal: groups body-too-large');
             error.code = 'body-too-large';
+            error.status = 413;
             throw error;
         }
         chunks.push(chunk);
@@ -405,7 +407,7 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
         root: groupsRootDir, rosters, ticketNumbers, sessionTitles, sessionController, config, llm, readDefaultModel,
         workspacePath, webOrigin, getAttachmentStore, resolveAttachments, surface: dshSurface, moveCardStatus,
         taskOverrides: injectedTaskOverrides, patchStore: injectedPatchStore, eventBus, eventStreams, collectPlainIncidents,
-        workspaceRegistry,
+        workspaceRegistry, getSpeechToText, getLlm, voiceEngine: injectedVoiceEngine,
     } = extras;
     const writeMutation = (res, value, ...topics) => {
         write(res, 200, value);
@@ -1102,9 +1104,171 @@ function makeRoutes(service, drafter, getBoard, initiator, cross, boardSource, m
             write(res, 200, { ok: true, ...await incidentsFor(scopedTickets(access, ledger), await proposalsFor(access)) });
         }),
     ];
+    const voice = injectedVoiceEngine ?? createVoiceEngine({
+        getSpeechToText,
+        llm,
+        getLlm,
+        readDefaultModel,
+        memory,
+    });
+    const lookupMember = (agent, ledger) => (ledger.teams ?? [])
+        .find(team => team?.id === agent.teamId)?.members
+        ?.find(member => member?.id === agent.agentId);
+    const voiceRoutes = [
+        domain('GET', 'voice/capabilities', async (_req, res) => {
+            write(res, 200, voice.capabilities());
+        }),
+        domain('POST', 'voice/prepare', async (req, res) => {
+            const body = await readBody(req);
+            const result = voice.prepareStt({
+                providerId: typeof body?.providerId === 'string' ? body.providerId : undefined,
+                source: typeof body?.source === 'string' ? body.source : undefined,
+            });
+            write(res, result.ok ? 200 : 503, result);
+        }),
+        domain('POST', 'voice/transcribe', async (req, res) => {
+            const body = await readBody(req, 6 * 1024 * 1024);
+            const abort = new AbortController();
+            const onAbort = () => abort.abort();
+            const onResClose = () => { if (!res.writableEnded) abort.abort(); };
+            req.on?.('aborted', onAbort);
+            res.on?.('close', onResClose);
+            try {
+                const result = await voice.transcribe({
+                    audioBase64: body?.audioBase64,
+                    language: body?.language,
+                    providerId: body?.providerId,
+                }, abort.signal);
+                write(res, 200, result);
+            } finally {
+                req.off?.('aborted', onAbort);
+                res.off?.('close', onResClose);
+            }
+        }),
+        domain('POST', 'voice/turn', async (req, res, access, ledger) => {
+            const body = await readBody(req);
+            const agent = requireAgent(body?.agentKey, access, ledger);
+            const utterance = typeof body?.text === 'string' ? body.text.trim() : '';
+            if (!utterance) {
+                write(res, 400, { ok: false, error: 'invalid-text', message: '语音输入内容不能为空。' });
+                return;
+            }
+            const member = lookupMember(agent, ledger);
+            let ticketContext = '';
+            if (typeof body?.targetTicketId === 'string' && body.targetTicketId.trim()) {
+                try {
+                    const ticket = requireTicket(scopedTickets(access, ledger), body.targetTicketId.trim());
+                    ticketContext = `工单：${ticket.title || ticket.id}（状态：${ticket.status || 'unknown'}）\n${String(ticket.description || '').slice(0, 500)}`;
+                } catch { /* ignore inaccessible or stale ticket context */ }
+            }
+            const abort = new AbortController();
+            let closed = false;
+            const onAbort = () => {
+                closed = true;
+                abort.abort();
+            };
+            const onResClose = () => { if (!res.writableEnded) onAbort(); };
+            req.on?.('aborted', onAbort);
+            res.on?.('close', onResClose);
+            res.writeHead(200, {
+                'content-type': 'text/event-stream; charset=utf-8',
+                'cache-control': 'no-cache, no-transform',
+                'connection': 'keep-alive',
+                'x-accel-buffering': 'no',
+            });
+            const sendEvent = (event, payload) => {
+                if (closed || res.destroyed || res.writableEnded) return;
+                res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
+            };
+            try {
+                for await (const item of voice.streamVoiceTurn({
+                    agent,
+                    member,
+                    text: utterance,
+                    history: body?.history,
+                    ticketContext,
+                    signal: abort.signal,
+                })) {
+                    if (closed || abort.signal.aborted) break;
+                    sendEvent(item.type, item);
+                }
+            } catch (error) {
+                if (!abort.signal.aborted) {
+                    sendEvent('error', {
+                        code: errorCode(error),
+                        message: error instanceof Error ? error.message : String(error),
+                    });
+                }
+            } finally {
+                req.off?.('aborted', onAbort);
+                res.off?.('close', onResClose);
+                if (!res.destroyed && !res.writableEnded) res.end();
+            }
+        }),
+        domain('POST', 'voice/tts', async (req, res) => {
+            const body = await readBody(req);
+            const abort = new AbortController();
+            const onAbort = () => abort.abort();
+            const onResClose = () => { if (!res.writableEnded) abort.abort(); };
+            req.on?.('aborted', onAbort);
+            res.on?.('close', onResClose);
+            try {
+                const result = await voice.synthesizeTts({
+                    provider: typeof body?.provider === 'string' ? body.provider : undefined,
+                    text: body?.text,
+                    voice: typeof body?.voice === 'string' ? body.voice : undefined,
+                    rate: body?.rate,
+                    signal: abort.signal,
+                });
+                if (abort.signal.aborted || res.destroyed || res.writableEnded) return;
+                res.writeHead(200, {
+                    'content-type': result.mime,
+                    'cache-control': 'no-store',
+                    'x-marshal-tts-provider': result.provider,
+                    'x-marshal-tts-voice': encodeURIComponent(String(result.voice ?? '')),
+                    ...(result.fallbackFrom ? { 'x-marshal-tts-fallback': result.fallbackFrom } : {}),
+                });
+                res.end(result.audio);
+            } finally {
+                req.off?.('aborted', onAbort);
+                res.off?.('close', onResClose);
+            }
+        }),
+        domain('POST', 'voice/summarize', async (req, res, access, ledger) => {
+            const body = await readBody(req);
+            const agent = requireAgent(body?.agentKey, access, ledger);
+            const member = lookupMember(agent, ledger);
+            let ticketTitle = '';
+            if (typeof body?.targetTicketId === 'string' && body.targetTicketId.trim()) {
+                try {
+                    ticketTitle = requireTicket(scopedTickets(access, ledger), body.targetTicketId.trim()).title ?? '';
+                } catch { /* ignore */ }
+            }
+            const abort = new AbortController();
+            const onAbort = () => abort.abort();
+            const onResClose = () => { if (!res.writableEnded) abort.abort(); };
+            req.on?.('aborted', onAbort);
+            res.on?.('close', onResClose);
+            try {
+                const result = await voice.summarizeCall({
+                    agent,
+                    member,
+                    transcript: body?.transcript,
+                    notes: body?.notes,
+                    ticketTitle,
+                    signal: abort.signal,
+                });
+                write(res, 200, result);
+            } finally {
+                req.off?.('aborted', onAbort);
+                res.off?.('close', onResClose);
+            }
+        }),
+    ];
     return [
         ...roomRoutes.routes,
         ...desktopRoutes,
+        ...voiceRoutes,
         exact('GET', '/marshal/health', async (req, res) => {
             const ledger = readAgentsLedger();
             write(res, 200, buildHealthBody(req, {
@@ -2967,6 +3131,8 @@ export function mountGroups(ctx, config, options = {}) {
                 webOrigin: resolveWebOrigin, getAttachmentStore, resolveAttachments: resolveTicketAttachments,
                 surface, moveCardStatus, taskOverrides, patchStore, eventBus, eventStreams, collectPlainIncidents,
                 workspaceRegistry: lookupWorkspaceRegistry(ctx),
+                getSpeechToText: () => { try { return ctx.get?.('speechToText') ?? ctx.speechToText; } catch { return undefined; } },
+                getLlm: () => { try { return ctx.get?.('llm') ?? ctx.llm; } catch { return llm; } },
             }).map((route) => scoped.webServer.register(route));
             return () => {
                 closeEventStreams();

@@ -288,7 +288,8 @@
               const guidance = useMvSnapshot(runtime.modal);
               React.useEffect(() => {
                 if (closed) return;
-                const provider = createLocalVoiceSessionProvider();
+                const canCapture = typeof navigator !== 'undefined' && typeof navigator.mediaDevices?.getUserMedia === 'function';
+                const provider = canCapture ? createLiveVoiceCallProvider() : createLocalVoiceSessionProvider();
                 voiceLayer.set(provider);
                 return () => {
                   provider.dispose();
