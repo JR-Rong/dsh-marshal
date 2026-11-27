@@ -16,8 +16,8 @@ import {
 } from './lib/account.ts'
 import type { AccountSession } from './lib/config.ts'
 import { openEventStream, type StreamHandle, type StreamFrame } from './lib/sse.ts'
-import { sliceSessions, SESSION_PAGE_SIZE } from './lib/sessions.ts'
-import { acceptEventSeq } from './lib/transcript.ts'
+import { ALL_DEVICES_ID, SESSION_PAGE_SIZE, SESSION_PAGE_STEP, sliceSessions } from './lib/sessions.ts'
+import { acceptEventSeq, extractPayloadText, TOOL_ARGS_PREVIEW_LIMIT, TOOL_OUTPUT_PREVIEW_LIMIT, truncateWithNotice } from './lib/transcript.ts'
 import { hasStoredBridge, loadBridgeDevice, openBridgeWorkbench, saveBridgeDevice } from './bridge/workbench.ts'
 import { classifyPairing, pairBridge, parsePairPayload, parseUnifiedPairing } from './lib/bridge.ts'
 import { openQrScanner } from './lib/scanner.ts'
@@ -66,6 +66,7 @@ interface Message {
   streamText?: string
   completed?: boolean
   toolTitle?: string
+  toolArgs?: string
   failed?: boolean
   retryKey?: string
 }
@@ -556,6 +557,8 @@ async function enterApp(): Promise<void> {
   state.devices = []
   state.sessions = []
   state.deviceId = null
+  sessionAgentFilter = ''
+  sessionLimit = SESSION_PAGE_SIZE
   hubUnavailable = false
   connectivity.stream('reset')
   resetTicketBoard()
@@ -716,18 +719,52 @@ async function refreshDevices(): Promise<void> {
   roster = named.ok ? named.data : roster
   connectivity.roster(named.ok ? Date.now() : null)
   if (state.view === 'sessions' && !state.deviceId) {
-    const first = state.devices.find((entry) => !entry.stale)
-    if (first) { void openDevice(first); return }
+    if (openDefaultDeviceScope()) return
     render()
     return
   }
   redrawConnectivity()
 }
 
+function openDefaultDeviceScope(): boolean {
+  if (state.devices.length > 1) {
+    void openAllDevices()
+    return true
+  }
+  const first = state.devices.find((entry) => !entry.stale) ?? state.devices[0]
+  if (first) {
+    void openDevice(first)
+    return true
+  }
+  return false
+}
+
+async function openAllDevices(): Promise<void> {
+  const api = state.api
+  if (!api) return
+  sessionCategory = 'single'
+  sessionAgentFilter = ''
+  sessionLimit = SESSION_PAGE_SIZE
+  state.deviceId = ALL_DEVICES_ID
+  state.sessions = []
+  state.view = 'sessions'
+  state.statusText = '读取会话…'
+  render()
+  const result = await api.sessions('')
+  if (state.api !== api || state.deviceId !== ALL_DEVICES_ID) return
+  if (result.ok) state.sessions = result.data
+  if (state.view === 'sessions') {
+    state.statusText = result.ok ? '' : result.message
+    render()
+  }
+}
+
 async function openDevice(device: DeviceRow): Promise<void> {
   const api = state.api
   if (!api) return
   sessionCategory = 'single'
+  sessionAgentFilter = ''
+  sessionLimit = SESSION_PAGE_SIZE
   state.deviceId = device.id
   state.sessions = []
   state.view = 'sessions'
@@ -821,10 +858,17 @@ async function openSession(deviceId: string, row: SessionRow): Promise<void> {
   const sessions = await api.sessions(deviceId)
   if (state.api !== api || state.session !== opened) return
   if (sessions.ok) {
-    if (state.deviceId === deviceId) state.sessions = sessions.data
+    if (state.deviceId === deviceId) {
+      state.sessions = sessions.data
+    } else if (state.deviceId === ALL_DEVICES_ID) {
+      state.sessions = [
+        ...state.sessions.filter((item) => item.deviceId !== deviceId),
+        ...sessions.data,
+      ]
+    }
     const fresh = sessions.data.find((item) => item.agent === row.agent && item.sessionId === row.sessionId)
     if (fresh) {
-      state.session = { ...fresh, deviceId: row.deviceId }
+      state.session = { ...fresh, deviceId: row.deviceId || deviceId }
       if (!receivedLiveCapability) state.capability = fresh.capability
       if (!receivedLiveRunning) state.running = fresh.running
     }
@@ -835,6 +879,8 @@ async function openSession(deviceId: string, row: SessionRow): Promise<void> {
 function targetOf(row: SessionRow): Target {
   return { deviceId: row.deviceId, agent: row.agent, sessionId: row.sessionId }
 }
+
+const HISTORY_PAGE_LIMIT = 80
 
 export function historyToMessage(item: { kind: string; payload?: Record<string, unknown>; seq?: number; ts?: number }): Message | null {
   const payload = item.payload ?? {}
@@ -847,8 +893,41 @@ export function historyToMessage(item: { kind: string; payload?: Record<string, 
     case 'message.delta': return text ? { id, role: 'assistant', text, open: false, at } : null
     case 'message.completed': return text ? { id, role: 'assistant', text, open: false, at, completed: true } : null
     case 'reasoning.delta': return text ? { id, role: 'reason', text, open: false, at } : null
-    case 'tool.started': return { id, role: 'tool', text: '开始：' + String(payload.name ?? payload.tool ?? '工具'), toolTitle: String(payload.name ?? payload.tool ?? '工具调用'), open: false, at }
-    case 'tool.completed': return { id, role: 'tool', text: (payload.isError === true || payload.status === 'error' ? '失败：' : '完成：') + String(payload.content ?? '').slice(0, 400), toolTitle: String(payload.name ?? payload.tool ?? '工具结果'), open: false, at, completed: true }
+    case 'tool.started': {
+      const title = String(payload.name ?? payload.tool ?? '工具调用')
+      const args = payload.arguments !== undefined
+        ? truncateWithNotice(extractPayloadText(payload.arguments), TOOL_ARGS_PREVIEW_LIMIT)
+        : ''
+      return {
+        id, role: 'tool',
+        text: args ? `开始：${title}\n参数：\n${args}` : '开始：' + title,
+        toolTitle: title,
+        toolArgs: args || undefined,
+        open: false, at,
+      }
+    }
+    case 'tool.output': {
+      const output = extractPayloadText(payload.text ?? payload.output ?? payload.content)
+      if (!output) return null
+      return {
+        id, role: 'tool',
+        text: truncateWithNotice(output, TOOL_OUTPUT_PREVIEW_LIMIT),
+        toolTitle: String(payload.name ?? payload.tool ?? '工具结果'),
+        open: false, at,
+      }
+    }
+    case 'tool.completed': {
+      const raw = extractPayloadText(payload.text ?? payload.output ?? payload.content)
+      const isChunk = Number(payload.chunkIndex) > 0
+      const prefix = isChunk ? '' : (payload.isError === true || payload.status === 'error' ? '失败：' : '完成：')
+      const body = isChunk ? raw : truncateWithNotice(raw, TOOL_OUTPUT_PREVIEW_LIMIT)
+      return {
+        id, role: 'tool',
+        text: prefix + body,
+        toolTitle: String(payload.name ?? payload.tool ?? '工具结果'),
+        open: false, at, completed: true,
+      }
+    }
     case 'turn.completed': return { id, role: 'system', text: '回合完成（' + String(payload.state ?? 'completed') + '）', open: false, at }
     default: return null
   }
@@ -861,13 +940,26 @@ function historyMessages(items: Parameters<typeof historyToMessage>[0][]): Messa
     if (!message) continue
     const key = transcriptMessageKey(message)
     const previous = messages.get(key)
-    if (previous && (item.kind === 'reasoning.delta' || item.kind === 'message.delta'
-      || ((item.kind === 'user.message' || item.kind === 'message.completed') && Number(item.payload?.chunkIndex) > 0))) {
-      previous.text += message.text
+    if (previous && (item.kind === 'reasoning.delta' || item.kind === 'message.delta' || item.kind === 'tool.output'
+      || ((item.kind === 'user.message' || item.kind === 'message.completed' || item.kind === 'tool.completed') && Number(item.payload?.chunkIndex) > 0))) {
+      if (item.kind === 'tool.output') {
+        const joined = previous.text.startsWith('开始：')
+          ? previous.text + '\n\n输出：\n' + message.text
+          : previous.text + message.text
+        previous.text = truncateWithNotice(joined, TOOL_OUTPUT_PREVIEW_LIMIT + TOOL_ARGS_PREVIEW_LIMIT)
+      } else if (item.kind === 'tool.completed') {
+        previous.text = truncateWithNotice(previous.text + message.text, TOOL_OUTPUT_PREVIEW_LIMIT + TOOL_ARGS_PREVIEW_LIMIT)
+      } else {
+        previous.text += message.text
+      }
       if (message.role === 'reason' && typeof item.ts === 'number') previous.endedAt = item.ts
     } else {
       if (previous) message.at = previous.at
       if (previous?.toolTitle && message.toolTitle === '工具结果') message.toolTitle = previous.toolTitle
+      if (previous?.toolArgs && item.kind === 'tool.completed') {
+        message.toolArgs = previous.toolArgs
+        message.text = `参数：\n${previous.toolArgs}\n\n${message.text}`
+      }
       messages.set(key, message)
     }
   }
@@ -949,11 +1041,11 @@ async function onFrame(frame: StreamFrame): Promise<void> {
     return
   }
   if (kind === 'session.updated' || kind === 'session.removed') {
-    if (state.view === 'sessions' && state.deviceId === event.deviceId) {
+    if (state.view === 'sessions' && (state.deviceId === ALL_DEVICES_ID || state.deviceId === event.deviceId)) {
       const api = state.api
       const deviceId = state.deviceId
       if (api && deviceId) {
-        const result = await api.sessions(deviceId)
+        const result = await api.sessions(deviceId === ALL_DEVICES_ID ? '' : deviceId)
         if (state.api !== api || state.deviceId !== deviceId || state.view !== 'sessions') return
         if (result.ok) { state.sessions = result.data; render() }
       }
@@ -972,17 +1064,22 @@ async function onFrame(frame: StreamFrame): Promise<void> {
   lastSeq = seq.lastSeq
   const ts = typeof event.ts === 'number' ? event.ts : undefined
   const transcriptEvent = { kind, payload, ts, seq: typeof event.seq === 'number' ? event.seq : undefined }
-  if ((kind === 'user.message' || kind === 'message.completed')
-    && typeof payload.itemId === 'string' && typeof payload.text === 'string'
+  const chunkKeyId = typeof payload.itemId === 'string' ? payload.itemId : typeof payload.callId === 'string' ? payload.callId : undefined
+  if ((kind === 'user.message' || kind === 'message.completed' || kind === 'tool.completed' || kind === 'tool.output')
+    && chunkKeyId && typeof payload.text === 'string'
     && typeof payload.chunkCount === 'number' && payload.chunkCount > 1
     && typeof payload.chunkIndex === 'number' && payload.chunkIndex >= 0 && payload.chunkIndex < payload.chunkCount) {
-    const key = `${kind}:${payload.itemId}`
+    const key = `${kind}:${chunkKeyId}`
     const parts = payload.chunkIndex === 0 ? new Map<number, string>() : transcriptChunks.get(key)
     if (!parts) return
     parts.set(payload.chunkIndex, payload.text)
     if (parts.size < payload.chunkCount) { transcriptChunks.set(key, parts); return }
     transcriptChunks.delete(key)
-    transcriptEvent.payload = { ...payload, text: [...parts.entries()].sort(([a], [b]) => a - b).map(([, part]) => part).join('') }
+    transcriptEvent.payload = {
+      ...payload,
+      chunkIndex: 0,
+      text: [...parts.entries()].sort(([a], [b]) => a - b).map(([, part]) => part).join(''),
+    }
   }
   switch (kind) {
     case 'capability.changed':
@@ -1020,6 +1117,7 @@ async function onFrame(frame: StreamFrame): Promise<void> {
       return
     }
     case 'tool.started':
+    case 'tool.output':
     case 'tool.completed':
     case 'user.message': {
       const message = historyToMessage(transcriptEvent)
@@ -1027,9 +1125,21 @@ async function onFrame(frame: StreamFrame): Promise<void> {
       if (message.role === 'tool') {
         const current = state.messages.find(entry => transcriptMessageKey(entry) === transcriptMessageKey(message))
         if (current) {
-          if (message.completed || !current.completed) current.text = message.text
-          if (message.completed) current.completed = true
-          if (message.toolTitle !== '工具结果') current.toolTitle = message.toolTitle
+          if (kind === 'tool.output') {
+            if (!current.completed) {
+              const joined = current.text.startsWith('开始：')
+                ? current.text + '\n\n输出：\n' + message.text
+                : current.text + message.text
+              current.text = truncateWithNotice(joined, TOOL_OUTPUT_PREVIEW_LIMIT + TOOL_ARGS_PREVIEW_LIMIT)
+            }
+          } else if (message.completed) {
+            current.text = current.toolArgs ? `参数：\n${current.toolArgs}\n\n${message.text}` : message.text
+            current.completed = true
+          } else if (!current.completed) {
+            current.text = message.text
+            if (message.toolArgs) current.toolArgs = message.toolArgs
+          }
+          if (message.toolTitle && message.toolTitle !== '工具结果') current.toolTitle = message.toolTitle
         } else state.messages = mergeTranscriptSnapshot([message], state.messages, { liveEvent: true })
       } else state.messages = mergeTranscriptSnapshot([message], state.messages, { liveEvent: true })
       if (state.view === 'session') render()
@@ -1078,7 +1188,7 @@ async function reloadTranscript(): Promise<void> {
   historyStatus = 'loading'
   state.statusText = ''
   if (state.view === 'session') render()
-  const result = await api.history(targetOf(session), 40)
+  const result = await api.history(targetOf(session), HISTORY_PAGE_LIMIT)
   if (request !== historyRequest || generation !== sessionGeneration || state.api !== api) return
   if (result.ok) {
     historyItemCount = result.data.items.length
@@ -1126,9 +1236,11 @@ async function loadOlder(): Promise<void> {
   const current = () => olderRequest === request && generation === sessionGeneration && state.api === api
   const indicator = rootNode().querySelector('.history-indicator')
   if (indicator) indicator.textContent = '正在同步更早对话…'
+  const loadMore = rootNode().querySelector<HTMLButtonElement>('.history-load-more')
+  if (loadMore) loadMore.disabled = true
   let inserted = false
   try {
-    const result = await api.history(targetOf(session), 40, cursor)
+    const result = await api.history(targetOf(session), HISTORY_PAGE_LIMIT, cursor)
     if (!current()) return
     if (!result.ok) {
       if (state.view === 'session') toast(result.message, 'error')
@@ -1788,6 +1900,7 @@ let agentsSegment: 'members' | 'memory' = 'members'
 let hubUnavailable = false
 let sessionQuery = ''
 let sessionLimit = SESSION_PAGE_SIZE
+let sessionAgentFilter = ''
 let roster: RosterEntry[] = []
 let boardTasks: Ticket[] = []
 let boardRevisions: Record<string, number> = {}
@@ -1829,8 +1942,7 @@ function showSessionCategory(category: SessionCategory, from = groupsParent): vo
   setSessionCenterRoute(category)
   render()
   if (category === 'single' && !state.deviceId) {
-    const first = state.devices.find(device => !device.stale) ?? state.devices[0]
-    if (first) void openDevice(first)
+    openDefaultDeviceScope()
   } else if (category === 'group') {
     void loadRooms()
     if (!boardLoaded) void loadBoard(true)
@@ -1884,7 +1996,7 @@ function openChatSheet(): void {
     }, busy)
     const body = el('div', { class: 'ticket-sheet-body' }, modes)
     if (wizard.mode === 'group') {
-      const ready = !!phoneApi() && accountUsable()
+      const ready = !!phoneApi()
       body.append(button(ready ? '继续选择群成员' : '去设置登录或配对', () => {
         close()
         if (ready) {
@@ -1972,48 +2084,79 @@ function openChatSheet(): void {
 
 function sessionsView(): Child[] {
   if (sessionCategory !== 'single') return groupsView()
-  const device = state.devices.find(entry => entry.id === state.deviceId)
+  const isAllDevices = state.deviceId === ALL_DEVICES_ID
+  const device = isAllDevices ? undefined : state.devices.find(entry => entry.id === state.deviceId)
   const host = el('select', { 'aria-label': '会话列表主机', onChange: () => {
+    if (host.value === ALL_DEVICES_ID) { void openAllDevices(); return }
     const selected = state.devices.find(entry => entry.id === host.value)
     if (selected) void openDevice(selected)
-  } }, ...state.devices.map(entry => optionNode(entry.id, entry.name)))
-  if (device) host.value = device.id
+  } },
+  optionNode(ALL_DEVICES_ID, `全部主机（${state.devices.length} 台）`),
+  ...state.devices.map(entry => optionNode(entry.id, entry.name))) as HTMLSelectElement
+  host.value = isAllDevices ? ALL_DEVICES_ID : (device?.id ?? ALL_DEVICES_ID)
   const search = el('input', {
-    type: 'search', placeholder: '搜索会话', value: sessionQuery,
+    type: 'search', placeholder: '搜索会话（标题 / 编号 / 引擎 / 主机）', value: sessionQuery,
     onInput: (event: Event) => { sessionQuery = (event.target as HTMLInputElement).value; sessionLimit = SESSION_PAGE_SIZE; render() },
   }) as HTMLInputElement
-  const page = sliceSessions(state.sessions, sessionQuery, sessionLimit)
-  const groups = new Map<string, SessionRow[]>()
-  for (const row of page.shown) {
-    const list = groups.get(row.agent) ?? []
-    list.push(row)
-    groups.set(row.agent, list)
+  let page = sliceSessions(state.sessions, sessionQuery, sessionLimit, sessionAgentFilter, deviceName)
+  if (sessionAgentFilter && !page.agentCounts.some(([agent]) => agent === sessionAgentFilter)) {
+    sessionAgentFilter = ''
+    page = sliceSessions(state.sessions, sessionQuery, sessionLimit, '', deviceName)
   }
   const sections: Child[] = [search]
-  if (groups.size === 0) {
-    sections.push(el('p', { class: 'empty', text: state.statusText || '这台设备暂无会话。' }))
-  }
-  for (const [agent, rows] of groups) {
-    rows.sort((a, b) => b.updatedAt - a.updatedAt)
-    sections.push(el('div', { class: 'agent-group' },
-      el('h3', { class: 'agent-title', text: agentLabel(agent) + ' · ' + rows.length + ' 个会话' }),
-      ...rows.map((row) => el('button', {
-        class: 'session',
-        onClick: () => { vibrate(); void openSession(state.deviceId ?? row.deviceId, row) },
-      },
-      el('span', { class: 'dot' + (row.running ? ' online' : '') }),
-      el('span', { class: 'copy' },
-        el('strong', { text: sessionTitle(row) }),
-        el('span', { text: formatTime(row.updatedAt) }),
-      ),
-      el('span', { class: 'state' + (row.running ? ' running' : ''), text: row.running ? '运行中' : '空闲' }),
-      el('span', { class: 'chevron', 'aria-hidden': 'true' }),
-      )),
+  if (page.agentCounts.length > 1) {
+    sections.push(el('div', { class: 'session-agent-filters', role: 'group', 'aria-label': '按引擎筛选' },
+      button(`全部 ${page.total}`, () => {
+        if (!sessionAgentFilter) return
+        sessionAgentFilter = ''
+        sessionLimit = SESSION_PAGE_SIZE
+        render()
+      }, { type: 'button', 'aria-pressed': sessionAgentFilter === '' }),
+      ...page.agentCounts.map(([agent, count]) => button(`${agentLabel(agent)} ${count}`, () => {
+        sessionAgentFilter = sessionAgentFilter === agent ? '' : agent
+        sessionLimit = SESSION_PAGE_SIZE
+        render()
+      }, { type: 'button', 'aria-pressed': sessionAgentFilter === agent })),
     ))
   }
-  if (page.hasMore) sections.push(button('加载更多', () => { sessionLimit += SESSION_PAGE_SIZE; render() }, { class: 'block' }))
+  if (page.shown.length === 0) {
+    sections.push(el('p', { class: 'empty', text: state.statusText || (sessionQuery ? '没有匹配的会话。' : isAllDevices ? '所有已连主机暂无会话。' : '这台设备暂无会话。') }))
+  } else {
+    const scopeLabel = sessionAgentFilter ? agentLabel(sessionAgentFilter) : '全部'
+    const summaryText = page.hasMore
+      ? `${scopeLabel} · 共 ${page.filteredTotal} 个会话（已显示最近 ${page.shown.length} 个）`
+      : `${scopeLabel} · 共 ${page.filteredTotal} 个会话`
+    sections.push(el('div', { class: 'agent-group' },
+      el('h3', { class: 'agent-title', text: summaryText }),
+      ...page.shown.map((row) => {
+        const metaParts = [agentLabel(row.agent)]
+        if (isAllDevices) metaParts.push(deviceName(row.deviceId))
+        metaParts.push(formatTime(row.updatedAt))
+        const targetDeviceId = row.deviceId || (state.deviceId && state.deviceId !== ALL_DEVICES_ID ? state.deviceId : '')
+        return el('button', {
+          class: 'session',
+          onClick: () => { vibrate(); void openSession(targetDeviceId, row) },
+        },
+        el('span', { class: 'dot' + (row.running ? ' online' : '') }),
+        el('span', { class: 'copy' },
+          el('strong', { text: sessionTitle(row) }),
+          el('span', { text: metaParts.join(' · ') }),
+        ),
+        el('span', { class: 'state' + (row.running ? ' running' : ''), text: row.running ? '运行中' : '空闲' }),
+        el('span', { class: 'chevron', 'aria-hidden': 'true' }),
+        )
+      }),
+    ))
+  }
+  if (page.hasMore) {
+    const remaining = page.filteredTotal - page.shown.length
+    sections.push(button(`加载更多（剩余 ${remaining} 个）`, () => { sessionLimit += SESSION_PAGE_STEP; render() }, { class: 'block' }))
+  }
+  const subtitle = isAllDevices
+    ? `全部主机（${state.devices.length} 台）`
+    : (device?.name ?? '暂无运行主机')
   return [
-    ...chatCenterHeader(device?.name ?? '暂无运行主机'),
+    ...chatCenterHeader(subtitle),
     state.devices.length > 1 ? host : null,
     el('div', { class: 'card' }, ...sections),
   ]
@@ -2294,6 +2437,9 @@ function sessionView(): Child[] {
     cards.length > 0 ? el('div', { class: 'session-pending' }, ...cards.map(cardNode)) : null,
     el('div', { class: 'transcript', tabindex: 0, 'aria-label': '对话记录' },
       el('p', { role: 'status', class: 'history-indicator', text: olderRequest ? '正在同步更早对话…' : historyPageNotice || (reachedHistoryStart ? '已加载全部历史' : '') }),
+      state.historyCursor && !olderRequest && historyStatus !== 'loading'
+        ? button('加载更早对话', () => { void loadOlder() }, { type: 'button', class: 'history-load-more' })
+        : null,
       ...state.messages.map(messageNode),
       historyStatus === 'loading' ? el('p', { role: 'status', class: 'notice', text: '正在读取历史…' }) : null,
       historyStatus === 'error' ? el('div', { class: 'card' },
@@ -2779,7 +2925,7 @@ async function writeBoard(
 }
 
 function boardHost(): string {
-  const selected = state.deviceId
+  const selected = state.deviceId && state.deviceId !== ALL_DEVICES_ID ? state.deviceId : null
   const id = selected && boardRevisions[selected] !== undefined ? selected
     : Object.keys(boardRevisions)[0] ?? selected ?? state.devices[0]?.id
   return id || ''
@@ -3328,7 +3474,7 @@ function groupsView(): Child[] {
   }
   const account = state.account
   const header = chatCenterHeader(phoneApi() ? '手机凭证' : '未配对')
-  if (!phoneApi() || !account || !accountUsable()) {
+  if (!phoneApi()) {
     return [
       ...header,
       el('div', { class: 'card' },
@@ -3360,7 +3506,12 @@ function groupsView(): Child[] {
       ...(rooms.length > 0 ? rooms : [el('p', { class: 'empty', text: roomListBusy ? '读取群聊…' : '暂无群聊房间。' })]),
       button('刷新群聊', () => { void loadRooms(true) }, { class: 'block' }),
     ),
-    el('p', { class: 'notice', text: '账号会话到期：' + new Date(account.expiresAt).toLocaleString('zh-CN') + '；到期后重新生成 ticket。' }),
+    el('p', {
+      class: 'notice',
+      text: account && accountUsable()
+        ? '账号会话到期：' + new Date(account.expiresAt).toLocaleString('zh-CN') + '；到期后重新生成 ticket。'
+        : '已通过手机配对凭证连接云端群聊。',
+    }),
   ]
 }
 
@@ -3397,8 +3548,7 @@ function updateGroupMessages(room: DiscussionRoom): void {
 function groupRoomView(ticketHeader?: HTMLElement): Child[] {
   const room = state.room
   const config = state.config
-  const account = state.account
-  if (!ticketHeader && sessionCategory !== 'ticketRoom' && (!config || !account || !accountUsable())) {
+  if (!ticketHeader && sessionCategory !== 'ticketRoom' && (!config || !phoneApi())) {
     setSessionCenterRoute('group')
     return groupsView()
   }
@@ -3444,7 +3594,7 @@ function groupRoomView(ticketHeader?: HTMLElement): Child[] {
 
 
 function openGroupNew(): void {
-  if (!accountUsable()) { toast('请先用账号 ticket 登录', 'error'); return }
+  if (!phoneApi()) { toast('请先扫描电脑配对码', 'error'); return }
   groupRequests.invalidate()
   state.groupTitle = ''
   state.groupText = ''

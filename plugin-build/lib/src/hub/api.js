@@ -1211,9 +1211,12 @@ export function registerMarshalRoutes(options) {
         if (phoneFrom(req) === undefined && authorize(req, res, readAccess) === undefined)
             return;
         const query = new URL(req.url ?? '/', 'http://localhost').searchParams;
-        // 空串 `?device=` 与缺参等价。
+        // 空串 `?device=` 与缺参等价；按最近更新时间倒序返回，避免客户端分页截断最新会话。
         const device = query.get('device') || undefined;
-        json(res, 200, { sessions: relay.sessions(device).map(row => publicSession(row, relay)) });
+        const sessions = relay.sessions(device)
+            .map(row => publicSession(row, relay))
+            .sort((a, b) => ((b.updatedAt ?? 0) - (a.updatedAt ?? 0)) || String(a.sessionId).localeCompare(String(b.sessionId)));
+        json(res, 200, { sessions });
     }));
     register('/marshal/api/discussions', guard(async (req, res) => {
         if (req.method !== 'GET' && req.method !== 'POST') {

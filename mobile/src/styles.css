@@ -523,6 +523,38 @@ select.mini-select:disabled { opacity: .45; }
   padding: 16px 0 2px;
 }
 .agent-title + .session { border-top: 0; }
+.session-agent-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  margin-top: var(--space-2);
+}
+.session-agent-filters button {
+  min-height: 36px;
+  padding: 6px 12px;
+  border-radius: var(--radius-pill);
+  font-size: var(--font-caption);
+  font-weight: 500;
+  color: var(--secondary);
+  background: var(--fill);
+  font-variant-numeric: tabular-nums;
+}
+.session-agent-filters button[aria-pressed="true"] {
+  color: var(--on-accent);
+  background: var(--action);
+  font-weight: 600;
+}
+.history-load-more {
+  align-self: center;
+  min-height: var(--tap-min);
+  padding: 0 16px;
+  border-radius: var(--radius-pill);
+  background: var(--fill);
+  color: var(--accent);
+  font-size: 14px;
+  font-weight: 500;
+}
+.history-load-more:disabled { opacity: .5; }
 
 /* ------------------------------ 横幅 / 提示 ------------------------------ */
 
