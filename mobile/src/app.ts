@@ -17,7 +17,11 @@ import {
 import type { AccountSession } from './lib/config.ts'
 import { openEventStream, type StreamHandle, type StreamFrame } from './lib/sse.ts'
 import { ALL_DEVICES_ID, SESSION_PAGE_SIZE, SESSION_PAGE_STEP, sliceSessions } from './lib/sessions.ts'
-import { acceptEventSeq, extractPayloadText, TOOL_ARGS_PREVIEW_LIMIT, TOOL_OUTPUT_PREVIEW_LIMIT, truncateWithNotice } from './lib/transcript.ts'
+import {
+  acceptEventSeq, extractPayloadText, fetchHistoryAdaptive, historyLoadsForward, initialHistoryLimit,
+  TOOL_ARGS_PREVIEW_LIMIT, TOOL_OUTPUT_PREVIEW_LIMIT, truncateWithNotice,
+} from './lib/transcript.ts'
+import { renderMarkdown } from './lib/markdown.ts'
 import { hasStoredBridge, loadBridgeDevice, openBridgeWorkbench, saveBridgeDevice } from './bridge/workbench.ts'
 import { classifyPairing, pairBridge, parsePairPayload, parseUnifiedPairing } from './lib/bridge.ts'
 import { openQrScanner } from './lib/scanner.ts'
@@ -785,6 +789,7 @@ let historyStatus: HistoryStatus = 'loading'
 let historyItemCount = 0
 let historyError = ''
 let historyRequest = 0
+let sessionHistoryLimit = 20
 let olderRequest: object | null = null
 let sessionGeneration = 0
 let renderedSession = -1
@@ -815,6 +820,7 @@ async function openSession(deviceId: string, row: SessionRow): Promise<void> {
   state.historyCursor = null
   historyStatus = 'loading'
   historyItemCount = 0
+  sessionHistoryLimit = initialHistoryLimit(row.agent)
   historyRequest++
   sessionGeneration++
   olderRequest = null
@@ -879,8 +885,6 @@ async function openSession(deviceId: string, row: SessionRow): Promise<void> {
 function targetOf(row: SessionRow): Target {
   return { deviceId: row.deviceId, agent: row.agent, sessionId: row.sessionId }
 }
-
-const HISTORY_PAGE_LIMIT = 80
 
 export function historyToMessage(item: { kind: string; payload?: Record<string, unknown>; seq?: number; ts?: number }): Message | null {
   const payload = item.payload ?? {}
@@ -1165,7 +1169,11 @@ function appendDelta(id: string, role: Role, text: string, at: number): void {
   const body = node && node.querySelector('.msg-body')
   if (body && existing && transcript && node?.classList.contains('streaming')) {
     const follow = transcript.scrollHeight - transcript.clientHeight - transcript.scrollTop <= 24
-    body.textContent = existing.text
+    if (existing.role === 'assistant') {
+      body.replaceChildren(renderMarkdown(existing.text, markdownOptions))
+    } else {
+      body.textContent = existing.text
+    }
     if (follow) transcript.scrollTop = transcript.scrollHeight
   } else render()
 }
@@ -1184,12 +1192,18 @@ async function reloadTranscript(): Promise<void> {
   if (!api || !session) return
   const request = ++historyRequest
   const generation = sessionGeneration
+  const current = () => request === historyRequest && generation === sessionGeneration && state.api === api
   olderRequest = null
   historyStatus = 'loading'
   state.statusText = ''
   if (state.view === 'session') render()
-  const result = await api.history(targetOf(session), HISTORY_PAGE_LIMIT)
-  if (request !== historyRequest || generation !== sessionGeneration || state.api !== api) return
+  const { result, usedLimit } = await fetchHistoryAdaptive(
+    (limit) => api.history(targetOf(session), limit),
+    sessionHistoryLimit,
+    current,
+  )
+  if (!current()) return
+  sessionHistoryLimit = usedLimit
   if (result.ok) {
     historyItemCount = result.data.items.length
     state.messages = mergeTranscriptSnapshot(historyMessages(result.data.items), state.messages)
@@ -1209,6 +1223,7 @@ function bindHistoryScroll(transcript: HTMLElement): void {
   historyScrollPositions.set(transcript, transcript.scrollTop)
   let touchY: number | undefined
   const check = (gesture: { prevScrollTop?: number; deltaY?: number; touchPullDy?: number }) => {
+    if (historyLoadsForward(state.session?.agent)) return
     if (!transcript.isConnected || !shouldTriggerOlderHistory({ ...gesture, scrollTop: transcript.scrollTop,
       loading: olderRequest !== null || historyStatus === 'loading', hasCursor: Boolean(state.historyCursor) })) return
     touchY = undefined
@@ -1231,29 +1246,35 @@ async function loadOlder(): Promise<void> {
   const session = state.session
   const cursor = state.historyCursor
   if (!api || !session || !cursor || olderRequest || historyStatus === 'loading' || state.view !== 'session') return
+  const forward = historyLoadsForward(session.agent)
   const request = olderRequest = {}
   const generation = sessionGeneration
   const current = () => olderRequest === request && generation === sessionGeneration && state.api === api
   const indicator = rootNode().querySelector('.history-indicator')
-  if (indicator) indicator.textContent = '正在同步更早对话…'
+  if (indicator) indicator.textContent = forward ? '正在同步后续对话…' : '正在同步更早对话…'
   const loadMore = rootNode().querySelector<HTMLButtonElement>('.history-load-more')
   if (loadMore) loadMore.disabled = true
   let inserted = false
   try {
-    const result = await api.history(targetOf(session), HISTORY_PAGE_LIMIT, cursor)
+    const { result, usedLimit } = await fetchHistoryAdaptive(
+      (limit) => api.history(targetOf(session), limit, cursor),
+      sessionHistoryLimit,
+      current,
+    )
     if (!current()) return
+    sessionHistoryLimit = usedLimit
     if (!result.ok) {
       if (state.view === 'session') toast(result.message, 'error')
       return
     }
-    const older = historyMessages(result.data.items)
-    state.messages = mergeTranscriptSnapshot(older, state.messages, { prepend: true })
+    const pageItems = historyMessages(result.data.items)
+    state.messages = mergeTranscriptSnapshot(pageItems, state.messages, { prepend: !forward })
     const progress = historyPageProgress(cursor, result.data.nextCursor, result.data.completeness, visitedHistoryCursors)
     visitedHistoryCursors.add(cursor)
     state.historyCursor = progress.cursor
     reachedHistoryStart = progress.reachedStart
     historyPageNotice = progress.notice
-    inserted = true
+    inserted = !forward
   } finally {
     if (current()) {
       olderRequest = null
@@ -2168,19 +2189,32 @@ function chatIconButton(icon: string, label: string, action: () => void, props: 
   return node
 }
 
-async function copyReply(text: string): Promise<void> {
+async function copyReply(text: string, label = '已复制回复'): Promise<void> {
   try {
     await navigator.clipboard.writeText(text)
-    toast('已复制回复')
+    toast(label)
   } catch {
-    toast('无法访问剪贴板，可长按回复手动复制', 'error')
+    toast('无法访问剪贴板，可长按内容手动复制', 'error')
   }
+}
+
+const markdownOptions = {
+  onOpenLink: (url: string) => { void openExternal(url) },
+  onCopyCode: (code: string) => { void copyReply(code, '已复制代码') },
+}
+
+function markdownBodyNode(text: string): HTMLElement {
+  const node = el('div', { class: 'msg-body md-body' })
+  node.append(renderMarkdown(text, markdownOptions))
+  return node
 }
 
 function messageNode(message: Message): HTMLElement {
   const key = transcriptMessageKey(message)
   const cls = 'msg msg-' + message.role + (message.failed ? ' failed' : '') + (message.open ? ' streaming' : '')
-  const body = el('div', { class: 'msg-body', text: message.text })
+  const body = message.role === 'assistant'
+    ? markdownBodyNode(message.text)
+    : el('div', { class: 'msg-body', text: message.text })
   if (message.role === 'reason' || message.role === 'tool') {
     const isReason = message.role === 'reason'
     const label = el('span')
@@ -2435,21 +2469,26 @@ function sessionView(): Child[] {
     header,
     ...sessionStatChips(),
     cards.length > 0 ? el('div', { class: 'session-pending' }, ...cards.map(cardNode)) : null,
-    el('div', { class: 'transcript', tabindex: 0, 'aria-label': '对话记录' },
-      el('p', { role: 'status', class: 'history-indicator', text: olderRequest ? '正在同步更早对话…' : historyPageNotice || (reachedHistoryStart ? '已加载全部历史' : '') }),
-      state.historyCursor && !olderRequest && historyStatus !== 'loading'
-        ? button('加载更早对话', () => { void loadOlder() }, { type: 'button', class: 'history-load-more' })
-        : null,
-      ...state.messages.map(messageNode),
-      historyStatus === 'loading' ? el('p', { role: 'status', class: 'notice', text: '正在读取历史…' }) : null,
+    (() => {
+      const forward = historyLoadsForward(session.agent)
+      const loadMoreBtn = state.historyCursor && !olderRequest && historyStatus !== 'loading'
+        ? button(forward ? '加载后续对话' : '加载更早对话', () => { void loadOlder() }, { type: 'button', class: 'history-load-more' })
+        : null
+      return el('div', { class: 'transcript', tabindex: 0, 'aria-label': '对话记录' },
+        el('p', { role: 'status', class: 'history-indicator', text: olderRequest ? (forward ? '正在同步后续对话…' : '正在同步更早对话…') : historyPageNotice || (reachedHistoryStart ? '已加载全部历史' : '') }),
+        forward ? null : loadMoreBtn,
+        ...state.messages.map(messageNode),
+        forward ? loadMoreBtn : null,
+        historyStatus === 'loading' ? el('p', { role: 'status', class: 'notice', text: '正在读取历史…' }) : null,
       historyStatus === 'error' ? el('div', { class: 'card' },
         el('p', { role: 'status', class: 'banner error', text: historyError }),
         button('重试读取历史', () => { void reloadTranscript() }, { class: 'block' })) : null,
-      ...(!historyPageNotice && isWelcomeEmpty(historyStatus, historyItemCount, state.messages.length, Boolean(state.historyCursor)) ? [el('div', { class: 'chat-welcome card' },
-        el('h2', { text: '开始对话' }), ...WELCOME_STARTERS.map(starter => button(starter, () => {
-          draft = fillWelcomeStarter(input, starter)
-        })))] : []),
-    ),
+        ...(!historyPageNotice && isWelcomeEmpty(historyStatus, historyItemCount, state.messages.length, Boolean(state.historyCursor)) ? [el('div', { class: 'chat-welcome card' },
+          el('h2', { text: '开始对话' }), ...WELCOME_STARTERS.map(starter => button(starter, () => {
+            draft = fillWelcomeStarter(input, starter)
+          })))] : []),
+      )
+    })(),
     el('div', { class: 'session-composer' },
       ...attachmentChips,
       input,
@@ -3519,9 +3558,11 @@ function groupMessageNode(room: DiscussionRoom, message: DiscussionRoom['message
   const member = room.members.find((entry) => entry.id === message.author)
   const author = message.author === 'user' ? '我' : member ? member.name + ' · ' + member.model.agent : message.author
   const stateLabel = message.state === 'streaming' ? '正在生成' : message.state === 'failed' ? '失败' : ''
+  const isAssistant = message.author !== 'user' && message.state !== 'failed'
+  const bodyText = message.text || message.error || '（空）'
   return el('div', { class: 'msg ' + (message.author === 'user' ? 'msg-user' : message.state === 'failed' ? 'msg-system' : 'msg-assistant') },
     el('div', { class: 'msg-role', text: author + (stateLabel ? ' · ' + stateLabel : '') + (message.at ? ' · ' + formatTime(message.at) : '') }),
-    el('div', { class: 'msg-body', text: message.text || message.error || '（空）' }),
+    isAssistant && message.text ? markdownBodyNode(bodyText) : el('div', { class: 'msg-body', text: bodyText }),
   )
 }
 

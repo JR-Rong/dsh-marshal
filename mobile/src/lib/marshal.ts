@@ -161,7 +161,10 @@ export function describeFailure(error: ApiFailure, code?: string): string {
     case 'unreachable': return '连不上 Hub'
     case 'server': return 'Hub 返回异常'
     case 'malformed': return 'Hub 返回了无法解析的数据'
-    case 'rejected': return 'Hub 拒绝：' + (code ?? 'invalid')
+    case 'rejected':
+      return code === 'result-too-large'
+        ? '单条历史消息超过传输上限（1 MB），请换电脑端查看完整记录'
+        : 'Hub 拒绝：' + (code ?? 'invalid')
     case 'conflict': return '状态冲突：' + (code ?? 'conflict')
   }
 }
@@ -523,6 +526,7 @@ export class MarshalApi {
   async history(target: Target, limit = 40, cursor?: string): Promise<ApiResult<{ items: HistoryItem[]; completeness: string; nextCursor?: string }>> {
     const result = await this.request<{ result?: unknown }>('/marshal/api/history', {
       body: { target, limit, ...(cursor ? { cursor } : {}) },
+      timeoutMs: 25_000,
     })
     if (!result.ok) return result
     const payload = (result.data as { result?: unknown })?.result as Record<string, unknown> | undefined

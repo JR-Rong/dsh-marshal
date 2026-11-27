@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { ALL_DEVICES_ID, SESSION_PAGE_SIZE, matchSession, sliceSessions, sortSessions } from '../src/lib/sessions.ts'
-import { TOOL_OUTPUT_PREVIEW_LIMIT, extractPayloadText, historyToMessage } from '../src/lib/transcript.ts'
+import { TOOL_OUTPUT_PREVIEW_LIMIT, extractPayloadText, fetchHistoryAdaptive, historyLoadsForward, historyToMessage, initialHistoryLimit } from '../src/lib/transcript.ts'
 import type { SessionRow } from '../src/lib/marshal.ts'
 
 function row(partial: Partial<SessionRow> & Pick<SessionRow, 'sessionId'>): SessionRow {
@@ -110,4 +110,30 @@ test('transcript helper extracts tool.completed text/content blocks without [obj
 
   assert.equal(extractPayloadText({ cmd: 'git status' }).includes('git status'), true)
   assert.equal(extractPayloadText({ cmd: 'git status' }).includes('[object Object]'), false)
+})
+
+test('fetchHistoryAdaptive halves page size on result-too-large until it fits under 1 MiB', async () => {
+  const seen: number[] = []
+  const outcome = await fetchHistoryAdaptive(async (limit) => {
+    seen.push(limit)
+    if (limit > 5) return { ok: false, error: 'rejected', code: 'result-too-large' }
+    return { ok: true, items: ['a', 'b'] }
+  }, initialHistoryLimit('dsh'))
+  assert.deepEqual(seen, [20, 10, 5])
+  assert.equal(outcome.usedLimit, 5)
+  assert.equal(outcome.result.ok, true)
+
+  const nonSizeSeen: number[] = []
+  const otherErr = await fetchHistoryAdaptive(async (limit) => {
+    nonSizeSeen.push(limit)
+    return { ok: false, error: 'rejected', code: 'session-unknown' }
+  }, 40)
+  assert.deepEqual(nonSizeSeen, [40])
+  assert.equal(otherErr.result.ok, false)
+
+  assert.equal(initialHistoryLimit('dsh'), 20)
+  assert.equal(initialHistoryLimit('codex'), 40)
+  assert.equal(historyLoadsForward('dsh'), false)
+  assert.equal(historyLoadsForward('codex'), true)
+  assert.equal(historyLoadsForward('claude'), true)
 })

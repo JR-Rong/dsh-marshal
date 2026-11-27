@@ -11,6 +11,46 @@ export interface TranscriptMessage {
 export const TOOL_OUTPUT_PREVIEW_LIMIT = 8000
 export const TOOL_ARGS_PREVIEW_LIMIT = 2000
 
+/** DSH 的 limit 表示完整消息数（每条含多次工具调用），初始取 20 避开 1 MiB 帧上限；Codex/Claude 初始取 40。 */
+export function initialHistoryLimit(agent: string): number {
+  return agent === 'dsh' ? 20 : 40
+}
+
+export function nextSmallerHistoryLimit(current: number): number | null {
+  if (!Number.isFinite(current) || current <= 1) return null
+  return Math.max(1, Math.floor(current / 2))
+}
+
+/** Codex 与 Claude 历史分页是正序向后翻页，DSH 是倒序向前翻页。 */
+export function historyLoadsForward(agent?: string): boolean {
+  return agent === 'codex' || agent === 'claude'
+}
+
+export interface AdaptiveHistoryResult<T> {
+  result: T
+  usedLimit: number
+}
+
+/**
+ * 遇到 Hub/Node 返回 `result-too-large`（单页超过 1 MiB 协议帧上限）时自动减半重试：
+ * 20 → 10 → 5 → 2 → 1（或 40 → 20 → 10 → 5 → 2 → 1），保证大体积会话也能正常读取。
+ */
+export async function fetchHistoryAdaptive<T extends { ok: boolean; error?: string; code?: string }>(
+  fetchPage: (limit: number) => Promise<T>,
+  startLimit: number,
+  isCurrent: () => boolean = () => true,
+): Promise<AdaptiveHistoryResult<T>> {
+  let limit = Math.max(1, Math.floor(startLimit))
+  for (;;) {
+    const result = await fetchPage(limit)
+    if (result.ok || !isCurrent()) return { result, usedLimit: limit }
+    if (result.code !== 'result-too-large') return { result, usedLimit: limit }
+    const smaller = nextSmallerHistoryLimit(limit)
+    if (smaller === null) return { result, usedLimit: limit }
+    limit = smaller
+  }
+}
+
 /** 从纯文本、content block 数组或结构化对象里安全提取可读文本，避免出现 [object Object]。 */
 export function extractPayloadText(value: unknown): string {
   if (typeof value === 'string') return value
