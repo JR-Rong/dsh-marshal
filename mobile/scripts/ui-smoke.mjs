@@ -4,25 +4,14 @@
  * 用路由拦截伪造 Hub 接口、注入假 EventSource，验证
  * 配置 → 设备 → 会话 → 消息流 → 审批 → 控制项 整条链路。
  */
-import { createServer } from 'node:http'
-import { readFile, mkdir, writeFile } from 'node:fs/promises'
-import { existsSync } from 'node:fs'
-import { extname, join, resolve } from 'node:path'
-import { tmpdir } from 'node:os'
+import assert from 'node:assert/strict'
+import { mkdir, writeFile } from 'node:fs/promises'
+import { join, resolve } from 'node:path'
 
 const ROOT = resolve(import.meta.dirname, '..')
 const DIST = join(ROOT, 'dist')
-const SHOTS = join(ROOT, 'docs', 'screenshots')
-const PORT = 5189
-
-const MIME = {
-  '.html': 'text/html; charset=utf-8',
-  '.js': 'text/javascript; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.png': 'image/png',
-  '.svg': 'image/svg+xml',
-  '.json': 'application/json; charset=utf-8',
-}
+const SHOTS = join(ROOT, 'artifacts', 'ui-smoke')
+const HUB = 'https://hub.smoke.test'
 
 const devices = {
   devices: [
@@ -114,39 +103,24 @@ const inputs = {
   ],
 }
 
-function startServer() {
-  const server = createServer(async (req, res) => {
-    const url = new URL(req.url ?? '/', 'http://127.0.0.1')
-    const path = url.pathname === '/' ? '/index.html' : url.pathname
-    const file = join(DIST, path)
-    if (!file.startsWith(DIST) || !existsSync(file)) { res.writeHead(404).end('not found'); return }
-    const body = await readFile(file)
-    res.writeHead(200, { 'content-type': MIME[extname(file)] ?? 'application/octet-stream', 'cache-control': 'no-store' })
-    res.end(body)
-  })
-  return new Promise((resolveServer) => server.listen(PORT, '127.0.0.1', () => resolveServer(server)))
-}
-
 async function main() {
-  let playwright
-  try {
-    playwright = await import('playwright-core')
-  } catch {
-    console.log('未安装 playwright-core，跳过 UI 冒烟')
-    return
-  }
+  const { chromium } = await import('playwright-core')
   await mkdir(SHOTS, { recursive: true })
-  const server = await startServer()
-  const profilePath = join(tmpdir(), 'marshal-ui-profile-' + process.pid)
-  const context = await playwright.chromium.launchPersistentContext(profilePath, {
-    channel: 'chrome', headless: true, args: ['--no-sandbox', '--disable-gpu'],
+  const browser = await chromium.launch({
+    channel: 'chrome', args: ['--disable-breakpad', '--disable-crash-reporter'],
+  })
+  const context = await browser.newContext({
     viewport: { width: 390, height: 844 }, deviceScaleFactor: 3, isMobile: true, hasTouch: true,
     locale: 'zh-CN', colorScheme: 'dark',
   })
   context.setDefaultTimeout(8000)
   const step = (name) => console.log('  ·', name)
   const page = await context.newPage()
+  const button = (name) => page.getByRole('button', { name, exact: true })
+  const tab = (name) => page.locator('.tab-item', { has: page.getByText(name, { exact: true }) })
+  const category = (name) => page.getByRole('group', { name: '会话类型' }).getByRole('button', { name, exact: true })
   const errors = []
+  const commands = []
   page.on('pageerror', (error) => errors.push(String(error)))
 
   const cors = {
@@ -157,12 +131,24 @@ async function main() {
   }
   const json = (body) => ({ status: 200, headers: cors, contentType: 'application/json; charset=utf-8', body: JSON.stringify(body) })
 
-  await context.route('**/marshal/api/devices', (route) => route.fulfill(json(devices)))
+  await context.route('**/*', (route) => {
+    const url = new URL(route.request().url())
+    if (url.origin !== HUB) return route.abort()
+    if (url.pathname === '/') return route.fulfill({ path: join(DIST, 'index.html') })
+    if (/^\/assets\/[\w.-]+$/.test(url.pathname)) return route.fulfill({ path: join(DIST, url.pathname) })
+    return route.fulfill({ status: 404 })
+  })
+  await context.route(`${HUB}/marshal/api/devices`, (route) => route.fulfill(json(devices)))
+  await context.route(`${HUB}/marshal/api/pairing/redeem`, (route) =>
+    route.fulfill(json({ credential: 'mph1.ui-fixture-not-a-real-credential' })))
+  await context.route('**/marshal/api/board', (route) => route.fulfill(json({ tasks: [] })))
   await context.route('**/marshal/api/sessions**', (route) => {
     const deviceId = new URL(route.request().url()).searchParams.get('device')
     return route.fulfill(json({ sessions: sessions.sessions.filter((row) => row.deviceId === deviceId) }))
   })
   await context.route('**/marshal/api/history', (route) => route.fulfill(json(history)))
+  await context.route('**/marshal/api/roster', (route) => route.fulfill(json({ agents: [] })))
+  await context.route('**/marshal/api/watch', (route) => route.fulfill(json({ ok: true })))
   await context.route('**/marshal/api/inputs', (route) => route.fulfill(json(inputs)))
   await context.route('**/marshal/api/discussions**', async (route) => {
     const url = new URL(route.request().url())
@@ -218,6 +204,7 @@ async function main() {
 
   await context.route('**/marshal/api/command', async (route) => {
     const body = JSON.parse(route.request().postData() ?? '{}')
+    commands.push(body)
     console.log('    command →', body.op)
     if (body.op === 'controls') {
       return route.fulfill(json({ ok: true, status: 'accepted', result: { controls } }))
@@ -240,26 +227,15 @@ async function main() {
         this.onmessage = null
         this.onerror = null
         this.readyState = 1
-        const frames = [
-          { deviceId: 'mac-local', agent: 'dsh', sessionId: 'session-aaa', seq: 10, kind: 'turn.started', payload: {} },
-          { deviceId: 'mac-local', agent: 'dsh', sessionId: 'session-aaa', seq: 11, kind: 'message.delta', payload: { itemId: 'm1', text: '正在' } },
-          { deviceId: 'mac-local', agent: 'dsh', sessionId: 'session-aaa', seq: 12, kind: 'message.delta', payload: { itemId: 'm1', text: '处理你的请求…' } },
-          { deviceId: 'mac-local', agent: 'dsh', sessionId: 'session-aaa', seq: 13, kind: 'turn.completed', payload: { state: 'completed' } },
-        ]
-        let index = 0
-        this.timer = setInterval(() => {
-          if (index >= frames.length) { clearInterval(this.timer); return }
-          const frame = frames[index++]
-          this.onmessage?.({ data: JSON.stringify(frame) })
-        }, 120)
+        window.smokeStream = this
       }
       addEventListener() {}
-      close() { clearInterval(this.timer) }
+      close() {}
     }
     window.EventSource = FakeEventSource
   })
 
-  await page.goto('http://127.0.0.1:' + PORT + '/', { waitUntil: 'networkidle' })
+  await page.goto(HUB, { waitUntil: 'domcontentloaded' })
   await page.evaluate(() => { localStorage.clear(); localStorage.removeItem('dsh-marshal-mobile.bridge') })
   await page.reload({ waitUntil: 'networkidle' })
 
@@ -273,35 +249,58 @@ async function main() {
   await page.locator('input[type="password"]').first().fill('0123456789abcdef0123456789abcdef')
   await page.getByRole('button', { name: '保存并进入' }).click()
 
-  await page.getByText('本机 Mac').first().waitFor()
+  await tab('节点').click()
+  await page.locator('.name', { hasText: '本机 Mac' }).first().waitFor()
   step('设备列表')
   await page.screenshot({ path: join(SHOTS, '02-home.png') })
 
-  await page.locator('.device-head').first().click()
+  await tab('会话').click()
+  await page.getByRole('combobox', { name: '会话列表主机' }).selectOption('mac-local')
   await page.getByText('dsh-marshal手机端').first().waitFor()
   step('会话列表')
   await page.screenshot({ path: join(SHOTS, '03-sessions.png') })
 
-  await page.locator('.session').first().click()
+  await page.getByRole('button', { name: /dsh-marshal手机端/ }).click()
   await page.getByText('把手机端改成直连').waitFor()
   await page.getByText('是否继续执行构建？').waitFor()
+  await page.waitForFunction(() => typeof window.smokeStream?.onmessage === 'function')
+  for (const [seq, text] of [[11, '正在'], [12, '处理你的请求…']]) {
+    await page.evaluate(({ seq, text }) => window.smokeStream.onmessage({ data: JSON.stringify({
+      deviceId: 'mac-local', agent: 'dsh', sessionId: 'session-aaa', seq,
+      kind: 'message.delta', payload: { itemId: 'smoke-live', text },
+    }) }), { seq, text })
+    await page.locator('.transcript').getByText(seq === 11 ? text : '正在处理你的请求…', { exact: true }).waitFor()
+  }
   step('会话详情（历史 + 审批卡 + 流式）')
   await page.screenshot({ path: join(SHOTS, '04-session.png') })
 
   await page.locator('.ask .choice').first().click()
   await page.getByRole('button', { name: '提交' }).click()
+  await page.getByText('是否继续执行构建？').waitFor({ state: 'hidden' })
+  assert.equal(commands.find(command => command.op === 'answer')?.args.requestId, 'req-1')
   step('提交审批')
 
   // 全功能：选模型、选思考强度、上传附件后发送。
-  await page.locator('select[aria-label="本次发送模型"]').selectOption('deepseek-account/deepseek-v4-pro')
-  await page.locator('select[aria-label="本次发送思考强度"]').selectOption('high')
-  await page.locator('.composer-tools input[type=file]').setInputFiles({
-    name: 'notes.txt', mimeType: 'text/plain', buffer: Buffer.from('手机端 node 附件冒烟'),
+  await page.getByRole('button', { name: /^选择模型/ }).click()
+  await page.getByRole('dialog').getByRole('button', { name: /deepseek-v4-pro/i }).click()
+  await page.locator('.composer-effort').click()
+  // The accessible name also includes descriptive copy; match the label itself.
+  await page.getByRole('dialog').getByRole('button')
+    .filter({ has: page.getByText('高', { exact: true }) }).click()
+  await page.locator('input[data-attachment-picker="2"]').setInputFiles({
+    name: 'notes.txt', mimeType: 'text/plain', buffer: Buffer.alloc(256 * 1024 + 1, 'a'),
   })
-  await page.getByText('notes.txt').waitFor()
+  await page.getByText('notes.txt', { exact: true }).waitFor()
   await page.screenshot({ path: join(SHOTS, '05a-attach.png') })
-  await page.locator('.composer input').fill('继续')
-  await page.getByRole('button', { name: '发送' }).click()
+  await page.getByRole('textbox', { name: '消息', exact: true }).fill('继续')
+  const promptRequest = page.waitForRequest(request =>
+    request.url() === `${HUB}/marshal/api/command` && request.postDataJSON()?.op === 'prompt')
+  await button('发送消息').click()
+  const prompt = (await promptRequest).postDataJSON()
+  const uploads = commands.filter(command => command.op === 'upload').map(command => command.args)
+  assert.deepEqual(uploads.map(args => args.offset), [0, 256 * 1024])
+  assert.deepEqual(prompt.args.attachments, [uploads[0].id])
+  assert.deepEqual(prompt.args.options, { model: 'deepseek-account/deepseek-v4-pro', reasoning: 'high' })
   step('发送消息（模型/思考/附件）')
   await page.screenshot({ path: join(SHOTS, '05-chat.png') })
 
@@ -311,14 +310,13 @@ async function main() {
   step('控制项（模型目录 + 统计 + 未开放项）')
   await page.screenshot({ path: join(SHOTS, '06-controls.png') })
 
-  // 控制项 → 会话 → 会话列表 → 首页
-  await page.getByRole('button', { name: '返回' }).first().click()
-  await page.getByRole('button', { name: '返回' }).first().click()
-  await page.getByRole('button', { name: '返回' }).first().click()
-
-  // 群聊：先看未登录提示，再注入账号会话，验证列表、房间与发送。
-  await page.getByRole('button', { name: '群聊' }).click()
-  await page.getByText('需要账号 ticket').waitFor()
+  // 控制项 → 会话 → 会话列表
+  await page.locator('.topbar').getByRole('button', { name: '返回' }).click()
+  await page.locator('.topbar').getByRole('button', { name: '返回' }).click()
+  await category('工单群').click()
+  await page.getByText('请先扫描电脑配对码。').waitFor()
+  await category('Agent 群聊').click()
+  await page.getByText('需要手机配对凭证').waitFor()
   step('群聊未登录提示')
   await page.screenshot({ path: join(SHOTS, '09-groups-login.png') })
 
@@ -327,6 +325,7 @@ async function main() {
     const raw = localStorage.getItem(key)
     if (!raw) return
     const config = JSON.parse(raw)
+    config.token = 'mph1.ui-fixture-not-a-real-credential'
     config.account = {
       cookies: '__Host-marshal-session=smoke; __Host-marshal-csrf=smoke',
       csrf: 'smoke',
@@ -336,8 +335,8 @@ async function main() {
     localStorage.setItem(key, JSON.stringify(config))
   })
   await page.reload({ waitUntil: 'domcontentloaded' })
-  await page.getByText('本机 Mac').first().waitFor()
-  await page.getByRole('button', { name: '群聊' }).click()
+  await tab('会话').click()
+  await category('Agent 群聊').click()
   await page.getByText('手机端验收群').waitFor()
   step('群聊列表（ticket 会话）')
   await page.screenshot({ path: join(SHOTS, '10-groups.png') })
@@ -352,8 +351,9 @@ async function main() {
   await page.getByText('补充一条冒烟消息').waitFor()
   step('群聊发送')
 
-  await page.getByRole('button', { name: '房间列表' }).click()
-  await page.getByRole('button', { name: '新建' }).click()
+  await page.locator('.topbar').getByRole('button', { name: '返回' }).click()
+  await button('新建会话').click()
+  await button('继续选择群成员').click()
   await page.getByPlaceholder('群聊标题').fill('新建验收群')
   await page.getByPlaceholder('第一条消息：要讨论/执行什么？').fill('请核对手机端 node 的群聊创建链路')
   await page.getByRole('button', { name: /本机 Mac · DSH/ }).click()
@@ -368,9 +368,9 @@ async function main() {
   step('群聊创建完成')
   await page.screenshot({ path: join(SHOTS, '13-group-created.png') })
 
-  await page.getByRole('button', { name: '房间列表' }).click()
-  await page.getByRole('button', { name: '返回' }).first().click()
-  await page.getByRole('button', { name: '设置' }).click()
+  await page.locator('.topbar').getByRole('button', { name: '返回' }).click()
+  await tab('节点').click()
+  await button('设置').click()
   await page.getByText('安全').waitFor()
   step('设置')
   await page.screenshot({ path: join(SHOTS, '07-settings.png') })
@@ -384,31 +384,32 @@ async function main() {
   step('应用锁')
   await page.screenshot({ path: join(SHOTS, '08-lock-enabled.png') })
 
-  // 一键配对链接导入：清空本地配置，粘贴 marshal:// 深链，自动完成 Hub + 令牌配置。
+  // 旧明文令牌链接不再受理；用当前一次性配对码走确认与兑换流程。
   await page.evaluate(() => localStorage.clear())
   await page.reload({ waitUntil: 'domcontentloaded' })
   await page.getByText('连接电脑').waitFor()
   await page.locator('details.manual').evaluate((el) => { el.open = true })
   await page.getByText('连接调度中心').waitFor()
   await page.getByPlaceholder('marshal://open?hub=...&token=...').fill(
-    'marshal://open?hub=https%3A%2F%2Fhub.smoke.test&token=0123456789abcdef0123456789abcdef',
+    `marshal://pair?hub=${encodeURIComponent(HUB)}&code=smoke-code`,
   )
   await page.getByRole('button', { name: '一键导入配对链接' }).click()
-  await page.getByText('本机 Mac').first().waitFor()
+  await page.getByRole('dialog', { name: '确认配对' }).getByRole('button', { name: '继续' }).click()
+  await tab('节点').click()
+  await page.locator('.name', { hasText: '本机 Mac' }).first().waitFor()
   step('一键配对链接导入')
   await page.screenshot({ path: join(SHOTS, '14-onboard-import.png') })
 
-  await context.close()
-  server.close()
+  await browser.close()
 
   const report = { viewport: '390x844@3x', screens: 15, pageErrors: errors }
   await writeFile(join(SHOTS, 'smoke-report.json'), JSON.stringify(report, null, 2) + '\n')
   if (errors.length > 0) { console.error('页面报错：', errors); process.exitCode = 1; return }
-  console.log('UI 冒烟通过，截图见 docs/screenshots/')
+  console.log('UI 冒烟断言通过，pageErrors=0，截图见 artifacts/ui-smoke/')
 }
 
 main().catch((error) => {
   console.error(error)
   process.exitCode = 1
-  setTimeout(() => process.exit(1), 500)
+  process.exit(1)
 })

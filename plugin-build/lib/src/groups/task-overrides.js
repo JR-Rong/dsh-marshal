@@ -130,9 +130,45 @@ export function createTaskOverrides(file) {
             const found = entries.get(keyFor(source, taskId));
             return found ? { ...found } : undefined;
         },
+        hasExecutionOverride(source, taskId) {
+            const entry = entries.get(keyFor(source, taskId));
+            return Boolean(entry && ['title', 'description', 'prompt', 'attachments'].some(field => Object.hasOwn(entry, field)));
+        },
+        setPermissionBlocked(source, taskId, signal) {
+            const key = keyFor(source, taskId);
+            const prior = entries.get(key);
+            if (signal === undefined && !prior?.permissionBlock) return;
+            const next = { ...prior };
+            if (signal === undefined) delete next.permissionBlock;
+            else next.permissionBlock = { ...signal };
+            if (Object.keys(next).length) entries.set(key, next);
+            else entries.delete(key);
+            try { save(); }
+            catch (error) {
+                if (prior === undefined) entries.delete(key);
+                else entries.set(key, prior);
+                throw error;
+            }
+        },
+        setMetadata(source, taskId, metadata) {
+            const key = keyFor(source, taskId);
+            const prior = entries.get(key);
+            const next = { ...prior };
+            for (const field of ['cascadePath', 'links']) {
+                if (metadata[field] !== undefined) next[field] = structuredClone(metadata[field]);
+            }
+            entries.set(key, next);
+            try { save(); }
+            catch (error) {
+                if (prior === undefined) entries.delete(key);
+                else entries.set(key, prior);
+                throw error;
+            }
+        },
         set(source, taskId, patch = {}) {
             const key = keyFor(source, taskId);
-            const prev = entries.get(key) ?? {};
+            const prior = entries.get(key);
+            const prev = prior ?? {};
             const next = { ...prev };
             if ('title' in patch && typeof patch.title === 'string' && patch.title.trim() !== '') {
                 next.title = patch.title.trim();
@@ -152,7 +188,12 @@ export function createTaskOverrides(file) {
             }
             next.updatedAt = Date.now();
             entries.set(key, next);
-            save();
+            try { save(); }
+            catch (error) {
+                if (prior === undefined) entries.delete(key);
+                else entries.set(key, prior);
+                throw error;
+            }
             return { ...next };
         },
         applyTo(source, task) {
@@ -166,6 +207,9 @@ export function createTaskOverrides(file) {
             if (Array.isArray(ov.attachments)) {
                 if (ov.attachments.length === 0) delete merged.attachments;
                 else merged.attachments = ov.attachments.map(item => ({ ...item }));
+            }
+            for (const field of ['cascadePath', 'links']) {
+                if (ov[field] !== undefined) merged[field] = structuredClone(ov[field]);
             }
             if (typeof ov.updatedAt === 'number') {
                 merged.updatedAt = Math.max(Number(task.updatedAt ?? 0), ov.updatedAt);

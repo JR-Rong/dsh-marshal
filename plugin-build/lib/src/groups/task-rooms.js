@@ -3,7 +3,7 @@ import { TaskRoomBinding, TaskRoomEvent } from './task-room-store.js';
 import { taskError } from './pr-material.js';
 
 const pageBytes = 480 * 1024;
-export function createTaskRooms({ store, deviceId, hub, now = Date.now }) {
+export function createTaskRooms({ store, deviceId, hub, now = Date.now, eventBus }) {
     const moves = new Map();
     const request = input => {
         if (!hub) throw taskError('task-room-hub-unavailable', '此节点尚未连接可用的 Hub。');
@@ -50,17 +50,31 @@ export function createTaskRooms({ store, deviceId, hub, now = Date.now }) {
         }
         return active;
     };
+    // Only publish a cursor; consumers still fetch message content through the room API.
+    const emitMessage = (roomId, record) => {
+        eventBus?.emit('room.message', { roomId, seq: record.seq });
+        if (record.kind === 'status' && ['repeat-tool-reminder', 'TOOL_TIMEOUT', 'permission-blocked'].includes(record.phase)) {
+            eventBus?.emit('incidents.changed');
+        }
+    };
     const append = async (id, event) => {
         let room = store.get(id);
         if (!room) throw taskError('task-room-not-found', '此工单群由原设备管理。');
         const entry = TaskRoomEvent.parse({ id: randomUUID(), at: now(), ...event });
         if (room.storage === 'moving') room = await recover(room);
+        let result;
+        let inserted;
         if (room.storage === 'hub') {
-            const result = await request({ action: 'append', roomId: id, event: entry });
+            result = await request({ action: 'append', roomId: id, event: entry });
+            // Older Hubs do not report insertion; only publish if this advances our cursor.
+            inserted = result.inserted ?? (result.record.seq > store.get(id).lastSeq);
             store.refreshPointer(result.room);
-            return result.record;
+        } else {
+            result = store.appendWithStatus(id, entry);
+            inserted = result.inserted;
         }
-        return store.append(id, entry);
+        if (inserted) emitMessage(id, result.record);
+        return result.record;
     };
     const begin = async (id, runId, actor, reason, text) => {
         await append(id, { id: 'batch:' + runId, kind: 'batch', runId, actor, text, phase: reason });
@@ -113,6 +127,7 @@ export function createTaskRooms({ store, deviceId, hub, now = Date.now }) {
         },
         async remote(id, { runId, target, text, phase }) {
             const { record } = await request({ action: 'turn', roomId: id, runId, turnId: randomUUID(), target, phase, text });
+            emitMessage(id, record);
             return record.text;
         },
         append,

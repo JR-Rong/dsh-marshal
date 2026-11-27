@@ -285,6 +285,23 @@ describe('hub api endpoints', () => {
     expect(all.json<{ sessions: unknown[] }>().sessions).toHaveLength(1)
   })
 
+  it('会话索引按 updatedAt 倒序返回最新会话', async () => {
+    const { web: target, relay } = await start()
+    for (const [seq, agent, sessionId, updatedAt] of [
+      [2, 'dsh', 'oldest', 100],
+      [3, 'codex', 'newest', 300],
+      [4, 'claude', 'middle', 200],
+    ] as const) {
+      relay.publish({
+        v: 2, type: 'event', deviceId: 'mac', agent, sessionId, nodeEpoch: 'epoch-1',
+        seq, ts: updatedAt, kind: 'session.updated', payload: { running: false, updatedAt },
+      })
+    }
+    const sessions = await target.request('/marshal/api/sessions?device=mac', { headers: AUTH })
+    expect(sessions.json<{ sessions: { sessionId: string }[] }>().sessions.map(row => row.sessionId))
+      .toEqual(['newest', 'middle', 'oldest', 's1'])
+  })
+
   it('会话索引附带最近一次能力文档且不暴露未投影字段', async () => {
     const { web: target, relay } = await start()
     const before = await target.request('/marshal/api/sessions?device=mac', { headers: AUTH })

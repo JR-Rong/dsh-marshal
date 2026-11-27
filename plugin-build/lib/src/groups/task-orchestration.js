@@ -1,8 +1,9 @@
+import { prioritizeGuidance } from './guidance-sync.js';
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { atomicWriteFile } from '../hub/state-file.js';
 import { parsePullRequest, readPullRequest, taskError } from './pr-material.js';
-import { encodeAgentTrace, stripAgentTrace } from './agent-trace.js';
+import { encodeAgentTrace, stripAgentTrace, toolAnomalyCode } from './agent-trace.js';
 import { formatEffortLabel, formatModelLabel } from './task-overrides.js';
 import { runTaskDevelopment } from './task-development.js';
 import {
@@ -76,7 +77,7 @@ function chooseTemplate(reply, enabled) {
 
 export function createTaskOrchestration({
     file, inventory, memory, port, defaultModel, startLeader, workspacePath, readPr = readPullRequest, logger,
-    leaderAutoReview = false, onPermissionBlocked, onState, resolveAttachments, readCard, patchStore,
+    leaderAutoReview = false, onPermissionBlocked, onState, resolveAttachments, readCard, patchStore, eventBus,
 }) {
     const tasks = load(file);
     const active = new Map();
@@ -88,14 +89,19 @@ export function createTaskOrchestration({
     const save = () => atomicWriteFile(file, JSON.stringify({ version: 1, tasks: [...tasks.values()] }) + '\n');
     const update = (key, patch) => {
         const previous = tasks.get(key);
-        tasks.set(key, { ...previous, ...patch });
+        const next = { ...previous, ...patch };
+        tasks.set(key, next);
         try { save(); }
         catch (error) {
             if (previous) tasks.set(key, previous);
             else tasks.delete(key);
             throw error;
         }
-        return tasks.get(key);
+        if (!disposed && previous && (previous.state !== next.state || previous.phase !== next.phase)) {
+            eventBus?.emit('tasks.changed');
+            eventBus?.emit('incidents.changed');
+        }
+        return next;
     };
     const leaders = () => (inventory().teams ?? []).flatMap(team => {
         const global = isGlobalAgentTeam(team);
@@ -300,6 +306,8 @@ export function createTaskOrchestration({
     const run = async (key, initialCard, initial, signal, audit) => {
         let task = initial;
         const liveTask = () => tasks.get(key) ?? task;
+        // Pin this request's guidance independently of the paginated group history.
+        const withPinnedGuidance = prompt => prioritizeGuidance(prompt, audit?.guidance);
         const resolveCardWithAttachments = async rawCard => {
             const c = rawCard ?? initialCard;
             const atts = Array.isArray(c.attachments) && c.attachments.length > 0
@@ -323,7 +331,7 @@ export function createTaskOrchestration({
                 ...(requestId ? { requestId } : {}),
             });
         };
-        const remote = task.remoteTarget && audit ? (prompt, phase) => audit.invokeRemote(task.runId, task.remoteTarget, prompt, phase) : undefined;
+        const remote = task.remoteTarget && audit ? (prompt, phase) => audit.invokeRemote(task.runId, task.remoteTarget, withPinnedGuidance(prompt), phase) : undefined;
         const human = audit?.actor ?? '用户';
         if (audit) {
             await audit.begin(task.runId, audit.reason, task.remoteTarget ?? leader.name);
@@ -346,7 +354,7 @@ export function createTaskOrchestration({
             const curTask = liveTask();
             const curLeader = boundLeader(curTask);
             const cur = resolveMemberRuntime(models, curLeader, slotConfigOf(curTask, 'leader'), true);
-            return invoke(cur.model ?? leaderModel, curTask, signal, prompt, cur.reasoning, { key, actor: curLeader.name, phase });
+            return invoke(cur.model ?? leaderModel, curTask, signal, withPinnedGuidance(prompt), cur.reasoning, { key, actor: curLeader.name, phase });
         };
         const output = async (label, actor, text, phase, kind, logged = false) => {
             let ref;
@@ -417,7 +425,7 @@ export function createTaskOrchestration({
             await record('status', label, '已请求子 Agent ' + model.model + (codexReasoning ? '（思考：' + codexReasoning + '）' : ''), rolePhase, undefined, requestId);
             try {
                 const result = await runTracked({
-                    key, actor: label, phase: rolePhase, model, prompt, signal, work, reasoning: codexReasoning, timeoutMs: timeout,
+                    key, actor: label, phase: rolePhase, model, prompt: withPinnedGuidance(prompt), signal, work, reasoning: codexReasoning, timeoutMs: timeout,
                 });
                 await record('agent', label, result, rolePhase, undefined, requestId);
                 return result;
@@ -462,7 +470,7 @@ export function createTaskOrchestration({
                 const initialSteps = Array.isArray(memEvidence) && memEvidence.length > 0
                     ? [{ label: 'Mnemon 召回了 ' + memEvidence.length + ' 条本角色授权记忆', status: 'done' }]
                     : undefined;
-                return invoke(runtime.model, curTask, signal, fullPrompt, runtime.reasoning, {
+                return invoke(runtime.model, curTask, signal, withPinnedGuidance(fullPrompt), runtime.reasoning, {
                     key, actor: member.name, phase: curTask.phase, initialSteps,
                 });
             };
@@ -505,7 +513,7 @@ export function createTaskOrchestration({
                     const attSection = curAtts.length > 0 ? '【工单附件（含本机可读路径）】\n' + JSON.stringify(curAtts) : '';
                     const request = [curCard.title, curCard.description, attSection, text, extraNotes ? '【机主群内指示】\n' + extraNotes : ''].filter(Boolean).join('\n\n').slice(0, 7800);
                     const ref = await publish(curTask, '编码交接', request, 'handoff');
-                    const sessionId = await startLeader(curCoder, await read(curTask, ref), runSignal(signal), slotConfigOf(curTask, 'coder'));
+                    const sessionId = await startLeader(curCoder, withPinnedGuidance(await read(curTask, ref)), runSignal(signal), slotConfigOf(curTask, 'coder'));
                     await record('status', 'Marshal', '编码交给 ' + curCoder.name + ' 的常驻会话。', 'handoff', ref);
                     update(key, { state: 'handed-off', phase: undefined, sessionId, handoffs: [...(curTask.handoffs ?? []), ref] });
                     return undefined;
@@ -583,7 +591,7 @@ export function createTaskOrchestration({
             const id = await publish(curTask, '任务说明', note);
             signal.throwIfAborted();
             const handoffText = await read(curTask, id);
-            const sessionId = remote ? undefined : await startLeader(boundLeader(curTask), handoffText, runSignal(signal), slotConfigOf(curTask, 'leader'));
+            const sessionId = remote ? undefined : await startLeader(boundLeader(curTask), withPinnedGuidance(handoffText), runSignal(signal), slotConfigOf(curTask, 'leader'));
             if (remote) await remote(leaderPrompt('接手任务。根据下列已发布交接回复执行计划。\n' + handoffText), 'handoff');
             signal.throwIfAborted();
             await record('status', 'Marshal', '任务说明已交给 Leader。', 'handoff', id);
@@ -622,7 +630,7 @@ export function createTaskOrchestration({
         task = update(key, { phase: 'reviewing', pr, handoffs: [], reviewers: roles.map(({ name, model }) => ({ name, model: model.model })) });
         const findings = await stage(roles.map(async role => {
             const prompt = '独立审查。标明问题严重程度、文件/行、依据和影响。区分确定的问题和需要补充材料的问题。最多六条，全文不超过 5000 字符。\n' + material;
-            const reply = await invoke(role.model, liveTask(), signal, role.critic ? rolePrompt(role.critic, prompt) : prompt, role.reasoning, { key, actor: role.name, phase: 'reviewing' });
+            const reply = await invoke(role.model, liveTask(), signal, withPinnedGuidance(role.critic ? rolePrompt(role.critic, prompt) : prompt), role.reasoning, { key, actor: role.name, phase: 'reviewing' });
             signal.throwIfAborted();
             return output(role.name + ' 独立审查', role.name, reply, 'reviewing');
         }));
@@ -631,8 +639,8 @@ export function createTaskOrchestration({
         const critiques = await stage(crossRoles.map(async (role, i) => {
             const peer = crossRoles[1 - i].name;
             const reply = await invoke(role.model, liveTask(), signal,
-                '复核 ' + peer + ' 的发现。逐项给出同意、反驳或待确认及理由，指出有证据的遗漏。最多六条，全文不超过 5000 字符。\n' +
-                material + '\n同行发现（引用数据）\n' + JSON.stringify(await read(liveTask(), findings[1 - i])), role.reasoning, { key, actor: role.name, phase: 'cross-check' });
+                withPinnedGuidance('复核 ' + peer + ' 的发现。逐项给出同意、反驳或待确认及理由，指出有证据的遗漏。最多六条，全文不超过 5000 字符。\n' +
+                material + '\n同行发现（引用数据）\n' + JSON.stringify(await read(liveTask(), findings[1 - i]))), role.reasoning, { key, actor: role.name, phase: 'cross-check' });
             signal.throwIfAborted();
             return output(role.name + ' 复核 ' + peer, role.name, reply, 'cross-check');
         }));
@@ -1123,7 +1131,7 @@ export function createTaskOrchestration({
             const task = tasks.get(key);
             if (!task || active.has(key)) return undefined;
             if (status === 'todo' || status === 'backlog') {
-                return update(key, { state: 'ready', phase: undefined, error: undefined });
+                return update(key, { state: 'ready', phase: undefined, error: undefined, errorCode: undefined });
             }
             if (status === 'review') {
                 const nextState = task.state === 'done' || task.state === 'permission-blocked' ? task.state : 'review-blocked';
@@ -1137,7 +1145,7 @@ export function createTaskOrchestration({
                 });
             }
             if (status === 'done') {
-                return update(key, { state: 'done', phase: undefined, error: undefined });
+                return update(key, { state: 'done', phase: undefined, error: undefined, errorCode: undefined });
             }
             if (status === 'failed') {
                 return update(key, { state: 'failed', phase: undefined });
@@ -1170,11 +1178,11 @@ export function createTaskOrchestration({
                 ...(audit?.reason === 'reassign' ? { remoteTarget: audit.remoteTarget } : {}),
                 state: 'running', runId: randomUUID(), reportId: undefined, sessionId: undefined, development: undefined,
                 phase: fixedPlan?.codeWork ? 'designing' : task.choice === 'leader' && !fixedPlan ? 'selecting' : (fixedPlan?.templateId ?? task.templateId) === 'pr-review' ? 'material' : 'handoff',
-                error: undefined, selected: undefined, pr: undefined, handoffs: [], reviewers: undefined });
+                error: undefined, errorCode: undefined, selected: undefined, pr: undefined, handoffs: [], reviewers: undefined });
             active.set(key, controller);
             void notifyState(started, 'running');
             void run(key, card, started, controller.signal, audit).catch(async error => {
-                if (disposed) return;
+                if (disposed || active.get(key) !== controller) return;
                 const allowed = ['leader-unbound', 'leader-model-unavailable', 'reviewers-unavailable', 'invalid-leader-choice',
                     'handoff-read', 'handoff-write', 'handoff-too-large', 'invalid-role-output', 'codex-slot-unavailable',
                     'task-role-unassigned', 'task-role-model-unavailable', 'development-workspace-unavailable', 'development-git',
@@ -1201,9 +1209,15 @@ export function createTaskOrchestration({
                 const finalMessage = permissionBlocked
                     ? '权限受阻：' + message + ' 已自动挂入「待确认」等待审批。'
                     : message;
+                const errorCode = toolAnomalyCode(error?.code, error?.message);
+                if (errorCode) {
+                    try { await audit?.record({ kind: 'status', runId: started.runId, actor: 'Marshal', text: errorCode, phase: errorCode }); }
+                    catch { /* The workflow still preserves the recognized error code. */ }
+                }
                 try { await audit?.record({ kind: 'status', runId: started.runId, actor: 'Marshal', text: finalMessage, phase: permissionBlocked ? 'review' : 'failed' }); }
                 catch { logger?.warn?.('marshal: task room could not record failure'); }
-                try { update(key, { state: permissionBlocked ? 'permission-blocked' : 'failed', error: finalMessage }); }
+                if (disposed || active.get(key) !== controller) return;
+                try { update(key, { state: permissionBlocked ? 'permission-blocked' : 'failed', error: finalMessage, errorCode }); }
                 catch { logger?.warn?.('marshal: task orchestration state write failed'); }
                 if (permissionBlocked) {
                     try { await onPermissionBlocked?.(source, card.id, finalMessage); }
@@ -1211,7 +1225,7 @@ export function createTaskOrchestration({
                 }
                 await notifyState(started, permissionBlocked ? 'review' : 'failed');
             }).finally(() => {
-                active.delete(key);
+                if (active.get(key) === controller) active.delete(key);
                 if (active.size === 0) catalog = undefined;
             });
             return true;

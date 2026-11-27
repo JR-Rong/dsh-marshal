@@ -3,12 +3,10 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { runInNewContext } from 'node:vm';
 import { createAgentMemoryService, mountAgentMemory, resolveMemoryIdentity, resolveWorkspaceIdForCwd, workspaceKey } from '../lib/src/memory/agent-memory.js';
 import { parseDotEdges } from '../lib/src/memory/mnemon-native.js';
 import { createMemoryHttpAuth, hostIsLoopback } from '../lib/src/memory/http-auth.js';
-import { createMemoryBridge } from '../lib/src/superagent/memory.js';
-import { findMember, resolveAgentForTask } from '../lib/src/superagent/agents.js';
-import { defaultSettings } from '../lib/src/superagent/settings.js';
 import { parseModelJson, VerdictSchema } from '../lib/src/groups/task-plans.js';
 import { createTaskOrchestration, isPermissionBlockedError } from '../lib/src/groups/task-orchestration.js';
 import { createWorkspaceRosters } from '../lib/src/groups/workspace-rosters.js';
@@ -18,36 +16,9 @@ import { memoryTargetAllowed } from '../lib/src/memory/http-auth.js';
 import { parseConfig } from '../lib/src/config.js';
 import { createLocalBoard } from '../lib/src/groups/local-board.js';
 import { detectAmbiguousTask } from '../lib/src/groups/mount.js';
-import { createSuperagentBridge, mountSuperagent } from '../lib/src/superagent/mount.js';
-import { agentsFixture, createFakeBoard, createFakeContext, createFakeMemory, loggerFixture, memberFixture, taskFixture } from './superagent-support.js';
 
 const tempRoot = () => mkdtempSync(join(tmpdir(), 'marshal-pr7-fixes-'));
 const mnemonBin = process.env.MARSHAL_TEST_MNEMON;
-
-test('superagent memory bridge never leaks private or never-group memories onto shared board cards', async (t) => {
-    const root = tempRoot();
-    const service = createAgentMemoryService({
-        root,
-        ...(mnemonBin ? { mnemonPilot: { agentId: 'agent-a', executable: mnemonBin } } : {}),
-    });
-    t.after(() => { service.store.close(); rmSync(root, { recursive: true, force: true }); });
-
-    await service.rememberFor({ agentId: 'agent-a', workspaceId: 'ws-1', scope: 'agent', title: 'Secret Key', text: 'PRIVATE_TOKEN_XYZ', visibility: 'private' });
-    await service.rememberFor({ agentId: 'agent-a', workspaceId: 'ws-1', scope: 'agent', title: 'Never Group', text: 'NEVER_GROUP_SECRET', visibility: 'never-group' });
-    await service.rememberFor({ agentId: 'agent-a', workspaceId: 'ws-1', scope: 'agent', title: 'Shared Checklist', text: 'SAFE_CHECKLIST_ITEM', visibility: 'group-safe' });
-    await service.rememberFor({ agentId: 'agent-a', workspaceId: 'ws-2', scope: 'workspace', title: 'Other Workspace', text: 'OTHER_WS_ITEM', visibility: 'group-safe' });
-    if (mnemonBin) {
-        await service.rememberFor({ agentId: 'agent-a', workspaceId: 'ws-2', scope: 'agent', title: 'Other Workspace Private', text: 'OTHER_WS_MNEMON_ITEM', visibility: 'group-safe' });
-    }
-
-    const bridge = createMemoryBridge(service);
-    const recalled = await bridge.recall({ agentId: 'agent-a', workspaceId: 'ws-1', text: 'Secret Key Never Group Shared Checklist Other Workspace', limit: 6 });
-    assert.doesNotMatch(recalled.text, /PRIVATE_TOKEN_XYZ/);
-    assert.doesNotMatch(recalled.text, /NEVER_GROUP_SECRET/);
-    assert.doesNotMatch(recalled.text, /OTHER_WS_ITEM/);
-    if (mnemonBin) assert.doesNotMatch(recalled.text, /OTHER_WS_MNEMON_ITEM/);
-    assert.match(recalled.text, /SAFE_CHECKLIST_ITEM/);
-});
 
 test('memory http-auth requires connection admission for desktop mode and blocks DNS rebinding Host headers', async () => {
     assert.equal(hostIsLoopback('127.0.0.1:53478'), true);
@@ -142,18 +113,9 @@ test('Mnemon native updates metadata on duplicate content and injects pinned pro
     assert.match(prompt, /先跑回归再打包/);
 });
 
-test('parseModelJson tolerates prose around JSON fences and superagent disambiguates duplicate names by workspace', () => {
+test('parseModelJson tolerates prose around JSON fences', () => {
     const wrapped = '审查结论如下：\n```json\n{"verdict":"pass","findings":"ok"}\n```\n以上。';
     assert.deepEqual(parseModelJson(wrapped, VerdictSchema), { verdict: 'pass', findings: 'ok' });
-
-    const members = [
-        { id: 'm1', name: '丞相', teamId: 't1', teamWorkspaceId: 'ws-1', legacy: false },
-        { id: 'm2', name: '丞相', teamId: 't2', teamWorkspaceId: 'ws-2', legacy: false },
-    ];
-    assert.equal(findMember(members, '丞相'), undefined);
-    assert.equal(findMember(members, '丞相', 'ws-2')?.id, 'm2');
-    const resolved = resolveAgentForTask({ id: 'card-1', workspaceId: 'ws-2', tags: [{ name: '@丞相' }] }, defaultSettings(), members);
-    assert.equal(resolved.member?.id, 'm2');
 });
 
 test('task orchestration matches bare model ids and clips oversize handoffs instead of failing', async (t) => {
@@ -176,57 +138,31 @@ test('task orchestration matches bare model ids and clips oversize handoffs inst
     assert.equal(rec.plan.templateId, 'report');
 });
 
-test('shipped client keeps plain card create/run working and sends auth for taskRoom cards', () => {
+test('shipped Hub kanban creates plain cards and authenticates create and run requests', () => {
     const source = readFileSync(new URL('../client/index.js', import.meta.url), 'utf8');
-    assert.ok(source.includes('if (leaderId && !workspace)'));
-    assert.ok(source.includes("fetchJson('marshal/tasks/run', { taskId: task.id }, Boolean(task.workflow || task.taskRoom))"));
-    assert.ok(source.includes("fetchJson('marshal/tasks/move', { taskId: task.id, status }, Boolean(task.workflow || task.taskRoom))"));
-    assert.ok(source.includes("fetchJson('marshal/tasks/delete', { taskId: task.id }, Boolean(task.workflow || task.taskRoom))"));
-    assert.ok(source.includes("!task.taskRoom?.closed && task.status !== 'running' && (!workflow || workflow.state !== 'done')"));
-    for (const [key, label] of [['backlog', '待规划'], ['todo', '待办'], ['running', '进行中'], ['review', '待确认'], ['done', '已完成'], ['failed', '已失败']]) {
-        assert.ok(source.includes("key: '" + key + "', label: '" + label + "'"), 'missing board column ' + key);
-    }
-    assert.ok(source.includes('--mtb-accent'), 'board should apply per-column theme accents');
-    assert.ok(source.includes('taskTagTone'), 'board should render colored tag and priority pills');
-    assert.ok(source.includes('mtb-drawer'), 'board should open a detail drawer on card click');
-    assert.ok(source.includes('mtb-tpl-pill'), 'create form should expose agent orchestration templates directly');
-    assert.ok(source.includes("fetchJson('marshal/tasks/set-parent'"), 'board should support linking subtasks');
-    assert.ok(source.includes("fetchJson('marshal/tasks/update'"), 'board should support editing tags and card details');
-    assert.ok(source.includes('--mtb-res-c'), 'bottom-left result badge should use high-contrast explicit dot + label-primary text');
-    assert.ok(source.includes('api/task-board/parse'), 'board should expose AI task draft parser modal');
-    assert.ok(source.includes('api/task-board/model-catalog'), 'board should load models and reasoning efforts');
-    assert.ok(source.includes('api/task-board/attachments/upload'), 'board should support optional attachment uploads');
-    assert.ok(source.includes('指派 Agent Leader'), 'board should support assigning an Agent Leader');
-});
-
-test('mountSuperagent adopts connection trust with only the real connection service (no connection.authentication)', async () => {
-    const context = createFakeContext({
-        taskBoard: createFakeBoard(),
-        memory: createFakeMemory(),
-        logger: loggerFixture(),
-        connection: {
-            requestRejection(req) {
-                return String(req.headers.cookie ?? '').includes('dsh-auth-live=ok') ? undefined : 401;
-            },
-        },
-    });
-    try {
-        mountSuperagent(context, { agents: ['dsh'] }, { root: tempRoot(), memory: createFakeMemory(), logger: context.logger, reconcileDelayMs: -1 });
-        const route = context.routes.find(item => item.path === '/api/marshal-superagent/human-create');
-        assert.ok(route);
-        const invoke = async headers => {
-            let status = 0;
-            const req = { method: 'POST', headers, socket: { remoteAddress: '127.0.0.1' }, async *[Symbol.asyncIterator]() { yield Buffer.from('{"taskId":"t1","source":"board-ui"}'); } };
-            const res = { writeHead(code) { status = code; }, end() {} };
-            await route.handler(req, res);
-            return status;
-        };
-        assert.equal(await invoke({ host: '127.0.0.1:56822', 'content-type': 'application/json' }), 403);
-        assert.notEqual(await invoke({ host: '127.0.0.1:56822', 'content-type': 'application/json', cookie: 'dsh-auth-live=ok' }), 403);
-    }
-    finally {
-        context.close();
-    }
+    const viewStart = source.indexOf('function MarshalHubKanbanView(');
+    const formStart = source.indexOf('function mvHubTicketForm(', viewStart);
+    const formEnd = source.indexOf('\n    }', formStart);
+    assert.ok(viewStart >= 0 && formStart > viewStart && formEnd > formStart);
+    const kanban = source.slice(viewStart, formStart);
+    const form = source.slice(formStart, formEnd);
+    assert.match(kanban, /label: '新建工单', onClick: \(\) => openForm\(\)/);
+    assert.match(kanban, /form && h\(mvHubTicketForm,/);
+    assert.match(form, /if \(!form\.task && !title\)/);
+    assert.match(form, /if \(\(form\.task \|\| isOrchestrated\) && \(!template \|\| !draft\.workspaceId \|\| !draft\.leaderId \|\| slots\.some\(role => role\.required && !draft\.members\[role\.id\]\)\)\)/);
+    assert.match(form, /mvHubSelect\('编排模板'[^\n]+\n\s*action\.busy, form\.task \? '选择模板' : '不启用编排'/);
+    assert.match(form, /mvHubSelect\('Leader 人选', draft\.leaderId, members,/);
+    assert.match(form, /fetchJson\('marshal\/tasks\/create', \{ title, description,\s+\.\.\.\(draft\.workspaceId \? \{ workspaceId: draft\.workspaceId \} : \{\}\), \.\.\.\(orchestration \? \{ orchestration \} : \{\}\),[\s\S]*?attachments: attachments\.map\(serializeAttachmentForWire\) \}, true, signal\)/);
+    assert.match(form, /h\(mvCascadePicker\.MarshalCascadeContextPicker,/);
+    assert.match(form, /checked: draft\.run[^\n]+创建后立即运行/);
+    assert.match(form, /!form\.task && draft\.run \? await fetchJson\('marshal\/tasks\/state', undefined, true, signal\)/);
+    assert.match(form, /if \(result\.movedToReview\) \{[^\n]+return; \}/);
+    assert.match(form, /const added = \(result\.tasks \?\? \[\]\)\.filter\(row => !known\.has\(row\.id\)\);\s+const created = added\.length === 1 && added\[0\];/);
+    assert.match(form, /if \(!created \|\| created\.title !== title \|\| mvHubWorkspace\(created\) !== draft\.workspaceId\) \{[^}]+return;/);
+    assert.match(form, /fetchJson\('marshal\/tasks\/run', \{ taskId: created\.id \}, true, signal\)/);
+    assert.match(kanban, /!task\.workflow && !mvHubIsLive\(task\) && mvHubLane\(task\) !== 'done' && h\(MvButton, \{[^}]+onClick: \(\) => mutate\('marshal\/tasks\/run', \{ taskId: task\.id \}\)/);
+    assert.match(kanban, /const mutate = \(path, body\) => action\.run\(async signal => \{\s+const result = await fetchJson\(path, body, true, signal\)/);
+    assert.match(kanban, /if \(path === 'marshal\/tasks\/run' && body\?\.taskId\) markBlocked\(body\.taskId, Boolean\(result\.permissionBlocked\)\)/);
 });
 
 test('local board supports moving tasks across all six columns including review', async (t) => {
@@ -364,15 +300,15 @@ test('global agents can orchestrate in any target project workspace while permis
 
 test('shipped client .19 delivers 4-tab nav, default tasks landing, dual casual-chat entry, rosters and 3-layer memory', () => {
     const source = readFileSync(new URL('../client/index.js', import.meta.url), 'utf8');
-    assert.ok(source.includes("['tasks', '任务看板']"), 'MarshalNav should list tasks tab');
-    assert.ok(source.includes("['chats', '会话']"), 'MarshalNav should list chats tab');
-    assert.ok(source.includes("['agents', '智能体']"), 'MarshalNav should list agents tab');
-    assert.ok(source.includes("['memory', '记忆']"), 'MarshalNav should list memory tab');
+    assert.ok(source.includes("['tasks', '工单看板']"), 'MarshalNav should list tasks tab');
+    assert.ok(source.includes("['monitor', '问题监控']"), 'MarshalNav should list monitor tab');
+    assert.ok(source.includes("['agents', '智能体与集群']"), 'MarshalNav should list agents tab');
+    assert.ok(source.includes("['memory', '3D 记忆星系']"), 'MarshalNav should list memory tab');
     assert.ok(source.includes("return { tab: 'tasks' };"), 'default landing tab should be tasks');
     assert.ok(source.includes('function AgentDirectChatsView'), 'chats tab should include direct casual chat history view');
     assert.ok(source.includes("fetchJson('marshal/agents/sessions')"), 'client should load agent casual chat history');
     assert.ok(source.includes("fetchJson('marshal/rosters/save'"), 'client should save workspace default rosters');
-    assert.ok(source.includes("fetchJson('marshal/devices/status')"), 'client should poll device status capsule');
+    assert.ok(source.includes("fetchJson('marshal/devices/status', undefined, true, signal)"), 'client should refresh authenticated device status');
     assert.ok(source.includes('全局记忆与审批') && source.includes('智能体私有记忆') && source.includes('工作区共享记忆'), 'MemoryPage should render 3 orthogonal layers');
     assert.ok(source.includes('isPseudoAgentWorkspace'), 'client should hide pseudo Agent · workspaces');
     assert.ok(!source.includes('自动创建「Agent · '), 'creating a new agent must no longer create pseudo Agent · workspaces');
@@ -460,12 +396,28 @@ test('memoryTargetAllowed admits owner real DSH workspaces even without pinned a
     assert.equal(memoryTargetAllowed(guestSession, { workspaceId: 'ws-foreign', scope: 'workspace' }, ledger, registered), true);
 });
 
-test('shipped client .20 exposes session rename/summarize, [GD-00001] ticket numbers, and board flow guide', () => {
+test('shipped client exposes session rename/summarize, [GD-00001] ticket numbers, and Hub kanban status routing', () => {
     const source = readFileSync(new URL('../client/index.js', import.meta.url), 'utf8');
     assert.ok(source.includes("fetchJson('marshal/agents/sessions/rename'"), 'client should allow renaming sessions');
     assert.ok(source.includes("fetchJson('marshal/agents/sessions/summarize'"), 'client should allow summarizing session titles');
     assert.ok(source.includes('task.ticketNo'), 'board should render GD ticket numbers');
-    assert.ok(source.includes('流转规则'), 'board should expose status transition guide');
+    const laneStart = source.indexOf('function mvHubLane(');
+    const laneEnd = source.indexOf('const mvHubIsLive', laneStart);
+    assert.ok(laneStart >= 0 && laneEnd > laneStart);
+    const laneFor = runInNewContext(source.slice(laneStart, laneEnd) + '\nmvHubLane');
+    for (const [task, lane] of [
+        [{ status: 'backlog' }, 'queued'],
+        [{ status: 'todo' }, 'queued'],
+        [{ status: 'running' }, 'running'],
+        [{ openExecution: true }, 'running'],
+        [{ status: 'review' }, 'review'],
+        [{ workflow: { state: 'review-blocked' } }, 'review'],
+        [{ status: 'failed' }, 'failed'],
+        [{ workflow: { state: 'permission-blocked' } }, 'failed'],
+        [{ status: 'done' }, 'done'],
+        [{ taskRoom: { closed: true } }, 'done'],
+    ]) assert.equal(laneFor(task), lane, JSON.stringify(task));
+    assert.match(source, /MV_HUB_LANES\.map\(\(\[id, label\]\) => \[id, label, visible\.filter\(row => mvHubLane\(row\) === id\)\]\)/);
 });
 
 
@@ -526,22 +478,27 @@ test('full-fleet Mnemon powers both agent and workspace scopes, migrates SQLite 
     assert.match(prompt, /奏对铁律|看板列宽|发版前必跑双测/);
 });
 
-test('shipped client .21 fixes MemoryPage realWorkspaces TDZ, wraps with ErrorBoundary, and enables TaskBoard horizontal scroll & collapse', () => {
+test('shipped client fixes MemoryPage realWorkspaces TDZ, wraps with ErrorBoundary, and ships the adaptive Hub kanban', () => {
     const source = readFileSync(new URL('../client/index.js', import.meta.url), 'utf8');
     const mpStart = source.indexOf('function MemoryPage(');
     const mpEnd = source.indexOf('function AgentDirectChatsView(', mpStart);
+    assert.ok(mpStart >= 0 && mpEnd > mpStart, 'MemoryPage must precede AgentDirectChatsView');
     const mpSrc = source.slice(mpStart, mpEnd);
     const declIdx = mpSrc.indexOf('const realWorkspaces = React.useMemo');
     const firstUseIdx = mpSrc.indexOf('realWorkspaces');
     assert.ok(declIdx > 0, 'realWorkspaces declaration should exist in MemoryPage');
     assert.equal(firstUseIdx, declIdx + 'const '.length, 'realWorkspaces must never be referenced before its declaration (TDZ bug)');
     assert.ok(source.includes('class MarshalErrorBoundary'), 'panel should wrap tabs in an ErrorBoundary');
-    assert.ok(source.includes('.mtb-page{flex:1;min-height:0;min-width:0;width:100%;overflow:hidden'), 'TaskBoard .mtb-page must constrain min-width: 0 for horizontal scroll');
-    assert.ok(source.includes('handleGridDragOver'), 'TaskBoard should auto-scroll horizontally while dragging cards');
-    assert.ok(source.includes('toggleCollapseCol'), 'TaskBoard should allow collapsing columns into vertical rails');
+    const kanban = source.slice(source.indexOf('function MarshalHubKanbanView('), source.indexOf('function mvHubTicketForm('));
+    assert.match(source, /const MV_HUB_LANES = \[\['queued', '[^']+'\], \['running', '[^']+'\], \['review', '[^']+'\], \['failed', '[^']+'\], \['done', '[^']+'\]\];/);
+    assert.match(kanban, /MV_HUB_LANES\.map/);
+    assert.match(kanban, /gridTemplateColumns: 'repeat\(auto-fit, minmax\(/);
+    assert.match(kanban, /mvHubSelect\('筛选工作区', scope, workspaceOptions, setScope/);
+    assert.match(kanban, /!scope \|\| scope === mvHubWorkspace\(row\)/);
+    assert.match(kanban, /'aria-label': '工单详情'/);
 });
 
-// --- .22 canonical workspace UUID, zero-duplication Mnemon, graph edges, cue HTTP, and TaskBoard drag-pan tests ---
+// --- .22 canonical workspace UUID, zero-duplication Mnemon, graph edges, cue HTTP, and Hub kanban tests ---
 test('resolveWorkspaceIdForCwd resolves registered workspace UUID, skips legacy Agent pseudo-workspaces, and falls back to workspaceKey', () => {
     const workspaces = [
         { id: 'ws-default-uuid', title: 'default-workspace', path: '/tmp/ws/default-workspace' },
@@ -638,105 +595,24 @@ test('full-fleet Mnemon eliminates SQLite duplicates, migrates legacy workspaceK
     assert.equal(stats[0].total, 1);
 });
 
-test('POST /marshal/memory/remember forwards cue and shipped client .22 exposes TaskBoard drag-pan, collapseEmptyCols & legacyReadOnly badge', () => {
+test('POST /marshal/memory/remember forwards cue and shipped client exposes live Hub kanban actions and the legacyReadOnly badge', () => {
     const httpSrc = readFileSync(new URL('../lib/src/memory/http.js', import.meta.url), 'utf8');
     const remIdx = httpSrc.indexOf("path: '/marshal/memory/remember'");
     assert.ok(remIdx > 0);
     assert.ok(httpSrc.slice(remIdx, remIdx + 1200).includes('cue: body.cue.trim()'), '/marshal/memory/remember must forward cue');
 
     const clientSrc = readFileSync(new URL('../client/index.js', import.meta.url), 'utf8');
-    assert.ok(clientSrc.includes('handleGridMouseDown'), 'TaskBoard should support drag-to-pan on empty grid canvas');
-    assert.ok(clientSrc.includes('handleGridWheel'), 'TaskBoard should support horizontal wheel scrolling');
-    assert.ok(clientSrc.includes('collapseEmptyCols'), 'TaskBoard should expose 1-click collapse empty columns');
-    assert.ok(clientSrc.includes('mtb-edge-pan-right'), 'TaskBoard should render right-edge quick jump cue');
+    const kanban = clientSrc.slice(clientSrc.indexOf('function MarshalHubKanbanView('), clientSrc.indexOf('function mvHubTicketForm('));
+    assert.match(kanban, /fetchJson\('marshal\/tasks\/update', \{ taskId: targetId, \.\.\.patch, steerNow: Boolean\(steerNow\)/);
+    assert.match(kanban, /label: '保存并立即插话发送'[^\n]*saveEdit\(true\)/);
+    assert.match(kanban, /label: '单次放行'[^\n]*\n\s*onClick: \(\) => mutate\('marshal\/tasks\/confirm-permission'/);
+    assert.match(kanban, /mvUseHubSnapshot\(MV_HUB_TASK_TOPICS, MV_HUB_KANBAN_READS\)/);
+    const snapshot = clientSrc.slice(clientSrc.indexOf('function mvUseHubSnapshot('), clientSrc.indexOf('function mvHubPlainNotice('));
+    assert.match(snapshot, /subscribeMarshalEvents\(topics, visible\.request,/);
     assert.ok(clientSrc.includes('legacyReadOnly'), 'Agent chat list should label cleaned legacy sessions as read-only archive');
 });
 
 // --- .23 universal todo auto-dispatch regardless of trigger source ---
-test('superagent auto-dispatches any todo card regardless of trigger source (tool, marshal UI, move from backlog) while skipping backlog/review/scheduled/already-recorded', async () => {
-    const dir = tempRoot();
-    const backlogCard = taskFixture({ id: 'card-backlog', title: '待规划卡', status: 'backlog', workspaceId: 'ws-canonical-1' });
-    const reviewCard = taskFixture({ id: 'card-review', title: '待确认卡', status: 'review' });
-    const scheduledCard = taskFixture({ id: 'card-sched', title: '定时卡', status: 'todo', schedule: { enabled: true, mode: 'cron', cron: '0 9 * * *' } });
-    const board = createFakeBoard({ tasks: [backlogCard, reviewCard, scheduledCard] });
-    // Extend fake board apply() to handle create & move like the real Host task board
-    const baseApply = board.apply;
-    const extraTasks = [backlogCard, reviewCard, scheduledCard];
-    const listeners = new Set();
-    const origSub = board.subscribe;
-    const origSnap = board.snapshot;
-    let customTasks = structuredClone(extraTasks);
-    const fakeBoard = {
-        ...board,
-        actions: [],
-        snapshot: () => ({ tasks: structuredClone(customTasks), sessionDefaultPermission: 'danger-full-access' }),
-        subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
-        async apply(requestId, action, initiator) {
-            fakeBoard.actions.push({ requestId, action, initiator });
-            if (action.kind === 'create') {
-                customTasks.push({
-                    id: action.id, status: 'todo', executions: [], createdAt: Date.now(), updatedAt: Date.now(),
-                    ...action.input,
-                });
-            } else if (action.kind === 'move') {
-                const t = customTasks.find(x => x.id === action.taskId);
-                if (t) { t.status = action.status; t.updatedAt = Date.now(); }
-            } else if (action.kind === 'update') {
-                const t = customTasks.find(x => x.id === action.taskId);
-                if (t) Object.assign(t, action.patch, { updatedAt: Date.now() });
-            } else if (action.kind === 'run') {
-                const t = customTasks.find(x => x.id === action.taskId);
-                if (t) {
-                    t.status = 'running';
-                    t.executions = [...t.executions, { id: 'exec-' + (t.executions.length + 1), startedAt: Date.now(), sessionId: 'sess-' + t.id }];
-                }
-            }
-            for (const fn of listeners) fn();
-            return fakeBoard.snapshot();
-        },
-        registerExtension: () => () => {},
-    };
-    const memory = createFakeMemory([{ id: 'm-ws', scope: 'workspace', ownerId: 'ws-canonical-1', title: '工作区规范', content: '使用规范 UUID', kind: 'fact' }]);
-    const memberNoWs = memberFixture({ id: 'cx-id', name: '丞相', teamWorkspaceId: undefined, brief: '你是丞相。' });
-    const bridge = createSuperagentBridge({
-        root: dir,
-        memory,
-        readAgents: () => agentsFixture([memberNoWs]),
-        logger: loggerFixture(),
-        reconcileDelayMs: 20,
-        trustedRequest: () => true,
-    });
-    try {
-        bridge.configure({ defaultAgent: '丞相' });
-        bridge.setBoard(fakeBoard);
-        await new Promise(r => setTimeout(r, 80));
-        // backlog, review, scheduled todo must NOT be dispatched
-        assert.equal(fakeBoard.actions.filter(a => a.action.kind === 'run').length, 0);
-
-        // 1. Card created directly via tool / Marshal UI (no browser hook!) -> auto-dispatched!
-        await fakeBoard.apply('r1', { kind: 'create', id: 'card-tool', input: { title: '工具建卡', description: '不经旧钩子', prompt: '执行任务', workspaceId: 'ws-canonical-1' } }, 'agent-tool');
-        await new Promise(r => setTimeout(r, 120));
-        assert.equal(customTasks.find(t => t.id === 'card-tool').status, 'running', 'todo card created from any source must auto-wake agent');
-        assert.equal(bridge.stateStore.get('card-tool').source, 'todo');
-        assert.equal(bridge.stateStore.get('card-tool').workspaceId, 'ws-canonical-1', 'card workspaceId must flow into superagent state & memory recall');
-        assert.ok(memory.recalls.some(q => q.scope === 'workspace' && q.workspaceId === 'ws-canonical-1'), 'workspace memory must be recalled from card workspaceId even when member has no teamWorkspaceId');
-
-        // 2. Backlog card moved to todo -> auto-dispatched!
-        await fakeBoard.apply('r2', { kind: 'move', taskId: 'card-backlog', status: 'todo' }, 'marshal');
-        await new Promise(r => setTimeout(r, 120));
-        assert.equal(customTasks.find(t => t.id === 'card-backlog').status, 'running', 'backlog card moved into todo must auto-wake agent');
-
-        // 3. Subsequent board changes must never double-dispatch already-running cards
-        await new Promise(r => setTimeout(r, 80));
-        assert.equal(fakeBoard.actions.filter(a => a.action.kind === 'run' && a.action.taskId === 'card-tool').length, 1);
-        assert.equal(fakeBoard.actions.filter(a => a.action.kind === 'run' && a.action.taskId === 'card-backlog').length, 1);
-    }
-    finally {
-        bridge.close();
-        rmSync(dir, { recursive: true, force: true });
-    }
-});
-
 test('groups/mount.js persists workspaceId on board create and task-development.js explains non-Git workspace errors clearly', () => {
     const gmSrc = readFileSync(new URL('../lib/src/groups/mount.js', import.meta.url), 'utf8');
     assert.ok(gmSrc.includes('cardWorkspaceId'), 'POST /marshal/tasks/create should persist workspaceId onto the task-board card');
@@ -744,14 +620,20 @@ test('groups/mount.js persists workspaceId on board create and task-development.
     assert.ok(devSrc.includes('不是 Git 仓库根目录'), 'task-development.js should clearly explain non-Git workspace errors');
 });
 
-test('task room client renders chat bubbles, smart Markdown/JSON code blocks, live sendChat, and dual-surface review controls', () => {
-    const clientSrc = readFileSync(new URL('../client/index.js', import.meta.url), 'utf8');
-    assert.ok(clientSrc.includes('function normalizeMessageMarkdown'), 'client should normalize raw JSON/diff/code into Markdown');
-    assert.ok(clientSrc.includes('function RichMarkdown'), 'client should render safe React GFM Markdown');
-    assert.ok(clientSrc.includes('mtr-bubble-agent') && clientSrc.includes('mtr-bubble-user'), 'task room should render left agent bubbles and right user bubbles');
-    assert.ok(clientSrc.includes('buildRoomColorMap'), 'task room should assign distinct per-agent bubble colors');
-    assert.ok(clientSrc.includes("fetchJson('marshal/tasks/confirm-review'"), 'board drawer should call unified confirm-review endpoint');
-    assert.ok(clientSrc.includes("fetchJson('marshal/tasks/revise'"), 'board drawer should call unified revise endpoint');
-    assert.ok(clientSrc.includes('const sendChat = async () =>'), 'task room should provide non-blocking live sendChat independent of workflow busy state');
-    assert.ok(clientSrc.includes('item.global || item.workspaceId === workspace'), 'task room leader picker should include global agents');
+test('vNext ticket conversation keeps Markdown, bubble roles, independent send and DAG review', () => {
+    const read = name => readFileSync(new URL(`../client/src/${name}.js`, import.meta.url), 'utf8');
+    const room = read('48-ticket-room-vnext');
+    const bubbles = read('40-groups');
+    const markdown = read('45-trace-and-markdown');
+    const dag = read('46-dag-sidebar');
+    assert.match(markdown, /const normalized = React.useMemo\(\(\) => normalizeMessageMarkdown\(text, phase\)/);
+    assert.match(bubbles, /h\(RichMarkdown, \{ text, phase \}/);
+    assert.match(room, /mine: record.kind === 'user', accent: colorMap.get\(record.actor\)/);
+    assert.match(bubbles, /marginInlineStart: mine \? 'var\(--mv-xl\)' : undefined/);
+    assert.match(bubbles, /marginInlineEnd: mine \? undefined : 'var\(--mv-xl\)'/);
+    assert.match(room, /buildRoomColorMap\(visible\?\.records, visible\?\.participants\)/);
+    assert.match(dag, /fetchJson\(action === 'confirm' \? 'marshal\/tasks\/confirm-review' : 'marshal\/tasks\/revise'/);
+    assert.match(room, /action !== 'send' && action !== 'revise' && locked/);
+    assert.match(room, /if \(text && !visible\?\.chatBusy\) return act\('send'/);
+    assert.match(room, /leaders.filter\(p => p.global \|\| p.workspaceId === workspace\)/);
 });

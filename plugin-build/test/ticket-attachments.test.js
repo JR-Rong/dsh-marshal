@@ -75,11 +75,13 @@ test('client/index.js snapshots FileList before clearing input.value and uses oc
     assert.equal(badPattern.test(source), false, 'must never assign live FileList and clear input.value before Array.from()');
 
     const safeMatches = source.match(/Array\.from\(\w+\.target\.files\s*\|\|\s*\[\]\);\s*\n\s*\w+\.target\.value\s*=\s*''/g) ?? [];
-    assert.ok(safeMatches.length >= 3, 'create form, detail drawer, and task room file inputs snapshot files before clearing value');
+    assert.ok(safeMatches.length >= 2, 'Marshal panel and cascade picker file inputs snapshot files before clearing value');
 
-    // Guard against black-screen regressions: no ensureBoardStyles typo, root & taskRoom ErrorBoundaries, and proper layout inject
-    assert.equal(source.includes('ensureBoardStyles('), false, 'must call ensureTaskBoardStyles(), never undefined ensureBoardStyles()');
-    assert.ok(source.includes("resetKey: 'taskRooms-'"), 'TaskRoomsPage must be wrapped in MarshalErrorBoundary');
+    // Guard against legacy board code and preserve the client lifecycle and error boundaries.
+    for (const legacy of ['ensureTaskBoardStyles(', 'ensureBoardStyles(', 'function TaskBoardPage(']) {
+        assert.ok(!source.includes(legacy), `bundle must not contain ${legacy}`);
+    }
+    assert.ok(source.includes("resetKey: 'taskRooms-'"), 'MarshalTicketRoomView must be wrapped in MarshalErrorBoundary');
     assert.ok(source.includes('SafeMarshalPanel'), 'MarshalPanel must be wrapped in SafeMarshalPanel root ErrorBoundary');
     assert.ok(source.includes("ctx.inject(['layout']"), 'must inject layout service via Cordis ctx.inject');
     assert.ok(source.includes("'marshal: client lifecycle'"), 'must dispose slots and intervals on client-hmr reload');

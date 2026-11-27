@@ -161,7 +161,10 @@ export function describeFailure(error: ApiFailure, code?: string): string {
     case 'unreachable': return '连不上 Hub'
     case 'server': return 'Hub 返回异常'
     case 'malformed': return 'Hub 返回了无法解析的数据'
-    case 'rejected': return 'Hub 拒绝：' + (code ?? 'invalid')
+    case 'rejected':
+      return code === 'result-too-large'
+        ? '单条历史消息超过传输上限（1 MB），请换电脑端查看完整记录'
+        : 'Hub 拒绝：' + (code ?? 'invalid')
     case 'conflict': return '状态冲突：' + (code ?? 'conflict')
   }
 }
@@ -295,8 +298,11 @@ export class MarshalApi {
       if (status === 403) {
         return {
           ok: false, error: 'unauthorized',
-          message: 'Hub 拒绝了 App 的来源（403）；请升级到 0.3.2+，或用带正确 Origin 的原生请求',
+          message: code === 'unsupported'
+            ? '节点拒绝读取该路径（受安全策略保护或未开启正文同步）'
+            : 'Hub 拒绝了 App 的来源（403）；请升级到 0.3.2+，或用带正确 Origin 的原生请求',
           status,
+          ...(code ? { code } : {}),
         }
       }
       const failure = statusFailure(status)
@@ -304,7 +310,7 @@ export class MarshalApi {
         return { ok: false, error: failure, message: describeFailure(failure, code), status, ...(code ? { code } : {}) }
       }
       if (status < 200 || status >= 300) {
-        return { ok: false, error: 'server', message: 'Hub 返回 ' + status, status }
+        return { ok: false, error: 'server', message: 'Hub 返回 ' + status, status, ...(code ? { code } : {}) }
       }
       return { ok: true, data: body as T }
     } catch (error) {
@@ -523,6 +529,7 @@ export class MarshalApi {
   async history(target: Target, limit = 40, cursor?: string): Promise<ApiResult<{ items: HistoryItem[]; completeness: string; nextCursor?: string }>> {
     const result = await this.request<{ result?: unknown }>('/marshal/api/history', {
       body: { target, limit, ...(cursor ? { cursor } : {}) },
+      timeoutMs: 25_000,
     })
     if (!result.ok) return result
     const payload = (result.data as { result?: unknown })?.result as Record<string, unknown> | undefined
@@ -533,6 +540,131 @@ export class MarshalApi {
         items,
         completeness: typeof payload?.completeness === 'string' ? String(payload.completeness) : 'unconfirmed',
         ...(typeof payload?.nextCursor === 'string' ? { nextCursor: payload.nextCursor } : {}),
+      },
+    }
+  }
+
+  /** 分片读取边缘主机上的文件/图片/视频（512 KiB/片）。 */
+  async artifact(
+    target: Target,
+    path: string,
+    offset = 0,
+    maxBytes = 524_288,
+  ): Promise<ApiResult<{
+    name: string
+    mime: string
+    kind: 'text' | 'image' | 'video' | 'audio' | 'pdf' | 'binary'
+    size: number
+    offset: number
+    bytes: number
+    eof: boolean
+    encoding: 'utf8' | 'base64'
+    data: string
+  }>> {
+    const result = await this.request<Record<string, unknown>>('/marshal/api/artifact', {
+      body: { target, path, offset, maxBytes },
+      timeoutMs: 25_000,
+    })
+    if (!result.ok) {
+      if (result.status === 404 && !result.code) {
+        return {
+          ...result,
+          code: 'hub-upgrade-required',
+          message: '当前云端 Hub 尚未升级到支持远程文件/媒体预览的版本（需 0.2.0-agent-groups.51+）',
+        }
+      }
+      if (result.code === 'record-unavailable') {
+        return { ...result, message: '电脑上未找到该文件（可能已移动或删除）' }
+      }
+      if (result.status === 413 || result.code === 'size-limit') {
+        return { ...result, message: '文件超过 50 MB 预览上限，请在电脑端打开查看' }
+      }
+      return result
+    }
+    const d = result.data
+    if (d?.ok !== true || typeof d.data !== 'string' || typeof d.name !== 'string' || typeof d.mime !== 'string') {
+      return { ok: false, error: 'malformed', message: '文件预览响应格式异常' }
+    }
+    const kind = (d.kind === 'text' || d.kind === 'image' || d.kind === 'video' || d.kind === 'audio' || d.kind === 'pdf')
+      ? d.kind : 'binary'
+    const encoding = d.encoding === 'utf8' ? 'utf8' : 'base64'
+    return {
+      ok: true,
+      data: {
+        name: d.name,
+        mime: d.mime,
+        kind,
+        size: typeof d.size === 'number' ? d.size : d.data.length,
+        offset: typeof d.offset === 'number' ? d.offset : offset,
+        bytes: typeof d.bytes === 'number' ? d.bytes : 0,
+        eof: d.eof === true,
+        encoding,
+        data: d.data,
+      },
+    }
+  }
+
+  /** 拉取完整远端文件/媒体并组装成文本或 Blob（支持进度回调与中断）。 */
+  async downloadArtifact(
+    target: Target,
+    path: string,
+    options: {
+      onProgress?: (loaded: number, total: number) => void
+      isAborted?: () => boolean
+    } = {},
+  ): Promise<ApiResult<{
+    name: string
+    mime: string
+    kind: 'text' | 'image' | 'video' | 'audio' | 'pdf' | 'binary'
+    size: number
+    text?: string
+    blob?: Blob
+    truncated?: boolean
+  }>> {
+    const first = await this.artifact(target, path, 0, 524_288)
+    if (!first.ok) return first
+    const head = first.data
+    options.onProgress?.(head.bytes, head.size)
+    if (head.encoding === 'utf8') {
+      let text = head.data
+      let offset = head.offset + head.bytes
+      let eof = head.eof
+      // Text preview reads up to 1.5 MiB (~3 chunks) so huge log files don't freeze mobile DOM.
+      const maxTextBytes = 1_572_864
+      while (!eof && offset < maxTextBytes) {
+        if (options.isAborted?.()) return { ok: false, error: 'timeout', message: '已取消加载' }
+        const next = await this.artifact(target, path, offset, 524_288)
+        if (!next.ok) return next
+        text += next.data.data
+        offset = next.data.offset + next.data.bytes
+        eof = next.data.eof
+        options.onProgress?.(offset, head.size)
+        if (next.data.bytes <= 0) break
+      }
+      return { ok: true, data: { name: head.name, mime: head.mime, kind: head.kind, size: head.size, text, truncated: !eof } }
+    }
+
+    const parts: BlobPart[] = [decodeBase64Chunk(head.data)]
+    let offset = head.offset + head.bytes
+    let eof = head.eof
+    while (!eof) {
+      if (options.isAborted?.()) return { ok: false, error: 'timeout', message: '已取消加载' }
+      const next = await this.artifact(target, path, offset, 524_288)
+      if (!next.ok) return next
+      if (next.data.bytes <= 0) break
+      parts.push(decodeBase64Chunk(next.data.data))
+      offset = next.data.offset + next.data.bytes
+      eof = next.data.eof
+      options.onProgress?.(offset, head.size)
+    }
+    return {
+      ok: true,
+      data: {
+        name: head.name,
+        mime: head.mime,
+        kind: head.kind,
+        size: head.size,
+        blob: new Blob(parts, { type: head.mime }),
       },
     }
   }
@@ -731,6 +863,15 @@ function bytesToBase64(bytes: Uint8Array): string {
     binary += String.fromCharCode(...bytes.subarray(index, index + step))
   }
   return btoa(binary)
+}
+
+function decodeBase64Chunk(encoded: string): Uint8Array<ArrayBuffer> {
+  const binary = atob(encoded)
+  const out = new Uint8Array(new ArrayBuffer(binary.length))
+  for (let index = 0; index < binary.length; index += 1) {
+    out[index] = binary.charCodeAt(index)
+  }
+  return out
 }
 
 async function sha256Hex(bytes: Uint8Array): Promise<string> {

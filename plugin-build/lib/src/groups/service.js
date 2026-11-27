@@ -60,7 +60,7 @@ function errorCode(error) {
     return 'internal-error';
 }
 
-export function createGroupService({ root, deviceId, store, inventory, prompt, reader, available, now = Date.now, idFactory, replyPollMs = 2500 } = {}) {
+export function createGroupService({ root, deviceId, store, inventory, prompt, reader, available, now = Date.now, idFactory, replyPollMs = 2500, eventBus } = {}) {
     if (store === undefined && root === undefined) {
         throw new Error('marshal: groups need a store or a root');
     }
@@ -69,6 +69,13 @@ export function createGroupService({ root, deviceId, store, inventory, prompt, r
     const isAvailable = typeof available === 'function' ? available : () => true;
     const watches = new Map();
     let disposed = false;
+    const notifyMessageChanged = () => {
+        if (!disposed) eventBus?.emit('groups.changed');
+    };
+    const markDelivery = (id, messageId, key, delivery) => {
+        groupStore.markDelivery(id, messageId, key, delivery);
+        notifyMessageChanged();
+    };
     const watchReplies = (groupId, member, baseline) => {
         if (disposed || reader === undefined || member.sessionId === undefined) return;
         const sessionId = member.sessionId;
@@ -102,7 +109,7 @@ export function createGroupService({ root, deviceId, store, inventory, prompt, r
                             authorDeviceId: member.deviceId,
                             source: { sessionId, seq: reply.seq },
                             text: reply.text.slice(0, 4000),
-                        });
+                        }, notifyMessageChanged);
                     }
                     watch.last = reply.seq;
                 }
@@ -216,7 +223,7 @@ export function createGroupService({ root, deviceId, store, inventory, prompt, r
             }
             const text = typeof input.text === 'string' ? input.text : '';
             const mentions = parseMentions(text);
-            const message = groupStore.appendMessage(id, { text, mentions, author: 'user' });
+            const message = groupStore.appendMessage(id, { text, mentions, author: 'user' }, notifyMessageChanged);
             const group = groupStore.get(id);
             const leader = leaderOf(group);
             // leader 所在设备离线时，整个群暂时不可用。
@@ -233,11 +240,11 @@ export function createGroupService({ root, deviceId, store, inventory, prompt, r
             const outcomes = await mapLimit(targets, CONCURRENCY, async (member) => {
                 const key = groupMemberKey(member);
                 if (isAvailable(member.deviceId) === false) {
-                    groupStore.markDelivery(id, message.id, key, { state: 'failed', code: 'unavailable' });
+                    markDelivery(id, message.id, key, { state: 'failed', code: 'unavailable' });
                     return { memberKey: key, state: 'failed', code: 'unavailable' };
                 }
                 if (member.sessionId === undefined) {
-                    groupStore.markDelivery(id, message.id, key, { state: 'failed', code: 'no-session' });
+                    markDelivery(id, message.id, key, { state: 'failed', code: 'no-session' });
                     return { memberKey: key, state: 'failed', code: 'no-session' };
                 }
                 try {
@@ -247,13 +254,13 @@ export function createGroupService({ root, deviceId, store, inventory, prompt, r
                         text,
                         requestId: randomUUID(),
                     });
-                    groupStore.markDelivery(id, message.id, key, { state: 'accepted' });
+                    markDelivery(id, message.id, key, { state: 'accepted' });
                     watchReplies(id, member, baseline);
                     return { memberKey: key, state: 'accepted' };
                 }
                 catch (error) {
                     const code = errorCode(error);
-                    groupStore.markDelivery(id, message.id, key, { state: 'failed', code });
+                    markDelivery(id, message.id, key, { state: 'failed', code });
                     return { memberKey: key, state: 'failed', code };
                 }
             });

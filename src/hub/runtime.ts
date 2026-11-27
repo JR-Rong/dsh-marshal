@@ -101,6 +101,7 @@ export function mountHub(webServer: WebServerLike, config: MarshalConfig, logger
         else if (frame.type === 'history.result') relay.settleHistory(frame, identity)
         else if (frame.type === 'command.status.result') relay.settleStatus(frame, identity)
         else if (frame.type === 'inputs.snapshot.result') relay.settleInputs(frame, identity)
+        else if (frame.type === 'artifact.result') relay.settleArtifact(frame, identity)
       },
     })
     disposers.push(() => socket.dispose())

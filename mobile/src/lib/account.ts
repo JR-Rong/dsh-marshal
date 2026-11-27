@@ -6,7 +6,8 @@
  * Cookie + x-marshal-csrf。仍然只是手机节点出站，不开任何端口。
  */
 import { Capacitor, CapacitorCookies, CapacitorHttp } from '@capacitor/core'
-import type { AccountSession } from './config.ts'
+import type { AccountSession, MarshalConfig } from './config.ts'
+import { removeConfig, updateConfig } from './storage.ts'
 import { randomUuid } from './marshal.ts'
 
 export type AccountFailure =
@@ -24,6 +25,78 @@ const CSRF_COOKIE = '__Host-marshal-csrf'
 export interface AccountLoginData extends AccountSession {
   accountHash?: string
   name?: string
+}
+
+export function createAccountLoginGuard(state: {
+  config: MarshalConfig | null; account: AccountSession | null; accountBusy: boolean
+}) {
+  let generation = 0
+  function invalidate() {
+    generation++
+    state.accountBusy = false
+  }
+  return {
+    invalidate,
+    adopt(next: MarshalConfig) {
+      if (state.config?.hubUrl !== next.hubUrl || state.config.token !== next.token) invalidate()
+      if (state.config?.hubUrl === next.hubUrl) return next
+      state.account = null
+      return { ...next, account: null }
+    },
+    save(patch: Partial<MarshalConfig>, initialize?: MarshalConfig) {
+      if ('hubUrl' in patch || 'token' in patch) invalidate()
+      return updateConfig(stored => {
+        const base = stored ?? initialize
+        if (!base) throw new Error('未找到本机配置')
+        const next = { ...base, ...patch, updatedAt: Date.now() }
+        if (next.hubUrl !== stored?.hubUrl) next.account = null
+        return next
+      })
+    },
+    async clear() {
+      invalidate()
+      await removeConfig()
+      invalidate()
+    },
+    begin(hubUrl: string) {
+      const request = ++generation
+      const current = () => request === generation && state.config?.hubUrl === hubUrl
+      async function persist(account: AccountSession) {
+        const stale = new Error('登录请求已失效')
+        let previousAccount: AccountSession | null = null
+        const saved = await updateConfig(stored => {
+          if (!current() || stored?.hubUrl !== hubUrl) throw stale
+          previousAccount = stored.account ?? null
+          return { ...stored, account, updatedAt: Date.now() }
+        }).catch(error => { if (error !== stale) throw error; return null })
+        if (!saved) return null
+        if (!current()) {
+          await updateConfig(stored => {
+            if (!stored || stored.hubUrl !== hubUrl) throw stale
+            if (JSON.stringify(stored.account ?? null) !== JSON.stringify(account)) return stored
+            return { ...stored, account: previousAccount, updatedAt: Date.now() }
+          }).catch(() => null)
+          return null
+        }
+        return saved
+      }
+      return { current, persist }
+    },
+    async logout() {
+      const { config, account } = state
+      invalidate()
+      state.account = null
+      if (!config) return
+      state.config = { ...config, account: null }
+      await Promise.all([
+        updateConfig(stored => {
+          if (!stored) throw new Error('未找到本机配置')
+          return stored.hubUrl === config.hubUrl ? { ...stored, account: null } : stored
+        }),
+        account && new AccountApi(config.hubUrl, account).logout(),
+      ])
+    },
+  }
 }
 
 export function describeAccountFailure(error: AccountFailure, code?: string): string {

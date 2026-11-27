@@ -6,6 +6,7 @@ import { parseCommandArgs } from "../wire/commands.js";
 import { PreCallRejection } from "../adapters/types.js";
 import { JournalError } from "./journal.js";
 import { createPrivacyProjector } from "./privacy.js";
+import { readArtifactChunk } from "./artifacts.js";
 /** 日志只留错误类型：原始 message 可能夹带会话正文或密钥。 */
 function errorClass(error) {
     return error instanceof Error && error.name !== '' ? error.name : 'error';
@@ -280,6 +281,10 @@ export function runCommand(link, adapter, follower, frame, deviceId, journal, no
     // 待答快照是只读控制帧，不是命令，也不能落 journal。
     if (frame.type === 'inputs.snapshot') {
         runInputsSnapshot(link, adapter, frame, deviceId, runtime);
+        return;
+    }
+    if (frame.type === 'artifact.read') {
+        runArtifactRead(link, frame, deviceId, project);
         return;
     }
     if (frame.type !== 'command')
@@ -663,12 +668,45 @@ export function runCommand(link, adapter, follower, frame, deviceId, journal, no
  * 按 target.agent 分派命令/状态/待答快照；未知 agent 不落 journal、不调用适配器，
  * 只用本帧的 agent 建一个 metadata 投影器回拒绝。任何发送失败都不得抛回宿主。
  */
+function runArtifactRead(link, frame, deviceId, project) {
+    const send = (payload) => {
+        try {
+            link.sendRaw(encodeFrame({ v: 2, type: 'artifact.result', requestId: frame.requestId, ...payload }));
+        }
+        catch { /* 帧超限或连接已断：调用方超时 */ }
+    };
+    if (bindingFor(link, frame) === undefined) {
+        send({ ok: false, code: 'stale-connection' });
+        return;
+    }
+    if (frame.target.deviceId !== deviceId) {
+        send({ ok: false, code: 'device-mismatch' });
+        return;
+    }
+    if (!project().content) {
+        send({ ok: false, code: 'unsupported' });
+        return;
+    }
+    const outcome = readArtifactChunk({
+        path: frame.path,
+        ...(frame.offset === undefined ? {} : { offset: frame.offset }),
+        ...(frame.maxBytes === undefined ? {} : { maxBytes: frame.maxBytes }),
+    });
+    send(outcome);
+}
 export function runRoutedCommand(link, routes, frame, deviceId, journal, now = Date.now) {
-    if (frame.type !== 'command' && frame.type !== 'command.status' && frame.type !== 'inputs.snapshot')
+    if (frame.type !== 'command' && frame.type !== 'command.status' && frame.type !== 'inputs.snapshot' && frame.type !== 'artifact.read')
         return;
     const route = routes.get(frame.target.agent);
     if (route !== undefined) {
         runCommand(link, route.adapter, route.follower, frame, deviceId, journal, now, route.runtime);
+        return;
+    }
+    if (frame.type === 'artifact.read') {
+        try {
+            link.sendRaw(encodeFrame({ v: 2, type: 'artifact.result', requestId: frame.requestId, ok: false, code: 'session-unknown' }));
+        }
+        catch { /* 连接已断 */ }
         return;
     }
     // 待答快照对未知 agent 只能沉默：hub 超时后按 unknown 收尾。

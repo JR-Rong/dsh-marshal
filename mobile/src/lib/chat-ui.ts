@@ -246,3 +246,37 @@ export function formatThoughtSummary(message: { open: boolean; at?: number; ende
     ? `已深度思考 ${Math.max(1, Math.round(elapsed / 1000))} 秒 ›`
     : '已深度思考 ›'
 }
+
+/** Authorization loss supersedes foreground work. */
+export function createGroupRequests(state: { groupBusy: boolean; room: unknown }, stopPolling: () => void) {
+  let generation = 0
+  function invalidate(): void {
+    generation++
+    state.groupBusy = false
+  }
+  return {
+    invalidate,
+    accept(result: { ok: boolean; error?: string; message?: string }, denied: (message: string) => void) {
+      if (!result.ok && result.error === 'unauthorized') {
+        state.room = null
+        invalidate()
+        stopPolling()
+        denied(result.message ?? '')
+        return false
+      }
+      return true
+    },
+    async run(work: (current: () => boolean) => Promise<void>, settled: () => void) {
+      const request = ++generation
+      const current = () => request === generation
+      state.groupBusy = true
+      try { await work(current) }
+      finally {
+        if (current()) {
+          state.groupBusy = false
+          settled()
+        }
+      }
+    },
+  }
+}

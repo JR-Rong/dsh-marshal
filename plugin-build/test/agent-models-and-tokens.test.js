@@ -486,11 +486,12 @@ test('full development + Codex sub-agent slot overrides (model + reasoningEffort
     });
 });
 
-test('shipped client/index.js renders per-agent model/thinking switchers in TaskBoardView and token badges in TaskRoomsPage, and interactive switching triggers /marshal/tasks/agent-configs', async () => {
+test('shipped client/index.js renders per-agent model/thinking switchers in TaskBoardView and token badges in MarshalTicketRoomView, and interactive switching triggers /marshal/tasks/agent-configs', async () => {
     const source = readFileSync(new URL('../client/index.js', import.meta.url), 'utf8');
 
     // Minimal stateful React hooks runtime to execute and inspect real component VDOM trees
     function createMiniReact() {
+        let nextId = 0;
         let currentHookIdx = 0;
         let currentInstance = null;
         const pendingEffects = [];
@@ -531,6 +532,13 @@ test('shipped client/index.js renders per-agent model/thinking switchers in Task
             useCallback(fn) {
                 currentHookIdx++;
                 return fn;
+            },
+            useId() {
+                const idx = currentHookIdx++;
+                return currentInstance.hooks[idx] ??= 'mini-' + nextId++;
+            },
+            useLayoutEffect(fn, deps) {
+                React.useEffect(fn, deps);
             },
             useEffect(fn, deps) {
                 const inst = currentInstance;
@@ -637,6 +645,7 @@ test('shipped client/index.js renders per-agent model/thinking switchers in Task
     const mockFetch = async (input, init) => {
         const u = typeof input === 'string' ? input : String(input?.href || input?.url || input);
         const method = String(init?.method || 'GET').toUpperCase();
+        if (u.endsWith('/marshal/setup')) return Response.json({ ok: true, ready: true });
         if (u.includes('marshal/memory/session')) {
             return new Response(JSON.stringify({ ok: true, csrf: 'csrf-ui' }), { status: 200 });
         }
@@ -766,6 +775,8 @@ test('shipped client/index.js renders per-agent model/thinking switchers in Task
         URL,
         URLSearchParams,
         Response,
+        AbortController,
+        TextDecoder,
         Blob,
         Intl,
         performance,
@@ -838,7 +849,7 @@ test('shipped client/index.js renders per-agent model/thinking switchers in Task
     const coderThinkSelect = byAria('Coder 思考模式');
     const reviewerModelSelect = byAria('Reviewer 模型');
     const reviewerThinkSelect = byAria('Reviewer 思考模式');
-    const codexCodeThinkSelect = byAria('⚙️ Codex · 编码执行子 Agent 思考模式');
+    const codexCodeThinkSelect = byAria('Codex · 编码执行子 Agent 思考模式');
 
     assert.ok(leaderModelSelect && leaderThinkSelect, 'Drawer must render Leader model & thinking mode switchers');
     assert.ok(coderModelSelect && coderThinkSelect, 'Drawer must render Coder model & thinking mode switchers');
@@ -862,7 +873,7 @@ test('shipped client/index.js renders per-agent model/thinking switchers in Task
         agentConfigs: { reviewer: { reasoningEffort: 'off' } },
     });
 
-    // 2. Click "进入工单群" button in Drawer to navigate to TaskRoomsPage and verify per-agent token badges render!
+    // 2. Click "进入工单群" button in Drawer to navigate to MarshalTicketRoomView and verify per-agent token badges render!
     const enterRoomBtn = collectAll(tree, n => n.tag === 'button' && textOf(n) === '进入工单群')[0];
     assert.ok(enterRoomBtn, 'Drawer must have 进入工单群 button');
     enterRoomBtn.props.onClick();
@@ -877,5 +888,5 @@ test('shipped client/index.js renders per-agent model/thinking switchers in Task
     assert.match(fullRoomText, /5\.4k tok \(入 4\.5k · 出 900\)/, 'Persisted 丞相 bubble must render formatted token badge');
     assert.match(fullRoomText, /2\.5k tok \(入 2\.1k · 出 400\)/, 'Live 工部尚书 bubble must render live token badge');
     assert.match(fullRoomText, /累计 7\.9k tok/, 'Room header must render cumulative token total across agents');
-    assert.match(fullRoomText, /@丞相· Leader· 🪙5\.4k/, '@角色 chip must display per-agent cumulative token count');
+    assert.match(fullRoomText, /@丞相\s*·\s*Leader\s*·\s*5\.4k/, '@角色 chip must display per-agent cumulative token count');
 });

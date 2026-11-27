@@ -32,11 +32,12 @@ export function parseRoomMentions(text) {
     return out;
 }
 
-export async function readOperatorNotes(rooms, roomId) {
+export async function readOperatorNotes(rooms, roomId, omitGuidance) {
     if (!rooms || !roomId) return '';
     try {
         const page = await rooms.page(roomId, { limit: 80 });
-        const items = (page.records ?? []).filter(r => r.kind === 'user' && r.phase !== 'brief');
+        const items = (page.records ?? []).filter(r => r.kind === 'user' && r.phase !== 'brief' &&
+            !(omitGuidance && r.phase === 'guidance' && r.text === omitGuidance));
         if (items.length === 0) return '';
         return items.slice(-12).map(r => '- [' + new Date(r.at).toISOString() + '] ' + r.text.trim()).join('\n').slice(-6000);
     } catch {
@@ -99,7 +100,7 @@ export function taskRoomAudit(rooms, room, reason, leader, remoteTarget, allowMe
 export function createTaskRoomRoutes({
     exact, write, readBody, authenticate, allowed, auth, rooms, orchestration, getBoard, boardSource, getInitiator,
     ticketNumbers, workspacePath, normalizeAttachments, resolveAttachments, surface, moveCardStatus,
-    getEffectiveCard, saveCardPromptOverride, launchPlainCardWithOverrides, patchStore, steerResidentSession,
+    getEffectiveCard, saveCardPromptOverride, launchPlainCardWithOverrides, patchStore, steerResidentSession, eventBus, clearPermissionBlock,
 }) {
     const viewRoom = room => visibleTaskRoom(room, ticketNumbers);
     const operations = new Set();
@@ -118,8 +119,14 @@ export function createTaskRoomRoutes({
         if (!rooms) throw unavailable();
         const access = authenticate(req, method === 'POST');
         if (!access.ok) { write(res, access.status, { ok: false, code: access.code }); return; }
-        const value = await callback(req, access);
+        let changed = false;
+        const value = await callback(req, access, () => { changed = true; });
         write(res, 200, { ok: true, ...value });
+        if (changed) {
+            // Message writes push their own cursor; room mutations can also affect the task view.
+            eventBus?.emit('tasks.changed');
+            eventBus?.emit('incidents.changed');
+        }
     });
     const readLocal = (id, access) => {
         const room = rooms.local(ROOM_ID.parse(id));
@@ -196,10 +203,9 @@ export function createTaskRoomRoutes({
             const card = rawCard && typeof getEffectiveCard === 'function' ? getEffectiveCard(room.source, rawCard) : rawCard;
             const mentions = parseRoomMentions(text);
             const mentionAll = mentions.some(m => m.toLowerCase() === 'all' || m === '所有人' || m === '全体');
-            const cardExecSessionId = Array.isArray(card?.executions)
-                ? [...card.executions].reverse().find(ex => typeof ex?.sessionId === 'string' && ex.sessionId !== '')?.sessionId
-                : undefined;
-            const residentSessionId = workflowView?.sessionId || (!workflowView ? (card?.sessionId || cardExecSessionId) : undefined);
+            const currentExecution = card?.executions?.at(-1);
+            const cardExecSessionId = currentExecution?.sessionId;
+            const residentSessionId = workflowView?.sessionId || (!workflowView ? (cardExecSessionId || (!currentExecution ? card?.sessionId : undefined)) : undefined);
             const residentOwnerName = workflowView?.leaderName || extractAgentTag(card) || '执行智能体';
             const targetsResident = Boolean(
                 !target
@@ -282,7 +288,7 @@ export function createTaskRoomRoutes({
         finally { chatOperations.delete(room.id); }
     };
 
-    const confirmReview = async ({ room, card, body, access, initiatorTag }) => {
+    const confirmReview = async ({ room, card, body, access, initiatorTag, guidance }) => {
         const source = room?.source ?? boardSource();
         if (room) assertIdle(room);
         else orchestration?.assertIdle(source, card.id);
@@ -335,6 +341,7 @@ export function createTaskRoomRoutes({
                 snapshot = await board.apply(randomUUID(), { kind: 'move', taskId: card.id, status: 'done' }, initiatorTag ?? ('marshal:' + getInitiator()));
             }
             orchestration?.syncStatus?.(source, card.id, 'done');
+            clearPermissionBlock?.(source, card.id);
             return {
                 snapshot,
                 patchApplied,
@@ -348,7 +355,7 @@ export function createTaskRoomRoutes({
         }
     };
 
-    const reviseTask = async ({ room: initialRoom, card, body, access, initiatorTag }) => {
+    const reviseTask = async ({ room: initialRoom, card, body, access, initiatorTag, guidance }) => {
         const source = initialRoom?.source ?? boardSource();
         const workflow = orchestration?.target(source, card.id);
         let room = initialRoom;
@@ -380,6 +387,7 @@ export function createTaskRoomRoutes({
             }
             const board = getBoard();
             let snapshot = board?.snapshot();
+            let woken = false;
             if (workflow) {
                 if (!orchestration) throw unavailable();
                 orchestration.cancel?.(source, card.id);
@@ -392,18 +400,30 @@ export function createTaskRoomRoutes({
                 }
                 const audit = room ? taskRoomAudit(rooms, room, 'revise', undefined, workflow.remoteTarget, member => allowed(access, member)) : undefined;
                 if (audit && seedPatch) audit.seedPatch = seedPatch;
-                orchestration.start(source, card, audit);
+                if (audit && guidance) audit.guidance = guidance;
+                const started = orchestration.start(source, card, audit);
+                if (guidance && audit && started) {
+                    // A new orchestration batch accepts the pinned guidance. Plain
+                    // host runs instead need the execution/session check below.
+                    const runId = orchestration.target(source, card.id)?.runId;
+                    woken = Boolean(runId && runId !== workflow.runId);
+                }
+                clearPermissionBlock?.(source, card.id);
                 if (board && card.status !== 'running') {
                     try {
                         snapshot = await board.apply(randomUUID(), { kind: 'move', taskId: card.id, status: 'running' }, initiatorTag ?? ('marshal:' + getInitiator()));
                     } catch { snapshot = board.snapshot(); }
                 }
             } else if (board) {
-                const notes = room ? await readOperatorNotes(rooms, room.id) : (feedbackText ? '- ' + feedbackText : '');
+                const notes = room ? await readOperatorNotes(rooms, room.id, guidance) : (feedbackText ? '- ' + feedbackText : '');
                 let nextPrompt;
-                if (notes) {
+                if (notes || guidance) {
                     const basePrompt = String(card.prompt || card.description || card.title || '').replace(/\n\n【机主补充修正意见】[\s\S]*$/, '');
-                    nextPrompt = (basePrompt + '\n\n【机主补充修正意见】\n' + notes).slice(0, 15_000);
+                    const heading = '\n\n【机主补充修正意见】\n';
+                    nextPrompt = guidance
+                        ? (basePrompt.slice(0, 15_000 - heading.length - guidance.length) + heading + guidance
+                            + (notes ? '\n\n' + notes : '')).slice(0, 15_000)
+                        : (basePrompt + heading + notes).slice(0, 15_000);
                     if (typeof saveCardPromptOverride === 'function') {
                         snapshot = await saveCardPromptOverride(source, card, nextPrompt, initiatorTag ?? ('marshal:' + getInitiator()));
                     } else {
@@ -414,13 +434,15 @@ export function createTaskRoomRoutes({
                     await rooms.begin(room.id, randomUUID(), 'Marshal', 'revise', '按群内修正意见重新启动工单执行');
                 }
                 if (typeof launchPlainCardWithOverrides === 'function') {
-                    snapshot = await launchPlainCardWithOverrides(source, card.id, initiatorTag ?? ('marshal:' + getInitiator()), nextPrompt);
+                    snapshot = await launchPlainCardWithOverrides(source, card.id, initiatorTag ?? ('marshal:' + getInitiator()), nextPrompt, guidance);
+                    woken = Boolean(guidance); // Guided launches resolve only after confirmation.
                 } else {
                     snapshot = await board.apply(randomUUID(), { kind: 'run', taskId: card.id }, initiatorTag ?? ('marshal:' + getInitiator()));
                 }
             }
             return {
                 snapshot,
+                ...(guidance ? { woken } : {}),
                 room: room ? viewRoom((await rooms.page(room.id, { limit: 1 })).room) : undefined,
             };
         }
@@ -474,8 +496,9 @@ export function createTaskRoomRoutes({
             const rawCard = origin ? getBoard()?.snapshot().tasks?.find(task => task.id === page.room.taskId) : undefined;
             const card = rawCard && typeof getEffectiveCard === 'function' ? getEffectiveCard(page.room.source, rawCard) : rawCard;
             const liveBubbles = origin ? [...(orchestration?.live?.(page.room.source, page.room.taskId) ?? [])] : [];
+            const currentExecution = card?.executions?.at(-1);
             const cardExecSessionId = Array.isArray(card?.executions)
-                ? [...card.executions].reverse().find(ex => typeof ex?.sessionId === 'string' && ex.sessionId !== '')?.sessionId
+                ? card.executions.findLast(ex => typeof ex?.sessionId === 'string' && ex.sessionId !== '')?.sessionId
                 : undefined;
             const residentSessionId = origin
                 ? (workflowView?.sessionId || (!workflowView ? (card?.sessionId || cardExecSessionId) : undefined))
@@ -490,6 +513,8 @@ export function createTaskRoomRoutes({
                     actor: workflowView?.leaderName || extractAgentTag(card) || '执行智能体',
                     runId: page.room.runId ?? workflowView?.runId,
                     workflowState: workflowView?.state,
+                    ...(currentExecution ? { startedAt: currentExecution.startedAt, endedAt: currentExecution.endedAt,
+                        captureIncidents: currentExecution.sessionId === residentSessionId } : {}),
                     onTurnCompleted: async (reason, lastText) => {
                         if (reason === 'completed') {
                             orchestration?.syncStatus?.(page.room.source, page.room.taskId, 'review', {
@@ -564,7 +589,7 @@ export function createTaskRoomRoutes({
             const room = readLocal(id, access);
             return { peers: await rooms.peers(room.workspaceId) };
         }),
-        route('POST', 'open', async (req, access) => {
+        route('POST', 'open', async (req, access, markChanged) => {
             const input = await readBody(req);
             const taskId = TaskRoomKey.parse(input.taskId);
             const source = boardSource();
@@ -581,22 +606,42 @@ export function createTaskRoomRoutes({
             const room = rooms.ensure(source, ticketNo ? { ...card, title: withTicketPrefix(ticketNo, card.title) } : card, workspaceId, access.session.ownerId);
             if (card.status === 'done') {
                 await rooms.append(room.id, { kind: 'closed', actor: 'Marshal', text: '工单已归档。' });
+            } else {
+                // An empty room has no append event yet; publish its initial cursor.
+                eventBus?.emit('room.message', { roomId: room.id, seq: room.lastSeq });
             }
+            markChanged();
             return { room: viewRoom(rooms.local(room.id)) };
         }),
-        route('POST', 'action', async (req, access) => {
+        route('POST', 'action', async (req, access, markChanged) => {
             const body = await readBody(req);
             const room = readLocal(body.roomId, access);
-            if (body.action === 'send') return send(room, body, access);
+            if (body.action === 'send') {
+                const result = await send(room, body, access);
+                markChanged();
+                return result;
+            }
             if (body.action === 'confirm') {
                 const card = getCard(getBoard(), room.taskId);
-                return confirmReview({ room, card, body, access });
+                const appliedAt = () => orchestration?.target(room.source, card.id)?.development?.appliedAt;
+                const previousAppliedAt = body.applyPatch === true ? appliedAt() : undefined;
+                const result = await confirmReview({ room, card, body, access });
+                const updatedCard = result.snapshot?.tasks?.find(task => task.id === card.id);
+                if (result.room?.lastSeq !== room.lastSeq || (updatedCard && updatedCard.status !== card.status)
+                    || result.patchApplied || result.committed || (result.patchAlreadyApplied && appliedAt() !== previousAppliedAt)) markChanged();
+                return result;
             }
             if (body.action === 'revise') {
                 const card = getCard(getBoard(), room.taskId);
-                return reviseTask({ room, card, body, access });
+                const result = await reviseTask({ room, card, body, access });
+                markChanged();
+                return result;
             }
-            if (body.action === 'retry' || body.action === 'reassign') return activeWorkflow(room, body, access, body.action);
+            if (body.action === 'retry' || body.action === 'reassign') {
+                const result = await activeWorkflow(room, body, access, body.action);
+                markChanged();
+                return result;
+            }
             if (!['close', 'reopen'].includes(body.action)) throw taskError('invalid-task-room', '工单群操作无效。');
             assertIdle(room);
             operations.add(room.id);
@@ -608,15 +653,16 @@ export function createTaskRoomRoutes({
                         kind: closing ? 'closed' : 'reopened', runId: current.runId, actor: '工单操作者',
                         text: closing ? '工单已关闭。群聊记录已归档。' : '工单已重开。',
                     });
+                    markChanged();
                 }
                 const board = getBoard();
-                if (board) {
-                    const card = board.snapshot().tasks?.find(task => task.id === room.taskId);
-                    if (closing && card && card.status !== 'done') {
-                        try { await board.apply(randomUUID(), { kind: 'move', taskId: card.id, status: 'done' }, 'marshal:' + getInitiator()); } catch {}
-                    } else if (!closing && card && card.status === 'done') {
-                        try { await board.apply(randomUUID(), { kind: 'move', taskId: card.id, status: 'review' }, 'marshal:' + getInitiator()); } catch {}
-                    }
+                const card = board?.snapshot().tasks?.find(task => task.id === room.taskId);
+                if (card && (card.status === 'done') !== closing) {
+                    const status = closing ? 'done' : 'review';
+                    try {
+                        const snapshot = await board.apply(randomUUID(), { kind: 'move', taskId: card.id, status }, 'marshal:' + getInitiator());
+                        if (snapshot?.tasks?.find(task => task.id === card.id)?.status === status) markChanged();
+                    } catch {}
                 }
                 return { room: viewRoom((await rooms.page(room.id, { limit: 1 })).room) };
             }

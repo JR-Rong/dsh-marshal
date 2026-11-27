@@ -303,7 +303,7 @@ export function createGroupStore({ root, now = Date.now, idFactory = randomUUID 
             persist();
             return clone(member);
         },
-        appendMessage(id, value) {
+        appendMessage(id, value, onInserted) {
             const group = requireGroup(id);
             const input = validateMessage(value);
             if (input.source !== undefined) {
@@ -321,6 +321,7 @@ export function createGroupStore({ root, now = Date.now, idFactory = randomUUID 
                 group.updatedAt = updatedAt;
                 throw error;
             }
+            onInserted?.();
             return clone(message);
         },
         markDelivery(id, messageId, key, delivery) {

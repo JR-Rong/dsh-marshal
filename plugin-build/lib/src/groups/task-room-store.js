@@ -114,6 +114,12 @@ export function createTaskRoomStore(file) {
         const records = rows.map(row => ({ ...JSON.parse(row.payload), seq: row.seq }));
         return { room, records, hasOlder: (records[0]?.seq ?? 1) > 1, hasNewer: (records.at(-1)?.seq ?? after ?? 0) < room.lastSeq };
     };
+    const appendWithStatus = (id, event) => tx(() => {
+        const room = requireRoom(id);
+        if (room.storage !== 'local' && room.storage !== 'hub') throw taskError('task-room-moving', '群聊正在转存，请稍后重试。');
+        const record = add(room, event);
+        return { record, inserted: record.seq > room.lastSeq };
+    });
 
     return {
         ensure(input, storage = 'local', remoteDeviceId) {
@@ -138,13 +144,8 @@ export function createTaskRoomStore(file) {
             return db.prepare('SELECT * FROM task_rooms WHERE owner_id=? AND workspace_id=? ORDER BY rowid DESC').all(ownerId, workspaceId).map(rowView);
         },
         page,
-        append(id, event) {
-            return tx(() => {
-                const room = requireRoom(id);
-                if (room.storage !== 'local' && room.storage !== 'hub') throw taskError('task-room-moving', '群聊正在转存，请稍后重试。');
-                return add(room, event);
-            });
-        },
+        append: (id, event) => appendWithStatus(id, event).record,
+        appendWithStatus,
         freeze(id, remoteDeviceId) {
             TaskRoomKey.parse(remoteDeviceId);
             return tx(() => {

@@ -146,8 +146,8 @@ export function createHubTaskRooms({ store, registry, deviceStore, inventories, 
                 return store.page(room.id, input);
             }
             if (input.action === 'append') {
-                const record = store.append(room.id, input.event);
-                return { record, room: store.get(room.id) };
+                const result = store.appendWithStatus(room.id, input.event);
+                return { ...result, room: store.get(room.id) };
             }
             return { record: await turn(room, input) };
         },

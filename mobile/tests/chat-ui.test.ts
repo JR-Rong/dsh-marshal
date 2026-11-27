@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { MarshalApi } from '../src/lib/marshal.ts'
 import { categorizeSession, filterSessionsByCategory, initialWizardState, moveWizardStep, selectWizardHost,
-  validateWizardState, WELCOME_STARTERS, sessionCenterRoute, groupBackCategory, roomRetryId,
+  validateWizardState, WELCOME_STARTERS, sessionCenterRoute, groupBackCategory, roomRetryId, createGroupRequests,
   beginCreateAttempt, finishCreateAttempt, canCloseCreateSheet, isWelcomeEmpty, isUnconfirmedEmpty,
   fillWelcomeStarter, shouldTriggerOlderHistory, preserveScrollAnchor, mergeTranscriptSnapshot,
   appendTranscriptDelta, historyPageProgress, buildEffortSheetOptions, formatThoughtSummary } from '../src/lib/chat-ui.ts'
@@ -209,3 +210,41 @@ test('thought summary distinguishes streaming, elapsed and saved completion time
   assert.equal(formatThoughtSummary({ open: false, endedAt: 1000 }), '已深度思考 ›')
   assert.equal(formatThoughtSummary({ open: false }), '已深度思考 ›')
 })
+
+for (const status of [401, 403]) for (const source of ['poll', 'send']) {
+  test(`${source} ${status}: room recovery`, async t => {
+    const room = { id: 'room' }
+    const state = { room, groupBusy: false }
+    let stopped = false
+    const requests = createGroupRequests(state, () => { stopped = true })
+    const api = new MarshalApi({ hubUrl: 'https://hub.example', token: 'mph1.test' })
+    const send = Promise.withResolvers<Response>()
+    const refresh = Promise.withResolvers<Response>()
+    const denied = new Response('{}', { status })
+    let response = send.promise
+    t.mock.method(globalThis, 'fetch', () => response)
+    const post = () => api.discussionAction({ action: 'send', roomId: room.id })
+    const accept = (result: { ok: boolean; error?: string }) => requests.accept(result, () => {})
+    const old = requests.run(async current => { const result = await post(); if (current()) accept(result) }, () => {})
+    if (source === 'poll') {
+      response = Promise.resolve(denied)
+      accept(await api.discussion(room.id))
+    } else { send.resolve(denied); await old }
+    assert.deepEqual(state, { room: null, groupBusy: false })
+    assert.ok(stopped)
+    response = refresh.promise
+    const retry = requests.run(async current => {
+      const result = await api.discussion(room.id)
+      assert.ok(current() && accept(result) && result.ok)
+      state.room = result.data
+    }, () => {})
+    send.resolve(Response.json({ room }))
+    await old
+    assert.equal(state.groupBusy, true)
+    refresh.resolve(Response.json({ room }))
+    await retry
+    assert.deepEqual(state, { room, groupBusy: false })
+    response = Promise.resolve(Response.json({ room }))
+    assert.ok((await post()).ok)
+  })
+}

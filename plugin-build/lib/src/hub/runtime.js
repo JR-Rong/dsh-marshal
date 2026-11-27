@@ -136,6 +136,8 @@ export function mountHub(webServer, config, logger) {
                     relay.settleStatus(frame, identity);
                 else if (frame.type === 'inputs.snapshot.result')
                     relay.settleInputs(frame, identity);
+                else if (frame.type === 'artifact.result')
+                    relay.settleArtifact(frame, identity);
             },
         });
         disposers.push(() => socket.dispose());

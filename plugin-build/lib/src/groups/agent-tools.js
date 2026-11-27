@@ -50,7 +50,8 @@ export function createAgentsHttpClient({ baseUrl, fetchImpl = fetch } = {}) {
         if (agent === undefined) throw new Error('agent-not-found');
         return agent;
     };
-    const chatMember = async (teamId, memberId, signal) => (await request('/dsh-agents/api/run', { teamId, memberId }, signal)).run;
+    const chatMember = async (teamId, memberId, signal, purpose) =>
+        (await request('/dsh-agents/api/run', { teamId, memberId, ...(purpose ? { purpose } : {}) }, signal)).run;
     return {
         async workspace(id, signal) {
             const state = await request('/dsh-agents/api/state', undefined, signal);
@@ -93,7 +94,7 @@ export function createAgentsHttpClient({ baseUrl, fetchImpl = fetch } = {}) {
         },
         async chat(memberId) {
             const agent = await findAgent(memberId);
-            return chatMember(agent.squadId, memberId);
+            return chatMember(agent.squadId, memberId, undefined, 'direct');
         },
     };
 }

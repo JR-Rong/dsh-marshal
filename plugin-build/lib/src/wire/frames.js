@@ -217,6 +217,31 @@ const InputsSnapshotResultSchema = z.object({
     highWatermark: z.number().int().nonnegative(),
     cards: z.array(z.unknown()),
 }).strict();
+const ArtifactReadSchema = z.object({
+    v: z.literal(2), type: z.literal('artifact.read'),
+    requestId: z.string().min(1),
+    target: TargetSchema,
+    path: z.string().min(1).max(4096),
+    offset: z.number().int().min(0).max(50 * 1024 * 1024).optional(),
+    maxBytes: z.number().int().min(1).max(524_288).optional(),
+    connectionId: z.string().min(1),
+    nodeEpoch: z.string().min(1),
+}).strict();
+const ArtifactResultSchema = z.object({
+    v: z.literal(2), type: z.literal('artifact.result'),
+    requestId: z.string().min(1),
+    ok: z.boolean(),
+    code: WireErrorCode.optional(),
+    name: z.string().max(260).optional(),
+    mime: z.string().max(120).optional(),
+    kind: z.enum(['text', 'image', 'video', 'audio', 'pdf', 'binary']).optional(),
+    size: z.number().int().nonnegative().optional(),
+    offset: z.number().int().nonnegative().optional(),
+    bytes: z.number().int().nonnegative().optional(),
+    eof: z.boolean().optional(),
+    encoding: z.enum(['utf8', 'base64']).optional(),
+    data: z.string().max(750_000).optional(),
+}).strict();
 const HeartbeatSchema = z.object({
     v: z.literal(2), type: z.literal('heartbeat'),
     nonce: z.string().min(1),
@@ -281,14 +306,15 @@ export const FrameSchema = z.discriminatedUnion('type', [
     SyncBeginSchema, SyncChunkSchema, SyncEndSchema, SyncAckSchema,
     CommandStatusSchema, CommandStatusResultSchema,
     InputsSnapshotSchema, InputsSnapshotResultSchema,
+    ArtifactReadSchema, ArtifactResultSchema,
     HeartbeatSchema, HeartbeatAckSchema,
 ]);
 const NODE_TO_HUB = new Set([
     'hello', 'event', 'history.result', 'sync.begin', 'sync.chunk', 'sync.end',
-    'ack', 'command.status.result', 'inputs.snapshot.result', 'discussion.catalog', 'discussion.result', 'discussion.progress', 'device.inventory',
+    'ack', 'command.status.result', 'inputs.snapshot.result', 'artifact.result', 'discussion.catalog', 'discussion.result', 'discussion.progress', 'device.inventory',
 ]);
 const HUB_TO_NODE = new Set([
-    'hello.ack', 'command', 'sync.ack', 'command.status', 'inputs.snapshot',
+    'hello.ack', 'command', 'sync.ack', 'command.status', 'inputs.snapshot', 'artifact.read',
 ]);
 export function directionOf(frame) {
     if (frame.type === 'heartbeat' || frame.type === 'heartbeat.ack')

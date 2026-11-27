@@ -42,8 +42,15 @@ function unavailable(res) {
  * Global approval and direct global edits are owner-only. Browser writes check
  * the CSRF cookie and header. The native DSH proxy uses proof headers instead.
  */
-export function createMemoryRoutes({ memory, auth, allowedOrigins } = {}) {
+export function createMemoryRoutes({ memory, auth, allowedOrigins, eventBus } = {}) {
     const origins = () => typeof allowedOrigins === 'function' ? allowedOrigins() : allowedOrigins;
+    const writeChanged = (res, value, changed = true) => {
+        write(res, 200, value);
+        if (changed) {
+            eventBus?.emit('memory.changed');
+            eventBus?.emit('incidents.changed');
+        }
+    };
     const guard = (writeNeeded, handler, { owner = false, target = false } = {}) => async (req, res) => {
         if (memory === undefined || auth === undefined) { unavailable(res); return; }
         const authn = auth.authenticate(req, { write: writeNeeded, origins: origins() });
@@ -108,7 +115,7 @@ export function createMemoryRoutes({ memory, auth, allowedOrigins } = {}) {
                     ...(typeof body.visibility === 'string' ? { visibility: body.visibility } : {}),
                 });
                 if (result === undefined) { write(res, 404, { ok: false, code: 'not-found' }); return; }
-                write(res, 200, { ok: true, ...result });
+                writeChanged(res, { ok: true, ...result });
             }, { owner: true }),
         },
         {
@@ -117,7 +124,7 @@ export function createMemoryRoutes({ memory, auth, allowedOrigins } = {}) {
                 if (typeof body.id !== 'string' || body.id === '') { write(res, 400, { ok: false, code: 'invalid-args' }); return; }
                 const proposal = memory.rejectProposal(body.id);
                 if (proposal === undefined) { write(res, 404, { ok: false, code: 'not-found' }); return; }
-                write(res, 200, { ok: true, proposal });
+                writeChanged(res, { ok: true, proposal });
             }, { owner: true }),
         },
         {
@@ -133,7 +140,7 @@ export function createMemoryRoutes({ memory, auth, allowedOrigins } = {}) {
                     visibility: body.visibility,
                     ...(typeof body.cue === 'string' && body.cue.trim() ? { cue: body.cue.trim() } : {}),
                 });
-                write(res, 200, { ok: true, item });
+                writeChanged(res, { ok: true, item });
             }, { owner: true }),
         },
         {
@@ -148,14 +155,15 @@ export function createMemoryRoutes({ memory, auth, allowedOrigins } = {}) {
                     ...(typeof body.kind === 'string' ? { kind: body.kind } : {}),
                 });
                 if (item === undefined) { write(res, 404, { ok: false, code: 'not-found' }); return; }
-                write(res, 200, { ok: true, item });
+                writeChanged(res, { ok: true, item });
             }, { owner: true }),
         },
         {
             method: 'POST', path: '/marshal/memory/global/forget',
             handler: guard(true, (_req, res, { body }) => {
                 if (typeof body.id !== 'string' || body.id === '') { write(res, 400, { ok: false, code: 'invalid-args' }); return; }
-                write(res, 200, { ok: true, removed: memory.forgetGlobal(body.id) === true });
+                const removed = memory.forgetGlobal(body.id) === true;
+                writeChanged(res, { ok: true, removed }, removed);
             }, { owner: true }),
         },
         {
@@ -248,7 +256,7 @@ export function createMemoryRoutes({ memory, auth, allowedOrigins } = {}) {
                     visibility: body.visibility,
                     ...(typeof body.cue === 'string' && body.cue.trim() ? { cue: body.cue.trim() } : {}),
                 });
-                write(res, 200, { ok: true, item });
+                writeChanged(res, { ok: true, item });
             }, { target: true }),
         },
         {
@@ -260,7 +268,7 @@ export function createMemoryRoutes({ memory, auth, allowedOrigins } = {}) {
                     workspaceId: requested.workspaceId,
                     id: typeof body.id === 'string' ? body.id : '',
                 });
-                write(res, 200, { ok: true, removed });
+                writeChanged(res, { ok: true, removed }, removed);
             }, { target: true }),
         },
         {

@@ -144,8 +144,8 @@ function marshalNative() {
 function marshalSetup(React) {
   const h = React.createElement;
   const errors = { 'account-required': '请先在 DeepSeek Harness 左下角登录账号，登录后会自动继续。', 'account-mismatch': '当前 DSH 账号与该中心绑定的账号不同。', revoked: '此设备已被中心撤销，无法自动重新加入。', 'duplicate-id': '设备凭据与已有安装不一致，请恢复原安装状态。', 'runtime-unavailable': '配置已保存，但服务启动失败，请检查插件日志。' };
-  const request = async body => {
-    const response = await fetch(new URL('marshal/setup', document.baseURI), { method: 'POST', headers: { 'x-marshal-setup': '1', 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  const request = async (body, signal) => {
+    const response = await fetch(new URL('marshal/setup', document.baseURI), { method: 'POST', headers: { 'x-marshal-setup': '1', 'content-type': 'application/json' }, body: JSON.stringify(body), signal });
     const data = await response.json(); if (!response.ok) throw Error(data.code); return data;
   };
   function Setup({ initial, onReady }) {
@@ -157,12 +157,35 @@ function marshalSetup(React) {
     const [busy, setBusy] = React.useState(false);
     const locked = busy || status.busy || status.configured;
     React.useEffect(() => {
-      let closed = false, checking = false;
-      const timer = setInterval(async () => {
-        if (checking) return; checking = true;
-        try { const next = await request({ action: 'status' }); if (!closed) { setStatus(next); if (next.ready) onReady(); } } catch {} finally { checking = false; }
-      }, 3000);
-      return () => { closed = true; clearInterval(timer); };
+      // Pre-authentication exception: there is no event stream until setup completes.
+      const controller = new AbortController();
+      let checking = false, ready = false, timer, delay = 3_500;
+      const schedule = () => { timer = setTimeout(checkStatus, delay); };
+      async function checkStatus() {
+        if (checking || ready || controller.signal.aborted) return;
+        clearTimeout(timer);
+        checking = true;
+        try {
+          const next = await request({ action: 'status' }, controller.signal);
+          if (controller.signal.aborted) return;
+          setStatus(next);
+          ready = next.ready === true;
+          delay = 3_500;
+          if (ready) onReady();
+        } catch {
+          delay = Math.min(delay * 2, 10_000);
+        } finally {
+          checking = false;
+          if (!ready && !controller.signal.aborted) schedule();
+        }
+      }
+      schedule();
+      window.addEventListener('focus', checkStatus);
+      return () => {
+        controller.abort();
+        clearTimeout(timer);
+        window.removeEventListener('focus', checkStatus);
+      };
     }, []);
     const save = async event => {
       event.preventDefault(); if (busy) return; setBusy(true);
@@ -197,7 +220,6 @@ window.__ModuleLoader__.load({
     const { Setup, readSetup } = marshalSetup(React);
     const h = React.createElement;
     let pendingTab = null;
-    const ACTIVE_TAB_STORAGE_KEY = 'marshal.activeTab.v2';
     function isPseudoAgentWorkspace(ws) {
       if (!ws) return false;
       const title = String(ws.title || ws.name || '').trim();
@@ -208,12 +230,13 @@ window.__ModuleLoader__.load({
     }
     function resolveNavTarget(raw) {
       if (raw === 'tasks') return { tab: 'tasks' };
-      if (raw === 'chats') return { tab: 'chats' };
-      if (raw === 'groups') return { tab: 'chats', chatSection: 'groups', groupSub: 'local' };
-      if (raw === 'cross') return { tab: 'chats', chatSection: 'groups', groupSub: 'cross' };
-      if (raw === 'taskRooms') return { tab: 'chats', chatSection: 'taskRooms' };
-      if (raw === 'direct') return { tab: 'chats', chatSection: 'direct' };
-      if (raw === 'session' || raw === 'remote') return { tab: 'chats', chatSection: 'remote' };
+      if (raw === 'monitor') return { tab: 'monitor' };
+      if (raw === 'chats') return { tab: 'agents', chatSection: 'groups' };
+      if (raw === 'groups') return { tab: 'agents', chatSection: 'groups', groupSub: 'local' };
+      if (raw === 'cross') return { tab: 'agents', chatSection: 'groups', groupSub: 'cross' };
+      if (raw === 'taskRooms') return { tab: 'tasks', chatSection: 'taskRooms' };
+      if (raw === 'direct') return { tab: 'agents', chatSection: 'direct' };
+      if (raw === 'session' || raw === 'remote') return { tab: 'agents', chatSection: 'remote' };
       if (raw === 'agents') return { tab: 'agents' };
       if (raw === 'rosters') return { tab: 'agents', agentSub: 'rosters' };
       if (raw === 'memory') return { tab: 'memory' };
@@ -246,7 +269,12 @@ window.__ModuleLoader__.load({
         h('rect', { x: 7, y: 2, width: 10, height: 7, rx: 1.5 }), h('path', { d: 'M12 9v5M5 14h14M5 14v3M19 14v3' }),
         h('rect', { x: 2, y: 17, width: 6, height: 5, rx: 1 }), h('rect', { x: 16, y: 17, width: 6, height: 5, rx: 1 }));
     }
-    async function readAddress(role, signal) {
+    function readAddress(role, signal) {
+      // Without an entry role, use the same local base as fetchJson, not an HTTPS dashboard.
+      if (role === undefined) return new URL('.', document.baseURI).href.replace(/\/$/, '');
+      return readDashboardAddress(role, signal);
+    }
+    async function readDashboardAddress(role, signal) {
       const response = await fetch(new URL(`marshal/entry/${role}`, document.baseURI), { signal });
       if (!response.ok) return null;
       const data = await response.json(); const url = new URL(data.dashboardUrl);
@@ -259,186 +287,886 @@ window.__ModuleLoader__.load({
         renderFactorySlot('conversation.content', { variant: 'embedded', phase: 'active', hero: false }));
     }
 
-    function MemoryGalaxy({ graph, selectedId, onSelect }) {
+    const marshalVnextCss = `
+.mv-scope,.mv-entry {
+  --mv-light-surface:#fff; --mv-dark-surface:#252529;
+  --mv-light-layer:#f2f4f7; --mv-dark-layer:#232327;
+  --mv-light-text:#0f1115; --mv-dark-text:#f5f6f8;
+  --mv-light-muted:#585e66; --mv-dark-muted:#c4c8ce;
+  --mv-light-accent:#1f6feb; --mv-dark-accent:#84b4ff;
+  --mv-light-danger:#b82222; --mv-dark-danger:#ff9292;
+  --mv-light-success:#167640; --mv-dark-success:#72dba2;
+  --dsw-alias-marshal-surface:var(--dsw-bg-card-elevated,light-dark(var(--mv-light-surface),var(--mv-dark-surface)));
+  --dsw-alias-marshal-layer:var(--dsw-bg-module,light-dark(var(--mv-light-layer),var(--mv-dark-layer)));
+  --dsw-alias-marshal-text:var(--dsw-alias-label-primary,light-dark(var(--mv-light-text),var(--mv-dark-text)));
+  --dsw-alias-marshal-muted:var(--dsw-alias-label-secondary,light-dark(var(--mv-light-muted),var(--mv-dark-muted)));
+  --dsw-alias-marshal-border:color-mix(in srgb,var(--dsw-alias-marshal-text) 15%,transparent);
+  --dsw-alias-marshal-hover:var(--dsw-alias-interactive-bg-hover,color-mix(in srgb,currentColor 8%,transparent));
+  --dsw-alias-marshal-accent:light-dark(var(--mv-light-accent),var(--mv-dark-accent));
+  --dsw-alias-marshal-danger:var(--dsw-alias-state-error-primary,light-dark(var(--mv-light-danger),var(--mv-dark-danger)));
+  --dsw-alias-marshal-success:light-dark(var(--mv-light-success),var(--mv-dark-success));
+  --dsw-alias-marshal-tint:color-mix(in srgb,var(--dsw-alias-marshal-accent) 12%,transparent);
+  --dsw-alias-marshal-shadow:var(--dsw-shadow-md,0 6px 20px #0f111524);
+  --mv-xs:4px; --mv-sm:8px; --mv-md:12px; --mv-lg:16px; --mv-xl:24px;
+  --mv-radius:12px; --mv-pill:999px; --mv-control:30px; --mv-avatar-size:28px;
+  --mv-font-small:12px; --mv-font:13px; --mv-font-title:14px; --mv-weight:600; --mv-leading:1.5;
+  --mv-float-width:360px; --mv-float-top:max(64px,var(--dsh-frame-overlay-top,0px));
+  --mv-composer-clearance:120px; --mv-float-z:30; --mv-breath:2.8s;
+  color-scheme:light;
+}
+[data-ds-dark-theme] :is(.mv-scope,.mv-entry),[data-theme="dark"] :is(.mv-scope,.mv-entry){color-scheme:dark}
+:root[data-ds-theme-source] :is(.mv-scope,.mv-entry){color-scheme:inherit}
+@media(prefers-color-scheme:dark){
+  :root:not([data-ds-theme-source],[data-theme="light"]) body:not([data-ds-light-theme],[data-theme="light"]) :is(.mv-scope,.mv-entry){color-scheme:dark}
+}
+.mv-scope{color:var(--dsw-alias-marshal-text);font-size:var(--mv-font);line-height:var(--mv-leading)}
+.mv-entry,.mv-line,.mv-actions{display:flex;align-items:center;gap:var(--mv-sm);min-width:0}
+.mv-entry{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;flex:none}
+/* A panellist entry is one positioned row holding [glyph][label], so the count
+   anchors to that row: it rides the sidebar's trailing edge instead of the glyph. */
+.mv-entry .mv-badge{position:absolute;z-index:1;inset-block-start:50%;inset-inline-end:6px;transform:translateY(-50%);min-width:18px;box-sizing:border-box;text-align:center;line-height:1.45;pointer-events:none;transition:opacity .12s}
+/* The host shows its unpin button in that same trailing slot on hover/focus:
+   step the count aside so the two never stack. */
+[class*="panelEntry"]:is(:hover,:focus-within) .mv-entry .mv-badge{opacity:0}
+/* Collapsed rail: the 36px tile has no trailing slot, so pin the count to its corner. */
+[class*="panelEntry"]:not([class*="panelEntryWide"]) .mv-entry .mv-badge{inset-block-start:0;inset-inline-end:0;transform:none;min-width:16px;font-size:10px;line-height:16px;padding-inline:3px}
+[class*="panelEntry"]:not([class*="panelEntryWide"]):is(:hover,:focus-within) .mv-entry .mv-badge{opacity:1}
+.mv-badge,.mv-model{font-size:var(--mv-font-small);border-radius:var(--mv-pill);padding-inline:var(--mv-xs)}
+.mv-badge{color:var(--dsw-alias-marshal-danger);background:var(--dsw-alias-marshal-surface);font-weight:var(--mv-weight);box-shadow:0 0 0 1px var(--dsw-alias-marshal-border)}
+.mv-model{color:var(--dsw-alias-marshal-muted);background:var(--dsw-alias-marshal-layer);display:block;width:fit-content;max-width:100%;box-sizing:border-box}
+/* Tone palette: one variable drives lane dots, card rails, chips and incident cards,
+   so a lane reads the same colour in the board, the drawer and the monitor. */
+:is(.mv-scope,.mv-entry) [data-tone="queued"]{--mv-tone:#4e93e8}
+:is(.mv-scope,.mv-entry) [data-tone="running"]{--mv-tone:#2ea36a}
+:is(.mv-scope,.mv-entry) [data-tone="review"]{--mv-tone:#d08a2a}
+:is(.mv-scope,.mv-entry) [data-tone="failed"]{--mv-tone:#cf5f7a}
+:is(.mv-scope,.mv-entry) [data-tone="done"]{--mv-tone:#4a9fb5}
+:is(.mv-scope,.mv-entry) [data-tone="critical"]{--mv-tone:#cf5f7a}
+:is(.mv-scope,.mv-entry) [data-tone="warning"]{--mv-tone:#d08a2a}
+:is(.mv-scope,.mv-entry) [data-tone="info"]{--mv-tone:#4e93e8}
+:is(.mv-scope,.mv-entry) [data-tone="memory"]{--mv-tone:#b456c8}
+:is(.mv-scope,.mv-entry) [data-tone="neutral"]{--mv-tone:#8b93a1}
+.mv-lane-head{display:flex;align-items:center;gap:var(--mv-xs);margin:0 0 var(--mv-xs);font-size:var(--mv-font-title)}
+.mv-tone-dot{flex:none;width:8px;height:8px;border-radius:var(--mv-pill);background:var(--mv-tone,var(--dsw-alias-marshal-muted));box-shadow:0 0 0 3px color-mix(in srgb,var(--mv-tone,transparent) 20%,transparent)}
+.mv-tone-count{margin-inline-start:auto;color:var(--dsw-alias-marshal-muted);font-size:var(--mv-font-small);font-variant-numeric:tabular-nums}
+.mv-agent-card[data-tone]{border-inline-start:3px solid var(--mv-tone,var(--dsw-alias-marshal-border));background:linear-gradient(180deg,color-mix(in srgb,var(--mv-tone,transparent) 8%,var(--dsw-alias-marshal-surface)),var(--dsw-alias-marshal-surface) 68%)}
+.mv-tone-chip{display:inline-flex;align-items:center;gap:var(--mv-xs);max-width:100%;box-sizing:border-box;border-radius:var(--mv-pill);padding:2px var(--mv-sm);font-size:var(--mv-font-small);line-height:1.5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--mv-tone,var(--dsw-alias-marshal-muted));border:1px solid color-mix(in srgb,var(--mv-tone,var(--dsw-alias-marshal-muted)) 42%,transparent);background:color-mix(in srgb,var(--mv-tone,var(--dsw-alias-marshal-muted)) 15%,transparent)}
+.mv-tone-chip[data-solid="true"]{font-weight:var(--mv-weight);background:color-mix(in srgb,var(--mv-tone,var(--dsw-alias-marshal-danger)) 24%,transparent)}
+.mv-metric[data-tone]{border-inline-start:3px solid var(--mv-tone,var(--dsw-alias-marshal-border));padding-inline-start:var(--mv-sm)}
+.mv-metric dd{margin:0;font-size:calc(var(--mv-font) + 3px);font-weight:var(--mv-weight);font-variant-numeric:tabular-nums}
+.mv-tag-row{display:flex;flex-wrap:wrap;gap:var(--mv-xs);align-items:center;min-width:0}
+.mv-toolbar-group{gap:var(--mv-xs);padding:3px;border-radius:calc(var(--mv-radius) - 2px);background:color-mix(in srgb,currentColor 4%,transparent);border:1px solid var(--dsw-alias-marshal-border)}
+.mv-toolbar-group .mv-btn{border-color:transparent;min-height:calc(var(--mv-control) - 4px)}
+.mv-memory-detail{flex:none;display:flex;flex-direction:column;gap:var(--mv-sm);width:min(320px,100%);box-sizing:border-box;overflow:auto;padding:var(--mv-md);border:1px solid var(--dsw-alias-marshal-border);border-radius:var(--mv-radius);background:var(--dsw-alias-marshal-surface);box-shadow:var(--dsw-alias-marshal-shadow)}
+.mv-memory-head{display:grid;gap:calc(var(--mv-xs) + 2px);padding-block-end:var(--mv-sm);border-block-end:1px solid var(--dsw-alias-marshal-border)}
+.mv-memory-title{margin:0;font-size:calc(var(--mv-font-title) + 2px);line-height:1.35;overflow-wrap:anywhere}
+.mv-memory-meta{font-size:var(--mv-font-small);color:var(--dsw-alias-marshal-muted);font-variant-numeric:tabular-nums}
+.mv-memory-cue{padding:var(--mv-xs) var(--mv-sm);border-radius:var(--mv-sm);font-size:var(--mv-font-small);color:var(--dsw-alias-marshal-muted);background:var(--dsw-alias-marshal-layer);border-inline-start:2px solid var(--dsw-alias-marshal-accent);overflow-wrap:anywhere}
+.mv-memory-body{margin:0;white-space:pre-wrap;font-size:var(--mv-font);line-height:1.7;overflow-wrap:anywhere}
+.mv-memory-conflict{display:grid;gap:var(--mv-sm);padding:var(--mv-sm);border-radius:var(--mv-radius);background:color-mix(in srgb,#d08a2a 12%,var(--dsw-alias-marshal-surface));border:1px solid color-mix(in srgb,#d08a2a 38%,transparent)}
+.mv-memory-conflict p{margin:0;font-size:var(--mv-font-small)}
+.mv-stack,.mv-sections,.mv-agent-card{display:grid;gap:var(--mv-sm);min-width:0}
+.mv-sections{padding:var(--mv-sm) var(--mv-md)}
+.mv-session-actions{flex:1;min-width:0}.mv-native-session{display:flex;align-items:center;gap:var(--mv-xs);min-width:0}
+.mv-agent-card,.mv-mini{margin-block:var(--mv-xs);padding:var(--mv-sm);border:1px solid var(--dsw-alias-marshal-border);border-radius:var(--mv-radius);background:var(--dsw-alias-marshal-surface)}
+.mv-agent-card[data-compact="true"]{justify-items:center;padding:var(--mv-xs)}
+.mv-agent-card[data-compact="true"] .mv-agent-main{flex-direction:column;gap:var(--mv-xs)}
+.mv-agent-row{gap:var(--mv-xs)}
+.mv-agent-main{display:flex;align-items:center;gap:var(--mv-sm);min-width:0}
+.mv-agent-open{display:flex;align-items:center;gap:var(--mv-sm);flex:1;min-width:0;padding:var(--mv-xs);margin:calc(-1 * var(--mv-xs));border:0;border-radius:var(--mv-sm);background:transparent;color:inherit;font:inherit;text-align:start;cursor:pointer}
+.mv-agent-open:hover:not(:disabled){background:var(--dsw-alias-marshal-hover)}
+.mv-agent-open:disabled{cursor:default;-webkit-text-fill-color:currentColor}
+.mv-agent-open:focus-visible{outline:2px solid var(--dsw-alias-marshal-accent);outline-offset:1px}
+.mv-agent-lines{display:grid;gap:2px;min-width:0}
+.mv-agent-card[data-compact="true"] .mv-actions{flex-direction:column;justify-content:center;gap:var(--mv-xs)}
+.mv-copy{min-width:0;flex:1}.mv-truncate{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.mv-muted{color:var(--dsw-alias-marshal-muted);font-size:var(--mv-font-small)}
+.mv-btn,.mv-row{box-sizing:border-box;display:inline-flex;align-items:center;gap:var(--mv-xs);min-height:var(--mv-control);padding:var(--mv-xs) var(--mv-sm);border:1px solid var(--dsw-alias-marshal-border);border-radius:var(--mv-radius);background:transparent;color:inherit;font:inherit;cursor:pointer}
+.mv-btn:hover:not(:disabled),.mv-row:hover:not(:disabled){background:var(--dsw-alias-marshal-hover)}
+.mv-btn:focus-visible,.mv-row:focus-visible,.mv-field:focus-visible{outline:2px solid var(--dsw-alias-marshal-accent);outline-offset:1px}
+.mv-btn:disabled,.mv-row:disabled{opacity:.6;cursor:default}
+.mv-icon-button{justify-content:center;min-width:var(--mv-control);padding:var(--mv-xs)}
+.mv-row{width:100%;border-color:transparent;text-align:start}.mv-section-label{font-weight:var(--mv-weight)}
+.mv-row-list{list-style:none;margin:0;padding:0;padding-inline-start:var(--mv-sm)}
+.mv-avatar{flex:none;display:grid;place-items:center;width:var(--mv-avatar-size);height:var(--mv-avatar-size);border-radius:var(--mv-pill);color:var(--dsw-alias-marshal-accent);background:var(--dsw-alias-marshal-tint);font-weight:var(--mv-weight)}
+.mv-svg{flex:none}.mv-online{color:var(--dsw-alias-marshal-success)}.mv-danger{color:var(--dsw-alias-marshal-danger)}
+/* Only the card and capsule take hits; neither is attached to the host composer. */
+.mv-voice-dock{position:fixed;top:var(--mv-float-top);inset-inline-end:var(--mv-lg);z-index:var(--mv-float-z);width:min(var(--mv-float-width),calc(100vw - 2 * var(--mv-lg)));display:grid;justify-items:end;gap:var(--mv-sm)}
+.mv-voice-dock,[data-shell-overlay]>.mv-voice-dock{pointer-events:none}
+.mv-voice-dock>*{pointer-events:auto;box-sizing:border-box}
+.mv-capsule,.mv-voice-panel,.mv-summary-card,.mv-drawer,.mv-dialog{background:var(--dsw-alias-marshal-surface);border:1px solid var(--dsw-alias-marshal-border);box-shadow:var(--dsw-alias-marshal-shadow)}
+.mv-capsule{border-radius:var(--mv-pill);padding-inline:var(--mv-md)}
+.mv-voice-panel,.mv-summary-card,.mv-drawer,.mv-dialog{width:100%;padding:var(--mv-md);border-radius:var(--mv-radius);overflow:auto}
+.mv-voice-panel,.mv-summary-card{max-height:calc(100vh - var(--mv-float-top) - var(--mv-control) - var(--mv-sm) - var(--mv-composer-clearance));overscroll-behavior:contain}
+.mv-summary-card{border-inline-start:3px solid var(--dsw-alias-marshal-accent)}
+.mv-voice-title{font-size:var(--mv-font-title);margin:0}.mv-time{font-variant-numeric:tabular-nums}
+.mv-voice-panel .mv-avatar[data-breathing="true"]{animation:mv-breath var(--mv-breath) ease-in-out infinite}
+@keyframes mv-breath{50%{box-shadow:0 0 0 var(--mv-xs) var(--dsw-alias-marshal-tint)}}
+@media(prefers-reduced-motion:reduce){.mv-voice-panel .mv-avatar[data-breathing]{animation:none}.mv-voice-meter-fill{transition:none}}
+.mv-voice-meter{height:4px;width:100%;border-radius:var(--mv-pill);background:var(--dsw-alias-marshal-layer);overflow:hidden}
+.mv-voice-meter-fill{height:100%;width:0;border-radius:var(--mv-pill);background:var(--dsw-alias-marshal-accent);transition:width 80ms linear}
+.mv-voice-controls{display:flex;flex-wrap:wrap;align-items:center;gap:var(--mv-xs)}
+.mv-voice-ptt{width:100%;justify-content:center;font-weight:var(--mv-weight)}
+.mv-voice-ptt[aria-pressed="true"]{background:var(--dsw-alias-marshal-tint);border-color:var(--dsw-alias-marshal-accent);color:var(--dsw-alias-marshal-accent)}
+.mv-voice-banner{padding:var(--mv-xs) var(--mv-sm);border-radius:var(--mv-sm);background:var(--dsw-alias-marshal-layer);border:1px solid var(--dsw-alias-marshal-border);display:flex;align-items:center;justify-content:space-between;gap:var(--mv-sm);font-size:var(--mv-font-small)}
+.mv-field,.mv-transcript{box-sizing:border-box;width:100%;padding:var(--mv-sm);border-radius:var(--mv-radius);border:1px solid var(--dsw-alias-marshal-border);background:var(--dsw-alias-marshal-layer);color:inherit;font:inherit}
+.mv-field{resize:vertical}.mv-transcript{max-height:calc(5 * var(--mv-xl));overflow:auto;overflow-wrap:anywhere;white-space:pre-wrap}
+.mv-actions{flex-wrap:wrap}.mv-drawer{max-width:var(--mv-float-width);height:100%}.mv-dialog{max-width:var(--mv-float-width)}
+.mv-room{display:flex;flex:1;flex-direction:column;gap:var(--mv-md);padding:var(--mv-lg);min-width:0;min-height:0;overflow:auto}
+.mv-room-fill{display:flex;flex:1;min-height:0;min-width:0}.mv-room-log{flex:1;overflow:auto;min-height:0}
+.mv-routed{flex:1;grid-template-rows:auto minmax(0,1fr);min-height:0}.mv-routed>header{padding:var(--mv-sm) var(--mv-md)}
+.mv-room-message{padding:var(--mv-sm);margin-block-end:var(--mv-sm);background:var(--dsw-alias-marshal-layer);border-radius:var(--mv-radius);white-space:pre-wrap;overflow-wrap:anywhere}
+.mv-task-pane{height:100%;box-sizing:border-box;padding:var(--mv-md);grid-template-rows:auto auto minmax(0,1fr) auto;overflow:auto;overflow-wrap:anywhere}
+.mv-task-scroll{overflow:auto;align-content:start;min-height:calc(2 * var(--mv-control));overscroll-behavior:contain}
+.mv-task-item{padding:var(--mv-sm);border:1px solid var(--dsw-alias-marshal-border);border-radius:var(--mv-radius)}
+.mv-task-item[data-focused="true"],.mv-casual-card[aria-pressed="true"],.mv-chip[aria-pressed="true"],.mv-guidance-action{background:var(--dsw-alias-marshal-tint);border-color:var(--dsw-alias-marshal-accent)}
+.mv-casual-card{font-weight:var(--mv-weight)}
+.mv-chip{border-radius:var(--mv-pill)}
+.mv-compact-field{width:auto;max-width:100%}
+.mv-composer-dock{gap:var(--mv-xs);padding-inline:var(--mv-xs);font-size:var(--mv-font-small)}
+.mv-composer-dock .mv-btn{border:0;min-height:var(--mv-xl)}
+.mv-composer-dock .mv-truncate{max-width:50%}
+.mv-guidance-dialog{box-sizing:border-box;max-width:min(var(--mv-float-width),calc(100vw - 2 * var(--mv-lg)));max-height:calc(100vh - 2 * var(--mv-xl));overscroll-behavior:contain}
+.mv-guidance-dialog::backdrop{background:color-mix(in srgb,currentColor 35%,transparent)}
+
+.mv-picker{position:relative;min-width:0}
+.mv-picker-popover{position:absolute;inset-block-end:calc(100% + var(--mv-xs));left:var(--mv-picker-offset,0px);z-index:var(--mv-float-z);box-sizing:border-box;width:min(calc(3 * var(--mv-float-width) / 2),calc(100vw - 2 * var(--mv-lg)));padding:var(--mv-sm);border:1px solid var(--dsw-alias-marshal-border);border-radius:var(--mv-radius);background:var(--dsw-alias-marshal-surface);box-shadow:var(--dsw-alias-marshal-shadow)}
+.mv-picker-chips{display:flex;flex-wrap:wrap;gap:var(--mv-xs)}
+.mv-picker-chips:not(:empty){margin-block-start:var(--mv-xs)}
+.mv-picker-chip{max-width:100%;border-radius:var(--mv-pill);overflow-wrap:anywhere}
+.mv-cascade3-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:var(--mv-sm)}
+.mv-cascade3-col{display:flex;flex-direction:column;gap:var(--mv-xs);min-width:0;max-height:min(calc(12 * var(--mv-xl)),45vh);overflow:auto;overscroll-behavior:contain;padding:var(--mv-xs);overflow-wrap:anywhere}
+.mv-cascade3-col+.mv-cascade3-col{border-inline-start:1px solid var(--dsw-alias-marshal-border)}
+.mv-cascade3-col input{max-width:100%}
+.mv-cascade3-label{position:sticky;top:0;background:var(--dsw-alias-marshal-surface);padding-block:var(--mv-xs)}
+.mv-cascade3-choice,.mv-dag-node{box-sizing:border-box;display:grid;gap:var(--mv-xs);min-width:0;min-height:var(--mv-control);padding:var(--mv-xs) var(--mv-sm);border:1px solid transparent;border-radius:var(--mv-radius);background:transparent;color:inherit;font:inherit;text-align:start;cursor:pointer;overflow-wrap:anywhere}
+.mv-cascade3-choice:hover:not(:disabled),.mv-dag-node:hover{background:var(--dsw-alias-marshal-hover)}
+.mv-cascade3-choice[aria-pressed="true"],.mv-dag-actions [aria-pressed="true"]{background:var(--dsw-alias-marshal-tint);border-color:var(--dsw-alias-marshal-accent)}
+.mv-cascade3-choice:disabled{cursor:default}
+.mv-cascade3-choice small{color:var(--dsw-alias-marshal-muted);font-size:var(--mv-font-small);display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden}
+
+.mv-dag-sidebar{position:relative;display:flex;flex-direction:column;flex:none;box-sizing:border-box;max-width:100%;min-height:0;border-inline-start:1px solid var(--dsw-alias-marshal-border);background:var(--dsw-alias-marshal-surface)}
+.mv-dag-sidebar[data-collapsed="true"]{width:calc(var(--mv-control) + 2 * var(--mv-sm))}
+.mv-dag-resize{position:absolute;inset-block:0;inset-inline-start:0;width:var(--mv-xs);cursor:col-resize;touch-action:none;z-index:1}
+.mv-dag-resize:hover,.mv-dag-resize:active{background:var(--dsw-alias-marshal-accent)}
+.mv-dag-header,.mv-dag-actions{display:flex;align-items:center;gap:var(--mv-sm);padding:var(--mv-sm);min-width:0}
+.mv-dag-header{justify-content:space-between;border-block-end:1px solid var(--dsw-alias-marshal-border)}
+.mv-dag-header strong{overflow-wrap:anywhere}
+.mv-dag-actions{flex-wrap:wrap;padding-inline:0}
+.mv-dag-content:not([hidden]){display:flex;flex-direction:column;min-height:0;overflow:auto;padding-inline:var(--mv-md)}
+.mv-dag-body{padding-block:var(--mv-sm)}
+.mv-dag-layer{display:grid}
+.mv-dag-node{margin-inline:var(--mv-xs);border-color:var(--dsw-alias-marshal-border);background:var(--dsw-alias-marshal-layer);font-variant-numeric:tabular-nums}
+.mv-dag-state{display:flex;align-items:center;gap:var(--mv-xs);color:var(--dsw-alias-marshal-muted)}
+.mv-dag-state svg{flex:none}
+.mv-dag-state[data-state="done"]{color:var(--dsw-alias-marshal-success)}
+.mv-dag-state[data-state="running"]{color:var(--dsw-alias-marshal-accent)}
+.mv-dag-state:is([data-state="failed"],[data-state="interrupted"],[data-state="review-blocked"],[data-state="permission-blocked"]){color:var(--dsw-alias-marshal-danger)}
+.mv-dag-edges{display:block;width:100%;height:var(--mv-xl);color:var(--dsw-alias-marshal-muted);pointer-events:none}
+.mv-dag-resize:focus-visible,.mv-dag-node:focus-visible,.mv-cascade3-choice:focus-visible{outline:2px solid var(--dsw-alias-marshal-accent);outline-offset:-2px}
+.mv-dag-dialog{box-sizing:border-box;width:min(calc(2 * var(--mv-float-width)),calc(100vw - 2 * var(--mv-lg)));max-height:calc(100dvh - 2 * var(--mv-xl));padding:0;border:1px solid var(--dsw-alias-marshal-border);border-radius:var(--mv-radius);background:var(--dsw-alias-marshal-surface);box-shadow:var(--dsw-alias-marshal-shadow);overscroll-behavior:contain}
+.mv-dag-dialog::backdrop{background:color-mix(in srgb,currentColor 35%,transparent)}
+.mv-dag-dialog>.mv-dag-header{position:sticky;top:0;background:var(--dsw-alias-marshal-surface)}
+.mv-dag-dialog-body{padding:var(--mv-md);overflow-wrap:anywhere}
+.mv-dag-detail h3{font-size:var(--mv-font-title);margin-block:var(--mv-md) var(--mv-xs)}
+.mv-dag-detail p,.mv-dag-detail ol,.mv-dag-detail ul{margin-block:var(--mv-xs)}
+.mv-dag-log,.mv-dag-diff{max-height:calc(12 * var(--mv-xl));overflow:auto;padding:var(--mv-sm);border-radius:var(--mv-radius);background:var(--dsw-alias-marshal-layer);font-size:var(--mv-font-small);tab-size:4}
+.mv-dag-log{white-space:pre-wrap;overflow-wrap:anywhere}
+.mv-dag-diff [data-change="add"]{color:var(--dsw-alias-marshal-success)}
+.mv-dag-diff [data-change="remove"]{color:var(--dsw-alias-marshal-danger)}
+`;
+
+    const marshalVnextStyleRefs = new WeakMap();
+    function ensureMarshalVnextStyles() {
+      if (typeof document === 'undefined' || !document.head) return () => {};
+      let style = document.getElementById('marshal-vnext-styles');
+      if (!style) {
+        style = document.createElement('style');
+        style.id = 'marshal-vnext-styles';
+        style.textContent = marshalVnextCss;
+        document.head.appendChild(style);
+        marshalVnextStyleRefs.set(style, 0);
+      }
+      if (!marshalVnextStyleRefs.has(style)) return () => {};
+      marshalVnextStyleRefs.set(style, marshalVnextStyleRefs.get(style) + 1);
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        const refs = marshalVnextStyleRefs.get(style) - 1;
+        if (refs) marshalVnextStyleRefs.set(style, refs);
+        else { marshalVnextStyleRefs.delete(style); style.remove(); }
+      };
+    }
+    const mvGlyphs = {
+      phone: 'M7 4H4v3a13 13 0 0 0 13 13h3v-4l-5-2-2 2a10 10 0 0 1-5-5l2-2-2-5Z',
+      hangup: 'M3 14a14 14 0 0 1 18 0v4h-5v-3a10 10 0 0 0-8 0v3H3Z',
+      chat: 'M4 4h16v12H9l-5 4V4Z M8 9h8M8 12h5',
+      room: 'M7 3h10v3h3v15H4V6h3V3Zm0 3h10M8 11h8M8 15h5',
+      agent: 'M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm-7 8v-1a7 7 0 0 1 14 0v1',
+      dot: 'M12 12h.01',
+      chevron: 'm9 5 7 7-7 7',
+      down: 'm5 9 7 7 7-7',
+      mic: 'M9 5a3 3 0 0 1 6 0v6a3 3 0 0 1-6 0V5Zm-4 6a7 7 0 0 0 14 0m-7 7v4m-3 0h6',
+      mute: 'M3 3l18 18M9 5a3 3 0 0 1 6 0v6m-6-1v1a3 3 0 0 0 4 3M5 11a7 7 0 0 0 12 5m2-5a7 7 0 0 1-.3 2M12 18v4m-3 0h6',
+      close: 'm6 6 12 12M18 6 6 18',
+      save: 'M5 3h12l3 3v15H4V3h1Zm3 0v6h8V3M8 21v-7h8v7',
+      send: 'm22 2-7 20-4-9-9-4 20-7ZM22 2 11 13',
+      back: 'm10 5-7 7 7 7M3 12h18',
+      refresh: 'M20 7v5h-5M4 17v-5h5M6 7a7 7 0 0 1 11-1l3 4M4 14l3 4a7 7 0 0 0 11-1',
+    };
+    function MvIcon({ name, className = '', size = 16 }) {
+      return h('svg', { className: 'mv-svg ' + className, width: size, height: size, viewBox: '0 0 24 24',
+        fill: 'none', stroke: 'currentColor', strokeWidth: name === 'dot' ? 8 : 1.7, strokeLinecap: 'round',
+        strokeLinejoin: 'round', 'aria-hidden': true }, h('path', { d: mvGlyphs[name] }));
+    }
+    function MvButton({ icon, label, iconOnly = false, className = '', children, ...props }) {
+      return h('button', { type: 'button', className: 'mv-btn ' + (iconOnly ? 'mv-icon-button ' : '') + className,
+        title: iconOnly ? label : undefined, 'aria-label': iconOnly ? label : undefined, ...props },
+        icon && h(MvIcon, { name: icon }), iconOnly ? null : (children ?? label));
+    }
+    function MvAvatar({ agent, breathing }) {
+      return h('span', { className: 'mv-avatar', 'aria-hidden': true, 'data-breathing': breathing },
+        agent?.name ? agentInitial(agent.name) : h(MvIcon, { name: 'agent' }));
+    }
+
+    function createMvStore(initial) {
+      let current = initial;
+      const listeners = new Set();
+      return {
+        getSnapshot: () => current,
+        subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
+        set(value) {
+          if (Object.is(current, value)) return;
+          current = value;
+          for (const listener of listeners) listener();
+        },
+        clear() { listeners.clear(); },
+      };
+    }
+    function useMvSnapshot(store) {
+      return React.useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
+    }
+
+    function createMarshalSidebarData() {
+      const empty = { rooms: [], groups: [], agents: [], count: 0, loading: true, incomplete: false };
+      const store = createMvStore(empty);
+      const lifetime = new AbortController();
+      const { signal } = lifetime;
+      const read = (path, auth = false) => fetchJson('marshal/' + path, undefined, auth, signal);
+      const readRooms = async () => {
+        const { workspaces = [] } = await read('task-rooms/workspaces', true);
+        const results = await Promise.allSettled(workspaces.filter(ws => !isPseudoAgentWorkspace(ws)).map(ws =>
+          read('task-rooms/list?' + new URLSearchParams({ workspaceId: ws.id }), true)));
+        const rooms = new Map();
+        let incomplete = false;
+        for (const result of results) {
+          if (result.status === 'rejected') { incomplete = true; continue; }
+          incomplete ||= Boolean(result.value.hubError);
+          for (const room of result.value.rooms ?? []) if (room.id) rooms.set(room.id, room);
+        }
+        return { items: [...rooms.values()].sort((a, b) => b.createdAt - a.createdAt), incomplete };
+      };
+      let epoch = 0, affected = new Set(), crossRequest;
+      const failures = new Set();
+      const groupLists = { groups: [], cross: [] };
+      const markRooms = rooms => rooms.map(room => ({ ...room, incident: affected.has(room.taskId) }));
+      signal.addEventListener('abort', () => crossRequest?.abort(), { once: true });
+      const readCrossGroups = async () => {
+        const controller = crossRequest = new AbortController();
+        let onAbort;
+        // Settle even if a transport does not reject its pending read on abort.
+        const cancelled = new Promise((_, reject) => {
+          onAbort = () => reject(controller.signal.reason);
+          controller.signal.addEventListener('abort', onAbort, { once: true });
+        });
+        const timer = setTimeout(() => controller.abort(), 5000);
+        try {
+          return await Promise.race([fetchJson('marshal/cross-groups/state', undefined, false, controller.signal), cancelled]);
+        } finally {
+          clearTimeout(timer);
+          controller.signal.removeEventListener('abort', onAbort);
+          if (crossRequest === controller) crossRequest = undefined;
+        }
+      };
+      const load = async () => {
+        const currentEpoch = ++epoch;
+        crossRequest?.abort();
+        const isCurrent = () => !signal.aborted && currentEpoch === epoch;
+        const merge = (source, incomplete, patch) => {
+          if (!isCurrent()) return;
+          if (incomplete) failures.add(source);
+          else failures.delete(source);
+          const previous = store.getSnapshot();
+          store.set({ ...previous, ...patch?.(previous), incomplete: failures.size > 0 });
+        };
+        const mergeGroups = (kind, request) => request.then(data => merge(kind, false, () => {
+          groupLists[kind] = (data?.groups ?? []).map(group => ({ ...group, kind }));
+          return { groups: [...groupLists.groups, ...groupLists.cross] };
+        }), () => merge(kind, true));
+        void readRooms().then(rooms => merge('rooms', rooms.incomplete, () => ({ rooms: markRooms(rooms.items) })),
+          () => merge('rooms', true));
+        void mergeGroups('groups', read('groups/state'));
+        void mergeGroups('cross', readCrossGroups());
+
+        const results = await Promise.allSettled([
+          read('desktop/overview', true), read('incidents/summary', true),
+          fetchJson('dsh-agents/api/state', undefined, false, signal),
+        ]);
+        if (!isCurrent()) return;
+        const [overview, incidents, library] = results.map(result => result.value);
+        const summary = incidents ?? overview?.incidents;
+        const memory = overview?.memory?.pendingProposalCount ?? summary?.countsByKind?.['memory-proposal'] ?? 0;
+        affected = new Set((summary?.items ?? []).filter(item => item.kind !== 'memory-proposal').map(item => item.targetId));
+        const incidentCount = summary?.items
+          ? affected.size : Math.max(0, (summary?.totalCount ?? 0) - (summary?.countsByKind?.['memory-proposal'] ?? 0));
+        // Team display order is editable; the fixed primary follows member creation time.
+        const directory = new Map((overview?.agents?.items ?? []).map(agent => [agent.agentKey, agent]));
+        const agents = (library?.teams ?? []).filter(isAgentTeam).flatMap(team => (team.members ?? []).flatMap(member => {
+          const agent = directory.get(`${overview?.host?.deviceId}/${team.id}/${member.id}`);
+          return agent ? [{ ...agent, model: member.model, name: member.name || agent.name,
+            createdAt: member.createdAt ?? team.createdAt }] : [];
+        })).sort((a, b) => (a.createdAt ?? Infinity) - (b.createdAt ?? Infinity));
+        merge('core', results.some(result => result.status === 'rejected'), previous => ({
+          loading: false,
+          count: incidentCount + memory, agents,
+          rooms: markRooms(previous.rooms),
+        }));
+      };
+      // Keep one trailing read when a browser event or SSE invalidates an in-flight snapshot.
+      let refreshing = false, pending = false;
+      const refresh = async () => {
+        if (signal.aborted) return;
+        pending = true;
+        if (refreshing) return;
+        refreshing = true;
+        try {
+          while (pending && !signal.aborted) {
+            pending = false;
+            await load();
+          }
+        } finally { refreshing = false; }
+      };
+      const hostWindow = typeof window === 'undefined' ? undefined : window;
+      const hostDocument = typeof document === 'undefined' ? undefined : document;
+      const onRefresh = () => { void refresh().catch(() => {}); };
+      const onVisibility = () => { if (hostDocument.visibilityState === 'visible') onRefresh(); };
+      let unsubscribe;
+      try {
+        unsubscribe = subscribeMarshalEvents(
+          ['tasks.changed', 'groups.changed', 'agents.changed', 'incidents.changed', 'memory.changed', 'ready'],
+          refresh, { initial: true, debounceMs: 100 });
+      } catch { store.set({ ...empty, loading: false, incomplete: true }); }
+      hostWindow?.addEventListener?.('marshal:agents-changed', onRefresh);
+      hostWindow?.addEventListener?.('focus', onRefresh);
+      hostDocument?.addEventListener?.('visibilitychange', onVisibility);
+      return { ...store, dispose() {
+        lifetime.abort();
+        hostWindow?.removeEventListener?.('marshal:agents-changed', onRefresh);
+        hostWindow?.removeEventListener?.('focus', onRefresh);
+        hostDocument?.removeEventListener?.('visibilitychange', onVisibility);
+        unsubscribe?.();
+        store.clear();
+      } };
+    }
+
+    function MarshalSidebarPanelItem({ sidebar, openPanel, size }) {
+      const { count } = useMvSnapshot(sidebar);
+      // DSH renders the keyboard-accessible button; stay an icon, not a nested button.
+      return h('span', { className: 'mv-entry', title: count ? '调度官 · ' + count + ' 项待处理' : '调度官',
+        onClick: event => { if (openPanel(PANEL)) event.stopPropagation(); } },
+        h('svg', { width: size ?? 18, height: size ?? 18, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor',
+          strokeWidth: 1.7, strokeLinejoin: 'round', 'aria-hidden': true },
+          h('path', { d: 'M7 2h10v7H7ZM12 9v5M5 17v-3h14v3M2 17h6v5H2Zm14 0h6v5h-6Z' })),
+        count > 0 && h('span', { className: 'mv-badge' }, count > 99 ? '99+' : count));
+    }
+    function MarshalSessionActionHoc({ wide, children, sidebar, voice, onOpenAgentDirect, voiceAvailable }) {
+      const agent = useMvSnapshot(sidebar).agents[0];
+      const call = useMvSnapshot(voice);
+      const compact = wide === false;
+      const [direct, setDirect] = React.useState(null);
+      const directState = direct?.key === agent?.agentKey ? direct : null;
+      const hasError = Boolean(directState?.message) || ['error', 'failed'].includes(agent?.status);
+      const running = ['active', 'running'].includes(agent?.status);
+      const statusClass = hasError ? 'mv-danger' : running || agent?.sessionId ? 'mv-online' : 'mv-muted';
+      const statusLabel = directState?.message ? '直连异常：' + directState.message
+        : hasError ? '智能体运行异常' : running ? '智能体运行中' : agent?.sessionId ? '已建立会话' : '智能体未激活';
+      const openDirect = async () => {
+        if (directState?.busy || !onOpenAgentDirect) return;
+        setDirect({ key: agent.agentKey, busy: true });
+        const message = await onOpenAgentDirect(agent, true);
+        setDirect({ key: agent.agentKey, message });
+      };
+      const inCall = voiceAvailable && call.status !== 'idle' && call.status !== 'summary';
+      if (!agent && !inCall) return children;
+      return h('div', { className: 'mv-session-actions' }, h('div', { className: 'mv-native-session' }, children),
+        agent && h('section', { className: 'mv-scope mv-agent-card mv-agent-row', 'data-compact': compact, 'aria-label': '主智能体' },
+          h('div', { className: 'mv-agent-main' },
+            h('button', { type: 'button', className: 'mv-agent-open', disabled: directState?.busy,
+              'aria-label': '1:1 直连 · ' + agent.name, title: '进入 1:1 直连 · ' + agent.name, onClick: openDirect },
+              h(MvAvatar, { agent }),
+              !compact && h('span', { className: 'mv-copy mv-agent-lines' },
+                h('span', { className: 'mv-line' },
+                  h('span', { className: statusClass, role: 'img', 'aria-label': statusLabel, title: statusLabel },
+                    h(MvIcon, { name: 'dot', size: 12 })),
+                  h('strong', { className: 'mv-truncate', title: agent.name }, agent.name),
+                  h('span', { className: 'mv-muted' }, '主智能体')),
+                h('span', { className: 'mv-model mv-truncate', title: agent.model }, agent.model || '默认模型'))),
+            voiceAvailable && h(MvButton, { icon: 'phone', label: '语音通话 · ' + agent.name, iconOnly: true,
+              onClick: () => { if (call.status === 'idle') void voice.start(agent); else voice.setExpanded(true); } })),
+          directState?.message && h('div', { className: 'mv-danger', role: 'status' }, directState.message)),
+        inCall &&
+          h('div', { className: 'mv-scope' }, h(MvButton, { icon: 'phone', className: 'mv-mini', iconOnly: compact,
+            label: mvVoiceLabels[call.status] + ' · ' + call.agent.name, onClick: () => voice.setExpanded(true) })));
+    }
+
+    const mvFoldKey = 'marshal.sidebar.sections.vnext';
+    function readMvFold() {
+      try { return JSON.parse(window.localStorage?.getItem(mvFoldKey)) ?? {}; } catch { return {}; }
+    }
+    function MarshalSidebarSections({ sidebar, openRoom, onOpenAgentDirect }) {
+      const { rooms, groups, agents, loading, incomplete } = useMvSnapshot(sidebar);
+      const [folded, setFolded] = React.useState(readMvFold);
+      const [directError, setDirectError] = React.useState('');
+      const openDirect = async agent => {
+        setDirectError('');
+        const message = await onOpenAgentDirect?.(agent);
+        if (message) setDirectError(message);
+      };
+      const toggle = key => {
+        const next = { ...folded, [key]: !folded[key] };
+        setFolded(next);
+        try { window.localStorage?.setItem(mvFoldKey, JSON.stringify(next)); } catch {}
+      };
+      const sections = [
+        ['taskRooms', '工单群', 'room', rooms, room => openRoom('taskRooms', room)],
+        ['groups', '群聊', 'chat', groups, group => openRoom(group.kind, group)],
+        ['agents', '智能体', 'agent', agents, openDirect],
+      ];
+      return h('nav', { className: 'mv-scope mv-sections', 'aria-label': '调度官会话快捷入口' },
+        ...sections.map(([key, label, icon, rows, open]) => h('section', { key },
+          h('button', { className: 'mv-row mv-section-label', type: 'button', 'aria-expanded': !folded[key],
+            'aria-controls': 'mv-sidebar-' + key, onClick: () => toggle(key) },
+            h(MvIcon, { name: folded[key] ? 'chevron' : 'down' }), label, h('span', { className: 'mv-muted' }, rows.length)),
+          h('ul', { id: 'mv-sidebar-' + key, className: 'mv-row-list', hidden: Boolean(folded[key]) },
+            rows.length === 0 ? h('li', { className: 'mv-muted' }, loading ? '正在读取…' : incomplete ? '暂无可显示的内容' : '暂无' + label)
+              : rows.map(row => h('li', { key: row.agentKey ?? (row.kind ?? key) + ':' + row.id },
+                h('button', { type: 'button', className: 'mv-row', onClick: () => open(row), title: row.title ?? row.name },
+                  h(MvIcon, { name: icon }), h('span', { className: 'mv-copy mv-truncate' }, row.title || row.name || '未命名'),
+                  row.incident && h('span', { role: 'img', 'aria-label': '有待处理异常' }, h(MvIcon, { name: 'dot', className: 'mv-danger', size: 12 })))))))),
+        incomplete && h('span', { className: 'mv-muted', role: 'status' }, '部分列表暂不可用'),
+        directError && h('span', { className: 'mv-danger', role: 'status' }, directError));
+    }
+
+    function mountSidebarSectionsPortal() {
+      const store = createMvStore(null);
+      if (typeof document === 'undefined' || !document.body) return { ...store, dispose() {} };
+      const root = document.createElement('div');
+      root.id = 'marshal-sidebar-sections-portal';
+      let disposed = false;
+      const sync = () => {
+        if (disposed) return;
+        const scrollport = document.querySelector('[data-sidebar-scrollport]');
+        const anchor = scrollport?.querySelector('[data-slot="sidebar.workspaces"]');
+        if (anchor?.parentElement) {
+          if (root.parentElement !== anchor.parentElement || root.nextSibling !== anchor) anchor.parentElement.insertBefore(root, anchor);
+          store.set(root);
+        } else {
+          root.remove();
+          store.set(null);
+        }
+      };
+      // Also handles the native sidebar switching between compact and wide in place.
+      const observer = typeof MutationObserver === 'function' ? new MutationObserver(records => {
+        if (records.some(record => record.target !== root && !root.contains(record.target))) sync();
+      }) : null;
+      observer?.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['data-sidebar-scrollport', 'data-slot'] });
+      sync();
+      return { ...store, dispose() { if (disposed) return; disposed = true; observer?.disconnect(); store.set(null); root.remove(); store.clear(); } };
+    }
+    function MarshalSidebarPortal({ target, ...props }) {
+      const root = useMvSnapshot(target);
+      if (!root) return null;
+      const children = h(MarshalSidebarSections, props);
+      if (typeof window.ReactDOM?.createPortal === 'function') return window.ReactDOM.createPortal(children, root);
+      // DSH 0.2.2-rc.5 only: its loader exposes React but not react-dom.
+      // This fallback mirrors that host renderer's internal Portal record.
+      return { $$typeof: Symbol.for('react.portal'), key: 'marshal-sidebar', children, containerInfo: root, implementation: null };
+    }
+
+    function marshalCrossGroupMentions(text) {
+      return [...new Set(Array.from(text.matchAll(/@([^\s@]+)/g), match => match[1]))];
+    }
+    function marshalCrossGroupDeliveryError(result) {
+      if (!Array.isArray(result?.deliveries)) return '';
+      const failed = result.deliveries.filter(item => item.state === 'failed');
+      return failed.length ? '部分成员失败：' + failed.map(item => item.name + ' ' + (item.code || '')).join('、') : '';
+    }
+    function validateSidebarGroupMentions(text, group, cross) {
+      // Local groups parse text again server-side; mirror their punctuation and
+      // @全体 alias so validation and actual delivery select the same targets.
+      const pattern = cross ? /@([^\s@]+)/g : /@([^\s@,，。；;]+)/g;
+      const mentions = cross ? marshalCrossGroupMentions(text) : [...new Set(Array.from(text.matchAll(pattern), match => {
+        const name = match[1].replace(/[：:]+$/, '');
+        return name === '全体' ? 'all' : name;
+      }))];
+      if (text.replace(pattern, '').includes('@') || mentions.includes('')) throw Error('无法解析 @ 提及，请输入完整成员名');
+      const unknown = mentions.filter(name => !(!cross && name === 'all') && !group.members?.some(member => member.name === name));
+      if (unknown.length) throw Error('未找到 @ 成员：' + unknown.join('、'));
+      return mentions;
+    }
+
+    // The existing group list views own unseeded selection. A shortcut opens a
+    // targeted group directly, without reaching into those views or clicking host DOM.
+    function MarshalSidebarGroupRoom({ route, ownerSignal }) {
+      const cross = route.kind === 'cross';
+      const prefix = cross ? 'marshal/cross-groups/' : 'marshal/groups/';
+      const id = route.item.id;
+      const [group, setGroup] = React.useState(null);
+      const [error, setError] = React.useState('');
+      const [sendError, setSendError] = React.useState('');
+      const [text, setText] = React.useState('');
+      const [busy, setBusy] = React.useState(false);
+      const live = React.useRef(null);
+      React.useEffect(() => {
+        if (ownerSignal.aborted) return;
+        const controller = new AbortController();
+        const { signal } = controller;
+        let reading, queued = false;
+        const read = async () => {
+          try {
+            const result = await fetchJson(prefix + (cross ? 'state' : 'get?id=' + encodeURIComponent(id)), undefined, false, signal);
+            if (!signal.aborted) {
+              const next = cross ? result.groups?.find(item => item.id === id) : result.group;
+              setGroup(next ?? null);
+              setError(next ? '' : '群聊不可用');
+            }
+          } catch { if (!signal.aborted) { setGroup(null); setError('无法读取群聊'); } }
+        };
+        const refresh = () => {
+          if (signal.aborted) return;
+          queued = true;
+          reading ??= Promise.resolve().then(async () => {
+            while (queued && !signal.aborted) { queued = false; await read(); }
+          }).finally(() => { reading = undefined; if (queued) refresh(); });
+          return reading;
+        };
+        live.current = { signal, refresh };
+        const unsubscribe = subscribeMarshalEvents(['ready', 'groups.changed'], refresh, { initial: true, debounceMs: 80 });
+        const cleanup = () => {
+          controller.abort();
+          live.current = null;
+          unsubscribe();
+          ownerSignal.removeEventListener('abort', cleanup);
+        };
+        ownerSignal.addEventListener('abort', cleanup, { once: true });
+        return cleanup;
+      }, [id, prefix, ownerSignal]);
+      const send = async event => {
+        event.preventDefault();
+        if (!live.current || !text.trim() || !group || busy) return;
+        const { signal, refresh } = live.current;
+        setBusy(true);
+        setSendError('');
+        try {
+          const message = text.trim();
+          const mentions = validateSidebarGroupMentions(message, group, cross);
+          const result = await fetchJson(prefix + 'send', { id, text: message, mentions }, false, signal);
+          if (result.error === 'leader-unavailable') throw Error('leader 所在设备离线，这个群暂时不可用');
+          if (result.error) throw Error(result.error);
+          if (!signal.aborted) {
+            const deliveryError = cross ? marshalCrossGroupDeliveryError(result) : '';
+            if (result.unknown?.length) setSendError('未找到 @ 成员：' + result.unknown.join('、') + (deliveryError ? '；' + deliveryError : ''));
+            else if (deliveryError) setSendError(deliveryError);
+            else if (result.offline?.length) setSendError('成员离线：' + result.offline.join('、') +
+              (result.fallback ? '；已通知 leader 新建临时智能体或改派' : ''));
+            setText('');
+            void refresh();
+          }
+        } catch (e) { if (!signal.aborted) setSendError('发送失败：' + (e.message || e)); }
+        finally { if (!signal.aborted) setBusy(false); }
+      };
+      return h('section', { className: 'mv-scope mv-room', 'aria-label': route.item.name },
+        h('div', { className: 'mv-line' }, h('h2', { className: 'mv-voice-title mv-copy' }, group?.name || route.item.name),
+          h(MvButton, { icon: 'refresh', label: '刷新群聊', iconOnly: true, onClick: () => void live.current?.refresh() })),
+        error && h('div', { role: 'status', className: 'mv-danger' }, error),
+        sendError && h('div', { role: 'status', className: 'mv-danger' }, sendError),
+        h('div', { className: 'mv-room-log', role: 'log', 'aria-label': '群聊记录' },
+          (group?.messages ?? []).map(message => h('div', { key: message.id, className: 'mv-room-message' },
+            h('div', { className: 'mv-muted' }, message.author === 'user' ? '我'
+              : group.members?.find(member => member.memberId === message.authorMemberId)?.name || (cross ? message.author : '成员')),
+            message.text))),
+        h('form', { onSubmit: send, className: 'mv-stack' },
+          h('textarea', { className: 'mv-field', rows: 2, 'aria-label': '群聊消息', value: text, onChange: event => setText(event.target.value) }),
+          h('div', null, h(MvButton, { icon: 'send', label: busy ? '正在发送…' : '发送消息', type: 'submit', disabled: !group || !text.trim() || busy }))));
+    }
+    function MemoryGalaxy({ graph, selectedId, onSelect, paused }) {
       const canvasRef = React.useRef(null);
-      const stateRef = React.useRef(null);
+      const pausedRef = React.useRef(paused);
+      pausedRef.current = paused;
+      const cameraRef = React.useRef({ yaw: 0.35, pitch: -0.16, zoom: 1 });
       const selectRef = React.useRef(onSelect);
       selectRef.current = onSelect;
       const selectedRef = React.useRef(selectedId);
       selectedRef.current = selectedId;
+      const kinds = ['profile', 'decision', 'fact', 'episode', 'handoff', 'scene'];
+      const layout = React.useMemo(() => {
+        const domains = new Set((graph.nodes || []).map(node => node.scope));
+        const hash = value => {
+          let h = 2166136261;
+          for (const character of value) h = Math.imul(h ^ character.codePointAt(0), 16777619);
+          return h >>> 0;
+        };
+        const nodes = (graph.nodes || []).slice(0, 420).map((node, index) => {
+          const seed = hash(String(node.id ?? index));
+          const domain = ({ global: 0, workspace: 1, agent: 2 })[node.scope] ?? 0;
+          const orbit = Math.max(0, kinds.indexOf(node.kind)) * Math.PI / 3;
+          const angle = seed / 0x100000000 * Math.PI * 2;
+          const radius = 12 + (hash('radius:' + seed) % 1000) / 1000 * 42;
+          return { ...node,
+            x: (domains.size > 1 ? (domain - 1) * 160 : 0) + Math.cos(orbit) * 78 + Math.cos(angle) * radius,
+            y: Math.sin(orbit) * 78 + Math.sin(angle) * radius,
+            z: (hash('depth:' + seed) % 1000) / 1000 * 140 - 70,
+          };
+        });
+        const ids = new Set(nodes.map(node => node.id));
+        const edges = (graph.edges || []).filter(edge => ids.has(edge.source) && ids.has(edge.target) && edge.source !== edge.target).slice(0, 1400);
+        // Keep a few landmark titles readable without labelling every node.
+        const labelIds = new Set([...nodes]
+          .sort((a, b) => (Number(b.pinned) - Number(a.pinned)) || (Number(b.importance) || 0) - (Number(a.importance) || 0))
+          .slice(0, nodes.length > 40 ? 5 : 8).map(node => node.id));
+        return { nodes, edges, labelIds };
+      }, [graph]);
+      const layoutRef = React.useRef(layout);
+      layoutRef.current = layout;
+      const scheduleRef = React.useRef(null);
       React.useEffect(() => {
         const canvas = canvasRef.current;
-        if (!canvas || !graph) return undefined;
-        const nodes = (graph.nodes || []).slice(0, 420).map((node, index) => {
-          const hash = (value) => { let h = 2166136261; for (let i = 0; i < value.length; i++) { h ^= value.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; };
-          const h = hash(node.id || String(index));
-          const angle = (h % 1000) / 1000 * Math.PI * 2;
-          const radius = 70 + ((h >>> 10) % 1000) / 1000 * 300;
-          return { ...node, x: Math.cos(angle) * radius, y: ((h >>> 20) % 1000) / 1000 * 420 - 210, z: Math.sin(angle) * radius, vx: 0, vy: 0, vz: 0 };
-        });
-        const ids = new Map(nodes.map((node, index) => [node.id, index]));
-        const edges = (graph.edges || []).map(edge => ({ ...edge, a: ids.get(edge.source), b: ids.get(edge.target) })).filter(edge => edge.a !== undefined && edge.b !== undefined && edge.a !== edge.b).slice(0, 1400);
-        for (let iteration = 0; iteration < 110; iteration++) {
-          for (let i = 0; i < nodes.length; i++) {
-            const a = nodes[i];
-            for (let j = i + 1; j < nodes.length; j++) {
-              const b = nodes[j];
-              let dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
-              let d2 = dx * dx + dy * dy + dz * dz + 12;
-              const force = 5200 / d2;
-              const d = Math.sqrt(d2);
-              dx /= d; dy /= d; dz /= d;
-              a.vx += dx * force; a.vy += dy * force; a.vz += dz * force;
-              b.vx -= dx * force; b.vy -= dy * force; b.vz -= dz * force;
-            }
-            a.vx -= a.x * 0.0007; a.vy -= a.y * 0.0007; a.vz -= a.z * 0.0007;
-          }
-          for (const edge of edges) {
-            const a = nodes[edge.a], b = nodes[edge.b];
-            const dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
-            const d = Math.sqrt(dx * dx + dy * dy + dz * dz) + 0.01;
-            const force = (d - 170) * 0.008 * (0.4 + Number(edge.weight || 0.4));
-            const fx = dx / d * force, fy = dy / d * force, fz = dz / d * force;
-            a.vx += fx; a.vy += fy; a.vz += fz;
-            b.vx -= fx; b.vy -= fy; b.vz -= fz;
-          }
-          for (const node of nodes) { node.vx *= 0.72; node.vy *= 0.72; node.vz *= 0.72; node.x += node.vx; node.y += node.vy; node.z += node.vz; }
-        }
-        let maxRadius = 1;
-        for (const node of nodes) maxRadius = Math.max(maxRadius, Math.hypot(node.x, node.y, node.z));
-        const spread = nodes.length <= 4 ? 360 : 300;
-        for (const node of nodes) { const factor = spread / maxRadius; node.x *= factor; node.y *= factor; node.z *= factor; }
-        const stars = Array.from({ length: 220 }, (_, index) => ({ x: (index * 73 % 997) / 997, y: (index * 151 % 991) / 991, r: (index % 7) / 7 * 1.2 + 0.2, phase: index }));
-        const labelIds = new Set([...nodes].sort((a, b) => (Number(b.pinned) - Number(a.pinned)) || (Number(b.importance) - Number(a.importance))).slice(0, 8).map(node => node.id));
-        const camera = { yaw: 0.35, pitch: -0.16, zoom: 1, auto: true, dragging: false, moved: false, lastX: 0, lastY: 0, hover: undefined };
-        stateRef.current = { nodes, edges, stars, camera, width: 0, height: 0 };
-        let raf = 0;
+        if (!canvas) return undefined;
+        const tokens = ['state-warning-primary', 'marshal-accent', 'marshal-success',
+          'label-secondary', 'marshal-danger', 'state-info-primary'];
+        const fallbackHues = [38, 215, 155, 265, 5, 185];
+        const stars = Array.from({ length: 120 }, (_, index) => ({ x: (index * 73 % 997) / 997, y: (index * 151 % 991) / 991, r: (index % 7) / 7 + 0.2 }));
+        const camera = cameraRef.current;
+        let width = 0, height = 0, pointerId = null;
+        let rotY = camera.yaw;
+        let drift = 1;
+        let hover, dragging = false, moved = false, lastX, lastY, startX, startY;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return undefined;
+        let raf = null;
         let disposed = false;
         const toScreen = (node, width, height) => {
-          const cy = Math.cos(camera.yaw), sy = Math.sin(camera.yaw);
+          const cy = Math.cos(rotY), sy = Math.sin(rotY);
           const cp = Math.cos(camera.pitch), sp = Math.sin(camera.pitch);
           let x = node.x * cy - node.z * sy;
           let z = node.x * sy + node.z * cy;
           let y = node.y * cp - z * sp;
           z = node.y * sp + z * cp;
           const focal = 900;
-          const scale = focal / (focal + z) * camera.zoom;
+          const scale = focal / (focal + z) * camera.zoom * Math.min(1.2, width / 560, height / 340);
           return { x: width / 2 + x * scale, y: height / 2 + y * scale, scale, depth: z };
         };
         const draw = () => {
           if (disposed) return;
           const dpr = Math.min(2, window.devicePixelRatio || 1);
-          const width = canvas.clientWidth || 600, height = canvas.clientHeight || 480;
+          width = canvas.clientWidth || 600; height = canvas.clientHeight || 480;
           if (canvas.width !== Math.round(width * dpr) || canvas.height !== Math.round(height * dpr)) {
             canvas.width = Math.round(width * dpr); canvas.height = Math.round(height * dpr);
           }
-          stateRef.current.width = width; stateRef.current.height = height;
-          const ctx = canvas.getContext('2d');
           ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-          const gradient = ctx.createRadialGradient(width * 0.5, height * 0.45, 20, width * 0.5, height * 0.5, Math.max(width, height) * 0.75);
-          gradient.addColorStop(0, '#111827'); gradient.addColorStop(1, '#05070d');
-          ctx.fillStyle = gradient; ctx.fillRect(0, 0, width, height);
+          ctx.clearRect(0, 0, width, height);
+          const theme = window.getComputedStyle(canvas);
+          const ink = theme.color;
+          const colors = tokens.map((token, index) => theme.getPropertyValue('--dsw-alias-' + token).trim() || 'hsl(' + fallbackHues[index] + ' 48% 48%)');
+          // A very soft vignette keeps the canvas from reading as a flat empty box.
+          if (typeof ctx.createRadialGradient === 'function' && typeof ctx.fillRect === 'function') {
+            try {
+              const vignette = ctx.createRadialGradient(width / 2, height * 0.46, Math.min(width, height) * 0.12,
+                width / 2, height / 2, Math.max(width, height) * 0.72);
+              vignette.addColorStop(0, ink);
+              vignette.addColorStop(1, 'transparent');
+              ctx.globalAlpha = 0.06; ctx.fillStyle = vignette; ctx.fillRect(0, 0, width, height);
+            } catch { /* A host colour the canvas cannot parse simply skips the wash. */ }
+          }
+          ctx.globalAlpha = 0.16; ctx.fillStyle = ink;
           for (const star of stars) {
-            const alpha = 0.18 + 0.35 * (0.5 + 0.5 * Math.sin((performance.now() / 2400) + star.phase));
-            ctx.fillStyle = 'rgba(180,210,255,' + alpha + ')';
             ctx.beginPath(); ctx.arc(star.x * width, star.y * height, star.r, 0, Math.PI * 2); ctx.fill();
           }
-          if (camera.auto && !camera.dragging) camera.yaw += 0.00045;
+          const { nodes, edges, labelIds } = layoutRef.current;
+          if (!dragging && hover !== undefined && !nodes.some(node => node.id === hover)) {
+            hover = undefined;
+            canvas.style.cursor = 'grab';
+          }
+          const target = hover !== undefined || dragging ? 0 : 1;
+          drift += (target - drift) * 0.09;
+          if (Math.abs(drift - target) < 0.001) drift = target;
+          if (!pausedRef.current) {
+            if (drift === 1) rotY += 0.00028;
+            else rotY += 0.00028 * drift;
+          }
+          camera.yaw = rotY;
           const projected = nodes.map(node => ({ node, ...toScreen(node, width, height) })).sort((a, b) => b.depth - a.depth);
+          const points = new Map(projected.map(entry => [entry.node.id, entry]));
+          ctx.lineWidth = 0.7;
           for (const edge of edges) {
-            const a = projected.find(entry => entry.node === nodes[edge.a]);
-            const b = projected.find(entry => entry.node === nodes[edge.b]);
+            const a = points.get(edge.source), b = points.get(edge.target);
             if (!a || !b) continue;
-            ctx.strokeStyle = edge.relation === 'session' ? 'rgba(120,180,255,0.10)' : 'rgba(160,140,255,0.13)';
-            ctx.lineWidth = 0.7;
+            const depth = Math.max(0.12, Math.min(1, 1 - (a.depth + 350) / 900));
+            ctx.globalAlpha = 0.05 + depth * 0.12;
+            ctx.strokeStyle = ink;
             ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
           }
-          let hover = undefined;
+          const focusId = hover ?? selectedRef.current;
           for (const entry of projected) {
             const node = entry.node;
-            const base = 3.2 + Math.sqrt(Math.max(0.01, Number(node.importance))) * 8 + Math.log1p(Number(node.accessCount || 0)) * 1.6;
+            const base = 3.2 + Math.sqrt(Math.max(0.01, (Number(node.importance) || 0))) * 8 + Math.log1p(Math.max(0, Number(node.accessCount) || 0)) * 1.6;
             const radius = Math.max(2, base * entry.scale);
             const clarityAlpha = node.clarity === 'fuzzy' ? 0.5 : node.clarity === 'trace' ? 0.28 : node.clarity === 'clear' ? 0.85 : 1;
             const alpha = Math.max(0.12, Math.min(1, 1 - (entry.depth + 350) / 900)) * clarityAlpha;
-            const colors = { profile: '#f6c35c', decision: '#5aa7ff', fact: '#4fd1c5', episode: '#b18cff', handoff: '#ff9f5a', scene: '#7bd88f' };
-            const color = colors[node.kind] || '#8fb4ff';
-            if (selectedRef.current === node.id) {
-              ctx.strokeStyle = 'rgba(255,255,255,0.85)'; ctx.lineWidth = 1.4;
-              ctx.beginPath(); ctx.arc(entry.x, entry.y, radius + 5, 0, Math.PI * 2); ctx.stroke();
+            const color = colors[kinds.indexOf(node.kind)] || ink;
+            const active = focusId === node.id;
+            // Landmarks and the focused node glow; the rest stay flat so a dense
+            // workspace graph never turns into a bloom storm.
+            if ((active || node.pinned || labelIds.has(node.id)) && typeof ctx.createRadialGradient === 'function' && radius > 3) {
+              try {
+                const halo = ctx.createRadialGradient(entry.x, entry.y, radius * 0.6, entry.x, entry.y, radius * 3.4);
+                halo.addColorStop(0, color);
+                halo.addColorStop(1, 'transparent');
+                ctx.globalAlpha = Math.min(0.42, alpha * 0.5); ctx.fillStyle = halo;
+                ctx.beginPath(); ctx.arc(entry.x, entry.y, radius * 3.4, 0, Math.PI * 2); ctx.fill();
+              } catch { /* Unparsable host colour: fall back to the solid node. */ }
             }
-            const glow = ctx.createRadialGradient(entry.x, entry.y, 0, entry.x, entry.y, radius * 3.2);
-            glow.addColorStop(0, color); glow.addColorStop(0.24, color + '55'); glow.addColorStop(1, 'rgba(0,0,0,0)');
-            ctx.globalAlpha = alpha * 0.55; ctx.fillStyle = glow;
-            ctx.beginPath(); ctx.arc(entry.x, entry.y, radius * 3.2, 0, Math.PI * 2); ctx.fill();
+            if (selectedRef.current === node.id || node.pinned) {
+              ctx.globalAlpha = 0.85; ctx.strokeStyle = ink; ctx.lineWidth = 1.2;
+              ctx.beginPath(); ctx.arc(entry.x, entry.y, radius + 4, 0, Math.PI * 2); ctx.stroke();
+            }
             ctx.globalAlpha = alpha; ctx.fillStyle = color;
             ctx.beginPath(); ctx.arc(entry.x, entry.y, radius, 0, Math.PI * 2); ctx.fill();
-            if (node.pinned) { ctx.strokeStyle = 'rgba(255,220,150,0.8)'; ctx.lineWidth = 1; ctx.beginPath(); ctx.arc(entry.x, entry.y, radius + 3, 0, Math.PI * 2); ctx.stroke(); }
-            if (camera.hover === node.id || selectedRef.current === node.id || labelIds.has(node.id)) {
-              hover = entry;
-              ctx.globalAlpha = 0.95; ctx.fillStyle = '#e8edf7'; ctx.font = '11px sans-serif';
+            if (active || labelIds.has(node.id)) {
               const label = String(node.title || '').slice(0, 42);
-              ctx.fillText(label, entry.x + radius + 7, entry.y + 3);
+              if (label) {
+                ctx.globalAlpha = active ? 1 : Math.min(0.72, alpha + 0.18);
+                ctx.fillStyle = ink; ctx.font = active ? '600 12px sans-serif' : '11px sans-serif';
+                ctx.fillText(label, entry.x + radius + 7, entry.y + 4);
+              }
             }
           }
           ctx.globalAlpha = 1;
-          ctx.fillStyle = 'rgba(200,215,235,0.55)'; ctx.font = '11px sans-serif';
-          ctx.fillText(nodes.length + ' memories · ' + edges.length + ' links · drag to orbit · wheel to zoom', 14, height - 14);
-          raf = requestAnimationFrame(draw);
+          ctx.fillStyle = ink; ctx.font = '12px sans-serif';
+          ctx.fillText('拖拽旋转 · 滚轮缩放 · 点击查看记忆', 14, height - 14);
+          return !pausedRef.current && ((hover === undefined && !dragging) || drift > 0.001);
         };
-        const onPointerDown = event => { camera.dragging = true; camera.moved = false; camera.lastX = event.clientX; camera.lastY = event.clientY; canvas.setPointerCapture?.(event.pointerId); canvas.style.cursor = 'grabbing'; };
-        const onPointerMove = event => {
-          if (camera.dragging) {
-            const dx = event.clientX - camera.lastX, dy = event.clientY - camera.lastY;
-            if (Math.abs(dx) + Math.abs(dy) > 2) camera.moved = true;
-            camera.yaw += dx * 0.008; camera.pitch = Math.max(-1.2, Math.min(1.2, camera.pitch + dy * 0.008));
-            camera.lastX = event.clientX; camera.lastY = event.clientY;
-            return;
-          }
+        const schedule = () => {
+          if (disposed || raf !== null) return;
+          raf = requestAnimationFrame(() => {
+            raf = null;
+            if (draw()) schedule();
+          });
+        };
+        const hit = event => {
           const rect = canvas.getBoundingClientRect();
-          const mx = event.clientX - rect.left, my = event.clientY - rect.top;
-          let best; let bestDistance = 18;
-          for (const node of nodes) {
-            const p = toScreen(node, stateRef.current.width, stateRef.current.height);
-            const distance = Math.hypot(p.x - mx, p.y - my);
-            if (distance < bestDistance) { best = node; bestDistance = distance; }
+          let best, distance = 18;
+          for (const node of layoutRef.current.nodes) {
+            const p = toScreen(node, width, height);
+            const d = Math.hypot(p.x - (event.clientX - rect.left), p.y - (event.clientY - rect.top));
+            if (d < distance) { best = node; distance = d; }
           }
-          camera.hover = best?.id;
-          canvas.style.cursor = best ? 'pointer' : 'grab';
+          return best;
         };
-        const onPointerUp = event => {
-          if (camera.dragging && !camera.moved) {
-            const rect = canvas.getBoundingClientRect();
-            const mx = event.clientX - rect.left, my = event.clientY - rect.top;
-            let best; let bestDistance = 24;
-            for (const node of nodes) { const p = toScreen(node, stateRef.current.width, stateRef.current.height); const distance = Math.hypot(p.x - mx, p.y - my); if (distance < bestDistance) { best = node; bestDistance = distance; } }
-            if (best) selectRef.current?.(best);
+        const onPointerDown = event => {
+          if (pointerId !== null || event.button !== 0) return;
+          pointerId = event.pointerId; dragging = true; moved = false;
+          startX = lastX = event.clientX; startY = lastY = event.clientY;
+          canvas.setPointerCapture?.(pointerId); canvas.style.cursor = 'grabbing';
+          schedule();
+        };
+        const onPointerMove = event => {
+          schedule();
+          if (dragging) {
+            if (event.pointerId !== pointerId) return;
+            moved ||= Math.hypot(event.clientX - startX, event.clientY - startY) > 3;
+            if (!moved) return;
+            rotY += (event.clientX - lastX) * 0.008;
+            camera.yaw = rotY;
+            camera.pitch = Math.max(-1.2, Math.min(1.2, camera.pitch + (event.clientY - lastY) * 0.008));
+            lastX = event.clientX; lastY = event.clientY;
+          } else {
+            hover = hit(event)?.id;
+            canvas.style.cursor = hover === undefined ? 'grab' : 'pointer';
           }
-          camera.dragging = false; canvas.style.cursor = 'grab';
         };
-        const onWheel = event => { event.preventDefault(); camera.zoom = Math.max(0.35, Math.min(2.8, camera.zoom * (event.deltaY > 0 ? 0.92 : 1.08))); };
-        canvas.addEventListener('pointerdown', onPointerDown);
-        canvas.addEventListener('pointermove', onPointerMove);
-        canvas.addEventListener('pointerup', onPointerUp);
-        canvas.addEventListener('pointerleave', () => { camera.dragging = false; });
-        canvas.addEventListener('wheel', onWheel, { passive: false });
-        const observer = new ResizeObserver(() => {});
-        observer.observe(canvas);
-        raf = requestAnimationFrame(draw);
-        return () => { disposed = true; cancelAnimationFrame(raf); observer.disconnect(); canvas.removeEventListener('pointerdown', onPointerDown); canvas.removeEventListener('pointermove', onPointerMove); canvas.removeEventListener('pointerup', onPointerUp); canvas.removeEventListener('wheel', onWheel); };
-      }, [graph]);
-      return h('canvas', { ref: canvasRef, style: { width: '100%', height: '100%', display: 'block', borderRadius: 14, background: '#05070d', cursor: 'grab', touchAction: 'none' } });
+        const finishPointer = event => {
+          if (!dragging || event.pointerId !== pointerId) return;
+          pointerId = null; dragging = false;
+          const node = event.type === 'pointerup' ? hit(event) : undefined;
+          hover = event.pointerType === 'touch' ? undefined : node?.id;
+          canvas.style.cursor = hover === undefined ? 'grab' : 'pointer';
+          schedule();
+          if (!moved && node) selectRef.current?.(node);
+        };
+        const onPointerLeave = () => { hover = undefined; if (!dragging) canvas.style.cursor = 'grab'; schedule(); };
+        const onWheel = event => { event.preventDefault(); camera.zoom = Math.max(0.35, Math.min(2.8, camera.zoom * (event.deltaY > 0 ? 0.92 : 1.08))); schedule(); };
+        const listeners = { pointerdown: onPointerDown, pointermove: onPointerMove, pointerup: finishPointer,
+          pointercancel: finishPointer, lostpointercapture: finishPointer, pointerleave: onPointerLeave, wheel: onWheel };
+        for (const [type, listener] of Object.entries(listeners)) canvas.addEventListener(type, listener, type === 'wheel' ? { passive: false } : undefined);
+        const observer = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(schedule) : null;
+        observer?.observe(canvas);
+        const colorScheme = window.matchMedia?.('(prefers-color-scheme: dark)');
+        colorScheme?.addEventListener?.('change', schedule);
+        const themeObserver = typeof MutationObserver !== 'undefined' ? new MutationObserver(schedule) : null;
+        for (let parent = canvas.parentElement; parent; parent = parent.parentElement) {
+          themeObserver?.observe(parent, { attributes: true, attributeFilter: [
+            'class', 'style', 'data-theme', 'data-ds-dark-theme', 'data-ds-light-theme', 'data-ds-theme-source',
+          ] });
+        }
+        scheduleRef.current = schedule;
+        schedule();
+        return () => {
+          disposed = true;
+          scheduleRef.current = null;
+          if (raf !== null) cancelAnimationFrame(raf);
+          observer?.disconnect();
+          themeObserver?.disconnect();
+          colorScheme?.removeEventListener?.('change', schedule);
+          for (const [type, listener] of Object.entries(listeners)) canvas.removeEventListener(type, listener);
+          if (pointerId !== null && canvas.hasPointerCapture?.(pointerId)) canvas.releasePointerCapture?.(pointerId);
+          canvas.style.cursor = 'grab';
+        };
+      }, []);
+      React.useEffect(() => { scheduleRef.current?.(); }, [graph, selectedId, paused]);
+      return h('canvas', { ref: canvasRef, 'aria-label': '3D 记忆星系', role: 'img', style: { width: '100%', height: '100%', display: 'block', borderRadius: 14, background: 'radial-gradient(ellipse at center, ' + dswTheme.layer + ', ' + dswTheme.layer3 + ')', cursor: 'grab', touchAction: 'none' } });
     }
 
-    function MemoryPage({ initialAgentId = '', initialLayer = '' } = {}) {
+    const MV_MEMORY_SCOPES = { global: ['全局', '#4e93e8'], agent: ['智能体私有', '#2ea36a'], workspace: ['工作区共享', '#d08a2a'] };
+    const MV_MEMORY_KINDS = { profile: ['偏好', '#4e93e8'], decision: ['决策', '#2ea36a'], fact: ['事实', '#4a9fb5'],
+      episode: ['片段', '#d08a2a'], handoff: ['交接', '#b456c8'], scene: ['场景', '#cf5f7a'] };
+    const mvMemoryScopeLabel = scope => (MV_MEMORY_SCOPES[scope] ?? [scope || '记忆', '#8b93a1']);
+    const mvMemoryKindLabel = kind => (MV_MEMORY_KINDS[kind] ?? [kind || '记忆', '#8b93a1']);
+    const mvMemoryClarity = clarity => ({ vivid: '清晰', clear: '清楚', fuzzy: '模糊', trace: '只剩印象' }[clarity] || clarity || '清晰');
+    function mvMemoryChip(label, color, key, solid = false) {
+      return h('span', { className: 'mv-tone-chip', key, 'data-solid': solid ? 'true' : undefined,
+        style: { '--mv-tone': color } }, label);
+    }
+
+    function MemoryPage({ initialAgentId = '', initialLayer = '', mvOpenDirect, closeMemorySidebar } = {}) {
       const [layer, setLayer] = React.useState(() => (initialLayer === 'agent' || initialLayer === 'workspace' || initialLayer === 'global') ? initialLayer : (initialAgentId ? 'agent' : 'global'));
       const [library, setLibrary] = React.useState(null);
       const [extraWorkspaces, setExtraWorkspaces] = React.useState([]);
       const [agentId, setAgentId] = React.useState(initialAgentId || '');
       const [workspaceId, setWorkspaceId] = React.useState('');
-      const [graph, setGraph] = React.useState({ nodes: [], edges: [] });
+      const [loadedGraph, setGraph] = React.useState(null);
+      const [paused, setPaused] = React.useState(() => window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches ?? false);
+      const [fullCanvas, setFullCanvas] = React.useState(false);
+      const closeSidebar = () => {
+        try { void Promise.resolve(closeMemorySidebar?.()).catch(() => {}); } catch { /* optional host service */ }
+      };
+      React.useEffect(closeSidebar, []);
       const [privateBackend, setPrivateBackend] = React.useState('');
       const [allowTaskRecall, setAllowTaskRecall] = React.useState(false);
       const [selected, setSelected] = React.useState(null);
+      const [detailConflict, setDetailConflict] = React.useState(null);
+      const [detailLoading, setDetailLoading] = React.useState(false);
       const [error, setError] = React.useState('');
       const [query, setQuery] = React.useState('');
       const [results, setResults] = React.useState(null);
@@ -479,8 +1207,6 @@ window.__ModuleLoader__.load({
 
       React.useEffect(() => {
         setScope(layer);
-        setSelected(null);
-        setResults(null);
       }, [layer]);
 
       React.useEffect(() => {
@@ -490,19 +1216,78 @@ window.__ModuleLoader__.load({
       }, [layer, workspaceId, realWorkspaces]);
 
       const activeAgentId = layer === 'agent' ? agentId : '';
+      const mvDirectAgent = agents.find(row => row.id === activeAgentId);
       const activeWorkspaceId = layer === 'workspace' ? workspaceId : '';
-      const view = JSON.stringify([layer, activeAgentId, activeWorkspaceId]);
+      const domains = (fullCanvas ? ['global', 'workspace', 'agent'] : [layer]).filter(domain =>
+        domain === 'global' || (domain === 'agent' ? agentId : workspaceId));
+      const view = JSON.stringify([layer, fullCanvas, fullCanvas ? agentId : activeAgentId, fullCanvas ? workspaceId : activeWorkspaceId]);
       const currentView = React.useRef(view);
       currentView.current = view;
-      const graphRequest = React.useRef(0);
-      const queryRequest = React.useRef(0);
+      const graph = React.useMemo(() => loadedGraph?.view === view ? loadedGraph : { nodes: [], edges: [] }, [loadedGraph, view]);
+      const searchActive = results?.view === view;
+      const visibleResults = searchActive ? results.items : null;
+      const visibleGraph = React.useMemo(() => {
+        if (visibleResults === null) return graph;
+        const ids = new Set(visibleResults.map(item => item.id));
+        return { nodes: visibleResults, edges: graph.edges.filter(edge => ids.has(edge.source) && ids.has(edge.target)) };
+      }, [graph, visibleResults]);
+      const lifetime = React.useRef(null);
+      const refreshRef = React.useRef(null);
+      const detailSelection = React.useRef(0);
+      const [detailCheck, setDetailCheck] = React.useState(null);
+      const checkingDetail = React.useRef(null);
+      const requiredEventSeq = React.useRef(0);
+      const verifiedEventSeq = React.useRef(0);
+      const detailVerifyFailed = React.useRef(false);
+      const verifyLatestDetail = React.useRef(null);
+      const detailVerified = () => !checkingDetail.current && !detailVerifyFailed.current
+        && verifiedEventSeq.current >= requiredEventSeq.current;
+      const savingDetail = React.useRef(false);
+      const [saving, setSaving] = React.useState(false);
+      const conflictRef = React.useRef(null);
+      const updateConflict = conflict => {
+        conflictRef.current = conflict;
+        setDetailConflict(conflict);
+      };
+      const searchRequest = React.useRef(null);
+      const requestMemory = async (path, body, signal = lifetime.current?.signal, beforeSend) => {
+        if (!signal) throw new DOMException('Memory view is not mounted', 'AbortError');
+        const data = await fetchJson(path, body, true, signal, beforeSend);
+        signal.throwIfAborted();
+        return data;
+      };
+      const submittedQuery = React.useRef('');
+      const refresh = () => {
+        // Even an initial read with no loaded body can be invalidated.
+        if (selectedRef.current?.id) {
+          requiredEventSeq.current++;
+          void verifyLatestDetail.current();
+        }
+        return refreshRef.current?.request();
+      };
+      const selectedRef = React.useRef(selected);
+      const editTextRef = React.useRef(editText);
+      const editVisibilityRef = React.useRef(editVisibility);
+      selectedRef.current = selected;
+      editTextRef.current = editText;
+      editVisibilityRef.current = editVisibility;
+      const replaceDetail = item => {
+        selectedRef.current = item;
+        editTextRef.current = item?.content || '';
+        editVisibilityRef.current = item?.visibility === 'all' ? 'all' : 'no-group';
+        setSelected(item);
+        setEditText(editTextRef.current);
+        setEditVisibility(editVisibilityRef.current);
+        updateConflict(null);
+      };
 
-      const load = async () => {
+      const load = async signal => {
         try {
           const [data, wsData] = await Promise.all([
-            loadAgentLibrary(),
-            fetchJson('marshal/task-rooms/workspaces', undefined, true).catch(() => ({ workspaces: [] })),
+            loadAgentLibrary(signal),
+            requestMemory('marshal/task-rooms/workspaces', undefined, signal).catch(() => ({ workspaces: [] })),
           ]);
+          if (signal.aborted) return;
           setLibrary(data);
           setExtraWorkspaces(Array.isArray(wsData?.workspaces) ? wsData.workspaces : []);
           setError('');
@@ -510,43 +1295,99 @@ window.__ModuleLoader__.load({
           const firstReal = [...(data.workspaces || []), ...(wsData?.workspaces || [])].find(ws => ws && ws.id && !isPseudoAgentWorkspace(ws));
           if (firstReal) setWorkspaceId(current => current || firstReal.id);
         }
-        catch (e) { setError(friendlyError(e, '记忆')); }
+        catch (e) { if (!signal.aborted) setError(friendlyError(e, '记忆')); }
       };
 
-      const buildScopeQuery = () => {
-        const parts = [];
-        if (activeAgentId) parts.push('agentId=' + encodeURIComponent(activeAgentId));
-        if (activeWorkspaceId) parts.push('workspaceId=' + encodeURIComponent(activeWorkspaceId));
-        parts.push('scope=' + encodeURIComponent(layer));
-        return '?' + parts.join('&');
+      const buildScopeQuery = domain => {
+        const params = new URLSearchParams({ scope: domain });
+        if (domain === 'agent') params.set('agentId', agentId);
+        if (domain === 'workspace') params.set('workspaceId', workspaceId);
+        return '?' + params;
       };
 
-      const loadGraph = async () => {
-        if (layer === 'agent' && !activeAgentId) { setGraph({ nodes: [], edges: [] }); return; }
-        if (layer === 'workspace' && !activeWorkspaceId) { setGraph({ nodes: [], edges: [] }); return; }
-        const request = ++graphRequest.current;
-        const target = buildScopeQuery();
+      const refreshSelectedDetail = async () => {
+        const current = selectedRef.current;
+        if (!lifetime.current || !current?.id || savingDetail.current || checkingDetail.current) return;
+        const controller = new AbortController();
+        const { signal } = controller;
+        const seq = requiredEventSeq.current;
+        const selection = detailSelection.current;
+        const check = { controller };
+        checkingDetail.current = check;
+        setDetailCheck(check);
+        // Ignore responses superseded by another selection or a saved version.
+        const isCurrent = () => !signal.aborted && currentView.current === view
+          && detailSelection.current === selection && selectedRef.current === current && requiredEventSeq.current === seq;
         try {
-          const [data, nextHealth] = await Promise.all([
-            fetchJson('marshal/memory/graph' + target),
-            fetchJson('marshal/memory/health' + target).catch(() => null),
-          ]);
-          if (currentView.current !== view || request !== graphRequest.current) return;
-          const rawGraph = data.graph || { nodes: [], edges: [] };
-          const nodes = (rawGraph.nodes || []).filter(node => node.scope === layer);
-          const idSet = new Set(nodes.map(n => n.id));
-          const edges = (rawGraph.edges || []).filter(edge => idSet.has(edge.source) && idSet.has(edge.target));
-          setGraph({ nodes, edges });
-          setPrivateBackend(layer === 'global' ? '' : (data.privateBackend ?? ''));
-          setHealth(nextHealth);
-          setError('');
+          let data;
+          try {
+            data = await requestMemory('marshal/memory/get' + buildScopeQuery(current.scope) + '&id=' + encodeURIComponent(current.id), undefined, signal);
+          } catch (error) {
+            if (!isCurrent()) return;
+            if (error.status !== 404) {
+              // Do not unlock a potentially stale save until a retry can verify the remote version.
+              detailVerifyFailed.current = true;
+              setError(friendlyError(error, '核验记忆版本（请刷新后重试保存）'));
+              return;
+            }
+            data = { item: null };
+          }
+          if (!isCurrent()) return;
+          verifiedEventSeq.current = seq;
+          detailVerifyFailed.current = false;
+          const isDirty = current.scope === 'global' && (editTextRef.current !== (current.content || '') || editVisibilityRef.current !== (current.visibility === 'all' ? 'all' : 'no-group'));
+          const remoteItem = data.item || null;
+          const matchesDraft = Boolean(remoteItem && current.scope === 'global'
+            && editTextRef.current === (remoteItem.content || '')
+            && editVisibilityRef.current === (remoteItem.visibility === 'all' ? 'all' : 'no-group'));
+          if (!isDirty || matchesDraft) replaceDetail(remoteItem);
+          else if (!remoteItem || remoteItem.content !== current.content || remoteItem.title !== current.title || remoteItem.visibility !== current.visibility) {
+            updateConflict({ remoteItem, deleted: !remoteItem, verifiedSeq: seq });
+          } else updateConflict(null);
+        } finally {
+          if (checkingDetail.current === check) {
+            checkingDetail.current = null;
+            if (lifetime.current && !signal.aborted) {
+              setDetailCheck(null);
+              // Only the newest invalidation can commit; coalesce any queued ones.
+              if (requiredEventSeq.current > seq || currentView.current !== view) void verifyLatestDetail.current();
+              else setDetailLoading(false);
+            }
+          }
         }
-        catch (e) { if (currentView.current === view && request === graphRequest.current) setError(friendlyError(e, '记忆')); }
+      };
+      verifyLatestDetail.current = refreshSelectedDetail;
+
+      const loadGraph = async signal => {
+        const [graphs, nextHealth] = await Promise.all([
+          Promise.allSettled(domains.map(async domain => ({
+            domain, data: await requestMemory('marshal/memory/graph' + buildScopeQuery(domain), undefined, signal),
+          }))),
+          domains.includes(layer) ? requestMemory('marshal/memory/health' + buildScopeQuery(layer), undefined, signal).catch(() => null) : null,
+        ]);
+        if (signal.aborted || currentView.current !== view) return;
+        const nodes = [], edges = new Map();
+        let backend = '';
+        for (const result of graphs) {
+          if (result.status !== 'fulfilled') continue;
+          const { domain, data } = result.value;
+          const scoped = (data.graph?.nodes || []).filter(node => node.scope === domain);
+          // Reserve space on the canvas for each domain.
+          nodes.push(...(fullCanvas ? scoped.slice(0, 140) : scoped));
+          for (const edge of data.graph?.edges || []) edges.set(JSON.stringify([edge.source, edge.target]), edge);
+          if (domain === layer && domain !== 'global') backend = data.privateBackend ?? '';
+        }
+        const ids = new Set(nodes.map(node => node.id));
+        setGraph({ view, nodes, edges: [...edges.values()].filter(edge => ids.has(edge.source) && ids.has(edge.target)) });
+        setPrivateBackend(backend);
+        setHealth(nextHealth);
+        const failure = graphs.find(result => result.status === 'rejected');
+        if (failure) setError(friendlyError(failure.reason, '记忆'));
       };
 
-      const loadProposals = async () => {
+      const loadProposals = async signal => {
         try {
-          const data = await fetchJson('marshal/memory/proposals');
+          const data = await requestMemory('marshal/memory/proposals', undefined, signal);
           const items = data.proposals || [];
           setProposals(items);
           setDrafts(current => {
@@ -558,25 +1399,84 @@ window.__ModuleLoader__.load({
           });
         }
         catch (error) {
+          if (signal.aborted) return;
           setProposals([]);
           if (error && (error.code === 'sign-in-to-approve' || String(error.message || '').includes('sign-in-to-approve')))
             setApprovalNotice('请先登录机主账号后再审批全局记忆');
         }
       };
 
-      React.useEffect(() => { void load(); void fetchJson('marshal/memory/settings/get').then(setSettings).catch(() => {}); void loadProposals(); }, []);
-      React.useEffect(() => { void loadGraph(); }, [layer, activeAgentId, activeWorkspaceId]);
-
-      const search = async () => {
-        const request = ++queryRequest.current;
-        if (query.trim() === '') { setResults(null); return; }
-        try {
-          const data = await fetchJson('marshal/memory/list' + buildScopeQuery() + '&query=' + encodeURIComponent(query));
-          if (currentView.current !== view || request !== queryRequest.current) return;
-          setResults((data.items || []).filter(item => item.scope === layer));
+      React.useEffect(() => {
+        const controller = new AbortController();
+        lifetime.current = controller;
+        void load(controller.signal);
+        void requestMemory('marshal/memory/settings/get', undefined, controller.signal).then(setSettings).catch(() => {});
+        return () => {
+          lifetime.current = null;
+          controller.abort();
+          checkingDetail.current?.controller.abort();
+        };
+      }, []);
+      // Catalog defaults change the loading key without changing the user's selection.
+      React.useEffect(() => {
+        void selectMemory(null);
+      }, [layer, fullCanvas, initialAgentId]);
+      React.useEffect(() => {
+        const visible = createVisibleMarshalRefresh(signal => {
           setError('');
+          return Promise.all([
+            loadGraph(signal), loadProposals(signal),
+            submittedQuery.current && !searchRequest.current ? search(submittedQuery.current, signal) : null,
+          ]);
+        });
+        refreshRef.current = visible;
+        const unsubscribe = subscribeMarshalEvents(['ready', 'memory.changed', 'incidents.changed'], () => { void refresh(); });
+        void visible.request();
+        return () => {
+          refreshRef.current = null;
+          unsubscribe();
+          visible.dispose();
+          searchRequest.current?.abort();
+          searchRequest.current = null;
+        };
+      }, [view]);
+
+      const search = async (value, refreshSignal) => {
+        searchRequest.current?.abort();
+        if (value.trim() === '') { searchRequest.current = null; submittedQuery.current = ''; setResults(null); return; }
+        const controller = new AbortController();
+        searchRequest.current = controller;
+        const signal = refreshSignal ? AbortSignal.any([refreshSignal, controller.signal]) : controller.signal;
+        const reads = await Promise.allSettled(domains.map(async domain => {
+          const data = await requestMemory('marshal/memory/list' + buildScopeQuery(domain) + '&query=' + encodeURIComponent(value.trim()), undefined, signal);
+          const scoped = (data.items || []).filter(item => item.scope === domain);
+          return fullCanvas ? scoped.slice(0, 140) : scoped;
+        }));
+        if (searchRequest.current === controller) searchRequest.current = null;
+        if (signal.aborted || currentView.current !== view) return;
+        const failure = reads.find(read => read.status === 'rejected');
+        if (failure) setError(friendlyError(failure.reason, '记忆检索'));
+        else {
+          submittedQuery.current = value;
+          setResults({ view, items: reads.flatMap(read => read.value) });
         }
-        catch (e) { if (currentView.current === view && request === queryRequest.current) setError(friendlyError(e, '记忆检索')); }
+      };
+      const submitSearch = () => {
+        setError('');
+        void search(query.trim());
+      };
+
+      const selectMemory = async item => {
+        detailSelection.current++;
+        checkingDetail.current?.controller.abort();
+        checkingDetail.current = null;
+        setDetailCheck(null);
+        setDetailLoading(!!item);
+        if (!item) { replaceDetail(null); return; }
+        // Search and graph payloads are previews, not verified edit baselines.
+        requiredEventSeq.current++;
+        replaceDetail({ ...item, content: undefined });
+        await verifyLatestDetail.current();
       };
 
       const create = async () => {
@@ -584,64 +1484,110 @@ window.__ModuleLoader__.load({
         setBusy(true);
         try {
           if (scope === 'global') {
-            await fetchJson('marshal/memory/global', { title: title.trim(), text: text.trim(), kind: 'fact', importance: 0.6, tags: [], visibility: globalVisibility });
+            await requestMemory('marshal/memory/global', { title: title.trim(), text: text.trim(), kind: 'fact', importance: 0.6, tags: [], visibility: globalVisibility });
           }
           else if (scope === 'workspace') {
             if (!workspaceId) throw new Error('请先选择一个项目工作区');
-            await fetchJson('marshal/memory/remember', { workspaceId, scope: 'workspace', title: title.trim(), text: text.trim(), ...(cue.trim() ? { cue: cue.trim() } : {}), kind: 'fact', importance: 0.6, tags: [] });
+            await requestMemory('marshal/memory/remember', { workspaceId, scope: 'workspace', title: title.trim(), text: text.trim(), ...(cue.trim() ? { cue: cue.trim() } : {}), kind: 'fact', importance: 0.6, tags: [] });
           }
           else {
             if (!agentId) throw new Error('请先选择一个智能体');
-            await fetchJson('marshal/memory/remember', {
+            await requestMemory('marshal/memory/remember', {
               agentId, ...(workspaceId ? { workspaceId } : {}), scope: 'agent',
               title: title.trim(), text: text.trim(), ...(cue.trim() ? { cue: cue.trim() } : {}), kind: 'fact', importance: 0.6, tags: [],
               ...(privateBackend === 'mnemon' && workspaceId && allowTaskRecall ? { visibility: 'group-safe' } : {}),
             });
           }
-          setTitle(''); setText(''); setCue(''); setAllowTaskRecall(false); setFormOpen(false); await loadGraph();
+          setTitle(''); setText(''); setCue(''); setAllowTaskRecall(false); setFormOpen(false); await refresh();
         }
-        catch (e) { setError(friendlyError(e, '写入记忆')); }
-        finally { setBusy(false); }
+        catch (e) { if (lifetime.current) setError(friendlyError(e, '写入记忆')); }
+        finally { if (lifetime.current) setBusy(false); }
       };
 
       const forget = async item => {
         if (!item || !window.confirm('删除这条记忆？')) return;
+        const selection = detailSelection.current;
         try {
-          if (item.scope === 'global') await fetchJson('marshal/memory/global/forget', { id: item.id });
-          else await fetchJson('marshal/memory/forget', {
+          if (item.scope === 'global') await requestMemory('marshal/memory/global/forget', { id: item.id });
+          else await requestMemory('marshal/memory/forget', {
             ...(item.scope === 'agent' ? { agentId } : {}),
             ...(item.scope === 'workspace' ? { workspaceId } : {}),
             id: item.id,
           });
-          setSelected(null); setResults(null); await loadGraph();
+          if (detailSelection.current === selection && selectedRef.current?.id === item.id && selectedRef.current.scope === item.scope) {
+            void selectMemory(null);
+          }
+          await refresh();
         }
-        catch (e) { setError(friendlyError(e, '删除记忆')); }
+        catch (e) { if (lifetime.current) setError(friendlyError(e, '删除记忆')); }
       };
 
       const decideProposal = async (item, action) => {
         const draft = drafts[item.id] || { title: item.title, text: item.content, visibility: item.visibility === 'all' ? 'all' : 'no-group' };
         try {
-          if (action === 'reject') await fetchJson('marshal/memory/proposals/reject', { id: item.id });
-          else await fetchJson('marshal/memory/proposals/approve', { id: item.id, title: draft.title, text: draft.text, visibility: draft.visibility });
-          await loadProposals();
-          await loadGraph();
+          if (action === 'reject') await requestMemory('marshal/memory/proposals/reject', { id: item.id });
+          else await requestMemory('marshal/memory/proposals/approve', { id: item.id, title: draft.title, text: draft.text, visibility: draft.visibility });
+          await refresh();
         }
         catch (e) {
+          if (!lifetime.current) return;
           if (e && (e.code === 'sign-in-to-approve' || String(e.message || '').includes('sign-in-to-approve')))
             setApprovalNotice('请先登录机主账号后再审批全局记忆');
           else setError(friendlyError(e, '全局记忆审批'));
         }
       };
 
-      const saveGlobal = async () => {
-        if (!selected || selected.scope !== 'global') return;
-        try {
-          const saved = await fetchJson('marshal/memory/global/update', { id: selected.id, title: selected.title, text: editText, visibility: editVisibility });
-          setSelected(saved.item);
-          await loadGraph();
+      const loadLatestConflict = () => {
+        const conflict = conflictRef.current;
+        if (!conflict) return;
+        if (savingDetail.current || !detailVerified() || conflict.verifiedSeq < requiredEventSeq.current) {
+          void verifyLatestDetail.current();
+          return;
         }
-        catch (e) { setError(friendlyError(e, '编辑全局记忆')); }
+        replaceDetail(conflict.remoteItem);
       };
+
+      const saveGlobal = async (overwrite = false) => {
+        const selection = detailSelection.current;
+        if (savingDetail.current || !detailVerified()) return;
+        const conflict = conflictRef.current;
+        if (overwrite ? !conflict || conflict.deleted || conflict.verifiedSeq < requiredEventSeq.current : !!conflict) return;
+        const current = selectedRef.current;
+        if (!current || current.scope !== 'global' || typeof current.content !== 'string') return;
+        const seq = requiredEventSeq.current;
+        const canSend = () => detailVerified() && requiredEventSeq.current === seq
+          && detailSelection.current === selection && currentView.current === view && selectedRef.current === current;
+        const staleWrite = new DOMException('Memory edit baseline changed', 'AbortError');
+        const text = editTextRef.current, visibility = editVisibilityRef.current;
+        savingDetail.current = true;
+        setSaving(true);
+        let writeCompleted = false;
+        try {
+          if (!canSend()) return;
+          const saved = await requestMemory('marshal/memory/global/update', { id: current.id, title: conflict?.remoteItem?.title ?? current.title, text, visibility }, lifetime.current?.signal, () => {
+            if (!canSend()) throw staleWrite;
+          });
+          writeCompleted = true;
+          if (detailSelection.current === selection && selectedRef.current === current && currentView.current === view && requiredEventSeq.current === seq) {
+            selectedRef.current = saved.item;
+            setSelected(saved.item);
+            if (editTextRef.current === text) setEditText(editTextRef.current = saved.item.content || '');
+            if (editVisibilityRef.current === visibility) setEditVisibility(editVisibilityRef.current = saved.item.visibility === 'all' ? 'all' : 'no-group');
+            updateConflict(null);
+          }
+        }
+        catch (e) { if (lifetime.current && e !== staleWrite) setError(friendlyError(e, '编辑全局记忆')); return; }
+        finally {
+          savingDetail.current = false;
+          if (lifetime.current) {
+            setSaving(false);
+            if (verifiedEventSeq.current < requiredEventSeq.current) void verifyLatestDetail.current();
+          }
+        }
+        if (requiredEventSeq.current === seq) await refresh();
+        else await refreshRef.current?.request();
+      };
+      const saveBlocked = saving || !!detailCheck || !detailVerified();
 
       const layerTabs = [
         ['global', '全局记忆与审批' + (proposals.length > 0 ? ' (' + proposals.length + ')' : '')],
@@ -657,35 +1603,46 @@ window.__ModuleLoader__.load({
               style: tabStyle(layer === key),
               onClick: () => setLayer(key),
             }, label))),
-          layer === 'agent' && h('select', { value: agentId, disabled: busy, onChange: event => {
-            setAgentId(event.target.value); setSelected(null); setResults(null); setGraph({ nodes: [], edges: [] });
+          (fullCanvas || layer === 'agent') && h('select', { 'aria-label': '智能体', value: agentId, disabled: busy, onChange: event => {
+            setAgentId(event.target.value); void selectMemory(null); setResults(null);
             setPrivateBackend(''); setHealth(null); setAllowTaskRecall(false); setError('');
           }, style: { ...uiInput, width: 170 } },
             agents.length === 0 ? h('option', { value: '' }, '暂无智能体') : agents.map(item => h('option', { key: item.id, value: item.id }, item.name))),
-          layer === 'workspace' && h('select', { value: workspaceId, disabled: busy, onChange: event => {
-            setWorkspaceId(event.target.value); setSelected(null); setResults(null); setGraph({ nodes: [], edges: [] });
+          (fullCanvas || layer === 'workspace') && h('select', { 'aria-label': '项目工作区', value: workspaceId, disabled: busy, onChange: event => {
+            setWorkspaceId(event.target.value); void selectMemory(null); setResults(null);
             setHealth(null); setError('');
           }, style: { ...uiInput, width: 220 } },
             realWorkspaces.length === 0 ? h('option', { value: '' }, '暂无项目工作区') : realWorkspaces.map(ws => h('option', { key: ws.id, value: ws.id }, ws.label))),
           layer !== 'global' && privateBackend === 'mnemon' && h('span', { style: { color: '#10b981', fontSize: 11, padding: '2px 8px', borderRadius: 999, border: '1px solid color-mix(in srgb, #10b981 35%, transparent)', background: 'color-mix(in srgb, #10b981 12%, transparent)' } }, 'Mnemon · 意图图谱 + 推索引引擎'),
-          h('input', { value: query, onChange: event => setQuery(event.target.value), onKeyDown: event => { if (event.key === 'Enter') void search(); }, placeholder: '搜索当前层级记忆…', style: { ...uiInput, width: 190 } }),
-          h('button', { type: 'button', style: uiButton(false), onClick: () => { void search(); } }, '搜索'),
-          h('button', { type: 'button', style: uiButton(false), onClick: () => { setScope(layer); setFormOpen(value => !value); } }, '＋ 记忆'),
-          h('button', { type: 'button', style: uiButton(false), onClick: () => setSettingsOpen(value => !value) }, '设置'),
-          h('span', { style: { marginLeft: 'auto', fontSize: 11, color: dswTheme.dim } }, graph.nodes.length + ' 个节点 · ' + graph.edges.length + ' 条关联' + (health?.health?.length ? ' · 模糊 ' + health.health.reduce((sum, item) => sum + (item.fuzzy || 0), 0) + ' · 档案 ' + health.health.reduce((sum, item) => sum + (item.archived || 0), 0) : '')),
-          h('button', { type: 'button', style: uiButton(false), onClick: async () => { setSyncNotice('同步中…'); try { const result = await fetchJson('marshal/memory/sync', { ...(activeAgentId ? { agentId: activeAgentId } : {}), ...(activeWorkspaceId ? { workspaceId: activeWorkspaceId } : {}) }); setSyncNotice('推送 ' + (result.pushed ?? 0) + ' · 拉取 ' + (result.pulled ?? 0)); await loadGraph(); } catch (e) { setSyncNotice(String(e.message || e)); } } }, '同步'),
-          layer === 'global' && h('button', { type: 'button', style: uiButton(false), onClick: async () => { setSyncNotice('迁移旧同步…'); try { const result = await fetchJson('marshal/memory/migrate-legacy', {}); setSyncNotice(result.migrated ? '已绑定 ' + result.migrated + ' 条旧记录' : '没有待迁移的旧记录'); } catch (e) { if (e && (e.code === 'sign-in-to-approve' || String(e.message || '').includes('sign-in-to-approve'))) setApprovalNotice('请先登录机主账号后再审批全局记忆'); setSyncNotice(String(e.message || e)); } } }, '迁移旧同步'),
-          h('button', { type: 'button', style: uiButton(false), onClick: () => { void loadGraph(); void loadProposals(); } }, '刷新')),
+          h('input', { value: query, onChange: event => setQuery(event.target.value), onKeyDown: event => { if (event.key === 'Enter') submitSearch(); }, placeholder: fullCanvas ? '搜索全域记忆…' : '搜索当前层级记忆…', style: { ...uiInput, width: 190 } }),
+          h('button', { type: 'button', style: uiButton(false), onClick: submitSearch }, '搜索'),
+          h('div', { className: 'mv-actions mv-toolbar-group' },
+            h('button', { type: 'button', style: uiButton(false), onClick: () => setPaused(value => !value) }, paused ? '恢复漂移' : '暂停漂移'),
+            h('button', { type: 'button', style: uiButton(false), onClick: () => {
+              if (!fullCanvas) { closeSidebar(); setFormOpen(false); setSettingsOpen(false); }
+              setFullCanvas(!fullCanvas);
+            } }, fullCanvas ? '退出全画布' : '全画布'),
+            mvOpenDirect && mvDirectAgent && h(mvDirectLink, { key: activeAgentId, agent: mvDirectAgent, open: mvOpenDirect }),
+            !fullCanvas && h('button', { type: 'button', style: uiButton(false), onClick: () => { setScope(layer); setFormOpen(value => !value); } }, '＋ 记忆'),
+            !fullCanvas && h('button', { type: 'button', style: uiButton(false), onClick: () => setSettingsOpen(value => !value) }, '设置')),
+          h('div', { className: 'mv-actions mv-toolbar-group' },
+            h('button', { type: 'button', style: uiButton(false), onClick: async () => { setSyncNotice('同步中…'); try { const result = await requestMemory('marshal/memory/sync', { ...(activeAgentId ? { agentId: activeAgentId } : {}), ...(activeWorkspaceId ? { workspaceId: activeWorkspaceId } : {}) }); setSyncNotice('推送 ' + (result.pushed ?? 0) + ' · 拉取 ' + (result.pulled ?? 0)); await refresh(); } catch (e) { if (lifetime.current) setSyncNotice(String(e.message || e)); } } }, '同步'),
+            layer === 'global' && h('button', { type: 'button', style: uiButton(false), onClick: async () => { setSyncNotice('迁移旧同步…'); try { const result = await requestMemory('marshal/memory/migrate-legacy', {}); setSyncNotice(result.migrated ? '已绑定 ' + result.migrated + ' 条旧记录' : '没有待迁移的旧记录'); } catch (e) { if (!lifetime.current) return; if (e && (e.code === 'sign-in-to-approve' || String(e.message || '').includes('sign-in-to-approve'))) setApprovalNotice('请先登录机主账号后再审批全局记忆'); setSyncNotice(String(e.message || e)); } } }, '迁移旧同步'),
+            h('button', { type: 'button', style: uiButton(false), onClick: () => { void refresh(); } }, '刷新')),
+          h('span', { className: 'mv-tone-chip', 'aria-label': '星系统计',
+            style: { '--mv-tone': '#8b93a1', marginLeft: 'auto' } },
+            visibleGraph.nodes.length + ' 节点 · ' + visibleGraph.edges.length + ' 关联' +
+            (health?.health?.length ? ' · 模糊 ' + health.health.reduce((sum, item) => sum + (item.fuzzy || 0), 0) + ' · 档案 ' + health.health.reduce((sum, item) => sum + (item.archived || 0), 0) : ''))),
         syncNotice !== '' && h('div', { style: { padding: '6px 18px', fontSize: 11, color: dswTheme.dim } }, syncNotice),
-        settingsOpen && settings && h('div', { style: { padding: '10px 18px', display: 'flex', gap: 16, flexWrap: 'wrap', fontSize: 12, borderBottom: '1px solid #8883' } },
+        !fullCanvas && settingsOpen && settings && h('div', { style: { padding: '10px 18px', display: 'flex', gap: 16, flexWrap: 'wrap', fontSize: 12, borderBottom: '1px solid #8883' } },
           [['autoSummary', '会话结束自动摘要'], ['autoRecall', '每轮自动召回'], ['allowGroupQuote', '群聊允许引用私有记忆']].map(([key, label]) => h('label', { key, style: { display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' } },
-            h('input', { type: 'checkbox', checked: settings[key] !== false, onChange: async event => { const next = { ...settings, [key]: event.target.checked }; setSettings(next); try { const saved = await fetchJson('marshal/memory/settings', { [key]: event.target.checked }); setSettings(saved.settings); } catch { /* keep local */ } } }), label)),
+            h('input', { type: 'checkbox', checked: settings[key] !== false, onChange: async event => { const next = { ...settings, [key]: event.target.checked }; setSettings(next); try { const saved = await requestMemory('marshal/memory/settings', { [key]: event.target.checked }); setSettings(saved.settings); } catch { /* keep local */ } } }), label)),
           h('span', { style: { color: dswTheme.dim, marginLeft: 'auto' } }, '摘要模型：空 = 本地启发式')),
-        settingsOpen && settings && h('div', { style: { padding: '0 18px 10px', display: 'flex', gap: 12, flexWrap: 'wrap', fontSize: 12, borderBottom: '1px solid #8883' } },
-          h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } }, '摘要 provider', h('input', { defaultValue: settings.summaryProvider ?? '', placeholder: 'empty = 本地', onBlur: async event => { const value = event.target.value.trim(); try { const saved = await fetchJson('marshal/memory/settings', { summaryProvider: value }); setSettings(saved.settings); } catch { /* keep local */ } }, style: { ...uiInput, width: 150 } })),
-          h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } }, '摘要模型', h('input', { defaultValue: settings.summaryModel ?? '', placeholder: 'empty = 本地', onBlur: async event => { const value = event.target.value.trim(); try { const saved = await fetchJson('marshal/memory/settings', { summaryModel: value }); setSettings(saved.settings); } catch { /* keep local */ } }, style: { ...uiInput, width: 180 } }))),
+        !fullCanvas && settingsOpen && settings && h('div', { style: { padding: '0 18px 10px', display: 'flex', gap: 12, flexWrap: 'wrap', fontSize: 12, borderBottom: '1px solid #8883' } },
+          h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } }, '摘要 provider', h('input', { defaultValue: settings.summaryProvider ?? '', placeholder: 'empty = 本地', onBlur: async event => { const value = event.target.value.trim(); try { const saved = await requestMemory('marshal/memory/settings', { summaryProvider: value }); setSettings(saved.settings); } catch { /* keep local */ } }, style: { ...uiInput, width: 150 } })),
+          h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } }, '摘要模型', h('input', { defaultValue: settings.summaryModel ?? '', placeholder: 'empty = 本地', onBlur: async event => { const value = event.target.value.trim(); try { const saved = await requestMemory('marshal/memory/settings', { summaryModel: value }); setSettings(saved.settings); } catch { /* keep local */ } }, style: { ...uiInput, width: 180 } }))),
         error !== '' && h('div', { style: { padding: '8px 18px', color: dswTheme.danger, fontSize: 12 } }, error),
-        layer === 'global' && h('section', { style: { padding: '10px 18px', borderBottom: '1px solid #8883', display: 'grid', gap: 8 } },
+        !fullCanvas && layer === 'global' && h('section', { style: { maxHeight: '30%', overflow: 'auto', padding: '10px 18px', borderBottom: '1px solid #8883', display: 'grid', gap: 8 } },
           h('div', { style: { fontSize: 13, fontWeight: 600 } }, '全局记忆审批' + (proposals.length > 0 ? ' · ' + proposals.length + ' 条待处理' : '')),
           approvalNotice !== '' && h('div', { style: { fontSize: 12, color: dswTheme.danger } }, approvalNotice),
           proposals.length === 0
@@ -702,7 +1659,7 @@ window.__ModuleLoader__.load({
                   h('button', { type: 'button', style: uiButton(true), onClick: () => { void decideProposal(item, 'approve'); } }, '同意'),
                   h('button', { type: 'button', style: uiButton(false), onClick: () => { void decideProposal(item, 'reject'); } }, '拒绝')));
             })),
-        formOpen && h('div', { style: { padding: '12px 18px', display: 'grid', gap: 8, borderBottom: '1px solid #8883' } },
+        !fullCanvas && formOpen && h('div', { style: { padding: '12px 18px', display: 'grid', gap: 8, borderBottom: '1px solid #8883' } },
           h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
             h('input', { value: title, onChange: event => setTitle(event.target.value), placeholder: '标题', style: { ...uiInput, flex: 1, minWidth: 180 } }),
             h('select', { value: scope, onChange: event => setScope(event.target.value), style: { ...uiInput, width: 140 } },
@@ -716,42 +1673,1856 @@ window.__ModuleLoader__.load({
             h('input', { type: 'checkbox', checked: allowTaskRecall, onChange: event => setAllowTaskRecall(event.target.checked) }),
             ' 允许本智能体在所选项目工作区的工单中使用这条记忆'),
           h('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8 } }, h('button', { type: 'button', style: uiButton(false), onClick: () => setFormOpen(false) }, '取消'), h('button', { type: 'button', disabled: busy, style: uiButton(true), onClick: () => { void create(); } }, busy ? '保存中…' : '保存'))),
-        results !== null && h('div', { style: { maxHeight: 180, overflow: 'auto', borderBottom: '1px solid #8883', padding: '8px 18px', display: 'grid', gap: 4 } },
-          results.length === 0 ? h('div', { style: { fontSize: 12, color: dswTheme.dim } }, '没有匹配的记忆') : results.map(item => h('button', { key: item.id, type: 'button', onClick: () => { setSelected(item); if (item.scope === 'global') { setEditText(item.content || ''); setEditVisibility(item.visibility === 'all' ? 'all' : 'no-group'); } }, style: { textAlign: 'left', border: 0, background: 'transparent', color: 'inherit', cursor: 'pointer', padding: '5px 0' } }, '[' + item.scope + '] ' + item.title))),
+        visibleResults !== null && h('div', { style: { maxHeight: 180, overflow: 'auto', borderBottom: '1px solid #8883', padding: '8px 18px', display: 'grid', gap: 4 } },
+          visibleResults.length === 0 ? h('div', { style: { fontSize: 12, color: dswTheme.dim } }, '没有匹配的记忆') : visibleResults.map(item => h('button', { key: item.id, type: 'button', onClick: () => { void selectMemory(item); }, style: { textAlign: 'left', border: 0, background: 'transparent', color: 'inherit', cursor: 'pointer', padding: '5px 0' } }, '[' + item.scope + '] ' + item.title))),
         h('div', { style: { flex: 1, minHeight: 0, display: 'flex', padding: 14, gap: 14 } },
-          h('div', { style: { flex: 1, minWidth: 0, minHeight: 0, borderRadius: 14, overflow: 'hidden', border: '1px solid #8883' } }, h(MemoryGalaxy, { graph, selectedId: selected?.id, onSelect: item => {
-            setSelected(item);
-            if (item?.scope !== 'global') return;
-            setEditVisibility(item.visibility === 'all' ? 'all' : 'no-group');
-            if (typeof item.content === 'string' && item.content !== '') { setEditText(item.content); return; }
-            void fetchJson('marshal/memory/get?id=' + encodeURIComponent(item.id) + '&scope=global').then(data => {
-              setSelected(data.item);
-              setEditText(data.item?.content || '');
-              setEditVisibility(data.item?.visibility === 'all' ? 'all' : 'no-group');
-            }).catch(e => setError(friendlyError(e, '读取全局记忆')));
-          } })),
-          selected && h('aside', { style: { width: 300, flexShrink: 0, overflow: 'auto', padding: 16, border: '1px solid #8883', borderRadius: 14, background: 'color-mix(in srgb, currentColor 3%, transparent)' } },
-            h('div', { style: { fontSize: 11, color: dswTheme.dim, textTransform: 'uppercase', letterSpacing: '.06em' } }, selected.scope + ' · ' + selected.kind + (selected.scope === 'global' ? ' · ' + (selected.visibility === 'all' ? '所有会话' : '仅单聊') : '')),
-            h('h3', { style: { margin: '6px 0 10px', fontSize: 16 } }, selected.title),
-            selected.cue && h('div', { style: { fontSize: 11, color: dswTheme.dim, marginBottom: 8, padding: '4px 8px', borderRadius: 6, background: 'color-mix(in srgb, currentColor 6%, transparent)' } }, '触发场景：' + selected.cue),
-            selected.scope === 'global'
+          h('div', { style: { flex: 1, minWidth: 0, minHeight: 0, borderRadius: 14, overflow: 'hidden', border: '1px solid #8883' } }, h(MemoryGalaxy, { graph: visibleGraph, paused, selectedId: selected?.id, onSelect: selectMemory })),
+          selected && h('aside', { className: 'mv-memory-detail', 'aria-label': '记忆详情' },
+            h('div', { className: 'mv-memory-head' },
+              h('div', { className: 'mv-tag-row' },
+                mvMemoryChip(mvMemoryScopeLabel(selected.scope)[0], mvMemoryScopeLabel(selected.scope)[1], 'scope', true),
+                mvMemoryChip(mvMemoryKindLabel(selected.kind)[0], mvMemoryKindLabel(selected.kind)[1], 'kind'),
+                selected.scope === 'global' && mvMemoryChip(selected.visibility === 'all' ? '所有会话' : '仅单聊',
+                  selected.visibility === 'all' ? '#2ea36a' : '#8b93a1', 'visibility'),
+                selected.pinned && mvMemoryChip('已固定', '#d08a2a', 'pinned')),
+              h('h3', { className: 'mv-memory-title' }, selected.title),
+              h('div', { className: 'mv-memory-meta' },
+                '清晰度 ' + mvMemoryClarity(selected.clarity),
+                ' · 重要性 ' + Math.round((selected.importance || 0) * 100) + '%',
+                ' · 访问 ' + (selected.accessCount || 0) + ' 次')),
+            selected.cue && h('div', { className: 'mv-memory-cue' }, '触发场景 · ' + selected.cue),
+            detailLoading ? h('p', { role: 'status', className: 'mv-muted' }, '正在读取记忆…') : selected.scope === 'global'
               ? h('div', { style: { display: 'grid', gap: 8 } },
-                h('textarea', { value: editText || selected.content || '', onChange: event => setEditText(event.target.value), rows: 6, style: { ...uiInput, resize: 'vertical' } }),
-                h('select', { value: editVisibility, onChange: event => setEditVisibility(event.target.value), style: uiInput }, h('option', { value: 'all' }, '所有会话'), h('option', { value: 'no-group' }, '仅单聊')),
-                h('button', { type: 'button', style: uiButton(true), onClick: () => { void saveGlobal(); } }, '保存全局记忆'))
-              : h('p', { style: { whiteSpace: 'pre-wrap', fontSize: 13, lineHeight: 1.65 } }, selected.content),
-            h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 12 } }, (selected.tags || []).map(tag => h('span', { key: tag, style: { fontSize: 11, padding: '3px 7px', borderRadius: 999, background: 'color-mix(in srgb, currentColor 8%, transparent)' } }, tag))),
-            h('div', { style: { marginTop: 14, fontSize: 11, color: dswTheme.dim } }, '清晰度 ' + ({ vivid: '清晰', clear: '清楚', fuzzy: '模糊', trace: '只剩印象' }[selected.clarity] || selected.clarity || '清晰') + ' · 重要性 ' + Math.round((selected.importance || 0) * 100) + '% · 访问 ' + (selected.accessCount || 0) + ' 次' + (selected.pinned ? ' · 已固定' : '')),
-            h('div', { style: { display: 'flex', gap: 8, marginTop: 16 } },
+                h('textarea', { value: editText, 'aria-label': '记忆正文', onChange: event => setEditText(editTextRef.current = event.target.value), rows: 6, style: { ...uiInput, resize: 'vertical' } }),
+                h('select', { value: editVisibility, 'aria-label': '记忆可见性', onChange: event => setEditVisibility(editVisibilityRef.current = event.target.value), style: uiInput }, h('option', { value: 'all' }, '所有会话'), h('option', { value: 'no-group' }, '仅单聊')),
+                detailConflict && h('div', { role: 'alert', className: 'mv-memory-conflict' },
+                  h('p', null, detailConflict.deleted ? '远端记忆已被删除，本地草稿仍保留。' : '远端记忆已更新，本地草稿仍保留。'),
+                  h('div', { className: 'mv-actions' },
+                    h('button', { type: 'button', style: uiButton(false), disabled: saveBlocked, onClick: loadLatestConflict }, '载入最新版本'),
+                    !detailConflict.deleted && h('button', { type: 'button', style: uiButton(false), disabled: saveBlocked, onClick: () => { void saveGlobal(true); } }, '覆盖保存'))),
+                h('button', { type: 'button', style: uiButton(true), disabled: saveBlocked || !!detailConflict || typeof selected.content !== 'string', onClick: () => { void saveGlobal(); } }, '保存全局记忆'))
+              : h('p', { className: 'mv-memory-body' }, selected.content),
+            h('div', { className: 'mv-tag-row', style: { marginTop: 12 } }, (selected.tags || []).map(tag =>
+              mvMemoryChip(tag, '#8b93a1', 'tag-' + tag))),
+            h('div', { className: 'mv-actions', style: { marginTop: 16 } },
               h('button', { type: 'button', style: uiButton(false), onClick: () => { void forget(selected); } }, '删除'),
-              h('button', { type: 'button', style: uiButton(false), onClick: () => setSelected(null) }, '关闭')))),
-        graph.nodes.length === 0 && results === null && h('div', { style: { padding: '0 18px 18px', fontSize: 12, color: dswTheme.dim } },
-          layer === 'global' ? '还没有全局记忆。可点“＋ 记忆”写入，或审批智能体提交的偏好。'
+              h('button', { type: 'button', style: uiButton(false), onClick: () => { void selectMemory(null); } }, '关闭')))),
+        graph.nodes.length === 0 && !searchActive && h('div', { style: { padding: '0 18px 18px', fontSize: 12, color: dswTheme.dim } },
+          fullCanvas ? '当前没有可显示的记忆。' : layer === 'global' ? '还没有全局记忆。可点“＋ 记忆”写入，或审批智能体提交的偏好。'
             : layer === 'workspace' ? '所选项目工作区还没有共享记忆。工单总结会自动沉淀到这里，也可手动写入。'
               : '该智能体还没有私有记忆。会话结束后会自动生成摘要，也可点“＋ 记忆”手动写入。'));
     }
 
-    function AgentDirectChatsView({ openSession, onOpenAgents, initialAgentId = '' }) {
+    const mvVoiceIdle = Object.freeze({ status: 'idle' });
+    const mvVoiceLabels = { connecting: '正在连接', active: '通话中', ending: '正在结束', summary: '语音纪要' };
+    const mvVoicePhaseLabels = {
+      listening: '聆听中',
+      transcribing: '识别中',
+      thinking: '思考中',
+      speaking: '说话中',
+      ptt: '按住说话',
+      notes: '本地笔记模式',
+    };
+    const mvVoiceNow = () => performance.now();
+
+    function mvBytesToBase64(bytes) {
+      let binary = '';
+      const step = 0x8000;
+      for (let i = 0; i < bytes.length; i += step) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + step));
+      }
+      return btoa(binary);
+    }
+
+    /** Downsample Float32 mono PCM chunks to 16kHz 16-bit PCM WAV bytes. */
+    function mvEncodePcm16Wav(chunks, inputSampleRate = 16000, targetRate = 16000) {
+      let total = 0;
+      for (const chunk of chunks) total += chunk.length;
+      if (total === 0) return new Uint8Array(0);
+      const merged = new Float32Array(total);
+      let offset = 0;
+      for (const chunk of chunks) {
+        merged.set(chunk, offset);
+        offset += chunk.length;
+      }
+      let samples = merged;
+      if (inputSampleRate > 0 && inputSampleRate !== targetRate) {
+        const ratio = inputSampleRate / targetRate;
+        const outLen = Math.max(1, Math.round(merged.length / ratio));
+        samples = new Float32Array(outLen);
+        for (let i = 0; i < outLen; i++) {
+          const pos = i * ratio;
+          const idx = Math.floor(pos);
+          const frac = pos - idx;
+          const a = merged[idx] ?? 0;
+          const b = merged[Math.min(idx + 1, merged.length - 1)] ?? a;
+          samples[i] = a + (b - a) * frac;
+        }
+      }
+      const dataSize = samples.length * 2;
+      const buffer = new ArrayBuffer(44 + dataSize);
+      const view = new DataView(buffer);
+      const writeAscii = (at, str) => { for (let i = 0; i < str.length; i++) view.setUint8(at + i, str.charCodeAt(i)); };
+      writeAscii(0, 'RIFF');
+      view.setUint32(4, 36 + dataSize, true);
+      writeAscii(8, 'WAVE');
+      writeAscii(12, 'fmt ');
+      view.setUint32(16, 16, true);
+      view.setUint16(20, 1, true);
+      view.setUint16(22, 1, true);
+      view.setUint32(24, targetRate, true);
+      view.setUint32(28, targetRate * 2, true);
+      view.setUint16(32, 2, true);
+      view.setUint16(34, 16, true);
+      writeAscii(36, 'data');
+      view.setUint32(40, dataSize, true);
+      let pos = 44;
+      for (let i = 0; i < samples.length; i++) {
+        const clamped = Math.max(-1, Math.min(1, samples[i]));
+        view.setInt16(pos, clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff, true);
+        pos += 2;
+      }
+      return new Uint8Array(buffer);
+    }
+
+    async function mvVoiceAuthFetch(path, body, signal, fetchImpl = fetch) {
+      const url = new URL(path, document.baseURI);
+      const send = proof => {
+        signal?.throwIfAborted();
+        return fetchImpl(url, {
+          credentials: 'same-origin',
+          ...(signal ? { signal } : {}),
+          ...(body === undefined ? {} : { method: 'POST', body: JSON.stringify(body) }),
+          headers: {
+            ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+            ...(typeof proof === 'string' ? { 'x-marshal-csrf': proof } : proof),
+          },
+        });
+      };
+      signal?.throwIfAborted();
+      const proof = await ensureMemorySession(undefined, signal);
+      let response = await send(proof);
+      let shouldRefresh = response.status === 401;
+      if (response.status === 403) {
+        let code = '';
+        try {
+          const parsed = typeof response.clone === 'function' ? await response.clone().json().catch(() => null) : null;
+          code = typeof parsed?.code === 'string' ? parsed.code : '';
+        } catch {}
+        shouldRefresh = !code || code === 'unauthorized' || code === 'memory-csrf-mismatch';
+      }
+      if (shouldRefresh) {
+        try { void response.body?.cancel?.().catch?.(() => {}); } catch {}
+        signal?.throwIfAborted();
+        const refreshed = await ensureMemorySession(proof, signal);
+        response = await send(refreshed);
+      }
+      return response;
+    }
+
+    async function* mvReadSseEvents(response, signal) {
+      const reader = response.body?.getReader?.();
+      if (!reader) return;
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let completed = false;
+      const safeCancel = () => { try { Promise.resolve(reader.cancel()).catch(() => {}); } catch {} };
+      const onAbort = () => safeCancel();
+      if (signal) {
+        if (signal.aborted) { safeCancel(); return; }
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
+      const parseBlock = block => {
+        let event = 'message';
+        const dataLines = [];
+        for (const line of block.split('\n')) {
+          if (line.startsWith('event:')) event = line.slice(6).trim();
+          else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
+        }
+        if (!dataLines.length) return null;
+        try { return { event, data: JSON.parse(dataLines.join('\n')) }; } catch { return null; }
+      };
+      try {
+        while (!signal?.aborted) {
+          const { done, value } = await reader.read();
+          if (done) { completed = true; break; }
+          buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+          let sep;
+          while ((sep = buffer.indexOf('\n\n')) !== -1) {
+            const parsed = parseBlock(buffer.slice(0, sep));
+            buffer = buffer.slice(sep + 2);
+            if (parsed) yield parsed;
+          }
+        }
+        if (!signal?.aborted) {
+          buffer += decoder.decode().replace(/\r\n/g, '\n');
+          const tail = buffer.trim();
+          if (tail) {
+            const parsed = parseBlock(tail);
+            if (parsed) yield parsed;
+          }
+        }
+      } finally {
+        signal?.removeEventListener?.('abort', onAbort);
+        if (!completed) safeCancel();
+        try { reader.releaseLock(); } catch {}
+      }
+    }
+
+    const mvIsSttPreparing = stt => Boolean(
+      stt?.preparing || ['preparing', 'checking', 'downloading', 'loading', 'waking'].includes(stt?.phase),
+    );
+
+    function mvTrimSummaryTranscript(transcript) {
+      if (!Array.isArray(transcript)) return [];
+      const recent = transcript.slice(-80).map(item => ({
+        speaker: String(item?.speaker || '').slice(0, 80),
+        text: String(item?.text || '').slice(0, 800),
+      })).filter(item => item.text.trim());
+      const out = [];
+      let approxBytes = 0;
+      for (let i = recent.length - 1; i >= 0; i--) {
+        const entry = recent[i];
+        const cost = (entry.speaker.length + entry.text.length) * 3 + 48;
+        if (approxBytes + cost > 48_000 && out.length > 0) break;
+        approxBytes += cost;
+        out.push(entry);
+      }
+      return out.reverse();
+    }
+
+    // Adapter contract: connect({agent, targetTicketId, signal, onTranscript, onUpdateTranscript, onState}),
+    // optional setMuted(bool), setMode(mode), setPttActive(bool), setTts({provider, voice}),
+    // interrupt(), prepareStt(), end({signal, agent, targetTicketId, transcript, notes}) -> {summary},
+    // and synchronous dispose(). dispose releases all session resources and permits a later fresh connect.
+    function createVoiceCallProvider(adapter) {
+      const store = createMvStore(mvVoiceIdle);
+      const get = store.getSnapshot;
+      const patch = next => store.set({ ...get(), ...next });
+      let session, disposed = false;
+      const release = call => {
+        if (call.released) return;
+        call.released = true;
+        call.connection.abort();
+        call.ending.abort();
+        try { adapter.dispose?.(); } catch {}
+      };
+      const clearSession = () => {
+        const call = session;
+        session = undefined;
+        if (call) {
+          call.actions.abort();
+          release(call);
+        }
+      };
+      const reset = () => {
+        if (disposed || !['idle', 'summary'].includes(get().status)) return false;
+        clearSession();
+        store.set(mvVoiceIdle);
+        return true;
+      };
+      // Failed or cancelled connections never acquire an active session or a summary.
+      const exitConnecting = (outcome, message) => {
+        if (get().status !== 'connecting' || !session) return false;
+        clearSession();
+        store.set({ status: 'idle', outcome, message });
+        return true;
+      };
+      const end = async () => {
+        const call = session;
+        if (!call || get().status !== 'active') return;
+        const snapshot = get();
+        patch({ status: 'ending', duration: mvVoiceNow() - snapshot.startedAt, level: 0 });
+        if (session !== call) return;
+        let result;
+        try {
+          result = await adapter.end?.({
+            signal: call.ending.signal,
+            agent: snapshot.agent,
+            targetTicketId: snapshot.targetTicketId,
+            transcript: snapshot.transcript,
+            notes: snapshot.notes,
+          });
+        } catch {
+          if (session !== call) return;
+          clearSession();
+          store.set({ status: 'idle', outcome: 'error', message: '语音连接结束失败，未生成纪要。' });
+          return;
+        }
+        if (session !== call) return;
+        release(call);
+        if (session !== call) return;
+        const { notes, transcript } = get();
+        const hasSummary = typeof result?.summary === 'string' && result.summary.trim().length > 0;
+        const summary = [
+          typeof result?.summary === 'string' ? result.summary : '',
+          hasSummary && result?.includesNotes ? '' : notes,
+        ].filter(Boolean).join('\n\n')
+          || transcript.map(line => line.speaker + '：' + line.text).join('\n');
+        patch({ status: 'summary', expanded: true, summary: summary.slice(0, 3000), message: '' });
+      };
+      const action = async (kind, targetTicketId) => {
+        const call = session;
+        const { status, agent, summary, busy, savedId, savedTask } = get();
+        const text = summary?.trim();
+        if (!call || status !== 'summary' || !text || busy ||
+          (kind === 'save' ? Boolean(savedId) : get().synced || (!targetTicketId && !savedId))) return;
+        const { signal } = call.actions;
+        patch({ busy: kind, message: '' });
+        try {
+          if (kind === 'save') {
+            const draft = {
+              agentKey: agent.agentKey, type: 'direct', title: ('语音纪要 · ' + agent.name).slice(0, 512),
+              lastSummary: text, ...(targetTicketId ? { linkedTicketId: targetTicketId } : {}),
+            };
+            const result = await fetchJson('marshal/agent-tasks/create', draft, true, signal);
+            if (!result.task?.id) throw Error('Missing task id');
+            if (session === call) patch({ savedId: result.task.id, savedTask: { ...draft, ...result.task }, message: '已保存为 1:1 任务。' });
+          } else {
+            await fetchJson('marshal/agents/guidance-sync', {
+              agentKey: agent.agentKey, guidanceText: text,
+              ...(savedId ? { taskIds: [savedId] } : {}),
+              ...(targetTicketId ? { targetTicketId, wakeTicket: savedTask?.linkedTicketId === targetTicketId } : {}),
+            }, true, signal);
+            if (session === call) patch({ synced: true, message: '已同步指导。' });
+          }
+        } catch (error) {
+          if (session === call) patch({ message: kind === 'save'
+            ? '未确认保存，请核对任务清单。'
+            : error?.code === 'direct-session-not-found' ? '请先建立智能体的 1:1 直连会话。' : '未确认同步，请核对目标会话。' });
+        } finally { if (session === call) patch({ busy: null }); }
+      };
+      return {
+        getSnapshot: get, subscribe: store.subscribe, local: adapter.local === true,
+        async start(agent, { targetTicketId, ticketNo } = {}) {
+          if (disposed || get().status !== 'idle' || !agent?.agentKey) return;
+          const call = { connection: new AbortController(), ending: new AbortController(), actions: new AbortController() };
+          session = call;
+          store.set({
+            status: 'connecting', agent, targetTicketId, ticketNo, expanded: true, muted: false,
+            notes: '', transcript: [], phase: adapter.local ? 'notes' : 'listening',
+            mode: 'vad', pttActive: false, level: 0, ttsProvider: 'edge', ttsVoice: '',
+            sttNeedsPrepare: false, preparingStt: false, fallbackLocal: adapter.local === true,
+          });
+          if (session !== call) return;
+          try {
+            await adapter.connect({
+              agent, targetTicketId, signal: call.connection.signal,
+              onTranscript(line) {
+                if (session !== call || call.released || !['connecting', 'active', 'ending'].includes(get().status) ||
+                  typeof line?.text !== 'string' || !line.text.trim()) return;
+                patch({ transcript: [...get().transcript.slice(-199),
+                  { id: line.id, speaker: String(line.speaker || agent.name).slice(0, 120), text: line.text.slice(0, 3000) }] });
+              },
+              onUpdateTranscript(id, text, speaker) {
+                if (session !== call || call.released || !['connecting', 'active', 'ending'].includes(get().status) ||
+                  typeof text !== 'string') return;
+                const list = get().transcript;
+                const idx = list.findIndex(item => item.id && item.id === id);
+                const nextLine = { id, speaker: String(speaker || agent.name).slice(0, 120), text: text.slice(0, 3000) };
+                if (idx >= 0) {
+                  const copy = list.slice();
+                  copy[idx] = nextLine;
+                  patch({ transcript: copy });
+                } else if (text.trim()) {
+                  patch({ transcript: [...list.slice(-199), nextLine] });
+                }
+              },
+              onState(partial) {
+                if (session !== call || call.released || !['connecting', 'active', 'ending'].includes(get().status)) return;
+                if (partial && typeof partial === 'object') patch(partial);
+              },
+            });
+            if (session === call && get().status === 'connecting') patch({ status: 'active', startedAt: mvVoiceNow() });
+          } catch { if (session === call) exitConnecting('error', '无法建立语音会话。'); }
+        },
+        async toggleMuted() {
+          const call = session;
+          if (!call || call.muting || get().status !== 'active') return;
+          call.muting = true;
+          const muted = !get().muted;
+          try {
+            await adapter.setMuted?.(muted);
+            if (session === call && get().status === 'active') patch({ muted, level: muted ? 0 : get().level, message: '' });
+          } catch {
+            if (session === call && get().status === 'active') patch({ message: '无法切换静音。' });
+          } finally { call.muting = false; }
+        },
+        setMode(mode) {
+          if (get().status !== 'active' || !['vad', 'ptt'].includes(mode)) return;
+          patch({ mode, pttActive: false });
+          adapter.setMode?.(mode);
+        },
+        setPttActive(active) {
+          if (get().status !== 'active' || get().mode !== 'ptt' || get().muted) return;
+          const next = Boolean(active);
+          patch({ pttActive: next });
+          adapter.setPttActive?.(next);
+        },
+        setTts(providerId, voice) {
+          if (get().status !== 'active' || !providerId) return;
+          const changedProvider = providerId !== get().ttsProvider;
+          const nextVoice = voice !== undefined ? voice : (changedProvider ? '' : undefined);
+          patch({ ttsProvider: providerId, ...(nextVoice !== undefined ? { ttsVoice: nextVoice } : {}) });
+          adapter.setTts?.({ provider: providerId, voice: nextVoice });
+        },
+        interrupt() {
+          if (get().status !== 'active') return;
+          adapter.interrupt?.();
+        },
+        prepareStt() {
+          if (get().status !== 'active' || get().preparingStt) return;
+          void adapter.prepareStt?.();
+        },
+        switchToLocalNotes() {
+          if (get().status !== 'active') return;
+          adapter.switchToLocalNotes?.();
+          patch({ fallbackLocal: true, phase: 'notes', level: 0, message: '已切换为本地笔记模式，不录音。' });
+        },
+        end, reset,
+        cancel() { return exitConnecting('cancelled', '已取消语音连接。'); },
+        setExpanded(expanded) { if (session) patch({ expanded }); },
+        setNotes(notes) { if (['connecting', 'active'].includes(get().status)) patch({ notes: notes.slice(0, 3000) }); },
+        editSummary(summary) {
+          const { status, busy, savedId, synced } = get();
+          if (status === 'summary' && !busy && !(savedId && synced)) patch({ summary: summary.slice(0, 3000) });
+        },
+        saveSummary() { return action('save', get().targetTicketId); },
+        syncGuidance() { return action('sync', get().targetTicketId); },
+        confirmGuidance(snapshot) {
+          if (get() === snapshot && snapshot.status === 'summary') patch({ synced: true, message: '已同步指导。' });
+        },
+        close() { if (get().status === 'summary' && !get().busy) reset(); },
+        dispose() {
+          if (disposed) return;
+          disposed = true;
+          // Destruction is not an operation on the live state machine.
+          store.clear();
+          clearSession();
+          store.set(mvVoiceIdle);
+        },
+      };
+    }
+
+    function createLocalVoiceSessionProvider() {
+      // This adapter deliberately does not request a microphone or simulate speech.
+      return createVoiceCallProvider({ local: true, connect({ signal }) { signal.throwIfAborted(); } });
+    }
+
+    /**
+     * Live real-time voice call adapter:
+     * - Microphone capture with hardware echoCancellation / noiseSuppression / autoGainControl
+     * - VAD auto-endpointing (default) + Push-to-Talk dual mode
+     * - SenseVoice STT via POST /marshal/voice/transcribe
+     * - A1 SSE streaming dialogue via POST /marshal/voice/turn
+     * - Pipelined sentence TTS playback queue via POST /marshal/voice/tts (T1 default / T2 local)
+     * - Automatic & manual Barge-in interruption cancelling in-flight LLM/TTS/audio
+     * - Post-call summary via POST /marshal/voice/summarize
+     */
+    function createLiveVoiceCallProvider(env = {}) {
+      let activeAgent = null;
+      let activeTicketId;
+      let emitTranscript = () => {};
+      let emitUpdateTranscript = () => {};
+      let emitState = () => {};
+      let muted = false;
+      let mode = 'vad';
+      let pttRecording = false;
+      let phase = 'listening';
+      let localFallback = false;
+      let ttsProvider = 'edge';
+      let ttsVoice = '';
+      let history = [];
+      let stream = null;
+      let audioCtx = null;
+      let sourceNode = null;
+      let processorNode = null;
+      let sinkGain = null;
+      let sampleRate = 16000;
+      let turnAbort = null;
+      let ttsAbort = null;
+      let callAbort = null;
+      let prepareTimer = null;
+      let disposed = false;
+      let activeAudio = null;
+      let stopActiveAudio = null;
+      let playQueue = [];
+      let pendingTts = [];
+      let ttsInflight = 0;
+      const MAX_TTS_INFLIGHT = 2;
+      let drainingSeq = 0;
+      let playbackSeq = 0;
+      let utteranceSeq = 0;
+      let connectSeq = 0;
+
+      // VAD capture buffers
+      let preRoll = [];
+      let speechChunks = [];
+      let inSpeech = false;
+      let speechMs = 0;
+      let captureMs = 0;
+      let silenceMs = 0;
+      let bargeMs = 0;
+      let lastLevelEmit = 0;
+      const PRE_ROLL_MAX = 4;
+
+      const getFetch = () => env.fetch ?? fetch;
+      const liveFetchJson = async (path, body, signal) => {
+        const response = await mvVoiceAuthFetch(path, body, signal, getFetch());
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw Object.assign(new Error(data?.message || data?.error || ('HTTP ' + response.status)), {
+            status: response.status,
+            code: data?.code || data?.error,
+            data,
+          });
+        }
+        return data;
+      };
+      const getMedia = () => env.getUserMedia ?? (typeof navigator !== 'undefined' && navigator.mediaDevices?.getUserMedia
+        ? constraints => navigator.mediaDevices.getUserMedia(constraints) : null);
+      const getAudioCtxCtor = () => env.AudioContext ?? (typeof window !== 'undefined' ? (window.AudioContext || window.webkitAudioContext) : null);
+      const getAudioCtor = () => env.Audio ?? (typeof Audio !== 'undefined' ? Audio : null);
+      const getUrlApi = () => env.URL ?? URL;
+
+      const setPhase = nextPhase => {
+        phase = nextPhase;
+        emitState({ phase: nextPhase });
+      };
+
+      const stopAudioPlayback = () => {
+        playbackSeq += 1;
+        playQueue = [];
+        const queued = pendingTts;
+        pendingTts = [];
+        for (const item of queued) item.resolve(null);
+        const stopFn = stopActiveAudio;
+        stopActiveAudio = null;
+        if (stopFn) {
+          try { stopFn(); } catch {}
+        } else if (activeAudio) {
+          const audio = activeAudio;
+          activeAudio = null;
+          try { audio.pause(); } catch {}
+          try { audio.src = ''; } catch {}
+        }
+      };
+
+      const cancelTurn = () => {
+        if (turnAbort) { try { turnAbort.abort(); } catch {} turnAbort = null; }
+        if (ttsAbort) { try { ttsAbort.abort(); } catch {} ttsAbort = null; }
+        stopAudioPlayback();
+      };
+
+      const releaseCapture = () => {
+        if (prepareTimer) { clearTimeout(prepareTimer); prepareTimer = null; }
+        if (processorNode) {
+          try { processorNode.onaudioprocess = null; processorNode.disconnect(); } catch {}
+          processorNode = null;
+        }
+        if (sourceNode) { try { sourceNode.disconnect(); } catch {} sourceNode = null; }
+        if (sinkGain) { try { sinkGain.disconnect(); } catch {} sinkGain = null; }
+        if (stream) {
+          for (const track of stream.getTracks?.() ?? []) { try { track.stop(); } catch {} }
+          stream = null;
+        }
+        if (audioCtx) { try { void audioCtx.close?.(); } catch {} audioCtx = null; }
+        preRoll = [];
+        speechChunks = [];
+        inSpeech = false;
+        speechMs = 0;
+        captureMs = 0;
+        silenceMs = 0;
+        bargeMs = 0;
+        pttRecording = false;
+      };
+
+      const playBlob = (blob, seq) => new Promise(resolve => {
+        if (disposed || seq !== playbackSeq) { resolve(); return; }
+        const AudioCtor = getAudioCtor();
+        const urlApi = getUrlApi();
+        if (!AudioCtor || typeof urlApi?.createObjectURL !== 'function') { resolve(); return; }
+        const objectUrl = urlApi.createObjectURL(blob);
+        const audio = new AudioCtor(objectUrl);
+        activeAudio = audio;
+        let done = false;
+        const finish = () => {
+          if (done) return;
+          done = true;
+          if (activeAudio === audio) activeAudio = null;
+          if (stopActiveAudio === abortPlayback) stopActiveAudio = null;
+          try { urlApi.revokeObjectURL?.(objectUrl); } catch {}
+          resolve();
+        };
+        const abortPlayback = () => {
+          try { audio.pause?.(); } catch {}
+          try { audio.src = ''; } catch {}
+          finish();
+        };
+        stopActiveAudio = abortPlayback;
+        audio.onended = finish;
+        audio.onerror = finish;
+        audio.onpause = finish;
+        try {
+          const maybePromise = audio.play?.();
+          if (maybePromise && typeof maybePromise.catch === 'function') maybePromise.catch(finish);
+        } catch { finish(); }
+      });
+
+      const drainPlayQueue = async seq => {
+        if (drainingSeq === seq) return;
+        drainingSeq = seq;
+        try {
+          while (!disposed && seq === playbackSeq && playQueue.length > 0) {
+            const job = playQueue.shift();
+            const blob = await job;
+            if (disposed || seq !== playbackSeq) break;
+            if (blob) {
+              setPhase('speaking');
+              await playBlob(blob, seq);
+            }
+          }
+        } finally {
+          if (drainingSeq === seq) drainingSeq = 0;
+          if (!disposed && seq === playbackSeq && !turnAbort && playQueue.length === 0) {
+            setPhase(localFallback ? 'notes' : (mode === 'ptt' ? 'ptt' : 'listening'));
+          }
+        }
+      };
+
+      const pumpTtsQueue = () => {
+        while (ttsInflight < MAX_TTS_INFLIGHT && pendingTts.length > 0) {
+          const item = pendingTts.shift();
+          if (disposed || item.signal.aborted || item.seq !== playbackSeq) {
+            item.resolve(null);
+            continue;
+          }
+          ttsInflight += 1;
+          (async () => {
+            try {
+              const response = await mvVoiceAuthFetch('marshal/voice/tts', {
+                provider: ttsProvider,
+                voice: ttsVoice || undefined,
+                text: item.sentence,
+              }, item.signal, getFetch());
+              if (!response.ok || item.signal.aborted || item.seq !== playbackSeq) return null;
+              const fallback = response.headers?.get?.('x-marshal-tts-fallback');
+              if (fallback) emitState({ message: '网络语音暂不可用，已自动切换本机离线朗读。' });
+              return await response.blob();
+            } catch {
+              return null;
+            }
+          })()
+            .then(item.resolve, () => item.resolve(null))
+            .finally(() => {
+              ttsInflight -= 1;
+              pumpTtsQueue();
+            });
+        }
+      };
+
+      const enqueueTtsSentence = (sentence, seq, signal) => {
+        if (!sentence || disposed || signal.aborted || seq !== playbackSeq) return;
+        const job = new Promise(resolve => {
+          pendingTts.push({ sentence, seq, signal, resolve });
+          pumpTtsQueue();
+        });
+        playQueue.push(job);
+        void drainPlayQueue(seq);
+      };
+
+      const processUtterance = async wavBytes => {
+        if (disposed || localFallback || !wavBytes || wavBytes.length <= 44) return;
+        const myUtterance = ++utteranceSeq;
+        cancelTurn();
+        const mySeq = playbackSeq;
+        const ctrl = new AbortController();
+        const myTtsAbort = new AbortController();
+        turnAbort = ctrl;
+        ttsAbort = myTtsAbort;
+        setPhase('transcribing');
+        emitState({ message: '' });
+        let recognized = '';
+        try {
+          const sttRes = await liveFetchJson('marshal/voice/transcribe', {
+            audioBase64: mvBytesToBase64(wavBytes),
+            language: 'auto',
+          }, ctrl.signal);
+          recognized = typeof sttRes?.text === 'string' ? sttRes.text.trim() : '';
+        } catch (error) {
+          if (ctrl.signal.aborted || disposed) return;
+          if (error?.code === 'stt-not-ready') {
+            emitState({ sttNeedsPrepare: true, message: 'SenseVoice 模型尚未就绪，请先点击「准备本地语音识别模型」。' });
+          } else {
+            emitState({ message: error?.message || '语音识别失败，请重试。' });
+          }
+          if (turnAbort === ctrl) turnAbort = null;
+          setPhase(mode === 'ptt' ? 'ptt' : 'listening');
+          return;
+        }
+        if (ctrl.signal.aborted || disposed || myUtterance !== utteranceSeq) return;
+        if (!recognized) {
+          if (turnAbort === ctrl) turnAbort = null;
+          setPhase(mode === 'ptt' ? 'ptt' : 'listening');
+          return;
+        }
+
+        emitTranscript({ speaker: '我', text: recognized });
+        setPhase('thinking');
+        const replyLineId = 'agent-turn-' + myUtterance;
+        let replyText = '';
+        try {
+          const response = await mvVoiceAuthFetch('marshal/voice/turn', {
+            agentKey: activeAgent.agentKey,
+            text: recognized,
+            history: history.slice(-12),
+            ...(activeTicketId ? { targetTicketId: activeTicketId } : {}),
+          }, ctrl.signal, getFetch());
+          if (!response.ok) {
+            const errBody = await response.json().catch(() => ({}));
+            throw Object.assign(new Error(errBody?.message || '模型回复失败'), { code: errBody?.code || 'turn-failed' });
+          }
+          for await (const { event, data } of mvReadSseEvents(response, ctrl.signal)) {
+            if (ctrl.signal.aborted || disposed || mySeq !== playbackSeq) break;
+            if (event === 'delta' && typeof data?.text === 'string') {
+              replyText += data.text;
+              emitUpdateTranscript(replyLineId, replyText, activeAgent.name);
+            } else if (event === 'sentence' && typeof data?.text === 'string') {
+              enqueueTtsSentence(data.text, mySeq, myTtsAbort.signal);
+            } else if (event === 'error') {
+              emitState({ message: data?.message || '语音对话异常，请重试。' });
+            }
+          }
+          if (!ctrl.signal.aborted && replyText.trim()) {
+            history = [...history.slice(-10), { role: 'user', text: recognized }, { role: 'assistant', text: replyText.trim() }];
+          }
+        } catch (error) {
+          if (!ctrl.signal.aborted && !disposed) {
+            emitState({ message: error?.message || '对话流中断，请重试。' });
+          }
+        } finally {
+          if (turnAbort === ctrl) turnAbort = null;
+          if (!disposed && drainingSeq !== mySeq && playQueue.length === 0 && mySeq === playbackSeq) {
+            setPhase(localFallback ? 'notes' : (mode === 'ptt' ? 'ptt' : 'listening'));
+          }
+        }
+      };
+
+      const onAudioFrame = samples => {
+        if (disposed || localFallback || muted || !samples?.length) return;
+        let sumSq = 0;
+        for (let i = 0; i < samples.length; i++) sumSq += samples[i] * samples[i];
+        const rms = Math.sqrt(sumSq / samples.length);
+        const frameMs = (samples.length / Math.max(8000, sampleRate)) * 1000;
+        const now = mvVoiceNow();
+        if (now - lastLevelEmit >= 80) {
+          lastLevelEmit = now;
+          emitState({ level: Math.min(1, rms * 6) });
+        }
+        const copy = new Float32Array(samples);
+        if (mode === 'ptt') {
+          if (pttRecording) {
+            speechChunks.push(copy);
+            speechMs += frameMs;
+            if (speechMs >= 30_000) {
+              pttRecording = false;
+              const wav = mvEncodePcm16Wav(speechChunks, sampleRate);
+              speechChunks = [];
+              speechMs = 0;
+              emitState({ pttActive: false });
+              void processUtterance(wav);
+            }
+          }
+          return;
+        }
+        // VAD mode + Barge-in
+        const busyTalking = phase === 'speaking' || phase === 'thinking';
+        const threshold = busyTalking ? 0.048 : 0.024;
+        if (busyTalking) {
+          if (rms >= threshold) {
+            preRoll.push(copy);
+            if (preRoll.length > PRE_ROLL_MAX) preRoll.shift();
+            bargeMs += frameMs;
+            if (bargeMs >= 260) {
+              cancelTurn();
+              inSpeech = true;
+              speechChunks = preRoll.slice();
+              preRoll = [];
+              speechMs = bargeMs;
+              captureMs = bargeMs;
+              silenceMs = 0;
+              bargeMs = 0;
+              setPhase('listening');
+              emitState({ message: '已打断，正在聆听…' });
+            }
+          } else {
+            bargeMs = Math.max(0, bargeMs - frameMs);
+          }
+          return;
+        }
+        if (phase === 'transcribing') return;
+        if (rms >= threshold) {
+          if (!inSpeech) {
+            inSpeech = true;
+            speechChunks = preRoll.slice();
+            preRoll = [];
+            speechMs = 0;
+            captureMs = 0;
+            silenceMs = 0;
+          }
+          speechChunks.push(copy);
+          speechMs += frameMs;
+          captureMs += frameMs;
+          silenceMs = 0;
+          if (speechMs >= 25_000 || captureMs >= 28_000) {
+            const wav = mvEncodePcm16Wav(speechChunks, sampleRate);
+            inSpeech = false; speechChunks = []; speechMs = 0; captureMs = 0; silenceMs = 0;
+            void processUtterance(wav);
+          }
+        } else if (inSpeech) {
+          speechChunks.push(copy);
+          silenceMs += frameMs;
+          captureMs += frameMs;
+          if (silenceMs >= 700 || captureMs >= 28_000) {
+            const wav = speechMs >= 240 ? mvEncodePcm16Wav(speechChunks, sampleRate) : null;
+            inSpeech = false; speechChunks = []; speechMs = 0; captureMs = 0; silenceMs = 0;
+            if (wav) void processUtterance(wav);
+          }
+        } else {
+          preRoll.push(copy);
+          if (preRoll.length > PRE_ROLL_MAX) preRoll.shift();
+        }
+      };
+
+      const refreshCapabilities = async signal => {
+        try {
+          const caps = await liveFetchJson('marshal/voice/capabilities', undefined, signal);
+          const stt = caps?.stt ?? {};
+          const needsPrepare = Boolean(stt.available && !stt.ready);
+          const providers = caps?.tts?.providers ?? [];
+          const defaultTts = caps?.tts?.defaultProvider || 'edge';
+          const defaultVoice = caps?.tts?.defaultVoice || '';
+          const resolvedProvider = providers.some(p => p.id === ttsProvider) ? ttsProvider : defaultTts;
+          if (resolvedProvider !== ttsProvider) {
+            ttsProvider = resolvedProvider;
+            ttsVoice = resolvedProvider === defaultTts ? defaultVoice : '';
+          } else if (!ttsVoice && resolvedProvider === defaultTts) {
+            ttsVoice = defaultVoice;
+          }
+          emitState({
+            capabilities: caps,
+            sttNeedsPrepare: needsPrepare,
+            preparingStt: mvIsSttPreparing(stt),
+            ttsProvider: resolvedProvider,
+            ttsVoice,
+          });
+          return caps;
+        } catch {
+          return null;
+        }
+      };
+
+      const schedulePrepareWatch = () => {
+        if (disposed || localFallback) return;
+        if (prepareTimer) clearTimeout(prepareTimer);
+        prepareTimer = setTimeout(async () => {
+          prepareTimer = null;
+          if (disposed || localFallback) return;
+          const caps = await refreshCapabilities(callAbort?.signal);
+          if (disposed || localFallback) return;
+          if (caps?.stt?.ready) {
+            emitState({ sttNeedsPrepare: false, preparingStt: false, message: 'SenseVoice 语音模型已就绪，可以直接开口对话。' });
+            return;
+          }
+          if (mvIsSttPreparing(caps?.stt)) schedulePrepareWatch();
+          else emitState({ preparingStt: false });
+        }, 1500);
+      };
+
+      return createVoiceCallProvider({
+        local: false,
+        async connect({ agent, targetTicketId, signal, onTranscript, onUpdateTranscript, onState }) {
+          signal.throwIfAborted();
+          const myConnect = ++connectSeq;
+          disposed = false;
+          callAbort?.abort();
+          callAbort = new AbortController();
+          activeAgent = agent;
+          activeTicketId = targetTicketId;
+          emitTranscript = onTranscript;
+          emitUpdateTranscript = onUpdateTranscript;
+          emitState = onState;
+          muted = false;
+          mode = 'vad';
+          pttRecording = false;
+          localFallback = false;
+          history = [];
+          const caps = await refreshCapabilities(signal);
+          signal.throwIfAborted();
+          if (myConnect !== connectSeq || disposed) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+          if (!caps || caps.llmAvailable === false || caps.stt?.available === false) {
+            localFallback = true;
+            const reason = caps && caps.stt?.available === false
+              ? '宿主未启用 SenseVoice 语音识别服务，已切换本地笔记模式。'
+              : '后端语音服务暂不可用，已切换本地笔记模式。';
+            emitState({ fallbackLocal: true, phase: 'notes', message: reason });
+            return;
+          }
+          const requestMic = getMedia();
+          const AudioCtx = getAudioCtxCtor();
+          if (!requestMic || !AudioCtx) {
+            localFallback = true;
+            emitState({ fallbackLocal: true, phase: 'notes', message: '当前环境不支持麦克风采集，已切换本地笔记模式。' });
+            return;
+          }
+          let micStream = null;
+          let localCtx = null;
+          const stopLocalCapture = () => {
+            if (micStream) {
+              for (const track of micStream.getTracks?.() ?? []) { try { track.stop(); } catch {} }
+              micStream = null;
+            }
+            if (localCtx) { try { void localCtx.close?.(); } catch {} localCtx = null; }
+          };
+          try {
+            micStream = await requestMic({
+              audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
+            });
+            if (signal.aborted || disposed || myConnect !== connectSeq) {
+              stopLocalCapture();
+              signal.throwIfAborted();
+              throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+            }
+            localCtx = new AudioCtx();
+            const localRate = localCtx.sampleRate || 16000;
+            const localSource = localCtx.createMediaStreamSource(micStream);
+            const localProcessor = localCtx.createScriptProcessor(2048, 1, 1);
+            const localSink = localCtx.createGain();
+            localSink.gain.value = 0;
+            localProcessor.onaudioprocess = event => {
+              const data = event?.inputBuffer?.getChannelData?.(0);
+              if (data) onAudioFrame(data);
+            };
+            localSource.connect(localProcessor);
+            localProcessor.connect(localSink);
+            localSink.connect(localCtx.destination);
+            if (typeof localCtx.resume === 'function') { try { await localCtx.resume(); } catch {} }
+            if (signal.aborted || disposed || myConnect !== connectSeq) {
+              try { localProcessor.onaudioprocess = null; localProcessor.disconnect(); } catch {}
+              try { localSource.disconnect(); } catch {}
+              try { localSink.disconnect(); } catch {}
+              stopLocalCapture();
+              signal.throwIfAborted();
+              throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+            }
+            stream = micStream;
+            audioCtx = localCtx;
+            sampleRate = localRate;
+            sourceNode = localSource;
+            processorNode = localProcessor;
+            sinkGain = localSink;
+            micStream = null;
+            localCtx = null;
+            setPhase('listening');
+          } catch (error) {
+            stopLocalCapture();
+            if (signal.aborted || disposed || myConnect !== connectSeq) throw error;
+            releaseCapture();
+            localFallback = true;
+            emitState({ fallbackLocal: true, phase: 'notes', message: '麦克风未授权或不可用，已切换为本地笔记模式。' });
+          }
+        },
+        setMuted(nextMuted) {
+          muted = Boolean(nextMuted);
+          if (stream) {
+            const tracks = stream.getAudioTracks?.() ?? stream.getTracks?.() ?? [];
+            for (const track of tracks) {
+              try { if ('enabled' in track) track.enabled = !muted; } catch {}
+            }
+          }
+          if (muted) {
+            const wasPttRecording = pttRecording;
+            inSpeech = false; speechChunks = []; preRoll = [];
+            speechMs = 0; captureMs = 0; silenceMs = 0; bargeMs = 0; pttRecording = false;
+            emitState({ level: 0, pttActive: false });
+            if (wasPttRecording && mode === 'ptt' && phase === 'listening') setPhase('ptt');
+          }
+        },
+        setMode(nextMode) {
+          mode = nextMode;
+          inSpeech = false; speechChunks = []; speechMs = 0; captureMs = 0; silenceMs = 0; pttRecording = false;
+          if (phase !== 'speaking' && phase !== 'thinking' && phase !== 'transcribing') {
+            setPhase(nextMode === 'ptt' ? 'ptt' : 'listening');
+          }
+        },
+        setPttActive(active) {
+          if (localFallback || muted || mode !== 'ptt') return;
+          if (active) {
+            if (pttRecording) return;
+            cancelTurn();
+            speechChunks = [];
+            speechMs = 0;
+            captureMs = 0;
+            pttRecording = true;
+            setPhase('listening');
+          } else if (pttRecording) {
+            pttRecording = false;
+            const wav = speechMs >= 160 ? mvEncodePcm16Wav(speechChunks, sampleRate) : null;
+            speechChunks = [];
+            speechMs = 0;
+            captureMs = 0;
+            if (wav) void processUtterance(wav);
+            else setPhase('ptt');
+          }
+        },
+        setTts({ provider, voice }) {
+          const changed = Boolean(provider && provider !== ttsProvider);
+          if (provider) ttsProvider = provider;
+          if (voice !== undefined) ttsVoice = voice;
+          else if (changed) ttsVoice = '';
+        },
+        interrupt() {
+          cancelTurn();
+          inSpeech = false; speechChunks = []; preRoll = [];
+          speechMs = 0; captureMs = 0; silenceMs = 0; bargeMs = 0;
+          setPhase(localFallback ? 'notes' : (mode === 'ptt' ? 'ptt' : 'listening'));
+          emitState({ message: '已打断回复。' });
+        },
+        async prepareStt() {
+          const myCallAbort = callAbort;
+          emitState({ preparingStt: true, message: '正在后台准备 SenseVoice 语音模型…' });
+          try {
+            const res = await liveFetchJson('marshal/voice/prepare', {}, myCallAbort?.signal);
+            if (disposed || localFallback || myCallAbort?.signal?.aborted) return;
+            if (res?.stt?.ready) {
+              emitState({ sttNeedsPrepare: false, preparingStt: false, message: 'SenseVoice 已就绪，可以直接说话。' });
+            } else {
+              schedulePrepareWatch();
+            }
+          } catch (error) {
+            if (disposed || myCallAbort?.signal?.aborted || error?.name === 'AbortError' || error?.code === 'aborted') return;
+            emitState({ preparingStt: false, message: error?.message || '触发模型准备失败。' });
+          }
+        },
+        switchToLocalNotes() {
+          cancelTurn();
+          releaseCapture();
+          localFallback = true;
+        },
+        async end({ signal, agent, targetTicketId, transcript, notes }) {
+          callAbort?.abort();
+          callAbort = null;
+          cancelTurn();
+          releaseCapture();
+          const trimmedTranscript = mvTrimSummaryTranscript(transcript);
+          if ((localFallback && trimmedTranscript.length === 0) || (trimmedTranscript.length === 0 && !notes?.trim())) return {};
+          const timeoutCtrl = new AbortController();
+          const onExternalAbort = () => timeoutCtrl.abort();
+          if (signal?.aborted) timeoutCtrl.abort();
+          else signal?.addEventListener?.('abort', onExternalAbort, { once: true });
+          const timer = setTimeout(() => timeoutCtrl.abort(), 18_000);
+          try {
+            const res = await liveFetchJson('marshal/voice/summarize', {
+              agentKey: agent.agentKey,
+              ...(targetTicketId ? { targetTicketId } : {}),
+              transcript: trimmedTranscript,
+              notes: String(notes ?? '').slice(0, 3000),
+            }, timeoutCtrl.signal);
+            const summary = typeof res?.summary === 'string' ? res.summary : '';
+            return { summary, includesNotes: Boolean(summary.trim()) };
+          } catch {
+            return {};
+          } finally {
+            clearTimeout(timer);
+            signal?.removeEventListener?.('abort', onExternalAbort);
+          }
+        },
+        dispose() {
+          disposed = true;
+          connectSeq += 1;
+          callAbort?.abort();
+          callAbort = null;
+          cancelTurn();
+          releaseCapture();
+          history = [];
+        },
+      });
+    }
+
+    function mvVoiceDuration(ms) {
+      const seconds = Math.max(0, Math.floor(ms / 1000));
+      const pad = value => String(value).padStart(2, '0');
+      return pad(Math.floor(seconds / 60)) + ':' + pad(seconds % 60);
+    }
+    function MvVoiceTimer({ call }) {
+      const [now, setNow] = React.useState(mvVoiceNow);
+      React.useEffect(() => {
+        if (call.status !== 'active') return;
+        let timer;
+        const tick = () => {
+          const time = mvVoiceNow();
+          setNow(time);
+          timer = setTimeout(tick, 1000 - (Math.max(0, time - call.startedAt) % 1000));
+        };
+        tick();
+        return () => clearTimeout(timer);
+      }, [call.status, call.startedAt]);
+      return h('span', { className: 'mv-time', 'aria-label': '通话时长' },
+        mvVoiceDuration(call.duration ?? (call.startedAt === undefined ? 0 : now - call.startedAt)));
+    }
+    function MvVoiceTranscript({ lines }) {
+      return h('div', { className: 'mv-transcript', 'aria-label': '对话记录' },
+        lines.length ? lines.map((line, index) => h('div', { key: line.id || index }, h('strong', null, line.speaker + '：'), line.text))
+          : h('span', { className: 'mv-muted' }, '暂无对话记录'));
+    }
+    function mvVoiceGuidanceAction({ voice, call, runtime }) {
+      const state = mvUseAgentTasks(runtime, call.agent.agentKey);
+      const { items } = useMvSnapshot(runtime.tickets);
+      const { tasks: selected, ticket } = mvSelection(state, items);
+      // Keep a saved, unlinked summary usable for direct sync, but never add
+      // an unselected ticket-bound summary or reuse the call's initial target.
+      const saved = state.rows.find(task => task.id === call.savedId) ?? call.savedTask;
+      const tasks = selected.length ? selected : saved && !saved.linkedTicketId ? [saved] : [];
+      return h(MvButton, { icon: 'send', className: 'mv-guidance-action', label: call.synced ? '已同步' : mvGuidanceLabel(ticket),
+        disabled: Boolean(call.busy || call.synced || !call.summary.trim()),
+        onClick: () => runtime.showModal({ agent: call.agent, tasks, ticket,
+          guidanceText: call.summary, onSuccess: () => voice.confirmGuidance(call) }) });
+    }
+    function MarshalVoiceSummaryCard({ voice, call, guidanceRuntime }) {
+      const canSync = Boolean(call.targetTicketId || call.savedId);
+      return h('section', { id: 'marshal-voice-detail', className: 'mv-summary-card mv-stack', role: 'region', 'aria-label': '语音纪要' },
+        h('div', { className: 'mv-line' }, h(MvAvatar, { agent: call.agent }),
+          h('div', { className: 'mv-copy' }, h('h2', { className: 'mv-voice-title' }, '语音纪要 · ' + call.agent.name),
+            h(MvVoiceTimer, { call }))),
+        h('label', { className: 'mv-stack' }, '纪要摘要',
+          h('textarea', { className: 'mv-field', rows: 4, maxLength: 3000, value: call.summary,
+            readOnly: Boolean(call.busy || (call.savedId && call.synced)), onChange: event => voice.editSummary(event.target.value) })),
+        call.transcript.length > 0 && h('details', null, h('summary', null, '对话记录'), h(MvVoiceTranscript, { lines: call.transcript })),
+        !guidanceRuntime && h('div', { className: 'mv-muted' }, call.targetTicketId ? '同步目标：关联工单群' :
+          canSync ? '同步目标：智能体 1:1 直连会话' : '先保存为任务，再同步至智能体的 1:1 会话。'),
+        h('div', { className: 'mv-actions' },
+          h(MvButton, { icon: 'save', label: call.savedId ? '已保存' : '保存为 1:1 任务',
+            disabled: Boolean(call.busy || call.savedId || !call.summary.trim()), onClick: () => void voice.saveSummary() }),
+          guidanceRuntime ? h(mvVoiceGuidanceAction, { voice, call, runtime: guidanceRuntime }) :
+            h(MvButton, { icon: 'send', label: call.synced ? '已同步' : '汇总同步指导',
+            disabled: Boolean(call.busy || call.synced || !canSync || !call.summary.trim()), onClick: () => void voice.syncGuidance() }),
+          h(MvButton, { icon: 'close', label: '关闭', disabled: Boolean(call.busy), onClick: () => voice.close() })),
+        h('div', { className: 'mv-muted', role: 'status' }, call.busy ? '正在提交…' : call.message));
+    }
+    function MarshalVoiceCallOverlay({ voice, guidanceRuntime }) {
+      const call = useMvSnapshot(voice);
+      if (call.status === 'idle') return call.message ? h('div', { className: 'mv-scope mv-voice-dock' },
+        h('section', { className: 'mv-voice-panel mv-line' },
+          h('span', { className: 'mv-copy', role: 'status' }, call.message),
+          h(MvButton, { icon: 'close', label: '关闭', iconOnly: true, onClick: () => voice.reset() }))) : null;
+      const summary = call.status === 'summary';
+      const connecting = call.status === 'connecting';
+      const isLocal = voice.local || call.fallbackLocal;
+      const phaseLabel = !isLocal && call.status === 'active' && !call.muted && mvVoicePhaseLabels[call.phase]
+        ? mvVoicePhaseLabels[call.phase] : null;
+      const label = call.status === 'active' && call.muted ? '已静音' : mvVoiceLabels[call.status];
+      const ttsProviders = call.capabilities?.tts?.providers ?? [];
+      const canInterrupt = !isLocal && call.status === 'active' && (call.phase === 'speaking' || call.phase === 'thinking' || call.phase === 'transcribing');
+      const sttProgress = typeof call.capabilities?.stt?.progress === 'number'
+        ? Math.round(call.capabilities.stt.progress * 100) : null;
+      return h('div', { className: 'mv-scope mv-voice-dock' },
+        h(MvButton, { icon: call.expanded ? 'down' : 'phone', label: label, className: 'mv-capsule',
+          'aria-expanded': call.expanded, 'aria-controls': call.expanded ? 'marshal-voice-detail' : undefined,
+          onClick: () => voice.setExpanded(!call.expanded) },
+          (phaseLabel || label) + ' · ' + call.agent.name, h(MvVoiceTimer, { call })),
+        call.expanded && (summary ? h(MarshalVoiceSummaryCard, { voice, call, guidanceRuntime })
+          : h('section', { id: 'marshal-voice-detail', className: 'mv-voice-panel mv-stack', role: 'region', 'aria-label': '语音小会话' },
+            h('div', { className: 'mv-line' },
+              h(MvAvatar, { agent: call.agent, breathing: call.status === 'active' && !call.muted }),
+              h('div', { className: 'mv-copy' }, h('h2', { className: 'mv-voice-title' }, '语音小会话 · ' + call.agent.name),
+                h('div', { className: 'mv-muted', role: 'status' }, phaseLabel ? label + ' · ' + phaseLabel : label))),
+            !isLocal && call.status === 'active' && h('div', { className: 'mv-voice-meter', 'aria-hidden': true },
+              h('div', { className: 'mv-voice-meter-fill', style: { width: Math.round((call.level || 0) * 100) + '%' } })),
+            !isLocal && call.sttNeedsPrepare && h('div', { className: 'mv-voice-banner' },
+              h('span', null, call.preparingStt
+                ? ('正在准备 SenseVoice 语音识别模型' + (sttProgress !== null ? '（' + sttProgress + '%）' : '') + '…')
+                : '首次通话需准备本机 SenseVoice 模型'),
+              h(MvButton, { label: call.preparingStt ? '准备中…' : '准备模型', disabled: Boolean(call.preparingStt),
+                onClick: () => voice.prepareStt() })),
+            !isLocal && call.status === 'active' && h('div', { className: 'mv-voice-controls', role: 'group', 'aria-label': '通话设置' },
+              h(MvButton, { className: 'mv-chip', label: '免提自动', 'aria-pressed': call.mode === 'vad',
+                onClick: () => voice.setMode('vad') }),
+              h(MvButton, { className: 'mv-chip', label: '按住说话', 'aria-pressed': call.mode === 'ptt',
+                onClick: () => voice.setMode('ptt') }),
+              ttsProviders.filter(item => item.id === 'edge' || item.id === 'local' || item.id === 'system').map(item =>
+                h(MvButton, {
+                  key: item.id, className: 'mv-chip',
+                  label: item.id === 'edge' ? 'T1 神经语音' : item.id === 'local' ? 'T2 本地离线' : '系统离线',
+                  title: item.ready ? item.label : (item.installHint || item.reason || '未就绪'),
+                  disabled: !item.ready,
+                  'aria-pressed': call.ttsProvider === item.id,
+                  onClick: () => voice.setTts(item.id),
+                }))),
+            !isLocal && call.status === 'active' && call.mode === 'ptt' && h(MvButton, {
+              icon: 'mic', className: 'mv-voice-ptt',
+              label: call.pttActive ? '松开发送' : '按住说话（或按住空格）',
+              disabled: Boolean(call.muted),
+              'aria-pressed': Boolean(call.pttActive),
+              onPointerDown: event => {
+                try { event?.currentTarget?.setPointerCapture?.(event.pointerId); } catch {}
+                voice.setPttActive(true);
+              },
+              onPointerUp: () => voice.setPttActive(false),
+              onPointerCancel: () => voice.setPttActive(false),
+              onLostPointerCapture: () => voice.setPttActive(false),
+              onBlur: () => voice.setPttActive(false),
+              onKeyDown: event => { if (event.code === 'Space' && !event.repeat) { event.preventDefault(); voice.setPttActive(true); } },
+              onKeyUp: event => { if (event.code === 'Space') { event.preventDefault(); voice.setPttActive(false); } },
+            }),
+            h('div', { className: 'mv-muted' }, isLocal ? '本地笔记模式，不录音。' : '实时语音通话中，可随时开口打断。', 'SenseVoice 听写仍可在原输入框使用。'),
+            h(MvVoiceTranscript, { lines: call.transcript }),
+            h('label', { className: 'mv-stack' }, '通话笔记', h('textarea', { className: 'mv-field', rows: 2,
+              maxLength: 3000, value: call.notes, readOnly: call.status === 'ending', onChange: event => voice.setNotes(event.target.value) })),
+            h('div', { className: 'mv-actions' },
+              h(MvButton, { icon: call.muted ? 'mute' : 'mic', label: '静音', disabled: call.status !== 'active',
+                'aria-pressed': call.muted, onClick: () => void voice.toggleMuted() }),
+              canInterrupt && h(MvButton, { icon: 'close', label: '打断', onClick: () => voice.interrupt() }),
+              !isLocal && call.status === 'active' && h(MvButton, { label: '切笔记模式', onClick: () => voice.switchToLocalNotes() }),
+              h(MvButton, { icon: 'hangup', label: connecting ? '取消连接' : '挂断并生成纪要',
+                className: 'mv-danger', disabled: call.status === 'ending',
+                onClick: () => { if (connecting) voice.cancel(); else void voice.end(); } })),
+            call.message && h('div', { className: 'mv-muted', role: 'status' }, call.message))));
+    }
+    const MV_TASK_TAB = 'marshal-agent-tasks';
+    const MV_TASK_TAB_ID = 'dsh-marshal/agent-tasks';
+    const MV_TASK_TAB_RETRY_DELAYS = [50, 150, 400, 1000];
+    const MV_TASK_TAB_UNAVAILABLE = '无法打开任务清单，请在智能体会话中重试。';
+    const mvTaskTypes = { casual: '闲聊记录', direct: '直连任务', ticket: '关联工单' };
+    const mvTaskStatuses = { queued: '待处理', running: '进行中', review: '待验收', done: '已完成', failed: '失败' };
+    const mvRead = (path, signal) => fetchJson('marshal/' + path, undefined, true, signal);
+    // Each agent owns ~/.dsh-marshal/agents/<name>. Make it a Host Workspace and pin it on
+    // the agent's squad before a run, so the agents plugin starts the session bound and
+    // the composer never asks which Workspace to use. Best effort: failure keeps the picker.
+    async function mvEnsureAgentWorkspace(teamId, name, signal) {
+      if (!teamId || !name || signal?.aborted) return undefined;
+      try {
+        const result = await fetchJson('marshal/agents/agent-workspace', { name }, true, signal);
+        const workspaceId = result?.workspaceId;
+        if (!workspaceId) return undefined;
+        const state = await fetchJson('dsh-agents/api/state', undefined, false, signal);
+        const team = (state?.teams ?? []).find(row => row?.id === teamId);
+        if (!team || team.workspaceId === workspaceId) return team ? workspaceId : undefined;
+        const draft = { id: team.id, name: team.name, workspaceId };
+        for (const key of ['description', 'leadPreset', 'order']) if (team[key] !== undefined) draft[key] = team[key];
+        await fetchJson('dsh-agents/api/team', { team: draft }, false, signal);
+        return workspaceId;
+      } catch { return undefined; }
+    }
+    // A host that installs the standalone @linxin666/dsh-agents plugin serves its
+    // own /api/run, whose body refuses any field it does not read. Only the bundled
+    // build records `purpose`, so retry once without it rather than failing the open.
+    async function mvRunDirectSession(agent, signal) {
+      const body = { teamId: agent.teamId, memberId: agent.agentId, purpose: 'direct' };
+      try {
+        return await fetchJson('dsh-agents/api/run', body, false, signal);
+      } catch (error) {
+        if (signal?.aborted || error?.status !== 400 || error?.code !== 'invalid-request') throw error;
+        const { purpose, ...compatible } = body;
+        return await fetchJson('dsh-agents/api/run', compatible, false, signal);
+      }
+    }
+    const mvAgentQuery = (path, agentKey) => path + '?' + new URLSearchParams({ agentKey });
+    const mvSessionId = row => row?.sessionId ?? row?.id;
+    const mvReadOnlyTask = task => task.id.startsWith('ticket:');
+    const mvTicketLabel = ticket => '#' + String(ticket.ticketNo ?? ticket.id).replace(/^#/, '');
+    const mvGuidanceLabel = ticket => ticket ? '汇总并同步指导至 ' + mvTicketLabel(ticket) : '汇总提交同步指导';
+    const mvTaskError = (error, fallback) => error?.message ? fallback + '：' + error.message : fallback;
+    const mvValidWorkspaceId = value => typeof value === 'string' && value.trim() && value.length <= 256 &&
+      !/[\u0000-\u001f\u007f]/.test(value);
+    async function mvReadTicketWorkspaces(signal) {
+      const { workspaces = [] } = await mvRead('task-rooms/workspaces', signal);
+      return workspaces.filter(ws => mvValidWorkspaceId(ws?.id) && !isPseudoAgentWorkspace(ws));
+    }
+
+    function mvService(ctx, name) {
+      try { return ctx?.get?.(name) ?? ctx?.[name]; } catch {
+        try { return ctx?.[name]; } catch { return undefined; }
+      }
+    }
+    function mvWaitForTasksTab(delay, signal) {
+      return new Promise(resolve => {
+        if (signal?.aborted) { resolve(); return; }
+        const stop = () => {
+          clearTimeout(timer);
+          signal?.removeEventListener('abort', stop);
+          resolve();
+        };
+        const timer = setTimeout(stop, delay);
+        signal?.addEventListener('abort', stop, { once: true });
+      });
+    }
+    async function mvOpenTasksTab(ctx, { sessionId, signal, isCurrent = () => true } = {}) {
+      for (const delay of [0, ...MV_TASK_TAB_RETRY_DELAYS]) {
+        if (signal?.aborted || !isCurrent()) return;
+        if (delay) await mvWaitForTasksTab(delay, signal);
+        if (signal?.aborted || !isCurrent()) return;
+        try {
+          const rightbar = mvService(ctx, 'sidebarRight');
+          // On the official host, openTab acts on the on-screen surface. A
+          // previous session can still be mounted after openSession resolves.
+          if (sessionId && typeof rightbar?.screen === 'function' && rightbar.screen()?.sessionId !== sessionId) continue;
+          if (typeof rightbar?.openTab === 'function' && await rightbar.openTab(MV_TASK_TAB) !== false) return;
+        } catch { /* The destination surface or tab registry may still be mounting. */ }
+      }
+      if (!signal?.aborted && isCurrent()) return MV_TASK_TAB_UNAVAILABLE;
+    }
+    function mvRegisterTasksTab(registry) {
+      return registry?.register?.({ id: MV_TASK_TAB_ID, kind: MV_TASK_TAB, title: () => '智能体任务',
+        priority: 'extension', keepMounted: true });
+    }
+    async function mvOpenAgentDirectSession({ agent, ctx, uiWorkspace, onOpenAgentDirect, sessionBridge,
+      openSessionRef, mvFocusedAgentStore, signal, sessionId, openDrawer }) {
+      try {
+        if (!agent?.agentKey || signal?.aborted) return;
+        try { await mvService(ctx, 'layout')?.selectPanel?.(null); } catch { /* still try native navigation */ }
+        if (signal?.aborted) return;
+        // createSessionBridge creates a synthetic marshal-view binding, not a
+        // resident DSH identity. Only use a bridge if it supplies a native opener.
+        const openSession = async id => {
+          for (const [owner, method] of [[sessionBridge, 'openSession'], [uiWorkspace, 'openSession'], [openSessionRef, 'current']]) {
+            if (signal?.aborted) return false;
+            try { if (typeof owner?.[method] === 'function' && await owner[method](id) !== false) return true; } catch {}
+          }
+          return false;
+        };
+        // Pin the agent's own Workspace first, so a session created below starts bound.
+        if (!sessionId) await mvEnsureAgentWorkspace(agent.teamId, agent.name, signal);
+        if (signal?.aborted) return;
+        const resolved = sessionId ?? (onOpenAgentDirect ? await onOpenAgentDirect(agent, signal) :
+          mvSessionId((await mvRead(mvAgentQuery('agent-direct-sessions', agent.agentKey), signal))?.mainSession));
+        const id = typeof resolved === 'string' ? resolved : resolved?.sessionId;
+        if (signal?.aborted) return;
+        if (typeof id !== 'string' || !id.trim()) return '暂无 1:1 直连会话。';
+        if (signal?.aborted) return;
+        if (!await openSession(id)) return signal?.aborted ? undefined : '宿主无法打开 1:1 直连会话。';
+        if (signal?.aborted) return;
+        mvFocusedAgentStore?.set({ ...agent, agentKey: resolved?.agentKey ?? agent.agentKey, navigationSessionId: id });
+        try {
+          if (openDrawer) return await openDrawer(ctx, id, signal);
+          if (mvService(ctx, 'sidebarRight')) return await mvOpenTasksTab(ctx, { sessionId: id, signal });
+        } catch {
+          if (!signal?.aborted) return MV_TASK_TAB_UNAVAILABLE;
+        }
+      } catch {
+        if (!signal?.aborted) return '无法打开 1:1 直连会话，请稍后重试。';
+      }
+    }
+
+    function mvTaskMutation(action, agentKey, fields, signal) {
+      if (action !== 'create' && mvReadOnlyTask(fields)) throw Error('关联工单是只读记录。');
+      return fetchJson('marshal/agent-tasks/' + action, { agentKey, ...fields }, true, signal);
+    }
+    function mvDirectLink({ agent, open, label = '1:1 直连' }) {
+      const [state, setState] = React.useState(null);
+      return h('span', { className: 'mv-scope mv-actions' },
+        h(MvButton, { icon: 'chat', label, disabled: state?.busy, onClick: async () => {
+          setState({ busy: true });
+          const message = await open(agent);
+          setState({ message });
+        } }),
+        state?.message && h('span', { className: 'mv-danger', role: 'status' }, state.message));
+    }
+    const mvRequiresGuidanceTarget = tasks => !tasks.length || tasks.some(task => task.type !== 'direct' || task.linkedTicketId);
+    const mvLinkedTicketIds = tasks => [...new Set(tasks.map(task => task.linkedTicketId).filter(Boolean))];
+    const MV_GUIDANCE_TICKET_CONFLICT = '请选择同一工单下的任务';
+    function mvSubmitGuidance({ agentKey, tasks, targetTicketId, guidanceText }, signal) {
+      const linked = mvLinkedTicketIds(tasks);
+      if (linked.length > 1 || (linked.length && targetTicketId && targetTicketId !== linked[0])) {
+        throw Error(MV_GUIDANCE_TICKET_CONFLICT);
+      }
+      const target = linked[0] ?? targetTicketId;
+      if (!target && mvRequiresGuidanceTarget(tasks)) {
+        throw Error('请选择目标工单，或改选直连任务。');
+      }
+      // The server resolves direct destinations from the stored tasks' sessionId.
+      return fetchJson('marshal/agents/guidance-sync', { agentKey, taskIds: tasks.map(task => task.id),
+        guidanceText: guidanceText.trim(), ...(target ? { targetTicketId: target, wakeTicket: true } : {}) }, true, signal);
+    }
+
+    function mvCreateAgentTasks() {
+      const lifetime = new AbortController();
+      const { signal } = lifetime;
+      const directory = createMvStore({ agents: [], marshalAgents: [], rosters: {}, loading: true });
+      const tickets = createMvStore({ items: [] });
+      const focus = createMvStore(null);
+      const modal = createMvStore(null);
+      const drawer = createMvStore(null);
+      const empty = { rows: [], selected: [], focusedId: '', loading: true };
+      const noAgent = createMvStore(empty);
+      const entries = new Map();
+      const stops = [];
+      const entryFor = key => {
+        if (!key) return { store: noAgent };
+        if (!entries.has(key)) entries.set(key, { store: createMvStore(empty), users: 0 });
+        return entries.get(key);
+      };
+      function refreshTasks(key) {
+        if (!key || signal.aborted) return;
+        const entry = entryFor(key);
+        if (entry.reading) { entry.pending = true; return entry.reading; }
+        const load = async () => {
+          do {
+            entry.pending = false;
+            try {
+              const result = await mvRead(mvAgentQuery('agent-tasks', key), signal);
+              if (signal.aborted) return;
+              const rows = result.tasks ?? [];
+              const ids = new Set(rows.map(task => task.id));
+              const previous = entry.store.getSnapshot();
+              entry.store.set({ rows, selected: previous.selected.filter(id => ids.has(id)),
+                focusedId: ids.has(previous.focusedId) ? previous.focusedId : '', loading: false });
+            } catch (error) {
+              if (!signal.aborted) entry.store.set({ ...entry.store.getSnapshot(), loading: false,
+                error: mvTaskError(error, '读取智能体任务失败') });
+            }
+          } while (entry.pending && !signal.aborted);
+        };
+        entry.reading = load().finally(() => { entry.reading = undefined; });
+        return entry.reading;
+      }
+      async function refreshDirectory() {
+        const [overview, rosterState, library] = await Promise.allSettled([
+          mvRead('desktop/overview', signal), mvRead('rosters/state', signal),
+          fetchJson('dsh-agents/api/state', undefined, false, signal),
+        ]);
+        if (signal.aborted) return;
+        const previous = directory.getSnapshot();
+        const agents = overview.value?.agents?.items ?? previous.agents;
+        const teams = library.value?.teams ?? [];
+        const marshalTeams = new Set(teams.filter(team => typeof team?.name === 'string' && isAgentTeam(team)).map(team => team.id));
+        directory.set({ agents, marshalAgents: agents.filter(row => marshalTeams.has(row.teamId)),
+          rosters: rosterState.value?.rosters ?? previous.rosters,
+          loading: false, error: [overview, library].some(result => result.status === 'rejected') ?
+            mvTaskError(overview.reason ?? library.reason, '读取智能体失败') : '' });
+      }
+      async function refreshTasksAndTickets() {
+        if (signal.aborted) return;
+        const refreshTickets = async () => {
+          try {
+            const result = await mvRead('tasks/state', signal);
+            if (!signal.aborted) tickets.set({ items: (result.tasks ?? []).filter(ticket => ticket.archivedAt == null) });
+          } catch (error) {
+            if (!signal.aborted) tickets.set({ ...tickets.getSnapshot(), error: mvTaskError(error, '读取工单失败') });
+          }
+        };
+        await Promise.all([
+          refreshTickets(),
+          ...[...entries].filter(([, entry]) => entry.users).map(([key]) => refreshTasks(key)),
+        ]);
+      }
+      function activate() {
+        if (stops.length || signal.aborted) return;
+        const listen = (topics, refresh) => {
+          try { stops.push(subscribeMarshalEvents(topics, refresh, { initial: true, debounceMs: 100 })); }
+          catch { stops.push(() => {}); void refresh(); }
+        };
+        // The shared dispatcher coalesces to the latest topic. Keep directory
+        // invalidations independent of high-frequency room messages.
+        listen(['ready', 'agents.changed'], refreshDirectory);
+        listen(['ready', 'room.message', 'tasks.changed', 'agents.changed'], refreshTasksAndTickets);
+      }
+      return { signal, directory, tickets, focus, drawer, modal, activate, refreshTasks,
+        tasks: key => entryFor(key).store,
+        setSelection(key, change) {
+          if (signal.aborted) return;
+          const { store } = entryFor(key);
+          const value = store.getSnapshot();
+          store.set({ ...value, ...change(value) });
+        },
+        retain(key) {
+          if (!key || signal.aborted) return;
+          const entry = entryFor(key);
+          if (entry.users++ === 0) void refreshTasks(key);
+          return () => { entry.users--; };
+        },
+        showModal(data) { if (!signal.aborted) { activate(); modal.set(data); } },
+        dispose() {
+          lifetime.abort();
+          for (const stop of stops.splice(0)) stop();
+          for (const store of [directory, tickets, focus, drawer, modal, noAgent, ...[...entries.values()].map(entry => entry.store)]) store.clear();
+          focus.set(null); drawer.set(null); modal.set(null);
+          entries.clear();
+        },
+      };
+    }
+
+    function mvUseTabInfo(props) {
+      // The host supplies one stable hook shape for the lifetime of the seat.
+      try { return props?.hooks?.tabInfo?.() || props?.useTabInfo?.(); } catch { return undefined; }
+    }
+    function mvUseSessionAgent(runtime, sessionId, allowFocused) {
+      const focus = useMvSnapshot(runtime.focus);
+      const { marshalAgents: agents, loading, error } = useMvSnapshot(runtime.directory);
+      const [found, setFound] = React.useState(null);
+      // A navigation target or overview match can identify the agent, but only
+      // the direct-sessions response can authorize binding a task to the session.
+      const visited = sessionId && focus?.navigationSessionId === sessionId ? focus : undefined;
+      const candidate = sessionId ? (visited ? agents.find(row => row.agentKey === visited.agentKey) ?? visited :
+        agents.find(row => row.sessionId === sessionId)) : undefined;
+      const matchForSession = found && found.sessionId === sessionId &&
+        (!candidate || found.agent.agentKey === candidate.agentKey) ? found.agent : undefined;
+      const verified = matchForSession && found.agents === agents;
+      const agent = candidate || (matchForSession && agents.find(row => row.agentKey === matchForSession.agentKey)) ||
+        (!sessionId && allowFocused ? focus : null);
+      React.useEffect(() => { runtime.activate(); }, [runtime]);
+      React.useEffect(() => {
+        if (!sessionId || verified || (!candidate && !agents.length) || runtime.signal.aborted) return;
+        const controller = new AbortController();
+        const { signal } = controller;
+        const abort = () => controller.abort();
+        runtime.signal.addEventListener('abort', abort, { once: true });
+        const candidates = candidate ? [candidate] : agents;
+        // Bound host lookups per batch when there is no overview candidate.
+        const resolve = async () => {
+          for (let i = 0; i < candidates.length && !signal.aborted; i += 4) {
+            const batch = candidates.slice(i, i + 4);
+            const results = await Promise.allSettled(batch.map(row => mvRead(mvAgentQuery('agent-direct-sessions', row.agentKey), signal)));
+            if (signal.aborted) return;
+            const match = batch.find((_, index) => {
+              const data = results[index].value;
+              return [data?.mainSession, ...(data?.subSessions ?? [])].some(row => mvSessionId(row) === sessionId);
+            });
+            if (match) {
+              setFound({ sessionId, agents, agent: match });
+              return;
+            }
+          }
+          if (!signal.aborted) setFound(null);
+        };
+        void resolve().finally(() => runtime.signal.removeEventListener('abort', abort));
+        return () => { runtime.signal.removeEventListener('abort', abort); abort(); };
+      }, [runtime, sessionId, agents, candidate, verified]);
+      return { agent, loading, error, focus, directSessionId: verified ? sessionId : undefined };
+    }
+    function mvUseAgentTasks(runtime, key) {
+      const state = useMvSnapshot(runtime.tasks(key));
+      React.useEffect(() => runtime.retain(key), [runtime, key]);
+      return state;
+    }
+    function mvSelection(state, tickets) {
+      const { selected, focusedId, rows } = state;
+      const tasks = rows.filter(row => selected.length ? selected.includes(row.id) : row.id === focusedId);
+      const targets = mvLinkedTicketIds(tasks);
+      const id = targets.length === 1 ? targets[0] : undefined;
+      return { tasks, ticket: id ? tickets.find(row => row.id === id) ?? { id } : undefined };
+    }
+    function mvTicketOptions(tickets) {
+      return tickets.map(ticket => h('option', { key: ticket.id, value: ticket.id }, mvTicketLabel(ticket) + ' · ' + (ticket.title ?? '工单')));
+    }
+    function mvStartVoice(voice, call, agent, ticket) {
+      if (call.status === 'idle') void voice.start(agent, { targetTicketId: ticket?.id, ticketNo: ticket?.ticketNo });
+      else voice.setExpanded(true);
+    }
+    const mvIsCalling = call => ['connecting', 'active', 'ending'].includes(call.status);
+    function mvGuidanceButton(runtime, agent, selection, dock = false) {
+      return h(MvButton, { icon: 'send', className: 'mv-guidance-action',
+        label: dock && !selection.ticket ? '同步指导' : mvGuidanceLabel(selection.ticket),
+        onClick: () => runtime.showModal({ agent, ...selection }) });
+    }
+
+    function mvAgentTasksRightbarTab(props) {
+      const { runtime, voiceLayer, idleVoice, navigation } = props;
+      const info = mvUseTabInfo(props);
+      const sessionId = info?.sessionId ?? info?.tab?.sessionId ?? props.sessionId;
+      const { agent, loading, error, focus, directSessionId } = mvUseSessionAgent(runtime, sessionId, true);
+      const voice = useMvSnapshot(voiceLayer);
+      const call = useMvSnapshot(voice ?? idleVoice);
+      const suggested = (mvIsCalling(call) ? call.agent : undefined) ?? focus;
+      if (!agent) return h('div', { className: 'mv-scope mv-task-pane mv-stack' },
+        h('p', { role: 'status' }, loading ? '正在读取智能体…' : '当前会话没有关联的智能体。'),
+        error && h('span', { className: 'mv-danger', role: 'status' }, error),
+        suggested && h(mvDirectLink, { agent: suggested, open: navigation.openAgent, label: '打开该智能体 1:1 会话' }));
+      return h(mvAgentTaskList, { key: agent.agentKey, agent, runtime, voiceLayer, idleVoice, navigation, directSessionId });
+    }
+    function mvAgentTaskList({ agent, runtime, voiceLayer, idleVoice, navigation, directSessionId }) {
+      const key = agent.agentKey;
+      const state = mvUseAgentTasks(runtime, key);
+      const { items: tickets, error: ticketError } = useMvSnapshot(runtime.tickets);
+      const voice = useMvSnapshot(voiceLayer);
+      const call = useMvSnapshot(voice ?? idleVoice);
+      const [filter, setFilter] = React.useState('');
+      const [type, setType] = React.useState('direct');
+      const [title, setTitle] = React.useState('');
+      const [ticketId, setTicketId] = React.useState('');
+      const [busy, setBusy] = React.useState(false);
+      const [error, setError] = React.useState('');
+      const [removeId, setRemoveId] = React.useState('');
+      const [ticketWorkspace, setTicketWorkspace] = React.useState(null);
+      const lock = React.useRef(false);
+      const selection = mvSelection(state, tickets);
+      const choose = change => runtime.setSelection(key, change);
+      const run = async work => {
+        if (lock.current) return;
+        lock.current = true; setBusy(true); setError('');
+        try { await work(); } catch (e) { if (!runtime.signal.aborted) setError(mvTaskError(e, '操作失败')); }
+        finally { lock.current = false; if (!runtime.signal.aborted) setBusy(false); }
+      };
+      const write = (action, fields, after) => run(async () => {
+        await mvTaskMutation(action, key, fields, runtime.signal);
+        if (runtime.signal.aborted) return;
+        after?.();
+        await runtime.refreshTasks(key);
+      });
+      const openTicket = (id, workspaceId) => run(async () => {
+        if (!workspaceId) setTicketWorkspace(null);
+        const card = tickets.find(row => row.id === id);
+        const options = await navigation.openTicket(id, card, agent, workspaceId);
+        if (!runtime.signal.aborted) setTicketWorkspace(options ? { id, card, options } : null);
+      });
+      const rows = state.rows.filter(task => !filter || task.status === filter);
+      return h('section', { className: 'mv-scope mv-task-pane mv-stack', 'aria-label': '智能体任务' },
+        h('header', { className: 'mv-stack' },
+          h(MvButton, { icon: 'chat', label: '自由闲聊（不绑定任务）', className: 'mv-casual-card',
+            'aria-pressed': !state.focusedId && !state.selected.length,
+            onClick: () => { choose(() => ({ focusedId: '', selected: [] })); setType('casual'); } }),
+          h('div', { className: 'mv-line' }, h(MvAvatar, { agent }),
+            h('div', { className: 'mv-copy' }, h('strong', null, agent.name),
+              h('div', { className: 'mv-muted' }, state.rows.find(row => row.id === state.focusedId)?.title ?? '自由闲聊')),
+            voice && h(MvButton, { icon: 'phone', iconOnly: true, label: '语音通话', onClick: () => mvStartVoice(voice, call, agent, selection.ticket) })),
+          mvGuidanceButton(runtime, agent, selection),
+          !directSessionId && h('div', { className: 'mv-stack' },
+            h('span', { className: 'mv-muted', role: 'status' }, '当前会话非 1:1 直连会话。新建直连任务将归入该智能体的主会话。'),
+            h(mvDirectLink, { agent, open: navigation.openAgent, label: '打开该智能体 1:1 会话' })),
+          h('form', { className: 'mv-stack', onSubmit: event => {
+            event.preventDefault();
+            if (!title.trim() || (type === 'ticket' && !ticketId)) return;
+            return write('create', { type, title: title.trim(), ...(type === 'ticket' ? { linkedTicketId: ticketId } : {}),
+              ...(directSessionId && type === 'direct' ? { sessionId: directSessionId } : {}) }, () => setTitle(''));
+          } },
+          h('input', { className: 'mv-field', 'aria-label': '新任务标题', placeholder: '新任务标题', value: title,
+            maxLength: 512, required: true, onChange: event => setTitle(event.target.value) }),
+          h('div', { className: 'mv-actions' },
+            h('select', { className: 'mv-field mv-compact-field', 'aria-label': '新任务类型', value: type, onChange: event => setType(event.target.value) },
+              Object.entries(mvTaskTypes).map(([value, label]) => h('option', { key: value, value }, label))),
+            h(MvButton, { type: 'submit', label: '新建 1:1 任务', disabled: busy || !title.trim() || (type === 'ticket' && !ticketId) })),
+          type === 'ticket' && h('select', { className: 'mv-field', 'aria-label': '关联工单', required: true, value: ticketId,
+            onChange: event => setTicketId(event.target.value) }, h('option', { value: '' }, '请选择关联工单'), mvTicketOptions(tickets)),
+          type === 'ticket' && ticketError && h('span', { className: 'mv-danger', role: 'status' }, ticketError))),
+        h('div', { className: 'mv-stack' },
+          h('div', { className: 'mv-actions', role: 'group', 'aria-label': '任务状态筛选' },
+            ['', 'running', 'review', 'done'].map(value => h(MvButton, { key: value, className: 'mv-chip',
+              label: mvTaskStatuses[value] ?? '全部', 'aria-pressed': filter === value, onClick: () => setFilter(value) }))),
+          (error || state.error) && h('div', { className: 'mv-line mv-danger', role: 'status' }, error || state.error,
+            state.error && h(MvButton, { icon: 'refresh', label: '重试', onClick: () => runtime.refreshTasks(key) })),
+          ticketWorkspace && h('label', { className: 'mv-stack' },
+            '为 ' + mvTicketLabel(ticketWorkspace.card ?? ticketWorkspace) + ' 选择工单工作区',
+            h('select', { className: 'mv-field', 'aria-label': '选择目标工单工作区', value: '', disabled: busy,
+              onChange: event => {
+                const workspaceId = event.target.value;
+                if (ticketWorkspace.options.some(ws => ws.id === workspaceId)) return openTicket(ticketWorkspace.id, workspaceId);
+              },
+            }, h('option', { value: '' }, '请选择工作区'),
+            ticketWorkspace.options.map(ws => h('option', { key: ws.id, value: ws.id }, ws.title || ws.name || ws.id))))),
+        h('div', { className: 'mv-stack mv-task-scroll' },
+          state.loading ? h('p', { className: 'mv-muted', role: 'status' }, '正在读取任务…') :
+          !rows.length ? h('p', { className: 'mv-muted' }, '暂无符合条件的任务') : rows.map(task => {
+            const readOnly = mvReadOnlyTask(task);
+            const active = state.focusedId === task.id;
+            const picked = state.selected.includes(task.id);
+            const ticket = task.linkedTicketId && (tickets.find(row => row.id === task.linkedTicketId) ?? { id: task.linkedTicketId });
+            const ticketButton = ticket && h(MvButton, { icon: 'room', label: '打开工单群 ' + mvTicketLabel(ticket), onClick: () => openTicket(ticket.id) });
+            return h('article', { key: task.id, className: 'mv-stack mv-task-item', 'data-focused': active },
+              h('div', { className: 'mv-line' }, h('input', { type: 'checkbox', checked: picked,
+                disabled: !picked && state.selected.length >= 32, 'aria-label': '选入同步指导：' + task.title,
+                onChange: () => choose(prev => ({ selected: picked ? prev.selected.filter(id => id !== task.id) : [...prev.selected, task.id] })) }),
+                readOnly ? h('strong', { className: 'mv-copy' }, task.title) : h(MvButton, { className: 'mv-row mv-copy', label: task.title,
+                  'aria-pressed': active, onClick: () => choose(() => ({ focusedId: active ? '' : task.id, selected: [] })) }),
+                h('span', { className: 'mv-model' }, mvTaskStatuses[task.status] ?? task.status)),
+              h('span', { className: 'mv-muted' }, mvTaskTypes[task.type], ticket && !readOnly ? ' · 状态跟随工单' : '',
+                task.lastSyncAt ? ' · 已同步指导' : ''),
+              readOnly ? ticketButton : h('details', null, h('summary', null, '任务详情'),
+                h('div', { className: 'mv-stack' },
+                  task.subSessions?.map(sub => h(MvButton, { key: sub.id, icon: 'chat', label: sub.title || sub.role || sub.id,
+                    onClick: () => run(() => navigation.openSubSession(agent, sub.id, task.id)) })),
+                  ticketButton,
+                  h('div', { className: 'mv-actions' },
+                    !ticket && h('select', { className: 'mv-field mv-compact-field', 'aria-label': '任务状态：' + task.title,
+                      value: task.status, disabled: busy, onChange: event => write('update', { id: task.id, patch: { status: event.target.value } }) },
+                      Object.entries(mvTaskStatuses).map(([value, label]) => h('option', { key: value, value }, label))),
+                    h(MvButton, { className: 'mv-danger', label: removeId === task.id ? '确认删除' : '删除任务', disabled: busy,
+                      onClick: () => removeId === task.id ? write('delete', { id: task.id }, () => setRemoveId('')) : setRemoveId(task.id) }),
+                    removeId === task.id && h(MvButton, { label: '取消', onClick: () => setRemoveId('') })))));
+          })),
+        h('footer', { className: 'mv-actions' }, h('span', { className: 'mv-muted' }, '已选 ' + selection.tasks.length + ' 项'),
+          mvGuidanceButton(runtime, agent, selection)));
+    }
+
+    function mvAgentComposerDockBar({ runtime, voiceLayer, idleVoice, navigation, sessionId }) {
+      const { agent: owner } = mvUseSessionAgent(runtime, sessionId, false);
+      const voice = useMvSnapshot(voiceLayer);
+      const call = useMvSnapshot(voice ?? idleVoice);
+      const pendingDrawer = useMvSnapshot(runtime.drawer);
+      const [drawerError, setDrawerError] = React.useState(null);
+      const calling = mvIsCalling(call);
+      const agent = owner ?? (calling ? call.agent : undefined);
+      const state = mvUseAgentTasks(runtime, agent?.agentKey);
+      const { items: tickets } = useMvSnapshot(runtime.tickets);
+      const selection = mvSelection(state, tickets);
+      const pending = state.rows.filter(row => row.status !== 'done').length;
+      React.useEffect(() => {
+        if (!sessionId || sessionId !== pendingDrawer) return;
+        const controller = new AbortController();
+        const isCurrent = () => !runtime.signal.aborted && runtime.drawer.getSnapshot() === sessionId;
+        setDrawerError(null);
+        // For hosts without a screen query, wait for the destination Composer
+        // to commit before trying to open the tab on its surface.
+        const id = setTimeout(async () => {
+          const message = await navigation.openDrawer({ sessionId, signal: controller.signal, isCurrent });
+          if (!controller.signal.aborted && isCurrent()) {
+            if (message) setDrawerError({ sessionId, message });
+            runtime.drawer.set(null);
+          }
+        }, 0);
+        return () => { clearTimeout(id); controller.abort(); };
+      }, [sessionId, pendingDrawer, runtime, navigation]);
+      if (!agent) return null;
+      return h('div', { className: 'mv-scope mv-actions mv-composer-dock', 'aria-label': '智能体会话快捷操作' },
+        h(MvIcon, { name: 'agent' }), h('strong', { className: 'mv-truncate' }, agent.name),
+        h(MvButton, { icon: 'room', 'aria-label': '任务清单 · ' + pending + ' 待处理',
+          onClick: async () => {
+            if (owner) { runtime.drawer.set(sessionId); return; }
+            const message = await navigation.openAgent(agent);
+            if (message && !runtime.signal.aborted) setDrawerError({ sessionId, message });
+          } },
+          '任务清单', h('span', { className: 'mv-model' }, pending)),
+        mvGuidanceButton(runtime, agent, selection, true),
+        voice && h(MvButton, { icon: 'phone', iconOnly: true, label: calling ? '查看语音通话' : '语音通话',
+          onClick: () => mvStartVoice(voice, call, agent, selection.ticket) }),
+        h('span', { className: 'mv-muted' }, 'SenseVoice 听写仍在输入框'),
+        drawerError && drawerError.sessionId === sessionId && h('span', { className: 'mv-danger', role: 'status' }, drawerError.message));
+    }
+
+    function mvSyncGuidanceModal({ runtime, data }) {
+      const { agent, tasks = [], ticket, onSuccess } = data;
+      const { items, error: ticketError } = useMvSnapshot(runtime.tickets);
+      const { agents, rosters } = useMvSnapshot(runtime.directory);
+      const linked = mvLinkedTicketIds(tasks);
+      const boundTarget = linked[0];
+      const conflict = linked.length > 1;
+      const [chosenTarget, setTarget] = React.useState('');
+      const target = conflict ? '' : boundTarget ?? chosenTarget;
+      const [guidance, setGuidance] = React.useState(() => (data.guidanceText ?? tasks.map(task => task.lastSummary).filter(Boolean).join('\n\n')).slice(0, 3000));
+      const [instructions, setInstructions] = React.useState({});
+      const [busy, setBusy] = React.useState(false);
+      const [status, setStatus] = React.useState(null);
+      const [workspaceResult, setWorkspaceResult] = React.useState(null);
+      const [chosenWorkspace, setChosenWorkspace] = React.useState('');
+      const dialogRef = React.useRef(null);
+      const lock = React.useRef(false);
+      const currentTicket = target ? items.find(row => row.id === target) ?? (target === ticket?.id ? ticket : { id: target }) : undefined;
+      const ticketOptions = boundTarget ? (currentTicket ? [currentTicket] : []) : items;
+      const needsRoom = Boolean(target) && !Boolean(currentTicket?.taskRoom?.id || currentTicket?.workflow?.workspaceId || currentTicket?.workspaceId);
+      const agentWorkspace = mvValidWorkspaceId(agent?.workspaceId) ? agent.workspaceId : undefined;
+      const lookupTarget = needsRoom && !agentWorkspace ? target : '';
+      const workspaceLookup = lookupTarget && workspaceResult?.target === lookupTarget ? workspaceResult : null;
+      const workspaceOptions = workspaceLookup?.options;
+      const roomWorkspaceId = agentWorkspace ?? (workspaceOptions?.length === 1 ? workspaceOptions[0].id :
+        workspaceOptions?.find(ws => ws.id === chosenWorkspace)?.id);
+      const workspaceId = currentTicket?.workflow?.workspaceId ?? currentTicket?.taskRoom?.workspaceId ?? currentTicket?.workspaceId ?? roomWorkspaceId;
+      const roster = rosters[workspaceId];
+      const rosterKeys = [roster?.leaderId, roster?.coderId, roster?.reviewerId, ...(roster?.members ?? []),
+        ...Object.values(currentTicket?.workflow?.plan?.members ?? {})];
+      const names = [...new Set([agent.name, ...agents.filter(row => (workspaceId && row.workspaceId === workspaceId) ||
+        rosterKeys.some(key => typeof key === 'string' && (row.agentKey === key || row.agentKey.endsWith('/' + key)))).map(row => row.name)].filter(Boolean))];
+      const requiresTarget = mvRequiresGuidanceTarget(tasks);
+      // The endpoint accepts text, so send @member instructions as explicit lines.
+      const text = [guidance.trim(), ...Object.entries(instructions).filter(([, value]) => value.trim())
+        .map(([name, value]) => '@' + name + ' ' + value.trim())].filter(Boolean).join('\n\n');
+      const close = () => { if (!lock.current) runtime.modal.set(null); };
+      React.useEffect(() => {
+        const dialog = dialogRef.current;
+        try { dialog?.showModal?.(); } catch {}
+        return () => { if (dialog?.open) dialog.close(); };
+      }, []);
+      React.useEffect(() => {
+        if (!lookupTarget || runtime.signal.aborted) return;
+        let active = true;
+        setWorkspaceResult(null);
+        void mvReadTicketWorkspaces(runtime.signal).then(options => {
+          if (active && !runtime.signal.aborted) setWorkspaceResult({ target: lookupTarget, options });
+        }, error => {
+          if (active && !runtime.signal.aborted) setWorkspaceResult({ target: lookupTarget, error: mvTaskError(error, '读取工单工作区失败') });
+        });
+        return () => { active = false; };
+      }, [lookupTarget, runtime.signal]);
+      const cannotSubmit = conflict || !text || text.length > 3000 || (!target && requiresTarget) || (needsRoom && !roomWorkspaceId);
+      const submit = async event => {
+        event.preventDefault();
+        if (lock.current || status?.ok || cannotSubmit) return;
+        // Keep the confirmed task IDs, but reject a link change observed while
+        // the dialog was open rather than applying its old target to those IDs.
+        const currentRows = runtime.tasks(agent.agentKey).getSnapshot().rows;
+        const currentById = new Map(currentRows.map(task => [task.id, task]));
+        if (tasks.some(task => currentById.has(task.id) &&
+          (currentById.get(task.id).linkedTicketId || '') !== (task.linkedTicketId || ''))) {
+          setStatus({ text: '任务关联已变更，请关闭弹窗后重新选择。' });
+          return;
+        }
+        lock.current = true; setBusy(true); setStatus(null);
+        let openingRoom = needsRoom;
+        try {
+          if (openingRoom) {
+            const result = await fetchJson('marshal/task-rooms/open', { taskId: target, workspaceId: roomWorkspaceId }, true, runtime.signal);
+            if (runtime.signal.aborted) return;
+            if (!result?.room?.id) throw Error('未确认工单群已绑定。');
+            openingRoom = false;
+          }
+          await mvSubmitGuidance({ agentKey: agent.agentKey, tasks, targetTicketId: target, guidanceText: text }, runtime.signal);
+          if (runtime.signal.aborted) return;
+          setStatus({ ok: true, text: target ? '已同步指导至 ' + mvTicketLabel(currentTicket) + '，已唤醒工单。' :
+            '已同步指导至 1:1 直连会话。' });
+          onSuccess?.();
+          void runtime.refreshTasks(agent.agentKey);
+        } catch (error) {
+          if (!runtime.signal.aborted) setStatus({ text: openingRoom ? mvTaskError(error, '打开目标工单群失败') :
+            error?.code === 'direct-session-not-found' ? '请先建立智能体的 1:1 直连会话。' : mvTaskError(error, '未确认同步，请先核对目标会话') });
+        } finally { lock.current = false; if (!runtime.signal.aborted) setBusy(false); }
+      };
+      return h('dialog', { ref: dialogRef, className: 'mv-scope mv-dialog mv-guidance-dialog', 'aria-labelledby': 'mv-guidance-title',
+        onCancel: event => { event.preventDefault(); close(); } },
+        h('form', { className: 'mv-stack', onSubmit: submit },
+          h('div', { className: 'mv-line' }, h('h2', { id: 'mv-guidance-title', className: 'mv-copy mv-voice-title' }, mvGuidanceLabel(currentTicket)),
+            h(MvButton, { icon: 'close', iconOnly: true, label: '关闭同步指导', disabled: busy, onClick: close })),
+          h('span', { className: 'mv-muted' }, '智能体：' + agent.name),
+          h('div', { className: 'mv-actions' }, tasks.map(task => h('span', { key: task.id, className: 'mv-model' }, task.title)),
+            !tasks.length && h('span', { className: 'mv-muted' }, '未绑定任务')),
+          h('label', { className: 'mv-stack' }, '同步目标',
+            h('select', { className: 'mv-field', value: target, required: requiresTarget, disabled: busy || status?.ok || Boolean(boundTarget),
+              onChange: event => { setTarget(event.target.value); setChosenWorkspace(''); setInstructions({}); setStatus(null); } },
+              h('option', { value: '' }, requiresTarget ? '请选择目标工单' : '智能体 1:1 直连会话'), mvTicketOptions(ticketOptions))),
+          conflict ? h('p', { className: 'mv-danger', role: 'alert' }, MV_GUIDANCE_TICKET_CONFLICT) :
+            !target && requiresTarget && h('p', { className: 'mv-muted' }, '请先选择工单，或返回任务清单改选直连任务。'),
+          lookupTarget && (workspaceLookup?.error ? h('p', { className: 'mv-danger', role: 'alert' }, workspaceLookup.error) :
+            !workspaceOptions ? h('p', { className: 'mv-muted', role: 'status' }, '正在读取工单工作区…') :
+            !workspaceOptions.length ? h('p', { className: 'mv-danger', role: 'alert' }, '没有可用的工单工作区。') :
+            workspaceOptions.length > 1 && h('label', { className: 'mv-stack' }, '工单群工作区',
+              h('select', { className: 'mv-field', 'aria-label': '选择目标工单工作区', value: roomWorkspaceId ?? '',
+                disabled: busy || status?.ok, onChange: event => { setChosenWorkspace(event.target.value); setStatus(null); } },
+                h('option', { value: '' }, '请选择工单群工作区'),
+                workspaceOptions.map(ws => h('option', { key: ws.id, value: ws.id }, ws.title || ws.name || ws.id))),
+              !roomWorkspaceId && h('span', { className: 'mv-muted' }, '请先选择工单群工作区，再确认同步指导。'))),
+          ticketError && h('span', { className: 'mv-muted', role: 'status' }, ticketError),
+          h('label', { className: 'mv-stack' }, '决策要点', h('textarea', { className: 'mv-field', rows: 4, value: guidance,
+            disabled: busy || status?.ok, maxLength: 3000, onChange: event => setGuidance(event.target.value) })),
+          h('div', { className: 'mv-actions', role: 'group', 'aria-label': '@成员指令' }, names.map(name => h(MvButton, {
+            key: name, label: '@' + name, className: 'mv-chip', disabled: busy || status?.ok, 'aria-pressed': Object.hasOwn(instructions, name),
+            onClick: () => setInstructions(prev => { const next = { ...prev }; if (Object.hasOwn(next, name)) delete next[name]; else return { ...next, [name]: '' }; return next; }),
+          }))),
+          Object.entries(instructions).map(([name, value]) => h('label', { key: name, className: 'mv-stack' }, '@' + name + ' 的指令',
+            h('input', { className: 'mv-field', value, maxLength: 512, disabled: busy || status?.ok,
+              onChange: event => setInstructions(prev => ({ ...prev, [name]: event.target.value })) }))),
+          text.length > 3000 && h('span', { className: 'mv-danger', role: 'status' }, '决策要点和成员指令合计不能超过 3000 字。'),
+          status && h('div', { className: status.ok ? 'mv-online' : 'mv-danger', role: 'status' }, status.text),
+          h('div', { className: 'mv-actions' }, status?.ok ? h(MvButton, { label: '完成', onClick: close }) :
+            h(MvButton, { type: 'submit', icon: 'send', className: 'mv-guidance-action', label: busy ? '正在同步…' : '确认同步指导',
+              disabled: busy || cannotSubmit }))));
+    }
+    function AgentDirectChatsView({ openSession, mvOpenDirect, onOpenAgents, initialAgentId = '' }) {
       const [library, setLibrary] = React.useState(null);
       const [sessions, setSessions] = React.useState([]);
       const [selectedAgentId, setSelectedAgentId] = React.useState(initialAgentId || 'all');
@@ -823,6 +3594,8 @@ window.__ModuleLoader__.load({
         setBusy(true);
         setError('');
         try {
+          // Pin the agent's own Workspace first: an unbound session makes the composer ask.
+          await mvEnsureAgentWorkspace(agent.squadId, agent.name);
           const data = await fetchJson('dsh-agents/api/run', { teamId: agent.squadId, memberId: agent.id });
           const sessionId = data?.run?.sessionId;
           if (!sessionId) throw new Error('未能创建会话');
@@ -853,6 +3626,7 @@ window.__ModuleLoader__.load({
           h('div', { style: { padding: '12px 16px', borderBottom: '1px solid ' + dswTheme.border, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
             h('div', { style: { fontSize: 14, fontWeight: 600 } }, selectedAgent ? selectedAgent.name + ' · 闲聊历史' : '全部智能体单聊历史'),
             h('input', { value: search, onChange: event => setSearch(event.target.value), placeholder: '搜索历史会话标题或智能体…', style: { ...uiInput, width: 220, marginLeft: 'auto' } }),
+            selectedAgent && mvOpenDirect && h(mvDirectLink, { key: selectedAgent.id, agent: selectedAgent, open: mvOpenDirect }),
             selectedAgent && h('button', { type: 'button', disabled: busy, style: uiButton(true), onClick: () => { void startNewChat(selectedAgent); } }, busy ? '创建中…' : '＋ 新建闲聊'),
             h('button', { type: 'button', style: uiButton(false), onClick: () => { void load(); } }, '刷新')),
           error && h('div', { style: { padding: '8px 16px', color: dswTheme.danger, fontSize: 12 } }, error),
@@ -897,8 +3671,102 @@ window.__ModuleLoader__.load({
                   h('button', { type: 'button', style: { ...uiButton(false), padding: '5px 10px', fontSize: 11 }, onClick: () => openSession && openSession(item.sessionId) }, '打开')))))));
     }
 
+    function pairingErrorText(code, status) {
+      if (code === 'account-required') return '请先在 DeepSeek Harness 中登录账号后再生成配对码。';
+      if (code === 'account-mismatch') return '当前 DSH 账号与云端 Hub 不匹配，请核对登录账号。';
+      if (code === 'rate-limited') return '配对码申请过于频繁，请稍后再试。';
+      if (code === 'hub-not-configured') return '当前为本机独立模式，未配置云端 Hub。';
+      if (status === 404) return '本机插件尚未加载手机配对接口，请重启一次 DSH Desktop 后重试。';
+      return '暂时无法从云端 Hub 获取手机配对码，请检查 Hub 连接后重试。';
+    }
+
     function DeviceStatusDrawer({ open, onClose, status, onRefresh, onOpenRemote }) {
       const [copied, setCopied] = React.useState(false);
+      const [pairOpen, setPairOpen] = React.useState(false);
+      const [pairBusy, setPairBusy] = React.useState(false);
+      const [pairError, setPairError] = React.useState('');
+      const [pairing, setPairing] = React.useState(null);
+      const [pairLeft, setPairLeft] = React.useState(0);
+      const [pairCopied, setPairCopied] = React.useState(false);
+      const pairAbort = React.useRef(null);
+      const pairTimers = React.useRef({ tick: null, rotate: null });
+      const pairCodeRef = React.useRef('');
+
+      const clearPairTimers = () => {
+        if (pairTimers.current.tick) { clearTimeout(pairTimers.current.tick); pairTimers.current.tick = null; }
+        if (pairTimers.current.rotate) { clearTimeout(pairTimers.current.rotate); pairTimers.current.rotate = null; }
+      };
+
+      const stopPairing = () => {
+        clearPairTimers();
+        pairAbort.current?.abort();
+        pairAbort.current = null;
+        pairCodeRef.current = '';
+        setPairOpen(false);
+        setPairBusy(false);
+        setPairError('');
+        setPairing(null);
+        setPairLeft(0);
+      };
+
+      const requestPairing = async replaceCode => {
+        clearPairTimers();
+        pairAbort.current?.abort();
+        const ctrl = new AbortController();
+        pairAbort.current = ctrl;
+        setPairOpen(true);
+        setPairBusy(true);
+        setPairError('');
+        try {
+          const response = await fetch(new URL('marshal/account/pairing', document.baseURI), {
+            method: 'POST',
+            credentials: 'same-origin',
+            signal: ctrl.signal,
+            headers: { 'content-type': 'application/json', 'x-marshal-account': '1' },
+            body: JSON.stringify(replaceCode ? { replace: replaceCode } : {}),
+          });
+          const data = await response.json().catch(() => ({}));
+          if (ctrl.signal.aborted) return;
+          if (!response.ok || !data?.ok || typeof data.svg !== 'string' || !data.svg.trim().startsWith('<svg') || typeof data.url !== 'string' || !data.url.startsWith('marshal://pair?') || typeof data.expiresAt !== 'number') {
+            setPairError(pairingErrorText(data?.code, response.status));
+            setPairBusy(false);
+            return;
+          }
+          pairCodeRef.current = data.code || '';
+          setPairing({
+            code: data.code || '',
+            url: data.url,
+            expiresAt: data.expiresAt,
+            imgSrc: 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(data.svg),
+          });
+          setPairBusy(false);
+          const scheduleTick = () => {
+            if (ctrl.signal.aborted) return;
+            const left = Math.max(0, Math.round((data.expiresAt - Date.now()) / 1000));
+            setPairLeft(left);
+            if (left > 0) pairTimers.current.tick = setTimeout(scheduleTick, 1000);
+          };
+          scheduleTick();
+          const rotateDelay = Math.max(1000, data.expiresAt - Date.now() - 5000);
+          pairTimers.current.rotate = setTimeout(() => {
+            if (!ctrl.signal.aborted) void requestPairing(data.code || '');
+          }, rotateDelay);
+        } catch (error) {
+          if (ctrl.signal.aborted) return;
+          setPairError(pairingErrorText(error?.code));
+          setPairBusy(false);
+        }
+      };
+
+      React.useEffect(() => {
+        if (!open) stopPairing();
+        return () => {
+          clearPairTimers();
+          pairAbort.current?.abort();
+          pairAbort.current = null;
+        };
+      }, [open]);
+
       if (!open) return null;
       const devices = Array.isArray(status?.devices) ? status.devices : [];
       const onlineCount = devices.filter(d => d && d.online !== false).length;
@@ -906,13 +3774,17 @@ window.__ModuleLoader__.load({
         if (!status?.dashboardUrl) return;
         try { navigator.clipboard?.writeText(status.dashboardUrl); setCopied(true); setTimeout(() => setCopied(false), 1800); } catch {}
       };
+      const copyPairUrl = () => {
+        if (!pairing?.url) return;
+        try { navigator.clipboard?.writeText(pairing.url); setPairCopied(true); setTimeout(() => setPairCopied(false), 1800); } catch {}
+      };
       return h('div', {
         style: { position: 'fixed', inset: 0, zIndex: 40, background: 'rgba(0,0,0,.35)', display: 'flex', justifyContent: 'flex-end' },
         onClick: onClose,
       },
         h('aside', {
           'aria-label': '设备与手机状态',
-          style: { width: 360, maxWidth: '92vw', height: '100%', background: 'var(--dsw-alias-bg-base, #14161a)', color: dswTheme.text, borderLeft: '1px solid ' + dswTheme.border2, display: 'flex', flexDirection: 'column', boxShadow: '-8px 0 28px rgba(0,0,0,.28)' },
+          style: { width: 380, maxWidth: '92vw', height: '100%', background: 'var(--dsw-alias-bg-base, #14161a)', color: dswTheme.text, borderLeft: '1px solid ' + dswTheme.border2, display: 'flex', flexDirection: 'column', boxShadow: '-8px 0 28px rgba(0,0,0,.28)' },
           onClick: event => event.stopPropagation(),
         },
           h('div', { style: { padding: '14px 18px', borderBottom: '1px solid ' + dswTheme.border, display: 'flex', alignItems: 'center', justifyContent: 'space-between' } },
@@ -925,6 +3797,25 @@ window.__ModuleLoader__.load({
                 status?.hubOnline ? 'Hub 已在线连接' : status?.hubConfigured ? 'Hub 连接中断' : '本机独立模式（未配置 Hub）'),
               status?.deviceId && h('div', { style: { fontSize: 11, color: dswTheme.dim } }, '本机标识：' + status.deviceId),
               status?.error && h('div', { style: { fontSize: 11, color: dswTheme.danger } }, status.error)),
+            h('div', { style: { padding: 12, borderRadius: 10, border: '1px solid ' + dswTheme.border, background: dswTheme.layer, display: 'grid', gap: 10 } },
+              h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 } },
+                h('div', { style: { fontSize: 12, fontWeight: 600 } }, '手机 App 扫码配对'),
+                pairOpen
+                  ? h('button', { type: 'button', style: uiButton(false), onClick: stopPairing }, '收起')
+                  : h('button', { type: 'button', style: uiButton(true), disabled: pairBusy, onClick: () => void requestPairing() }, '显示配对二维码')),
+              !pairOpen && h('div', { style: { fontSize: 11, color: dswTheme.dim, lineHeight: 1.5 } },
+                '打开手机 Marshal App，点击「扫码连接」直接扫描此处二维码。60 秒一次性配对码，到期前自动更换。'),
+              pairOpen && h('div', { style: { display: 'grid', gap: 10, justifyItems: 'center', textAlign: 'center' } },
+                pairError && h('div', { role: 'alert', style: { fontSize: 11, color: dswTheme.danger, width: '100%', textAlign: 'left' } }, pairError),
+                pairing?.imgSrc && h('div', { style: { background: '#ffffff', padding: 12, borderRadius: 12, display: 'inline-flex', boxShadow: '0 2px 10px rgba(0,0,0,.18)' } },
+                  h('img', { src: pairing.imgSrc, alt: '手机配对二维码', width: 220, height: 220, style: { display: 'block', width: 220, height: 220 } })),
+                h('div', { role: 'status', style: { fontSize: 11, color: dswTheme.dim } },
+                  pairBusy ? '正在向云端 Hub 领取配对码…'
+                    : pairing ? (pairLeft > 0 ? '剩余 ' + pairLeft + ' 秒，到期前 5 秒自动更换' : '正在自动更换新配对码…')
+                      : '点击下方按钮重新生成配对码'),
+                h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'center' } },
+                  h('button', { type: 'button', style: uiButton(false), disabled: pairBusy, onClick: () => void requestPairing(pairCodeRef.current) }, '立即换码'),
+                  pairing?.url && h('button', { type: 'button', style: uiButton(false), onClick: copyPairUrl }, pairCopied ? '已复制配对链接' : '复制配对链接')))),
             h('div', { style: { display: 'grid', gap: 8 } },
               h('div', { style: { fontSize: 12, fontWeight: 600, color: dswTheme.dim } }, '在线设备（' + onlineCount + ' / ' + devices.length + '）'),
               devices.length === 0
@@ -935,11 +3826,11 @@ window.__ModuleLoader__.load({
                     h('div', { style: { fontSize: 11, color: dswTheme.faint } }, [dev.deviceId || dev.id, dev.platform].filter(Boolean).join(' · '))),
                   h('span', { style: { fontSize: 11, color: dev.online === false ? dswTheme.faint : '#10b981' } }, dev.online === false ? '离线' : '● 在线')))),
             status?.dashboardUrl && h('div', { style: { padding: 12, borderRadius: 10, border: '1px solid ' + dswTheme.border, background: dswTheme.layer, display: 'grid', gap: 8 } },
-              h('div', { style: { fontSize: 12, fontWeight: 600 } }, '手机 / 浏览器控制入口'),
+              h('div', { style: { fontSize: 12, fontWeight: 600 } }, '云端 Hub 地址'),
               h('div', { style: { fontSize: 11, color: dswTheme.dim, wordBreak: 'break-all' } }, status.dashboardUrl),
+              h('div', { style: { fontSize: 11, color: dswTheme.faint } }, 'DSH 账号模式下请直接用上方二维码配对手机，或点击下方「打开远端设备会话」在插件内自动免密登录。'),
               h('div', { style: { display: 'flex', gap: 8 } },
-                h('button', { type: 'button', style: uiButton(false), onClick: copyUrl }, copied ? '已复制链接' : '复制地址'),
-                h('a', { href: status.dashboardUrl, target: '_blank', rel: 'noreferrer', style: { ...uiButton(false), textDecoration: 'none', display: 'inline-flex', alignItems: 'center' } }, '浏览器打开'))),
+                h('button', { type: 'button', style: uiButton(false), onClick: copyUrl }, copied ? '已复制链接' : '复制地址'))),
             h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
               h('button', { type: 'button', style: uiButton(true), onClick: () => { onClose(); onOpenRemote(); } }, '打开远端设备会话 →'),
               h('button', { type: 'button', style: uiButton(false), onClick: onRefresh }, '重新连接')))));
@@ -960,7 +3851,8 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function MarshalPanel({ marshalContext, openSession, openPanel, workspaceService, SessionProvider, renderSlot }) {
+    function MarshalPanel({ marshalContext, openSession, openPanel, mvOpenDirect, mvStartVoice, closeMemorySidebar, SessionProvider, renderSlot }) {
+      React.useEffect(ensureMarshalVnextStyles, []);
       const [attempt, retry] = React.useState(0);
       const initialNav = React.useMemo(() => {
         if (pendingTab) {
@@ -968,35 +3860,29 @@ window.__ModuleLoader__.load({
           pendingTab = null;
           return resolved;
         }
-        try {
-          const saved = globalThis.localStorage?.getItem(ACTIVE_TAB_STORAGE_KEY);
-          if (saved && ['tasks', 'chats', 'agents', 'memory'].includes(saved)) return { tab: saved };
-        } catch {}
         return { tab: 'tasks' };
       }, []);
       const [tab, setTab] = React.useState(initialNav.tab);
-      const [chatSection, setChatSection] = React.useState(initialNav.chatSection || 'groups');
+      const [chatSection, setChatSection] = React.useState(initialNav.chatSection || '');
       const [groupSub, setGroupSub] = React.useState(initialNav.groupSub || 'local');
       const [agentSub, setAgentSub] = React.useState(initialNav.agentSub || 'pool');
       const [memoryTarget, setMemoryTarget] = React.useState({ agentId: '', layer: '' });
       const [roomTask, setRoomTask] = React.useState(null);
       const [focusedTask, focusTask] = React.useState('');
-      const [deviceStatus, setDeviceStatus] = React.useState(null);
       const [deviceDrawerOpen, setDeviceDrawerOpen] = React.useState(false);
 
       const chooseTab = value => {
         pendingTab = null;
         const resolved = resolveNavTarget(value);
-        if (resolved.chatSection) setChatSection(resolved.chatSection);
+        setChatSection(resolved.chatSection || '');
+        setRoomTask(null);
         if (resolved.groupSub) setGroupSub(resolved.groupSub);
-        if (resolved.agentSub) setAgentSub(resolved.agentSub);
-        if (value === 'taskRooms') setRoomTask(null);
+        if (resolved.tab === 'agents') setAgentSub(resolved.agentSub || 'pool');
         setTab(resolved.tab);
-        try { globalThis.localStorage?.setItem(ACTIVE_TAB_STORAGE_KEY, resolved.tab); } catch {}
       };
-      const openTaskRoom = task => { setRoomTask(task); setChatSection('taskRooms'); setTab('chats'); };
-      const openBoard = taskId => { focusTask(taskId ?? ''); setTab('tasks'); };
-      const openAgentMemory = agentId => { setMemoryTarget({ agentId, layer: 'agent' }); setTab('memory'); };
+      const openTaskRoom = task => { setRoomTask(task); setChatSection('taskRooms'); setTab('tasks'); };
+      const openBoard = taskId => { focusTask(taskId ?? ''); chooseTab('tasks'); };
+      const openAgentMemory = (agentId, layer = 'agent') => { setMemoryTarget({ agentId, layer }); chooseTab('memory'); };
 
       React.useEffect(() => {
         const onTab = event => { if (event && typeof event.detail === 'string') chooseTab(event.detail); };
@@ -1004,26 +3890,14 @@ window.__ModuleLoader__.load({
         return () => { window.removeEventListener('marshal:tab', onTab); };
       }, []);
 
-      const refreshDeviceStatus = React.useCallback(() => {
-        fetchJson('marshal/devices/status')
-          .then(next => setDeviceStatus(next))
-          .catch(() => setDeviceStatus(null));
-      }, []);
-
-      React.useEffect(() => {
-        let alive = true;
-        fetchJson('marshal/health')
-          .then(next => { if (alive) setHealth(next); })
-          .catch(() => { if (alive) setHealth(null); });
-        refreshDeviceStatus();
-        const timer = setInterval(refreshDeviceStatus, 15000);
-        return () => { alive = false; clearInterval(timer); };
-      }, [attempt, refreshDeviceStatus]);
+      const [hub, refreshDeviceStatus] = mvUseHubSnapshot(MV_HUB_MONITOR_TOPICS, MV_HUB_CHROME_READS, attempt);
+      const monitorCount = hub.incidents?.totalCount ?? 0;
+      const deviceStatus = hub.devices;
+      const health = hub.health;
 
       const [address, setAddress] = React.useState(null);
       const [setup, setSetup] = React.useState(null);
       const [state, setState] = React.useState({ authenticated: false });
-      const [health, setHealth] = React.useState(null);
       const [binding, setBinding] = React.useState(null);
       const [notice, setNotice] = React.useState('正在连接调度官…');
       const [older, setOlder] = React.useState(null);
@@ -1048,8 +3922,8 @@ window.__ModuleLoader__.load({
         pending.current.set(id, { resolve, reject, timer });
         connection.current.postMessage({ id, op, args, target });
       });
-      const accountRequest = async action => {
-        const response = await fetch(new URL(`marshal/account/${action}`, document.baseURI), { method: 'POST', headers: { 'x-marshal-account': '1' } });
+      const accountRequest = async (action, signal) => {
+        const response = await fetch(new URL(`marshal/account/${action}`, document.baseURI), { method: 'POST', headers: { 'x-marshal-account': '1' }, signal });
         return response.json();
       };
       const loginAccount = async () => {
@@ -1086,8 +3960,9 @@ window.__ModuleLoader__.load({
         choices.current.set(targetKey(active.current.target), value); setSelection(value);
         setControlsNotice('已选择，下次发送时应用');
       };
-      const uploadFiles = async event => {
-        const chosen = Array.from(event.target.files || []); event.target.value = '';
+      const uploadFiles = async e => {
+        const chosen = Array.from(e.target.files || []);
+        e.target.value = '';
         const bridge = active.current; if (!bridge || !chosen.length) return;
         if (uploads.current.length + chosen.length > 8 || chosen.some(file => file.size > 10 * 1024 * 1024)) {
           setControlsNotice('每次最多 8 个附件，每个不超过 10 MB'); return;
@@ -1154,28 +4029,30 @@ window.__ModuleLoader__.load({
           else setNotice('暂时无法连接，请检查插件配置后重试。');
         });
         let checking = false;
-        const checkAccount = async () => {
+        const checkAccount = async signal => {
           if (!accountMode.current || !connection.current || accountBusy.current || checking) return;
           checking = true;
           try {
-            const data = await accountRequest('status');
-            if (abort.signal.aborted) return;
+            const data = await accountRequest('status', signal);
+            if (signal.aborted) return;
             const next = data.ok ? data.accountHash : null;
             if (next !== accountHash.current) {
               accountHash.current = next; disposeSession();
               await invoke('account.logout', { code: data.code || 'account-required' });
-              if (next && !abort.signal.aborted) await loginAccount();
+              if (next && !signal.aborted) await loginAccount();
             }
           } catch (error) {
-            if (!abort.signal.aborted && accountHash.current !== null) {
+            if (!signal.aborted && accountHash.current !== null) {
               accountHash.current = null; disposeSession();
               await invoke('account.logout', { code: 'account-unavailable' }).catch(() => {});
             }
           } finally { checking = false; }
         };
-        const timer = setInterval(checkAccount, 20000); window.addEventListener('focus', checkAccount);
+        const accountRefresh = createVisibleMarshalRefresh(checkAccount);
+        const stop = subscribeMarshalEvents(['ready'], accountRefresh.request);
+        window.addEventListener('focus', accountRefresh.request);
         return () => {
-          clearInterval(timer); window.removeEventListener('focus', checkAccount);
+          stop(); accountRefresh.dispose(); window.removeEventListener('focus', accountRefresh.request);
           abort.abort(); active.current?.dispose(); active.current = null;
           connection.current?.close(); connection.current = null;
           for (const task of pending.current.values()) { clearTimeout(task.timer); task.reject(Error('连接已关闭')); }
@@ -1232,15 +4109,18 @@ window.__ModuleLoader__.load({
         ['remote', '远端设备会话', '云端与多设备'],
       ];
 
+      if (chatSection === 'taskRooms') return h('div', { className: 'mv-room-fill' },
+        h(MarshalErrorBoundary, { resetKey: 'taskRooms-' + (roomTask?.id || 'archive') },
+          h(MarshalTicketRoomView, { key: roomTask?.id ?? 'archive', task: roomTask, openBoard, onOpenAgents: () => chooseTab('agents') })));
       if (setup) return h(Setup, { initial: setup, onReady: () => retry(value => value + 1) });
-      return h('section', { 'aria-label': '调度官', style: { flex: 1, height: '100%', minHeight: 0, width: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden', background: 'var(--dsw-alias-bg-base, transparent)', color: 'var(--dsw-alias-label-primary, inherit)' } },
+      return h('section', { 'aria-label': '调度官', className: 'mv-scope', style: { flex: 1, height: '100%', minHeight: 0, width: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden', background: 'var(--dsw-alias-bg-base, transparent)', color: 'var(--dsw-alias-label-primary, inherit)' } },
         h('header', { style: { padding: '10px 18px', minHeight: 52, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, borderBottom: '1px solid #8883', flexShrink: 0 } },
           h('div', { style: { display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 } },
             h(MarshalIcon),
             h('h1', { style: { fontSize: 15, fontWeight: 600, margin: 0, whiteSpace: 'nowrap' } }, '调度官'),
             state.account && h('span', { style: { fontSize: 11, opacity: .55, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } }, state.account.name + (state.workspaceName ? ' · ' + state.workspaceName : ''))),
           h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' } },
-            h(MarshalNav, { active: tab, onTab: chooseTab, compact: true }),
+            h(MarshalNav, { active: tab, onTab: chooseTab, compact: true, monitorCount }),
             health && (!health.capabilities?.agents || !health.capabilities?.taskBoard) && h('span', { style: { fontSize: 11, color: dswTheme.danger } },
               '缺少：' + [!health.capabilities?.agents ? '智能体后端' : '', !health.capabilities?.taskBoard ? '任务看板后端' : ''].filter(Boolean).join('、')),
             h('button', {
@@ -1251,15 +4131,15 @@ window.__ModuleLoader__.load({
             },
               h('span', { style: { width: 7, height: 7, borderRadius: '50%', background: deviceDotColor, flexShrink: 0 } }),
               h('span', null, deviceLabel)))),
-        tab === 'tasks' && h('div', { style: { flex: 1, minHeight: 0, minWidth: 0, width: '100%', overflow: 'hidden', display: 'flex' } },
+        tab === 'tasks' && !chatSection && h('div', { style: { flex: 1, minHeight: 0, minWidth: 0, width: '100%', overflow: 'hidden', display: 'flex' } },
           h(MarshalErrorBoundary, { resetKey: 'tasks' },
-            h(TaskBoardPage, { openSession, openTaskRoom, focusedTask, openNativeBoard: openPanel ? () => openPanel('task-board') : undefined, onOpenRosters: () => chooseTab('rosters') }))),
-        tab === 'chats' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex', overflow: 'hidden' } },
+            h(MarshalHubKanbanView, { openSession, openTaskRoom, focusedTask, openNativeBoard: openPanel ? () => openPanel('task-board') : undefined, onOpenRosters: () => chooseTab('rosters') }))),
+        chatSection && h('div', { style: { flex: 1, minHeight: 0, display: 'flex', overflow: 'hidden' } },
           h('nav', { 'aria-label': '会话分类', style: { width: 168, flexShrink: 0, borderRight: '1px solid ' + dswTheme.border, padding: 10, display: 'flex', flexDirection: 'column', gap: 4, background: 'color-mix(in srgb, currentColor 2%, transparent)' } },
             chatSections.map(([key, label, hint]) => h('button', {
               key, type: 'button', 'aria-pressed': chatSection === key,
               style: { ...tabStyle(chatSection === key), textAlign: 'left', padding: '9px 10px', display: 'grid', gap: 2 },
-              onClick: () => { if (key === 'taskRooms') setRoomTask(null); setChatSection(key); },
+              onClick: () => { chooseTab(key); },
             },
               h('span', { style: { fontSize: 13, fontWeight: chatSection === key ? 600 : 500 } }, label),
               h('span', { style: { fontSize: 10, opacity: .6 } }, hint)))),
@@ -1272,10 +4152,8 @@ window.__ModuleLoader__.load({
                 groupSub === 'local'
                   ? h(GroupsPage, { openSession, onOpenAgents: () => chooseTab('agents') })
                   : h(CrossGroupsPage))),
-            chatSection === 'taskRooms' && h(MarshalErrorBoundary, { resetKey: 'taskRooms-' + (roomTask?.id ?? 'archive') },
-              h(TaskRoomsPage, { key: roomTask?.id ?? 'archive', task: roomTask, openBoard })),
             chatSection === 'direct' && h(MarshalErrorBoundary, { resetKey: 'direct' },
-              h(AgentDirectChatsView, { openSession, onOpenAgents: () => chooseTab('agents') })),
+              h(AgentDirectChatsView, { openSession, mvOpenDirect, onOpenAgents: () => chooseTab('agents') })),
             chatSection === 'remote' && h('div', { style: { display: 'flex', flex: 1, minHeight: 0 } },
               address && h('iframe', { ref: iframe, onLoad: connect, title: '调度官设备与群聊', src: address,
                 sandbox: 'allow-scripts allow-same-origin allow-forms', allow: 'clipboard-write', referrerPolicy: 'no-referrer',
@@ -1305,18 +4183,20 @@ window.__ModuleLoader__.load({
                   : h('p', { style: { margin: 'auto', opacity: .55 } }, notice || '选择一个远端会话，继续工作'),
                 h(Statistics, { value: state.statistics, agent: state.target?.agent })),
               !address && h('p', { role: 'status', style: { margin: 'auto', padding: 24 } }, notice)))),
-        tab === 'agents' && h('div', { style: { flex: 1, minHeight: 0, minWidth: 0, width: '100%', overflow: 'hidden', display: 'flex' } },
-          h(MarshalErrorBoundary, { resetKey: 'agents' },
-            h(AgentsPage, { onOpenChats: () => chooseTab('chats'), onOpenMemory: openAgentMemory, openSession, workspaceService, initialSubTab: agentSub }))),
-        tab === 'memory' && h('div', { style: { flex: 1, minHeight: 0, minWidth: 0, width: '100%', overflow: 'hidden', display: 'flex' } },
+        tab === 'agents' && !chatSection && h(MarshalErrorBoundary, { resetKey: 'agents' },
+          h(MarshalHubAgentsView, { key: agentSub, onOpenChats: () => chooseTab('direct'), onOpenMemory: openAgentMemory,
+            openSession, mvOpenDirect, onStartVoice: mvStartVoice, initialSubTab: agentSub })),
+        tab === 'monitor' && h(MarshalErrorBoundary, { resetKey: 'monitor' },
+          h(MarshalHubMonitorView, { openTaskRoom, onOpenMemory: openAgentMemory, onOpenDirect: mvOpenDirect })),
+        tab === 'memory' && h('div', { className: 'mv-room-fill' },
           h(MarshalErrorBoundary, { resetKey: 'memory' },
-            h(MemoryPage, { initialAgentId: memoryTarget.agentId, initialLayer: memoryTarget.layer }))),
+            h(MemoryPage, { initialAgentId: memoryTarget.agentId, initialLayer: memoryTarget.layer, mvOpenDirect, closeMemorySidebar }))),
         h(DeviceStatusDrawer, {
           open: deviceDrawerOpen,
           onClose: () => setDeviceDrawerOpen(false),
           status: deviceStatus,
           onRefresh: () => { retry(v => v + 1); refreshDeviceStatus(); },
-          onOpenRemote: () => { setChatSection('remote'); setTab('chats'); },
+          onOpenRemote: () => chooseTab('remote'),
         }));
     }
     const AGENT_TEAM_NAME = '智能体库';
@@ -1386,7 +4266,7 @@ window.__ModuleLoader__.load({
     const MEMORY_CSRF_COOKIE = 'marshal-memory-csrf';
     const nativeMemory = window.location.protocol === 'dsh-app:' && window.location.hostname === 'app';
     let desktopMemorySession;
-    let memorySessionPromise;
+    let memorySessionFlight;
     function readBrowserCookie(name) {
       const parts = String(document.cookie || '').split(';');
       for (const part of parts) {
@@ -1400,54 +4280,92 @@ window.__ModuleLoader__.load({
     }
     function requestError(response, data, explain) {
       const code = data?.code ?? 'HTTP ' + response.status;
-      return Object.assign(new Error(String(explain ? data?.message || code : code)), { code });
+      return Object.assign(new Error(String(explain ? data?.message || code : code)), { code, status: response.status });
     }
     function memoryProof() {
       return nativeMemory ? desktopMemorySession : (readBrowserCookie(MEMORY_CSRF_COOKIE) || undefined);
     }
-    async function ensureMemorySession(rejected) {
+    async function ensureMemorySession(rejected, signal) {
+      signal?.throwIfAborted();
       const current = memoryProof();
       if (current && current !== rejected) return current;
-      memorySessionPromise ??= fetch(new URL('marshal/memory/session', document.baseURI), {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: { 'x-marshal-memory': '1', ...(nativeMemory ? { 'x-marshal-desktop': '1' } : {}) },
-      }).then(async response => {
-        const data = await readJson(response);
-        if (!response.ok || data?.ok !== true) throw requestError(response, data, true);
-        if (nativeMemory) {
-          if (typeof data.sessionToken === 'string' && typeof data.csrf === 'string') {
-            desktopMemorySession = { 'x-marshal-desktop': '1', 'x-marshal-session': data.sessionToken, 'x-marshal-csrf': data.csrf };
-          } else {
-            desktopMemorySession = undefined;
+      if (!memorySessionFlight) {
+        const flight = { controller: new AbortController(), waiters: 0 };
+        memorySessionFlight = flight;
+        flight.promise = fetch(new URL('marshal/memory/session', document.baseURI), {
+          method: 'POST',
+          credentials: 'same-origin',
+          signal: flight.controller.signal,
+          headers: { 'x-marshal-memory': '1', ...(nativeMemory ? { 'x-marshal-desktop': '1' } : {}) },
+        }).then(async response => {
+          const data = await readJson(response);
+          flight.controller.signal.throwIfAborted();
+          if (!response.ok || data?.ok !== true) throw requestError(response, data, true);
+          if (nativeMemory) {
+            if (typeof data.sessionToken === 'string' && typeof data.csrf === 'string') {
+              desktopMemorySession = { 'x-marshal-desktop': '1', 'x-marshal-session': data.sessionToken, 'x-marshal-csrf': data.csrf };
+            } else {
+              desktopMemorySession = undefined;
+            }
           }
+          const proof = memoryProof();
+          if (!proof) throw Object.assign(new Error('记忆会话凭证不可用。'), { code: 'memory-session-invalid' });
+          if (typeof resumeDeniedMarshalSse === 'function') resumeDeniedMarshalSse(true);
+          return proof;
+        }).finally(() => {
+          if (memorySessionFlight === flight) memorySessionFlight = undefined;
+        });
+      }
+      const flight = memorySessionFlight;
+      flight.waiters++;
+      let onAbort;
+      try {
+        if (!signal) return await flight.promise;
+        return await Promise.race([flight.promise, new Promise((_, reject) => {
+          onAbort = () => reject(signal.reason);
+          signal.addEventListener('abort', onAbort, { once: true });
+        })]);
+      } finally {
+        if (onAbort) signal.removeEventListener('abort', onAbort);
+        // One consumer leaving must not cancel a handshake still needed by another.
+        if (--flight.waiters === 0 && memorySessionFlight === flight) {
+          memorySessionFlight = undefined;
+          flight.controller.abort();
         }
-        const proof = memoryProof();
-        if (!proof) throw Object.assign(new Error('记忆会话凭证不可用。'), { code: 'memory-session-invalid' });
-        return proof;
-      }).finally(() => { memorySessionPromise = undefined; });
-      return memorySessionPromise;
+      }
     }
-    async function fetchJson(path, body, workspaceAuth = false) {
+    async function fetchJson(path, body, workspaceAuth = false, signal, beforeSend) {
       const memory = String(path).startsWith('marshal/memory') && !String(path).startsWith('marshal/memory/session');
       const authenticated = memory || workspaceAuth;
       const url = new URL(path, document.baseURI);
-      const send = proof => fetch(url, {
-        credentials: 'same-origin',
-        ...(body === undefined ? {} : { method: 'POST', body: JSON.stringify(body) }),
-        headers: {
-          ...(body === undefined ? {} : { 'content-type': 'application/json' }),
-          ...(typeof proof === 'string' ? { 'x-marshal-csrf': proof } : proof),
-        },
-      });
-      const proof = authenticated ? await ensureMemorySession() : undefined;
+      const send = proof => {
+        signal?.throwIfAborted();
+        // Credential acquisition can yield; check again at the actual send.
+        beforeSend?.();
+        return fetch(url, {
+          credentials: 'same-origin',
+          ...(signal ? { signal } : {}),
+          ...(body === undefined ? {} : { method: 'POST', body: JSON.stringify(body) }),
+          headers: {
+            ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+            ...(typeof proof === 'string' ? { 'x-marshal-csrf': proof } : proof),
+          },
+        });
+      };
+      signal?.throwIfAborted();
+      const proof = authenticated ? await ensureMemorySession(undefined, signal) : undefined;
       let response = await send(proof);
       let data = await readJson(response);
       if (authenticated && (response.status === 401 || data?.code === 'memory-csrf-mismatch')) {
-        response = await send(await ensureMemorySession(proof));
+        signal?.throwIfAborted();
+        beforeSend?.();
+        response = await send(await ensureMemorySession(proof, signal));
         data = await readJson(response);
       }
       if (!response.ok || data?.ok === false) throw requestError(response, data, authenticated);
+      if (body !== undefined && String(path).startsWith('dsh-agents/api/')) {
+        try { window.dispatchEvent(new CustomEvent('marshal:agents-changed')); } catch {}
+      }
       return data;
     }
 
@@ -1456,12 +4374,12 @@ window.__ModuleLoader__.load({
       return team.name === AGENT_TEAM_NAME || team.name.startsWith(AGENT_TEAM_PREFIX);
     }
 
-    async function loadAgentLibrary() {
-      const state = await fetchJson('dsh-agents/api/state');
+    async function loadAgentLibrary(signal, mvAllTeams = false) {
+      const state = await fetchJson('dsh-agents/api/state', undefined, false, signal);
       const workspaces = state.workspaces || [];
       const agents = [];
       for (const team of state.teams || []) {
-        if (!isAgentTeam(team)) continue;
+        if (!mvAllTeams && !isAgentTeam(team)) continue;
         for (const member of team.members || []) {
           agents.push({
             ...member,
@@ -1591,17 +4509,16 @@ window.__ModuleLoader__.load({
       const schedule = () => { requestAnimationFrame(() => { apply(); }); };
       const observer = new MutationObserver(schedule);
       observer.observe(document.body, { childList: true, subtree: true });
-      setInterval(apply, 1500);
       apply();
     }
 
-    function MarshalNav({ active, onTab, compact = false }) {
+    function MarshalNav({ active, onTab, compact = false, monitorCount = 0 }) {
       const normalized = resolveNavTarget(active).tab;
       const tabs = [
-        ['tasks', '任务看板'],
-        ['chats', '会话'],
-        ['agents', '智能体'],
-        ['memory', '记忆'],
+        ['tasks', '工单看板'],
+        ['monitor', '问题监控'],
+        ['memory', '3D 记忆星系'],
+        ['agents', '智能体与集群'],
       ];
       return h('div', {
         id: 'marshal-quick-nav',
@@ -1616,6 +4533,7 @@ window.__ModuleLoader__.load({
       },
         tabs.map(([key, label]) => h('button', {
           key, type: 'button', 'aria-pressed': normalized === key,
+          'aria-label': key === 'monitor' && monitorCount > 0 ? label + '，' + monitorCount + ' 条告警' : label,
           style: {
             border: 0, borderRadius: 999, cursor: 'pointer', whiteSpace: 'nowrap',
             font: (compact ? '11px/1' : '12px/1') + ' inherit',
@@ -1625,7 +4543,7 @@ window.__ModuleLoader__.load({
             transition: 'background .15s ease',
           },
           onClick: () => onTab(key),
-        }, label)));
+        }, label, key === 'monitor' && monitorCount > 0 && h('span', { className: 'mv-badge', 'aria-hidden': true, style: { marginInlineStart: 'var(--mv-xs, 4px)' } }, monitorCount))));
     }
 
     function Field({ label, children }) {
@@ -1644,12 +4562,675 @@ window.__ModuleLoader__.load({
         action && h('button', { type: 'button', style: uiButton(false), onClick: onAction }, action));
     }
 
+    const marshalSseConnections = new Map();
+    const marshalSseRetryDelays = [1000, 2000, 5000, 15000];
+
+    function marshalAuthDenied(status) {
+      return status === 401 || status === 403;
+    }
+
+    async function refreshMarshalSseProof(connection) {
+      const proof = await ensureMemorySession(connection.rejectedProof, connection.controller.signal);
+      connection.auth = 'refreshed';
+      connection.rejectedProof = undefined;
+      connection.refreshedProof = proof;
+      return proof;
+    }
+
+    function notifyMarshalSubscriber(subscriber, topic, data) {
+      if (!subscriber.active || (!subscriber.topics.has(topic) && !subscriber.topics.has('*'))) return;
+      if (!subscriber.debounceMs) {
+        try { void Promise.resolve(subscriber.listener(topic, data)).catch(() => {}); } catch {}
+        return;
+      }
+      // Coalesce invalidations without waiting for a quiet period during continuous streaming.
+      subscriber.pending = [topic, data];
+      scheduleMarshalSubscriber(subscriber);
+    }
+
+    function scheduleMarshalSubscriber(subscriber) {
+      if (!subscriber.active || !subscriber.pending || subscriber.running || subscriber.timer !== undefined) return;
+      subscriber.timer = setTimeout(() => {
+        subscriber.timer = undefined;
+        void deliverMarshalRefresh(subscriber);
+      }, subscriber.debounceMs);
+    }
+
+    async function deliverMarshalRefresh(subscriber) {
+      const args = subscriber.pending;
+      subscriber.pending = undefined;
+      subscriber.running = true;
+      try { await subscriber.listener(...args); } catch {}
+      finally {
+        subscriber.running = false;
+        scheduleMarshalSubscriber(subscriber);
+      }
+    }
+
+    function dispatchMarshalFrame(connection, frame) {
+      let topic = 'message';
+      const lines = [];
+      for (const line of frame.split(/\r?\n/)) {
+        if (line.startsWith(':')) continue;
+        const colon = line.indexOf(':');
+        const field = colon < 0 ? line : line.slice(0, colon);
+        const value = colon < 0 ? '' : line.slice(colon + 1).replace(/^ /, '');
+        if (field === 'event') topic = value || 'message';
+        else if (field === 'data') lines.push(value);
+      }
+      if (!lines.length) return;
+      let data;
+      try { data = JSON.parse(lines.join('\n')); } catch { return; }
+      if (topic === 'ready') {
+        connection.ready = { data };
+        connection.auth = undefined;
+        connection.refreshedProof = undefined;
+      }
+      for (const subscriber of [...connection.subscribers]) notifyMarshalSubscriber(subscriber, topic, data);
+    }
+
+    async function runMarshalSse(connection) {
+      if (connection.running || connection.controller.signal.aborted) return;
+      connection.running = true;
+      const { signal } = connection.controller;
+      connection.ready = undefined;
+      let openedAt;
+      try {
+        const proof = connection.auth === 'refreshing'
+          ? await refreshMarshalSseProof(connection)
+          : connection.auth === 'refreshed' ? memoryProof() ?? connection.refreshedProof
+          : nativeMemory ? await ensureMemorySession(undefined, signal) : memoryProof();
+        if (signal.aborted) return;
+        const response = await fetch(connection.address + '/marshal/events', {
+          headers: {
+            accept: 'text/event-stream',
+            ...(typeof proof === 'string' ? { 'x-marshal-csrf': proof } : proof),
+          },
+          credentials: 'same-origin',
+          signal,
+        });
+        if (signal.aborted || !response.ok) {
+          void response.body?.cancel().catch(() => {});
+          if (!signal.aborted && marshalAuthDenied(response.status) && !connection.auth) {
+            connection.auth = 'refreshing';
+            connection.rejectedProof = proof;
+            // Don't clear credentials another request has already refreshed.
+            if (nativeMemory && desktopMemorySession === proof) desktopMemorySession = undefined;
+            await refreshMarshalSseProof(connection);
+          }
+          return;
+        }
+        if (!response.body) return;
+        openedAt = Date.now();
+        const reader = response.body.getReader();
+        connection.reader = reader;
+        const decoder = new TextDecoder();
+        let buffer = '';
+        try {
+          while (!signal.aborted) {
+            const { value, done } = await reader.read();
+            if (done || signal.aborted) break;
+            buffer += decoder.decode(value, { stream: true });
+            // Match LF and CRLF delimiters even when split across byte chunks.
+            const frames = buffer.split(/\r?\n\r?\n/);
+            buffer = frames.pop();
+            for (const frame of frames) {
+              if (signal.aborted) break;
+              dispatchMarshalFrame(connection, frame);
+            }
+            if (buffer.length > 1_048_576) break; // Bound an unterminated frame.
+          }
+        } finally {
+          connection.reader = undefined;
+          void reader.cancel().catch(() => {});
+          reader.releaseLock();
+        }
+      } catch (error) {
+        // A session endpoint rejection, unlike a transport failure, cannot be retried in the background.
+        if (marshalAuthDenied(error?.status)) connection.auth = 'denied';
+      }
+      finally {
+        connection.running = false;
+        connection.ready = undefined;
+        if (!signal.aborted && connection.subscribers.size && connection.auth !== 'denied') {
+          // A stream that immediately closes after ready is still a failed attempt.
+          if (openedAt !== undefined && Date.now() - openedAt >= 30_000) connection.retry = 0;
+          const delay = marshalSseRetryDelays[connection.retry] + Math.floor(Math.random() * 250);
+          connection.retry = Math.min(connection.retry + 1, marshalSseRetryDelays.length - 1);
+          connection.timer = setTimeout(() => {
+            connection.timer = undefined;
+            void runMarshalSse(connection);
+          }, delay);
+        }
+      }
+    }
+
+    function resumeMarshalSseConnection(connection, fromSessionSuccess = false) {
+      if (connection.auth !== 'denied' || connection.running || connection.controller.signal.aborted || !connection.subscribers.size) return;
+      if (!fromSessionSuccess && nativeMemory && connection.rejectedProof && desktopMemorySession === connection.rejectedProof) {
+        desktopMemorySession = undefined;
+      }
+      connection.auth = undefined;
+      connection.rejectedProof = undefined;
+      connection.refreshedProof = undefined;
+      connection.retry = 0;
+      clearTimeout(connection.timer);
+      connection.timer = undefined;
+      void runMarshalSse(connection);
+    }
+
+    function resumeDeniedMarshalSse(fromSessionSuccess = false) {
+      for (const connection of [...marshalSseConnections.values()]) {
+        resumeMarshalSseConnection(connection, fromSessionSuccess);
+      }
+    }
+
+    function stopMarshalSubscriber(subscriber) {
+      subscriber.active = false;
+      clearTimeout(subscriber.timer);
+      subscriber.pending = undefined;
+    }
+
+    function stopMarshalSse(connection) {
+      marshalSseConnections.delete(connection.address);
+      clearTimeout(connection.timer);
+      if (connection.onWake) {
+        window.removeEventListener?.('focus', connection.onWake);
+        document.removeEventListener?.('visibilitychange', connection.onWake);
+        connection.onWake = undefined;
+      }
+      for (const subscriber of connection.subscribers) stopMarshalSubscriber(subscriber);
+      connection.subscribers.clear();
+      connection.controller.abort();
+      void connection.reader?.cancel().catch(() => {});
+    }
+
+    // Listeners receive (topic, data). Refresh views can opt into a synthetic initial
+    // read and coalesced, serialized invalidations (including a replay of an active ready).
+    function subscribeMarshalEvents(topics, listener, { debounceMs = 0, initial = false } = {}) {
+      const address = readAddress();
+      let connection = marshalSseConnections.get(address);
+      const start = !connection;
+      if (start) {
+        connection = { address, controller: new AbortController(), subscribers: new Set(), retry: 0, running: false };
+        connection.onWake = () => {
+          if (document.visibilityState === 'hidden') return;
+          resumeMarshalSseConnection(connection, false);
+        };
+        window.addEventListener?.('focus', connection.onWake);
+        document.addEventListener?.('visibilitychange', connection.onWake);
+        marshalSseConnections.set(address, connection);
+      }
+      const subscriber = { topics: new Set(typeof topics === 'string' ? [topics] : topics), listener, debounceMs, active: true };
+      connection.subscribers.add(subscriber);
+      if (initial) {
+        subscriber.pending = ['initial', undefined];
+        void deliverMarshalRefresh(subscriber);
+      }
+      if (connection.ready) notifyMarshalSubscriber(subscriber, 'ready', connection.ready.data);
+      if (start && !connection.controller.signal.aborted) void runMarshalSse(connection);
+      return () => {
+        if (!connection.subscribers.delete(subscriber)) return;
+        stopMarshalSubscriber(subscriber);
+        if (!connection.subscribers.size) stopMarshalSse(connection);
+      };
+    }
+
+    function disposeAllMarshalSse() {
+      for (const connection of [...marshalSseConnections.values()]) stopMarshalSse(connection);
+    }
+
+    // SSE, manual refresh and the low-frequency fallback share one read at a time.
+    // Keep one trailing refresh if an invalidation arrives during a read.
+    function createVisibleMarshalRefresh(read, intervalMs) {
+      let closed = false;
+      let polling = false;
+      let currentInterval = intervalMs;
+      let queued = false;
+      let timer, flight, controller;
+      const visible = () => !closed && document.visibilityState !== 'hidden';
+      const clearTimer = () => {
+        clearTimeout(timer);
+        timer = undefined;
+      };
+      const schedule = () => {
+        if (!visible() || !polling || flight || timer !== undefined) return;
+        timer = setTimeout(request, currentInterval + Math.floor(Math.random() * 750));
+      };
+      function request() {
+        if (!visible()) return;
+        clearTimer();
+        queued = true;
+        flight ??= Promise.resolve().then(async () => {
+          while (queued && visible()) {
+            queued = false;
+            controller = new AbortController();
+            try { await read(controller.signal); } catch {}
+            finally { controller = undefined; }
+          }
+        }).finally(() => {
+          flight = undefined;
+          if (queued) request();
+          else schedule();
+        });
+        return flight;
+      }
+      const cancel = () => {
+        queued = false;
+        clearTimer();
+        controller?.abort();
+      };
+      const onVisibility = () => {
+        if (visible()) request();
+        else cancel();
+      };
+      document.addEventListener?.('visibilitychange', onVisibility);
+      return {
+        request,
+        setPolling(enabled, nextIntervalMs) {
+          if (closed) return;
+          const nextInterval = typeof nextIntervalMs === 'number' && nextIntervalMs > 0 ? nextIntervalMs : intervalMs;
+          if (polling === enabled && currentInterval === nextInterval) return;
+          polling = enabled;
+          currentInterval = nextInterval;
+          clearTimer();
+          if (enabled) schedule();
+        },
+        dispose() {
+          closed = true;
+          cancel();
+          document.removeEventListener?.('visibilitychange', onVisibility);
+        },
+      };
+    }
+    const MV_CASCADE_EFFORTS = ['off', 'low', 'medium', 'high', 'xhigh'];
+    const MV_CONTEXT_KINDS = [
+      ['sessions', '近期会话'], ['tickets', '关联工单'], ['memory', '记忆片段'], ['files', '本地文件/附件'],
+    ];
+    const MV_LINK_KEYS = ['sessionIds', 'proposalIds', 'docPaths'];
+    const MV_ATTACHMENT_LIMIT = 8;
+    const MV_ATTACHMENT_TOTAL_BYTES = 32 * 1024 * 1024;
+    // Keep in sync with AGENT_CONFIG_SLOTS in groups/task-plans.
+    const MV_AGENT_CONFIG_SLOTS = new Set([
+      'leader', 'coder', 'reviewer', 'critic', 'codexCritic', 'writer', 'researcher',
+      'checker', 'collaborator', 'codexCoding', 'codexReview',
+    ]);
+
+    function mvUsePickerPopup() {
+      const [open, setOpen] = React.useState(false);
+      const root = React.useRef(null);
+      const id = React.useId();
+      React.useEffect(ensureMarshalVnextStyles, []);
+      React.useEffect(() => {
+        if (!open) return;
+        const panel = root.current?.querySelector('.mv-picker-popover');
+        const place = () => {
+          if (!panel) return;
+          const start = root.current?.getBoundingClientRect().left;
+          if (start === undefined) return;
+          const viewport = document.documentElement.clientWidth;
+          panel.style.setProperty('--mv-picker-offset', Math.min(0, viewport - start - panel.offsetWidth) + 'px');
+        };
+        place();
+        const dismiss = event => { if (!root.current?.contains(event.target)) setOpen(false); };
+        document.addEventListener('pointerdown', dismiss);
+        window.addEventListener('resize', place);
+        return () => {
+          document.removeEventListener('pointerdown', dismiss);
+          window.removeEventListener('resize', place);
+        };
+      }, [open]);
+      const close = () => { setOpen(false); root.current?.querySelector('.mv-picker-trigger')?.focus(); };
+      return { open, setOpen, id, close, rootProps: { ref: root, onKeyDown: event => {
+        if (open && event.key === 'Escape') { event.stopPropagation(); close(); }
+      } } };
+    }
+
+    function mvPickerTrigger(popup, label) {
+      return h(MvButton, { className: 'mv-picker-trigger', 'aria-expanded': popup.open, 'aria-controls': popup.open ? popup.id : undefined,
+        onClick: () => popup.setOpen(!popup.open) }, label,
+        h('svg', { width: 12, height: 12, viewBox: '0 0 12 12', 'aria-hidden': true },
+          h('path', { d: 'M2 4h8L6 8Z', fill: 'currentColor' })));
+    }
+
+    function mvPickerColumn(label, children) {
+      return h('section', { className: 'mv-cascade3-col', 'aria-label': label },
+        h('strong', { className: 'mv-cascade3-label' }, label), children);
+    }
+
+    function mvPickerChoice(key, label, selected, onClick, subtitle, disabled) {
+      return h('button', { key, type: 'button', className: 'mv-cascade3-choice', 'aria-pressed': selected, disabled, onClick },
+        h('span', null, label), subtitle && h('small', null, subtitle));
+    }
+
+    function mvAgentConfigSlot(agent, workflow) {
+      if (!agent) return undefined;
+      if (MV_AGENT_CONFIG_SLOTS.has(agent.configKey)) return agent.configKey;
+      if (agent.id && workflow?.leaderId === agent.id) return 'leader';
+      const slots = Object.entries(workflow?.plan?.members ?? {}).filter(([slot, memberId]) =>
+        agent.id && memberId === agent.id && MV_AGENT_CONFIG_SLOTS.has(slot));
+      return slots.length === 1 ? slots[0][0] : undefined;
+    }
+
+    // Each agent has { id, name, role, status, configKey?, models: [{ route, label?, efforts? }] }.
+    // task.workflow can resolve a slot when configKey isn't supplied. Without a
+    // task + slot, onApply is the persistence adapter rather than a notification.
+    function mvAgentModelCascade({ agents = [], task, taskId = task?.id, onApply, onSaved }) {
+      const popup = mvUsePickerPopup();
+      const [agentKey, setAgentKey] = React.useState('');
+      const [modelRoute, setModelRoute] = React.useState('');
+      const [error, setError] = React.useState('');
+      const [busy, setBusy] = React.useState(false);
+      const pending = React.useRef(false);
+      const agent = agents.find(row => row.id === agentKey);
+      const models = agent?.models ?? [];
+      const model = models.find(row => row.route === modelRoute);
+      const efforts = model ? MV_CASCADE_EFFORTS.filter(id => id === 'off' || !Array.isArray(model.efforts) || model.efforts.includes(id)) : [];
+      const slot = mvAgentConfigSlot(agent, task?.id === taskId ? task?.workflow : undefined);
+      const saveToTask = Boolean(taskId && slot);
+      const canApply = saveToTask || typeof onApply === 'function';
+      const apply = async reasoningEffort => {
+        if (!agent || !model || !canApply || pending.current) return;
+        pending.current = true;
+        setBusy(true);
+        setError('');
+        try {
+          const config = { model: model.route, reasoningEffort };
+          const selection = { agentId: agent.id, ...config };
+          let result;
+          if (saveToTask) {
+            const saving = fetchJson('marshal/tasks/agent-configs', {
+              taskId, agentConfigs: { [slot]: config },
+            }, true);
+            void Promise.resolve().then(() => onApply?.(selection)).catch(failure => {
+              setError(failure.message || String(failure));
+            });
+            result = await saving;
+          } else if (await onApply?.(selection) === false) throw new Error('未能应用模型配置。');
+          popup.close();
+          await onSaved?.(result, selection);
+        } catch (failure) { setError(failure.message || String(failure)); }
+        finally { pending.current = false; setBusy(false); }
+      };
+      return h('div', { ...popup.rootProps, className: 'mv-scope mv-picker' },
+        mvPickerTrigger(popup, `Agent 模型与思考 (${agents.length})`),
+        popup.open && h('div', { className: 'mv-picker-popover', id: popup.id, 'aria-label': 'Agent 模型与思考', role: 'group' },
+          h('div', { className: 'mv-cascade3-grid' },
+            mvPickerColumn('Agent', agents.length ? agents.map(row => mvPickerChoice(row.id, row.name || row.id, row.id === agentKey,
+              () => { setAgentKey(row.id); setModelRoute(''); setError(''); }, [row.role, row.status].filter(Boolean).join(' · '), busy)) : '暂无 Agent'),
+            mvPickerColumn('模型', models.length ? models.map(row => mvPickerChoice(row.route, row.label || row.route, row.route === modelRoute,
+              () => { setModelRoute(row.route); setError(''); }, undefined, busy)) : (agent ? '暂无可选模型' : '请选择 Agent')),
+            mvPickerColumn('思考强度', efforts.length ? efforts.map(id => mvPickerChoice(id, id,
+              agent.model === model.route && agent.reasoningEffort === id, () => void apply(id), undefined, busy || !canApply)) : '请选择模型')),
+          busy && h('div', { role: 'status' }, '正在保存配置…')),
+        error && h('div', { role: 'alert' }, error));
+    }
+
+    function mvValidatePickerAttachmentBudget(selected, chosen = []) {
+      if (selected.length + chosen.length > MV_ATTACHMENT_LIMIT) throw new Error('最多添加 8 个附件。');
+      const total = selected.reduce((sum, item) => {
+        if (!Number.isSafeInteger(item.bytes) || item.bytes < 0) throw new Error('无法确认已选附件的大小，请移除后重新添加。');
+        return sum + item.bytes;
+      }, 0) + chosen.reduce((sum, file) => sum + file.size, 0);
+      if (total > MV_ATTACHMENT_TOTAL_BYTES) throw new Error('附件总大小不能超过 32 MiB。');
+    }
+
+    // Pass the currently selected wire attachments to validate the entire
+    // selection before uploading. Retain successful uploads on partial failure.
+    async function mvUploadPickerAttachments(e, selected = [], signal) {
+      const chosen = Array.from(e.target.files || []);
+      e.target.value = '';
+      for (const file of chosen) {
+        if (!Number.isSafeInteger(file.size) || file.size <= 0 || file.size > 10 * 1024 * 1024) {
+          throw new Error('文件「' + file.name + '」为空或超过 10 MB 限制。');
+        }
+      }
+      mvValidatePickerAttachmentBudget(selected, chosen);
+      const results = await Promise.allSettled(chosen.map(async file => {
+        const mediaType = inferAttachmentMediaType(file);
+        const kind = /^image\/(png|jpeg|webp|gif)$/.test(mediaType) ? 'image' : 'file';
+        const qs = new URLSearchParams({ kind, name: file.name || 'attachment', mediaType });
+        const response = await fetch(new URL('api/task-board/attachments/upload?' + qs, document.baseURI), {
+          method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/octet-stream' }, body: file, signal,
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || !data?.attachment) throw new Error(data?.error || data?.message || ('HTTP ' + response.status));
+        return serializeAttachmentForWire(data.attachment);
+      }));
+      return { attachments: results.flatMap(result => result.status === 'fulfilled' ? [result.value] : []),
+        errors: results.flatMap((result, i) => result.status === 'rejected'
+          ? [chosen[i].name + '：' + (result.reason?.message || result.reason)] : []) };
+    }
+
+    function mvContextLinkValid(key, id) {
+      return typeof id === 'string' && id.length <= 256 && id === id.trim() && !/[\x00-\x1f\x7f]/.test(id) && (key === 'docPaths'
+        ? !/[:\\%]/.test(id) && id.split('/').every(part => part && part !== '.' && part !== '..')
+        : !!id && !/[\\/]/.test(id));
+    }
+
+    async function mvReadContextRows(scopeId, kind, scopedAgentKey, signal) {
+      if (kind === 'sessions') {
+        const direct = Boolean(scopeId && scopedAgentKey);
+        const data = await fetchJson(direct ? 'marshal/agent-direct-sessions?' + new URLSearchParams({ agentKey: scopedAgentKey })
+          : 'marshal/agents/sessions', undefined, true, signal);
+        const rows = direct ? [data.mainSession, ...(data.subSessions ?? [])].filter(Boolean) : data.sessions ?? [];
+        return rows.filter(row => !row.archived && (direct || !scopeId || row.workspaceId === scopeId))
+          .map(row => ({ key: 'sessionIds', id: row.sessionId ?? row.id, label: row.title || row.sessionId || row.id, subtitle: row.agentName || row.status }));
+      }
+      if (kind === 'tickets') {
+        const { tasks = [] } = await fetchJson('marshal/tasks/state', undefined, true, signal);
+        return tasks.filter(row => !scopeId || (row.taskRoom?.workspaceId ?? row.workflow?.workspaceId ?? row.workspaceId) === scopeId)
+          .map(row => ({ key: 'proposalIds', id: row.id, label: row.title || row.id, subtitle: row.ticketNo }));
+      }
+      const query = new URLSearchParams(scopeId ? { scope: 'workspace', workspaceId: scopeId } : { scope: 'global' });
+      const { items = [] } = await fetchJson('marshal/memory/list?' + query, undefined, true, signal);
+      return items.map((row, index) => {
+        const proposalId = row.proposalId || row.id;
+        const key = row.docPath ? 'docPaths' : mvContextLinkValid('proposalIds', proposalId) ? 'proposalIds' : 'sessionIds';
+        const id = key === 'docPaths' ? row.docPath : key === 'proposalIds' ? proposalId : row.sourceSession;
+        const scopeTag = scopeId || 'global';
+        const itemKey = row.id || row.proposalId || row.docPath || (row.sourceSession ? 'src:' + row.sourceSession + ':' + index : 'idx:' + index);
+        const rowId = 'memory:' + scopeTag + ':' + (row.key || '') + ':' + itemKey;
+        return { key, id, rowId, label: row.title || row.id, subtitle: row.content, memory: row };
+      });
+    }
+
+    // value/onChange use { links: { sessionIds, proposalIds, docPaths }, attachments }.
+    // directAgentSessions opts in to agent-only sessions in its workspace (never globally).
+    // resolveMemoryLink(item) may return { key, id } for host-backed memory.
+    function mvCascadeContextPicker({ workspaces, agentKey, agentWorkspaceId, directAgentSessions = false, value, onChange, resolveMemoryLink, onUploadState, disableUpload }) {
+      const popup = mvUsePickerPopup();
+      const [scopeId, setScopeId] = React.useState(null);
+      const [kind, setKind] = React.useState('');
+      const [query, setQuery] = React.useState('');
+      const [host, setHost] = React.useState({ rows: [], loading: true });
+      const [result, setResult] = React.useState(null);
+      const [stored, setStored] = React.useState({ links: {}, attachments: [] });
+      const [storedRows, setStoredRows] = React.useState(() => new Map());
+      const [uploading, setUploading] = React.useState(false);
+      const [uploadFailures, setUploadFailures] = React.useState([]);
+      const [uploadValidation, setUploadValidation] = React.useState('');
+      const [error, setError] = React.useState('');
+      const [retry, setRetry] = React.useState(0);
+      const pending = React.useRef(false);
+      const lifetime = React.useRef(null);
+      const current = React.useRef(null);
+      const activeValue = value ?? stored;
+      const links = Object.fromEntries(MV_LINK_KEYS.map(key => [key, activeValue.links?.[key] ?? []]));
+      const attachments = activeValue.attachments ?? [];
+      // Multiple selected rows can own the same deduplicated wire link.
+      const selectedRows = new Map([...storedRows].filter(([, { key, id }]) => links[key].includes(id)));
+      const hasReference = (rows, key, id) => {
+        for (const row of rows.values()) if (row.key === key && row.id === id) return true;
+        return false;
+      };
+      current.current = { links, attachments, onChange, selectedRows, onUploadState };
+      React.useEffect(() => {
+        const controller = new AbortController();
+        lifetime.current = controller;
+        if (pending.current) {
+          pending.current = false;
+          setUploading(false);
+          current.current.onUploadState?.(false);
+        }
+        return () => controller.abort();
+      }, [disableUpload]);
+      const commit = (nextLinks, nextAttachments) => {
+        const next = { links: nextLinks, attachments: nextAttachments };
+        current.current = { ...current.current, ...next };
+        setStored(next);
+        current.current.onChange?.(next);
+      };
+      const scopes = [{ id: '', title: '全局上下文' }, ...(workspaces ?? host.rows).filter(row => row.id && !isPseudoAgentWorkspace(row))];
+      const scope = scopes.find(row => row.id === scopeId);
+      const hasScope = !!scope;
+      const scopedAgentKey = directAgentSessions && scopeId && scopeId === agentWorkspaceId ? agentKey : undefined;
+      const requestKey = JSON.stringify([scopeId, kind, scopedAgentKey, retry]);
+      React.useEffect(() => {
+        if (!popup.open || workspaces) return;
+        const controller = new AbortController();
+        setHost(previous => ({ rows: previous.rows, loading: true }));
+        void fetchJson('marshal/task-rooms/workspaces', undefined, true, controller.signal).then(data => {
+          if (!controller.signal.aborted) setHost({ rows: data.workspaces ?? [] });
+        }).catch(failure => {
+          if (!controller.signal.aborted) setHost({ rows: [], error: failure.message || String(failure) });
+        });
+        return () => controller.abort();
+      }, [popup.open, workspaces, retry]);
+      React.useEffect(() => {
+        if (!popup.open || !hasScope || !kind || kind === 'files') return;
+        const controller = new AbortController();
+        setResult(null);
+        void mvReadContextRows(scopeId, kind, scopedAgentKey, controller.signal).then(rows => {
+          if (!controller.signal.aborted) setResult({ requestKey, rows });
+        }).catch(failure => {
+          if (!controller.signal.aborted) setResult({ requestKey, error: failure.message || String(failure) });
+        });
+        return () => controller.abort();
+      }, [popup.open, hasScope, requestKey]);
+      const toggle = (rowKey, ref, label) => {
+        const { links, attachments, selectedRows } = current.current;
+        const { key, id } = selectedRows.get(rowKey) ?? ref;
+        const existing = links[key];
+        if (!existing.includes(id) && existing.length >= 32) { setError('每类上下文最多添加 32 条。'); return; }
+        setError('');
+        const nextRows = new Map(selectedRows);
+        const remove = nextRows.delete(rowKey) ||
+          (rowKey === key + ':' + id && existing.includes(id) && !hasReference(selectedRows, key, id));
+        if (!remove) nextRows.set(rowKey, { key, id, label: label || id });
+        current.current.selectedRows = nextRows;
+        setStoredRows(nextRows);
+        let nextIds = existing;
+        if (remove && !hasReference(nextRows, key, id)) nextIds = existing.filter(item => item !== id);
+        else if (!remove && !existing.includes(id)) nextIds = [...existing, id];
+        commit({ ...links, [key]: nextIds }, attachments);
+      };
+      const upload = async e => {
+        const signal = lifetime.current?.signal;
+        if (!signal || signal.aborted || pending.current || disableUpload) return;
+        pending.current = true;
+        setUploading(true);
+        setUploadValidation('');
+        const failures = [];
+        let validation = '';
+        try {
+          const request = mvUploadPickerAttachments(e, current.current.attachments, signal);
+          onUploadState?.(true);
+          const uploaded = await request;
+          if (signal?.aborted) return;
+          failures.push(...uploaded.errors);
+          const latest = current.current;
+          const unique = new Map(latest.attachments.map(item => [item.attachmentId, item]));
+          for (const item of uploaded.attachments) unique.set(item.attachmentId, item);
+          if (uploaded.attachments.length) {
+            const next = [...unique.values()];
+            // The host may have changed its controlled selection during upload.
+            mvValidatePickerAttachmentBudget(next);
+            commit(latest.links, next);
+          }
+        } catch (failure) { validation = failure.message || String(failure); }
+        finally {
+          if (!signal.aborted) {
+            pending.current = false;
+            setUploading(false);
+            // The controlled form owns its failure history and submission guard.
+            if (onUploadState) onUploadState(false, validation ? [...failures, validation] : failures);
+            else {
+              // Without a host submission guard, selection validation is per attempt.
+              setUploadValidation(validation);
+              if (failures.length) setUploadFailures(previous => [...previous, ...failures]);
+            }
+          }
+        }
+      };
+      const loaded = result?.requestKey === requestKey ? result : null;
+      const keyword = query.trim().toLowerCase();
+      const rows = loaded?.rows?.filter(row => [row.label, row.subtitle, row.id].some(text => String(text ?? '').toLowerCase().includes(keyword)));
+      const retryButton = () => h(MvButton, { label: '重试', onClick: () => setRetry(n => n + 1) });
+      const chip = (id, label, remove) => h(MvButton, { key: id, className: 'mv-picker-chip', icon: 'close',
+        'aria-label': '移除 ' + label, onClick: remove }, label);
+      return h('div', { ...popup.rootProps, className: 'mv-scope mv-picker' },
+        mvPickerTrigger(popup, '添加上下文'),
+        h('div', { className: 'mv-picker-chips', 'aria-label': '已选上下文' },
+          [...selectedRows].map(([rowKey, row]) => chip(rowKey, row.label, () => toggle(rowKey, row, row.label))),
+          MV_LINK_KEYS.flatMap(key => links[key].filter(id => !hasReference(selectedRows, key, id)).map(id =>
+            chip(key + ':' + id, id, () => toggle(key + ':' + id, { key, id }, id)))),
+          attachments.map(item => chip(item.attachmentId, item.name, () =>
+            commit(links, attachments.filter(row => row.attachmentId !== item.attachmentId))))),
+        popup.open && h('div', { className: 'mv-picker-popover', id: popup.id, 'aria-label': '上下文选择器', role: 'group' },
+          h('div', { className: 'mv-cascade3-grid' },
+            mvPickerColumn('工作区', [scopes.map(row => mvPickerChoice(row.id, row.title || row.name || row.id, scopeId === row.id,
+              () => { setScopeId(row.id); setKind(''); setQuery(''); })),
+              !workspaces && host.loading && h('span', { key: 'pending', role: 'status' }, '正在读取工作区…'),
+              !workspaces && host.error && h('div', { key: 'failure', role: 'alert' }, host.error, retryButton())]),
+            mvPickerColumn('上下文类型', scope ? MV_CONTEXT_KINDS.map(([key, label]) => mvPickerChoice(key, label, key === kind,
+              () => { setKind(key); setQuery(''); })) : '请选择工作区'),
+            mvPickerColumn('选择内容', !scope || !kind ? '请选择上下文类型' : kind === 'files'
+              ? h('label', null, '选择文件', h('input', { type: 'file', multiple: true, disabled: disableUpload || uploading || attachments.length >= MV_ATTACHMENT_LIMIT,
+                onChange: e => void upload(e) }))
+              : h(React.Fragment, null, h('input', { type: 'search', className: 'mv-field', 'aria-label': '筛选上下文',
+                placeholder: '筛选上下文', value: query, onChange: e => setQuery(e.target.value) }),
+                !loaded ? h('span', { role: 'status' }, '正在读取上下文…') : loaded.error
+                  ? h('div', { role: 'alert' }, loaded.error, retryButton()) : rows.length ? rows.map((row, index) => {
+                    const rowKey = row.rowId || (row.key + ':' + row.id);
+                    const ref = row.memory && resolveMemoryLink?.(row.memory) || row;
+                    const { key, id } = ref;
+                    const linkKey = key + ':' + id;
+                    const valid = MV_LINK_KEYS.includes(key) && mvContextLinkValid(key, id);
+                    const selected = valid && (selectedRows.has(rowKey) ||
+                      (rowKey === linkKey && links[key].includes(id) && !hasReference(selectedRows, key, id)));
+                    const subtitle = [!valid ? '暂无可引用标识' : row.memory && key === 'sessionIds' && '引用来源会话',
+                      row.subtitle].filter(Boolean).join(' · ');
+                    return mvPickerChoice(valid ? rowKey : row.rowId || 'unavailable:' + index, row.label, selected,
+                      () => { if (valid) toggle(rowKey, ref, row.label); }, subtitle, !valid);
+                  }) : '没有匹配的上下文')))),
+        uploading && h('div', { role: 'status' }, '正在上传附件…'),
+        uploadValidation && h('div', { role: 'alert' }, uploadValidation),
+        uploadFailures.length > 0 && h('div', { role: 'alert' }, uploadFailures.join('；'),
+          h(MvButton, { label: '仅保留已上传附件', disabled: uploading, onClick: () => setUploadFailures([]) })),
+        error && h('div', { role: 'alert' }, error));
+    }
+
+    // Public names for sibling shards sharing the client factory.
+    const mvCascadePicker = {
+      MarshalAgentModelCascade: mvAgentModelCascade,
+      MarshalCascadeContextPicker: mvCascadeContextPicker,
+      mvUploadPickerAttachments,
+    };
+    // Reuse the sidebar helpers without changing the sidebar entry points.
+    function mvValidateSidebarGroupMentions(text, group, cross) {
+      return validateSidebarGroupMentions(text, group, cross);
+    }
+    function mvCrossGroupDeliveryError(result) {
+      return marshalCrossGroupDeliveryError(result);
+    }
+
     function GroupsPage({ openSession, onOpenAgents }) {
       const [state, setState] = React.useState(null);
       const [library, setLibrary] = React.useState(null);
       const [selected, setSelected] = React.useState(null);
-      const [group, setGroup] = React.useState(null);
-      const [text, setText] = React.useState('');
+      const [loadedGroup, setGroup] = React.useState(null);
+      const group = loadedGroup?.id === selected ? loadedGroup : null;
       const [error, setError] = React.useState('');
       const [busy, setBusy] = React.useState(false);
       const [notice, setNotice] = React.useState('');
@@ -1661,32 +5242,32 @@ window.__ModuleLoader__.load({
       const agents = library && Array.isArray(library.agents) ? library.agents : [];
       const groups = (state && state.groups) || [];
 
-      const load = async () => {
-        try {
-          const [groupsState, agentLibrary] = await Promise.all([fetchJson('marshal/groups/state'), loadAgentLibrary()]);
-          setState(groupsState);
-          setLibrary(agentLibrary);
-          setError('');
-        }
-        catch (e) { setError(friendlyError(e, '智能体/群聊')); }
-      };
-      const reloadGroup = async () => {
-        if (!group) return;
-        const fresh = await fetchJson('marshal/groups/get?id=' + encodeURIComponent(group.id));
-        setGroup(fresh.group);
-      };
-      React.useEffect(() => { void load(); }, []);
+      const listRefresh = React.useRef(null);
+      const detailRefresh = React.useRef(null);
+      const load = () => listRefresh.current?.request();
+      const reloadGroup = () => detailRefresh.current?.request();
       React.useEffect(() => {
-        if (!selected) { setGroup(null); return; }
-        let alive = true;
-        const pull = () => {
-          fetchJson('marshal/groups/get?id=' + encodeURIComponent(selected))
-            .then(data => { if (alive) setGroup(data.group); })
-            .catch(e => { if (alive) setError('读取群失败：' + (e.message || e)); });
-        };
-        pull();
-        const timer = setInterval(pull, 2000);
-        return () => { alive = false; clearInterval(timer); };
+        const refresh = createVisibleMarshalRefresh(async signal => {
+          try {
+            const [groupsState, agentLibrary] = await Promise.all([fetchJson('marshal/groups/state', undefined, true, signal), loadAgentLibrary()]);
+            if (!signal.aborted) { setState(groupsState); setLibrary(agentLibrary); }
+          } catch (e) { if (!signal.aborted) setError(friendlyError(e, '智能体/群聊')); }
+        });
+        listRefresh.current = refresh;
+        const unsubscribe = subscribeMarshalEvents(['ready', 'groups.changed', 'agents.changed'], refresh.request, { initial: true, debounceMs: 80 });
+        return () => { listRefresh.current = null; unsubscribe(); refresh.dispose(); };
+      }, []);
+      React.useEffect(() => {
+        if (!selected) return;
+        const refresh = createVisibleMarshalRefresh(async signal => {
+          try {
+            const data = await fetchJson('marshal/groups/get?' + new URLSearchParams({ id: selected }), undefined, true, signal);
+            if (!signal.aborted) setGroup(data.group);
+          } catch (e) { if (!signal.aborted) setError('读取群失败：' + e.message); }
+        });
+        detailRefresh.current = refresh;
+        const unsubscribe = subscribeMarshalEvents(['ready', 'groups.changed', 'agents.changed'], refresh.request, { initial: true, debounceMs: 80 });
+        return () => { detailRefresh.current = null; unsubscribe(); refresh.dispose(); };
       }, [selected]);
 
       const create = async () => {
@@ -1709,13 +5290,13 @@ window.__ModuleLoader__.load({
           }));
           const leader = chosen.find(agent => agent.id === (leaderId || chosen[0].id)) || chosen[0];
           const leaderKey = deviceId + '/' + leader.squadId + '/' + leader.id;
-          const created = await fetchJson('marshal/groups/create', { name: draftName.trim(), members, leaderKey });
+          const created = await fetchJson('marshal/groups/create', { name: draftName.trim(), members, leaderKey }, true);
           const id = created.group.id;
           for (const agent of chosen) {
             try {
               const run = await fetchJson('dsh-agents/api/run', { teamId: agent.squadId, memberId: agent.id });
               const sessionId = run && run.run && run.run.sessionId;
-              if (sessionId) await fetchJson('marshal/groups/bind', { id, key: deviceId + '/' + agent.squadId + '/' + agent.id, sessionId });
+              if (sessionId) await fetchJson('marshal/groups/bind', { id, key: deviceId + '/' + agent.squadId + '/' + agent.id, sessionId }, true);
             }
             catch (e) { setError('会话创建失败（' + agent.name + '）：' + (e.message || e)); }
           }
@@ -1730,24 +5311,22 @@ window.__ModuleLoader__.load({
         finally { setCreating(false); }
       };
 
-      const send = async () => {
-        if (!group || !text.trim()) return;
-        setBusy(true);
-        setError('');
-        try {
-          const result = await fetchJson('marshal/groups/send', { id: group.id, text });
-          if (result && result.error === 'leader-unavailable') {
-            throw new Error('leader 所在设备离线，这个群暂时不可用');
-          }
-          if (result && Array.isArray(result.offline) && result.offline.length > 0) {
-            setNotice('成员离线：' + result.offline.join('、') + (result.fallback ? '；已通知 leader 新建临时智能体或改派' : ''));
-          }
-          setText('');
-          await reloadGroup();
-          setState(await fetchJson('marshal/groups/state'));
-        }
-        catch (e) { setError('发送失败：' + (e.message || e)); }
-        finally { setBusy(false); }
+      const send = async (text, context) => {
+        const mentions = mvValidateSidebarGroupMentions(text, group, false);
+        const result = await fetchJson('marshal/groups/send', { id: group.id, text: mvChatWireText(text, context), mentions }, true);
+        if (result?.error === 'leader-unavailable') throw new Error('群主所在设备离线，这个群暂时不可用');
+        if (result?.offline?.length) setNotice('成员离线：' + result.offline.join('、'));
+        void reloadGroup();
+        void load();
+      };
+      const changeModel = async ({ agentId, model, reasoningEffort }) => {
+        const member = group.members.find(row => mvChatMemberId(row) === agentId);
+        const agent = agents.find(row => row.id === member?.memberId && row.squadId === member?.squadId);
+        if (!agent) throw new Error('只能更新本机智能体的默认模型与思考。');
+        const { id, name, brief, preset, permission } = agent;
+        await fetchJson('dsh-agents/api/member', { teamId: agent.squadId, member: { id, name, brief, preset, permission, model, reasoningEffort } });
+        setNotice('已更新智能体默认模型与思考；现有常驻会话不受影响。');
+        void load();
       };
 
       const convertToTask = async (message) => {
@@ -1756,7 +5335,7 @@ window.__ModuleLoader__.load({
         setError('');
         setNotice('');
         try {
-          const data = await fetchJson('marshal/groups/task', { id: group.id, messageId: message.id });
+          const data = await fetchJson('marshal/groups/task', { id: group.id, messageId: message.id }, true);
           setNotice('已创建任务：' + ((data && data.task && data.task.title) || ''));
           await reloadGroup();
         }
@@ -1765,7 +5344,7 @@ window.__ModuleLoader__.load({
       };
 
       const ensureSession = async (member) => {
-        if (!group || !library) return;
+        if (!group || !library || busy) return;
         setBusy(true);
         setError('');
         try {
@@ -1773,7 +5352,7 @@ window.__ModuleLoader__.load({
           const run = await fetchJson('dsh-agents/api/run', { teamId: member.squadId, memberId: member.memberId });
           const sessionId = run && run.run && run.run.sessionId;
           if (!sessionId) throw new Error('no-session');
-          await fetchJson('marshal/groups/bind', { id: group.id, key, sessionId });
+          await fetchJson('marshal/groups/bind', { id: group.id, key, sessionId }, true);
           await reloadGroup();
         }
         catch (e) { setError('创建会话失败：' + (e.message || e)); }
@@ -1792,34 +5371,6 @@ window.__ModuleLoader__.load({
           h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, item.name),
           h('span', { style: { fontSize: 11, color: dswTheme.faint, flexShrink: 0 } }, item.memberCount + ' 人')),
         h('div', { style: { fontSize: 11, color: dswTheme.faint, marginTop: 3 } }, item.messageCount + ' 条消息' + (item.mode === 'discussion' ? ' · 讨论' : '')));
-
-      const memberChip = member => h('button', {
-        key: member.memberId, type: 'button',
-        onClick: () => { if (member.sessionId) { if (openSession) openSession(member.sessionId); } else void ensureSession(member); },
-        style: {
-          display: 'inline-flex', alignItems: 'center', gap: 6, border: '1px solid ' + dswTheme.border2,
-          background: 'transparent', color: dswTheme.text, borderRadius: 999, padding: '4px 10px 4px 4px',
-          fontSize: 12, cursor: 'pointer', fontFamily: 'inherit',
-        },
-      }, h(Avatar, { name: member.name, size: 22 }), member.name,
-        h('span', { style: { color: member.sessionId ? dswTheme.faint : dswTheme.brand, fontSize: 11 } }, member.sessionId ? '打开' : '建会话'));
-
-      const messageView = message => {
-        const mine = message.author === 'user';
-        const name = mine ? '我' : ((group && group.members.find(member => member.memberId === message.authorMemberId)) || {}).name || '成员';
-        return h('div', { key: message.id, style: { display: 'flex', gap: 10, alignItems: 'flex-start', flexDirection: mine ? 'row-reverse' : 'row' } },
-          h(Avatar, { name, size: 28 }),
-          h('div', { style: { maxWidth: '74%' } },
-            h('div', { style: { fontSize: 11, color: dswTheme.faint, marginBottom: 4, textAlign: mine ? 'right' : 'left' } },
-              name + ' · ' + new Date(message.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })),
-            h('div', { style: { padding: '9px 12px', borderRadius: 12, background: mine ? dswTheme.layer3 : dswTheme.layer, border: '1px solid ' + dswTheme.border, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontSize: 13, lineHeight: 1.6 } }, message.text),
-            h('div', { style: { display: 'flex', gap: 8, alignItems: 'center', marginTop: 4, justifyContent: mine ? 'flex-end' : 'flex-start' } },
-              message.deliveries && message.deliveries.length > 0 && h('span', { style: { fontSize: 11, color: dswTheme.faint } },
-                message.deliveries.map(delivery => delivery.memberKey.split('/').pop() + (delivery.state === 'accepted' ? ' ✓' : ' ✕ ' + (delivery.code || ''))).join('  ')),
-              mine && (message.taskId
-                ? h('span', { style: { fontSize: 11, color: dswTheme.faint } }, '已建任务')
-                : h('button', { type: 'button', style: { ...uiButton(false), padding: '2px 8px', fontSize: 11 }, onClick: () => { void convertToTask(message); } }, '变任务')))));
-      };
 
       const createDialog = () => h('div', { style: { position: 'absolute', inset: 0, background: 'rgba(0,0,0,.48)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 20, padding: 20 } },
         h('div', { role: 'dialog', 'aria-label': '新建群聊', style: { width: 480, maxWidth: '100%', maxHeight: '86%', overflow: 'auto', background: dswTheme.layer, border: '1px solid ' + dswTheme.border2, borderRadius: 14, padding: 20, boxShadow: '0 24px 60px rgba(0,0,0,.45)' } },
@@ -1854,13 +5405,13 @@ window.__ModuleLoader__.load({
             h('button', { type: 'button', style: uiButton(false), onClick: () => setCreateOpen(false) }, '取消'),
             h('button', { type: 'button', disabled: creating, style: { ...uiButton(true), opacity: creating ? .6 : 1 }, onClick: () => { void create(); } }, creating ? '创建中…' : '创建并开会话'))));
 
-      return h('section', { style: { flex: 1, minHeight: 0, display: 'flex', position: 'relative', background: dswTheme.bg, color: dswTheme.text } },
+      return h('section', { className: 'mv-scope mv-room-fill', style: { position: 'relative' }, 'aria-label': '群聊' },
         h('aside', { style: { width: 292, flexShrink: 0, background: dswTheme.layer, borderRight: '1px solid ' + dswTheme.border, display: 'flex', flexDirection: 'column', minHeight: 0 } },
           h('div', { style: { padding: '14px 14px 10px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' } },
             h('div', null,
               h('div', { style: { fontSize: 13, fontWeight: 600 } }, '群聊'),
               h('div', { style: uiMuted }, groups.length + ' 个会话')),
-            h('button', { type: 'button', style: uiButton(true), onClick: () => setCreateOpen(true) }, '＋ 新建')),
+            h('button', { type: 'button', style: uiButton(true), onClick: () => setCreateOpen(true) }, '新建')),
           h('div', { style: { flex: 1, overflow: 'auto', padding: '2px 8px 10px' } },
             groups.map(groupRow),
             groups.length === 0 && h('p', { style: { ...uiMuted, padding: '10px 6px' } }, '还没有群聊')),
@@ -1870,20 +5421,15 @@ window.__ModuleLoader__.load({
         h('main', { style: { flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', minHeight: 0 } },
           error && h('div', { style: { padding: '8px 18px', fontSize: 12, color: dswTheme.danger, borderBottom: '1px solid ' + dswTheme.border } }, error),
           group
-            ? h('div', { style: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' } },
-                h('header', { style: { padding: '14px 20px', borderBottom: '1px solid ' + dswTheme.border, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexShrink: 0 } },
-                  h('div', null,
-                    h('div', { style: { fontSize: 15, fontWeight: 600 } }, group.name),
-                    h('div', { style: uiMuted }, group.members.length + ' 个智能体 · 不 @ 由 leader 回')),
-                  h('button', { type: 'button', style: uiButton(false), onClick: () => { void reloadGroup(); } }, '刷新')),
-                h('div', { style: { padding: '10px 20px', display: 'flex', gap: 8, flexWrap: 'wrap', borderBottom: '1px solid ' + dswTheme.border, flexShrink: 0 } }, group.members.map(memberChip)),
-                h('div', { style: { flex: 1, minHeight: 0, overflow: 'auto', padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 14 } },
-                  (group.messages || []).length === 0
-                    ? h('div', { style: { margin: 'auto', textAlign: 'center', color: dswTheme.faint, fontSize: 12, lineHeight: 1.8 } }, '还没有消息', h('br'), '@ 某个智能体，或直接说话让 leader 接。')
-                    : (group.messages || []).map(messageView)),
-                h('div', { style: { padding: '12px 20px', borderTop: '1px solid ' + dswTheme.border, display: 'flex', gap: 10, alignItems: 'flex-end', flexShrink: 0 } },
-                  h('textarea', { value: text, onChange: event => setText(event.target.value), rows: 2, placeholder: '@成员名 或 @all；不 @ 时由 leader 回', style: { ...uiInput, flex: 1, resize: 'none', minHeight: 44, lineHeight: 1.5 } }),
-                  h('button', { type: 'button', disabled: busy || !text.trim(), style: { ...uiButton(true), opacity: busy || !text.trim() ? .5 : 1 }, onClick: () => { void send(); } }, '发送')))
+            ? h(mvGroupConversation, { key: group.id, group, onSend: send, changeModel,
+                members: group.members.map(member => {
+                  const agent = agents.find(row => row.id === member.memberId && row.squadId === member.squadId);
+                  const model = agent?.model || member.model;
+                  return { ...member, model, reasoningEffort: agent?.reasoningEffort || member.reasoningEffort,
+                    models: agent ? mvChatModelsWithCurrent(mvChatModels(library?.models), model) : [] };
+                }), onMember: member => member.sessionId ? openSession?.(member.sessionId) : ensureSession(member),
+                onRebuildSession: ensureSession,
+                onTask: convertToTask, busy, notice }, mvGroupRefreshButton(reloadGroup))
             : h(EmptyState, { title: '选择一个群聊', hint: '群里的智能体各自有一个常驻会话。\n@ 谁谁回，@all 全体回，不 @ 由 leader 回。', action: '新建群聊', onAction: () => setCreateOpen(true) })),
         createOpen && createDialog());
     }
@@ -1898,73 +5444,36 @@ window.__ModuleLoader__.load({
       const [createOpen, setCreateOpen] = React.useState(false);
       const [name, setName] = React.useState('');
       const [picked, setPicked] = React.useState({});
-      const [text, setText] = React.useState('');
       const [busy, setBusy] = React.useState(false);
-      const [, setTick] = React.useState(0);
-      const reveal = React.useRef(new Map());
-      const seenMessages = React.useRef(false);
-      const lastGroupId = React.useRef('');
+      const refreshRef = React.useRef(null);
       const groups = (state && state.groups) || [];
       const group = groups.find(item => item.id === selected) || null;
       const devices = (catalog && catalog.devices) || [];
 
-      const load = async () => {
-        try {
-          const [nextState, nextCatalog] = await Promise.all([
-            fetchJson('marshal/cross-groups/state'),
-            fetchJson('marshal/cross-groups/catalog'),
+      React.useEffect(() => {
+        // The local SSE stream does not relay changes made on the Hub.
+        const refresh = createVisibleMarshalRefresh(async signal => {
+          const [nextState, nextCatalog] = await Promise.allSettled([
+            fetchJson('marshal/cross-groups/state', undefined, true, signal),
+            fetchJson('marshal/cross-groups/catalog', undefined, true, signal),
           ]);
-          setState(nextState);
-          setCatalog(nextCatalog);
-          setError('');
-        }
-        catch (e) { setError('跨设备路由不可用：' + (e.message || e)); }
-      };
-      React.useEffect(() => { void load(); }, []);
-      React.useEffect(() => {
-        let alive = true;
-        const timer = setInterval(() => {
-          fetchJson('marshal/cross-groups/state')
-            .then(next => { if (alive) setState(next); })
-            .catch(() => {});
-        }, 350);
-        return () => { alive = false; clearInterval(timer); };
+          if (signal.aborted) return;
+          if (nextState.status === 'fulfilled') setState(nextState.value);
+          if (nextCatalog.status === 'fulfilled') setCatalog(nextCatalog.value);
+          const failure = [nextState, nextCatalog].find(result => result.status === 'rejected');
+          setError(failure ? '跨设备路由不可用：' + (failure.reason?.message || failure.reason) : '');
+        }, 12_000);
+        refreshRef.current = refresh;
+        refresh.setPolling(true);
+        const unsubscribe = subscribeMarshalEvents(['ready', 'groups.changed', 'agents.changed'],
+          refresh.request, { initial: true, debounceMs: 80 });
+        return () => {
+          refreshRef.current = null;
+          refresh.dispose();
+          unsubscribe();
+        };
       }, []);
-      const messageSignature = group === null ? '' : group.messages.map(message => message.id + ':' + message.text.length).join(',');
-      React.useEffect(() => {
-        if (group === null) return;
-        const map = reveal.current;
-        if (lastGroupId.current !== group.id) {
-          lastGroupId.current = group.id;
-          map.clear();
-          for (const message of group.messages) map.set(message.id, message.text.length);
-          seenMessages.current = true;
-          setTick(value => value + 1);
-          return;
-        }
-        if (!seenMessages.current) {
-          for (const message of group.messages) map.set(message.id, message.text.length);
-          seenMessages.current = true;
-          setTick(value => value + 1);
-          return;
-        }
-        for (const message of group.messages) {
-          if (!map.has(message.id)) map.set(message.id, message.streaming === true ? message.text.length : 0);
-        }
-        const timer = setInterval(() => {
-          let changed = false;
-          for (const message of group.messages) {
-            const target = message.text.length;
-            const current = map.get(message.id) ?? target;
-            if (current >= target) continue;
-            map.set(message.id, Math.min(target, current + 2));
-            changed = true;
-          }
-          if (changed) setTick(value => value + 1);
-        }, 25);
-        return () => clearInterval(timer);
-      }, [group === null ? '' : group.id, messageSignature]);
-
+      const load = () => refreshRef.current?.request();
       const candidates = [];
       for (const device of devices) {
         for (const member of device.members || []) {
@@ -1982,7 +5491,7 @@ window.__ModuleLoader__.load({
           const data = await fetchJson('marshal/cross-groups/create', {
             name: name.trim(),
             members: members.map(item => ({ deviceId: item.deviceId, agent: item.agent, sessionId: item.sessionId, name: item.name })),
-          });
+          }, true);
           setSelected(data.group.id);
           setCreateOpen(false); setName(''); setPicked({});
           await load();
@@ -1991,31 +5500,18 @@ window.__ModuleLoader__.load({
         finally { setBusy(false); }
       };
 
-      const send = async () => {
-        if (!group || !text.trim()) return;
-        const mentions = [];
-        const pattern = /@([^\s@]+)/g;
-        let match;
-        while ((match = pattern.exec(text)) !== null) if (!mentions.includes(match[1])) mentions.push(match[1]);
-        setBusy(true); setError('');
-        try {
-          const result = await fetchJson('marshal/cross-groups/send', { id: group.id, text, mentions });
-          if (result && Array.isArray(result.deliveries)) {
-            const failed = result.deliveries.filter(item => item.state === 'failed');
-            if (failed.length > 0) setError('部分成员失败：' + failed.map(item => item.name + ' ' + (item.code || '')).join('、'));
-          }
-          setText('');
-          await load();
-        }
-        catch (e) { setError('发送失败：' + (e.message || e)); }
-        finally { setBusy(false); }
+      const send = async (text, context) => {
+        const mentions = mvValidateSidebarGroupMentions(text, group, true);
+        const result = await fetchJson('marshal/cross-groups/send', { id: group.id, text: mvChatWireText(text, context), mentions }, true);
+        void load();
+        return mvCrossGroupDeliveryError(result);
       };
 
-      return h('div', { style: { flex: 1, minHeight: 0, display: 'flex' } },
+      return h('div', { className: 'mv-scope mv-room-fill', 'aria-label': '跨设备群聊' },
         h('aside', { style: { width: 260, borderRight: '1px solid ' + dswTheme.border, display: 'flex', flexDirection: 'column' } },
           h('div', { style: { padding: 12, display: 'flex', alignItems: 'center', justifyContent: 'space-between' } },
             h('div', { style: { fontSize: 13, fontWeight: 600 } }, '跨设备群聊'),
-            h('button', { type: 'button', style: uiButton(true), onClick: () => setCreateOpen(value => !value) }, '＋ 新建')),
+            h('button', { type: 'button', style: uiButton(true), onClick: () => setCreateOpen(value => !value) }, '新建')),
           createOpen && h('div', { style: { padding: 12, borderBottom: '1px solid ' + dswTheme.border, display: 'grid', gap: 8 } },
             h('input', { value: name, onChange: event => setName(event.target.value), placeholder: '群名称', style: uiInput }),
             candidates.length === 0 && h('div', { style: uiMuted }, '没有带常驻会话的成员；先在各设备打开智能体私聊。'),
@@ -2033,27 +5529,147 @@ window.__ModuleLoader__.load({
           error && h('div', { style: { padding: '8px 16px', color: dswTheme.danger, fontSize: 12 } }, error),
           group === null
             ? h(EmptyState, { title: '选择一个跨设备群', hint: '成员各自在自己的设备上，用常驻会话回复。' })
-            : h(React.Fragment, null,
-              h('header', { style: { padding: '12px 16px', borderBottom: '1px solid ' + dswTheme.border, display: 'flex', justifyContent: 'space-between', alignItems: 'center' } },
-                h('div', null,
-                  h('div', { style: { fontSize: 14, fontWeight: 600 } }, group.name),
-                  h('div', { style: uiMuted }, group.members.map(member => member.name + ' · ' + member.deviceId).join(' / '))),
-                h('button', { type: 'button', style: uiButton(false), onClick: () => { void load(); } }, '刷新')),
-              h('div', { style: { flex: 1, overflow: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 8 } },
-                group.messages.length === 0 ? h('p', { style: uiMuted }, '还没有消息') : group.messages.map(message => h('div', {
-                  key: message.id,
-                  'data-group-message': message.id,
-                  'data-group-role': message.role,
-                  style: { alignSelf: message.role === 'user' ? 'flex-end' : 'flex-start', maxWidth: '80%', padding: '8px 10px', borderRadius: 10, background: message.role === 'user' ? 'color-mix(in srgb, #4c8bf5 18%, transparent)' : 'color-mix(in srgb, currentColor 8%, transparent)' },
-                },
-                  h('div', { style: { fontSize: 11, opacity: .6 } }, message.author + ' · ' + new Date(message.at).toLocaleTimeString()),
-                  (() => { const shown = message.role === 'user' || message.streaming === true ? message.text : message.text.slice(0, reveal.current.get(message.id) ?? message.text.length); return h('div', { style: { whiteSpace: 'pre-wrap', fontSize: 13, lineHeight: 1.6 } }, shown); })())),
-                (group.active || []).length > 0 && h('div', { style: { alignSelf: 'flex-start', color: dswTheme.dim, fontSize: 12 } }, '成员正在生成…')),
-              h('div', { style: { padding: 12, borderTop: '1px solid ' + dswTheme.border, display: 'flex', gap: 8 } },
-                h('textarea', { value: text, onChange: event => setText(event.target.value), rows: 2, placeholder: '@成员名 或直接说话让 leader 接', style: { ...uiInput, flex: 1, resize: 'vertical' } }),
-                h('button', { type: 'button', disabled: busy, style: { ...uiButton(true), opacity: busy ? .6 : 1 }, onClick: () => { void send(); } }, '发送')))));
+            : h(mvGroupConversation, { key: group.id, cross: true, group, members: group.members.map(member => {
+                const device = devices.find(item => item.id === member.deviceId);
+                const current = device?.members?.find(item => item.sessionId === member.sessionId);
+                return { ...member, deviceName: device?.name || member.deviceName,
+                  model: current?.model || member.model, reasoningEffort: current?.reasoningEffort || member.reasoningEffort };
+              }),
+                onSend: send, busy }, mvGroupRefreshButton(load), (group.messages ?? []).map(row =>
+                  mvChatMessage({ mine: row.role === 'user', name: row.author, at: row.at, text: row.text,
+                    streaming: row.streaming, messageId: row.id, children: mvChatDeliveries(row.deliveries) })))));
     }
 
+    function mvChatModels(models = []) {
+      const rows = models.map(item => ({ ...item, route: item.route || (item.provider && item.model ? item.provider + '/' + item.model : item.id),
+        efforts: item.efforts ?? item.reasoning?.efforts?.map(e => typeof e === 'string' ? e : e.id).filter(Boolean) }));
+      return [...new Map(rows.filter(row => row.route).map(row => [row.route, row])).values()];
+    }
+
+    function mvChatModelsWithCurrent(models, model) {
+      return model && !models.some(item => item.route === model) ? [{ route: model }, ...models] : models;
+    }
+
+    function mvChatLinks(context) {
+      const links = Object.fromEntries(Object.entries(context.links ?? {}).filter(([, ids]) => ids.length));
+      return Object.keys(links).length ? links : undefined;
+    }
+
+    function mvChatWireText(text, context) {
+      // Group endpoints accept text only. Use reference IDs, not local paths to
+      // uploaded files, and avoid interpreting @ in reference labels as delivery targets.
+      const links = mvChatLinks(context);
+      if (!links) return text;
+      const labels = { sessionIds: '会话', proposalIds: '工单或记忆', docPaths: '文档' };
+      return text + '\n\n关联上下文：\n' + Object.entries(links).flatMap(([key, ids]) =>
+        ids.map(id => `${labels[key] || key}：${id.replaceAll('@', '＠')}`)).join('\n');
+    }
+
+    function mvChatMemberId(member) {
+      return member.key || [member.deviceId, member.squadId, member.memberId || member.sessionId || member.name].filter(Boolean).join('/');
+    }
+
+    function mvChatMentions({ members, usage, all, input, setText }) {
+      const chip = (key, name, role) => {
+        const count = usage?.get(name);
+        return h('button', { type: 'button', key, className: 'mv-btn mv-chip', onClick: () => {
+          setText(current => (current.trimEnd() ? current.trimEnd() + ' ' : '') + '@' + name + ' ');
+          input.current?.focus();
+        } }, '@' + name, role && ' · ' + role, count > 0 && ' · ' + formatTokenCount(count) + ' tok');
+      };
+      return h('div', { className: 'mv-actions', 'aria-label': '提及成员' },
+        members.map(member => chip(member.id || mvChatMemberId(member), member.name, member.role)), all && chip('all', '全体'));
+    }
+
+    function mvChatMessage({ mine, name, at, phase, text, trace, live, streaming, messageId, accent, children }) {
+      const u = trace?.usage;
+      const total = Number(u?.totalTokens) || Number(u?.inputTokens || 0) + Number(u?.outputTokens || 0);
+      return h('article', { key: messageId, className: 'mv-room-message', style: { marginInlineStart: mine ? 'var(--mv-xl)' : undefined,
+        borderInlineStart: !mine && accent ? '2px solid ' + accent : undefined, marginInlineEnd: mine ? undefined : 'var(--mv-xl)', background: mine ? 'var(--dsw-alias-marshal-tint)' : undefined } },
+        h('div', { className: 'mv-actions mv-muted' }, h('strong', null, mine ? '我' : name),
+          at != null && h('time', null, new Date(at).toLocaleTimeString()),
+          phase && taskPhases[phase] && h('span', null, taskPhases[phase]),
+          total > 0 && h('span', { className: 'mv-time', title: formatUsageTitle(u) },
+            formatTokenCount(total) + ' tok (入 ' + (formatTokenCount(Number(u.inputTokens)) || '0') + ' · 出 ' + (formatTokenCount(Number(u.outputTokens)) || '0') + ')'),
+          (live || streaming) && h('span', null, live ? '思考/处理中' : '生成中')),
+        trace && h(AgentTracePanel, { trace, live, hasBody: Boolean(text?.trim()) }),
+        text && (streaming ? h('div', null, text) : h(RichMarkdown, { text, phase })), children);
+    }
+
+    function mvChatDeliveries(deliveries) {
+      return deliveries?.length > 0 && h('p', { className: 'mv-muted' }, deliveries.map(item =>
+        (item.name || item.memberKey?.split('/').pop() || '成员') + (item.state === 'accepted' ? ' 已送达' : ' ' + (item.code || item.state))).join(' · '));
+    }
+
+    function mvGroupRefreshButton(refresh) {
+      return h('button', { type: 'button', className: 'mv-btn', onClick: refresh }, '刷新');
+    }
+
+    function mvGroupConversation({ cross, group, members, onSend, changeModel, onMember, onRebuildSession, onTask, busy, notice, children }) {
+      const [refreshButton, crossTranscript] = Array.isArray(children) ? children : [children];
+      const [draft, setDraft] = React.useState('');
+      const [context, setContext] = React.useState({});
+      const [sending, setSending] = React.useState(false);
+      const [error, setError] = React.useState('');
+      const [panel, setPanel] = React.useState(false);
+      const input = React.useRef(null);
+      const stream = React.useRef(null);
+      const stick = React.useRef(true);
+      const pending = React.useRef(false);
+      const messages = group.messages ?? [];
+      const messageVersion = messages.map(row => row.id + ':' + row.text?.length).join(',');
+      React.useEffect(() => {
+        if (stick.current && stream.current) stream.current.scrollTop = stream.current.scrollHeight;
+      }, [messageVersion]);
+      const send = async () => {
+        if (!draft.trim() || pending.current) return;
+        if (context.attachments?.length) { setError('当前群聊只支持上下文引用。请移除文件后再发送。'); return; }
+        pending.current = true;
+        setSending(true); setError('');
+        try {
+          const warning = await onSend(draft.trim(), context);
+          setDraft(current => current === draft ? '' : current);
+          setContext(current => current === context ? {} : current);
+          if (warning) setError(warning);
+          stick.current = true;
+        } catch (e) { setError('发送失败：' + e.message); }
+        finally { pending.current = false; setSending(false); }
+      };
+      const roster = h('div', { className: 'mv-stack' }, members.map(member => h('div', { key: mvChatMemberId(member), className: 'mv-task-item' },
+        h('strong', null, member.name), h('div', { className: 'mv-muted' }, [member.deviceName || member.deviceId,
+          member.model || (cross ? '模型未上报' : '默认模型'), member.reasoningEffort].filter(Boolean).join(' · ')),
+        onMember && h('button', { type: 'button', className: 'mv-btn', disabled: !member.sessionId && busy, onClick: () => onMember(member) }, member.sessionId ? '打开会话' : '建立会话'),
+        member.sessionId && onRebuildSession && h('button', { type: 'button', className: 'mv-btn', disabled: busy, onClick: () => onRebuildSession(member) }, '重建会话'))),
+        h('strong', null, '关联工单'),
+        [...new Set(messages.map(row => row.taskId).filter(Boolean))].map(id => h('div', { key: id }, id)),
+        !messages.some(row => row.taskId) && h('span', { className: 'mv-muted' }, '暂无关联工单'));
+      return h('div', { className: 'mv-room-fill' }, h('section', { className: 'mv-room', style: { overflow: 'visible' } },
+        h('header', { className: 'mv-dag-header mv-actions' }, h('strong', { className: 'mv-copy mv-truncate' }, group.name),
+          refreshButton,
+          h('button', { type: 'button', className: 'mv-btn', 'aria-pressed': panel, onClick: () => setPanel(v => !v) }, '群聊成员')),
+        (notice || error) && h('div', { role: error ? 'alert' : 'status', className: error ? 'mv-danger' : 'mv-muted' }, error || notice),
+        h('div', { ref: stream, className: 'mv-room-log', 'aria-label': '群聊记录', onScroll: e => {
+          const el = e.currentTarget; stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+        } }, messages.length === 0 && h('p', { className: 'mv-muted' }, '还没有消息'),
+        crossTranscript ?? messages.map(message => {
+          const mine = message.role === 'user' || message.author === 'user';
+          const name = members.find(member => member.memberId === message.authorMemberId)?.name || '成员';
+          return h(mvChatMessage, { key: message.id, mine, name, at: message.at ?? message.ts, text: message.text, streaming: message.streaming },
+            onTask && mine && !message.taskId && h('button', { type: 'button', className: 'mv-btn', disabled: busy, onClick: () => onTask(message) }, '创建工单'),
+            mvChatDeliveries(message.deliveries));
+        }), group.active?.length > 0 && h('p', { className: 'mv-muted' }, '成员正在生成…')),
+        h('footer', { className: 'mv-composer-dock' },
+          h(mvChatMentions, { members, all: !cross, input, setText: setDraft }),
+          h('textarea', { ref: input, className: 'mv-field', value: draft, rows: 2, 'aria-label': '群聊消息', placeholder: '输入消息或 @成员', onChange: e => setDraft(e.target.value) }),
+          h('div', { className: 'mv-actions' },
+            !cross && h(mvCascadePicker.MarshalAgentModelCascade, {
+              agents: members.map(member => ({ ...member, id: mvChatMemberId(member), models: member.models ?? [] })), onApply: changeModel }),
+            h('span', { className: 'mv-muted' }, cross ? '跨设备成员模型只读（由所在设备管理）' : '默认模型与思考，新会话生效'),
+            h(mvCascadePicker.MarshalCascadeContextPicker, { value: context, onChange: setContext }),
+            context.attachments?.length > 0 && h('span', { className: 'mv-muted' }, '此群只能发送关联引用，不能发送文件。'),
+            h('button', { type: 'button', className: 'mv-btn mv-guidance-action', disabled: busy || sending || !draft.trim(), onClick: send }, '发送')))),
+        panel && h(mvDagSidebar.MarshalVerticalDagSidebar, { members: roster }));
+    }
     const taskPhases = {
       selecting: 'Leader 选择编排',
       material: '读取 PR 快照',
@@ -2635,147 +6251,877 @@ window.__ModuleLoader__.load({
           h(RichMarkdown, { text: report })));
     }
 
-    function ensureTaskBoardStyles() {
-      if (typeof document === 'undefined') return;
-      const existing = document.getElementById('marshal-taskboard-styles');
-      const style = existing || document.createElement('style');
-      style.id = 'marshal-taskboard-styles';
-      style.textContent = [
-        '@keyframes mtb-pulse{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--mtb-accent) 55%,transparent)}70%{box-shadow:0 0 0 6px transparent}100%{box-shadow:0 0 0 0 transparent}}',
-        '@keyframes mtb-spin{to{transform:rotate(360deg)}}',
-        '.mtb-page{flex:1;min-height:0;min-width:0;width:100%;overflow:hidden;display:flex;flex-direction:column;position:relative;background:var(--dsw-alias-bg-base,transparent);color:var(--dsw-alias-label-primary,inherit)}',
-        '.mtb-head{padding:12px 20px;border-bottom:1px solid var(--dsw-alias-border-l1,color-mix(in srgb,currentColor 10%,transparent));display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;flex-shrink:0}',
-        '.mtb-head-left{display:flex;align-items:center;gap:14px;flex-wrap:wrap;min-width:0}',
-        '.mtb-head-right{display:flex;align-items:center;gap:8px;flex-shrink:0;flex-wrap:wrap}',
-        '.mtb-summary{display:flex;align-items:center;gap:6px;flex-wrap:wrap}',
-        '.mtb-summary-chip{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:999px;border:1px solid color-mix(in srgb,var(--mtb-accent) 28%,transparent);background:color-mix(in srgb,var(--mtb-accent) 10%,transparent);color:var(--dsw-alias-label-primary,inherit);font-size:11px;line-height:1.4;cursor:pointer;font-family:inherit;transition:background .15s,border-color .15s,transform .12s}',
-        '.mtb-summary-chip:hover{background:color-mix(in srgb,var(--mtb-accent) 18%,transparent);border-color:color-mix(in srgb,var(--mtb-accent) 52%,transparent);transform:translateY(-1px)}',
-        '.mtb-summary-chip strong{font-variant-numeric:tabular-nums;font-weight:700}',
-        '.mtb-tagbar{padding:8px 20px;border-bottom:1px solid var(--dsw-alias-border-l1,color-mix(in srgb,currentColor 8%,transparent));display:flex;align-items:center;gap:6px;flex-wrap:wrap;flex-shrink:0;background:color-mix(in srgb,currentColor 2%,transparent)}',
-        '.mtb-search{width:170px;box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 16%,transparent));background:var(--dsw-alias-bg-base,transparent);color:var(--dsw-alias-label-primary,inherit);border-radius:999px;padding:3.5px 10px;font-size:11.5px;font-family:inherit;outline:none}',
-        '.mtb-search:focus{border-color:var(--dsw-alias-brand-primary,#6366f1)}',
-        '.mtb-tagbar-label{font-size:11px;color:var(--dsw-alias-label-secondary,color-mix(in srgb,currentColor 60%,transparent));margin-left:4px}',
-        '.mtb-notice{padding:9px 20px;font-size:12px;display:flex;align-items:center;justify-content:space-between;gap:10px;background:color-mix(in srgb,#8b5cf6 14%,transparent);border-bottom:1px solid color-mix(in srgb,#8b5cf6 32%,transparent);color:var(--dsw-alias-label-primary,inherit)}',
-        '.mtb-warn-hint{padding:8px 11px;border-radius:9px;font-size:12px;line-height:1.5;background:color-mix(in srgb,#8b5cf6 13%,transparent);border:1px solid color-mix(in srgb,#8b5cf6 38%,transparent);color:var(--dsw-alias-label-primary,inherit)}',
-        '.mtb-tag{display:inline-flex;align-items:center;gap:4px;max-width:100%;border-radius:999px;padding:1.5px 8px;font-size:11px;line-height:1.5;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--dsw-alias-label-primary,inherit);border:1px solid var(--mtb-tag-border,color-mix(in srgb,currentColor 22%,transparent));background:var(--mtb-tag-fill,color-mix(in srgb,currentColor 8%,transparent))}',
-        '.mtb-tag-btn{cursor:pointer;font-family:inherit;transition:opacity .12s,transform .12s,box-shadow .12s}',
-        '.mtb-tag-btn:hover{transform:translateY(-1px)}',
-        '.mtb-tag-btn[data-active="true"]{box-shadow:0 0 0 1.5px var(--mtb-tag-border,currentColor);font-weight:600}',
-        '.mtb-tag-x{border:0;background:transparent;color:inherit;cursor:pointer;padding:0 1px;font-size:12px;line-height:1;opacity:.75}',
-        '.mtb-tag-x:hover{opacity:1}',
-        '.mtb-tag[data-tag-tone="0"]{--mtb-tag-fill:#4e93e82e;--mtb-tag-border:#4e93e870}',
-        '.mtb-tag[data-tag-tone="1"]{--mtb-tag-fill:#2ea36a2e;--mtb-tag-border:#2ea36a70}',
-        '.mtb-tag[data-tag-tone="2"]{--mtb-tag-fill:#d08a2a2e;--mtb-tag-border:#d08a2a70}',
-        '.mtb-tag[data-tag-tone="3"]{--mtb-tag-fill:#b456c82e;--mtb-tag-border:#b456c870}',
-        '.mtb-tag[data-tag-tone="4"]{--mtb-tag-fill:#cf5f7a2e;--mtb-tag-border:#cf5f7a70}',
-        '.mtb-tag[data-tag-tone="5"]{--mtb-tag-fill:#4a9fb52e;--mtb-tag-border:#4a9fb570}',
-        '.mtb-tag[data-tag-tone="p0"]{--mtb-tag-fill:#ef444432;--mtb-tag-border:#ef444482;font-weight:600;font-variant-numeric:tabular-nums}',
-        '.mtb-tag[data-tag-tone="p1"]{--mtb-tag-fill:#f59e0b32;--mtb-tag-border:#f59e0b82;font-weight:600;font-variant-numeric:tabular-nums}',
-        '.mtb-tag[data-tag-tone="p2"]{--mtb-tag-fill:#3b82f630;--mtb-tag-border:#3b82f67a;font-weight:600;font-variant-numeric:tabular-nums}',
-        '.mtb-tag[data-tag-tone="p3"]{--mtb-tag-fill:#64748b30;--mtb-tag-border:#64748b78;font-weight:600;font-variant-numeric:tabular-nums}',
-        '.mtb-grid{flex:1;min-height:0;min-width:0;width:100%;box-sizing:border-box;overflow-x:auto;overflow-y:hidden;padding:14px 18px 14px;display:flex;flex-direction:row;gap:12px;align-items:stretch;scrollbar-width:auto;scrollbar-color:var(--dsw-alias-border-l3,color-mix(in srgb,currentColor 32%,transparent)) color-mix(in srgb,currentColor 6%,transparent)}',
-        '.mtb-grid::-webkit-scrollbar{height:10px}',
-        '.mtb-grid::-webkit-scrollbar-track{background:color-mix(in srgb,currentColor 5%,transparent);border-radius:999px}',
-        '.mtb-grid::-webkit-scrollbar-thumb{background:var(--dsw-alias-border-l3,color-mix(in srgb,currentColor 32%,transparent));border-radius:999px;border:2px solid transparent;background-clip:content-box}',
-        '.mtb-grid::-webkit-scrollbar-thumb:hover{background:color-mix(in srgb,currentColor 48%,transparent)}',
-        '.mtb-col{flex:1 0 232px;min-width:232px;display:flex;flex-direction:column;min-height:0;max-height:100%;border-radius:14px;overflow:hidden;background:var(--dsw-alias-bg-layer-2,color-mix(in srgb,currentColor 4%,transparent));border:1px solid color-mix(in srgb,var(--mtb-accent) 22%,var(--dsw-alias-border-l1,color-mix(in srgb,currentColor 10%,transparent)));border-top:3px solid var(--mtb-accent);transition:border-color .15s,box-shadow .15s,background .15s,flex-basis .15s}',
-        '.mtb-col[data-collapsed="true"]{flex:0 0 44px;min-width:44px;max-width:44px;cursor:pointer;align-items:center;padding:10px 4px;gap:10px}',
-        '.mtb-col-rail-title{writing-mode:vertical-rl;text-orientation:mixed;font-size:12px;font-weight:600;letter-spacing:.12em;color:var(--dsw-alias-label-secondary,inherit);user-select:none}',
-        '.mtb-pan-btn{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:999px;border:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 18%,transparent));background:color-mix(in srgb,currentColor 5%,transparent);color:inherit;cursor:pointer;font-size:11px;padding:0;flex-shrink:0}',
-        '.mtb-pan-btn:hover{background:color-mix(in srgb,currentColor 13%,transparent)}',
-        '.mtb-pan-btn[data-active="true"]{border-color:var(--dsw-alias-brand-primary,#6366f1);color:var(--dsw-alias-brand-primary,#6366f1);background:color-mix(in srgb,var(--dsw-alias-brand-primary,#6366f1) 12%,transparent)}',
-        '.mtb-grid-wrap{flex:1;min-height:0;min-width:0;width:100%;position:relative;display:flex;overflow:hidden}',
-        '.mtb-grid[data-panning="true"]{cursor:grabbing;user-select:none}',
-        '.mtb-edge-pan{position:absolute;top:50%;transform:translateY(-50%);z-index:4;display:inline-flex;align-items:center;gap:4px;padding:7px 10px;border-radius:999px;border:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 22%,transparent));background:var(--dsw-alias-bg-layer-1,rgba(24,26,32,.92));color:var(--dsw-alias-label-primary,inherit);box-shadow:0 4px 14px rgba(0,0,0,.28);cursor:pointer;font-size:11.5px;font-weight:600;backdrop-filter:blur(8px);transition:transform .14s,background .14s}',
-        '.mtb-edge-pan:hover{transform:translateY(-50%) scale(1.03)}',
-        '.mtb-edge-pan-left{left:10px}',
-        '.mtb-edge-pan-right{right:10px}',
-        '.mtb-col[data-drop="true"]{border-color:var(--mtb-accent);box-shadow:0 0 0 2px color-mix(in srgb,var(--mtb-accent) 28%,transparent);background:color-mix(in srgb,var(--mtb-accent) 7%,var(--dsw-alias-bg-layer-2,transparent))}',
-        '.mtb-col-head{padding:10px 12px;display:flex;align-items:center;gap:8px;flex-shrink:0;background:color-mix(in srgb,var(--mtb-accent) 8%,transparent);border-bottom:1px solid color-mix(in srgb,var(--mtb-accent) 16%,transparent)}',
-        '.mtb-dot{width:8px;height:8px;border-radius:999px;background:var(--mtb-accent);flex-shrink:0}',
-        '.mtb-dot[data-pulse="true"]{animation:mtb-pulse 2s cubic-bezier(.4,0,.6,1) infinite}',
-        '.mtb-col-title{flex:1;min-width:0;font-size:13px;font-weight:600;letter-spacing:.01em;color:var(--dsw-alias-label-primary,inherit);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
-        '.mtb-count{font-size:11px;font-weight:600;font-variant-numeric:tabular-nums;padding:1px 8px;border-radius:999px;flex-shrink:0;background:color-mix(in srgb,var(--mtb-accent) 16%,transparent);color:var(--dsw-alias-label-primary,inherit);border:1px solid color-mix(in srgb,var(--mtb-accent) 30%,transparent)}',
-        '.mtb-col-body{flex:1;min-height:80px;overflow-y:auto;padding:10px;display:flex;flex-direction:column;gap:8px;scrollbar-width:thin}',
-        '.mtb-empty{padding:26px 12px;text-align:center;font-size:12px;color:var(--dsw-alias-label-secondary,color-mix(in srgb,currentColor 55%,transparent));border:1px dashed color-mix(in srgb,var(--mtb-accent) 24%,transparent);border-radius:10px;background:color-mix(in srgb,var(--mtb-accent) 3%,transparent)}',
-        '.mtb-card{position:relative;overflow:hidden;border-radius:10px;padding:10px 12px 9px 14px;display:flex;flex-direction:column;gap:6px;cursor:pointer;text-align:left;background:var(--dsw-alias-bg-base,color-mix(in srgb,currentColor 3%,transparent));border:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 13%,transparent));transition:transform .12s ease,box-shadow .12s ease,border-color .12s ease,opacity .12s ease}',
-        '.mtb-card::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3.5px;background:var(--mtb-accent);opacity:.92;pointer-events:none}',
-        '.mtb-card:hover{transform:translateY(-1px);border-color:color-mix(in srgb,var(--mtb-accent) 48%,var(--dsw-alias-border-l3,transparent));box-shadow:var(--dsw-shadow-lv2,0 6px 16px -8px rgba(0,0,0,.22))}',
-        '.mtb-card[data-status="running"]{border-color:color-mix(in srgb,var(--mtb-accent) 55%,transparent)}',
-        '.mtb-card[data-compact="true"]{padding:7px 10px 7px 13px;gap:4px}',
-        '.mtb-card[data-compact="true"]:hover{transform:none;box-shadow:none}',
-        '.mtb-card[data-focused="true"],.mtb-card[data-selected="true"]{box-shadow:0 0 0 2px var(--mtb-accent)}',
-        '.mtb-card[data-dragging="true"]{opacity:.45;transform:none}',
-        '.mtb-card-title-row{display:flex;align-items:flex-start;gap:6px;min-width:0}',
-        '.mtb-card-kind{flex:none;font-size:11px;font-weight:600;line-height:1.35;padding:1px 6px;border-radius:6px;background:color-mix(in srgb,var(--mtb-accent) 16%,transparent);color:var(--dsw-alias-label-primary,inherit);border:1px solid color-mix(in srgb,var(--mtb-accent) 34%,transparent)}',
-        '.mtb-card-title{font-size:13px;font-weight:600;line-height:1.4;color:var(--dsw-alias-label-primary,inherit);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word;flex:1;min-width:0}',
-        '.mtb-card[data-compact="true"] .mtb-card-title{-webkit-line-clamp:1;font-size:12px;font-weight:500}',
-        '.mtb-card-tags{display:flex;flex-wrap:wrap;gap:4px;align-items:center}',
-        '.mtb-card-excerpt{font-size:12px;line-height:1.48;color:var(--dsw-alias-label-secondary,color-mix(in srgb,currentColor 66%,transparent));display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word}',
-        '.mtb-card-meta{display:flex;flex-wrap:wrap;align-items:center;gap:4px 8px;font-size:11.5px;line-height:1.45;color:var(--dsw-alias-label-secondary,color-mix(in srgb,currentColor 68%,transparent))}',
-        '.mtb-card-time{white-space:nowrap;font-variant-numeric:tabular-nums}',
-        '.mtb-card-micro{display:inline-flex;align-items:center;gap:3px;padding:0 7px;height:19px;border-radius:999px;font-size:11px;line-height:1;background:color-mix(in srgb,currentColor 8%,transparent);border:1px solid color-mix(in srgb,currentColor 14%,transparent);color:var(--dsw-alias-label-primary,inherit);max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
-        '.mtb-card-foot{display:flex;align-items:center;justify-content:space-between;gap:6px;min-height:22px;margin-top:2px}',
-        '.mtb-card-foot-left{display:flex;align-items:center;gap:6px;min-width:0;flex-wrap:wrap}',
-        '.mtb-card-foot-right{display:flex;align-items:center;gap:4px;flex-shrink:0;margin-left:auto}',
-        '.mtb-result{--mtb-res-c:#94a3b8;display:inline-flex;align-items:center;gap:5px;padding:2px 8px;border-radius:999px;font-size:11.5px;font-weight:600;line-height:1.35;flex:none;color:var(--dsw-alias-label-primary,inherit);background:color-mix(in srgb,var(--mtb-res-c) 16%,transparent);border:1px solid color-mix(in srgb,var(--mtb-res-c) 46%,transparent)}',
-        '.mtb-result::before{content:"";width:6px;height:6px;border-radius:999px;background:var(--mtb-res-c);flex-shrink:0}',
-        '.mtb-result[data-tone="succeeded"]{--mtb-res-c:#10b981}',
-        '.mtb-result[data-tone="review"]{--mtb-res-c:#8b5cf6}',
-        '.mtb-result[data-tone="failed"]{--mtb-res-c:#ef4444}',
-        '.mtb-result[data-tone="running"]{--mtb-res-c:#f59e0b}',
-        '.mtb-result[data-tone="cancelled"]{--mtb-res-c:#94a3b8}',
-        '.mtb-runs{font-size:11.5px;font-weight:500;color:var(--dsw-alias-label-secondary,color-mix(in srgb,currentColor 72%,transparent));font-variant-numeric:tabular-nums;white-space:nowrap}',
-        '.mtb-spinner{width:11px;height:11px;border-radius:999px;border:1.8px solid color-mix(in srgb,var(--mtb-accent) 26%,transparent);border-top-color:var(--mtb-accent);animation:mtb-spin .85s linear infinite;flex-shrink:0}',
-        '.mtb-icon-pill{display:inline-flex;align-items:center;gap:4px;border:1px solid transparent;background:transparent;color:var(--dsw-alias-label-secondary,inherit);border-radius:7px;padding:2.5px 7px;font-size:11px;line-height:1.3;font-weight:500;cursor:pointer;font-family:inherit;transition:background .12s,border-color .12s,color .12s}',
-        '.mtb-icon-pill:hover{background:var(--dsw-alias-interactive-bg-hover,color-mix(in srgb,currentColor 9%,transparent));color:var(--dsw-alias-label-primary,inherit);border-color:var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 16%,transparent))}',
-        '.mtb-icon-pill-confirm{color:var(--dsw-alias-label-primary,inherit);background:color-mix(in srgb,#10b981 18%,transparent);border-color:color-mix(in srgb,#10b981 48%,transparent);font-weight:600}',
-        '.mtb-icon-pill-confirm:hover{background:color-mix(in srgb,#10b981 28%,transparent)}',
-        '.mtb-icon-btn{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border:0;background:transparent;color:var(--dsw-alias-label-secondary,inherit);border-radius:6px;cursor:pointer;padding:0;transition:background .12s,color .12s}',
-        '.mtb-icon-btn:hover{background:var(--dsw-alias-interactive-bg-hover,color-mix(in srgb,currentColor 9%,transparent));color:var(--dsw-alias-label-primary,inherit)}',
-        '.mtb-backdrop{position:absolute;inset:0;z-index:20;background:rgba(0,0,0,.32);display:flex;justify-content:flex-end;backdrop-filter:blur(1.5px)}',
-        '.mtb-modal-backdrop{position:absolute;inset:0;z-index:25;background:rgba(0,0,0,.38);display:flex;align-items:center;justify-content:center;padding:20px;backdrop-filter:blur(2px)}',
-        '.mtb-modal{width:min(540px,100%);max-height:86vh;display:flex;flex-direction:column;border-radius:16px;overflow:hidden;background:var(--dsw-alias-bg-base,#16181d);color:var(--dsw-alias-label-primary,inherit);border:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 16%,transparent));box-shadow:0 20px 56px rgba(0,0,0,.4)}',
-        '.mtb-drawer{width:min(510px,94%);height:100%;display:flex;flex-direction:column;background:var(--dsw-alias-bg-base,#16181d);color:var(--dsw-alias-label-primary,inherit);border-left:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 14%,transparent));box-shadow:-12px 0 36px rgba(0,0,0,.28)}',
-        '.mtb-drawer-head{padding:14px 18px;display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--dsw-alias-border-l1,color-mix(in srgb,currentColor 10%,transparent));flex-shrink:0;background:color-mix(in srgb,var(--mtb-accent) 8%,transparent)}',
-        '.mtb-drawer-body{flex:1;min-height:0;overflow-y:auto;padding:18px;display:flex;flex-direction:column;gap:14px}',
-        '.mtb-drawer-sec{display:grid;gap:8px;padding:11px 13px;border-radius:10px;border:1px solid var(--dsw-alias-border-l1,color-mix(in srgb,currentColor 10%,transparent));background:color-mix(in srgb,currentColor 3%,transparent)}',
-        '.mtb-drawer-sec-title{font-size:12px;font-weight:600;color:var(--dsw-alias-label-secondary,inherit);display:flex;align-items:center;justify-content:space-between;gap:8px}',
-        '.mtb-drawer-foot{padding:12px 18px;border-top:1px solid var(--dsw-alias-border-l1,color-mix(in srgb,currentColor 10%,transparent));display:flex;flex-wrap:wrap;gap:7px;align-items:center;flex-shrink:0}',
-        '.mtb-btn{border:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 16%,transparent));background:transparent;color:var(--dsw-alias-label-primary,inherit);border-radius:8px;padding:5px 11px;font-size:12px;line-height:1.3;font-weight:500;cursor:pointer;font-family:inherit;transition:background .12s,border-color .12s,color .12s}',
-        '.mtb-btn:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover,color-mix(in srgb,currentColor 8%,transparent));border-color:var(--dsw-alias-border-l3,color-mix(in srgb,currentColor 26%,transparent))}',
-        '.mtb-btn:disabled{opacity:.5;cursor:not-allowed}',
-        '.mtb-btn-accent{border-color:color-mix(in srgb,var(--mtb-accent) 46%,transparent);background:color-mix(in srgb,var(--mtb-accent) 18%,transparent);color:var(--dsw-alias-label-primary,inherit);font-weight:600}',
-        '.mtb-btn-accent:hover:not(:disabled){background:color-mix(in srgb,var(--mtb-accent) 28%,transparent)}',
-        '.mtb-btn-confirm{border-color:color-mix(in srgb,#10b981 48%,transparent);background:color-mix(in srgb,#10b981 18%,transparent);color:var(--dsw-alias-label-primary,inherit);font-weight:600}',
-        '.mtb-btn-confirm:hover:not(:disabled){background:color-mix(in srgb,#10b981 28%,transparent)}',
-        '.mtb-btn-ai{border-color:color-mix(in srgb,#8b5cf6 48%,transparent);background:color-mix(in srgb,#8b5cf6 14%,transparent);color:var(--dsw-alias-label-primary,inherit);font-weight:600}',
-        '.mtb-btn-ai:hover:not(:disabled){background:color-mix(in srgb,#8b5cf6 24%,transparent)}',
-        '.mtb-btn-danger{color:#ef4444;border-color:color-mix(in srgb,#ef4444 48%,transparent);background:color-mix(in srgb,#ef4444 12%,transparent)}',
-        '.mtb-move{border:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 16%,transparent));background:var(--dsw-alias-bg-base,transparent);color:var(--dsw-alias-label-primary,inherit);border-radius:8px;padding:4px 8px;font-size:12px;line-height:1.3;cursor:pointer;font-family:inherit;outline:none}',
-        '.mtb-form{margin:14px 20px 0;padding:16px;min-width:0;max-height:68vh;overflow-y:auto;border:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 14%,transparent));border-radius:14px;background:var(--dsw-alias-bg-layer-2,color-mix(in srgb,currentColor 5%,transparent));display:grid;gap:12px;box-shadow:0 8px 24px -12px rgba(0,0,0,.24)}',
-        '.mtb-tpl-grid{display:flex;flex-wrap:wrap;gap:6px}',
-        '.mtb-tpl-pill{border:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 16%,transparent));background:var(--dsw-alias-bg-base,transparent);color:var(--dsw-alias-label-primary,inherit);border-radius:9px;padding:6px 11px;font-size:12px;line-height:1.3;cursor:pointer;font-family:inherit;transition:border-color .12s,background .12s}',
-        '.mtb-tpl-pill:hover:not(:disabled){border-color:var(--dsw-alias-brand-primary,#6366f1)}',
-        '.mtb-tpl-pill[data-active="true"]{border-color:var(--dsw-alias-brand-primary,#6366f1);background:color-mix(in srgb,var(--dsw-alias-brand-primary,#6366f1) 16%,transparent);font-weight:600}',
-        '.mtb-tpl-pill:disabled{opacity:.48;cursor:not-allowed}',
-        '.mtb-sub-row{display:flex;align-items:center;gap:8px;padding:6px 9px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1,color-mix(in srgb,currentColor 10%,transparent));background:var(--dsw-alias-bg-base,transparent)}',
-        '.mtb-att-list{display:flex;flex-wrap:wrap;gap:8px}',
-        '.mtb-att-card{display:inline-flex;align-items:center;gap:8px;padding:5px 9px;border-radius:9px;border:1px solid var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 16%,transparent));background:var(--dsw-alias-bg-base,transparent);font-size:11.5px;max-width:240px}',
-        '.mtb-att-link{color:inherit;text-decoration:none;font-weight:500;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
-        '.mtb-att-link:hover{text-decoration:underline;color:var(--dsw-alias-brand-primary,#6366f1)}',
-        '.mtb-att-thumb{width:34px;height:34px;border-radius:6px;object-fit:cover;flex-shrink:0;border:1px solid var(--dsw-alias-border-l1,transparent)}',
-        '.mtb-exec-row{display:grid;gap:4px;padding:8px 10px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1,color-mix(in srgb,currentColor 10%,transparent));background:var(--dsw-alias-bg-base,transparent);font-size:11.5px}',
-        '.mtb-review-panel{display:grid;gap:9px;padding:12px 14px;border-radius:12px;border:1px solid color-mix(in srgb,#8b5cf6 42%,transparent);background:color-mix(in srgb,#8b5cf6 9%,var(--dsw-alias-bg-layer-2,transparent))}',
-        '.mtb-agent-cfg-list{display:grid;gap:8px}',
-        '.mtb-agent-cfg-row{display:grid;gap:6px;padding:9px 11px;border-radius:10px;border:1px solid var(--dsw-alias-border-l1,color-mix(in srgb,currentColor 13%,transparent));background:color-mix(in srgb,currentColor 3.5%,transparent)}',
-        '.mtb-agent-cfg-head{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;font-size:12px;font-weight:600}',
-        '.mtb-agent-cfg-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:7px}',
-        '.mtb-archive-grid{flex:1;min-height:0;overflow:auto;padding:16px 20px;display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:10px;align-content:start}',
-      ].join('\n');
-      if (!existing) document.head.appendChild(style);
+    const MV_DAG_WIDTH_KEY = 'marshal.dag-sidebar.width.v1';
+    const MV_DAG_MIN = 260;
+    const MV_DAG_MAX = 520;
+    const MV_DAG_STATUS = {
+      done: '已完成', recorded: '已记录', running: '运行中', review: '待确认',
+      'review-blocked': '审查待裁决', 'permission-blocked': '权限受阻',
+      failed: '失败', cancelled: '已取消', interrupted: '已中断',
+    };
+
+    function mvDagWidth(value) {
+      return Math.round(Math.min(MV_DAG_MAX, Math.max(MV_DAG_MIN, value)));
     }
 
+    function mvDagInitialWidth() {
+      try {
+        const width = Number(localStorage.getItem(MV_DAG_WIDTH_KEY));
+        if (width > 0 && Number.isFinite(width)) return mvDagWidth(width);
+      } catch { /* Storage may be unavailable in the native host. */ }
+      return 340;
+    }
+
+    function mvDagRows(layers) {
+      return layers.flatMap(layer => {
+        const nodes = layer.nodes ?? [];
+        return layer.type === 'parallel' && nodes.length >= 2 ? [{ id: layer.id, nodes }]
+          : nodes.map(node => ({ id: node.id, nodes: [node] }));
+      });
+    }
+
+    // Nodes occupy equal-width grid tracks without column gaps. Each anchor
+    // is the center of its track; SVG stretches with the same width as the grid.
+    function mvDagPaths(from, to) {
+      const x = (index, count) => 100 * (index + .5) / count;
+      if (from.nodes.length > 1 && to.nodes.length > 1) {
+        // Layers encode ordering, not pairwise dependencies between parallel
+        // nodes. Use a shared junction instead of inventing N×M edges.
+        const incoming = from.nodes.map((_, i) => {
+          const a = x(i, from.nodes.length);
+          return `M${a} 0 C${a} 6 50 6 50 12`;
+        });
+        const outgoing = to.nodes.map((_, i) => {
+          const b = x(i, to.nodes.length);
+          return `M50 12 C50 18 ${b} 18 ${b} 24`;
+        });
+        return [...incoming, ...outgoing];
+      }
+      return from.nodes.flatMap((_, i) => to.nodes.map((_, j) => {
+        const a = x(i, from.nodes.length), b = x(j, to.nodes.length);
+        return a === b ? `M${a} 0 V24` : `M${a} 0 C${a} 12 ${b} 12 ${b} 24`;
+      }));
+    }
+
+    function mvDagCanvas({ layers, onInspect }) {
+      const rows = mvDagRows(layers);
+      if (!rows.length) return h('p', null, '暂无编排节点');
+      return h('div', { className: 'mv-dag-canvas' }, rows.map((row, i) =>
+        h(React.Fragment, { key: row.id },
+          i > 0 && h('svg', { className: 'mv-dag-edges', viewBox: '0 0 100 24', preserveAspectRatio: 'none', 'aria-hidden': true },
+            mvDagPaths(rows[i - 1], row).map((d, index) => h('path', {
+              key: index, d, fill: 'none', stroke: 'currentColor', vectorEffect: 'non-scaling-stroke',
+            }))),
+          h('div', { className: 'mv-dag-layer', 'data-parallel': row.nodes.length > 1,
+            style: { gridTemplateColumns: `repeat(${row.nodes.length}, minmax(0, 1fr))` } },
+            row.nodes.map(node => {
+              const tokens = node.tokens?.totalTokens;
+              const metrics = [Number.isFinite(node.durationMs) && node.durationMs + ' ms',
+                Number.isFinite(tokens) && tokens.toLocaleString() + ' tokens'].filter(Boolean).join(' · ');
+              return h('button', { key: node.id, type: 'button', className: 'mv-dag-node', onClick: () => onInspect(node.id) },
+                h('strong', null, node.label ?? node.phase),
+                h('span', { className: 'mv-dag-state', 'data-state': node.status },
+                  h('svg', { width: 8, height: 8, viewBox: '0 0 8 8', 'aria-hidden': true },
+                    h('circle', { cx: 4, cy: 4, r: 3, fill: 'currentColor' })), (MV_DAG_STATUS[node.status] ?? node.status)),
+                (node.role || node.agentName) && h('span', null, [node.role, node.agentName].filter(Boolean).join(' · ')),
+                node.model && h('span', { className: 'mv-model' }, node.model),
+                metrics && h('span', null, metrics));
+            })))));
+    }
+
+    function mvUseDagReview(taskId, task, onReview) {
+      const [busy, setBusy] = React.useState(false);
+      const [doneRound, setDoneRound] = React.useState(null);
+      const [error, setError] = React.useState('');
+      const pending = React.useRef(false);
+      const available = taskId && task && !task.taskRoom?.closed && task.status !== 'done' &&
+        (task.status === 'review' || task.workflow?.state === 'review-blocked');
+      const roundKey = String(task?.workflow?.runId || task?.updatedAt || taskId || '');
+      const done = available && doneRound === roundKey;
+      const run = async action => {
+        if (!available || done || pending.current) return;
+        pending.current = true;
+        setBusy(true);
+        setError('');
+        try {
+          if (onReview) {
+            if (await onReview(action, taskId) === false) throw new Error('工单操作未完成。');
+          } else {
+            await fetchJson(action === 'confirm' ? 'marshal/tasks/confirm-review' : 'marshal/tasks/revise',
+              action === 'confirm' ? { taskId, applyPatch: false } : { taskId }, true);
+          }
+          setDoneRound(roundKey);
+        } catch (failure) { setError(failure.message || String(failure)); }
+        finally { pending.current = false; setBusy(false); }
+      };
+      return { available: available && !done, busy, error, run };
+    }
+
+    function mvDagReviewActions({ review }) {
+      return h(React.Fragment, null, review.available && h('div', { className: 'mv-dag-actions' },
+        h(MvButton, { label: '确认验收', title: '确认通过并归档，不应用补丁', disabled: review.busy, onClick: () => void review.run('confirm') }),
+        h(MvButton, { label: '打回返工', disabled: review.busy, onClick: () => void review.run('revise') })),
+      review.error && h('p', { role: 'alert' }, review.error));
+    }
+
+    function mvDagDetailSection(title, children) {
+      return h('section', { className: 'mv-dag-detail' }, h('h3', null, title), children);
+    }
+
+    function mvDagDiff({ diff }) {
+      let inHunk = false;
+      return h('pre', { className: 'mv-dag-diff', tabIndex: 0 }, diff.split('\n').map((line, index) => {
+        if (line.startsWith('diff --git ')) inHunk = false;
+        if (line.startsWith('@@')) inHunk = true;
+        const header = !inHunk && /^(?:\+\+\+|---) /.test(line);
+        return h('span', { key: index, 'data-change': header ? undefined
+          : line.startsWith('+') ? 'add' : line.startsWith('-') ? 'remove' : undefined }, line, '\n');
+      }));
+    }
+
+    function mvDagDetail({ node }) {
+      const paths = node.artifactPaths ?? [];
+      return h(React.Fragment, null,
+        mvDagDetailSection('执行摘要', h('p', null, node.summary || '暂无执行摘要')),
+        mvDagDetailSection('变更文件', node.diffFiles?.length ? h('ul', null, node.diffFiles.map(path =>
+          h('li', { key: path }, h('code', null, path)))) : '暂无变更文件'),
+        node.diff && mvDagDetailSection('Diff', h(mvDagDiff, { diff: node.diff })),
+        mvDagDetailSection('执行日志', node.logs?.length ? h('ol', null, node.logs.map((log, i) =>
+          h('li', { key: log.id ?? log.seq ?? i },
+            h('strong', null, [log.actor, log.kind, Number.isFinite(log.at) ? new Date(log.at).toLocaleString() : null].filter(Boolean).join(' · ')),
+            h('pre', { className: 'mv-dag-log' }, log.text),
+            log.trace && h('details', null, h('summary', null, '执行轨迹'), h('pre', { className: 'mv-dag-log' }, JSON.stringify(log.trace, null, 2))))
+        )) : '暂无执行日志'),
+        mvDagDetailSection('产物路径', paths.length ? h('ul', null, paths.map(path =>
+          h('li', { key: path }, h('code', null, path)))) : '未返回产物路径'),
+        node.patchDigest && mvDagDetailSection('补丁摘要值', h('code', null, node.patchDigest)),
+        node.reportId && mvDagDetailSection('报告标识', h('code', null, node.reportId)));
+    }
+
+    function mvDagNodeDialog({ taskId, nodeId, onClose, review, refresh }) {
+      const dialog = React.useRef(null);
+      const heading = React.useId();
+      const [node, setNode] = React.useState(null);
+      const [error, setError] = React.useState('');
+      const [retry, setRetry] = React.useState(0);
+      React.useEffect(ensureMarshalVnextStyles, []);
+      React.useEffect(() => {
+        const element = dialog.current;
+        const previous = document.activeElement;
+        element?.showModal();
+        return () => { if (element?.open) element.close(); previous?.focus(); };
+      }, []);
+      React.useEffect(() => {
+        const controller = new AbortController();
+        setError('');
+        void fetchJson('marshal/tasks/dag/node?' + new URLSearchParams({ taskId, nodeId }), undefined, true, controller.signal)
+          .then(data => { if (!controller.signal.aborted) setNode(data.node); })
+          .catch(failure => {
+            if (controller.signal.aborted) return;
+            setNode(null);
+            setError(failure.message || String(failure));
+          });
+        return () => controller.abort();
+      }, [taskId, nodeId, refresh, retry]);
+      return h('dialog', { ref: dialog, className: 'mv-scope mv-dag-dialog', 'aria-labelledby': heading,
+        onCancel: e => { e.preventDefault(); onClose(); } },
+        h('header', { className: 'mv-dag-header' }, h('strong', { id: heading }, node?.label || '节点详情'),
+          h(MvButton, { label: '关闭节点详情', icon: 'close', iconOnly: true, autoFocus: true, onClick: onClose })),
+        h('div', { className: 'mv-dag-dialog-body' },
+          h(mvDagReviewActions, { review }),
+          error && h('div', { role: 'alert' }, error, ' ', h(MvButton, { label: '重试', onClick: () => setRetry(n => n + 1) })),
+          node ? h(mvDagDetail, { node }) : !error && h('p', { role: 'status' }, '正在读取节点详情…')));
+    }
+
+    function mvDagStandaloneNode({ task, onReview, ...props }) {
+      const review = mvUseDagReview(props.taskId, task, onReview);
+      return h(mvDagNodeDialog, { ...props, review });
+    }
+
+    // Standalone inspector: pass the current task projection for review controls.
+    function mvDagNodeModal(props) {
+      return props.taskId && props.nodeId ? h(mvDagStandaloneNode, {
+        ...props, key: JSON.stringify([props.taskId, props.nodeId]),
+      }) : null;
+    }
+
+    function mvDagTaskBody({ taskId, task, onReview, collapsed }) {
+      const [layers, setLayers] = React.useState(null);
+      const [taskState, setTaskState] = React.useState(undefined);
+      const [error, setError] = React.useState('');
+      const [stateError, setStateError] = React.useState('');
+      const [nodeId, inspect] = React.useState(null);
+      const [refresh, setRefresh] = React.useState(0);
+      const [retry, setRetry] = React.useState(0);
+      const review = mvUseDagReview(taskId, stateError ? null : taskState === undefined ? task : taskState, onReview);
+      React.useEffect(() => {
+        const controller = new AbortController();
+        const refreshDag = async () => {
+          const list = async () => {
+            try {
+              const data = await fetchJson('marshal/tasks/dag?' + new URLSearchParams({ taskId }), undefined, true, controller.signal);
+              if (controller.signal.aborted) return;
+              setLayers(data.layers);
+              setError('');
+              setRefresh(n => n + 1);
+            } catch (failure) { if (!controller.signal.aborted) setError(failure.message || String(failure)); }
+          };
+          const status = async () => {
+            try {
+              const data = await fetchJson('marshal/tasks/state', undefined, true, controller.signal);
+              if (controller.signal.aborted) return;
+              setTaskState(data.tasks?.find(row => row.id === taskId) ?? null);
+              setStateError('');
+            } catch (failure) { if (!controller.signal.aborted) setStateError(failure.message || String(failure)); }
+          };
+          // SSE coalesces topics, so a room message can replace a pending
+          // tasks.changed invalidation. Refresh both projections together.
+          await Promise.all([list(), status()]);
+        };
+        const unsubscribe = subscribeMarshalEvents(['tasks.changed', 'room.message', 'ready'], refreshDag, { initial: true, debounceMs: 80 });
+        return () => { controller.abort(); unsubscribe(); };
+      }, [taskId, retry]);
+      return h(React.Fragment, null,
+        !collapsed && h('div', { className: 'mv-dag-body' },
+          h(mvDagReviewActions, { review }),
+          (error || stateError) && h('div', { role: 'alert' }, [error, stateError].filter(Boolean).join('；'), ' ',
+            h(MvButton, { label: '重试', onClick: () => setRetry(n => n + 1) })),
+          layers ? h(mvDagCanvas, { layers, onInspect: inspect }) : !error && h('p', { role: 'status' }, '正在读取 DAG…')),
+        !collapsed && nodeId !== null && h(mvDagNodeDialog, {
+          key: nodeId, taskId, nodeId, onClose: () => inspect(null), review, refresh,
+        }));
+    }
+
+    // Provide taskId for the ticket projection, or pass members/taskDrawer
+    // React nodes for the group chat panes. The host owns where this mounts.
+    function mvVerticalDagSidebar({ taskId, task, onReview, members, taskDrawer, defaultCollapsed = false }) {
+      const [width, setWidth] = React.useState(mvDagInitialWidth);
+      const [collapsed, setCollapsed] = React.useState(defaultCollapsed);
+      const [pane, setPane] = React.useState('');
+      const drag = React.useRef(null);
+      const bodyId = React.useId();
+      React.useEffect(ensureMarshalVnextStyles, []);
+      const resize = value => {
+        const next = mvDagWidth(value);
+        setWidth(next);
+        try { localStorage.setItem(MV_DAG_WIDTH_KEY, String(next)); } catch {}
+      };
+      const tabs = [taskId && ['dag', 'DAG 编排'], members != null && ['members', '群聊成员'],
+        taskDrawer != null && ['tasks', '任务清单']].filter(Boolean);
+      const active = tabs.some(([id]) => id === pane) ? pane : tabs[0]?.[0];
+      return h('aside', { className: 'mv-scope mv-dag-sidebar', 'aria-label': '编排与群聊详情',
+        'data-collapsed': collapsed, style: collapsed ? undefined : { width } },
+        !collapsed && h('div', { className: 'mv-dag-resize', role: 'separator', tabIndex: 0, 'aria-label': '调整右栏宽度',
+          'aria-orientation': 'vertical', 'aria-valuemin': MV_DAG_MIN, 'aria-valuemax': MV_DAG_MAX,
+          'aria-valuenow': width, 'aria-controls': bodyId,
+          onPointerDown: e => {
+            if (e.button !== 0 || drag.current) return;
+            drag.current = { id: e.pointerId, width, x: e.clientX };
+            e.currentTarget.setPointerCapture(e.pointerId);
+          },
+          onPointerMove: e => {
+            if (drag.current?.id === e.pointerId) resize(drag.current.width + drag.current.x - e.clientX);
+          },
+          onLostPointerCapture: e => { if (drag.current?.id === e.pointerId) drag.current = null; },
+          onKeyDown: e => {
+            const desired = { ArrowLeft: width + 16, ArrowRight: width - 16, Home: MV_DAG_MIN, End: MV_DAG_MAX }[e.key];
+            if (Number.isFinite(desired)) { e.preventDefault(); resize(desired); }
+          },
+        }),
+        h('header', { className: 'mv-dag-header' },
+          !collapsed && h('strong', null, tabs.find(([id]) => id === active)?.[1] ?? '群聊详情'),
+          h(MvButton, { icon: collapsed ? 'back' : 'chevron', label: collapsed ? '展开右栏' : '收起右栏',
+            iconOnly: true, 'aria-expanded': !collapsed, 'aria-controls': bodyId,
+            onClick: () => { drag.current = null; setCollapsed(value => !value); } })),
+        h('div', { id: bodyId, className: 'mv-dag-content', hidden: collapsed },
+          tabs.length > 1 && h('nav', { className: 'mv-dag-actions', 'aria-label': '右栏内容' }, tabs.map(([id, label]) =>
+            h(MvButton, { key: id, label, 'aria-pressed': id === active, onClick: () => setPane(id) }))),
+          taskId && h(mvDagTaskBody, { key: taskId, taskId,
+            task, onReview, collapsed: collapsed || active !== 'dag' }),
+          !collapsed && active === 'members' && h('div', { className: 'mv-dag-body' }, members),
+          !collapsed && active === 'tasks' && h('div', { className: 'mv-dag-body' }, taskDrawer)));
+    }
+
+    // Public names for sibling shards sharing the client factory.
+    const mvDagSidebar = { MarshalVerticalDagSidebar: mvVerticalDagSidebar, MarshalDagNodeModal: mvDagNodeModal };
+    const MV_ROOM_API = 'marshal/task-rooms/';
+
+    function mvRoomMerge(previous, data, older) {
+      const records = new Map((previous?.records ?? []).map(row => [row.seq, row]));
+      for (const row of data.records ?? []) if (!older || !records.has(row.seq)) records.set(row.seq, row);
+      return { ...(older ? previous : data), hasOlder: older || !previous ? data.hasOlder : previous.hasOlder,
+        records: [...records.values()].sort((a, b) => a.seq - b.seq) };
+    }
+
+    function mvRoomHandoffText(...values) {
+      return values.find(value => typeof value === 'string' && value.trim())?.trim();
+    }
+
+    function mvRoomPatchSummary(artifact) {
+      if (!artifact) return;
+      const digest = mvRoomHandoffText(artifact.digest);
+      const files = artifact.fileCount ?? (Array.isArray(artifact.files) ? artifact.files.length : artifact.files);
+      const parts = [];
+      if (digest) parts.push(digest.slice(0, 12));
+      if (Number.isInteger(files)) parts.push(`${files} 个文件`);
+      if (Number.isInteger(artifact.additions)) parts.push(`+${artifact.additions}`);
+      if (Number.isInteger(artifact.deletions)) parts.push(`-${artifact.deletions}`);
+      if (parts.length) return '补丁 ' + parts.join(' · ');
+    }
+
+    function mvRoomIsPatch(record) {
+      return record.phase === 'development-patch' || record.kind === 'development-patch';
+    }
+
+    function mvRoomParsePatchArtifact(record) {
+      const text = record.body ?? record.text ?? '';
+      const marker = /^<!--marshal-patch-artifact:([\s\S]*?)-->/.exec(text);
+      if (marker) {
+        try { return { meta: JSON.parse(marker[1]), body: text.slice(marker[0].length).replace(/^\r?\n/, '') }; }
+        catch {}
+      }
+      return { meta: null, body: text };
+    }
+
+    async function mvRoomFetchFullPatch({ roomId, taskId, nodeId, digest, seq, preview, stored, bytes, signal }) {
+      const qs = new URLSearchParams({ roomId });
+      if (digest) qs.set('digest', digest);
+      if (seq != null) qs.set('seq', seq);
+      const complete = text => {
+        if (typeof text !== 'string' || !text) return false;
+        if (text.startsWith('<!--marshal-patch-artifact:') || text.includes('点击「下载 .patch」或「应用补丁」可获取完整补丁')) return false;
+        if (Number.isSafeInteger(bytes) && bytes > 0 && new TextEncoder().encode(text).length < bytes) return false;
+        if (stored && preview && !(Number.isSafeInteger(bytes) && bytes > 0) && text === preview) return false;
+        return true;
+      };
+      try {
+        const result = await fetchJson(MV_ROOM_API + 'patch?' + qs, undefined, true, signal);
+        if ((seq != null && result?.seq != null && result.seq !== seq) ||
+            (digest && result?.digest && result.digest !== digest)) {
+          throw new Error('服务端返回的补丁与请求记录不一致');
+        }
+        const text = typeof result === 'string' ? result : result?.patch;
+        if (!complete(text)) throw new Error('服务端未返回完整补丁内容');
+        return text;
+      } catch (e) {
+        if (signal.aborted || !taskId) throw e;
+        // The room patch endpoint only searches its latest page. DAG detail resolves the exact record.
+        let targetNodeId = nodeId;
+        if (!targetNodeId) {
+          const dag = await fetchJson('marshal/tasks/dag?' + new URLSearchParams({ taskId }), undefined, true, signal);
+          const nodes = (dag?.layers ?? []).flatMap(layer => layer.nodes ?? []);
+          const matched = (digest && nodes.find(item => item.patchDigest === digest))
+            || nodes.findLast(item => item.phase === 'development-patch' || item.id?.startsWith('development-patch:') || item.id?.startsWith('patch:'));
+          targetNodeId = matched?.id;
+          if (!targetNodeId) throw e;
+        }
+        const { node } = await fetchJson('marshal/tasks/dag/node?' + new URLSearchParams({ taskId, nodeId: targetNodeId }),
+          undefined, true, signal);
+        if (node?.id !== targetNodeId || (digest && node.patchDigest && node.patchDigest !== digest) || !complete(node.diff)) throw e;
+        return node.diff;
+      }
+    }
+
+    function mvRoomDownloadPatch(text, { digest, seq }) {
+      const url = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
+      try {
+        const link = document.createElement('a');
+        link.hidden = true;
+        link.href = url;
+        link.download = `development-${digest?.slice(0, 12) || (seq ?? 'latest')}.patch`;
+        link.click();
+      } finally {
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      }
+    }
+
+    function mvRoomReadPatch(record, artifact, digest) {
+      const summary = mvRoomPatchSummary(artifact.meta);
+      if (summary) return summary;
+      const files = new Set();
+      let additions = 0, deletions = 0, inHunk = false;
+      for (const line of artifact.body.split('\n')) {
+        if (line.startsWith('diff --git ')) {
+          files.add(line.slice('diff --git '.length));
+          inHunk = false;
+        } else if (line.startsWith('@@ ')) inHunk = true;
+        else if (inHunk && line.startsWith('+')) additions++;
+        else if (inHunk && line.startsWith('-')) deletions++;
+      }
+      if (files.size) return mvRoomPatchSummary({ fileCount: files.size, additions, deletions, digest: record.patchDigest || digest });
+    }
+
+    function mvRoomHandoffMeta(record, text) {
+      const parse = value => {
+        if (typeof value !== 'string') return value;
+        try { return JSON.parse(value); } catch { return null; }
+      };
+      let data = parse(record.meta) ?? parse(record.body ?? text);
+      for (let depth = 0; data && depth < 2; depth++) {
+        const wrapped = parse(data.meta ?? data.body);
+        if (!wrapped || typeof wrapped !== 'object') break;
+        data = wrapped;
+      }
+      return data;
+    }
+
+    function mvRoomHandoff(record, participants, text, workflow, patchSummary, { runAssignment, isCurrentRun }) {
+      const phase = record.phase || record.kind;
+      const meta = mvRoomHandoffMeta(record, text);
+      const direction = /→|->|(?:移交|转交|交接|分配)\s*(?:给|至)|退回(?:给|至)?|交给|hand(?:ed)?\s*off\s+to\b/i.exec(text);
+      const structuredTarget = mvRoomHandoffText(record.targetName, record.target, record.assignee, record.to,
+        meta?.targetName, meta?.target, meta?.assignee, meta?.to)?.replace(/^@\s*/, '');
+      const assignment = record.kind === 'assignment' || phase === 'assignment';
+      const transfer = direction && !['→', '->'].includes(direction[0]);
+      const explicit = record.kind === 'handoff' || phase === 'handoff' || assignment;
+      const designHandoff = phase === 'designing' && /^开发设计交接已写入工作区公共记忆[。.]?$/.test(text.trim());
+      const reviewHandoff = phase === 'dev-reviewing' && /^编码交付与审查交接已写入工作区公共记忆[。.]?$/.test(text.trim());
+      if (!explicit && !['agent', 'status'].includes(record.kind)) return null;
+
+      const labels = new Map(isCurrentRun ? [
+        ['leader', workflow?.leaderName || 'Leader'], ['coder', 'Coder'], ['reviewer', 'Reviewer'],
+      ] : []);
+      for (const member of isCurrentRun ? participants : []) {
+        if (!member.name) continue;
+        labels.set(member.name.toLowerCase(), member.name);
+        for (const role of member.roles ?? member.role?.split('/') ?? []) labels.set(role.toLowerCase(), member.name);
+      }
+      for (const [role, name] of Object.entries({ ...runAssignment?.roles,
+        ...(runAssignment?.leaderName ? { Leader: runAssignment.leaderName } : {}) })) {
+        if (!mvRoomHandoffText(name)) continue;
+        labels.set(role.toLowerCase(), name);
+        labels.set(name.toLowerCase(), name);
+      }
+      const matchMember = (segment, end) => {
+        const name = segment.trimStart().replace(/^@\s*/, '').toLowerCase();
+        const label = [...labels.keys()].sort((a, b) => b.length - a.length)
+          .find(key => name.startsWith(key) && end.test(name.slice(key.length)));
+        return labels.get(label);
+      };
+      const destination = direction && text.slice(direction.index + direction[0].length).replace(/^[\s:：]+/, '');
+      const mentioned = /^@\s*([^\s，。；、,.!?！？;:：/]+)/.exec((destination || (explicit && !direction ? text.trimStart() : '')))?.[1];
+      const codingRecipient = /^编码交给[ \t]+([^@\r\n，。；、,.!?！？;:：/]+?)[ \t]+的常驻会话[。.]?$/.exec(text.trim())?.[1]?.trim();
+      const target = structuredTarget
+        ? labels.get(structuredTarget.toLowerCase()) || structuredTarget
+        : (destination && matchMember(destination, /^(?:$|[，。；、,.!?！？;:：/]|[ \t]+(?:的|常驻|[·（(]|$))/))
+          || (codingRecipient && (labels.get(codingRecipient.toLowerCase()) || codingRecipient))
+          || (mentioned && (labels.get(mentioned.toLowerCase()) || mentioned));
+      const source = direction && matchMember(text.slice(0, direction.index).trim().replace(/^由\s*/, ''), /^(?:$|\s|[，,：:]|要求|决定)/);
+      // An arrow alone can be part of an ordinary agent reply (e.g. a code snippet).
+      if (!explicit && !structuredTarget && !designHandoff && !reviewHandoff &&
+          !(transfer ? target || source : source && target)) return null;
+      const roles = assignment ? Object.values(meta?.roles ?? {}).filter(name => typeof name === 'string' && name.trim()) : [];
+      let sourceRole, targetRole;
+      if ((runAssignment || (isCurrentRun && (workflow || participants.length))) && !direction && !structuredTarget) {
+        if (designHandoff || (explicit && phase === 'designing')) {
+          sourceRole = 'leader'; targetRole = 'coder';
+        } else if (reviewHandoff || (explicit && phase === 'dev-reviewing')) {
+          sourceRole = 'coder'; targetRole = 'reviewer';
+        }
+      }
+      const recipient = target || labels.get(targetRole);
+      const projectedPhase = phase === 'coding' && /返工|退回 Coder/.test(text) ? 'revise' : phase;
+      return { targets: [...new Set(recipient ? [recipient] : roles)], phase,
+        source: mvRoomHandoffText(record.sourceName, record.from, meta?.sourceName, meta?.from, source, labels.get(sourceRole), record.actor) || 'Marshal',
+        // A room ref can point to shared memory rather than a patch or artifact.
+        summary: mvRoomHandoffText(record.artifactSummary, meta?.artifactSummary, record.patchDigest, meta?.patchDigest,
+          phase === 'dev-reviewing' && patchSummary, record.patchSummary, meta?.patchSummary, meta?.template, meta?.group),
+        nodeId: record.nodeId || meta?.nodeId || `${projectedPhase}:${record.id ?? record.seq}` };
+    }
+
+    function MarshalTicketRoomView({ task, openBoard, onOpenAgents }) {
+      const bound = task?.taskRoom;
+      const [workspace, setWorkspace] = React.useState(bound?.workspaceId || task?.workflow?.workspaceId || task?.workspaceId || '');
+      const [workspaces, setWorkspaces] = React.useState([]);
+      const [rooms, setRooms] = React.useState([]);
+      const [roomId, setRoomId] = React.useState(bound?.id || '');
+      const [error, setError] = React.useState('');
+      const [opening, setOpening] = React.useState(false);
+      const listRefresh = React.useRef(null);
+      const life = React.useRef(null);
+      React.useEffect(() => {
+        ensureTaskRoomStyles();
+        return ensureMarshalVnextStyles();
+      }, []);
+      React.useEffect(() => {
+        const controller = new AbortController();
+        life.current = controller;
+        const { signal } = controller;
+        void fetchJson(MV_ROOM_API + 'workspaces', undefined, true, signal).then(data => {
+          if (signal.aborted) return;
+          const available = (data.workspaces ?? []).filter(ws => !isPseudoAgentWorkspace(ws) || ws.id === bound?.workspaceId);
+          setWorkspaces(available);
+          setWorkspace(current => current || (available.length === 1 ? available[0].id : ''));
+        }).catch(e => { if (!signal.aborted) setError(e.message); });
+        return () => controller.abort();
+      }, []);
+      React.useEffect(() => {
+        if (!workspace) return;
+        const refresh = createVisibleMarshalRefresh(async signal => {
+          try {
+            const data = await fetchJson(MV_ROOM_API + 'list?' + new URLSearchParams({ workspaceId: workspace }), undefined, true, signal);
+            if (signal.aborted) return;
+            setRooms(data.rooms ?? []);
+            if (!task) setRoomId(current => current || data.rooms?.[0]?.id || '');
+          } catch (e) { if (!signal.aborted) setError(e.message); }
+        });
+        listRefresh.current = refresh;
+        const unsubscribe = subscribeMarshalEvents(['ready', 'tasks.changed', 'room.message'], refresh.request, { initial: true, debounceMs: 80 });
+        return () => { listRefresh.current = null; unsubscribe(); refresh.dispose(); };
+      }, [workspace]);
+      const open = async () => {
+        const signal = life.current.signal;
+        setOpening(true);
+        setError('');
+        try {
+          const data = await fetchJson(MV_ROOM_API + 'open', { taskId: task.id, workspaceId: workspace }, true, signal);
+          if (!signal.aborted) { setRoomId(data.room.id); void listRefresh.current?.request(); }
+        } catch (e) { if (!signal.aborted) setError(e.message); }
+        finally { if (!signal.aborted) setOpening(false); }
+      };
+      return h('section', { className: 'mv-scope mv-room-fill', 'aria-label': '工单群', style: { flexDirection: 'column' } },
+        (!task || !roomId || error) && h('div', { className: 'mv-dag-header mv-actions' },
+          !roomId && h(MvButton, { label: '返回工作台', icon: 'back', onClick: () => openBoard?.(task?.id) }),
+          (!task || !workspace) && h('select', { className: 'mv-field mv-compact-field', 'aria-label': '工作区', value: workspace, disabled: opening,
+            onChange: e => { setWorkspace(e.target.value); setRoomId(''); setRooms([]); setError(''); } },
+            h('option', { value: '' }, '选择工作区'), workspaces.map(ws => h('option', { key: ws.id, value: ws.id }, ws.name || ws.title || ws.id))),
+          !task && workspace && h('select', { className: 'mv-field mv-compact-field', 'aria-label': '工单群记录', value: roomId,
+            onChange: e => setRoomId(e.target.value) }, h('option', { value: '' }, '选择工单群'),
+            rooms.map(room => h('option', { key: room.id, value: room.id }, room.title))),
+          error && h('span', { role: 'alert', className: 'mv-danger' }, error)),
+        roomId && workspace ? h(mvTicketConversation, { key: 'taskRooms-' + workspace + '/' + roomId, workspace, roomId, task, openBoard, onOpenAgents })
+          : h(EmptyState, { title: task?.title || '选择一个工单群', hint: task ? '开启工单群后即可参与协作。' : '从工作区查看工单群记录。',
+            action: task && workspace && !opening ? '开启此工单群聊' : undefined, onAction: open }));
+    }
+
+    function mvTicketConversation({ workspace, roomId, task, openBoard, onOpenAgents }) {
+      const [visible, setVisible] = React.useState(null);
+      const [draft, setDraft] = React.useState('');
+      const [context, setContext] = React.useState({});
+      const [library, setLibrary] = React.useState(null);
+      const [leaders, setLeaders] = React.useState([]);
+      const [assignee, setAssignee] = React.useState('');
+      const [peers, setPeers] = React.useState([]);
+      const [error, setError] = React.useState('');
+      const [notice, setNotice] = React.useState('');
+      const [pending, setPending] = React.useState('');
+      const [paging, setPaging] = React.useState(false);
+      const [dagOpen, setDagOpen] = React.useState(false);
+      const [nodeId, setNodeId] = React.useState('');
+      const [locating, setLocating] = React.useState(false);
+      const [catalogModels, setCatalogModels] = React.useState([]);
+      const [fullPatch, setFullPatch] = React.useState(null);
+      const patchRequest = React.useRef(null);
+      const patchResult = React.useRef(null);
+      const cursor = React.useRef(null);
+      const refreshRef = React.useRef(null);
+      const lifetime = React.useRef(null);
+      const flight = React.useRef('');
+      const stream = React.useRef(null);
+      const stick = React.useRef(true);
+      const prepend = React.useRef(null);
+      const input = React.useRef(null);
+      const url = MV_ROOM_API + 'page?' + new URLSearchParams({ roomId, workspaceId: workspace });
+      const room = visible?.room;
+      const taskId = visible?.taskId || room?.taskId || task?.id;
+      const workflow = visible?.workflow ?? task?.workflow;
+      const projectedTask = { ...task, id: taskId, title: room?.title || task?.title,
+        workflow, status: visible?.cardStatus ?? task?.status, taskRoom: room };
+      const participants = visible?.participants ?? [];
+      const colorMap = React.useMemo(() => buildRoomColorMap(visible?.records, visible?.participants), [visible?.records, visible?.participants]);
+      const reviewing = visible?.origin && !room?.closed && (visible.cardStatus === 'review' || visible.runState === 'review-blocked');
+      const runningRevision = visible?.origin && !room?.closed && (visible.busy || visible.cardStatus === 'running');
+      const actionPending = Boolean(pending || visible?.chatBusy);
+      const locked = actionPending || Boolean(visible?.busy);
+      React.useEffect(() => () => patchRequest.current?.abort(), [url, room?.id]);
+      React.useEffect(() => {
+        if (fullPatch?.focusResult && !fullPatch.loading) patchResult.current?.focus();
+      }, [fullPatch]);
+      React.useEffect(() => {
+        const controller = new AbortController();
+        lifetime.current = controller;
+        const refresh = createVisibleMarshalRefresh(async signal => {
+          try {
+            while (!signal.aborted) {
+              const after = cursor.current;
+              const page = await fetchJson(url + (after === null ? '' : '&after=' + after), undefined, true, signal);
+              if (signal.aborted) return;
+              const next = page.records?.at(-1)?.seq ?? after ?? 0;
+              setVisible(previous => mvRoomMerge(previous, page, false));
+              cursor.current = Math.max(after ?? 0, next);
+              if (!page.hasNewer || next <= (after ?? 0)) break;
+            }
+          } catch (e) {
+            if (signal.aborted) return;
+            if (['forbidden', 'workspace-forbidden', 'unauthorized', 'task-room-not-found'].includes(e.code)) {
+              cursor.current = null; setVisible(null);
+            }
+            setError(e.message);
+          }
+        }, 12_000);
+        refreshRef.current = refresh;
+        const unsubscribe = subscribeMarshalEvents(['ready', 'tasks.changed', 'room.message'], refresh.request, { initial: true, debounceMs: 80 });
+        void fetchJson('api/task-board/model-catalog', undefined, false, controller.signal)
+          .then(data => { if (!controller.signal.aborted) setCatalogModels(flattenModelCatalog(data).options); }).catch(() => {});
+        void loadAgentLibrary().then(data => { if (!controller.signal.aborted) setLibrary(data); }).catch(() => {});
+        void fetchJson('marshal/tasks/orchestration', undefined, true, controller.signal)
+          .then(data => { if (!controller.signal.aborted) setLeaders(data.leaders ?? []); }).catch(() => {});
+        return () => { controller.abort(); refreshRef.current = null; unsubscribe(); refresh.dispose(); };
+      }, [url]);
+      React.useEffect(() => {
+        if (!visible?.origin) return;
+        const controller = new AbortController();
+        void fetchJson(MV_ROOM_API + 'peers?' + new URLSearchParams({ roomId }), undefined, true, controller.signal)
+          .then(data => { if (!controller.signal.aborted) setPeers(data.peers ?? []); }).catch(() => {});
+        return () => controller.abort();
+      }, [roomId, visible?.origin]);
+      React.useEffect(() => {
+        refreshRef.current?.setPolling(Boolean(room && !room.closed), visible?.busy || visible?.chatBusy ? 5_000 : 12_000);
+      }, [room?.id, room?.closed, visible?.busy, visible?.chatBusy]);
+      React.useEffect(() => {
+        const el = stream.current;
+        if (!el) return;
+        if (prepend.current) {
+          const anchor = prepend.current;
+          prepend.current = null;
+          el.scrollTop = anchor.top + el.scrollHeight - anchor.height;
+        } else if (stick.current) el.scrollTop = el.scrollHeight;
+      }, [visible]);
+      const older = async () => {
+        if (!visible?.records[0] || paging) return;
+        const signal = lifetime.current.signal;
+        setPaging(true);
+        try {
+          const page = await fetchJson(url + '&before=' + visible.records[0].seq, undefined, true, signal);
+          if (signal.aborted) return;
+          if (stream.current) prepend.current = { top: stream.current.scrollTop, height: stream.current.scrollHeight };
+          stick.current = false;
+          setVisible(previous => previous && mvRoomMerge(previous, page, true));
+        } catch (e) { if (!signal.aborted) setError(e.message); }
+        finally { if (!signal.aborted) setPaging(false); }
+      };
+      const act = async (action, fields = {}) => {
+        if (!room || !visible.origin || flight.current || actionPending ||
+            (action !== 'send' && action !== 'revise' && locked)) return false;
+        const signal = lifetime.current.signal;
+        flight.current = action;
+        setPending(action);
+        setError('');
+        setNotice('');
+        try {
+          if (action === 'send' && context.attachments?.length) {
+            const attachments = new Map([...(visible.attachments ?? []), ...context.attachments].map(item => [item.attachmentId, item]));
+            mvValidatePickerAttachmentBudget([...attachments.values()]);
+            await fetchJson('marshal/tasks/update', { taskId, attachments: [...attachments.values()].map(serializeAttachmentForWire) }, true, signal);
+          }
+          await fetchJson(MV_ROOM_API + 'action', { roomId: room.id, action, ...fields }, true, signal);
+          if (signal.aborted) return false;
+          if (['send', 'confirm', 'revise'].includes(action)) setDraft(current => current === draft ? '' : current);
+          if (action === 'send') { setContext(current => current === context ? {} : current); stick.current = true; }
+          if (action === 'confirm' || action === 'revise') setNotice(action === 'confirm' ? '已确认验收。' : '已提交返工。');
+          await refreshRef.current?.request();
+          return true;
+        } catch (e) { if (!signal.aborted) setError(e.message); return false; }
+        finally { flight.current = ''; if (!signal.aborted) setPending(''); }
+      };
+      const review = (action, applyPatch = false) => action === 'confirm'
+        ? act('confirm', { applyPatch, ...(draft.trim() ? { note: draft.trim() } : {}) })
+        : act('revise', draft.trim() ? { text: draft.trim() } : {});
+      const onReview = action => review(action);
+      const send = () => {
+        const links = mvChatLinks(context);
+        const text = draft.trim();
+        if (text && !visible?.chatBusy) return act('send', { text, ...(room?.closed ? { autoReopen: true } : {}), ...(links ? { links } : {}) });
+      };
+      const locate = async (record, fallback) => {
+        const signal = lifetime.current.signal;
+        setLocating(true);
+        setError('');
+        try {
+          const dag = await fetchJson('marshal/tasks/dag?' + new URLSearchParams({ taskId }), undefined, true, signal);
+          if (signal.aborted) return;
+          // Projection may coalesce several room records into the same node.
+          const nodes = (dag.layers ?? []).flatMap(layer => layer.nodes ?? []);
+          const node = nodes.find(node => node.logs?.some(log => log.seq === record.seq || (record.id && log.id === record.id)));
+          setNodeId(node?.id || fallback);
+        } catch (e) {
+          if (!signal.aborted) setError('无法定位 DAG 节点：' + e.message);
+        } finally { if (!signal.aborted) setLocating(false); }
+      };
+      const assignees = [
+        ...leaders.filter(p => p.global || p.workspaceId === workspace).map(p => ({ id: 'local/' + p.id, name: p.name, fields: { leaderId: p.id } })),
+        ...peers.flatMap(peer => (peer.models ?? []).map(model => ({ id: 'remote/' + peer.id + '/' + model.id,
+          name: peer.name + ' · ' + (model.model || model.id), fields: { remote: { deviceId: peer.id, modelId: model.id } } }))),
+      ];
+      const assigneeFields = assignees.find(row => row.id === assignee)?.fields;
+      const models = mvChatModels([...(library?.models ?? []), ...catalogModels]);
+      const agents = participants.filter(p => mvAgentConfigSlot(p, workflow)).map(p => {
+        const slot = mvAgentConfigSlot(p, workflow);
+        const member = library?.agents.find(a => a.id === p.agentId);
+        const config = workflow?.plan?.agentConfigs?.[slot] || workflow?.agentConfigs?.[slot] || member || p;
+        return { ...p, model: config.model, reasoningEffort: config.reasoningEffort, configKey: slot,
+          models: p.models ?? mvChatModelsWithCurrent(models, config.model) };
+      });
+      const records = visible?.records;
+      const [inlineDigests, setInlineDigests] = React.useState(() => new Map());
+      React.useEffect(() => {
+        if (!globalThis.crypto?.subtle || !records) return;
+        const inline = records.filter(record => mvRoomIsPatch(record) && !record.patchDigest &&
+          record.text?.startsWith('diff --git ') && !inlineDigests.has(record.text));
+        if (!inline.length) return;
+        let active = true;
+        void Promise.all(inline.map(async record => {
+          const bytes = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(record.text));
+          return [record.text, Array.from(new Uint8Array(bytes), byte => byte.toString(16).padStart(2, '0')).join('')];
+        })).then(entries => {
+          if (active) setInlineDigests(current => new Map([...current, ...entries]));
+        }).catch(() => {}); // The file and line counts remain available without SHA-256.
+        return () => { active = false; };
+      }, [records]);
+      let runId, runAssignment = null, priorPatchSummary, sawPatch = false;
+      const lastPatch = records?.findLast(mvRoomIsPatch);
+      const rows = (records ?? []).map(record => {
+        if (record.kind === 'batch' || (record.runId && record.runId !== runId)) {
+          runId = record.runId;
+          runAssignment = null;
+          priorPatchSummary = undefined;
+          sawPatch = false;
+        }
+        const decoded = decodeAgentTraceClient(record.text ?? record.body ?? '');
+        if (record.kind === 'assignment' || record.phase === 'assignment') {
+          const meta = mvRoomHandoffMeta(record, decoded.text);
+          runAssignment = meta ? { leaderName: meta.leader || meta.leaderName, roles: meta.roles } : null;
+        }
+        const isCurrentRun = !record.runId || !workflow?.runId || record.runId === workflow.runId;
+        const artifact = mvRoomIsPatch(record) ? mvRoomParsePatchArtifact(record) : null;
+        if (artifact) {
+          sawPatch = true;
+          priorPatchSummary = mvRoomReadPatch(record, artifact, inlineDigests.get(record.text));
+        }
+        // The workflow describes the latest deliverable, not a past batch or iteration.
+        const patchSummary = sawPatch ? priorPatchSummary :
+          runId && runId === workflow?.runId && (!lastPatch || lastPatch.seq < record.seq) ? mvRoomPatchSummary(workflow.development) : undefined;
+        return { record, ...decoded, patchSummary, runAssignment, isCurrentRun, artifact };
+      });
+      const patchTarget = ({ record, artifact }) => ({
+        digest: artifact?.meta?.digest || record.patchDigest, seq: record.seq, preview: artifact?.body,
+        nodeId: `development-patch:${record.id ?? record.seq}`,
+        stored: Boolean(artifact?.meta?.stored), bytes: artifact?.meta?.bytes,
+      });
+      const headerPatchRow = visible?.patchAvailable
+        ? rows.findLast(row => row.artifact && row.isCurrentRun)
+        : rows.findLast(row => row.artifact?.meta?.stored);
+      const headerPatch = room?.id && (headerPatchRow || visible?.patchAvailable) &&
+        (headerPatchRow ? patchTarget(headerPatchRow) : {
+          digest: workflow?.development?.digest,
+          bytes: workflow?.development?.bytes,
+          stored: true,
+        });
+      const patchKey = ({ digest, seq }) => JSON.stringify([room.id, digest, seq]);
+      const loadPatch = async (target, download, focusResult) => {
+        const key = patchKey(target);
+        const previous = fullPatch?.key === key ? fullPatch : null;
+        if (!download && previous?.text) {
+          setFullPatch({ ...previous, open: !previous.open, error: '', focusResult: focusResult && !previous.open });
+          return;
+        }
+        patchRequest.current?.abort();
+        const controller = new AbortController();
+        patchRequest.current = controller;
+        const { signal } = controller;
+        setFullPatch({ ...previous, key, loading: true, error: '' });
+        let text, patchError = '';
+        try {
+          text = await mvRoomFetchFullPatch({ roomId: room.id, taskId, ...target, signal });
+        } catch (e) {
+          if (signal.aborted) return;
+          patchError = `完整补丁读取失败：${e.message}${download && target.preview ? '（将下载预览）' : ''}`;
+        }
+        if (signal.aborted) return;
+        if (download && (text || target.preview)) {
+          try { mvRoomDownloadPatch(text || target.preview, target); }
+          catch (e) { patchError = [patchError, `补丁下载失败：${e.message}`].filter(Boolean).join('；'); }
+        }
+        setFullPatch({ key, loading: false, error: patchError, text: text ?? previous?.text,
+          open: download ? previous?.open : Boolean(text), focusResult: focusResult && (!download || Boolean(patchError)) });
+      };
+      const patchControls = (target, focusResult = false) => {
+        const state = fullPatch?.key === patchKey(target) ? fullPatch : null;
+        return h('div', { className: 'mv-actions' },
+          h(MvButton, { label: state?.open ? '收起完整补丁' : '查看完整补丁',
+            'aria-expanded': Boolean(state?.open), disabled: Boolean(state?.loading), onClick: () => loadPatch(target, false, focusResult) }),
+          h(MvButton, { label: '下载完整 .patch', disabled: Boolean(state?.loading), onClick: () => loadPatch(target, true, focusResult) }));
+      };
+      const patchContents = target => fullPatch?.key === patchKey(target) && [
+        fullPatch.error && h('div', { key: 'error', ref: patchResult, tabIndex: -1, role: 'alert', className: 'mv-danger' }, fullPatch.error),
+        fullPatch.open && h('pre', { key: 'diff', ref: fullPatch.error ? undefined : patchResult, className: 'mv-dag-diff', tabIndex: 0 }, fullPatch.text),
+      ];
+      const usage = new Map();
+      const add = (actor, u) => usage.set(actor, (usage.get(actor) || 0) + (Number(u?.totalTokens) || (Number(u?.inputTokens || 0) + Number(u?.outputTokens || 0))));
+      rows.forEach(({ record, trace }) => { if (trace?.usage) add(record.actor, trace.usage); });
+      (visible?.liveBubbles ?? []).forEach(live => { if (live.usage) add(live.actor, live.usage); });
+      const ticketNo = room?.ticketNo || task?.ticketNo;
+      const heading = projectedTask.title || '工单群';
+      const total = [...usage.values()].reduce((a, b) => a + b, 0);
+      const renderRow = ({ record, text, trace, patchSummary, runAssignment, isCurrentRun, artifact }) => {
+        const handoff = mvRoomHandoff(record, participants, text, workflow, patchSummary, { runAssignment, isCurrentRun });
+        const banner = handoff && h('div', { 'data-record-seq': record.seq, className: 'mv-task-item mv-guidance-action', 'aria-label': '阶段交接' },
+          h('div', { className: 'mv-actions' }, h('strong', null, handoff.source), ' → ',
+            handoff.targets.length ? handoff.targets.map(target => h('span', { key: target, className: 'mv-capsule' }, '@' + target)) : '待分配',
+            ' · ' + (taskPhases[handoff.phase] || (handoff.phase === 'assignment' ? '编排分工' : '阶段交接')),
+            taskId && h(MvButton, { label: '定位 DAG 节点', disabled: locating, onClick: () => locate(record, handoff.nodeId) })),
+          handoff.summary && h(RichMarkdown, { text: handoff.summary }));
+        const target = artifact && room?.id && patchTarget({ record, artifact });
+        return h(mvChatMessage, { key: record.seq, mine: record.kind === 'user', accent: colorMap.get(record.actor), name: record.actor, text: artifact?.body ?? text,
+          at: record.at, phase: record.phase, trace }, banner, target && patchControls(target), target && patchContents(target));
+      };
+      return h('div', { className: 'mv-room-fill' },
+        h('main', { className: 'mv-room', style: { overflow: 'visible' } },
+          h('header', { className: 'mv-dag-header mv-actions' },
+            h(MvButton, { label: '返回工作台', icon: 'back', onClick: () => openBoard?.(taskId) }),
+            h('strong', { className: 'mv-copy mv-truncate', title: projectedTask.title }, ticketNo && !heading.startsWith('[' + ticketNo + ']') && !heading.startsWith(ticketNo) ? ticketNo + ' · ' + heading : heading),
+            h('span', { className: 'mv-capsule' }, room?.closed ? '已归档' : taskPhases[workflow?.phase] || (reviewing ? '待验收' : visible?.busy ? '执行中' : room ? '讨论中' : '读取中')),
+            h('span', { className: 'mv-actions', 'aria-label': '智能体头像' }, participants.slice(0, 5).map(p => h('span', { key: p.id, title: p.name }, h(MvAvatar, { agent: p })))),
+            total > 0 && h('span', { className: 'mv-capsule mv-time' }, h(MvIcon, { name: 'dot' }), '累计 ' + formatTokenCount(total) + ' tok'),
+            headerPatch && patchControls(headerPatch, true),
+            h(MvButton, { label: '刷新', icon: 'refresh', iconOnly: true, onClick: () => refreshRef.current?.request() }),
+            taskId && h(MvButton, { label: 'DAG 编排', 'aria-pressed': dagOpen, onClick: () => setDagOpen(v => !v) })),
+          error && h('div', { role: 'alert', className: 'mv-danger' }, error),
+          notice && h('div', { role: 'status' }, notice),
+          headerPatch && !headerPatchRow && patchContents(headerPatch),
+          h('section', { ref: stream, className: 'mv-room-log', 'aria-label': '群聊记录', onScroll: e => {
+            const el = e.currentTarget;
+            stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+          } }, visible?.hasOlder && h(MvButton, { label: '加载更早消息', disabled: paging, onClick: older }),
+          !rows.length && !(visible?.liveBubbles?.length) && h('p', { className: 'mv-muted' }, room ? '还没有消息。' : '正在读取工单群…'),
+          rows.map(renderRow), visible && (visible.liveBubbles ?? []).map(live => h(mvChatMessage, { key: 'live-' + live.id,
+            name: live.actor, accent: colorMap.get(live.actor), phase: live.phase, text: live.text, trace: live, live: true })),
+          workflow?.reportId && taskId && h(TaskReviewReport, { key: workflow.reportId, taskId, development: Boolean(workflow.development) })),
+          visible?.origin && room && h('footer', { className: 'mv-composer-dock' },
+            h(mvChatMentions, { members: participants, usage, all: true, input, setText: setDraft }),
+            visible.attachments?.length > 0 && h('div', { className: 'mv-muted', 'aria-label': '工单附件' },
+              '工单附件：' + visible.attachments.map(item => item.name).join('、')),
+            h('textarea', { ref: input, rows: 2, className: 'mv-field', value: draft, 'aria-label': '工单群消息', placeholder: '输入消息或 @成员', onChange: e => setDraft(e.target.value) }),
+            h('div', { className: 'mv-actions' },
+              h(mvCascadePicker.MarshalAgentModelCascade, { agents, task: projectedTask, onSaved: () => { setNotice('模型与思考配置已更新。'); return refreshRef.current?.request(); } }),
+              h(mvCascadePicker.MarshalCascadeContextPicker, { value: context, onChange: setContext }),
+              !participants.length && onOpenAgents && h(MvButton, { label: '打开智能体', onClick: onOpenAgents }),
+              h(MvButton, { icon: 'send', label: pending === 'send' ? '发送中…' : '发送', disabled: !draft.trim() || Boolean(pending) || visible.chatBusy, onClick: send })),
+            h('div', { className: 'mv-actions' },
+              reviewing && h(MvButton, { label: '确认验收', disabled: locked, onClick: () => review('confirm') }),
+              reviewing && visible.patchAvailable && h(MvButton, { label: '应用补丁并验收', disabled: locked, onClick: () => review('confirm', true) }),
+              (reviewing || runningRevision) && h(MvButton, { label: reviewing ? '返工' : '按意见返工',
+                disabled: actionPending || (!reviewing && !draft.trim()), onClick: () => {
+                  if (reviewing || draft.trim()) return review('revise');
+                } }),
+              h(MvButton, { label: room.closed ? '重开工单' : '关闭工单', disabled: locked, onClick: () => act(room.closed ? 'reopen' : 'close') }),
+              !room.closed && h(MvButton, { label: '重试', disabled: locked, onClick: () => act('retry') }),
+              !room.closed && h('select', { className: 'mv-field mv-compact-field', 'aria-label': '改派负责人', value: assignee, disabled: locked, onChange: e => setAssignee(e.target.value) },
+                h('option', { value: '' }, '选择负责人'), assignees.map(p => h('option', { key: p.id, value: p.id }, p.name))),
+              !room.closed && h(MvButton, { label: '改派并运行', disabled: locked || !assigneeFields, onClick: () => act('reassign', assigneeFields) })))),
+        dagOpen && taskId && h(mvDagSidebar.MarshalVerticalDagSidebar, { taskId, task: projectedTask, onReview }),
+        nodeId && taskId && h(mvDagSidebar.MarshalDagNodeModal, { taskId, task: projectedTask, nodeId, onReview, onClose: () => setNodeId('') }));
+    }
     function formatTaskTime(ts) {
       if (typeof ts !== 'number' || !Number.isFinite(ts)) return '';
       const diff = Math.max(0, Date.now() - ts);
@@ -2963,3315 +7309,607 @@ window.__ModuleLoader__.load({
     };
 
     const PERMISSION_RANK = { 'read-only': 0, 'workspace-write': 1, 'danger-full-access': 2 };
+    const MV_HUB_TASK_TOPICS = ['ready', 'tasks.changed', 'incidents.changed'];
+    const MV_HUB_INCIDENTS = signal => fetchJson('marshal/incidents/summary', undefined, true, signal);
+    const MV_HUB_KANBAN_READS = {
+      board: signal => fetchJson('marshal/tasks/state', undefined, true, signal),
+      incidents: MV_HUB_INCIDENTS,
+      orchestration: signal => fetchJson('marshal/tasks/orchestration', undefined, true, signal),
+      models: signal => fetchJson('api/task-board/model-catalog', undefined, false, signal),
+      workspaces: signal => fetchJson('marshal/task-rooms/workspaces', undefined, true, signal),
+    };
 
-    function TaskBoardPage({ openSession, openTaskRoom, focusedTask, openNativeBoard, onOpenRosters }) {
-      const [tasks, setTasks] = React.useState(null);
-      const [sessionDefaultPerm, setSessionDefaultPerm] = React.useState('read-only');
-      const [error, setError] = React.useState('');
-      const [notice, setNotice] = React.useState('');
-      const [busy, setBusy] = React.useState(false);
-      const [formOpen, setFormOpen] = React.useState(false);
-      const [parseOpen, setParseOpen] = React.useState(false);
-      const [parseInput, setParseInput] = React.useState('');
-      const [parseModel, setParseModel] = React.useState(() => {
-        try { return globalThis.localStorage?.getItem(PARSE_MODEL_STORAGE_KEY) || ''; } catch { return ''; }
-      });
-      const [parseBusy, setParseBusy] = React.useState(false);
-      const [parseError, setParseError] = React.useState('');
-      const [modelOptions, setModelOptions] = React.useState([]);
-      const [defaultModelRoute, setDefaultModelRoute] = React.useState('');
-
-      const [title, setTitle] = React.useState('');
-      const [description, setDescription] = React.useState('');
-      const [formPrompt, setFormPrompt] = React.useState('');
-      const [formTags, setFormTags] = React.useState([]);
-      const [newTagDraft, setNewTagDraft] = React.useState('');
-      const [formParentId, setFormParentId] = React.useState('');
-      const [formPermission, setFormPermission] = React.useState('');
-      const [formModel, setFormModel] = React.useState('');
-      const [formEffort, setFormEffort] = React.useState('');
-      const [formReuseSession, setFormReuseSession] = React.useState(false);
-      const [formAttachments, setFormAttachments] = React.useState([]);
-      const [uploading, setUploading] = React.useState(false);
-      const [assignedAgent, setAssignedAgent] = React.useState('');
-      const [orchestrationMode, setOrchestrationMode] = React.useState('plain');
-
-      const [confirmId, setConfirmId] = React.useState('');
-      const [drawerReviseNote, setDrawerReviseNote] = React.useState('');
-      React.useEffect(() => { ensureTaskRoomStyles(); }, []);
-      const [dragTaskId, setDragTaskId] = React.useState('');
-      const [dropCol, setDropCol] = React.useState('');
-      const [compactCards, setCompactCards] = React.useState(false);
-      const [showFlowGuide, setShowFlowGuide] = React.useState(false);
-      const [collapsedCols, setCollapsedCols] = React.useState(() => {
-        try { const raw = JSON.parse(globalThis.localStorage?.getItem('marshal.board.collapsedCols') || '[]'); return Array.isArray(raw) ? raw : []; } catch { return []; }
-      });
-      const gridRef = React.useRef(null);
-      const panDragRef = React.useRef(null);
-      const [panning, setPanning] = React.useState(false);
-      const [scrollEdge, setScrollEdge] = React.useState({ left: false, right: false });
-      const syncScrollEdges = React.useCallback(() => {
-        const el = gridRef.current;
-        if (!el) return;
-        const maxLeft = Math.max(0, el.scrollWidth - el.clientWidth);
-        const left = el.scrollLeft > 8;
-        const right = maxLeft > 8 && el.scrollLeft < maxLeft - 8;
-        setScrollEdge(prev => (prev.left === left && prev.right === right ? prev : { left, right }));
-      }, []);
+    function mvUseHubSnapshot(topics, reads, version) {
+      const [snapshot, setSnapshot] = React.useState({ loading: true });
+      const refresh = React.useRef(null);
       React.useEffect(() => {
-        syncScrollEdges();
-        const el = gridRef.current;
-        if (!el) return;
-        const onScroll = () => syncScrollEdges();
-        el.addEventListener('scroll', onScroll, { passive: true });
-        let ro;
-        if (typeof ResizeObserver === 'function') {
-          ro = new ResizeObserver(() => syncScrollEdges());
-          ro.observe(el);
-        }
-        window.addEventListener('resize', onScroll);
-        return () => {
-          el.removeEventListener('scroll', onScroll);
-          window.removeEventListener('resize', onScroll);
-          ro?.disconnect();
-        };
-      }, [syncScrollEdges, collapsedCols]);
-      const toggleCollapseCol = key => {
-        setCollapsedCols(prev => {
-          const next = prev.includes(key) ? prev.filter(k => k !== key) : [...prev, key];
-          try { globalThis.localStorage?.setItem('marshal.board.collapsedCols', JSON.stringify(next)); } catch {}
-          return next;
-        });
-      };
-      const collapseEmptyCols = emptyKeys => {
-        setCollapsedCols(prev => {
-          const allEmptyCollapsed = emptyKeys.length > 0 && emptyKeys.every(k => prev.includes(k));
-          const next = allEmptyCollapsed ? prev.filter(k => !emptyKeys.includes(k)) : [...new Set([...prev, ...emptyKeys])];
-          try { globalThis.localStorage?.setItem('marshal.board.collapsedCols', JSON.stringify(next)); } catch {}
-          return next;
-        });
-      };
-      const expandAllCols = () => {
-        setCollapsedCols([]);
-        try { globalThis.localStorage?.setItem('marshal.board.collapsedCols', '[]'); } catch {}
-      };
-      const panBoard = delta => {
-        const el = gridRef.current;
-        if (el) el.scrollBy({ left: delta, behavior: 'smooth' });
-      };
-      const handleGridMouseDown = event => {
-        if (event.button !== 0 || dragTaskId) return;
-        const target = event.target;
-        if (target && typeof target.closest === 'function' && target.closest('button,input,textarea,select,a,[draggable="true"],.mtb-card')) return;
-        const el = gridRef.current;
-        if (!el || el.scrollWidth <= el.clientWidth + 4) return;
-        panDragRef.current = { startX: event.clientX, startLeft: el.scrollLeft };
-        setPanning(true);
-        const onMove = moveEvent => {
-          const state = panDragRef.current;
-          if (!state) return;
-          el.scrollLeft = state.startLeft - (moveEvent.clientX - state.startX);
-        };
-        const onUp = () => {
-          panDragRef.current = null;
-          setPanning(false);
-          window.removeEventListener('mousemove', onMove);
-          window.removeEventListener('mouseup', onUp);
-        };
-        window.addEventListener('mousemove', onMove);
-        window.addEventListener('mouseup', onUp);
-      };
-      const handleGridWheel = event => {
-        const el = gridRef.current;
-        if (!el || el.scrollWidth <= el.clientWidth + 4) return;
-        if (event.shiftKey && Math.abs(event.deltaY) > 0) {
-          el.scrollLeft += event.deltaY;
-          event.preventDefault();
-          return;
-        }
-        const colBody = event.target && typeof event.target.closest === 'function' ? event.target.closest('.mtb-col-body') : null;
-        const colCanScrollY = colBody && colBody.scrollHeight > colBody.clientHeight + 2;
-        if (!colCanScrollY && Math.abs(event.deltaY) > Math.abs(event.deltaX)) {
-          el.scrollLeft += event.deltaY;
-          event.preventDefault();
-        }
-      };
-      const handleGridDragOver = event => {
-        if (!dragTaskId) return;
-        const el = gridRef.current;
-        if (!el) return;
-        const rect = el.getBoundingClientRect();
-        const edge = 76;
-        if (event.clientX > rect.right - edge) el.scrollLeft += 18;
-        else if (event.clientX < rect.left + edge) el.scrollLeft -= 18;
-      };
-      const [showArchive, setShowArchive] = React.useState(false);
-      const [activeTag, setActiveTag] = React.useState('');
-      const [searchQuery, setSearchQuery] = React.useState('');
-      const [selectedId, setSelectedId] = React.useState('');
-      const [drawerEditing, setDrawerEditing] = React.useState(false);
-      const [editTitle, setEditTitle] = React.useState('');
-      const [editDesc, setEditDesc] = React.useState('');
-      const [editPrompt, setEditPrompt] = React.useState('');
-      const [editPerm, setEditPerm] = React.useState('');
-      const [editModel, setEditModel] = React.useState('');
-      const [editEffort, setEditEffort] = React.useState('');
-      const [editReuseSession, setEditReuseSession] = React.useState(false);
-      const [editFreezeGoal, setEditFreezeGoal] = React.useState('');
-      const [editSteerNow, setEditSteerNow] = React.useState(true);
-      const [drawerTagDraft, setDrawerTagDraft] = React.useState('');
-      const [newSubtaskTitle, setNewSubtaskTitle] = React.useState('');
-      const [linkChildId, setLinkChildId] = React.useState('');
-      const [cronDraft, setCronDraft] = React.useState('');
-      const [cronMode, setCronMode] = React.useState('cron');
-      const [onceDraft, setOnceDraft] = React.useState('');
-      const [cronEnabled, setCronEnabled] = React.useState(false);
-
-      const [catalog, setCatalog] = React.useState(null);
-      const [catalogError, setCatalogError] = React.useState('');
-      const [leaderId, setLeaderId] = React.useState('');
-      const [workspaceId, setWorkspaceId] = React.useState('');
-      const [workspaces, setWorkspaces] = React.useState([]);
-      const [rosters, setRosters] = React.useState({});
-      const selectedLeader = catalog?.leaders.find(item => item.id === leaderId);
-      const workspace = workspaceId || (selectedLeader && !selectedLeader.global ? selectedLeader.workspaceId : '');
-      const [choice, setChoice] = React.useState('leader');
-      const [templateId, setTemplateId] = React.useState('pr-review');
-      const [prUrl, setPrUrl] = React.useState('');
-      const [editing, setEditing] = React.useState('');
-      const [plan, setPlan] = React.useState(null);
-      const [codexModels, setCodexModels] = React.useState([]);
-      const [explicitCode, setExplicitCode] = React.useState(false);
-      const [formAgentConfigs, setFormAgentConfigs] = React.useState({});
-      const selectedTemplate = plan?.templateId ?? (choice === 'template' ? templateId : choice === 'none' ? 'none' : '');
-      const recommendedTemplate = selectedTemplate === 'none' ? catalog?.plainTemplate : catalog?.templates.find(item => item.id === selectedTemplate);
-      const codeWork = selectedTemplate === 'development' || (selectedTemplate !== 'pr-review' && (plan?.codeWork ?? explicitCode));
-      const roleChoices = codeWork ? recommendedTemplate?.codingRoles : recommendedTemplate?.roles;
-      const candidates = catalog?.leaders.filter(item => (item.global || item.workspaceId === workspace) && item.id !== leaderId) ?? [];
-      const groupId = codeWork && selectedTemplate ? 'delivery' : recommendedTemplate?.groupTemplate;
-      const group = catalog?.groupTemplates?.find(item => item.id === groupId);
-      const template = catalog?.templates.find(item => item.id === templateId);
-      const requiresPr = orchestrationMode === 'template' && leaderId !== '' && choice === 'template' && templateId === 'pr-review';
-
-      const allTasks = Array.isArray(tasks) ? tasks : [];
-      const allActive = allTasks.filter(task => task.archivedAt === undefined);
-      const archivedTasks = allTasks.filter(task => task.archivedAt !== undefined);
-      const knownTags = React.useMemo(() => {
-        const seen = new Set();
-        const out = [];
-        for (const task of allActive) {
-          for (const tag of task.tags ?? []) {
-            if (tag?.name && !seen.has(tag.name)) { seen.add(tag.name); out.push(tag); }
-          }
-        }
-        return out;
-      }, [allActive]);
-      const q = searchQuery.trim().toLowerCase();
-      const list = allActive.filter(task => {
-        if (activeTag && !(task.tags ?? []).some(tag => tag.name === activeTag)) return false;
-        if (q) {
-          const hay = [task.ticketNo, task.title, task.description, ...(task.tags ?? []).map(t => t.name)].filter(Boolean).join(' ').toLowerCase();
-          if (!hay.includes(q)) return false;
-        }
-        return true;
-      });
-      const subtaskStats = React.useMemo(() => {
-        const map = new Map();
-        for (const task of allActive) {
-          if (!task.parentId) continue;
-          const entry = map.get(task.parentId) ?? { total: 0, done: 0, running: 0, failed: 0 };
-          entry.total += 1;
-          if (task.status === 'done' || task.status === 'review') entry.done += 1;
-          else if (task.status === 'running') entry.running += 1;
-          else if (task.status === 'failed') entry.failed += 1;
-          map.set(task.parentId, entry);
-        }
-        return map;
-      }, [allActive]);
-      const columns = [
-        { key: 'backlog', label: '待规划', accent: '#7c8798', empty: '暂无待规划任务' },
-        { key: 'todo', label: '待办', accent: 'var(--dsw-alias-state-business-primary, #3b82f6)', empty: '暂无待办任务' },
-        { key: 'running', label: '进行中', accent: 'var(--dsw-alias-state-warn-primary, #f59e0b)', empty: '暂无进行中任务', pulse: true },
-        { key: 'review', label: '待确认', accent: '#8b5cf6', empty: '暂无待确认任务' },
-        { key: 'done', label: '已完成', accent: 'var(--dsw-alias-state-success-primary, #10b981)', empty: '暂无已完成任务' },
-        { key: 'failed', label: '已失败', accent: 'var(--dsw-alias-state-error-primary, #ef4444)', empty: '暂无失败任务' },
-      ];
-      const knownStatuses = new Set(columns.map(c => c.key));
-
-      const load = async () => {
-        try {
-          const data = await fetchJson('marshal/tasks/state', undefined, true);
-          setTasks(data.tasks || []);
-          if (typeof data.sessionDefaultPermission === 'string') setSessionDefaultPerm(data.sessionDefaultPermission);
-          setError('');
-        }
-        catch (e) { setError(friendlyError(e, '任务看板')); }
-      };
-      React.useEffect(() => {
-        ensureTaskBoardStyles();
-        void load();
-        void fetchJson('marshal/tasks/orchestration', undefined, true)
-          .then(data => {
-            setCatalog(data);
-            if (Array.isArray(data?.codexModels) && data.codexModels.length > 0) {
-              setCodexModels(data.codexModels);
-            }
-          }).catch(() => setCatalogError('编排配置暂不可用。'));
-        void fetchJson('marshal/task-rooms/workspaces', undefined, true).then(data => {
-          const realWs = (data.workspaces || []).filter(item => !isPseudoAgentWorkspace(item));
-          setWorkspaces(realWs);
-          if (realWs.length === 1) setWorkspaceId(realWs[0].id);
-        }).catch(() => {});
-        void fetchJson('marshal/rosters/state').then(data => {
-          setRosters(data?.rosters || {});
-        }).catch(() => {});
-        void fetch('api/task-board/model-catalog', { credentials: 'same-origin' })
-          .then(r => r.ok ? r.json() : null)
-          .then(raw => {
-            if (!raw) return;
-            const flat = flattenModelCatalog(raw);
-            setModelOptions(flat.options);
-            setDefaultModelRoute(flat.defaultRoute);
-            setParseModel(cur => cur || flat.defaultRoute || flat.options[0]?.route || '');
-          }).catch(() => {});
-        const timer = setInterval(() => { void load(); }, 3000);
-        return () => clearInterval(timer);
-      }, []);
-
-      React.useEffect(() => {
-        if (!selectedId && !parseOpen) return undefined;
-        const onKey = event => {
-          if (event.key === 'Escape') {
-            if (parseOpen) setParseOpen(false);
-            else { setSelectedId(''); setConfirmId(''); setDrawerEditing(false); }
-          }
-        };
-        window.addEventListener('keydown', onKey);
-        return () => window.removeEventListener('keydown', onKey);
-      }, [selectedId, parseOpen]);
-
-      const selectedTask = selectedId ? allTasks.find(item => item.id === selectedId) : undefined;
-      React.useEffect(() => {
-        setDrawerEditing(false);
-        setDrawerTagDraft('');
-        setNewSubtaskTitle('');
-        setLinkChildId('');
-        if (selectedTask) {
-          setEditTitle(selectedTask.title || '');
-          setEditDesc(selectedTask.description || '');
-          setEditPrompt(selectedTask.prompt || '');
-          setEditPerm(selectedTask.permission || '');
-          setEditModel(selectedTask.model || '');
-          setEditEffort(selectedTask.reasoningEffort || '');
-          setEditReuseSession(selectedTask.reuseSession === true);
-          setEditFreezeGoal(selectedTask.freeze?.goal || '');
-          setEditSteerNow(true);
-          setCronDraft(selectedTask.schedule?.cron || '');
-          setCronMode(selectedTask.schedule?.mode === 'once' ? 'once' : 'cron');
-          setOnceDraft(selectedTask.schedule?.at ? new Date(selectedTask.schedule.at - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 16) : '');
-          setCronEnabled(selectedTask.schedule?.enabled === true);
-        }
-      }, [selectedId]);
-
-      const focusAvailable = allActive.some(item => item.id === focusedTask);
-      React.useEffect(() => {
-        if (focusedTask && focusAvailable) document.getElementById('marshal-ticket-' + focusedTask)?.scrollIntoView({ block: 'nearest' });
-      }, [focusedTask, focusAvailable]);
-
-      const effortsForModel = route => {
-        const hit = modelOptions.find(m => m.route === route || m.id === route);
-        if (hit && hit.efforts.length > 0) {
-          return hit.efforts.map(id => DEFAULT_REASONING_EFFORTS.find(d => d.id === id) ?? { id, label: id });
-        }
-        return DEFAULT_REASONING_EFFORTS;
-      };
-
-      const thinkingModeOptions = (route, defaultEffort = '', currentVal = '') => {
-        const base = [
-          { id: '', label: '思考：跟随默认' + (defaultEffort ? ' (' + defaultEffort + ')' : '') },
-          { id: 'off', label: '思考：关闭 (直出)' },
-          ...effortsForModel(route).map(opt => ({ id: opt.id, label: '思考：' + opt.label })),
-        ];
-        if (currentVal && !base.some(o => o.id === currentVal)) {
-          base.push({ id: currentVal, label: '思考：' + currentVal });
-        }
-        return base;
-      };
-
-      const codexThinkingOptions = (codexSlotValue, currentVal = '') => {
-        const matched = codexModels.find(m => m.id === codexSlotValue || m.model === codexSlotValue) ?? codexModels[0];
-        const declared = Array.isArray(matched?.reasoningEfforts) && matched.reasoningEfforts.length > 0
-          ? matched.reasoningEfforts.map(id => DEFAULT_REASONING_EFFORTS.find(d => d.id === id) ?? { id, label: id })
-          : DEFAULT_REASONING_EFFORTS;
-        const base = [
-          { id: '', label: '思考：跟随默认' },
-          { id: 'off', label: '思考：关闭 (直出)' },
-          ...declared.map(opt => ({ id: opt.id, label: '思考：' + opt.label })),
-        ];
-        if (currentVal && !base.some(o => o.id === currentVal)) {
-          base.push({ id: currentVal, label: '思考：' + currentVal });
-        }
-        return base;
-      };
-
-      const modelSelectOptions = (defaultModelHint = '', currentVal = '') => {
-        const opts = [
-          { route: '', label: defaultModelHint ? '默认 (' + defaultModelHint + ')' : '跟随智能体默认模型' },
-          ...modelOptions,
-        ];
-        if (currentVal && !opts.some(o => o.route === currentVal)) {
-          opts.push({ route: currentVal, label: currentVal + ' (已指定)' });
-        }
-        return opts;
-      };
-
-      const cleanClientAgentConfigs = raw => {
-        if (!raw || typeof raw !== 'object') return undefined;
-        const out = {};
-        for (const [slot, cfg] of Object.entries(raw)) {
-          if (!cfg || typeof cfg !== 'object') continue;
-          const m = typeof cfg.model === 'string' ? cfg.model.trim() : '';
-          const r = typeof cfg.reasoningEffort === 'string' ? cfg.reasoningEffort.trim() : '';
-          if (m || r) out[slot] = { ...(m ? { model: m } : {}), ...(r ? { reasoningEffort: r } : {}) };
-        }
-        return Object.keys(out).length > 0 ? out : undefined;
-      };
-
-      const setSlotConfig = (slot, patch) => {
-        setFormAgentConfigs(prev => {
-          const cur = prev?.[slot] ?? {};
-          const nextSlot = { ...cur, ...patch };
-          if (!nextSlot.model) delete nextSlot.model;
-          if (!nextSlot.reasoningEffort) delete nextSlot.reasoningEffort;
-          const next = { ...(prev ?? {}) };
-          if (Object.keys(nextSlot).length === 0) delete next[slot];
-          else next[slot] = nextSlot;
-          return next;
-        });
-      };
-
-      const buildLocalPlanFor = (tplId, useCodeWork, activeLeaderId, wsId) => {
-        if (!catalog || !tplId) return null;
-        const tplMeta = tplId === 'none' ? catalog.plainTemplate : catalog.templates?.find(t => t.id === tplId);
-        if (!tplMeta) return null;
-        const isCode = tplId === 'development' || (tplId !== 'pr-review' && Boolean(useCodeWork));
-        const slots = (isCode ? tplMeta.codingRoles : tplMeta.roles) ?? [];
-        const pool = (catalog.leaders ?? []).filter(item => (item.global || !wsId || item.workspaceId === wsId) && item.id !== activeLeaderId);
-        const used = new Set([activeLeaderId]);
-        const members = {};
-        for (const slot of slots) {
-          if (slot.id === 'codexCritic') {
-            members[slot.id] = '@codex';
-            continue;
-          }
-          const avail = pool.filter(m => !used.has(m.id) && (slot.id !== 'coder' || ['workspace-write', 'danger-full-access'].includes(m.permission)));
-          if (avail[0]) {
-            members[slot.id] = avail[0].id;
-            used.add(avail[0].id);
-          } else if (slot.id === 'critic') {
-            members[slot.id] = '@dsh';
-          }
-        }
-        return {
-          templateId: tplId,
-          groupTemplate: isCode ? 'delivery' : (tplMeta.groupTemplate ?? 'free'),
-          codeWork: isCode,
-          members,
-          codex: {
-            coding: isCode ? 'auto' : null,
-            review: (isCode || tplId === 'pr-review') ? 'auto' : null,
-          },
-        };
-      };
-
-      const previewUrlsRef = React.useRef(new Map());
-      React.useEffect(() => () => {
-        for (const blobUrl of previewUrlsRef.current.values()) {
-          try { URL.revokeObjectURL(blobUrl); } catch {}
-        }
-        previewUrlsRef.current.clear();
-      }, []);
-
-      const uploadFiles = async (fileList, onUploaded) => {
-        const files = Array.from(fileList || []).slice(0, 8);
-        if (files.length === 0) return;
-        setUploading(true);
-        setError('');
-        try {
-          const uploaded = await uploadAttachmentFiles(files, previewUrlsRef.current);
-          if (uploaded.length > 0) {
-            onUploaded(uploaded);
-            setNotice('已上传 ' + uploaded.length + ' 个附件：' + uploaded.map(item => item.name).join('、'));
-          }
-        }
-        catch (e) { setError('上传附件失败：' + (e.message || e)); }
-        finally { setUploading(false); }
-      };
-
-      const runAiParse = async () => {
-        const text = parseInput.trim();
-        if (!text || parseBusy) return;
-        const route = parseModel || defaultModelRoute || modelOptions[0]?.route || '';
-        if (!route) { setParseError('未检测到可用的解析模型，请先在 DSH 中配置模型。'); return; }
-        setParseBusy(true);
-        setParseError('');
-        try {
-          try { globalThis.localStorage?.setItem(PARSE_MODEL_STORAGE_KEY, route); } catch {}
-          const resp = await fetch('api/task-board/parse', {
-            method: 'POST',
-            credentials: 'same-origin',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ text, model: route }),
+        const visible = createVisibleMarshalRefresh(async signal => {
+          const keys = Object.keys(reads);
+          const results = await Promise.allSettled(keys.map(key => reads[key](signal)));
+          if (signal.aborted) return;
+          const patch = {};
+          const errors = [];
+          results.forEach((result, index) => {
+            if (result.status === 'fulfilled') patch[keys[index]] = result.value;
+            else errors.push(result.reason?.message || String(result.reason));
           });
-          const data = await resp.json().catch(() => ({}));
-          if (!resp.ok || !data?.draft) throw new Error(data?.error || ('解析失败 HTTP ' + resp.status));
-          setTitle(data.draft.title || '');
-          setDescription(data.draft.description || '');
-          setFormPrompt(data.draft.prompt || '');
-          setPlan(null);
-          setParseOpen(false);
-          setFormOpen(true);
-          setNotice('AI 已解析任务草稿，可继续补充标签、Agent Leader、模型或直接创建。');
-        }
-        catch (e) { setParseError('AI 解析失败：' + (e.message || e)); }
-        finally { setParseBusy(false); }
-      };
-
-      const choiceBody = () => {
-        const cleanedConfigs = cleanClientAgentConfigs(formAgentConfigs);
-        return {
-          leaderId, choice, codeWork: explicitCode || undefined,
-          ...(workspace ? { workspaceId: workspace } : {}),
-          ...(choice === 'template' ? { templateId } : {}),
-          ...(choice !== 'none' && prUrl.trim() ? { prUrl: prUrl.trim() } : {}),
-          ...(cleanedConfigs ? { agentConfigs: cleanedConfigs } : {}),
-        };
-      };
-      const recommend = async () => {
-        if (busy || !leaderId || !title.trim()) return;
-        if (requiresPr && !prUrl.trim()) { setError('请填写要审查的 PR 链接'); return; }
-        setBusy(true);
-        setError('');
-        try {
-          const result = await fetchJson('marshal/tasks/preview', {
-            title: title.trim(), description: description.trim(), orchestration: choiceBody(),
-          }, true);
-          setPlan(result.plan);
-          if (result.plan?.agentConfigs) setFormAgentConfigs(result.plan.agentConfigs);
-          if (Array.isArray(result.codexModels) && result.codexModels.length > 0) setCodexModels(result.codexModels);
-          setExplicitCode(result.plan.codeWork && result.plan.templateId !== 'development');
-        }
-        catch (e) { setError('推荐分工失败，' + (e.message || e)); }
-        finally { setBusy(false); }
-      };
-      const cancelForm = () => {
-        setFormOpen(false);
-        if (editing) {
-          setEditing('');
-          setTitle('');
-          setDescription('');
-          setFormPrompt('');
-          setFormTags([]);
-          setNewTagDraft('');
-          setFormParentId('');
-          setFormPermission('');
-          setFormModel('');
-          setFormEffort('');
-          setFormReuseSession(false);
-          setFormAttachments([]);
-          setAssignedAgent('');
-          setOrchestrationMode('plain');
-          setLeaderId('');
-          setPlan(null);
-          setFormAgentConfigs({});
-          setChoice('leader');
-          setPrUrl('');
-          setExplicitCode(false);
-        }
-      };
-      const edit = task => {
-        const workflow = task.workflow;
-        setSelectedId('');
-        setEditing(task.id);
-        setTitle(task.title);
-        setDescription(task.description ?? '');
-        setFormPrompt(task.prompt ?? '');
-        setFormTags((task.tags ?? []).map(t => t.name).filter(n => !n.startsWith('智能体:')));
-        setNewTagDraft('');
-        setFormParentId(task.parentId ?? '');
-        setFormPermission(task.permission ?? '');
-        setFormModel(task.model ?? '');
-        setFormEffort(task.reasoningEffort ?? '');
-        setFormReuseSession(task.reuseSession === true);
-        setFormAttachments(Array.isArray(task.attachments) ? task.attachments : []);
-        if (workflow) {
-          setWorkspaceId(workflow.workspaceId);
-          setLeaderId(workflow.leaderId);
-          setAssignedAgent(workflow.leaderId);
-          setOrchestrationMode(workflow.choice === 'template' ? 'template' : workflow.choice === 'none' ? 'none' : 'leader');
-          setChoice(workflow.choice);
-          const effTpl = workflow.templateId ?? workflow.plan?.templateId ?? 'pr-review';
-          setTemplateId(effTpl);
-          setPrUrl(workflow.prUrl ?? '');
-          const mergedCfg = { ...(workflow.agentConfigs ?? {}), ...(workflow.plan?.agentConfigs ?? {}) };
-          setFormAgentConfigs(mergedCfg);
-          setPlan(workflow.planConfirmed && workflow.plan ? workflow.plan : (workflow.choice !== 'leader' ? buildLocalPlanFor(workflow.choice === 'none' ? 'none' : effTpl, workflow.plan?.codeWork, workflow.leaderId, workflow.workspaceId) : null));
-          setExplicitCode(Boolean(workflow.plan?.codeWork && workflow.plan?.templateId !== 'development'));
-        } else {
-          const fallbackWs = task.taskRoom?.workspaceId || (workspaces.length === 1 ? workspaces[0].id : '');
-          const tagAgentName = ((task.tags ?? []).map(t => t.name).find(n => n.startsWith('智能体:')) || '').slice(4);
-          const matchedLeader = (catalog?.leaders ?? []).find(l => l.name === tagAgentName) ?? (catalog?.leaders ?? [])[0];
-          const initWs = fallbackWs || (matchedLeader && !matchedLeader.global ? matchedLeader.workspaceId : '');
-          setWorkspaceId(initWs);
-          setLeaderId(matchedLeader?.id ?? '');
-          setAssignedAgent(matchedLeader?.id ?? '');
-          setOrchestrationMode(matchedLeader ? 'leader' : 'plain');
-          setChoice('leader');
-          setTemplateId('development');
-          setPrUrl('');
-          setFormAgentConfigs({});
-          setPlan(null);
-          setExplicitCode(false);
-        }
-        setError('');
-        setFormOpen(true);
-      };
-      const pickOrchestrationMode = (mode, tplId) => {
-        setExplicitCode(false);
-        setOrchestrationMode(mode);
-        if (mode === 'plain') {
-          setPlan(null);
-          setLeaderId('');
-          setChoice('leader');
-          return;
-        }
-        const availLeaders = catalog?.leaders ?? [];
-        const picked = assignedAgent || leaderId || availLeaders[0]?.id || '';
-        if (picked) { setLeaderId(picked); setAssignedAgent(picked); }
-        if (mode === 'leader') {
-          setChoice('leader');
-          setPlan(null);
-        } else if (mode === 'template') {
-          const targetTpl = tplId || templateId;
-          setChoice('template');
-          if (tplId) setTemplateId(tplId);
-          setPlan(picked ? buildLocalPlanFor(targetTpl, false, picked, workspaceId) : null);
-        } else if (mode === 'none') {
-          setChoice('none');
-          setPlan(picked ? buildLocalPlanFor('none', false, picked, workspaceId) : null);
-        }
-      };
-      const handleAssignAgent = id => {
-        setAssignedAgent(id);
-        if (orchestrationMode !== 'plain') {
-          setLeaderId(id);
-          if (orchestrationMode === 'template') setPlan(id ? buildLocalPlanFor(templateId, explicitCode, id, workspaceId) : null);
-          else if (orchestrationMode === 'none') setPlan(id ? buildLocalPlanFor('none', explicitCode, id, workspaceId) : null);
-          else setPlan(null);
-        }
-      };
-      const handleSelectWorkspace = nextWsId => {
-        setWorkspaceId(nextWsId);
-        const roster = nextWsId ? rosters[nextWsId] : undefined;
-        let effLeader = leaderId;
-        if (roster?.leaderId && catalog?.leaders?.some(item => item.id === roster.leaderId)) {
-          effLeader = roster.leaderId;
-          setAssignedAgent(roster.leaderId);
-          if (orchestrationMode !== 'plain') setLeaderId(roster.leaderId);
-          setNotice('已套用该工作区默认班底 Leader');
-        }
-        if (orchestrationMode === 'template' && effLeader) setPlan(buildLocalPlanFor(templateId, explicitCode, effLeader, nextWsId));
-        else if (orchestrationMode === 'none' && effLeader) setPlan(buildLocalPlanFor('none', explicitCode, effLeader, nextWsId));
-        else setPlan(null);
-      };
-      const toggleFormTag = name => {
-        const clean = String(name || '').trim();
-        if (!clean) return;
-        setFormTags(prev => prev.includes(clean) ? prev.filter(t => t !== clean) : [...prev, clean]);
-      };
-      const addNewFormTag = () => {
-        const parts = newTagDraft.split(/[,，]/).map(s => s.trim()).filter(Boolean);
-        if (parts.length === 0) return;
-        setFormTags(prev => {
-          const next = [...prev];
-          for (const p of parts) if (!next.includes(p)) next.push(p);
-          return next;
+          setSnapshot(previous => ({ ...previous, ...patch, loading: false, error: errors.join('；') }));
         });
-        setNewTagDraft('');
-      };
-      const changeMember = (role, id) => {
-        setPlan(current => {
-          if (!current) return current;
-          const members = { ...current.members };
-          if (id) members[role] = id;
-          else delete members[role];
-          return { ...current, members };
-        });
-      };
-      const changeCodeWork = enabled => {
-        setExplicitCode(enabled);
-        setPlan(current => {
-          if (current) {
-            return {
-              ...current, codeWork: enabled,
-              codex: enabled ? { coding: 'auto', review: 'auto' } : { coding: null, review: null },
-            };
-          }
-          const tpl = choice === 'template' ? templateId : choice === 'none' ? 'none' : '';
-          return tpl && leaderId ? buildLocalPlanFor(tpl, enabled, leaderId, workspace) : null;
-        });
-      };
-      const create = async () => {
-        if (!title.trim()) { setError('请填写标题'); return; }
-        const useOrch = orchestrationMode !== 'plain' && leaderId !== '';
-        if (leaderId && !workspace) { setError('请选择工单所属的工作区'); return; }
-        if (requiresPr && !prUrl.trim()) { setError('请填写要审查的 PR 链接'); return; }
-        if (useOrch && !plan) { await recommend(); return; }
-        if (useOrch && roleChoices?.some(role => role.required && !plan.members[role.id])) {
-          setError('请指派所有必需角色。');
-          return;
-        }
-        const cleanedConfigs = cleanClientAgentConfigs(formAgentConfigs);
-        const orchestration = useOrch ? {
-          ...choiceBody(),
-          plan: {
-            templateId: plan.templateId,
-            codeWork: plan.codeWork,
-            members: plan.members,
-            codex: plan.codex,
-            ...(cleanedConfigs ? { agentConfigs: cleanedConfigs } : {}),
-          },
-        } : undefined;
-        const pendingDraftTags = newTagDraft.split(/[,，]/).map(s => s.trim()).filter(Boolean);
-        const assignedObj = assignedAgent ? catalog?.leaders.find(item => item.id === assignedAgent) : undefined;
-        const agentTag = assignedObj ? ['智能体:' + assignedObj.name] : [];
-        const mergedTagNames = [...new Set([...formTags, ...pendingDraftTags, ...agentTag])];
-        const parsedTags = mergedTagNames.map(name => ({ name }));
-        const effectiveWorkspace = useOrch ? workspace : (workspaceId || '');
+        refresh.current = visible.request;
+        let stop;
+        try { stop = subscribeMarshalEvents(topics, visible.request, { debounceMs: 80 }); }
+        catch { /* The initial read and visibility refresh still work without SSE. */ }
+        void visible.request();
+        return () => { stop?.(); visible.dispose(); refresh.current = null; };
+      }, [topics, reads, version]);
+      return [snapshot, () => refresh.current?.(), patch => setSnapshot(previous => ({ ...previous, ...patch }))];
+    }
+
+    function mvHubPlainNotice(value) {
+      return String(value ?? '').replace(/[#*0-9]\uFE0F?\u20E3|[\p{Extended_Pictographic}\p{Emoji_Presentation}\p{Emoji_Modifier}\u200D\uFE0E\uFE0F\u{E0020}-\u{E007F}]/gu, '').trim();
+    }
+
+    function mvUseHubAction(refresh) {
+      const lifetime = React.useRef(null);
+      const pending = React.useRef(false);
+      const [busy, setBusy] = React.useState(false);
+      const [notice, setNoticeText] = React.useState('');
+      const setNotice = value => setNoticeText(mvHubPlainNotice(value));
+      React.useEffect(() => {
+        const controller = new AbortController();
+        lifetime.current = controller;
+        return () => controller.abort();
+      }, []);
+      const run = async work => {
+        const signal = lifetime.current?.signal;
+        if (!signal || signal.aborted || pending.current) return;
+        pending.current = true;
         setBusy(true);
-        setError('');
         setNotice('');
-        try {
-          let result;
-          if (editing) {
-            const orig = allTasks.find(item => item.id === editing);
-            const cardPatch = {};
-            if (!orig || title.trim() !== orig.title) cardPatch.title = title.trim();
-            if (!orig || description.trim() !== (orig.description ?? '')) cardPatch.description = description.trim();
-            if (orig && formPrompt.trim() !== (orig.prompt ?? '') && !(formPrompt.trim() === '' && orig.prompt === orig.description)) {
-              cardPatch.prompt = formPrompt.trim() || description.trim() || title.trim();
-            }
-            const origAttSig = (orig?.attachments ?? []).map(a => a.attachmentId).join('|');
-            const nextAttSig = formAttachments.map(a => a.attachmentId).join('|');
-            if (origAttSig !== nextAttSig) {
-              cardPatch.attachments = formAttachments.length > 0 ? formAttachments.map(serializeAttachmentForWire) : null;
-            }
-            if (formPermission && formPermission !== (orig?.permission ?? '')) cardPatch.permission = formPermission;
-            if (formModel !== (orig?.model ?? '')) cardPatch.model = formModel;
-            if (formEffort !== (orig?.reasoningEffort ?? '')) cardPatch.reasoningEffort = formEffort;
-            if (formReuseSession !== (orig?.reuseSession === true)) cardPatch.reuseSession = formReuseSession;
-            const origTagsSig = (orig?.tags ?? []).map(t => t.name).join('|');
-            const nextTagsSig = parsedTags.map(t => t.name).join('|');
-            if (origTagsSig !== nextTagsSig) cardPatch.tags = parsedTags.length > 0 ? parsedTags : null;
-            if (effectiveWorkspace && !orig?.workflow && !orig?.taskRoom) cardPatch.workspaceId = effectiveWorkspace;
-
-            if (Object.keys(cardPatch).length > 0) {
-              result = await fetchJson('marshal/tasks/update', {
-                taskId: editing,
-                ...cardPatch,
-              }, Boolean(orig?.workflow || orig?.taskRoom || effectiveWorkspace));
-            }
-            if (useOrch && orchestration) {
-              result = await fetchJson('marshal/tasks/plan', { taskId: editing, orchestration }, true);
-            }
-            if (!result) result = { tasks: allTasks };
-          } else {
-            result = await fetchJson('marshal/tasks/create', {
-              title: title.trim(),
-              description: description.trim(),
-              ...(formPrompt.trim() ? { prompt: formPrompt.trim() } : {}),
-              ...(parsedTags.length > 0 ? { tags: parsedTags } : {}),
-              ...(formAttachments.length > 0 ? { attachments: formAttachments.map(serializeAttachmentForWire) } : {}),
-              ...(formParentId ? { parentId: formParentId } : {}),
-              ...(formPermission ? { permission: formPermission } : {}),
-              ...(formModel ? { model: formModel } : {}),
-              ...(formEffort ? { reasoningEffort: formEffort } : {}),
-              ...(formReuseSession ? { reuseSession: true } : {}),
-              ...(effectiveWorkspace ? { workspaceId: effectiveWorkspace } : {}),
-              ...(orchestration === undefined ? {} : { orchestration }),
-            }, Boolean(effectiveWorkspace || orchestration));
-          }
-          setTasks(result.tasks || []);
-          if (result.movedToReview) {
-            setNotice('任务描述较模糊（' + (result.ambiguityReason || '信息尚不明确') + '），已自动转入「待确认」列等待确认。');
-          } else if (editing) {
-            setNotice(result.steered
-              ? '工单修改已保存，并已将更新内容作为插话立即发送给正在运行的 Agent。'
-              : (result.notice || result.configNotice || '工单与编排分工已保存，模型与思考强度变更将在下一轮对话生效。'));
-          }
-          setTitle('');
-          setDescription('');
-          setFormPrompt('');
-          setFormTags([]);
-          setNewTagDraft('');
-          setFormParentId('');
-          setFormPermission('');
-          setFormModel('');
-          setFormEffort('');
-          setFormReuseSession(false);
-          setFormAttachments([]);
-          setAssignedAgent('');
-          setOrchestrationMode('plain');
-          setLeaderId('');
-          setChoice('leader');
-          setTemplateId('pr-review');
-          setPrUrl('');
-          setPlan(null);
-          setFormAgentConfigs({});
-          setExplicitCode(false);
-          setEditing('');
-          setFormOpen(false);
-        }
-        catch (e) { setError((editing ? '保存分工失败，' : '创建失败，') + (e.message || e)); }
-        finally { setBusy(false); }
-      };
-
-      const saveWorkflowAgentConfigs = async (task, patch, labelHint = '智能体配置') => {
-        if (busy || !task) return false;
-        setBusy(true);
-        setError('');
-        try {
-          const result = await fetchJson('marshal/tasks/agent-configs', { taskId: task.id, ...patch }, true);
-          setTasks(result.tasks || []);
-          setNotice(result.notice || ('已更新「' + labelHint + '」，工单群已发送变更提示，将在下一轮对话生效。'));
-          return true;
-        } catch (e) {
-          setError('更新智能体配置失败：' + (e.message || e));
-          return false;
-        } finally {
-          setBusy(false);
+        try { await work(signal); }
+        catch (error) { if (!signal.aborted) setNotice(error.message || String(error)); }
+        finally {
+          pending.current = false;
+          if (!signal.aborted) { setBusy(false); void refresh(); }
         }
       };
+      return { run, busy, notice, setNotice };
+    }
 
-      const run = async (task) => {
-        setBusy(true);
-        setError('');
-        try {
-          const result = await fetchJson('marshal/tasks/run', { taskId: task.id }, Boolean(task.workflow || task.taskRoom));
-          setTasks(result.tasks || []);
-          if (result.permissionBlocked && result.message) setNotice(result.message);
+    const MV_HUB_LANES = [['queued', '待办'], ['running', '运行中'], ['review', '待验收'], ['failed', '阻塞失败'], ['done', '已完成']];
+    // One compact palette shared by tag pills, priority chips and card rails so a
+    // ticket keeps the same colour in the lane, the drawer and the incident card.
+    const MV_HUB_TONE_COLORS = ['#4e93e8', '#2ea36a', '#d08a2a', '#b456c8', '#cf5f7a', '#4a9fb5'];
+    const MV_HUB_PRIORITY_COLORS = ['#cf5f7a', '#d08a2a', '#4e93e8', '#8b93a1'];
+    function mvHubToneColor(name) {
+      const tone = taskTagTone(name);
+      return tone[0] === 'p' ? MV_HUB_PRIORITY_COLORS[Number(tone[1])] : MV_HUB_TONE_COLORS[Number(tone)] || MV_HUB_TONE_COLORS[0];
+    }
+    function mvHubToneChip(label, name, key, solid = false) {
+      return h('span', { className: 'mv-tone-chip', key, 'data-solid': solid ? 'true' : undefined,
+        style: { '--mv-tone': mvHubToneColor(name) } }, label);
+    }
+    const mvHubPriority = row => row.priority || row.tags?.find(tag => /^P[0-3]$/.test(tag.name))?.name;
+    const mvHubPhase = (row, label) => taskPhases[row.workflow?.phase] || row.workflow?.phase || label;
+    const mvHubTagNames = row => (row.tags ?? []).map(tag => tag.name).filter(name => name && !/^P[0-3]$/i.test(name)).slice(0, 3);
+    const mvHubWorkspace = task => task.taskRoom?.workspaceId || task.workflow?.workspaceId || task.workspaceId || '';
+    function mvHubLane(task) {
+      const state = task.workflow?.state;
+      if (task.status === 'done' || task.taskRoom?.closed) return 'done';
+      if (['failed', 'permission-blocked', 'interrupted', 'cancelled'].includes(state) || task.permissionBlock || task.status === 'failed') return 'failed';
+      if (state === 'running' || task.status === 'running' || task.openExecution) return 'running';
+      if (['waiting', 'review-blocked', 'handed-off'].includes(state) || ['waiting', 'review'].includes(task.status)) return 'review';
+      return state === 'done' ? 'done' : 'queued';
+    }
+    const mvHubIsLive = task => mvHubLane(task) === 'running' || Boolean(task?.openExecution);
+    const mvHubIsTaskIncident = row => row.targetType === 'task' && ['failed', 'review-blocked', 'tool-anomaly'].includes(row.kind);
+    const MV_HUB_PERMISSION_RANK = { 'read-only': 0, 'workspace-write': 1, 'danger-full-access': 2 };
+    function mvHubHasPermissionBlock(task, incidentOrItems, sessionDefaultPermission = 'read-only', localBlocked = false) {
+      if (task && mvHubLane(task) === 'done') return false;
+      if (localBlocked || task?.permissionBlock || task?.workflow?.state === 'permission-blocked') return true;
+      if (task && !task.archivedAt && task.permission && !task.permissionConfirmedAt &&
+        (MV_HUB_PERMISSION_RANK[task.permission] ?? 0) > (MV_HUB_PERMISSION_RANK[sessionDefaultPermission] ?? 0)) return true;
+      const rows = Array.isArray(incidentOrItems) ? incidentOrItems : incidentOrItems ? [incidentOrItems] : [];
+      return rows.some(row => row && row.targetType === 'task' && (!task || row.targetId === task.id) &&
+        (Boolean(row.permissionBlock) || (row.kind === 'failed' && Boolean(task) && task.status !== 'failed' &&
+          task.workflow?.state !== 'failed' && !mvHubIsLive(task))));
+    }
+    const mvHubRunIssue = result => result.permissionBlocked || result.movedToReview || result.error || result.accepted === false
+      ? result.ambiguityReason || result.permissionBlock?.summary || result.error?.message || result.error || result.message || '需人工确认'
+      : '';
+    function mvHubSelect(label, value, choices, onChange, disabled = false, empty = '默认') {
+      return h(Field, { label }, h('select', { className: 'mv-field', 'aria-label': label, value, disabled, onChange: e => onChange(e.target.value) },
+        h('option', { value: '' }, empty),
+        value && !choices.some(([id]) => id === value) && h('option', { value }, value),
+        choices.map(([id, text]) => h('option', { key: id, value: id }, text))));
+    }
+    function mvHubModelFields(label, config, models, change, disabled = false, fallback = '') {
+      const efforts = models.find(model => model.route === (config.model || fallback))?.efforts;
+      const available = [...new Set(['off', ...(efforts?.length ? efforts : ['low', 'medium', 'high', 'xhigh']), config.reasoningEffort].filter(Boolean))];
+      return h('div', { className: 'mv-actions' },
+        mvHubSelect(label + '模型', config.model || '', models.map(model => [model.route, model.label]), value => change({ model: value }), disabled),
+        mvHubSelect(label + '思考模式', config.reasoningEffort || '', available.map(value => [value, value === 'off' ? '关闭' : value]),
+          value => change({ reasoningEffort: value }), disabled));
+    }
+    function mvHubText(label, value, change, props = {}, element = 'input') {
+      return h(Field, { label }, h(element, { className: 'mv-field', 'aria-label': label, value, onChange: e => change(e.target.value), ...props }));
+    }
+    const MV_HUB_ROLE_LABELS = { leader: 'Leader', coder: 'Coder', reviewer: 'Reviewer' };
+
+    function MarshalHubKanbanView({ openSession, openTaskRoom, focusedTask, openNativeBoard, onOpenRosters }) {
+      const [data, refresh, patchSnapshot] = mvUseHubSnapshot(MV_HUB_TASK_TOPICS, MV_HUB_KANBAN_READS);
+      const action = mvUseHubAction(refresh);
+      const [query, setQuery] = React.useState('');
+      const [scope, setScope] = React.useState('');
+      const [selected, select] = React.useState(focusedTask || '');
+      const [form, setForm] = React.useState(null);
+      const [edit, setEdit] = React.useState(null);
+      const [blockedIds, setBlockedIds] = React.useState([]);
+      const markBlocked = (taskId, blocked) => setBlockedIds(previous => blocked
+        ? (previous.includes(taskId) ? previous : [...previous, taskId])
+        : previous.filter(id => id !== taskId));
+      const tasks = (data.board?.tasks ?? []).filter(row => row.archivedAt == null);
+      const workspaceRows = (data.workspaces?.workspaces ?? []).filter(row => !isPseudoAgentWorkspace(row));
+      const workspaceOptions = workspaceRows.map(row => [row.id, row.name || row.title || row.id]);
+      const models = flattenModelCatalog(data.models);
+      const task = tasks.find(row => row.id === selected);
+      const editing = task && edit?.taskId === task.id;
+      const permissionBlocked = mvHubHasPermissionBlock(task, data.incidents?.items, data.board?.sessionDefaultPermission, Boolean(task && blockedIds.includes(task.id)));
+      const keyword = query.trim().toLowerCase();
+      const visible = tasks.filter(row => (!scope || scope === mvHubWorkspace(row)) &&
+        [row.title, row.ticketNo, row.id, row.description].some(value => String(value ?? '').toLowerCase().includes(keyword)));
+      const lanes = MV_HUB_LANES.map(([id, label]) => [id, label, visible.filter(row => mvHubLane(row) === id)]);
+      const focusReady = !!focusedTask && tasks.some(row => row.id === focusedTask);
+      React.useEffect(() => { if (focusedTask) select(focusedTask); }, [focusedTask]);
+      const scrollToTask = React.useLayoutEffect || React.useEffect;
+      scrollToTask(() => {
+        if (focusReady) document.getElementById?.('marshal-ticket-' + focusedTask)?.scrollIntoView?.({ block: 'nearest' });
+      }, [focusedTask, focusReady]);
+      const chooseTask = row => { select(row.id); setEdit(null); action.setNotice(''); };
+      const applyBoard = result => { if (Array.isArray(result.tasks)) patchSnapshot({ board: { ...data.board, ...result } }); };
+      const mutate = (path, body) => action.run(async signal => {
+        const result = await fetchJson(path, body, true, signal);
+        if (!signal.aborted) {
+          applyBoard(result);
+          if (path === 'marshal/tasks/run' && body?.taskId) markBlocked(body.taskId, Boolean(result.permissionBlocked));
+          if (path === 'marshal/tasks/confirm-permission' && body?.taskId && !result.permissionBlocked) markBlocked(body.taskId, false);
+          action.setNotice(mvHubRunIssue(result) || result.notice || result.message || '已保存');
         }
-        catch (e) { setError('运行失败：' + (e.message || e)); }
-        finally { setBusy(false); }
-      };
-
-      const move = async (task, status) => {
-        if (busy || !task || task.status === status) return;
-        setBusy(true);
-        setError('');
-        try {
-          const result = await fetchJson('marshal/tasks/move', { taskId: task.id, status }, Boolean(task.workflow || task.taskRoom));
-          setTasks(result.tasks || []);
-        }
-        catch (e) { setError('移动状态失败：' + (e.message || e)); }
-        finally { setBusy(false); setDragTaskId(''); setDropCol(''); }
-      };
-
-      const confirmReview = async (task, applyPatch = false, noteText = '') => {
-        if (busy || !task) return;
-        setBusy(true);
-        setError('');
-        setNotice('');
-        try {
-          const result = await fetchJson('marshal/tasks/confirm-review', {
-            taskId: task.id,
-            applyPatch,
-            ...(noteText.trim() ? { note: noteText.trim() } : {}),
-          }, Boolean(task.workflow || task.taskRoom));
-          setTasks(result.tasks || []);
-          setDrawerReviseNote('');
-          setNotice(result.patchApplied
-            ? '已将隔离开发补丁应用到工作区并确认工单完成。'
-            : result.patchAlreadyApplied
-              ? '补丁已在工作区生效，工单已确认完成。'
-              : '工单已确认验收完成并归档。');
-        }
-        catch (e) { setError('确认完成失败：' + (e.message || e)); }
-        finally { setBusy(false); }
-      };
-
-      const reviseTaskFromBoard = async (task, noteText = '') => {
-        if (busy || !task) return;
-        setBusy(true);
-        setError('');
-        setNotice('');
-        try {
-          const result = await fetchJson('marshal/tasks/revise', {
-            taskId: task.id,
-            ...(noteText.trim() ? { text: noteText.trim() } : {}),
-          }, Boolean(task.workflow || task.taskRoom || task.workspaceId));
-          setTasks(result.tasks || []);
-          setDrawerReviseNote('');
-          setNotice('已将补充意见同步至工单群并启动继续执行。');
-        }
-        catch (e) { setError('继续执行失败：' + (e.message || e)); }
-        finally { setBusy(false); }
-      };
-
-      const updateTask = async (task, patch) => {
-        if (busy || !task) return false;
-        setBusy(true);
-        setError('');
-        try {
-          const result = await fetchJson('marshal/tasks/update', { taskId: task.id, ...patch }, Boolean(task.workflow || task.taskRoom));
-          setTasks(result.tasks || []);
-          if (result.steered && result.configNotice) {
-            setNotice('内容已作为实时插话立刻发给运行中的 Agent；' + result.configNotice);
-          } else if (result.steered) {
-            setNotice('工单修改已保存，并已作为实时插话立即发送给正在运行的 Agent。');
-          } else if (result.configNotice) {
-            setNotice(result.configNotice);
-          }
-          return true;
-        }
-        catch (e) { setError('更新卡片失败：' + (e.message || e)); return false; }
-        finally { setBusy(false); }
-      };
-
-      const setParent = async (task, parentId) => {
-        if (busy || !task) return;
-        setBusy(true);
-        setError('');
-        try {
-          const result = await fetchJson('marshal/tasks/set-parent', { taskId: task.id, parentId: parentId || null }, Boolean(task.workflow || task.taskRoom));
-          setTasks(result.tasks || []);
-          setLinkChildId('');
-        }
-        catch (e) { setError('关联子任务失败：' + (e.message || e)); }
-        finally { setBusy(false); }
-      };
-
-      const createSubtask = async (parentTask) => {
-        const subTitle = newSubtaskTitle.trim();
-        if (busy || !parentTask || !subTitle) return;
-        setBusy(true);
-        setError('');
-        try {
-          const result = await fetchJson('marshal/tasks/create', {
-            title: subTitle, description: '', parentId: parentTask.id, skipAmbiguityCheck: true,
-          }, false);
-          setTasks(result.tasks || []);
-          setNewSubtaskTitle('');
-        }
-        catch (e) { setError('创建子任务失败：' + (e.message || e)); }
-        finally { setBusy(false); }
-      };
-
-      const duplicateTask = async (task) => {
-        if (busy || !task) return;
-        setBusy(true);
-        setError('');
-        try {
-          const result = await fetchJson('marshal/tasks/create', {
-            title: task.title + '（副本）',
-            description: task.description ?? '',
-            skipAmbiguityCheck: true,
-            ...(task.prompt ? { prompt: task.prompt } : {}),
-            ...(task.tags?.length ? { tags: task.tags } : {}),
-            ...(task.permission ? { permission: task.permission } : {}),
-            ...(task.model ? { model: task.model } : {}),
-            ...(task.reasoningEffort ? { reasoningEffort: task.reasoningEffort } : {}),
-            ...(task.reuseSession ? { reuseSession: true } : {}),
-            ...(task.attachments?.length ? { attachments: task.attachments.map(serializeAttachmentForWire) } : {}),
-          }, false);
-          setTasks(result.tasks || []);
-        }
-        catch (e) { setError('复制卡片失败：' + (e.message || e)); }
-        finally { setBusy(false); }
-      };
-
-      const archiveTask = async (task) => {
-        if (busy || !task) return;
-        setBusy(true);
-        setError('');
-        try {
-          const result = await fetchJson('marshal/tasks/archive', { taskId: task.id }, Boolean(task.workflow || task.taskRoom));
-          setTasks(result.tasks || []);
-          if (selectedId === task.id) setSelectedId('');
-        }
-        catch (e) { setError('归档失败：' + (e.message || e)); }
-        finally { setBusy(false); }
-      };
-
-      const restoreTask = async (task) => {
-        if (busy || !task) return;
-        setBusy(true);
-        setError('');
-        try {
-          const result = await fetchJson('marshal/tasks/restore', { taskId: task.id }, Boolean(task.workflow || task.taskRoom));
-          setTasks(result.tasks || []);
-        }
-        catch (e) { setError('恢复失败：' + (e.message || e)); }
-        finally { setBusy(false); }
-      };
-
-      const settleTask = async (task) => {
-        if (busy || !task) return;
-        setBusy(true);
-        setError('');
-        try {
-          const result = await fetchJson('marshal/tasks/settle', { taskId: task.id }, Boolean(task.workflow || task.taskRoom));
-          setTasks(result.tasks || []);
-        }
-        catch (e) { setError('终止失败：' + (e.message || e)); }
-        finally { setBusy(false); }
-      };
-
-      const confirmPermission = async (task) => {
-        if (busy || !task) return;
-        setBusy(true);
-        setError('');
-        try {
-          const result = await fetchJson('marshal/tasks/confirm-permission', { taskId: task.id }, Boolean(task.workflow || task.taskRoom));
-          setTasks(result.tasks || []);
-        }
-        catch (e) { setError('确认权限失败：' + (e.message || e)); }
-        finally { setBusy(false); }
-      };
-
-      const saveSchedule = async (task, enabled, mode, cron, onceIso) => {
-        if (busy || !task) return;
-        setBusy(true);
-        setError('');
-        try {
-          const at = mode === 'once' && onceIso ? Math.floor(new Date(onceIso).getTime()) : undefined;
-          const result = await fetchJson('marshal/tasks/schedule', {
-            taskId: task.id, enabled, mode,
-            ...(mode === 'cron' && cron.trim() ? { cron: cron.trim() } : {}),
-            ...(mode === 'once' && Number.isFinite(at) ? { at } : {}),
-          }, Boolean(task.workflow || task.taskRoom));
-          setTasks(result.tasks || []);
-        }
-        catch (e) { setError('保存定时失败：' + (e.message || e)); }
-        finally { setBusy(false); }
-      };
-
-      const remove = async (task) => {
-        if (confirmId !== task.id) { setConfirmId(task.id); return; }
-        setBusy(true);
-        setError('');
-        try {
-          const result = await fetchJson('marshal/tasks/delete', { taskId: task.id }, Boolean(task.workflow || task.taskRoom));
-          setTasks(result.tasks || []);
-          setConfirmId('');
-          if (selectedId === task.id) setSelectedId('');
-        }
-        catch (e) { setError('删除失败：' + (e.message || e)); }
-        finally { setBusy(false); }
-      };
-
-      const iconRoom = () => h('svg', { width: 12, height: 12, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': 'true' },
-        h('path', { d: 'M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2' }),
-        h('circle', { cx: 9, cy: 7, r: 4 }),
-        h('path', { d: 'M23 21v-2a4 4 0 0 0-3-3.87' }),
-        h('path', { d: 'M16 3.13a4 4 0 0 1 0 7.75' }));
-      const iconSession = () => h('svg', { width: 13, height: 13, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.9, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': 'true' },
-        h('path', { d: 'M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z' }));
-
-      const renderAttachments = (items, onRemove, taskId = '') => {
-        if (!Array.isArray(items) || items.length === 0) return null;
-        return h('div', { className: 'mtb-att-list' },
-          items.map(att => {
-            const href = attachmentHref(taskId, att, previewUrlsRef.current);
-            const fallbackImgSrc = resolveClientApiUrl('api/task-board/attachments/image?id=' + encodeURIComponent(att.attachmentId));
-            const imgSrc = previewUrlsRef.current.get(att.attachmentId)
-              || (taskId ? href : fallbackImgSrc);
-            return h('div', { key: att.attachmentId, className: 'mtb-att-card', title: att.name + ' (' + formatBytes(att.bytes) + ')' },
-              att.kind === 'image'
-                ? h('img', {
-                    className: 'mtb-att-thumb',
-                    src: imgSrc,
-                    alt: att.name,
-                    onError: ev => {
-                      if (ev.currentTarget.dataset.fallback !== '1' && ev.currentTarget.src !== fallbackImgSrc) {
-                        ev.currentTarget.dataset.fallback = '1';
-                        ev.currentTarget.src = fallbackImgSrc;
-                      }
-                    },
-                  })
-                : h('span', { style: { fontSize: 15, flexShrink: 0 }, 'aria-hidden': 'true' }, '📄'),
-              h('div', { style: { minWidth: 0, flex: 1 } },
-                href
-                  ? h('a', {
-                      className: 'mtb-att-link',
-                      href,
-                      target: '_blank',
-                      rel: 'noreferrer',
-                      download: att.kind === 'file' ? att.name : undefined,
-                      onClick: ev => ev.stopPropagation(),
-                    }, att.name)
-                  : h('div', { style: { fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, att.name),
-                h('div', { style: { fontSize: 10.5, color: dswTheme.dim } },
-                  formatBytes(att.bytes) + (att.kind === 'image' && att.width && att.height ? ' · ' + att.width + '×' + att.height : ''))),
-              onRemove && h('button', { type: 'button', className: 'mtb-tag-x', 'aria-label': '移除附件 ' + att.name, onClick: () => onRemove(att.attachmentId) }, '×'));
+      });
+      const detailFields = row => {
+        const wf = row.workflow;
+        if (!wf) return mvHubModelFields('工单', row, models.options, patch => mutate('marshal/tasks/update', { taskId: row.id, ...patch }), action.busy, models.defaultRoute);
+        const configs = { ...wf.agentConfigs, ...wf.plan?.agentConfigs };
+        const leaders = data.orchestration?.leaders ?? [];
+        const roles = Object.entries(MV_HUB_ROLE_LABELS);
+        const codexModels = (data.orchestration?.codexModels ?? []).map(model => ({ route: model.id, efforts: model.reasoningEfforts, label: model.model }));
+        const change = (role, patch) => mutate('marshal/tasks/agent-configs', { taskId: row.id, agentConfigs: { [role]: patch } });
+        return h('div', { className: 'mv-stack' },
+          roles.map(([role, label]) => h('div', { key: role }, mvHubModelFields(label + ' ', configs[role] ?? {}, models.options,
+            patch => change(role, patch), action.busy, leaders.find(member => member.id === (role === 'leader' ? wf.leaderId : wf.plan?.members?.[role]))?.model || models.defaultRoute))),
+          wf.plan?.codex && [['coding', 'codexCoding', 'Codex · 编码执行子 Agent'], ['review', 'codexReview', 'Codex · 审查复核子 Agent']].map(([slot, key, label]) => {
+            const mode = wf.plan.codex[slot];
+            const efforts = codexModels.find(model => model.route === mode)?.efforts ?? ['low', 'medium', 'high', 'xhigh'];
+            return h('div', { key, className: 'mv-actions' },
+              mvHubSelect(label + ' 模型', mode === null ? 'off' : mode || '', [['off', '关闭'], ...codexModels.map(model => [model.route, model.label])],
+                value => mutate('marshal/tasks/agent-configs', { taskId: row.id,
+                  codex: { [slot]: value === 'off' ? null : value || 'auto' }, agentConfigs: { [key]: { model: value === 'off' ? '' : value } },
+                }), action.busy, '自动'),
+              mvHubSelect(label + ' 思考模式', configs[key]?.reasoningEffort || '', efforts.map(value => [value, value]),
+                value => change(key, { reasoningEffort: value }), action.busy || mode === null));
           }));
       };
-
-      const card = (task, column) => {
-        const workflow = task.workflow;
-        const step = workflow?.state === 'handed-off' ? '已交给 Leader'
-          : workflow?.state === 'permission-blocked' ? '权限受阻 · 待确认'
-          : workflow?.state === 'review-blocked' ? '审查待裁决 · 待确认'
-          : workflow?.state === 'interrupted' ? '运行中断'
-          : taskPhases[workflow?.phase];
-        const isRunning = task.status === 'running' || task.openExecution === true || workflow?.state === 'running';
-        const canMove = !busy && !isRunning;
-        const parsedTitle = splitCardTitleKind(task.title);
-        const timeAt = task.status === 'running' ? (task.startedAt ?? task.updatedAt ?? task.createdAt)
-          : (task.status === 'done' || task.status === 'failed' || task.status === 'review') ? (task.endedAt ?? task.updatedAt ?? task.createdAt)
-          : (task.createdAt ?? task.updatedAt);
-        const timeLabel = formatTaskTime(timeAt);
-        const timePrefix = task.status === 'backlog' || task.status === 'todo' ? '创建于 ' : '';
-        const runs = Number(task.runCount || 0);
-        const resultTone = isRunning ? 'running' : task.status === 'review' ? 'review' : task.result;
-        const resultText = isRunning ? (step || '运行中…')
-          : task.status === 'review' ? '待确认'
-          : task.result ? (TASK_RESULT_LABELS[task.result] ?? task.result) : '';
-        const subs = subtaskStats.get(task.id);
-        const attCount = Array.isArray(task.attachments) ? task.attachments.length : 0;
-        return h('article', {
-          key: task.id,
-          id: 'marshal-ticket-' + task.id,
-          className: 'mtb-card',
-          'data-status': task.status,
-          'data-compact': compactCards ? 'true' : undefined,
-          'data-focused': focusedTask === task.id ? 'true' : undefined,
-          'data-selected': selectedId === task.id ? 'true' : undefined,
-          'data-dragging': dragTaskId === task.id ? 'true' : undefined,
-          draggable: canMove,
-          onClick: () => { setSelectedId(task.id); setConfirmId(''); },
-          onDragStart: event => {
-            if (!canMove) { event.preventDefault(); return; }
-            setDragTaskId(task.id);
-            try { event.dataTransfer.setData('text/plain', task.id); event.dataTransfer.effectAllowed = 'move'; } catch {}
-          },
-          onDragEnd: () => { setDragTaskId(''); setDropCol(''); },
-          style: { '--mtb-accent': column.accent },
-        },
-          h('div', { className: 'mtb-card-title-row' },
-            task.ticketNo && h('span', {
-              className: 'mtb-card-kind',
-              style: { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', letterSpacing: '.02em' },
-              title: '工单号 ' + task.ticketNo,
-            }, '[' + task.ticketNo + ']'),
-            parsedTitle.kind && h('span', { className: 'mtb-card-kind' }, parsedTitle.kind),
-            h('span', { className: 'mtb-card-title', title: (task.ticketNo ? '[' + task.ticketNo + '] ' : '') + task.title }, parsedTitle.text)),
-          !compactCards && Array.isArray(task.tags) && task.tags.length > 0 && h('div', { className: 'mtb-card-tags' },
-            task.tags.map(tag => h('span', {
-              key: tag.name,
-              className: 'mtb-tag',
-              'data-tag-tone': taskTagTone(tag.name),
-              title: tag.promptPrefix || tag.name,
-            }, tag.name))),
-          !compactCards && task.description && h('div', { className: 'mtb-card-excerpt' }, task.description),
-          h('div', { className: 'mtb-card-meta' },
-            task.parentId && h('span', { className: 'mtb-card-micro' }, '子任务'),
-            subs && h('span', { className: 'mtb-card-micro' }, subs.done + '/' + subs.total + ' 子任务'),
-            workflow?.leaderName && h('span', { className: 'mtb-card-micro', title: workflow.leaderName }, workflow.leaderName),
-            attCount > 0 && h('span', { className: 'mtb-card-micro' }, '📎 ' + attCount),
-            task.freeze && h('span', { className: 'mtb-card-micro', title: task.freeze.goal || '已冻结' }, '已冻结'),
-            task.schedule?.enabled && h('span', { className: 'mtb-card-micro' }, task.schedule.mode === 'once' ? '定时一次' : '定时'),
-            timeLabel && h('span', { className: 'mtb-card-time' }, timePrefix + timeLabel)),
-          !compactCards && h('div', { className: 'mtb-card-foot' },
-            h('div', { className: 'mtb-card-foot-left' },
-              resultText && h('span', { className: 'mtb-result', 'data-tone': resultTone }, resultText),
-              runs > 0 && h('span', { className: 'mtb-runs' }, runs + ' 次运行'),
-              !resultText && step && h('span', { className: 'mtb-runs' }, step)),
-            h('div', { className: 'mtb-card-foot-right' },
-              isRunning && h('span', { className: 'mtb-spinner', 'aria-hidden': 'true' }),
-              task.status === 'review' && canMove && h('button', {
-                type: 'button',
-                className: 'mtb-icon-pill',
-                disabled: busy,
-                title: '退回待办重新修改或重跑',
-                onClick: event => { event.stopPropagation(); void move(task, 'todo'); },
-              }, '↩ 待办'),
-              task.status === 'review' && canMove && h('button', {
-                type: 'button',
-                className: 'mtb-icon-pill mtb-icon-pill-confirm',
-                disabled: busy,
-                title: task.patchAvailable ? '打开确认面板选择是否将补丁应用到工作区' : '确认验收完成并移入已完成',
-                onClick: event => {
-                  event.stopPropagation();
-                  if (task.patchAvailable) {
-                    setSelectedId(task.id);
-                    setNotice('此工单包含隔离开发补丁，请在右侧详情面板选择「应用补丁并完成」或「仅确认完成」。');
-                  } else {
-                    void confirmReview(task, false);
-                  }
-                },
-              }, '✓ 确认'),
-              h('button', {
-                type: 'button',
-                className: 'mtb-icon-pill',
-                title: '进入工单群',
-                onClick: event => { event.stopPropagation(); openTaskRoom?.(task); },
-              }, iconRoom(), '工单群'),
-              task.sessionId && h('button', {
-                type: 'button',
-                className: 'mtb-icon-btn',
-                title: '打开会话',
-                'aria-label': '打开会话',
-                onClick: event => { event.stopPropagation(); openSession && openSession(task.sessionId); },
-              }, iconSession()))));
-      };
-
-      const selectedColumn = selectedTask ? (columns.find(c => c.key === selectedTask.status) ?? columns[1]) : undefined;
-
-      const renderParseModal = () => {
-        if (!parseOpen) return null;
-        return h('div', {
-          className: 'mtb-modal-backdrop',
-          onClick: e => { if (e.target === e.currentTarget && !parseBusy) setParseOpen(false); },
-        },
-          h('div', { className: 'mtb-modal', role: 'dialog', 'aria-label': 'AI 自动解析任务' },
-            h('div', { className: 'mtb-drawer-head', style: { '--mtb-accent': '#8b5cf6' } },
-              h('span', { className: 'mtb-dot' }),
-              h('strong', { style: { fontSize: 14, flex: 1 } }, '✨ AI 自动解析任务'),
-              h('button', { type: 'button', className: 'mtb-icon-btn', disabled: parseBusy, onClick: () => setParseOpen(false) }, '✕')),
-            h('div', { style: { padding: 18, display: 'grid', gap: 12, overflowY: 'auto' } },
-              h('div', { style: { fontSize: 12, color: dswTheme.dim, lineHeight: 1.55 } },
-                '粘贴聊天记录、Issue 原文、零散想法或需求段落，AI 将自动提炼出结构化的标题、描述与执行指令并填入新建卡片表单。'),
-              h(Field, { label: '解析模型' },
-                h('select', { style: uiInput, value: parseModel, disabled: parseBusy, onChange: e => setParseModel(e.target.value) },
-                  modelOptions.length === 0
-                    ? h('option', { value: '' }, '未读取到模型目录')
-                    : modelOptions.map(opt => h('option', { key: opt.route, value: opt.route }, opt.label)))),
-              h(Field, { label: '原始任务文本' },
-                h('textarea', {
-                  style: { ...uiInput, resize: 'vertical', lineHeight: 1.6 },
-                  rows: 7,
-                  value: parseInput,
-                  disabled: parseBusy,
-                  placeholder: '例如：帮我把登录接口的 403 问题查清楚并修复，加回归测试并验证重启后生效…',
-                  onChange: e => setParseInput(e.target.value),
-                })),
-              parseError && h('div', { role: 'alert', style: { color: dswTheme.danger, fontSize: 12 } }, parseError)),
-            h('div', { className: 'mtb-drawer-foot', style: { justifyContent: 'flex-end' } },
-              h('button', { type: 'button', className: 'mtb-btn', disabled: parseBusy, onClick: () => setParseOpen(false) }, '取消'),
-              h('button', { type: 'button', className: 'mtb-btn mtb-btn-ai', disabled: parseBusy || !parseInput.trim(), onClick: () => { void runAiParse(); } },
-                parseBusy ? '解析中…' : '✨ 解析并填入表单'))));
-      };
-
-      const renderDrawer = () => {
-        if (!selectedTask || !selectedColumn) return null;
-        const task = selectedTask;
-        const archived = task.archivedAt !== undefined;
-        const workflow = task.workflow;
-        const execution = workflow?.selected ?? workflow?.templateId;
-        const templateName = catalog?.templates.find(item => item.id === execution)?.name;
-        const modeLabel = execution === 'none' || workflow?.choice === 'none' ? '普通任务'
-          : templateName ?? (workflow?.choice === 'leader' ? '由 Leader 决定' : '编排任务');
-        const step = workflow?.state === 'handed-off' ? '已交给 Leader'
-          : workflow?.state === 'permission-blocked' ? '权限受阻 · 待确认'
-          : workflow?.state === 'review-blocked' ? '审查待裁决 · 待确认'
-          : workflow?.state === 'interrupted' ? '运行中断，可重试'
-          : taskPhases[workflow?.phase];
-        const isRunning = task.status === 'running' || task.openExecution === true || workflow?.state === 'running';
-        const canMove = !busy && !archived && !isRunning;
-        const permLabel = task.permission ? (TASK_PERMISSION_LABELS[task.permission] ?? task.permission) : '';
-        const needsPermConfirm = Boolean(!archived && task.permission && (PERMISSION_RANK[task.permission] ?? 0) > (PERMISSION_RANK[sessionDefaultPerm] ?? 0) && !task.permissionConfirmedAt);
-        const currentTagNames = (task.tags ?? []).map(t => t.name);
-        const currentAgentTag = currentTagNames.find(n => n.startsWith('智能体:'));
-        const parentCard = task.parentId ? allTasks.find(t => t.id === task.parentId) : undefined;
-        const childCards = allActive.filter(t => t.parentId === task.id);
-        const linkableChildren = allActive.filter(t => t.id !== task.id && t.parentId === undefined && t.id !== task.parentId && !allActive.some(c => c.parentId === t.id));
-        const suggestedDrawerTags = [...new Set([...PRIORITY_TAGS, ...knownTags.map(t => t.name)])].filter(name => !currentTagNames.includes(name));
-        const drawerAttachments = Array.isArray(task.attachments) ? task.attachments : [];
-        const drawerExecutions = Array.isArray(task.executions) ? [...task.executions].reverse() : [];
-        const drawerAmbiguity = !archived && task.status === 'review' && drawerExecutions.length === 0
-          ? clientAmbiguityHint(task.title, task.description, task.prompt, drawerAttachments.length > 0, Boolean(workflow?.pr))
-          : '';
-        const toggleDrawerTag = async name => {
-          const nextNames = currentTagNames.includes(name) ? currentTagNames.filter(n => n !== name) : [...currentTagNames, name];
-          await updateTask(task, { tags: nextNames.length > 0 ? nextNames.map(n => ({ name: n })) : null });
-        };
-        const assignDrawerAgentLeader = async agentName => {
-          const cleaned = currentTagNames.filter(n => !n.startsWith('智能体:'));
-          const nextNames = agentName ? [...cleaned, '智能体:' + agentName] : cleaned;
-          await updateTask(task, { tags: nextNames.length > 0 ? nextNames.map(n => ({ name: n })) : null });
-        };
-        const addDrawerTag = async () => {
-          const parts = drawerTagDraft.split(/[,，]/).map(s => s.trim()).filter(Boolean);
-          if (parts.length === 0) return;
-          const nextNames = [...new Set([...currentTagNames, ...parts])];
-          const ok = await updateTask(task, { tags: nextNames.map(n => ({ name: n })) });
-          if (ok) setDrawerTagDraft('');
-        };
-        const openDrawerEditor = () => {
-          if (!drawerEditing) {
-            setEditTitle(task.title || '');
-            setEditDesc(task.description || '');
-            setEditPrompt(task.prompt || '');
-            setEditPerm(task.permission || '');
-            setEditModel(task.model || '');
-            setEditEffort(task.reasoningEffort || '');
-            setEditReuseSession(task.reuseSession === true);
-            setEditFreezeGoal(task.freeze?.goal || '');
-            setEditSteerNow(true);
-          }
-          setDrawerEditing(v => !v);
-        };
-        const saveDrawerEdit = async () => {
-          const patch = {};
-          const trimmedTitle = editTitle.trim();
-          if (!trimmedTitle) return;
-          if (trimmedTitle !== (task.title || '')) patch.title = trimmedTitle;
-          if (editDesc !== (task.description || '')) patch.description = editDesc;
-          if (editPrompt !== (task.prompt || '')) patch.prompt = editPrompt;
-          if (editPerm && editPerm !== (task.permission || '')) patch.permission = editPerm;
-          if (editModel !== (task.model || '')) patch.model = editModel;
-          if (editEffort !== (task.reasoningEffort || '')) patch.reasoningEffort = editEffort;
-          if (editReuseSession !== (task.reuseSession === true)) patch.reuseSession = editReuseSession;
-          const prevGoal = task.freeze?.goal || '';
-          const nextGoal = editFreezeGoal.trim();
-          if (nextGoal !== prevGoal) patch.freeze = nextGoal ? { goal: nextGoal } : null;
-          if (Object.keys(patch).length === 0) {
-            setDrawerEditing(false);
-            return;
-          }
-          if ('title' in patch || 'description' in patch || 'prompt' in patch) {
-            patch.steerNow = isRunning ? editSteerNow : false;
-          }
-          const ok = await updateTask(task, patch);
-          if (ok) setDrawerEditing(false);
-        };
-
-        return h('div', {
-          className: 'mtb-backdrop',
-          onClick: event => { if (event.target === event.currentTarget) { setSelectedId(''); setConfirmId(''); setDrawerEditing(false); } },
-        },
-          h('aside', { className: 'mtb-drawer', 'aria-label': '卡片详情', style: { '--mtb-accent': selectedColumn.accent } },
-            h('div', { className: 'mtb-drawer-head' },
-              h('span', { className: 'mtb-dot', 'data-pulse': selectedColumn.pulse && !archived ? 'true' : undefined }),
-              task.ticketNo && h('span', { style: { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 11, fontWeight: 600, padding: '2px 7px', borderRadius: 6, border: '1px solid ' + dswTheme.border2, background: dswTheme.layer } }, '[' + task.ticketNo + ']'),
-              h('strong', { style: { fontSize: 13, flex: 1 } }, archived ? '已归档 · ' + selectedColumn.label : selectedColumn.label),
-              canMove && h('select', {
-                'aria-label': '切换状态',
-                className: 'mtb-move',
-                value: knownStatuses.has(task.status) ? task.status : 'todo',
-                disabled: busy,
-                onChange: event => { void move(task, event.target.value); },
-              }, columns.map(col => h('option', { key: col.key, value: col.key }, col.label))),
-              !archived && h('button', { type: 'button', className: 'mtb-btn', onClick: openDrawerEditor }, drawerEditing ? '取消编辑' : (isRunning ? '实时编辑' : '编辑')),
-              h('button', { type: 'button', className: 'mtb-icon-btn', 'aria-label': '关闭详情', onClick: () => { setSelectedId(''); setConfirmId(''); setDrawerEditing(false); } }, '✕')),
-            h('div', { className: 'mtb-drawer-body' },
-              error && h('div', { role: 'alert', style: { padding: '8px 12px', borderRadius: 9, fontSize: 12, color: dswTheme.danger, background: 'color-mix(in srgb, #ef4444 10%, transparent)', border: '1px solid color-mix(in srgb, #ef4444 30%, transparent)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 } },
-                h('span', null, error),
-                h('button', { type: 'button', className: 'mtb-icon-btn', onClick: () => setError('') }, '✕')),
-              notice && h('div', { role: 'status', style: { padding: '8px 12px', borderRadius: 9, fontSize: 12, color: '#10b981', background: 'color-mix(in srgb, #10b981 10%, transparent)', border: '1px solid color-mix(in srgb, #10b981 30%, transparent)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 } },
-                h('span', null, notice),
-                h('button', { type: 'button', className: 'mtb-icon-btn', onClick: () => setNotice('') }, '✕')),
-              !archived && task.status === 'review' && (() => {
-                const reviewMeta = describeReviewState(task, workflow, drawerAmbiguity, needsPermConfirm);
-                return h('div', { className: 'mtb-review-panel' },
-                  h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' } },
-                    h('strong', { style: { fontSize: 12.5, color: '#a78bfa' } }, reviewMeta.badge),
-                    task.patchAvailable && h('span', { style: { fontSize: 11, padding: '2px 8px', borderRadius: 999, background: 'color-mix(in srgb, #06b6d4 16%, transparent)', color: '#06b6d4' } }, '含待落盘代码补丁')),
-                  h('div', { style: { fontSize: 12, color: dswTheme.dim } }, h(RichMarkdown, { text: reviewMeta.summary })),
-                  h('textarea', {
-                    value: drawerReviseNote,
-                    onChange: e => setDrawerReviseNote(e.target.value),
-                    rows: 2,
-                    placeholder: '可选：填写裁决结论、调整方向或验收备注（点「继续修正」会写入工单群并驱动智能体按此意见执行）…',
-                    style: { ...uiInput, resize: 'vertical', lineHeight: 1.5 },
-                  }),
-                  h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 8 } },
-                    task.patchAvailable && h('button', {
-                      type: 'button', className: 'mtb-btn mtb-btn-confirm', disabled: busy,
-                      onClick: () => { void confirmReview(task, true, drawerReviseNote); },
-                    }, '✓ 应用补丁到工作区并完成'),
-                    h('button', {
-                      type: 'button', className: task.patchAvailable ? 'mtb-btn' : 'mtb-btn mtb-btn-confirm', disabled: busy,
-                      onClick: () => { void confirmReview(task, false, drawerReviseNote); },
-                    }, task.patchAvailable ? '仅确认完成（不写工作区）' : '✓ 确认验收完成'),
-                    h('button', {
-                      type: 'button', className: 'mtb-btn mtb-btn-accent', disabled: busy,
-                      onClick: () => { void reviseTaskFromBoard(task, drawerReviseNote); },
-                    }, '↻ 按意见继续执行'),
-                    h('button', {
-                      type: 'button', className: 'mtb-btn',
-                      onClick: () => { setSelectedId(''); openTaskRoom?.(task); },
-                    }, '去工单群讨论')));
-              })(),
-              drawerAmbiguity && task.status !== 'review' && h('div', { className: 'mtb-warn-hint' },
-                '⚠ ' + drawerAmbiguity + ' 点右上角「编辑」补充后可点击下方「移回待办」继续执行。'),
-              needsPermConfirm && h('div', { className: 'mtb-warn-hint', style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 } },
-                h('span', null, '此卡片权限（' + permLabel + '）高于默认基线，运行前需人工确认。'),
-                h('button', { type: 'button', className: 'mtb-btn mtb-btn-confirm', disabled: busy, onClick: () => { void confirmPermission(task); } }, '确认高权限')),
-
-              drawerEditing
-                ? h('div', { className: 'mtb-drawer-sec' },
-                    h(Field, { label: '标题' }, h('input', { style: uiInput, value: editTitle, onChange: e => setEditTitle(e.target.value) })),
-                    h(Field, { label: '描述' }, h('textarea', { style: { ...uiInput, resize: 'vertical', lineHeight: 1.55 }, rows: 4, value: editDesc, onChange: e => setEditDesc(e.target.value) })),
-                    h(Field, { label: '执行指令 Prompt' }, h('textarea', { style: { ...uiInput, resize: 'vertical', lineHeight: 1.55 }, rows: 3, value: editPrompt, onChange: e => setEditPrompt(e.target.value) })),
-                    h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 } },
-                      h(Field, { label: '模型' }, h('select', { style: uiInput, value: editModel, onChange: e => setEditModel(e.target.value) },
-                        modelSelectOptions('', editModel).map(opt => h('option', { key: opt.route || '__default', value: opt.route }, opt.label)))),
-                      h(Field, { label: '思考模式' }, h('select', { style: uiInput, value: editEffort, onChange: e => setEditEffort(e.target.value) },
-                        thinkingModeOptions(editModel, '', editEffort).map(opt => h('option', { key: opt.id || '__default', value: opt.id }, opt.label))))),
-                    h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 } },
-                      h(Field, { label: '权限预设' }, h('select', { style: uiInput, value: editPerm, onChange: e => setEditPerm(e.target.value) },
-                        h('option', { value: '' }, '跟随默认'),
-                        h('option', { value: 'read-only' }, '只读'),
-                        h('option', { value: 'workspace-write' }, '工作区可写'),
-                        h('option', { value: 'danger-full-access' }, '完全权限'))),
-                      h(Field, { label: '冻结目标（可选，清空解冻）' }, h('input', { style: uiInput, value: editFreezeGoal, placeholder: '例如：等 PR #6 合并后推进', onChange: e => setEditFreezeGoal(e.target.value) }))),
-                    h('label', { style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 } },
-                      h('input', { type: 'checkbox', checked: editReuseSession, onChange: e => setEditReuseSession(e.target.checked) }),
-                      '复用上次执行会话（保留上下文）'),
-                    isRunning && h('label', {
-                      style: {
-                        display: 'flex', alignItems: 'flex-start', gap: 7, fontSize: 12, lineHeight: 1.5,
-                        padding: '8px 10px', borderRadius: 8,
-                        background: 'color-mix(in srgb, #3b82f6 10%, transparent)',
-                        border: '1px solid color-mix(in srgb, #3b82f6 28%, transparent)',
-                      },
-                    },
-                      h('input', { type: 'checkbox', style: { marginTop: 2 }, checked: editSteerNow, onChange: e => setEditSteerNow(e.target.checked) }),
-                      h('span', null, '立即以插话形式将修改后的内容发送给正在运行的 Agent（模型与思考强度变更自动在下一轮对话生效并通知工单群）')),
-                    h('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 6 } },
-                      h('button', { type: 'button', className: 'mtb-btn', onClick: () => setDrawerEditing(false) }, '取消'),
-                      h('button', { type: 'button', className: 'mtb-btn mtb-btn-accent', disabled: busy || !editTitle.trim(), onClick: () => { void saveDrawerEdit(); } }, isRunning && editSteerNow ? '保存并立即插话发送' : '保存修改')))
-                : h(React.Fragment, null,
-                    h('h3', { style: { margin: 0, fontSize: 16, fontWeight: 600, lineHeight: 1.45, wordBreak: 'break-word' } }, task.title),
-                    h('div', { className: 'mtb-card-meta' },
-                      task.createdAt && h('span', null, '创建于 ' + new Date(task.createdAt).toLocaleString()),
-                      Number(task.runCount || 0) > 0 && h('span', null, '· ' + task.runCount + ' 次运行'),
-                      permLabel && h('span', { className: 'mtb-card-micro' }, permLabel),
-                      task.model && h('span', { className: 'mtb-card-micro' }, task.model),
-                      task.reasoningEffort && h('span', { className: 'mtb-card-micro' }, '思考: ' + task.reasoningEffort),
-                      task.reuseSession && h('span', { className: 'mtb-card-micro' }, '复用会话'),
-                      task.freeze && h('span', { className: 'mtb-card-micro' }, '已冻结' + (task.freeze.goal ? ': ' + task.freeze.goal : ''))),
-                    task.description
-                      ? h('div', { style: { fontSize: 13, lineHeight: 1.65, whiteSpace: 'pre-wrap', wordBreak: 'break-word', padding: '10px 12px', borderRadius: 10, background: 'color-mix(in srgb, currentColor 4%, transparent)', border: '1px solid var(--dsw-alias-border-l1, color-mix(in srgb, currentColor 10%, transparent))' } }, task.description)
-                      : h('div', { style: uiMuted }, '暂无描述'),
-                    task.prompt && task.prompt !== task.description && task.prompt !== task.title && h('details', { className: 'mtb-drawer-sec' },
-                      h('summary', { style: { cursor: 'pointer', fontSize: 12, fontWeight: 600, color: dswTheme.dim } }, '执行指令 Prompt'),
-                      h('pre', { style: { margin: '6px 0 0', whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 12, lineHeight: 1.55, fontFamily: 'inherit' } }, task.prompt))),
-
-              !archived && (() => {
-                if (workflow) {
-                  const wfConfigs = { ...(workflow.agentConfigs ?? {}), ...(workflow.plan?.agentConfigs ?? {}) };
-                  const wfPool = (catalog?.leaders ?? []).filter(item => item.global || item.workspaceId === workflow.workspaceId);
-                  const leaderMeta = wfPool.find(item => item.id === workflow.leaderId) ?? (catalog?.leaders ?? []).find(item => item.id === workflow.leaderId);
-                  const leaderCfg = wfConfigs.leader ?? {};
-                  const activeTplId = workflow.plan?.templateId ?? workflow.selected ?? workflow.templateId ?? (workflow.choice === 'none' ? 'none' : '');
-                  const activeTplMeta = activeTplId === 'none' ? catalog?.plainTemplate : catalog?.templates?.find(t => t.id === activeTplId);
-                  const wfCodeWork = Boolean(workflow.plan?.codeWork || activeTplId === 'development');
-                  const wfSlots = workflow.plan ? ((wfCodeWork ? activeTplMeta?.codingRoles : activeTplMeta?.roles) ?? Object.keys(workflow.plan.members ?? {}).map(id => ({ id, name: id }))) : [];
-                  const codexSlots = workflow.plan ? (wfCodeWork ? ['coding', 'review'] : (activeTplId === 'pr-review' ? ['review'] : [])) : [];
-                  const controlsDisabled = busy;
-                  return h('div', { className: 'mtb-drawer-sec', 'aria-label': '参战 Agent 模型与思考模式' },
-                    h('div', { className: 'mtb-drawer-sec-title' },
-                      '🤖 参战 Agent 模型与思考模式',
-                      h('span', { style: { fontSize: 10.5, fontWeight: 500, color: isRunning ? '#3b82f6' : dswTheme.faint } },
-                        isRunning ? '● 运行中可随时切换 · 下一轮生效并通知工单群' : '切换后通知工单群 · 下一轮生效')),
-                    h('div', { className: 'mtb-agent-cfg-list' },
-                      // 1) Leader Row
-                      h('div', { className: 'mtb-agent-cfg-row' },
-                        h('div', { className: 'mtb-agent-cfg-head' },
-                          h('span', null, '👑 Leader · ' + (leaderMeta?.name || workflow.leaderName || '未绑定')),
-                          h('span', { style: { fontSize: 10.5, fontWeight: 500, color: dswTheme.faint } }, modeLabel)),
-                        h('div', { className: 'mtb-agent-cfg-grid' },
-                          wfPool.length > 0 && h('select', {
-                            'aria-label': 'Leader 人选',
-                            style: uiInput,
-                            disabled: controlsDisabled,
-                            value: workflow.leaderId || '',
-                            onChange: e => {
-                              const picked = wfPool.find(item => item.id === e.target.value);
-                              if (picked) void saveWorkflowAgentConfigs(task, { leaderId: picked.id }, 'Leader → ' + picked.name);
-                            },
-                          }, wfPool.map(item => h('option', { key: item.id, value: item.id }, 'Leader: ' + item.name))),
-                          h('select', {
-                            'aria-label': 'Leader 模型',
-                            style: uiInput,
-                            disabled: controlsDisabled,
-                            value: leaderCfg.model || '',
-                            onChange: e => { void saveWorkflowAgentConfigs(task, { agentConfigs: { leader: { ...leaderCfg, model: e.target.value } } }, (leaderMeta?.name || 'Leader') + ' 模型'); },
-                          }, modelSelectOptions(leaderMeta?.model || '', leaderCfg.model || '').map(opt => h('option', { key: opt.route || '__def', value: opt.route }, opt.label))),
-                          h('select', {
-                            'aria-label': 'Leader 思考模式',
-                            style: uiInput,
-                            disabled: controlsDisabled,
-                            value: leaderCfg.reasoningEffort || '',
-                            onChange: e => { void saveWorkflowAgentConfigs(task, { agentConfigs: { leader: { ...leaderCfg, reasoningEffort: e.target.value } } }, (leaderMeta?.name || 'Leader') + ' 思考模式'); },
-                          }, thinkingModeOptions(leaderCfg.model || leaderMeta?.model || '', leaderMeta?.reasoningEffort || '', leaderCfg.reasoningEffort || '').map(opt => h('option', { key: opt.id || '__def', value: opt.id }, opt.label))))),
-                      // 2) Role Slot Rows
-                      wfSlots.filter(slot => slot.id !== 'codexCritic').map(slot => {
-                        const memberIdVal = workflow.plan?.members?.[slot.id] ?? '';
-                        const memberMeta = wfPool.find(m => m.id === memberIdVal);
-                        const slotCfg = wfConfigs[slot.id] ?? {};
-                        const rolePool = wfPool.filter(m => m.id !== workflow.leaderId && (slot.id !== 'coder' || ['workspace-write', 'danger-full-access'].includes(m.permission)));
-                        return h('div', { key: slot.id, className: 'mtb-agent-cfg-row' },
-                          h('div', { className: 'mtb-agent-cfg-head' },
-                            h('span', null, '🧩 ' + slot.name + ' · ' + (memberIdVal === '@dsh' ? '独立 DSH 席位' : (memberMeta?.name || '待指派')))),
-                          h('div', { className: 'mtb-agent-cfg-grid' },
-                            h('select', {
-                              'aria-label': slot.name + ' 人选',
-                              style: uiInput,
-                              disabled: controlsDisabled,
-                              value: memberIdVal,
-                              onChange: e => { void saveWorkflowAgentConfigs(task, { members: { [slot.id]: e.target.value } }, slot.name + ' 指派'); },
-                            },
-                              !slot.required && h('option', { value: '' }, '暂不指派'),
-                              slot.id === 'critic' && h('option', { value: '@dsh' }, '独立 DSH 审查席位'),
-                              rolePool.map(m => h('option', {
-                                key: m.id, value: m.id,
-                                disabled: Object.entries(workflow.plan?.members ?? {}).some(([k, v]) => k !== slot.id && v === m.id),
-                              }, slot.name + ': ' + m.name))),
-                            h('select', {
-                              'aria-label': slot.name + ' 模型',
-                              style: uiInput,
-                              disabled: controlsDisabled || !memberIdVal,
-                              value: slotCfg.model || '',
-                              onChange: e => { void saveWorkflowAgentConfigs(task, { agentConfigs: { [slot.id]: { ...slotCfg, model: e.target.value } } }, (memberMeta?.name || slot.name) + ' 模型'); },
-                            }, modelSelectOptions(memberMeta?.model || '', slotCfg.model || '').map(opt => h('option', { key: opt.route || '__def', value: opt.route }, opt.label))),
-                            h('select', {
-                              'aria-label': slot.name + ' 思考模式',
-                              style: uiInput,
-                              disabled: controlsDisabled || !memberIdVal,
-                              value: slotCfg.reasoningEffort || '',
-                              onChange: e => { void saveWorkflowAgentConfigs(task, { agentConfigs: { [slot.id]: { ...slotCfg, reasoningEffort: e.target.value } } }, (memberMeta?.name || slot.name) + ' 思考模式'); },
-                            }, thinkingModeOptions(slotCfg.model || memberMeta?.model || '', memberMeta?.reasoningEffort || '', slotCfg.reasoningEffort || '').map(opt => h('option', { key: opt.id || '__def', value: opt.id }, opt.label)))));
-                      }),
-                      // 3) Codex Sub-Agent Rows
-                      codexSlots.map(slot => {
-                        const cfgKey = slot === 'coding' ? 'codexCoding' : 'codexReview';
-                        const slotTitle = slot === 'coding' ? '⚙️ Codex · 编码执行子 Agent' : '🔍 Codex · 审查复核子 Agent';
-                        const codexVal = workflow.plan?.codex?.[slot] === null ? 'off' : (workflow.plan?.codex?.[slot] || 'auto');
-                        const slotCfg = wfConfigs[cfgKey] ?? {};
-                        return h('div', { key: cfgKey, className: 'mtb-agent-cfg-row' },
-                          h('div', { className: 'mtb-agent-cfg-head' }, h('span', null, slotTitle)),
-                          h('div', { className: 'mtb-agent-cfg-grid' },
-                            h('select', {
-                              'aria-label': slotTitle + ' 模型',
-                              style: uiInput,
-                              disabled: controlsDisabled,
-                              value: codexVal,
-                              onChange: e => {
-                                const nextVal = e.target.value === 'off' ? null : e.target.value;
-                                void saveWorkflowAgentConfigs(task, {
-                                  codex: { [slot]: nextVal },
-                                  agentConfigs: { [cfgKey]: { ...slotCfg, model: nextVal && nextVal !== 'auto' ? nextVal : '' } },
-                                }, slotTitle + ' 模型');
-                              },
-                            },
-                              h('option', { value: 'auto' }, '模型：自动选择 Codex'),
-                              h('option', { value: 'off' }, '关闭此阶段 Codex 子调用'),
-                              codexVal !== 'auto' && codexVal !== 'off' && !codexModels.some(m => m.id === codexVal) && h('option', { value: codexVal }, codexVal),
-                              codexModels.filter(m => slot !== 'coding' || m.work).map(m => h('option', { key: m.id, value: m.id }, 'Codex: ' + m.model))),
-                            h('select', {
-                              'aria-label': slotTitle + ' 思考模式',
-                              style: uiInput,
-                              disabled: controlsDisabled || codexVal === 'off',
-                              value: slotCfg.reasoningEffort || '',
-                              onChange: e => { void saveWorkflowAgentConfigs(task, { agentConfigs: { [cfgKey]: { ...slotCfg, reasoningEffort: e.target.value } } }, slotTitle + ' 思考模式'); },
-                            }, codexThinkingOptions(codexVal, slotCfg.reasoningEffort || '').map(opt => h('option', { key: opt.id || '__def', value: opt.id }, opt.label)))));
-                      })));
-                }
-                // Plain / Single-Agent Card quick switcher
-                const boundAgentName = currentAgentTag ? currentAgentTag.slice(4) : '';
-                const boundAgentMeta = (catalog?.leaders ?? []).find(item => item.name === boundAgentName);
-                return h('div', { className: 'mtb-drawer-sec', 'aria-label': '执行智能体模型与思考模式' },
-                  h('div', { className: 'mtb-drawer-sec-title' },
-                    '🤖 执行 Agent 模型与思考模式',
-                    h('span', { style: { fontSize: 10.5, fontWeight: 500, color: isRunning ? '#3b82f6' : dswTheme.faint } },
-                      isRunning ? '● 运行中可改 · 下一轮生效并通知工单群' : '切换后下一轮生效')),
-                  h('div', { className: 'mtb-agent-cfg-row' },
-                    h('div', { className: 'mtb-agent-cfg-grid' },
-                      (catalog?.leaders?.length ?? 0) > 0 && h('select', {
-                        'aria-label': '指派智能体',
-                        style: uiInput,
-                        disabled: busy,
-                        value: boundAgentName,
-                        onChange: e => { void assignDrawerAgentLeader(e.target.value); },
-                      },
-                        h('option', { value: '' }, '指派 Agent：未指派'),
-                        catalog.leaders.map(item => h('option', { key: item.id, value: item.name }, 'Agent: ' + item.name))),
-                      h('select', {
-                        'aria-label': '工单模型',
-                        style: uiInput,
-                        disabled: busy,
-                        value: task.model || '',
-                        onChange: e => {
-                          const v = e.target.value;
-                          setEditModel(v);
-                          void updateTask(task, { model: v });
-                        },
-                      }, modelSelectOptions(boundAgentMeta?.model || '', task.model || '').map(opt => h('option', { key: opt.route || '__def', value: opt.route }, opt.label))),
-                      h('select', {
-                        'aria-label': '工单思考模式',
-                        style: uiInput,
-                        disabled: busy,
-                        value: task.reasoningEffort || '',
-                        onChange: e => {
-                          const v = e.target.value;
-                          setEditEffort(v);
-                          void updateTask(task, { reasoningEffort: v });
-                        },
-                      }, thinkingModeOptions(task.model || boundAgentMeta?.model || '', boundAgentMeta?.reasoningEffort || '', task.reasoningEffort || '').map(opt => h('option', { key: opt.id || '__def', value: opt.id }, opt.label))))));
-              })(),
-
-              h('div', { className: 'mtb-drawer-sec' },
-                h('div', { className: 'mtb-drawer-sec-title' }, '标签与优先级'),
-                h('div', { className: 'mtb-card-tags' },
-                  currentTagNames.length === 0
-                    ? h('span', { style: uiMuted }, '暂无标签')
-                    : currentTagNames.map(name => h('span', { key: name, className: 'mtb-tag', 'data-tag-tone': taskTagTone(name) },
-                        name,
-                        !archived && h('button', { type: 'button', className: 'mtb-tag-x', 'aria-label': '移除 ' + name, disabled: busy, onClick: () => { void toggleDrawerTag(name); } }, '×')))),
-                !archived && h('div', { style: { display: 'flex', gap: 6 } },
-                  h('input', {
-                    style: { ...uiInput, padding: '5px 9px' },
-                    value: drawerTagDraft,
-                    placeholder: '输入新标签，如 记忆 / P1…',
-                    onChange: e => setDrawerTagDraft(e.target.value),
-                    onKeyDown: e => { if (e.key === 'Enter') { e.preventDefault(); void addDrawerTag(); } },
-                  }),
-                  h('button', { type: 'button', className: 'mtb-btn', disabled: busy || !drawerTagDraft.trim(), onClick: () => { void addDrawerTag(); } }, '＋ 添加')),
-                !archived && suggestedDrawerTags.length > 0 && h('div', { className: 'mtb-card-tags' },
-                  suggestedDrawerTags.map(name => h('button', {
-                    key: name, type: 'button', className: 'mtb-tag mtb-tag-btn',
-                    'data-tag-tone': taskTagTone(name), disabled: busy,
-                    onClick: () => { void toggleDrawerTag(name); },
-                  }, '＋ ' + name)))),
-
-              h('div', { className: 'mtb-drawer-sec' },
-                h('div', { className: 'mtb-drawer-sec-title' },
-                  '附件（图片 / 文件，最多 8 个）',
-                  !archived && drawerAttachments.length < 8 && h('label', { className: 'mtb-btn', style: { cursor: uploading ? 'wait' : 'pointer', padding: '3px 9px', fontSize: 11 } },
-                    uploading ? '上传中…' : '📎 上传附件',
-                    h('input', {
-                      type: 'file', multiple: true, style: { display: 'none' }, disabled: uploading || busy,
-                      onChange: e => {
-                        const picked = Array.from(e.target.files || []);
-                        e.target.value = '';
-                        void uploadFiles(picked, added => {
-                          const existingIds = new Set(drawerAttachments.map(a => a.attachmentId));
-                          const merged = [
-                            ...drawerAttachments.map(serializeAttachmentForWire),
-                            ...added.filter(a => !existingIds.has(a.attachmentId)),
-                          ].slice(0, 8);
-                          void updateTask(task, { attachments: merged, ...(isRunning ? { steerNow: true } : {}) });
-                        });
-                      },
-                    }))),
-                drawerAttachments.length === 0
-                  ? h('span', { style: uiMuted }, '暂无附件')
-                  : renderAttachments(drawerAttachments, archived ? undefined : attId => {
-                      const remaining = drawerAttachments.filter(a => a.attachmentId !== attId).map(serializeAttachmentForWire);
-                      void updateTask(task, { attachments: remaining.length > 0 ? remaining : null, ...(isRunning ? { steerNow: true } : {}) });
-                    }, task.id)),
-
-              h('div', { className: 'mtb-drawer-sec' },
-                h('div', { className: 'mtb-drawer-sec-title' },
-                  '父任务 / 子任务关联',
-                  childCards.length > 0 && h('span', { style: { fontWeight: 500, fontSize: 11 } }, childCards.length + ' 个子任务')),
-                parentCard && h('div', { className: 'mtb-sub-row' },
-                  h('span', { style: { fontSize: 11, color: dswTheme.faint } }, '父任务'),
-                  h('button', { type: 'button', style: { border: 0, background: 'transparent', color: 'inherit', fontWeight: 600, fontSize: 12, cursor: 'pointer', textAlign: 'left', flex: 1 }, onClick: () => setSelectedId(parentCard.id) }, parentCard.title),
-                  !archived && h('button', { type: 'button', className: 'mtb-btn', disabled: busy, onClick: () => { void setParent(task, null); } }, '解除')),
-                !parentCard && h(React.Fragment, null,
-                  childCards.map(child => {
-                    const cCol = columns.find(c => c.key === child.status) ?? columns[1];
-                    return h('div', { key: child.id, className: 'mtb-sub-row', style: { '--mtb-accent': cCol.accent } },
-                      h('span', { className: 'mtb-dot' }),
-                      h('button', { type: 'button', style: { border: 0, background: 'transparent', color: 'inherit', fontSize: 12, cursor: 'pointer', textAlign: 'left', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, onClick: () => setSelectedId(child.id) }, child.title),
-                      h('span', { style: { fontSize: 11, color: dswTheme.dim } }, cCol.label),
-                      !archived && h('button', { type: 'button', className: 'mtb-icon-btn', title: '解除子任务关联', disabled: busy, onClick: () => { void setParent(child, null); } }, '×'));
-                  }),
-                  !archived && h('div', { style: { display: 'flex', gap: 6 } },
-                    h('input', {
-                      style: { ...uiInput, padding: '5px 9px' },
-                      value: newSubtaskTitle,
-                      placeholder: '新建子任务标题…',
-                      onChange: e => setNewSubtaskTitle(e.target.value),
-                      onKeyDown: e => { if (e.key === 'Enter') { e.preventDefault(); void createSubtask(task); } },
-                    }),
-                    h('button', { type: 'button', className: 'mtb-btn', disabled: busy || !newSubtaskTitle.trim(), onClick: () => { void createSubtask(task); } }, '＋ 子任务')),
-                  !archived && linkableChildren.length > 0 && h('div', { style: { display: 'flex', gap: 6 } },
-                    h('select', { style: { ...uiInput, padding: '5px 8px', flex: 1 }, value: linkChildId, onChange: e => setLinkChildId(e.target.value) },
-                      h('option', { value: '' }, '关联已有卡片为子任务…'),
-                      linkableChildren.map(item => h('option', { key: item.id, value: item.id }, item.title))),
-                    h('button', { type: 'button', className: 'mtb-btn', disabled: busy || !linkChildId, onClick: () => { const ch = allActive.find(i => i.id === linkChildId); if (ch) void setParent(ch, task.id); } }, '关联')))),
-
-              !archived && h('details', { className: 'mtb-drawer-sec' },
-                h('summary', { style: { cursor: 'pointer', fontSize: 12, fontWeight: 600, color: dswTheme.dim } },
-                  '定时执行 (Cron / 单次)' + (task.schedule?.enabled ? ' · 已开启' : '')),
-                h('div', { style: { display: 'grid', gap: 8, marginTop: 8 } },
-                  h('div', { style: { display: 'flex', alignItems: 'center', gap: 12, fontSize: 12 } },
-                    h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
-                      h('input', { type: 'checkbox', checked: cronEnabled, onChange: e => setCronEnabled(e.target.checked) }),
-                      '启用定时'),
-                    h('select', { className: 'mtb-move', value: cronMode, onChange: e => setCronMode(e.target.value) },
-                      h('option', { value: 'cron' }, '周期 Cron'),
-                      h('option', { value: 'once' }, '单次触发'))),
-                  cronMode === 'cron'
-                    ? h(React.Fragment, null,
-                        h('div', { style: { display: 'flex', gap: 5, flexWrap: 'wrap' } },
-                          [['每小时', '0 * * * *'], ['每天 09:00', '0 9 * * *'], ['工作日 09:30', '30 9 * * 1-5']].map(([lbl, expr]) =>
-                            h('button', { key: expr, type: 'button', className: 'mtb-btn', style: { padding: '2px 8px', fontSize: 11 }, onClick: () => { setCronDraft(expr); setCronEnabled(true); } }, lbl))),
-                        h('div', { style: { display: 'flex', gap: 6 } },
-                          h('input', { style: { ...uiInput, padding: '5px 9px', fontFamily: 'monospace' }, value: cronDraft, placeholder: '5 段 cron，例如 0 9 * * *', onChange: e => setCronDraft(e.target.value) }),
-                          h('button', { type: 'button', className: 'mtb-btn', disabled: busy, onClick: () => { void saveSchedule(task, cronEnabled, 'cron', cronDraft, onceDraft); } }, '保存定时')))
-                    : h('div', { style: { display: 'flex', gap: 6 } },
-                        h('input', { type: 'datetime-local', style: { ...uiInput, padding: '5px 9px' }, value: onceDraft, onChange: e => setOnceDraft(e.target.value) }),
-                        h('button', { type: 'button', className: 'mtb-btn', disabled: busy, onClick: () => { void saveSchedule(task, cronEnabled, 'once', cronDraft, onceDraft); } }, '保存定时')))),
-
-              drawerExecutions.length > 0 && h('details', { className: 'mtb-drawer-sec', open: drawerExecutions.length <= 3 },
-                h('summary', { style: { cursor: 'pointer', fontSize: 12, fontWeight: 600, color: dswTheme.dim } },
-                  '执行历史（' + drawerExecutions.length + ' 条）'),
-                h('div', { style: { display: 'grid', gap: 6, marginTop: 8 } },
-                  drawerExecutions.map((ex, idx) => h('div', { key: ex.id || idx, className: 'mtb-exec-row' },
-                    h('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
-                      h('span', { className: 'mtb-result', 'data-tone': ex.result || 'running' },
-                        ex.result ? (TASK_RESULT_LABELS[ex.result] ?? ex.result) : '运行中'),
-                      ex.startedAt && h('span', { style: { color: dswTheme.dim } }, new Date(ex.startedAt).toLocaleString()),
-                      ex.sessionId && h('button', { type: 'button', className: 'mtb-icon-pill', style: { marginLeft: 'auto' }, onClick: () => openSession && openSession(ex.sessionId) }, '打开会话')),
-                    ex.error && h('div', { style: { color: dswTheme.danger } }, ex.error))))),
-
-              workflow && h('div', { className: 'mtb-drawer-sec' },
-                h('div', { style: { fontSize: 12, fontWeight: 600 } }, [workflow.leaderName, modeLabel,
-                  catalog?.groupTemplates?.find(item => item.id === workflow.plan?.groupTemplate)?.name].filter(Boolean).join(' · ')),
-                step && h('div', { role: 'status', style: uiMuted }, step),
-                workflow.error && h('div', { role: 'alert', style: { color: dswTheme.danger, fontSize: 12 } }, workflow.error),
-                workflow.pr && h('div', { style: uiMuted, title: workflow.pr.head },
-                  h('a', { href: workflow.pr.url, target: '_blank', rel: 'noreferrer' }, 'PR'), ' · ' + workflow.pr.head.slice(0, 10),
-                  workflow.pr.omitted.length > 0 ? ' · ' + workflow.pr.omitted.length + ' 个文件缺少完整文本补丁' : ''),
-                workflow.reviewers?.length > 0 && h('div', { style: uiMuted },
-                  workflow.reviewers.map(reviewer => reviewer.name + ' · ' + reviewer.model).join(' / ')),
-                workflow.reportId && h(TaskReviewReport, { key: workflow.reportId, taskId: task.id, development: Boolean(workflow.development) }))),
-
-            h('div', { className: 'mtb-drawer-foot' },
-              !archived && task.status === 'review' && canMove && h('button', { type: 'button', className: 'mtb-btn mtb-btn-confirm', disabled: busy, onClick: () => { void confirmReview(task, Boolean(task.patchAvailable), drawerReviseNote); } }, task.patchAvailable ? '应用补丁并完成' : '确认完成'),
-              !archived && task.status === 'review' && canMove && h('button', { type: 'button', className: 'mtb-btn', disabled: busy, onClick: () => { void move(task, 'todo'); } }, '移回待办'),
-              !archived && !task.taskRoom?.closed && task.status !== 'running' && (!workflow || workflow.state !== 'done') && h('button', { type: 'button', disabled: busy, className: 'mtb-btn mtb-btn-accent', onClick: () => { void run(task); } }, workflow?.state === 'failed' || workflow?.state === 'interrupted' ? '重试' : '运行'),
-              !archived && isRunning && !workflow && h('button', { type: 'button', className: 'mtb-btn', disabled: busy, onClick: () => { void settleTask(task); } }, '终止运行'),
-              h('button', { type: 'button', className: 'mtb-btn', onClick: () => { setSelectedId(''); openTaskRoom?.(task); } }, '进入工单群'),
-              !archived && (workflow || canOrchestrate) && h('button', { type: 'button', className: 'mtb-btn', disabled: busy, onClick: () => edit(task) }, workflow ? '编辑分工' : '启用编排'),
-              task.sessionId && h('button', { type: 'button', className: 'mtb-btn', onClick: () => openSession && openSession(task.sessionId) }, '打开会话'),
-              !archived && h('button', { type: 'button', className: 'mtb-btn', disabled: busy, onClick: () => { void duplicateTask(task); } }, '复制'),
-              !archived && !isRunning && h('button', { type: 'button', className: 'mtb-btn', disabled: busy, onClick: () => { void archiveTask(task); } }, '归档'),
-              archived && h('button', { type: 'button', className: 'mtb-btn mtb-btn-confirm', disabled: busy, onClick: () => { void restoreTask(task); } }, '恢复到看板'),
-              !task.taskRoom && h('button', { type: 'button', className: confirmId === task.id ? 'mtb-btn mtb-btn-danger' : 'mtb-btn', style: { marginLeft: 'auto' }, onClick: () => { void remove(task); } }, confirmId === task.id ? '确认删除' : '删除'))));
-      };
-
-      const scrollToColumn = key => {
-        setShowArchive(false);
-        setCollapsedCols(prev => {
-          if (!prev.includes(key)) return prev;
-          const next = prev.filter(k => k !== key);
-          try { globalThis.localStorage?.setItem('marshal.board.collapsedCols', JSON.stringify(next)); } catch {}
-          return next;
-        });
-        setTimeout(() => {
-          document.getElementById('marshal-col-' + key)?.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
-        }, 30);
-      };
-
-      const canOrchestrate = Boolean(catalog?.memoryAvailable && catalog?.leaders?.length > 0);
-      const topLevelParents = allActive.filter(item => item.parentId === undefined);
-      const allTagSuggestions = [...new Set([...PRIORITY_TAGS, ...knownTags.map(t => t.name)])];
-      const liveAmbiguityHint = !editing ? clientAmbiguityHint(title, description, formPrompt, formAttachments.length > 0, Boolean(prUrl.trim())) : '';
-
-      return h('section', { className: 'mtb-page' },
-        h('header', { className: 'mtb-head' },
-          h('div', { className: 'mtb-head-left' },
-            h('div', { style: { fontSize: 15, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 8 } },
-              '任务看板',
-              h('span', { style: { fontSize: 11, fontWeight: 500, color: dswTheme.dim, fontVariantNumeric: 'tabular-nums' } },
-                (activeTag || q) ? list.length + '/' + allActive.length + ' 张卡片' : allActive.length + ' 张卡片')),
-            h('div', { className: 'mtb-summary', 'aria-label': '状态总览' },
-              columns.map(column => {
-                const count = list.filter(task => (knownStatuses.has(task.status) ? task.status : 'todo') === column.key).length;
-                return h('button', {
-                  key: column.key,
-                  type: 'button',
-                  className: 'mtb-summary-chip',
-                  style: { '--mtb-accent': column.accent },
-                  onClick: () => scrollToColumn(column.key),
-                  title: '定位到「' + column.label + '」列',
-                },
-                  h('span', { className: 'mtb-dot', 'data-pulse': column.pulse && count > 0 ? 'true' : undefined }),
-                  column.label,
-                  h('strong', null, count));
-              }),
-              h('button', { type: 'button', className: 'mtb-pan-btn', 'data-active': scrollEdge.left ? 'true' : undefined, title: '向左滚动看板列', 'aria-label': '向左滚动看板列', onClick: () => panBoard(-320) }, '◀'),
-              h('button', { type: 'button', className: 'mtb-pan-btn', 'data-active': scrollEdge.right ? 'true' : undefined, title: '向右滚动看板列（查看已完成/已失败）', 'aria-label': '向右滚动看板列', onClick: () => panBoard(320) }, '▶'),
-              (() => {
-                const emptyKeys = columns.filter(c => list.every(t => (knownStatuses.has(t.status) ? t.status : 'todo') !== c.key)).map(c => c.key);
-                const allEmptyCollapsed = emptyKeys.length > 0 && emptyKeys.every(k => collapsedCols.includes(k));
-                return emptyKeys.length > 0 && h('button', {
-                  type: 'button',
-                  className: 'mtb-summary-chip',
-                  style: { '--mtb-accent': '#64748b' },
-                  title: allEmptyCollapsed ? '展开所有已折叠的空列' : '将无工单的空列折叠为窄条，腾出空间查看「已完成 / 已失败」',
-                  onClick: () => allEmptyCollapsed ? expandAllCols() : collapseEmptyCols(emptyKeys),
-                }, allEmptyCollapsed ? '展开空列' : '收起空列');
-              })(),
-              collapsedCols.length > 0 && h('button', {
-                type: 'button',
-                className: 'mtb-summary-chip',
-                style: { '--mtb-accent': '#6366f1' },
-                title: '展开全部 6 列',
-                onClick: expandAllCols,
-              }, '全展'))),
-          h('div', { className: 'mtb-head-right' },
-            archivedTasks.length > 0 && h('button', { type: 'button', style: tabStyle(showArchive), onClick: () => setShowArchive(v => !v) },
-              showArchive ? '返回看板' : '归档 (' + archivedTasks.length + ')'),
-            !showArchive && h('button', { type: 'button', style: tabStyle(showFlowGuide), onClick: () => setShowFlowGuide(v => !v), title: '查看工单 6 列状态流转规则' }, '流转规则'),
-            !showArchive && h('button', { type: 'button', style: uiButton(false), onClick: () => setCompactCards(v => !v) }, compactCards ? '展开卡片' : '紧凑视图'),
-            openNativeBoard && h('button', { type: 'button', style: uiButton(false), onClick: () => openNativeBoard(), title: '切换到 DSH 原版任务看板' }, '原版看板'),
-            h('button', { type: 'button', className: 'mtb-btn mtb-btn-ai', style: { padding: '6px 11px' }, onClick: () => { setParseError(''); setParseOpen(true); } }, '✨ AI 解析任务'),
-            h('button', { type: 'button', disabled: busy, style: uiButton(true), onClick: () => formOpen ? cancelForm() : setFormOpen(true) }, formOpen ? '收起' : '＋ 新建卡片'))),
-
-        !showArchive && h('div', { className: 'mtb-tagbar', 'aria-label': '搜索与标签筛选' },
-          h('input', {
-            className: 'mtb-search',
-            type: 'search',
-            value: searchQuery,
-            onChange: e => setSearchQuery(e.target.value),
-            placeholder: '搜索标题 / 描述 / 标签…',
-          }),
-          knownTags.length > 0 && h('span', { className: 'mtb-tagbar-label' }, '标签'),
-          knownTags.length > 0 && h('button', {
-            type: 'button',
-            className: 'mtb-tag mtb-tag-btn',
-            'data-active': activeTag === '' ? 'true' : undefined,
-            onClick: () => setActiveTag(''),
-          }, '全部'),
-          knownTags.map(tag => h('button', {
-            key: tag.name,
-            type: 'button',
-            className: 'mtb-tag mtb-tag-btn',
-            'data-tag-tone': taskTagTone(tag.name),
-            'data-active': activeTag === tag.name ? 'true' : undefined,
-            onClick: () => setActiveTag(current => current === tag.name ? '' : tag.name),
-          }, tag.name))),
-
-        showFlowGuide && h('div', { style: { margin: '0 20px 8px', padding: '10px 14px', borderRadius: 10, border: '1px solid ' + dswTheme.border, background: dswTheme.layer, fontSize: 12, lineHeight: 1.65, display: 'grid', gap: 4 } },
-          h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between' } },
-            h('strong', null, '工单状态流转规则'),
-            h('button', { type: 'button', className: 'mtb-icon-btn', onClick: () => setShowFlowGuide(false) }, '✕')),
-          h('div', { style: { color: dswTheme.dim } }, '主链路：待规划 (backlog) → 待办 (todo) → 进行中 (running) → 待确认 (review) → 已完成 (done) / 已失败 (failed)'),
-          h('div', { style: { color: dswTheme.dim } }, '• 自动入「待确认」：描述模糊拦截 / 非定时工单执行完成待验收 / 派驻工作区权限受阻挂起'),
-          h('div', { style: { color: dswTheme.dim } }, '• 人工拍板：「待确认」点「✓ 确认」→ 已完成，点「↩ 待办」或直接运行 → 退回修改/重跑；「已失败」可修后重试。')),
-        notice && h('div', { className: 'mtb-notice', role: 'status' },
-          h('span', null, notice),
-          h('button', { type: 'button', className: 'mtb-icon-btn', onClick: () => setNotice('') }, '✕')),
-        error && h('div', { style: { padding: '8px 20px', fontSize: 12, color: dswTheme.danger } }, error),
-
-        formOpen && h('fieldset', { disabled: busy, 'aria-label': editing ? '编辑工单分工' : '创建工单', className: 'mtb-form' },
-          h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 } },
-            h('strong', { style: { fontSize: 13 } }, editing ? '编辑工单分工' : '新建任务卡片'),
-            !editing && h('button', { type: 'button', className: 'mtb-btn mtb-btn-ai', onClick: () => { setParseError(''); setParseOpen(true); } }, '✨ 从文本 AI 自动解析')),
-          h(Field, { label: '标题' }, h('input', { value: title, onChange: event => { setTitle(event.target.value); if (!editing) setPlan(null); }, placeholder: '这张卡片要做什么', style: uiInput })),
-          h(Field, { label: '描述（建议写清目标与验收标准；可直接粘贴截图或文件；若模糊将自动转入「待确认」）' }, h('textarea', {
-            value: description,
-            onChange: event => { setDescription(event.target.value); if (!editing) setPlan(null); },
-            onPaste: event => {
-              if (uploading || busy) return;
-              const pasted = Array.from(event.clipboardData?.files || []);
-              if (pasted.length > 0) {
-                event.preventDefault();
-                void uploadFiles(pasted, added => setFormAttachments(prev => {
-                  const existingIds = new Set(prev.map(a => a.attachmentId));
-                  return [...prev, ...added.filter(a => !existingIds.has(a.attachmentId))].slice(0, 8);
-                }));
-              }
-            },
-            rows: 3,
-            placeholder: '背景、目标、验收标准、约束（支持 ⌘/Ctrl+V 直接粘贴截图附件）…',
-            style: { ...uiInput, resize: 'vertical', lineHeight: 1.6 },
-          })),
-          liveAmbiguityHint && h('div', { className: 'mtb-warn-hint' }, '⚠ ' + liveAmbiguityHint),
-
-          h('details', { style: { fontSize: 12 } },
-            h('summary', { style: { cursor: 'pointer', color: dswTheme.dim, fontWeight: 500 } }, '执行指令 Prompt（可选，留空自动沿用描述）'),
-            h('textarea', { value: formPrompt, onChange: event => setFormPrompt(event.target.value), rows: 3, placeholder: '下发给执行智能体的具体指令…', style: { ...uiInput, marginTop: 6, resize: 'vertical', lineHeight: 1.55 } })),
-
-          !editing && h(Field, { label: '标签与优先级（点选已有标签，或输入新建）' },
-            formTags.length > 0 && h('div', { className: 'mtb-card-tags' },
-              formTags.map(name => h('span', { key: name, className: 'mtb-tag', 'data-tag-tone': taskTagTone(name) },
-                name,
-                h('button', { type: 'button', className: 'mtb-tag-x', onClick: () => toggleFormTag(name) }, '×')))),
-            h('div', { style: { display: 'flex', gap: 6 } },
-              h('input', {
-                value: newTagDraft,
-                onChange: event => setNewTagDraft(event.target.value),
-                onKeyDown: event => { if (event.key === 'Enter') { event.preventDefault(); addNewFormTag(); } },
-                placeholder: '新建标签名，回车添加（如：记忆、前端、P1）',
-                style: { ...uiInput, flex: 1 },
-              }),
-              h('button', { type: 'button', className: 'mtb-btn', onClick: addNewFormTag }, '＋ 新建标签')),
-            h('div', { className: 'mtb-card-tags', style: { marginTop: 2 } },
-              allTagSuggestions.map(name => h('button', {
-                key: name,
-                type: 'button',
-                className: 'mtb-tag mtb-tag-btn',
-                'data-tag-tone': taskTagTone(name),
-                'data-active': formTags.includes(name) ? 'true' : undefined,
-                onClick: () => toggleFormTag(name),
-              }, (formTags.includes(name) ? '✓ ' : '＋ ') + name)))),
-
-          !editing && h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(175px, 1fr))', gap: 10 } },
-            (catalog?.leaders?.length ?? 0) > 0 && h(Field, { label: '指派 Agent Leader（可选）' },
-              h('select', { value: assignedAgent, style: uiInput, onChange: event => handleAssignAgent(event.target.value) },
-                h('option', { value: '' }, '暂不指派'),
-                catalog.leaders.map(item => h('option', { key: item.id, value: item.id }, item.name)))),
-            h(Field, { label: '模型（可选）' },
-              h('select', { value: formModel, style: uiInput, onChange: event => setFormModel(event.target.value) },
-                modelSelectOptions((catalog?.leaders ?? []).find(l => l.id === assignedAgent)?.model || '', formModel).map(opt => h('option', { key: opt.route || '__def', value: opt.route }, opt.label)))),
-            h(Field, { label: '思考模式（可选）' },
-              h('select', { value: formEffort, style: uiInput, onChange: event => setFormEffort(event.target.value) },
-                thinkingModeOptions(formModel || (catalog?.leaders ?? []).find(l => l.id === assignedAgent)?.model || '', (catalog?.leaders ?? []).find(l => l.id === assignedAgent)?.reasoningEffort || '', formEffort)
-                  .map(opt => h('option', { key: opt.id || '__def', value: opt.id }, opt.label)))),
-            h(Field, { label: '权限预设（可选）' },
-              h('select', { value: formPermission, style: uiInput, onChange: event => setFormPermission(event.target.value) },
-                h('option', { value: '' }, '跟随默认权限'),
-                h('option', { value: 'read-only' }, '只读'),
-                h('option', { value: 'workspace-write' }, '工作区可写'),
-                h('option', { value: 'danger-full-access' }, '完全权限'))),
-            topLevelParents.length > 0 && h(Field, { label: '关联父任务（设为子任务）' },
-              h('select', { value: formParentId, style: uiInput, onChange: event => setFormParentId(event.target.value) },
-                h('option', { value: '' }, '独立任务（无父任务）'),
-                topLevelParents.map(item => h('option', { key: item.id, value: item.id }, (item.ticketNo ? '[' + item.ticketNo + '] ' : '') + item.title)))),
-            workspaces.length > 0 && h(Field, { label: orchestrationMode === 'plain' ? '目标工作区（可选）' : '目标项目工作区（必填）' },
-              h('select', { value: workspaceId, style: uiInput, onChange: event => handleSelectWorkspace(event.target.value) },
-                h('option', { value: '' }, orchestrationMode === 'plain' ? '不绑定工作区' : '请选择项目工作区'),
-                workspaces.map(item => h('option', { key: item.id, value: item.id }, item.name))))),
-
-          !editing && h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 10 } },
-            h('label', { style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, cursor: 'pointer' } },
-              h('input', { type: 'checkbox', checked: formReuseSession, onChange: event => setFormReuseSession(event.target.checked) }),
-              '复用上次执行会话'),
-            h('label', { className: 'mtb-btn', style: { cursor: uploading ? 'wait' : 'pointer' } },
-              uploading ? '附件上传中…' : ('📎 选择附件上传（图片 / 文件' + (formAttachments.length > 0 ? ' · 已添加 ' + formAttachments.length + '/8' : '，可选') + '）'),
-              h('input', {
-                type: 'file', multiple: true, style: { display: 'none' }, disabled: uploading || busy || formAttachments.length >= 8,
-                onChange: event => {
-                  const picked = Array.from(event.target.files || []);
-                  event.target.value = '';
-                  void uploadFiles(picked, added => setFormAttachments(prev => {
-                    const existingIds = new Set(prev.map(a => a.attachmentId));
-                    return [...prev, ...added.filter(a => !existingIds.has(a.attachmentId))].slice(0, 8);
-                  }));
-                },
-              }))),
-          !editing && renderAttachments(formAttachments, attId => setFormAttachments(prev => prev.filter(a => a.attachmentId !== attId))),
-
-          h(Field, { label: 'Agent 编排模板' },
-            h('div', { className: 'mtb-tpl-grid' },
-              !editing && h('button', {
-                type: 'button', className: 'mtb-tpl-pill',
-                'data-active': orchestrationMode === 'plain' ? 'true' : undefined,
-                onClick: () => pickOrchestrationMode('plain'),
-              }, '普通卡片'),
-              h('button', {
-                type: 'button', className: 'mtb-tpl-pill',
-                disabled: !canOrchestrate,
-                'data-active': orchestrationMode === 'leader' ? 'true' : undefined,
-                onClick: () => pickOrchestrationMode('leader'),
-              }, '由 Leader 自动选模板'),
-              (catalog?.templates ?? []).map(item => h('button', {
-                key: item.id,
-                type: 'button',
-                className: 'mtb-tpl-pill',
-                disabled: !canOrchestrate,
-                'data-active': orchestrationMode === 'template' && templateId === item.id ? 'true' : undefined,
-                onClick: () => pickOrchestrationMode('template', item.id),
-                title: item.stages.join(' → '),
-              }, item.name + (item.automated ? ' · 自动' : ''))),
-              h('button', {
-                type: 'button', className: 'mtb-tpl-pill',
-                disabled: !canOrchestrate,
-                'data-active': orchestrationMode === 'none' ? 'true' : undefined,
-                onClick: () => pickOrchestrationMode('none'),
-              }, '仅派给 Leader（无模板）')),
-            orchestrationMode === 'template' && template && h('span', { style: uiMuted }, '阶段：' + template.stages.join(' → ')),
-            catalogError && h('div', { style: uiMuted }, catalogError),
-            catalog && !canOrchestrate && h('div', { style: uiMuted }, '提示：需开启工作区记忆并至少有一个智能体作为 Leader，方可启用编排模板。')),
-
-          orchestrationMode !== 'plain' && leaderId && (requiresPr || choice === 'leader') && h(Field, { label: requiresPr ? 'PR 链接' : 'PR 链接（可选）' },
-            h('input', { type: 'url', value: prUrl, onChange: event => { setPrUrl(event.target.value); setPlan(null); }, placeholder: 'GitHub 或 Gitee PR 链接', style: uiInput })),
-
-          orchestrationMode !== 'plain' && leaderId && h('section', { 'aria-label': '运行分工', style: { display: 'grid', gap: 9, borderTop: '1px solid ' + dswTheme.border, paddingTop: 10 } },
-            h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' } },
-              h('strong', { style: { fontSize: 13 } }, '🤖 各参战 Agent 模型与思考模式（' + (group ? group.name : '按模板协作') + '）'),
-              title.trim() && h('button', { type: 'button', className: 'mtb-btn', disabled: busy, onClick: () => { void recommend(); } }, '✨ Leader 智能推荐分工')),
-            plan && recommendedTemplate && h('span', { style: uiMuted }, recommendedTemplate.name + ' · Leader ' + selectedLeader?.name),
-            selectedTemplate !== 'development' && selectedTemplate !== 'pr-review' && h('label', { style: { display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 12 } },
-              h('input', { type: 'checkbox', checked: explicitCode, onChange: event => changeCodeWork(event.target.checked) }),
-              '包含编码与代码审查角色（Coder + Reviewer + Codex）'),
-            h('div', { className: 'mtb-agent-cfg-list' },
-              // Leader row with model & thinking mode switcher
-              (() => {
-                const lCfg = formAgentConfigs.leader ?? {};
-                return h('div', { className: 'mtb-agent-cfg-row' },
-                  h('div', { className: 'mtb-agent-cfg-head' },
-                    h('span', null, '👑 Leader · ' + (selectedLeader?.name || '负责智能体'))),
-                  h('div', { className: 'mtb-agent-cfg-grid' },
-                    h('select', {
-                      'aria-label': '选择负责 Leader',
-                      style: uiInput,
-                      disabled: busy,
-                      value: leaderId,
-                      onChange: e => handleAssignAgent(e.target.value),
-                    }, (catalog?.leaders ?? []).filter(item => item.global || !workspace || item.workspaceId === workspace)
-                      .map(item => h('option', { key: item.id, value: item.id }, 'Leader: ' + item.name))),
-                    h('select', {
-                      'aria-label': 'Leader 使用模型',
-                      style: uiInput,
-                      disabled: busy,
-                      value: lCfg.model || '',
-                      onChange: e => setSlotConfig('leader', { model: e.target.value }),
-                    }, modelSelectOptions(selectedLeader?.model || '', lCfg.model || '').map(opt => h('option', { key: opt.route || '__def', value: opt.route }, opt.label))),
-                    h('select', {
-                      'aria-label': 'Leader 思考模式',
-                      style: uiInput,
-                      disabled: busy,
-                      value: lCfg.reasoningEffort || '',
-                      onChange: e => setSlotConfig('leader', { reasoningEffort: e.target.value }),
-                    }, thinkingModeOptions(lCfg.model || selectedLeader?.model || '', selectedLeader?.reasoningEffort || '', lCfg.reasoningEffort || '').map(opt => h('option', { key: opt.id || '__def', value: opt.id }, opt.label)))));
-              })(),
-              // Role rows (Coder, Reviewer, Critic, Collaborator, etc.)
-              (roleChoices ?? []).map(role => {
-                if (role.id === 'codexCritic') {
-                  const cxCfg = formAgentConfigs.codexCritic ?? {};
-                  return h('div', { key: role.id, className: 'mtb-agent-cfg-row' },
-                    h('div', { className: 'mtb-agent-cfg-head' }, h('span', null, '🔍 ' + role.name + '（Codex 独立审查席位）')),
-                    h('div', { className: 'mtb-agent-cfg-grid' },
-                      h('select', {
-                        'aria-label': 'Codex 审查席位模型',
-                        style: uiInput,
-                        disabled: busy,
-                        value: cxCfg.model || 'auto',
-                        onChange: e => setSlotConfig('codexCritic', { model: e.target.value === 'auto' ? '' : e.target.value }),
-                      },
-                        h('option', { value: 'auto' }, '模型：自动选择 Codex'),
-                        codexModels.map(m => h('option', { key: m.id, value: m.id }, 'Codex: ' + m.model))),
-                      h('select', {
-                        'aria-label': 'Codex 审查席位思考模式',
-                        style: uiInput,
-                        disabled: busy,
-                        value: cxCfg.reasoningEffort || '',
-                        onChange: e => setSlotConfig('codexCritic', { reasoningEffort: e.target.value }),
-                      }, codexThinkingOptions(cxCfg.model || 'auto', cxCfg.reasoningEffort || '').map(opt => h('option', { key: opt.id || '__def', value: opt.id }, opt.label)))));
-                }
-                const assignedId = plan?.members[role.id] ?? '';
-                const memberMeta = candidates.find(m => m.id === assignedId);
-                const rCfg = formAgentConfigs[role.id] ?? {};
-                return h('div', { key: role.id, className: 'mtb-agent-cfg-row' },
-                  h('div', { className: 'mtb-agent-cfg-head' },
-                    h('span', null, '🧩 ' + role.name + (memberMeta ? ' · ' + memberMeta.name : ''))),
-                  h('div', { className: 'mtb-agent-cfg-grid' },
-                    h('select', {
-                      'aria-label': role.name + ' 指派智能体',
-                      style: uiInput,
-                      disabled: busy || !plan,
-                      value: assignedId,
-                      onChange: event => changeMember(role.id, event.target.value),
-                    },
-                      h('option', { value: '' }, role.required ? '待指派（必需）' : '待指派（可选）'),
-                      role.id === 'critic' && h('option', { value: '@dsh' }, '独立 DSH 审查席位'),
-                      candidates.filter(member => role.id !== 'coder' || ['workspace-write', 'danger-full-access'].includes(member.permission))
-                        .map(member => h('option', {
-                          key: member.id, value: member.id,
-                          disabled: Object.entries(plan?.members ?? {}).some(([slot, id]) => slot !== role.id && id === member.id),
-                        }, role.name + ': ' + member.name))),
-                    h('select', {
-                      'aria-label': role.name + ' 使用模型',
-                      style: uiInput,
-                      disabled: busy || !plan || !assignedId,
-                      value: rCfg.model || '',
-                      onChange: e => setSlotConfig(role.id, { model: e.target.value }),
-                    }, modelSelectOptions(memberMeta?.model || '', rCfg.model || '').map(opt => h('option', { key: opt.route || '__def', value: opt.route }, opt.label))),
-                    h('select', {
-                      'aria-label': role.name + ' 思考模式',
-                      style: uiInput,
-                      disabled: busy || !plan || !assignedId,
-                      value: rCfg.reasoningEffort || '',
-                      onChange: e => setSlotConfig(role.id, { reasoningEffort: e.target.value }),
-                    }, thinkingModeOptions(rCfg.model || memberMeta?.model || '', memberMeta?.reasoningEffort || '', rCfg.reasoningEffort || '').map(opt => h('option', { key: opt.id || '__def', value: opt.id }, opt.label)))));
-              }),
-              // Codex coding / review sub-agent rows
-              (codeWork || selectedTemplate === 'pr-review') && (codeWork ? ['coding', 'review'] : ['review']).map(slot => {
-                const cfgKey = slot === 'coding' ? 'codexCoding' : 'codexReview';
-                const slotLabel = slot === 'coding' ? '⚙️ 编码 Codex 子 Agent' : '🔍 审查 Codex 子 Agent';
-                const codexVal = plan ? (plan.codex[slot] ?? 'off') : 'auto';
-                const cCfg = formAgentConfigs[cfgKey] ?? {};
-                return h('div', { key: slot, className: 'mtb-agent-cfg-row' },
-                  h('div', { className: 'mtb-agent-cfg-head' }, h('span', null, slotLabel)),
-                  h('div', { className: 'mtb-agent-cfg-grid' },
-                    h('select', {
-                      'aria-label': slotLabel + ' 模型',
-                      style: uiInput,
-                      disabled: busy || !plan,
-                      value: codexVal,
-                      onChange: event => {
-                        const nextVal = event.target.value === 'off' ? null : event.target.value;
-                        setPlan(current => ({ ...current, codex: { ...current.codex, [slot]: nextVal } }));
-                        setSlotConfig(cfgKey, { model: nextVal && nextVal !== 'auto' ? nextVal : '' });
-                      },
-                    },
-                      h('option', { value: 'auto' }, '自动选择 · 按需调用'),
-                      h('option', { value: 'off' }, '关闭子调用'),
-                      plan?.codex[slot] && plan.codex[slot] !== 'auto' && !codexModels.some(model => model.id === plan.codex[slot]) &&
-                        h('option', { value: plan.codex[slot] }, plan.codex[slot]),
-                      codexModels.filter(model => slot !== 'coding' || model.work).map(model =>
-                        h('option', { key: model.id, value: model.id }, 'Codex: ' + model.model))),
-                    h('select', {
-                      'aria-label': slotLabel + ' 思考模式',
-                      style: uiInput,
-                      disabled: busy || !plan || codexVal === 'off',
-                      value: cCfg.reasoningEffort || '',
-                      onChange: e => setSlotConfig(cfgKey, { reasoningEffort: e.target.value }),
-                    }, codexThinkingOptions(codexVal, cCfg.reasoningEffort || '').map(opt => h('option', { key: opt.id || '__def', value: opt.id }, opt.label)))));
-              }))),
-
-          error && h('div', { role: 'alert', style: { padding: '7px 10px', borderRadius: 8, fontSize: 12, color: dswTheme.danger, background: 'color-mix(in srgb, #ef4444 10%, transparent)', border: '1px solid color-mix(in srgb, #ef4444 28%, transparent)' } }, error),
-          h('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8 } },
-            h('button', { type: 'button', style: uiButton(false), onClick: cancelForm }, '取消'),
-            orchestrationMode !== 'plain' && leaderId && plan && h('button', { type: 'button', style: uiButton(false), disabled: busy, onClick: () => { void recommend(); } }, '重新推荐'),
-            h('button', { type: 'button', disabled: busy || uploading, style: { ...uiButton(true), opacity: busy || uploading ? .6 : 1 }, onClick: () => { void create(); } },
-              busy ? '处理中…' : orchestrationMode !== 'plain' && leaderId && !plan ? 'Leader 推荐分工' : editing ? '保存分工' : '创建'))),
-
-        showArchive
-          ? h('div', { className: 'mtb-archive-grid' },
-              archivedTasks.length === 0
-                ? h(EmptyState, { title: '没有已归档卡片', hint: '已完成或失败的卡片可在详情中归档。', action: '返回看板', onAction: () => setShowArchive(false) })
-                : archivedTasks.map(task => {
-                    const col = columns.find(c => c.key === task.status) ?? columns[4];
-                    return h('article', { key: task.id, className: 'mtb-card', style: { '--mtb-accent': col.accent }, onClick: () => setSelectedId(task.id) },
-                      h('div', { className: 'mtb-card-title-row' }, h('span', { className: 'mtb-card-title' }, task.title)),
-                      Array.isArray(task.tags) && task.tags.length > 0 && h('div', { className: 'mtb-card-tags' },
-                        task.tags.map(tag => h('span', { key: tag.name, className: 'mtb-tag', 'data-tag-tone': taskTagTone(tag.name) }, tag.name))),
-                      h('div', { className: 'mtb-card-foot' },
-                        h('span', { className: 'mtb-runs' }, '归档于 ' + formatTaskTime(task.archivedAt)),
-                        h('button', { type: 'button', className: 'mtb-icon-pill mtb-icon-pill-confirm', onClick: e => { e.stopPropagation(); void restoreTask(task); } }, '恢复')));
-                  }))
-          : allActive.length === 0 && !formOpen
-            ? h(EmptyState, { title: '还没有卡片', hint: '新建一张卡片，或点上方「✨ AI 解析任务」快速生成。', action: '新建卡片', onAction: () => setFormOpen(true) })
-            : h('div', { className: 'mtb-grid-wrap' },
-                scrollEdge.left && h('button', { type: 'button', className: 'mtb-edge-pan mtb-edge-pan-left', title: '向左查看前面列', onClick: () => panBoard(-340) }, '← 前列'),
-                scrollEdge.right && h('button', { type: 'button', className: 'mtb-edge-pan mtb-edge-pan-right', title: '向右查看已完成 / 已失败列', onClick: () => panBoard(340) }, '已完成 / 失败 →'),
-                h('div', {
-                  ref: gridRef,
-                  className: 'mtb-grid',
-                  'data-panning': panning ? 'true' : undefined,
-                  onMouseDown: handleGridMouseDown,
-                  onWheel: handleGridWheel,
-                  onDragOver: handleGridDragOver,
-                },
-                columns.map(column => {
-                  const items = list.filter(task => (knownStatuses.has(task.status) ? task.status : 'todo') === column.key);
-                  const collapsed = collapsedCols.includes(column.key);
-                  return h('section', {
-                    key: column.key,
-                    id: 'marshal-col-' + column.key,
-                    className: 'mtb-col',
-                    'data-status': column.key,
-                    'data-collapsed': collapsed ? 'true' : undefined,
-                    'data-drop': dropCol === column.key ? 'true' : undefined,
-                    style: { '--mtb-accent': column.accent },
-                    onClick: collapsed ? () => toggleCollapseCol(column.key) : undefined,
-                    title: collapsed ? '点击展开「' + column.label + '」列（拖拽卡片到此也可直接流转）' : undefined,
-                    onDragOver: event => {
-                      if (!dragTaskId) return;
-                      event.preventDefault();
-                      handleGridDragOver(event);
-                      if (dropCol !== column.key) setDropCol(column.key);
-                    },
-                    onDragLeave: event => {
-                      if (dropCol === column.key && !event.currentTarget.contains(event.relatedTarget)) setDropCol('');
-                    },
-                    onDrop: event => {
-                      event.preventDefault();
-                      const droppedId = dragTaskId || event.dataTransfer?.getData('text/plain') || '';
-                      setDropCol('');
-                      setDragTaskId('');
-                      const target = allActive.find(item => item.id === droppedId);
-                      if (target && target.status !== column.key) void move(target, column.key);
-                    },
-                  },
-                    collapsed
-                      ? [
-                          h('span', { key: 'd', className: 'mtb-dot', 'data-pulse': column.pulse && items.length > 0 ? 'true' : undefined }),
-                          h('span', { key: 'c', className: 'mtb-count', style: { padding: '1px 6px' } }, items.length),
-                          h('span', { key: 't', className: 'mtb-col-rail-title' }, column.label),
-                        ]
-                      : [
-                          h('div', { key: 'h', className: 'mtb-col-head' },
-                            h('span', { className: 'mtb-dot', 'data-pulse': column.pulse && items.length > 0 ? 'true' : undefined }),
-                            h('h2', { className: 'mtb-col-title', style: { margin: 0 } }, column.label),
-                            h('span', { className: 'mtb-count' }, items.length),
-                            h('button', {
-                              type: 'button',
-                              className: 'mtb-icon-btn',
-                              style: { width: 20, height: 20, fontSize: 12 },
-                              title: '折叠「' + column.label + '」列以腾出空间',
-                              'aria-label': '折叠' + column.label,
-                              onClick: event => { event.stopPropagation(); toggleCollapseCol(column.key); },
-                            }, '‹')),
-                          h('div', { key: 'b', className: 'mtb-col-body' },
-                            items.length === 0
-                              ? h('div', { className: 'mtb-empty' }, column.empty)
-                              : items.map(task => card(task, column))),
-                        ]);
-                }))),
-        renderDrawer(),
-        renderParseModal());
-    }
-    function TaskRoomsPage({ task, openBoard }) {
-      const bound = task?.taskRoom;
-      const [workspace, setWorkspace] = React.useState(bound?.workspaceId ?? task?.workflow?.workspaceId ?? '');
-      const [workspaces, setWorkspaces] = React.useState([]);
-      const [leaders, setLeaders] = React.useState([]);
-      const [rooms, setRooms] = React.useState([]);
-      const [id, setId] = React.useState(bound?.id ?? '');
-      const [view, setView] = React.useState(null);
-      const [peers, setPeers] = React.useState([]);
-      const [notice, setNotice] = React.useState('');
-      const [error, setError] = React.useState('');
-      const [busy, setBusy] = React.useState(false);
-      const [sendingChat, setSendingChat] = React.useState(false);
-      const [uploadingAtt, setUploadingAtt] = React.useState(false);
-      const [leader, setLeader] = React.useState('');
-      const [remote, setRemote] = React.useState('');
-      const [draft, setDraft] = React.useState('');
-      const cursor = React.useRef(0);
-      const selection = React.useRef('');
-      const streamRef = React.useRef(null);
-      const inputRef = React.useRef(null);
-      const stickBottomRef = React.useRef(true);
-      const prevLastSeqRef = React.useRef(0);
-      const roomPreviewUrlsRef = React.useRef(new Map());
-      React.useEffect(() => () => {
-        for (const blobUrl of roomPreviewUrlsRef.current.values()) {
-          try { URL.revokeObjectURL(blobUrl); } catch {}
-        }
-        roomPreviewUrlsRef.current.clear();
-      }, []);
-      const viewKey = workspace + '/' + id;
-      selection.current = viewKey;
-      const prefix = 'marshal/task-rooms/';
-      const query = values => '?' + new URLSearchParams(values);
-      const url = prefix + 'page' + query({ roomId: id, workspaceId: workspace });
-      const loadList = () => workspace ? fetchJson(prefix + 'list' + query({ workspaceId: workspace }), undefined, true) : Promise.resolve({ rooms: [] });
-
-      React.useEffect(() => {
-        ensureTaskBoardStyles();
-        ensureTaskRoomStyles();
-        let alive = true;
-        void fetchJson(prefix + 'workspaces', undefined, true).then(data => {
-          if (!alive) return;
-          const filteredWs = (data.workspaces || []).filter(ws => !isPseudoAgentWorkspace(ws) || ws.id === (bound?.workspaceId ?? task?.workflow?.workspaceId));
-          setWorkspaces(filteredWs);
-          setWorkspace(current => current || (filteredWs.length === 1 ? filteredWs[0].id : ''));
-        }).catch(e => { if (alive) setError(e.message); });
-        void fetchJson('marshal/tasks/orchestration', undefined, true)
-          .then(data => { if (alive) setLeaders(data.leaders ?? []); }).catch(() => {});
-        return () => { alive = false; };
-      }, []);
-
-      React.useEffect(() => {
-        let alive = true;
-        setRooms([]);
-        setNotice('');
-        void loadList().then(data => {
-          if (!alive) return;
-          setRooms(data.rooms);
-          if (!id && data.rooms?.length > 0 && !task) setId(data.rooms[0].id);
-          setNotice(data.hubError ? 'Hub 群聊暂不可读取。' : '');
-        }).catch(e => { if (alive) setError(e.message); });
-        return () => { alive = false; };
-      }, [workspace]);
-
-      const mergePage = (data, key) => {
-        if (selection.current !== key) return;
-        cursor.current = Math.max(cursor.current, data.records.at(-1)?.seq ?? 0);
-        setView(previous => {
-          const records = new Map((previous?.key === key ? previous.records : []).map(record => [record.seq, record]));
-          for (const record of data.records) records.set(record.seq, record);
-          return { ...data, key, records: [...records.values()].sort((a, b) => a.seq - b.seq) };
-        });
-      };
-
-      const failedRead = (e, key) => {
-        if (selection.current !== key) return;
-        if (['forbidden', 'workspace-forbidden', 'unauthorized', 'task-room-not-found'].includes(e.code)) {
-          cursor.current = 0;
-          setView(null);
-        }
-        setError(e.message);
-      };
-
-      React.useEffect(() => {
-        cursor.current = 0;
-        prevLastSeqRef.current = 0;
-        stickBottomRef.current = true;
-        setView(null);
-        setPeers([]);
-        setDraft('');
-        setLeader('');
-        setRemote('');
-        if (!id || !workspace) return;
-        let alive = true;
-        let inFlight = false;
-        const load = async () => {
-          if (inFlight) return;
-          inFlight = true;
-          try {
-            const data = await fetchJson(url + (cursor.current ? '&after=' + cursor.current : ''), undefined, true);
-            if (alive) mergePage(data, viewKey);
-          } catch (e) { if (alive) failedRead(e, viewKey); }
-          finally { inFlight = false; }
-        };
-        void load();
-        const timer = setInterval(load, 1600);
-        return () => { alive = false; clearInterval(timer); };
-      }, [id, workspace]);
-
-      const visible = view?.key === viewKey ? view : null;
-      const room = visible?.room;
-      const lastSeq = visible?.records?.at(-1)?.seq ?? 0;
-      const liveSig = (visible?.liveBubbles ?? []).map(b => b.id + ':' + (b.updatedAt || 0) + ':' + (b.thinking?.length || 0) + ':' + (b.text?.length || 0) + ':' + (b.steps?.length || 0)).join('|');
-
-      React.useEffect(() => {
-        const el = streamRef.current;
-        if (!el || (!lastSeq && !liveSig)) return;
-        if (stickBottomRef.current || prevLastSeqRef.current === 0) {
-          requestAnimationFrame(() => {
-            if (streamRef.current) streamRef.current.scrollTop = streamRef.current.scrollHeight;
-          });
-        }
-        if (lastSeq) prevLastSeqRef.current = lastSeq;
-      }, [lastSeq, liveSig, sendingChat]);
-
-      React.useEffect(() => {
-        if (!visible?.origin) return;
-        let alive = true;
-        void fetchJson(prefix + 'peers' + query({ roomId: id }), undefined, true)
-          .then(data => { if (alive) setPeers(data.peers ?? []); }).catch(() => {});
-        return () => { alive = false; };
-      }, [id, visible?.origin]);
-
-      const bind = async () => {
-        if (!workspace || !task) return;
-        setBusy(true);
-        setError('');
-        try {
-          const result = await fetchJson(prefix + 'open', { taskId: task.id, workspaceId: workspace }, true);
-          setId(result.room.id);
-          setRooms(current => current.some(item => item.id === result.room.id) ? current : [result.room, ...current]);
-        }
-        catch (e) { setError(e.message); }
-        finally { setBusy(false); }
-      };
-
-      // Lifecycle actions (confirm, revise, close, reopen, retry, reassign)
-      const act = async (action, data = {}) => {
-        if (!room || busy) return;
-        setBusy(true);
-        setError('');
-        setNotice('');
-        const key = viewKey;
-        try {
-          const res = await fetchJson(prefix + 'action', { roomId: room.id, action, ...data }, true);
-          if (action === 'revise' && selection.current === key) {
-            setDraft('');
-            setNotice('已按群内最新讨论启动继续执行。');
-          } else if (action === 'confirm' && selection.current === key) {
-            setDraft('');
-            setNotice(res.patchApplied ? '已将补丁应用到工作区并确认工单完成。' : '已确认验收完成并归档。');
-          }
-          stickBottomRef.current = true;
-          mergePage(await fetchJson(url + '&after=' + cursor.current, undefined, true), key);
-        }
-        catch (e) { failedRead(e, key); }
-        finally { setBusy(false); }
-      };
-
-      // Non-blocking live chat send: works at ANY time (even while workflow is running or room was closed!)
-      const sendChat = async () => {
-        const messageText = draft.trim();
-        if (!room || !messageText || sendingChat) return;
-        setSendingChat(true);
-        setError('');
-        const key = viewKey;
-        try {
-          if (room.closed) {
-            await fetchJson(prefix + 'action', { roomId: room.id, action: 'reopen' }, true);
-          }
-          setDraft('');
-          stickBottomRef.current = true;
-          await fetchJson(prefix + 'action', { roomId: room.id, action: 'send', text: messageText, ...(room.closed ? { autoReopen: true } : {}) }, true);
-          mergePage(await fetchJson(url + '&after=' + cursor.current, undefined, true), key);
-        }
-        catch (e) {
-          if (selection.current === key) setDraft(prev => prev || messageText);
-          failedRead(e, key);
-        }
-        finally { setSendingChat(false); }
-      };
-
-      const insertMention = name => {
-        const token = '@' + name + ' ';
-        setDraft(cur => (cur.includes('@' + name) ? cur : (cur ? cur.replace(/\s*$/, ' ') + token : token)));
-        requestAnimationFrame(() => inputRef.current?.focus());
-      };
-
-      const older = async () => {
-        if (!visible?.records[0] || busy) return;
-        setBusy(true);
-        stickBottomRef.current = false;
-        try { mergePage(await fetchJson(url + '&before=' + visible.records[0].seq, undefined, true), viewKey); }
-        catch (e) { failedRead(e, viewKey); }
-        finally { setBusy(false); }
-      };
-
-      const button = (label, onClick, disabled = false, primary = false) =>
-        h('button', { type: 'button', style: { ...uiButton(primary), opacity: disabled ? .52 : 1 }, onClick, disabled }, label);
-
-      const parsePatchRecordClient = text => {
-        const prefix = '<!--marshal-patch-artifact:';
-        if (typeof text !== 'string' || !text.startsWith(prefix)) return { meta: null, body: String(text || '') };
-        const end = text.indexOf('-->', prefix.length);
-        if (end === -1) return { meta: null, body: text };
-        try {
-          const meta = JSON.parse(text.slice(prefix.length, end).trim());
-          return { meta, body: text.slice(end + 3).replace(/^\n+/, '') };
-        } catch {
-          return { meta: null, body: text };
-        }
-      };
-
-      const downloadPatch = async record => {
-        const parsed = parsePatchRecordClient(record.text);
-        let content = record.text;
-        if (parsed.meta?.stored && room?.id) {
-          try {
-            const qs = 'roomId=' + encodeURIComponent(room.id)
-              + (parsed.meta.digest ? '&digest=' + encodeURIComponent(parsed.meta.digest) : '')
-              + (record.seq ? '&seq=' + encodeURIComponent(String(record.seq)) : '');
-            const res = await fetchJson(prefix + 'patch?' + qs, undefined, true);
-            if (typeof res?.patch === 'string' && res.patch) content = res.patch;
-          } catch (e) {
-            setError(e?.message || '读取完整补丁失败，将下载预览片段。');
-          }
-        }
-        const blobUrl = URL.createObjectURL(new Blob([content], { type: 'text/x-diff' }));
-        const link = document.createElement('a');
-        link.href = blobUrl;
-        link.download = 'development-' + ((parsed.meta?.digest || record.ref)?.slice(0, 12) ?? record.seq) + '.patch';
-        link.click();
-        setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
-      };
-
-      const runLabel = { start: '首次运行', retry: '重试运行', reassign: '改派执行', revise: '按意见修正', conversation: '群聊讨论', 'auto-dispatch': '自动派单', backfill: '历史补记' };
-      const controlsLocked = busy || visible?.busy === true;
-      const chatLocked = sendingChat || visible?.chatBusy === true;
-      const participants = Array.isArray(visible?.participants) ? visible.participants : [];
-      const colorMap = React.useMemo(() => buildRoomColorMap(visible?.records, participants), [visible?.records, participants]);
-      const roomTokenStats = React.useMemo(() => {
-        const byActor = new Map();
-        let totalTokens = 0;
-        let inputTokens = 0;
-        let outputTokens = 0;
-        const addUsage = (actor, u) => {
-          if (!actor || !u || typeof u !== 'object') return;
-          const inT = Number(u.inputTokens || 0);
-          const outT = Number(u.outputTokens || 0);
-          const tot = Number(u.totalTokens || (inT + outT));
-          if (tot <= 0) return;
-          totalTokens += tot;
-          inputTokens += inT;
-          outputTokens += outT;
-          const cur = byActor.get(actor) ?? { totalTokens: 0, inputTokens: 0, outputTokens: 0 };
-          cur.totalTokens += tot;
-          cur.inputTokens += inT;
-          cur.outputTokens += outT;
-          byActor.set(actor, cur);
-        };
-        for (const rec of visible?.records ?? []) {
-          if (rec?.kind !== 'agent') continue;
-          const dec = decodeAgentTraceClient(rec.text);
-          if (dec.trace?.usage) addUsage(rec.actor, dec.trace.usage);
-        }
-        for (const live of visible?.liveBubbles ?? []) {
-          if (live?.usage) addUsage(live.actor, live.usage);
-        }
-        const breakdownTitle = [...byActor.entries()]
-          .map(([actor, st]) => actor + ': ' + st.totalTokens.toLocaleString() + ' (入 ' + st.inputTokens.toLocaleString() + ' / 出 ' + st.outputTokens.toLocaleString() + ')')
-          .join(' ｜ ');
-        return { totalTokens, inputTokens, outputTokens, byActor, breakdownTitle };
-      }, [visible?.records, visible?.liveBubbles]);
-      const roleOfActor = actorName => participants.find(p => p.name === actorName)?.role || '';
-      const isInReview = Boolean(visible?.origin && !room?.closed && (visible?.cardStatus === 'review' || visible?.runState === 'review-blocked'));
-      const isWorkflowRunning = visible?.runState === 'running' || visible?.cardStatus === 'running';
-
-      const renderRecord = record => {
-        const timeStr = new Date(record.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-        // 1) Batch / Closed / Reopened -> compact centered timeline pill
-        if (record.kind === 'batch' || record.kind === 'closed' || record.kind === 'reopened') {
-          const badge = record.kind === 'batch'
-            ? '── 批次 ' + (record.runId?.slice(0, 8) ?? '') + ' · ' + (runLabel[record.phase] ?? record.phase ?? '运行') + (record.text ? ' · ' + record.text : '') + ' ──'
-            : (record.kind === 'closed' ? '✓ ' : '↻ ') + record.text;
-          return h('div', { key: record.seq, className: 'mtr-sys-row' },
-            h('span', { className: 'mtr-sys-pill', title: new Date(record.at).toLocaleString() }, badge));
-        }
-
-        // 2) Initial auto-injected ticket brief -> clean collapsible summary card
-        if (record.kind === 'user' && record.phase === 'brief') {
-          return h('details', { key: record.seq, className: 'mtr-brief-card', open: (visible?.records?.length ?? 0) <= 6 },
-            h('summary', { style: { cursor: 'pointer', fontWeight: 600, fontSize: 12, color: dswTheme.dim } },
-              '📋 工单原始需求说明 · ' + timeStr),
-            h('div', { style: { marginTop: 8 } }, h(RichMarkdown, { text: record.text, phase: record.phase })));
-        }
-
-        // 3) Human operator message -> right-aligned bubble
-        if (record.kind === 'user') {
-          const phaseHint = record.phase === 'steering' ? '运行中插话'
-            : record.phase === 'revision' ? '补充修正意见'
-              : record.phase === 'confirm' ? '验收备注' : '';
-          return h('div', { key: record.seq, className: 'mtr-msg-row', 'data-side': 'right' },
-            h('span', {
-              className: 'mtr-avatar',
-              style: {
-                background: 'color-mix(in srgb, var(--dsw-alias-brand-primary, #4f46e5) 24%, transparent)',
-                color: 'var(--dsw-alias-brand-primary, #6366f1)',
-                border: '1px solid color-mix(in srgb, var(--dsw-alias-brand-primary, #6366f1) 42%, transparent)',
-              },
-            }, '我'),
-            h('div', { className: 'mtr-msg-col' },
-              h('div', { className: 'mtr-msg-meta' },
-                h('strong', { style: { color: dswTheme.text } }, '我'),
-                phaseHint && h('span', { className: 'mtr-role-badge' }, phaseHint),
-                h('span', null, timeStr)),
-              h('div', { className: 'mtr-bubble mtr-bubble-user' },
-                h(RichMarkdown, { text: record.text, phase: record.phase }))));
-        }
-
-        // 4) Development patch card
-        if (record.phase === 'development-patch') {
-          const parsedPatch = parsePatchRecordClient(record.text);
-          const meta = parsedPatch.meta;
-          const fileCount = meta?.fileCount ?? (parsedPatch.body.match(/^diff --git /gm) || []).length;
-          const sizeLabel = meta?.bytes ? ((meta.bytes / 1024).toFixed(1) + ' KiB') : '';
-          const diffStats = (typeof meta?.additions === 'number' || typeof meta?.deletions === 'number')
-            ? ('+' + (meta.additions || 0) + ' / -' + (meta.deletions || 0))
-            : '';
-          return h('div', { key: record.seq, className: 'mtr-patch-card' },
-            h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' } },
-              h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 12.5, fontWeight: 600, flexWrap: 'wrap' } },
-                '📦 隔离工作树代码补丁',
-                fileCount > 0 && h('span', { style: uiMuted }, fileCount + ' 个文件变更'),
-                sizeLabel && h('span', { style: uiMuted }, sizeLabel),
-                diffStats && h('span', { style: uiMuted }, diffStats),
-                (meta?.digest || record.ref) && h('code', { className: 'mtr-inline-code' }, (meta?.digest || record.ref).slice(0, 10))),
-              h('div', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
-                h('span', { style: uiMuted }, timeStr),
-                button('下载 .patch', () => { void downloadPatch(record); }))),
-            h('details', { style: { marginTop: 8 } },
-              h('summary', { style: { cursor: 'pointer', fontSize: 12, color: dswTheme.dim } },
-                meta?.stored ? '展开查看补丁变更摘要与前段预览（完整版已持久化）' : '展开查看 Git Diff 补丁明细'),
-              h(CodeFenceBlock, { language: 'diff', code: parsedPatch.body })));
-        }
-
-        // 5) Assignment configuration card or short Marshal status pill
-        if (record.kind === 'status') {
-          if (record.phase === 'assignment') {
-            return h('div', { key: record.seq, className: 'mtr-brief-card' },
-              h(RichMarkdown, { text: record.text, phase: 'assignment' }));
-          }
-          const tone = record.phase === 'failed' ? 'danger' : record.phase === 'review' ? 'review' : undefined;
-          const prefixActor = record.actor && record.actor !== 'Marshal' ? record.actor + '：' : '';
-          return h('div', { key: record.seq, className: 'mtr-sys-row' },
-            h('span', { className: 'mtr-sys-pill', 'data-tone': tone, title: new Date(record.at).toLocaleString() },
-              prefixActor + record.text));
-        }
-
-        // 6) Agent speech bubble -> left-aligned with distinct per-agent color + embedded thinking/processing trace!
-        const accent = agentBubbleAccent(record.actor, colorMap);
-        const roleTag = roleOfActor(record.actor);
-        const stageLabel = taskPhases[record.phase] || '';
-        const badgeText = [roleTag, stageLabel].filter(Boolean).join(' · ');
-        const decoded = decodeAgentTraceClient(record.text);
-        const hasCleanBody = Boolean(decoded.text && decoded.text.trim());
-        return h('div', { key: record.seq, className: 'mtr-msg-row', 'data-side': 'left', style: { '--mtr-agent-c': accent } },
-          h('span', {
-            className: 'mtr-avatar',
-            style: {
-              background: 'color-mix(in srgb, ' + accent + ' 20%, var(--dsw-alias-bg-layer-2, #1f2430))',
-              color: accent,
-              border: '1px solid color-mix(in srgb, ' + accent + ' 40%, transparent)',
-            },
-          }, agentInitial(record.actor)),
-          h('div', { className: 'mtr-msg-col' },
-            h('div', { className: 'mtr-msg-meta' },
-              h('strong', { style: { color: accent, fontSize: 12.5 } }, record.actor),
-              badgeText && h('span', { className: 'mtr-role-badge' }, badgeText),
-              decoded.trace?.usage && h(AgentUsageBadge, { usage: decoded.trace.usage }),
-              h('span', null, timeStr)),
-            h('div', { className: 'mtr-bubble mtr-bubble-agent' },
-              decoded.trace && h(AgentTracePanel, { trace: decoded.trace, live: false, hasBody: hasCleanBody }),
-              hasCleanBody && h(RichMarkdown, { text: decoded.text, phase: record.phase }))));
-      };
-
-      const renderLiveBubble = live => {
-        const accent = agentBubbleAccent(live.actor, colorMap);
-        const roleTag = roleOfActor(live.actor);
-        const stageLabel = taskPhases[live.phase] || (live.phase === 'handoff' ? '常驻会话执行' : '');
-        const badgeText = [roleTag, stageLabel].filter(Boolean).join(' · ');
-        const elapsedSec = Math.max(1, Math.round(((live.updatedAt || Date.now()) - (live.startedAt || Date.now())) / 1000));
-        const hasLiveBody = Boolean(live.text && live.text.trim());
-        return h('div', { key: 'live-' + live.id, className: 'mtr-msg-row', 'data-side': 'left', style: { '--mtr-agent-c': accent } },
-          h('span', {
-            className: 'mtr-avatar',
-            style: {
-              background: 'color-mix(in srgb, ' + accent + ' 22%, var(--dsw-alias-bg-layer-2, #1f2430))',
-              color: accent,
-              border: '1px solid color-mix(in srgb, ' + accent + ' 52%, transparent)',
-            },
-          }, agentInitial(live.actor)),
-          h('div', { className: 'mtr-msg-col' },
-            h('div', { className: 'mtr-msg-meta' },
-              h('strong', { style: { color: accent, fontSize: 12.5 } }, live.actor),
-              badgeText && h('span', { className: 'mtr-role-badge' }, badgeText),
-              live.usage && h(AgentUsageBadge, { usage: live.usage }),
-              h('span', { className: 'mtr-live-badge' },
-                h('span', { className: 'mtr-live-dot', 'aria-hidden': 'true' }),
-                '思考/处理中 · ' + elapsedSec + 's')),
-            h('div', { className: 'mtr-bubble mtr-bubble-agent mtr-bubble-live' },
-              h(AgentTracePanel, { trace: live, live: true, hasBody: hasLiveBody }),
-              hasLiveBody && h(RichMarkdown, { text: live.text, phase: live.phase }))));
-      };
-
-      const localLeaderChoices = leaders.filter(item => item.global || item.workspaceId === workspace);
-      const primaryParticipants = participants.filter(p => p.primary);
-      const mentionTargets = primaryParticipants.length > 0 ? primaryParticipants : participants.slice(0, 6);
-      const roomTaskId = visible?.taskId || room?.taskId || task?.id || '';
-      const roomAttachments = Array.isArray(visible?.attachments) ? visible.attachments : (Array.isArray(task?.attachments) ? task.attachments : []);
-      const uploadRoomAttachments = async pickedFiles => {
-        const files = Array.from(pickedFiles || []).slice(0, 8);
-        if (!roomTaskId || files.length === 0 || uploadingAtt) return;
-        setUploadingAtt(true);
-        setError('');
-        const key = viewKey;
-        try {
-          const uploaded = await uploadAttachmentFiles(files, roomPreviewUrlsRef.current);
-          if (uploaded.length === 0) return;
-          const existingIds = new Set(roomAttachments.map(a => a.attachmentId));
-          const merged = [
-            ...roomAttachments.map(serializeAttachmentForWire),
-            ...uploaded.filter(a => !existingIds.has(a.attachmentId)),
-          ].slice(0, 8);
-          await fetchJson('marshal/tasks/update', { taskId: roomTaskId, attachments: merged, ...(isWorkflowRunning ? { steerNow: true } : {}) }, true);
-          if (id && workspace) {
-            mergePage(await fetchJson(url + (cursor.current ? '&after=' + cursor.current : ''), undefined, true), key);
-          }
-          if (selection.current === key) {
-            setNotice('已上传 ' + uploaded.length + ' 个工单附件：' + uploaded.map(item => item.name).join('、') + (isWorkflowRunning ? '（已作为实时插话同步给运行中的 Agent）' : ''));
-          }
-        } catch (e) {
-          if (selection.current === key) setError('上传附件失败：' + (e.message || e));
-        } finally {
-          setUploadingAtt(false);
-        }
-      };
-
-      return h('section', { 'aria-label': '工单群', className: 'mtr-shell' },
-        h('aside', { className: 'mtr-side' },
-          h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between' } },
-            h('h2', { style: { fontSize: 15, margin: 0 } }, '工单群'),
-            h('span', { style: uiMuted }, rooms.length + ' 个群')),
-          h(Field, { label: '工作区' }, h('select', { value: workspace, style: uiInput,
-            onChange: event => { setWorkspace(event.target.value); setId(''); setError(''); } },
-            h('option', { value: '' }, '选择工作区'),
-            workspaces.map(item => h('option', { key: item.id, value: item.id }, item.name)))),
-          notice && !room && h('p', { style: uiMuted }, notice),
-          rooms.length === 0 && workspace && h('p', { style: { ...uiMuted, margin: '8px 2px' } }, '该工作区暂无工单群记录。'),
-          rooms.map(item => h('button', {
-            key: item.id,
-            type: 'button',
-            className: 'mtr-room-item',
-            'aria-pressed': id === item.id,
-            'data-active': id === item.id ? 'true' : undefined,
-            onClick: () => { setError(''); setNotice(''); setId(item.id); },
-          },
-            h('span', { style: { fontSize: 12.5, fontWeight: id === item.id ? 600 : 500, overflowWrap: 'anywhere', lineHeight: 1.4 } }, item.title),
-            h('span', { style: { fontSize: 11, color: dswTheme.faint } }, (item.closed ? '已归档' : '活跃中') + ' · ' + (item.lastSeq || 0) + ' 条记录')))),
-
-        h('main', { className: 'mtr-main' },
-          h('header', { className: 'mtr-header' },
-            button('← 回任务看板', () => openBoard(visible?.origin ? room?.taskId : task?.id)),
-            h('strong', { style: { fontSize: 14, flex: 1, minWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
-              room?.title ?? task?.title ?? '工单群聊'),
-            isWorkflowRunning && h('span', { style: { fontSize: 11.5, color: '#3b82f6', fontWeight: 600 } }, '● 编排执行中（可随时发言参与讨论）'),
-            isInReview && h('span', { style: { fontSize: 11.5, color: '#a78bfa', fontWeight: 600 } }, '● 待确认'),
-            roomTokenStats.totalTokens > 0 && h('span', {
-              className: 'mtr-tok-badge',
-              title: '各 Agent 累计消耗 — ' + roomTokenStats.breakdownTitle,
-            }, '🪙 累计 ' + formatTokenCount(roomTokenStats.totalTokens) + ' tok'),
-            room && h('span', { style: uiMuted }, (room.storage === 'hub' ? 'Hub 归档' : room.storage === 'moving' ? '转存中' : '本机归档') + (room.closed ? ' · 已关单' : '')),
-            visible?.runState === 'interrupted' && h('span', { style: { fontSize: 11.5, color: '#f59e0b' } }, '上次运行已中断'),
-            visible?.origin && room && button(room.closed ? '重开工单' : '关单归档', () => { void act(room.closed ? 'reopen' : 'close'); }, controlsLocked),
-            visible?.origin && room && !isWorkflowRunning && button('重跑编排', () => { void act('retry'); }, controlsLocked)),
-
-          error && h('div', { role: 'alert', style: { padding: '8px 18px', fontSize: 12, color: dswTheme.danger, borderBottom: '1px solid ' + dswTheme.border } }, error),
-          notice && room && h('div', { role: 'status', style: { padding: '7px 18px', fontSize: 12, color: '#10b981', borderBottom: '1px solid ' + dswTheme.border } }, notice),
-
-          isInReview && (() => {
-            const reviewMeta = describeReviewState(task, visible?.workflow, '', false);
-            return h('div', { className: 'mtr-review-bar' },
-              h('div', { style: { display: 'grid', gap: 3, flex: '1 1 260px', minWidth: 0 } },
-                h('strong', { style: { fontSize: 12.5, color: '#a78bfa' } }, reviewMeta.badge),
-                h('span', { style: { fontSize: 12, color: dswTheme.dim, overflowWrap: 'anywhere' } }, reviewMeta.summary)),
-              h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' } },
-                visible?.patchAvailable && button('✓ 应用补丁到工作区并完成', () => { void act('confirm', { applyPatch: true, ...(draft.trim() ? { note: draft.trim() } : {}) }); }, busy, true),
-                button(visible?.patchAvailable ? '仅确认完成' : '✓ 确认验收完成', () => { void act('confirm', { applyPatch: false, ...(draft.trim() ? { note: draft.trim() } : {}) }); }, busy, !visible?.patchAvailable),
-                button('↻ 按群内意见继续执行', () => { void act('revise', draft.trim() ? { text: draft.trim() } : {}); }, busy)));
-          })(),
-
-          room && roomAttachments.length > 0 && h('div', { className: 'mtr-att-bar' },
-            h('span', { style: { fontSize: 11.5, fontWeight: 600, color: dswTheme.dim } }, '📎 工单附件 (' + roomAttachments.length + ')：'),
-            h('div', { className: 'mtb-att-list' },
-              roomAttachments.map(att => {
-                const href = attachmentHref(roomTaskId, att, roomPreviewUrlsRef.current);
-                const fallbackImgSrc = resolveClientApiUrl('api/task-board/attachments/image?id=' + encodeURIComponent(att.attachmentId));
-                const imgSrc = roomPreviewUrlsRef.current.get(att.attachmentId) || (roomTaskId ? href : fallbackImgSrc);
-                return h('div', { key: att.attachmentId, className: 'mtb-att-card', title: att.name + ' (' + formatBytes(att.bytes) + ')' },
-                  att.kind === 'image'
-                    ? h('img', { className: 'mtb-att-thumb', src: imgSrc, alt: att.name })
-                    : h('span', { style: { fontSize: 14 }, 'aria-hidden': 'true' }, '📄'),
-                  href
-                    ? h('a', { className: 'mtb-att-link', href, target: '_blank', rel: 'noreferrer', download: att.kind === 'file' ? att.name : undefined }, att.name)
-                    : h('span', { style: { fontWeight: 500 } }, att.name),
-                  h('span', { style: { fontSize: 10.5, color: dswTheme.dim } }, formatBytes(att.bytes)));
-              }))),
-
-          !id && task && h('div', { style: { padding: 18 } }, button('开启此工单群聊', () => { void bind(); }, !workspace || busy, true)),
-          !room && !task && h('div', { style: { ...uiMuted, padding: 24, margin: 'auto', textAlign: 'center' } }, '从左侧选择一个工单群，即可查看智能体协作过程并随时参与讨论。'),
-
-          room && h('section', {
-            ref: streamRef,
-            'aria-label': '群聊记录',
-            className: 'mtr-stream',
-            onScroll: event => {
-              const el = event.currentTarget;
-              stickBottomRef.current = (el.scrollHeight - el.scrollTop - el.clientHeight) < 80;
-            },
-          },
-            visible.records[0]?.seq > 1 && h('div', { className: 'mtr-sys-row' }, button('↑ 加载更早消息', () => { void older(); }, busy)),
-            visible.records.length === 0 && !(visible.liveBubbles?.length > 0) && h('div', { style: { ...uiMuted, margin: 'auto', textAlign: 'center', lineHeight: 1.8 } },
-              '工单群已就绪，还没有消息。', h('br'), '您可以直接在下方输入要求、@指定角色讨论，或点击「按意见继续执行」启动编排。'),
-            visible.records.map(renderRecord),
-            (visible.liveBubbles || []).map(renderLiveBubble),
-            sendingChat && !(visible.liveBubbles?.length > 0) && h('div', { className: 'mtr-msg-row', 'data-side': 'left' },
-              h('span', { className: 'mtr-avatar', style: { background: 'color-mix(in srgb, currentColor 12%, transparent)', fontSize: 12 } }, '…'),
-              h('div', { className: 'mtr-msg-col' },
-                h('div', { className: 'mtr-bubble mtr-bubble-agent', style: { opacity: .75, fontSize: 12 } }, '正在结合工单上下文生成回复…')))),
-
-          visible?.origin && room && h('footer', { className: 'mtr-composer' },
-            h('div', { className: 'mtr-chip-row' },
-              h('span', { style: { fontSize: 11, color: dswTheme.faint } }, '点按 @角色讨论：'),
-              mentionTargets.map(member => {
-                const c = agentBubbleAccent(member.name, colorMap);
-                const actorStat = roomTokenStats.byActor.get(member.name);
-                return h('button', {
-                  key: member.id,
-                  type: 'button',
-                  className: 'mtr-mention-chip',
-                  style: { '--mtr-chip-c': c },
-                  title: actorStat ? formatUsageTitle(actorStat) : undefined,
-                  onClick: () => insertMention(member.name),
-                },
-                  h('span', { style: { color: c, fontWeight: 600 } }, '@' + member.name),
-                  member.role && h('span', { style: { opacity: .72 } }, '· ' + member.role),
-                  actorStat && actorStat.totalTokens > 0 && h('span', { style: { opacity: .82, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 10 } }, '· 🪙' + formatTokenCount(actorStat.totalTokens)));
-              }),
-              mentionTargets.length > 1 && h('button', {
-                type: 'button',
-                className: 'mtr-mention-chip',
-                onClick: () => insertMention('全体'),
-              }, '@全体'),
-              roomTaskId && roomAttachments.length < 8 && h('label', {
-                className: 'mtr-mention-chip',
-                style: { cursor: uploadingAtt ? 'wait' : 'pointer' },
-              },
-                uploadingAtt ? '附件上传中…' : '📎 补充附件',
-                h('input', {
-                  type: 'file', multiple: true, style: { display: 'none' }, disabled: uploadingAtt || busy,
-                  onChange: ev => {
-                    const picked = Array.from(ev.target.files || []);
-                    ev.target.value = '';
-                    void uploadRoomAttachments(picked);
-                  },
-                })),
-              room.closed && h('span', { style: { fontSize: 11, color: '#f59e0b', marginLeft: 'auto' } }, '工单已归档，发送消息将自动重开讨论')),
-
-            h('div', { style: { display: 'flex', alignItems: 'flex-end', gap: 8 } },
-              h('textarea', {
-                ref: inputRef,
-                'aria-label': '工单群消息',
-                value: draft,
-                onChange: event => setDraft(event.target.value),
-                onKeyDown: event => {
-                  if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
-                    event.preventDefault();
-                    void sendChat();
-                  }
-                },
-                rows: 2,
-                placeholder: isWorkflowRunning
-                  ? '编排运行中也可随时发言讨论或补充指示（⌘/Ctrl+Enter 发送讨论；点「按意见继续执行」立即中断并按新意见重跑）…'
-                  : '输入问题或修正意见（不 @ 默认由 Leader 回复；⌘/Ctrl+Enter 发送讨论）…',
-                style: { ...uiInput, flex: 1, resize: 'vertical', lineHeight: 1.55, minHeight: 46 },
-              }),
-              h('div', { style: { display: 'flex', gap: 6, flexShrink: 0 } },
-                button(chatLocked ? '发送中…' : '发送讨论', () => { void sendChat(); }, chatLocked || !draft.trim(), true),
-                button(isWorkflowRunning ? '↻ 中断并按意见重跑' : '↻ 按意见继续执行', () => { void act('revise', draft.trim() ? { text: draft.trim() } : {}); }, busy))),
-
-            (localLeaderChoices.length > 0 || peers.length > 0) && h('details', { style: { fontSize: 11.5 } },
-              h('summary', { style: { cursor: 'pointer', color: dswTheme.faint, userSelect: 'none' } }, '高级操作：改派负责 Leader 或跨设备调度'),
-              h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 6 } },
-                h('select', { 'aria-label': '改派 Leader', value: leader, style: { ...uiInput, width: 'auto', minWidth: 160 }, onChange: event => { setLeader(event.target.value); setRemote(''); } },
-                  h('option', { value: '' }, '选择本机 Leader'),
-                  localLeaderChoices.map(item => h('option', { key: item.id, value: item.id }, item.name + (item.global ? '（全局）' : '')))),
-                peers.length > 0 && h('select', { 'aria-label': '改派到其它设备', value: remote, style: { ...uiInput, width: 'auto', minWidth: 200 },
-                  onChange: event => { setRemote(event.target.value); setLeader(''); } },
-                  h('option', { value: '' }, '选择跨设备 Agent'),
-                  peers.flatMap(peer => peer.models.map(model => h('option',
-                    { key: peer.id + '/' + model.id, value: JSON.stringify({ deviceId: peer.id, modelId: model.id }) },
-                    peer.name + ' · ' + model.agent + ' · ' + model.model)))),
-                button('改派并运行', () => { void act('reassign', remote ? { remote: JSON.parse(remote) } : { leaderId: leader }); },
-                  controlsLocked || (!leader && !remote)))))));
-    }
-
-    function AgentsPage({ onOpenChats, onOpenMemory, openSession, workspaceService, initialSubTab = 'pool' }) {
-      const [subTab, setSubTab] = React.useState(initialSubTab === 'rosters' ? 'rosters' : 'pool');
-      const [library, setLibrary] = React.useState(null);
-      const [extraWorkspaces, setExtraWorkspaces] = React.useState([]);
-      const [sessions, setSessions] = React.useState([]);
-      const [rosters, setRosters] = React.useState({});
-      const [selectedAgentId, setSelectedAgentId] = React.useState('');
-      const [selectedWsId, setSelectedWsId] = React.useState('');
-      const [chatSearch, setChatSearch] = React.useState('');
-      const [dispatchWsId, setDispatchWsId] = React.useState('');
-      const [rosterDraft, setRosterDraft] = React.useState({ leaderId: '', coderId: '', reviewerId: '', members: [] });
-      const [rosterNotice, setRosterNotice] = React.useState('');
-      const [error, setError] = React.useState('');
-      const [formOpen, setFormOpen] = React.useState(false);
-      const [editingId, setEditingId] = React.useState('');
-      const [saving, setSaving] = React.useState(false);
-      const [confirmId, setConfirmId] = React.useState('');
-      const [name, setName] = React.useState('');
-      const [preset, setPreset] = React.useState('');
-      const [permission, setPermission] = React.useState('workspace-write');
-      const [model, setModel] = React.useState('');
-      const [brief, setBrief] = React.useState('');
-      const [workspacePath, setWorkspacePath] = React.useState('');
-      const [creatingWorkspace, setCreatingWorkspace] = React.useState(false);
-      const [quick, setQuick] = React.useState('');
-      const [quickBusy, setQuickBusy] = React.useState(false);
-      const [chatBusy, setChatBusy] = React.useState(false);
-      const [renamingSessionId, setRenamingSessionId] = React.useState('');
-      const [renameSessionDraft, setRenameSessionDraft] = React.useState('');
-      const [summarizingSessionId, setSummarizingSessionId] = React.useState('');
-
-      React.useEffect(() => {
-        if (initialSubTab === 'rosters' || initialSubTab === 'pool') setSubTab(initialSubTab);
-      }, [initialSubTab]);
-
-      const agents = library && Array.isArray(library.agents) ? library.agents : [];
-      const presets = (library && library.presets) || [];
-      const models = (library && library.models) || [];
-      const realWorkspaces = React.useMemo(() => {
-        const map = new Map();
-        for (const ws of [...((library && library.workspaces) || []), ...extraWorkspaces]) {
-          if (!ws || !ws.id || isPseudoAgentWorkspace(ws)) continue;
-          if (!map.has(ws.id)) {
-            map.set(ws.id, {
-              id: ws.id,
-              title: ws.title || ws.name || (ws.path ? String(ws.path).split('/').pop() : ws.id),
-              path: ws.path || '',
+      const saveEdit = steerNow => {
+        if (!editing) return;
+        const { taskId: targetId, revision: submitRevision, draft: submittedDraft, original } = edit;
+        if (!edit.dirty) { action.setNotice('没有需要保存的修改'); return; }
+        const patch = Object.fromEntries(Object.entries(submittedDraft).filter(([key, value]) => value !== original[key]));
+        void action.run(async signal => {
+          const result = await fetchJson('marshal/tasks/update', { taskId: targetId, ...patch, steerNow: Boolean(steerNow) }, true, signal);
+          if (!signal.aborted) {
+            applyBoard(result);
+            if (!result.error && result.ok !== false) setEdit(current => {
+              if (current?.taskId !== targetId) return current;
+              if (current.revision === submitRevision && current.draft === submittedDraft) return null;
+              if (current.original !== original) return current;
+              // Preserve newer edits while diffing the next save against the submitted values.
+              return { ...current, original: submittedDraft,
+                dirty: Object.keys(current.draft).some(key => current.draft[key] !== submittedDraft[key]) };
             });
+            action.setNotice(result.notice || (result.steered ? '已保存并发送插话' : '已保存'));
           }
-        }
-        return [...map.values()];
-      }, [library, extraWorkspaces]);
-
-      const load = async () => {
-        try {
-          const [lib, sessData, wsData, rosterData] = await Promise.all([
-            loadAgentLibrary(),
-            fetchJson('marshal/agents/sessions').catch(() => ({ sessions: [] })),
-            fetchJson('marshal/task-rooms/workspaces', undefined, true).catch(() => ({ workspaces: [] })),
-            fetchJson('marshal/rosters/state').catch(() => ({ rosters: {} })),
-          ]);
-          setLibrary(lib);
-          setSessions(Array.isArray(sessData?.sessions) ? sessData.sessions : []);
-          setExtraWorkspaces(Array.isArray(wsData?.workspaces) ? wsData.workspaces : []);
-          setRosters(rosterData?.rosters || {});
-          setSelectedAgentId(cur => (cur && (lib.agents || []).some(a => a.id === cur)) ? cur : (lib.agents?.[0]?.id || ''));
-          const mergedReal = [...(lib.workspaces || []), ...(wsData?.workspaces || [])].filter(ws => ws && ws.id && !isPseudoAgentWorkspace(ws));
-          if (mergedReal.length > 0) {
-            setSelectedWsId(cur => (cur && mergedReal.some(w => w.id === cur)) ? cur : mergedReal[0].id);
-            setDispatchWsId(cur => cur || mergedReal[0].id);
-          }
-          setError('');
-        }
-        catch (e) { setError(friendlyError(e, '智能体')); }
+        });
       };
-      React.useEffect(() => { void load(); }, []);
+      const beginEdit = () => {
+        const values = { title: task.title, description: task.description ?? '', prompt: task.prompt ?? '' };
+        setEdit({ taskId: task.id, revision: 0, original: values, draft: values, dirty: false });
+      };
+      const changeEdit = (key, value) => setEdit(current => {
+        if (current?.taskId !== task.id || current.draft[key] === value) return current;
+        const draft = { ...current.draft, [key]: value };
+        return { ...current, revision: current.revision + 1, draft,
+          dirty: Object.keys(draft).some(field => draft[field] !== current.original[field]) };
+      });
+      const openForm = row => { setForm({ task: row, workspace: (row && mvHubWorkspace(row)) || scope || (workspaceRows.length === 1 ? workspaceRows[0].id : '') }); action.setNotice(''); };
+      return h('section', { className: 'mv-scope mv-room', 'aria-label': '工单看板' },
+        h('header', { className: 'mv-actions' }, h('h2', { className: 'mv-copy mv-voice-title' }, '工单看板'),
+          openNativeBoard && h(MvButton, { label: '原生看板', onClick: openNativeBoard }),
+          onOpenRosters && h(MvButton, { label: '默认阵容', onClick: onOpenRosters }),
+          h(MvButton, { label: '新建工单', onClick: () => openForm() })),
+        h('div', { className: 'mv-actions' }, mvHubText('搜索工单', query, setQuery, { type: 'search' }),
+          mvHubSelect('筛选工作区', scope, workspaceOptions, setScope, false, '全部工作区')),
+        h('div', { className: 'mv-actions', 'aria-label': '工单统计' }, h('strong', null, '共 ' + visible.length),
+          lanes.map(([id, label, rows]) => h('span', { className: 'mv-model', key: id }, label + ' ' + rows.length))),
+        data.loading && h('p', { role: 'status' }, '正在读取工单…'),
+        data.error && h('div', { role: 'alert' }, data.error, h(MvButton, { label: '刷新', onClick: refresh })),
+        action.notice && !form && h('p', { role: 'status' }, action.notice),
+        h('div', { className: 'mv-room-fill', style: { flexWrap: 'wrap', alignContent: 'start', gap: 'var(--mv-md)' } },
+          h('div', { className: 'mv-copy', style: { display: 'grid', flex: '1 1 var(--mv-float-width)', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, calc(10 * var(--mv-lg))), 1fr))', gap: 'var(--mv-sm)', alignItems: 'start' } },
+            lanes.map(([id, label, rows]) => h('section', { key: id, 'aria-label': label },
+              h('h3', { className: 'mv-lane-head' }, h('span', { className: 'mv-tone-dot', 'data-tone': id }),
+                label, h('span', { className: 'mv-tone-count' }, rows.length)),
+              rows.map(row => h('article', { id: 'marshal-ticket-' + row.id, key: row.id, className: 'mv-agent-card',
+                'data-tone': id, onClick: () => chooseTask(row) },
+                h('button', { type: 'button', className: 'mv-row', 'aria-pressed': task?.id === row.id, onClick: event => { event.stopPropagation(); chooseTask(row); } }, row.title),
+                h('div', { className: 'mv-tag-row' }, h('span', { className: 'mv-muted' }, row.ticketNo || row.id),
+                  [mvHubPriority(row), mvHubPhase(row, label)].filter(Boolean)
+                    .map((text, index) => mvHubToneChip(text, text, 'state-' + index, index === 0)),
+                  mvHubTagNames(row).map((name, index) => mvHubToneChip(name, name, 'tag-' + index))),
+                h(MvButton, { label: '工单群', 'aria-label': '进入工单群 · ' + row.title, onClick: event => { event.stopPropagation(); openTaskRoom(row); } })))))),
+          task && h('aside', { className: 'mv-drawer mv-stack', style: { flex: '1 1 var(--mv-float-width)', height: 'auto', boxSizing: 'border-box', overflowWrap: 'anywhere' }, 'aria-label': '工单详情' },
+            h('div', { className: 'mv-actions' }, h('strong', { className: 'mv-copy' }, task.title), h(MvButton, { label: '关闭', onClick: () => { select(''); setEdit(null); } })),
+            h('div', { className: 'mv-muted' }, task.ticketNo || task.id),
+            !editing && h('div', { style: { whiteSpace: 'pre-wrap' } }, task.description),
+            mvHubIsLive(task) && h('div', { className: 'mv-muted' }, '运行中可随时切换 · 下一轮生效并通知工单群'),
+            detailFields(task),
+            h('div', { className: 'mv-actions' },
+              h(MvButton, { label: '进入工单群', onClick: () => openTaskRoom(task) }),
+              task.sessionId && openSession && h(MvButton, { label: '执行会话', onClick: () => openSession(task.sessionId) }),
+              !editing && h(MvButton, { label: mvHubIsLive(task) ? '实时编辑' : '编辑', onClick: beginEdit }),
+              !task.workflow && !mvHubIsLive(task) && mvHubLane(task) !== 'done' && h(MvButton, {
+                label: permissionBlocked || mvHubLane(task) === 'failed' ? '重试运行' : '运行工单', disabled: action.busy,
+                onClick: () => mutate('marshal/tasks/run', { taskId: task.id }),
+              }),
+              permissionBlocked && mvHubLane(task) !== 'done' && h(MvButton, { label: '单次放行', disabled: action.busy,
+                onClick: () => mutate('marshal/tasks/confirm-permission', { taskId: task.id }),
+              }),
+              !task.workflow && h(MvButton, { label: '启用编排', onClick: () => openForm(task) })),
+            editing && h('div', { className: 'mv-stack' },
+              ...[['title', '标题', 'input'], ['description', '描述', 'textarea'], ['prompt', '执行指令', 'textarea']].map(([key, label, element]) =>
+                h('div', { key }, mvHubText(label, edit.draft[key], value => changeEdit(key, value), {}, element))),
+              h('div', { className: 'mv-actions' }, h(MvButton, { label: '保存', disabled: action.busy, onClick: () => saveEdit(false) }),
+                mvHubIsLive(task) && h(MvButton, { label: '保存并立即插话发送', disabled: action.busy, onClick: () => saveEdit(true) }),
+                h(MvButton, { label: '取消', onClick: () => setEdit(null) })),
+              mvHubIsLive(task) && h('div', { className: 'mv-muted' }, '立即以插话形式将修改后的内容发送给正在运行的 Agent')))),
+        form && h(mvHubTicketForm, { form, workspaceRows, workspaceOptions, models, catalog: data.orchestration,
+          close: () => { setForm(null); action.setNotice(''); }, action, applyBoard, markBlocked }));
+    }
 
+    function mvHubTicketForm({ form, workspaceRows, workspaceOptions, models, catalog, close, action, applyBoard, markBlocked }) {
+      const dialog = React.useRef(null);
+      const heading = React.useId();
+      const [draft, setDraft] = React.useState({ title: '', description: '', workspaceId: form.workspace, template: '', leaderId: '', prUrl: '', members: {}, configs: {}, path: ['', '', ''], run: false });
+      const [context, setContext] = React.useState({ links: {}, attachments: [] });
+      const latestContext = React.useRef(context);
+      const changeContext = next => { latestContext.current = next; setContext(next); };
+      const upload = React.useRef({ pending: false, uploadFailures: [] });
+      const [uploadState, setUploadState] = React.useState(upload.current);
+      const changeUploadState = (pending, failures = [], discardFailures = false) => {
+        const next = { pending, uploadFailures: discardFailures ? [] : [...upload.current.uploadFailures, ...failures.map(mvHubPlainNotice)] };
+        upload.current = next;
+        setUploadState(next);
+      };
       React.useEffect(() => {
-        if (!selectedWsId) return;
-        const r = rosters[selectedWsId] || {};
-        setRosterDraft({
-          leaderId: r.leaderId || '',
-          coderId: r.coderId || '',
-          reviewerId: r.reviewerId || '',
-          members: Array.isArray(r.members) ? r.members : [],
-        });
-        setRosterNotice('');
-      }, [selectedWsId, rosters]);
-
-      const selectedAgent = agents.find(a => a.id === selectedAgentId) || agents[0] || null;
-      const agentFullId = agent => agent.squadId + '/' + agent.id;
-
-      const agentSessions = React.useMemo(() => {
-        if (!selectedAgent) return [];
-        const q = chatSearch.trim().toLowerCase();
-        return sessions.filter(item => {
-          const match = item.memberId === selectedAgent.id || (item.teamId === selectedAgent.squadId && item.agentName === selectedAgent.name);
-          if (!match) return false;
-          if (q && !String(item.title || '').toLowerCase().includes(q) && !String(item.sessionId || '').toLowerCase().includes(q)) return false;
-          return true;
-        });
-      }, [sessions, selectedAgent, chatSearch]);
-
-      const createWorkspace = async () => {
-        const path = workspacePath.trim();
-        if (!path.startsWith('/')) { setError('项目工作区路径必须是绝对路径'); return; }
-        const service = typeof workspaceService === 'function' ? workspaceService() : workspaceService;
-        if (!service || typeof service.create !== 'function') { setError('当前 DSH 版本不支持从插件新建工作区'); return; }
-        setCreatingWorkspace(true);
-        setError('');
-        try {
-          await fetchJson('marshal/workspaces/prepare', { path });
-          const created = await service.create({ path });
-          setWorkspacePath('');
-          await load();
-          if (created && created.workspaceId) setSelectedWsId(created.workspaceId);
+        const node = dialog.current;
+        const previous = document.activeElement;
+        node?.showModal();
+        return () => { if (node?.open) node.close(); previous?.focus(); };
+      }, []);
+      const update = patch => setDraft(previous => ({ ...previous, ...patch }));
+      const change = key => value => update({ [key]: value });
+      const templates = [catalog?.plainTemplate, ...(catalog?.templates ?? [])].filter(Boolean);
+      const template = templates.find(row => row.id === draft.template);
+      const codeWork = template?.id === 'development';
+      const slots = ((codeWork ? template?.codingRoles : template?.roles) ?? []).filter(role => role.id !== 'codexCritic');
+      const leaders = (catalog?.leaders ?? []).filter(row => row.global || row.workspaceId === draft.workspaceId);
+      const members = leaders.map(row => [row.id, row.name]);
+      const isOrchestrated = !!template;
+      const submit = event => {
+        event.preventDefault();
+        if (upload.current.pending || upload.current.uploadFailures.length) return;
+        const { links, attachments } = latestContext.current;
+        const title = draft.title.trim();
+        const description = draft.description.trim();
+        const cascadePath = draft.path.map(value => value.trim());
+        const prUrl = draft.prUrl.trim();
+        if (!form.task && !title) { action.setNotice('请填写标题'); return; }
+        if (cascadePath.some(Boolean) && !cascadePath.every(Boolean)) { action.setNotice('请填写完整的三级分类'); return; }
+        if ((form.task || isOrchestrated) && (!template || !draft.workspaceId || !draft.leaderId || slots.some(role => role.required && !draft.members[role.id]))) {
+          action.setNotice('请选择工作区、编排模板并指派必需角色'); return;
         }
-        catch (e) { setError('新建项目工作区失败：' + (e.message || e)); }
-        finally { setCreatingWorkspace(false); }
-      };
-
-      const resetForm = () => {
-        setEditingId('');
-        setName('');
-        setPreset('');
-        setPermission('workspace-write');
-        setModel('');
-        setBrief('');
-        setFormOpen(false);
-      };
-
-      const openEdit = agent => {
-        setEditingId(agent.id);
-        setName(agent.name || '');
-        setPreset(agent.preset || '');
-        setPermission(agent.permission || 'workspace-write');
-        setModel(agent.model || '');
-        setBrief(agent.brief || '');
-        setFormOpen(true);
-      };
-
-      const saveAgent = async () => {
-        if (!name.trim()) { setError('请填写名称'); return; }
-        if (!library) return;
-        setSaving(true);
-        setError('');
-        try {
-          const current = editingId ? agents.find(agent => agent.id === editingId) : undefined;
-          const member = { name: name.trim() };
-          if (preset) member.preset = preset;
-          if (permission) member.permission = permission;
-          if (model) member.model = model;
-          if (brief.trim()) member.brief = brief.trim();
-          let teamId;
-          if (current !== undefined) {
-            teamId = current.squadId;
-            member.id = current.id;
+        if (template?.id === 'pr-review' && !prUrl) { action.setNotice('请填写 PR 链接'); return; }
+        const orchestration = template && {
+          workspaceId: draft.workspaceId, leaderId: draft.leaderId, choice: template.id === 'none' ? 'none' : 'template',
+          ...(template.id !== 'none' ? { templateId: template.id } : {}), ...(prUrl ? { prUrl } : {}),
+          plan: { templateId: template.id, codeWork, members: Object.fromEntries(Object.entries(draft.members).filter(([, id]) => id)), agentConfigs: draft.configs },
+        };
+        void action.run(async signal => {
+          const before = !form.task && draft.run ? await fetchJson('marshal/tasks/state', undefined, true, signal) : null;
+          const result = form.task ? await fetchJson('marshal/tasks/plan', { taskId: form.task.id, orchestration }, true, signal)
+            : await fetchJson('marshal/tasks/create', { title, description,
+              ...(draft.workspaceId ? { workspaceId: draft.workspaceId } : {}), ...(orchestration ? { orchestration } : {}),
+              ...(cascadePath.every(Boolean) ? { cascadePath } : {}), links,
+              attachments: attachments.map(serializeAttachmentForWire) }, true, signal);
+          if (signal.aborted) return;
+          applyBoard(result);
+          close();
+          if (!before) { action.setNotice(form.task ? '已启用编排' : '工单已创建'); return; }
+          if (result.movedToReview) { action.setNotice('工单已创建，内容待确认，未立即运行'); return; }
+          const known = new Set((before.tasks ?? []).map(row => row.id));
+          const added = (result.tasks ?? []).filter(row => !known.has(row.id));
+          const created = added.length === 1 && added[0];
+          // Older hosts return a snapshot, not a created ID. Never run an ambiguous match.
+          if (!created || created.title !== title || mvHubWorkspace(created) !== draft.workspaceId) {
+            action.setNotice('工单已创建，无法确认运行目标，请从工单群手动启动'); return;
           }
-          else {
-            const team = await createAgentTeam(name.trim());
-            teamId = team.id;
-          }
-          const saved = await fetchJson('dsh-agents/api/member', { teamId, member });
-          const created = ((saved.team && saved.team.members) || []).find(item => item.name === name.trim());
-          resetForm();
-          await load();
-          if (created) setSelectedAgentId(created.id);
-        }
-        catch (e) { setError((editingId ? '保存失败：' : '创建失败：') + (e.message || e)); }
-        finally { setSaving(false); }
-      };
-
-      const quickCreate = async () => {
-        if (!quick.trim()) { setError('先写一句话描述'); return; }
-        if (!library) return;
-        setQuickBusy(true);
-        setError('');
-        try {
-          const defaultModel = (library.models || [])[0];
-          const data = await fetchJson('marshal/agents/draft', {
-            text: quick.trim(),
-            ...(defaultModel && defaultModel.provider && defaultModel.model
-              ? { provider: defaultModel.provider, model: defaultModel.model }
-              : {}),
-          });
-          const draft = (data && data.draft) || {};
-          const agentName = (draft.name || quick.trim().slice(0, 12)).slice(0, 40);
-          const team = await createAgentTeam(agentName);
-          const member = {
-            name: agentName,
-            permission: draft.permission || 'workspace-write',
-          };
-          if (draft.brief) member.brief = draft.brief;
-          const saved = await fetchJson('dsh-agents/api/member', { teamId: team.id, member });
-          const created = ((saved.team && saved.team.members) || []).find(item => item.name === agentName);
-          setQuick('');
-          await load();
-          if (created) setSelectedAgentId(created.id);
-        }
-        catch (e) { setError('一句话创建失败：' + (e.message || e)); }
-        finally { setQuickBusy(false); }
-      };
-
-      const saveSessionRename = async sessionId => {
-        if (!sessionId) return;
-        setError('');
-        try {
-          await fetchJson('marshal/agents/sessions/rename', { sessionId, title: renameSessionDraft.trim() });
-          setRenamingSessionId('');
-          setRenameSessionDraft('');
-          await load();
-        }
-        catch (e) { setError('重命名失败：' + (e.message || e)); }
-      };
-      const summarizeSessionTitle = async sessionId => {
-        if (!sessionId || summarizingSessionId) return;
-        setSummarizingSessionId(sessionId);
-        setError('');
-        try {
-          await fetchJson('marshal/agents/sessions/summarize', { sessionId, clearCustom: true });
-          await load();
-        }
-        catch (e) { setError('总结标题失败：' + (e.message || e)); }
-        finally { setSummarizingSessionId(''); }
-      };
-      const startCasualChat = async (agent) => {
-        if (!agent || chatBusy) return;
-        setChatBusy(true);
-        setError('');
-        try {
-          const data = await fetchJson('dsh-agents/api/run', { teamId: agent.squadId, memberId: agent.id });
-          const sessionId = data && data.run && data.run.sessionId;
-          if (!sessionId) throw new Error('no-session');
-          await load();
-          openSession && openSession(sessionId);
-        }
-        catch (e) { setError('新建闲聊失败：' + (e.message || e)); }
-        finally { setChatBusy(false); }
-      };
-
-      const workIn = async (agent, targetWsId) => {
-        if (!agent || !targetWsId) return;
-        setError('');
-        try {
-          const team = await createTaskTeam(agent.name, targetWsId);
-          const cappedPerm = agent.permission === 'read-only' ? 'read-only' : 'workspace-write';
-          const member = { name: agent.name, permission: cappedPerm };
-          if (agent.preset) member.preset = agent.preset;
-          if (agent.model) member.model = agent.model;
-          if (agent.brief) member.brief = agent.brief;
-          const saved = await fetchJson('dsh-agents/api/member', { teamId: team.id, member });
-          const created = (saved.team && saved.team.members || []).find(item => item.name === agent.name) || (saved.team && saved.team.members || [])[0];
-          if (!created) throw new Error('no-member');
-          const data = await fetchJson('dsh-agents/api/run', { teamId: team.id, memberId: created.id });
-          const sessionId = data && data.run && data.run.sessionId;
-          if (!sessionId) throw new Error('no-session');
-          await load();
-          openSession && openSession(sessionId);
-        }
-        catch (e) { setError('派驻到工作区失败：' + (e.message || e)); }
-      };
-
-      const remove = async (agent) => {
-        if (confirmId !== agent.id) { setConfirmId(agent.id); return; }
-        if (!library) return;
-        try {
-          if (agent.legacy) await fetchJson('dsh-agents/api/member/delete', { teamId: agent.squadId, memberId: agent.id });
-          else await fetchJson('dsh-agents/api/team/delete', { teamId: agent.squadId });
-          setConfirmId('');
-          await load();
-        }
-        catch (e) { setError('删除失败：' + (e.message || e)); }
-      };
-
-      const saveRoster = async () => {
-        if (!selectedWsId) return;
-        setSaving(true);
-        setError('');
-        setRosterNotice('');
-        try {
-          const res = await fetchJson('marshal/rosters/save', {
-            workspaceId: selectedWsId,
-            leaderId: rosterDraft.leaderId || undefined,
-            coderId: rosterDraft.coderId || undefined,
-            reviewerId: rosterDraft.reviewerId || undefined,
-            members: rosterDraft.members,
-          });
-          setRosters(res?.rosters || {});
-          setRosterNotice('已保存该工作区默认班底');
-        }
-        catch (e) { setError('保存班底失败：' + (e.message || e)); }
-        finally { setSaving(false); }
-      };
-
-      const toggleRosterMember = fullId => {
-        setRosterDraft(cur => {
-          const exists = cur.members.includes(fullId);
-          return { ...cur, members: exists ? cur.members.filter(x => x !== fullId) : [...cur.members, fullId] };
+          try {
+            const running = await fetchJson('marshal/tasks/run', { taskId: created.id }, true, signal);
+            if (!signal.aborted) {
+              applyBoard(running);
+              markBlocked?.(created.id, Boolean(running.permissionBlocked));
+              const issue = mvHubRunIssue(running);
+              action.setNotice(issue ? '工单已创建，运行受阻或人工确认：' + issue : '工单已创建并启动');
+            }
+          } catch (error) { if (!signal.aborted) action.setNotice('工单已创建，启动请求未确认：' + error.message); }
         });
       };
+      const roleOptions = role => leaders.filter(row => row.id !== draft.leaderId &&
+        (role !== 'coder' || ['workspace-write', 'danger-full-access'].includes(row.permission)) &&
+        !Object.entries(draft.members).some(([key, id]) => key !== role && row.id === id)).map(row => [row.id, row.name]);
+      const configFields = (id, label) => mvHubModelFields(label + ' ', draft.configs[id] ?? {}, models.options,
+        patch => update({ configs: { ...draft.configs, [id]: { ...draft.configs[id], ...patch } } }), action.busy, models.defaultRoute);
+      return h('dialog', { ref: dialog, className: 'mv-scope mv-dag-dialog', 'aria-labelledby': heading,
+        onCancel: event => { event.preventDefault(); if (!action.busy) close(); } },
+        h('header', { className: 'mv-dag-header' }, h('strong', { id: heading }, form.task ? '启用编排' : '新建工单'),
+          h(MvButton, { icon: 'close', iconOnly: true, label: '关闭', disabled: action.busy, onClick: close })),
+        h('form', { className: 'mv-dag-dialog-body mv-stack', onSubmit: submit },
+          !form.task && mvHubText('工单标题', draft.title, change('title'), { required: true, autoFocus: true }),
+          !form.task && mvHubText('工单描述', draft.description, change('description'), {}, 'textarea'),
+          mvHubSelect('工作区', draft.workspaceId, workspaceOptions, value => update({ workspaceId: value, leaderId: '', members: {} }),
+            !!(form.task && form.workspace) || action.busy, '选择工作区'),
+          !form.task && h('div', { className: 'mv-actions', 'aria-label': '工单分类路径' }, draft.path.map((value, index) =>
+            h('div', { key: index }, mvHubText(['一级分类', '二级分类', '三级分类'][index], value,
+              next => update({ path: draft.path.map((part, i) => i === index ? next : part) }), { maxLength: 128 })))),
+          mvHubSelect('编排模板', draft.template, templates.map(row => [row.id, row.name]), value => update({ template: value, members: {}, configs: {} }),
+            action.busy, form.task ? '选择模板' : '不启用编排'),
+          isOrchestrated && h('div', { className: 'mv-stack' },
+            template.id === 'pr-review' && mvHubText('PR 链接', draft.prUrl, change('prUrl'), { type: 'url', required: true }),
+            mvHubSelect('Leader 人选', draft.leaderId, members, value => update({ leaderId: value, members: {} }), action.busy, '选择 Leader'),
+            configFields('leader', 'Leader'),
+            slots.map(role => h('div', { key: role.id, className: 'mv-stack' },
+              mvHubSelect(role.name + ' 人选', draft.members[role.id] || '', roleOptions(role.id), value => update({ members: { ...draft.members, [role.id]: value } }),
+                action.busy, role.required ? '请选择' : '暂不指派'), configFields(role.id, role.name)))),
+          !form.task && h(mvCascadePicker.MarshalCascadeContextPicker, { workspaces: workspaceRows, value: context,
+            onChange: changeContext, onUploadState: changeUploadState, disableUpload: action.busy }),
+          uploadState.uploadFailures.length > 0 && h('div', { role: 'alert' }, '附件上传失败：' + uploadState.uploadFailures.join('；'),
+            h(MvButton, { label: '仅保留已上传附件', disabled: uploadState.pending, onClick: () => {
+              if (!upload.current.pending) changeUploadState(false, [], true);
+            } })),
+          !form.task && h('label', { className: 'mv-line' }, h('input', { type: 'checkbox', checked: draft.run, onChange: e => change('run')(e.target.checked) }), '创建后立即运行'),
+          action.notice && h('p', { role: 'alert' }, action.notice),
+          h('button', { className: 'mv-btn', type: 'submit', disabled: action.busy || uploadState.pending || uploadState.uploadFailures.length > 0 }, form.task ? '保存编排' : '创建工单')));
+    }
+    const MV_HUB_MONITOR_TOPICS = [...MV_HUB_TASK_TOPICS, 'memory.changed'];
+    const MV_HUB_OVERVIEW = signal => fetchJson('marshal/desktop/overview', undefined, true, signal);
+    const MV_HUB_DEVICES = signal => fetchJson('marshal/devices/status', undefined, true, signal);
+    const MV_HUB_CHROME_READS = { incidents: MV_HUB_INCIDENTS, devices: MV_HUB_DEVICES,
+      health: signal => fetchJson('marshal/health', undefined, true, signal) };
+    const MV_HUB_MONITOR_READS = { overview: MV_HUB_OVERVIEW, incidents: MV_HUB_INCIDENTS, board: MV_HUB_KANBAN_READS.board };
+    const MV_HUB_INCIDENT_KINDS = [['review-blocked', '待人工裁决'], ['failed', '执行失败或受阻'], ['tool-anomaly', '工具异常'], ['memory-proposal', '待审记忆提案']];
+    const MV_HUB_INCIDENT_TONES = { 'review-blocked': 'review', failed: 'critical', 'tool-anomaly': 'warning', 'memory-proposal': 'memory' };
+    const MV_HUB_METRIC_TONES = [['工单总数', 'info'], ['智能体总数', 'running'], ['严重告警数', 'critical'],
+      ['待审记忆提案数', 'memory'], ['主机', 'neutral']];
 
-      const agentSessionCount = agent => sessions.filter(s => s.memberId === agent.id || (s.teamId === agent.squadId && s.agentName === agent.name)).length;
-      const agentNameByFullId = fullId => {
-        if (!fullId) return '';
-        const found = agents.find(a => agentFullId(a) === fullId || a.id === fullId);
-        return found ? found.name : fullId;
+    function MarshalHubMonitorView({ openTaskRoom, onOpenMemory, onOpenDirect }) {
+      const [data, refresh] = mvUseHubSnapshot(MV_HUB_MONITOR_TOPICS, MV_HUB_MONITOR_READS);
+      const action = mvUseHubAction(refresh);
+      const overview = data.overview;
+      const summary = data.incidents ?? overview?.incidents;
+      const metrics = [['工单总数', overview?.tasks?.totalCount], ['智能体总数', overview?.agents?.totalCount],
+        ['严重告警数', summary?.criticalCount], ['待审记忆提案数', overview?.memory?.pendingProposalCount ?? summary?.countsByKind?.['memory-proposal']], ['主机', overview?.host?.deviceId]];
+      const tasks = new Map((data.board?.tasks ?? []).map(task => [task.id, task]));
+      const agents = new Map((overview?.agents?.items ?? []).map(agent => [agent.agentKey, agent]));
+      const resolveTask = (path, taskId, notice) => action.run(async signal => {
+        const result = await fetchJson(path, { taskId }, true, signal);
+        if (!signal.aborted) action.setNotice(mvHubRunIssue(result) || result.notice || result.message || notice);
+      });
+      const handle = row => {
+        if (row.kind === 'memory-proposal') return onOpenMemory('', 'global');
+        if (row.targetType === 'agent') return agents.has(row.targetId) && onOpenDirect?.(agents.get(row.targetId));
+        return openTaskRoom(tasks.get(row.targetId) ?? { id: row.targetId, title: row.title });
       };
+      return h('section', { className: 'mv-scope mv-room', 'aria-label': '问题监控' },
+        h('header', { className: 'mv-actions' }, h('h2', { className: 'mv-copy mv-voice-title' }, '问题监控'), h(MvButton, { label: '刷新', onClick: refresh })),
+        h('dl', { className: 'mv-actions', 'aria-label': '系统总览' }, metrics.map(([label, value], index) =>
+          h('div', { className: 'mv-mini mv-metric', key: label, 'data-tone': MV_HUB_METRIC_TONES[index]?.[1] },
+            h('dt', { className: 'mv-muted' }, label), h('dd', null, value ?? '—')))),
+        data.loading && h('p', { role: 'status' }, '正在读取告警…'),
+        data.error && h('p', { role: 'alert' }, data.error),
+        action.notice && h('p', { role: 'status' }, action.notice),
+        MV_HUB_INCIDENT_KINDS.map(([kind, label]) => {
+          const rows = (summary?.items ?? []).filter(row => row.kind === kind);
+          const tone = MV_HUB_INCIDENT_TONES[kind];
+          return h('section', { key: kind, 'aria-label': label },
+            h('h3', { className: 'mv-lane-head' }, h('span', { className: 'mv-tone-dot', 'data-tone': tone }),
+              label, h('span', { className: 'mv-tone-count' }, summary?.countsByKind?.[kind] ?? rows.length)),
+            rows.map(row => {
+              const task = tasks.get(row.targetId);
+              const actionable = mvHubIsTaskIncident(row);
+              const plain = task && !task.workflow;
+              const blocked = mvHubHasPermissionBlock(task, row, data.board?.sessionDefaultPermission);
+              return h('article', { key: row.id, className: 'mv-agent-card',
+                'data-tone': row.severity === 'critical' ? 'critical' : tone },
+                h('div', { className: 'mv-actions' }, h('strong', { className: 'mv-copy' }, row.title),
+                  h('span', { className: 'mv-tone-chip', 'data-solid': 'true',
+                    style: { '--mv-tone': row.severity === 'critical' ? '#cf5f7a' : '#d08a2a' } },
+                    row.severity === 'critical' ? '严重' : '待处理')),
+                h('div', { className: 'mv-muted', style: { overflowWrap: 'anywhere' } }, row.subtitle),
+                h('div', { className: 'mv-actions' }, h(MvButton, { label: kind === 'memory-proposal' ? '查看记忆提案' : row.targetType === 'agent' ? '打开智能体' : '进入工单群处理',
+                  disabled: row.targetType === 'agent' && (!onOpenDirect || !agents.has(row.targetId)), onClick: () => handle(row) }),
+                  actionable && plain && !mvHubIsLive(task) && mvHubLane(task) !== 'done' && h(MvButton, { label: '重试运行', disabled: action.busy,
+                    onClick: () => resolveTask('marshal/tasks/run', row.targetId, '已提交运行请求') }),
+                  actionable && blocked && (!task || mvHubLane(task) !== 'done') && h(MvButton, { label: '单次放行', disabled: action.busy,
+                    onClick: () => resolveTask('marshal/tasks/confirm-permission', row.targetId, '已提交放行请求') })));
+            }));
+        }));
+    }
+    const MV_HUB_AGENT_TOPICS = [...MV_HUB_TASK_TOPICS, 'agents.changed', 'groups.changed'];
+    async function mvHubAgentDirectory(signal) {
+      const overview = await MV_HUB_OVERVIEW(signal);
+      const rows = overview.agents?.items ?? [];
+      const counts = {};
+      // Bound concurrency: each directory member may have a separate task list.
+      for (let index = 0; index < rows.length && !signal.aborted; index += 6) {
+        await Promise.all(rows.slice(index, index + 6).map(async agent => {
+          try {
+            const result = await fetchJson('marshal/agent-tasks?' + new URLSearchParams({ agentKey: agent.agentKey }), undefined, true, signal);
+            const tasks = result.tasks ?? [];
+            counts[agent.agentKey] = { total: tasks.length, done: tasks.filter(task => task.status === 'done').length };
+          } catch { /* Keep the directory usable if one member's task list is unavailable. */ }
+        }));
+      }
+      return { overview, counts };
+    }
+    const MV_HUB_AGENT_READS = {
+      directory: mvHubAgentDirectory, devices: MV_HUB_DEVICES,
+      rosters: signal => fetchJson('marshal/rosters/state', undefined, true, signal),
+      workspaces: MV_HUB_KANBAN_READS.workspaces,
+      library: signal => loadAgentLibrary(signal, true),
+    };
 
-      return h('section', { style: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', background: dswTheme.bg, color: dswTheme.text } },
-        h('header', { style: { padding: '12px 20px', borderBottom: '1px solid ' + dswTheme.border, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexShrink: 0, flexWrap: 'wrap' } },
-          h('div', { style: { display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' } },
-            h('div', { role: 'tablist', 'aria-label': '智能体视图', style: { display: 'flex', gap: 4, padding: 3, borderRadius: 10, border: '1px solid ' + dswTheme.border, background: dswTheme.layer } },
-              h('button', { type: 'button', role: 'tab', 'aria-selected': subTab === 'pool', style: tabStyle(subTab === 'pool'), onClick: () => setSubTab('pool') }, '全部智能体（人才库 · ' + agents.length + '）'),
-              h('button', { type: 'button', role: 'tab', 'aria-selected': subTab === 'rosters', style: tabStyle(subTab === 'rosters'), onClick: () => setSubTab('rosters') }, '工作区班底（' + realWorkspaces.length + '）'))),
-          h('div', { style: { display: 'flex', gap: 8 } },
-            onOpenChats && h('button', { type: 'button', style: uiButton(false), onClick: onOpenChats }, '去会话'),
-            subTab === 'pool' && h('button', { type: 'button', style: uiButton(true), onClick: () => { if (formOpen) resetForm(); else { setEditingId(''); setFormOpen(true); } } }, formOpen ? '收起' : '＋ 新建智能体'))),
-        error && h('div', { style: { padding: '8px 20px', fontSize: 12, color: dswTheme.danger } }, error),
-
-        subTab === 'pool' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' } },
-          h('div', { style: { margin: '12px 20px 0', padding: '10px 14px', border: '1px solid ' + dswTheme.border, borderRadius: 12, background: dswTheme.layer, display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 } },
-            h('input', { value: quick, onChange: event => setQuick(event.target.value), onKeyDown: event => { if (event.key === 'Enter') void quickCreate(); }, placeholder: '一句话新建全局智能体（不创建假工作区），如：严谨的代码审查员，先查边界条件', style: { ...uiInput, flex: 1 } }),
-            h('button', { type: 'button', disabled: quickBusy, style: { ...uiButton(true), opacity: quickBusy ? .6 : 1, whiteSpace: 'nowrap' }, onClick: () => { void quickCreate(); } }, quickBusy ? '生成中…' : '一句话创建')),
-          formOpen && h('div', { style: { margin: '12px 20px 0', padding: 16, border: '1px solid ' + dswTheme.border, borderRadius: 12, background: dswTheme.layer, display: 'grid', gap: 10, flexShrink: 0 } },
-            h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between' } },
-              h('div', { style: { fontSize: 13, fontWeight: 600 } }, editingId ? '编辑智能体' : '新建全局智能体'),
-              h('div', { style: uiMuted }, '全局独立实体 · 不创建假工作区，可自由派驻任意项目')),
-            h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: 10 } },
-              h(Field, { label: '名称' }, h('input', { value: name, onChange: event => setName(event.target.value), placeholder: '例如：工部尚书', style: uiInput })),
-              h(Field, { label: '预设' }, h('select', { value: preset, onChange: event => setPreset(event.target.value), style: uiInput },
-                h('option', { value: '' }, '默认预设'),
-                presets.map(item => {
-                  const id = typeof item === 'string' ? item : item.id;
-                  const label = typeof item === 'string' ? item : (item.name || item.id);
-                  return h('option', { key: id, value: id }, label);
-                }))),
-              h(Field, { label: '单聊默认权限' }, h('select', { value: permission, onChange: event => setPermission(event.target.value), style: uiInput },
-                h('option', { value: 'read-only' }, '只读'),
-                h('option', { value: 'workspace-write' }, '可写工作区（推荐）'),
-                h('option', { value: 'danger-full-access' }, '完全访问（派驻工作区自动收紧为工作区可写）'))),
-              h(Field, { label: '模型' }, h('select', { value: model, onChange: event => setModel(event.target.value), style: uiInput },
-                h('option', { value: '' }, '默认模型'),
-                models.map(item => {
-                  const value = item.provider && item.model ? item.provider + '/' + item.model : (item.id || '');
-                  return h('option', { key: value, value }, item.label || value);
-                })))),
-            h(Field, { label: '简报（人设与职责说明）' }, h('textarea', { value: brief, onChange: event => setBrief(event.target.value), rows: 3, placeholder: '它擅长什么、用什么语气、注意什么…', style: { ...uiInput, resize: 'vertical', lineHeight: 1.6 } })),
-            h('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8 } },
-              h('button', { type: 'button', style: uiButton(false), onClick: () => resetForm() }, '取消'),
-              h('button', { type: 'button', disabled: saving, style: { ...uiButton(true), opacity: saving ? .6 : 1 }, onClick: () => { void saveAgent(); } }, saving ? '保存中…' : editingId ? '保存修改' : '创建智能体'))),
-          agents.length === 0
-            ? h('div', { style: { flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 } },
-                h(EmptyState, { title: '还没有智能体', hint: '智能体独立于项目工作区存在，可单聊、拉群，也可派驻到任意真实项目工作区。', action: '新建智能体', onAction: () => setFormOpen(true) }))
-            : h('div', { style: { flex: 1, minHeight: 0, display: 'flex', marginTop: 12, borderTop: '1px solid ' + dswTheme.border, overflow: 'hidden' } },
-                h('aside', { style: { width: 250, flexShrink: 0, borderRight: '1px solid ' + dswTheme.border, overflow: 'auto', padding: 12, display: 'flex', flexDirection: 'column', gap: 6 } },
-                  agents.map(agent => {
-                    const active = selectedAgent && selectedAgent.id === agent.id;
-                    const count = agentSessionCount(agent);
-                    return h('button', {
-                      key: agent.id, type: 'button',
-                      style: { ...tabStyle(active), textAlign: 'left', padding: '9px 10px', display: 'flex', alignItems: 'center', gap: 10 },
-                      onClick: () => { setSelectedAgentId(agent.id); setConfirmId(''); },
-                    },
-                      h(Avatar, { name: agent.name, size: 28 }),
-                      h('div', { style: { flex: 1, minWidth: 0 } },
-                        h('div', { style: { fontSize: 13, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, agent.name),
-                        h('div', { style: { fontSize: 10, opacity: .65, marginTop: 2 } }, (agent.model || '默认模型') + ' · ' + count + ' 次闲聊')));
-                  })),
-                selectedAgent && h('div', { style: { flex: 1, minWidth: 0, overflow: 'auto', padding: 20, display: 'grid', gap: 16, alignContent: 'start' } },
-                  h('div', { style: { padding: 16, borderRadius: 12, border: '1px solid ' + dswTheme.border, background: dswTheme.layer, display: 'grid', gap: 10 } },
-                    h('div', { style: { display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' } },
-                      h(Avatar, { name: selectedAgent.name, size: 40 }),
-                      h('div', { style: { flex: 1, minWidth: 0 } },
-                        h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
-                          h('span', { style: { fontSize: 16, fontWeight: 600 } }, selectedAgent.name),
-                          h('span', { style: { fontSize: 10, color: dswTheme.faint, border: '1px solid ' + dswTheme.border2, borderRadius: 999, padding: '2px 8px' } }, '全局智能体'),
-                          h('span', { style: { fontSize: 10, color: dswTheme.faint, border: '1px solid ' + dswTheme.border2, borderRadius: 999, padding: '2px 8px' } }, selectedAgent.permission || 'workspace-write')),
-                        h('div', { style: { fontSize: 11, color: dswTheme.faint, marginTop: 4 } }, [selectedAgent.preset || '默认预设', selectedAgent.model || '默认模型'].join(' · '))),
-                      h('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap' } },
-                        onOpenMemory && h('button', { type: 'button', style: uiButton(false), onClick: () => onOpenMemory(selectedAgent.id) }, '私有记忆'),
-                        h('button', { type: 'button', style: uiButton(false), onClick: () => openEdit(selectedAgent) }, '编辑'),
-                        h('button', { type: 'button', style: { ...uiButton(false), color: confirmId === selectedAgent.id ? dswTheme.danger : undefined }, onClick: () => { void remove(selectedAgent); } }, confirmId === selectedAgent.id ? '确认删除' : '删除'))),
-                    selectedAgent.brief && h('div', { style: { fontSize: 12, color: dswTheme.dim, lineHeight: 1.65, whiteSpace: 'pre-wrap' } }, selectedAgent.brief)),
-
-                  h('div', { style: { padding: 14, borderRadius: 12, border: '1px solid ' + dswTheme.border, background: dswTheme.layer, display: 'grid', gap: 8 } },
-                    h('div', { style: { fontSize: 13, fontWeight: 600 } }, '派驻到真实项目工作区'),
-                    h('div', { style: { fontSize: 11, color: dswTheme.faint } }, '被派驻到工作区时自动限制为「工作区可写」权限；如需在看板按模板协同，可在「工作区班底」配置默认班底。'),
-                    realWorkspaces.length === 0
-                      ? h('div', { style: { fontSize: 12, color: dswTheme.dim } }, '还没有真实项目工作区，请切到上方「工作区班底」新建一个项目工作区。')
-                      : h('div', { style: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' } },
-                          h('select', { value: dispatchWsId, onChange: event => setDispatchWsId(event.target.value), style: { ...uiInput, flex: 1, minWidth: 200 } },
-                            realWorkspaces.map(ws => h('option', { key: ws.id, value: ws.id }, ws.title + (ws.path ? ' · ' + ws.path : '')))),
-                          h('button', { type: 'button', style: uiButton(false), onClick: () => { void workIn(selectedAgent, dispatchWsId); } }, '派驻并开启会话'))),
-
-                  h('div', { style: { padding: 14, borderRadius: 12, border: '1px solid ' + dswTheme.border, background: dswTheme.layer, display: 'grid', gap: 10 } },
-                    h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
-                      h('div', { style: { fontSize: 13, fontWeight: 600 } }, '闲聊会话历史（' + agentSessions.length + '）'),
-                      h('input', { value: chatSearch, onChange: event => setChatSearch(event.target.value), placeholder: '搜索历史闲聊…', style: { ...uiInput, width: 190, marginLeft: 'auto' } }),
-                      h('button', { type: 'button', disabled: chatBusy, style: uiButton(true), onClick: () => { void startCasualChat(selectedAgent); } }, chatBusy ? '创建中…' : '＋ 新建闲聊')),
-                    agentSessions.length === 0
-                      ? h('div', { style: { fontSize: 12, color: dswTheme.faint, padding: '8px 0' } }, '还没有与「' + selectedAgent.name + '」的闲聊历史，点“＋ 新建闲聊”立即开始。')
-                      : h('div', { style: { display: 'grid', gap: 6, maxHeight: 320, overflow: 'auto' } },
-                          agentSessions.map(item => h('div', {
-                            key: item.sessionId,
-                            style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '8px 10px', borderRadius: 8, border: '1px solid ' + dswTheme.border, cursor: renamingSessionId === item.sessionId ? 'default' : 'pointer' },
-                            onClick: () => { if (renamingSessionId !== item.sessionId) openSession && openSession(item.sessionId); },
-                          },
-                            h('div', { style: { flex: 1, minWidth: 0 } },
-                              renamingSessionId === item.sessionId
-                                ? h('div', { style: { display: 'flex', gap: 6, alignItems: 'center' }, onClick: e => e.stopPropagation() },
-                                    h('input', {
-                                      value: renameSessionDraft,
-                                      autoFocus: true,
-                                      placeholder: '输入新标题（留空恢复自动标题）',
-                                      style: { ...uiInput, flex: 1, padding: '4px 8px', fontSize: 12 },
-                                      onChange: e => setRenameSessionDraft(e.target.value),
-                                      onKeyDown: e => { if (e.key === 'Enter') void saveSessionRename(item.sessionId); if (e.key === 'Escape') setRenamingSessionId(''); },
-                                    }),
-                                    h('button', { type: 'button', style: { ...uiButton(true), padding: '4px 8px', fontSize: 11 }, onClick: () => { void saveSessionRename(item.sessionId); } }, '保存'),
-                                    h('button', { type: 'button', style: { ...uiButton(false), padding: '4px 7px', fontSize: 11 }, onClick: () => setRenamingSessionId('') }, '取消'))
-                                : h('div', { style: { display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 } },
-                                    h('span', { style: { fontSize: 12, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: item.title }, item.title || '历史闲聊'),
-                                    item.titleSource === 'custom' && h('span', { style: { fontSize: 10, color: dswTheme.faint, border: '1px solid ' + dswTheme.border, borderRadius: 999, padding: '0 5px', flexShrink: 0 } }, '已重命名'),
-                                    item.titleSource === 'auto' && h('span', { style: { fontSize: 10, color: dswTheme.faint, border: '1px solid ' + dswTheme.border, borderRadius: 999, padding: '0 5px', flexShrink: 0 } }, '自动总结'),
-                                    item.legacyReadOnly && h('span', { title: '原独立工作区已迁出清壳，仅作历史查阅；继续对话请点「新建闲聊」', style: { fontSize: 10, color: '#f59e0b', border: '1px solid color-mix(in srgb, #f59e0b 45%, transparent)', background: 'color-mix(in srgb, #f59e0b 10%, transparent)', borderRadius: 999, padding: '0 5px', flexShrink: 0 } }, '历史只读')),
-                              h('div', { style: { fontSize: 10, color: dswTheme.faint, marginTop: 2 } }, [formatSessionTime(item.updatedAt || item.createdAt), item.sessionId.slice(0, 8)].filter(Boolean).join(' · '))),
-                            renamingSessionId !== item.sessionId && h('div', { style: { display: 'flex', gap: 5, flexShrink: 0 }, onClick: e => e.stopPropagation() },
-                              h('button', { type: 'button', title: '重命名', style: { ...uiButton(false), padding: '4px 7px', fontSize: 11 }, onClick: () => { setRenamingSessionId(item.sessionId); setRenameSessionDraft(item.title || ''); } }, '重命名'),
-                              h('button', { type: 'button', title: '总结标题', disabled: summarizingSessionId === item.sessionId, style: { ...uiButton(false), padding: '4px 7px', fontSize: 11 }, onClick: () => { void summarizeSessionTitle(item.sessionId); } }, summarizingSessionId === item.sessionId ? '…' : '✨'),
-                              h('button', { type: 'button', style: { ...uiButton(false), padding: '4px 9px', fontSize: 11 }, onClick: () => openSession && openSession(item.sessionId) }, '打开'))))))))),
-
-        subTab === 'rosters' && h('div', { style: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' } },
-          h('div', { style: { margin: '12px 20px 0', padding: '10px 14px', border: '1px solid ' + dswTheme.border, borderRadius: 12, background: dswTheme.layer, display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 } },
-            h('input', { value: workspacePath, onChange: event => setWorkspacePath(event.target.value), placeholder: '新建真实项目工作区（输入绝对路径，例如 /Users/you/projects/app）', style: { ...uiInput, flex: 1 } }),
-            h('button', { type: 'button', disabled: creatingWorkspace, style: { ...uiButton(false), whiteSpace: 'nowrap' }, onClick: () => { void createWorkspace(); } }, creatingWorkspace ? '创建中…' : '＋ 新建项目工作区')),
-          realWorkspaces.length === 0
-            ? h('div', { style: { flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 } },
-                h(EmptyState, { title: '还没有项目工作区', hint: '在上方输入项目目录绝对路径，即可创建真实项目工作区并配置默认班底。' }))
-            : h('div', { style: { flex: 1, minHeight: 0, display: 'flex', marginTop: 12, borderTop: '1px solid ' + dswTheme.border, overflow: 'hidden' } },
-                h('aside', { style: { width: 250, flexShrink: 0, borderRight: '1px solid ' + dswTheme.border, overflow: 'auto', padding: 12, display: 'flex', flexDirection: 'column', gap: 6 } },
-                  realWorkspaces.map(ws => {
-                    const active = selectedWsId === ws.id;
-                    const r = rosters[ws.id];
-                    return h('button', {
-                      key: ws.id, type: 'button',
-                      style: { ...tabStyle(active), textAlign: 'left', padding: '9px 10px', display: 'grid', gap: 3 },
-                      onClick: () => setSelectedWsId(ws.id),
-                    },
-                      h('div', { style: { fontSize: 13, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, ws.title),
-                      h('div', { style: { fontSize: 10, opacity: .65, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, r?.leaderId ? 'Leader: ' + agentNameByFullId(r.leaderId) : (ws.path || '尚未配置默认班底')));
-                  })),
-                selectedWsId && h('div', { style: { flex: 1, minWidth: 0, overflow: 'auto', padding: 20, display: 'grid', gap: 14, alignContent: 'start' } },
-                  h('div', null,
-                    h('div', { style: { fontSize: 15, fontWeight: 600 } }, (realWorkspaces.find(w => w.id === selectedWsId)?.title || selectedWsId) + ' · 工作区班底'),
-                    h('div', { style: { fontSize: 11, color: dswTheme.faint, marginTop: 4 } }, realWorkspaces.find(w => w.id === selectedWsId)?.path || '')),
-                  h('div', { style: { padding: 12, borderRadius: 10, border: '1px solid ' + dswTheme.border, background: dswTheme.layer, fontSize: 12, color: dswTheme.dim, lineHeight: 1.6 } },
-                    '在任务看板选择该工作区时，将自动套用这里的默认 Leader。派驻到工作区执行时默认授予「工作区可写」权限并开启 Leader 自动审核；如遇权限受阻，工单会自动转入「待确认」列等待确认。'),
-                  h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 12 } },
-                    h(Field, { label: '默认 Leader（统筹与自动审核）' },
-                      h('select', { value: rosterDraft.leaderId, style: uiInput, onChange: event => setRosterDraft(cur => ({ ...cur, leaderId: event.target.value })) },
-                        h('option', { value: '' }, '不预设'),
-                        agents.map(a => h('option', { key: a.id, value: agentFullId(a) }, a.name)))),
-                    h(Field, { label: '默认 Coder（主力开发）' },
-                      h('select', { value: rosterDraft.coderId, style: uiInput, onChange: event => setRosterDraft(cur => ({ ...cur, coderId: event.target.value })) },
-                        h('option', { value: '' }, '不预设'),
-                        agents.map(a => h('option', { key: a.id, value: agentFullId(a) }, a.name)))),
-                    h(Field, { label: '默认 Reviewer（独立审查）' },
-                      h('select', { value: rosterDraft.reviewerId, style: uiInput, onChange: event => setRosterDraft(cur => ({ ...cur, reviewerId: event.target.value })) },
-                        h('option', { value: '' }, '不预设'),
-                        agents.map(a => h('option', { key: a.id, value: agentFullId(a) }, a.name))))),
-                  h(Field, { label: '常驻协作班底成员（点击切换）' },
-                    h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 8 } },
-                      agents.map(a => {
-                        const fid = agentFullId(a);
-                        const on = rosterDraft.members.includes(fid);
-                        return h('button', {
-                          key: a.id, type: 'button',
-                          style: { ...tabStyle(on), border: '1px solid ' + (on ? dswTheme.brand : dswTheme.border), padding: '6px 12px' },
-                          onClick: () => toggleRosterMember(fid),
-                        }, (on ? '✓ ' : '＋ ') + a.name);
-                      }))),
-                  h('div', { style: { display: 'flex', alignItems: 'center', gap: 12 } },
-                    h('button', { type: 'button', disabled: saving, style: uiButton(true), onClick: () => { void saveRoster(); } }, saving ? '保存中…' : '保存工作区班底'),
-                    rosterNotice && h('span', { style: { fontSize: 12, color: '#10b981' } }, rosterNotice))))));
+    function MarshalHubAgentsView({ onOpenChats, onOpenMemory, openSession, mvOpenDirect, onStartVoice, initialSubTab = 'pool' }) {
+      const [data, refresh, patchSnapshot] = mvUseHubSnapshot(MV_HUB_AGENT_TOPICS, MV_HUB_AGENT_READS);
+      const action = mvUseHubAction(refresh);
+      const [sub, setSub] = React.useState(initialSubTab);
+      const [drawer, setDrawer] = React.useState(false);
+      const [workspaceId, setWorkspace] = React.useState('');
+      const [draft, setDraft] = React.useState(null);
+      const overview = data.directory?.overview;
+      const workspaces = (data.workspaces?.workspaces ?? data.library?.workspaces ?? []).filter(row => !isPseudoAgentWorkspace(row));
+      const workspace = workspaceId || (workspaces.length === 1 ? workspaces[0].id : '');
+      const saved = data.rosters?.rosters?.[workspace];
+      const roster = draft ?? saved ?? {};
+      const library = new Map((data.library?.agents ?? []).map(member => [member.squadId + '/' + member.id, member]));
+      const teams = new Map();
+      const agents = (overview?.agents?.items ?? []).map(agent => {
+        const id = agent.teamId + '/' + agent.agentId;
+        const local = library.get(id);
+        const teamName = local?.teamName || agent.teamName || agent.teamId;
+        const member = { ...local, ...agent, global: agent.global || local?.global,
+          teamGlobal: isAgentTeam({ name: teamName }), rosterId: id, teamName };
+        if (!teams.has(agent.teamId)) teams.set(agent.teamId, { name: member.teamName, members: [] });
+        teams.get(agent.teamId).members.push(member);
+        return member;
+      });
+      const candidates = agents.filter(agent => agent.global || agent.teamGlobal || !agent.workspaceId || agent.workspaceId === workspace);
+      const options = candidates.map(agent => [agent.rosterId, agent.name || agent.agentId]);
+      const devices = new Map();
+      const deviceStatus = data.devices;
+      const host = overview?.host;
+      for (const row of deviceStatus?.devices ?? []) {
+        const id = row?.deviceId || row?.id;
+        if (id) devices.set(id, { ...devices.get(id), ...row, deviceId: id });
+      }
+      const localId = host?.deviceId || deviceStatus?.deviceId;
+      if (localId) devices.set(localId, { ...devices.get(localId), ...host, deviceId: localId, online: true });
+      const save = () => action.run(async signal => {
+        const result = await fetchJson('marshal/rosters/save', { workspaceId: workspace,
+          leaderId: roster.leaderId || undefined, coderId: roster.coderId || undefined, reviewerId: roster.reviewerId || undefined,
+          members: roster.members ?? [] }, true, signal);
+        if (!signal.aborted) {
+          if (result.rosters) patchSnapshot({ rosters: result });
+          setDraft(null); action.setNotice('已保存工作区默认阵容');
+        }
+      });
+      return h('section', { className: 'mv-scope mv-room', 'aria-label': '智能体与集群' },
+        h('header', { className: 'mv-actions' }, h('h2', { className: 'mv-copy mv-voice-title' }, '智能体与集群'),
+          onOpenChats && h(MvButton, { label: '历史单聊', onClick: onOpenChats }),
+          h(MvButton, { label: '设备节点', 'aria-expanded': drawer, onClick: () => setDrawer(true) })),
+        h('div', { className: 'mv-actions', role: 'group', 'aria-label': '智能体与集群分类' },
+          h(MvButton, { label: '智能体团队', 'aria-pressed': sub !== 'rosters', onClick: () => setSub('pool') }),
+          h(MvButton, { label: '工作区默认阵容', 'aria-pressed': sub === 'rosters', onClick: () => setSub('rosters') })),
+        data.loading && h('p', { role: 'status' }, '正在读取智能体与集群…'),
+        data.error && h('div', { role: 'alert' }, data.error, h(MvButton, { label: '刷新', onClick: refresh })),
+        sub === 'rosters' ? h('section', { className: 'mv-stack', 'aria-label': '工作区默认阵容' },
+          mvHubSelect('阵容工作区', workspace, workspaces.map(row => [row.id, row.name || row.title || row.id]), value => {
+            setWorkspace(value); setDraft(null); action.setNotice('');
+          }, action.busy, '选择工作区'),
+          workspace && h('div', { className: 'mv-stack' },
+            Object.entries(MV_HUB_ROLE_LABELS).map(([id, label]) => h('div', { key: id }, mvHubSelect('默认 ' + label, roster[id + 'Id'] || '', options,
+              value => setDraft({ ...roster, [id + 'Id']: value }), action.busy, '不指定'))),
+            h('fieldset', { className: 'mv-mini mv-actions' }, h('legend', null, '默认成员'),
+              options.map(([id, name]) => h('label', { key: id, className: 'mv-line' }, h('input', { type: 'checkbox',
+                checked: (roster.members ?? []).includes(id), disabled: action.busy,
+                onChange: e => setDraft({ ...roster, members: e.target.checked ? [...(roster.members ?? []), id] : (roster.members ?? []).filter(value => value !== id) }) }), name))),
+            h('div', null, h(MvButton, { label: '保存工作区默认阵容', disabled: action.busy || !data.rosters, onClick: save })),
+            action.notice && h('p', { role: 'status' }, action.notice)))
+          : h('div', { className: 'mv-stack' },
+            !data.loading && teams.size === 0 && h('p', { className: 'mv-muted' }, '暂无可用智能体'),
+            [...teams].map(([id, team]) => h('section', { key: id, 'aria-label': team.name },
+              h('h3', { className: 'mv-voice-title' }, team.name), team.members.map(agent => {
+                const counts = data.directory?.counts?.[agent.agentKey];
+                return h('article', { className: 'mv-agent-card', key: agent.agentKey },
+                  h('strong', null, agent.name || agent.agentId),
+                  h('div', { className: 'mv-actions' }, h('span', { className: 'mv-model' }, agent.model || '默认模型'),
+                    h('span', { className: 'mv-model' }, TASK_PERMISSION_LABELS[agent.permission] || agent.permission || '默认权限'),
+                    h('span', { className: 'mv-muted' }, '1:1 任务：' + (counts ? counts.done + ' / ' + counts.total + ' 已完成' : '未获取'))),
+                  h('div', { className: 'mv-actions' },
+                    h(MvButton, { label: '1:1 原生对话', disabled: !mvOpenDirect, onClick: () => mvOpenDirect(agent) }),
+                    h(MvButton, { icon: 'phone', label: '语音通话', iconOnly: true, disabled: !onStartVoice, onClick: () => onStartVoice(agent) }),
+                    h(MvButton, { label: '私有记忆', onClick: () => onOpenMemory(agent.agentId) }),
+                    agent.sessionId && openSession && h(MvButton, { label: '最近执行会话', onClick: () => openSession(agent.sessionId) })));
+              })))),
+        h(DeviceStatusDrawer, { open: drawer, onClose: () => setDrawer(false), status: { ...deviceStatus, deviceId: localId, devices: [...devices.values()] },
+          onRefresh: refresh, onOpenRemote: () => { window.dispatchEvent(new CustomEvent('marshal:tab', { detail: 'remote' })); } }));
     }
     function SafeMarshalPanel(props) {
       return h(MarshalErrorBoundary, { resetKey: 'marshal-panel-root' }, h(MarshalPanel, props));
     }
 
     return {
-      inject: ['slots', 'sessions', 'uiSession', 'uiConversation'],
+      inject: ['slots'],
+      // Reusable UI exposed as components on the dsh-marshal/client module.
+      components: Object.freeze({ ...mvCascadePicker, ...mvDagSidebar }),
       apply(ctx) {
         const disposers = [];
-        const track = handle => {
-          if (typeof handle === 'function') disposers.push(handle);
-          else if (handle && typeof handle.dispose === 'function') disposers.push(() => handle.dispose());
+        const track = (handle, list = disposers) => {
+          if (typeof handle === 'function') list.push(handle);
+          else if (handle && typeof handle.dispose === 'function') list.push(() => handle.dispose());
         };
-        try {
-          const existingStyle = document.getElementById('marshal-consolidated-rows');
-          const style = existingStyle || document.createElement('style');
-          style.id = 'marshal-consolidated-rows';
-          style.textContent = 'button:has([data-dsh-panel-entry="agents"]),[role="button"]:has([data-dsh-panel-entry="agents"]),li:has([data-dsh-panel-entry="agents"]),button:has([data-dsh-panel-entry="task-board"]),[role="button"]:has([data-dsh-panel-entry="task-board"]),li:has([data-dsh-panel-entry="task-board"]){display:none!important}[data-dsh-taskboard-view]{padding-top:44px!important;box-sizing:border-box!important;position:relative}';
-          if (!existingStyle) document.head.appendChild(style);
-        } catch (error) { /* a DOM-less host keeps its own panel list */ }
-        installSidebarWorkspaceSwitch();
+        const clean = list => {
+          for (const dispose of list.splice(0).reverse()) {
+            try { void Promise.resolve(dispose()).catch(() => {}); } catch {}
+          }
+        };
+        const service = mvService;
+        const register = (options, Comp, list, slots = service(ctx, 'slots')) => {
+          try {
+            if (typeof slots?.register !== 'function') return;
+            track(typeof slots.inject === 'function'
+              ? slots.inject(options.name, () => slots.register(options, Comp)) : slots.register(options, Comp), list);
+          }
+          catch {} // Optional slots are not declared in all host versions.
+        };
+        const routes = createMvStore(null);
+        const routeLifetime = new AbortController();
         const openSessionRef = { current: undefined };
         const layoutRef = { current: undefined };
+        let desktopContext, nativeContext, tabTimer, mvCancelNative;
         const workspacesRef = { current: undefined };
         try {
           track(ctx.inject(['uiWorkspace'], inner => {
-            const workspace = inner.get('uiWorkspace');
-            openSessionRef.current = sessionId => { if (workspace && typeof workspace.openSession === 'function') workspace.openSession(sessionId); };
+            const workspace = service(inner, 'uiWorkspace');
+            if (typeof workspace?.openSession === 'function') openSessionRef.current = sessionId => workspace.openSession(sessionId);
             return () => { openSessionRef.current = undefined; };
           }));
         } catch {}
@@ -6289,79 +7927,281 @@ window.__ModuleLoader__.load({
         } catch {}
         const openPanel = id => {
           try {
-            const layout = layoutRef.current ?? (ctx.get && ctx.get('layout'));
-            if (layout && typeof layout.selectPanel === 'function') { layout.selectPanel(id); return true; }
+            const layout = service(desktopContext, 'layout') ?? layoutRef.current ?? service(ctx, 'layout');
+            if (layout && typeof layout.selectPanel === 'function') return layout.selectPanel(id) !== false;
           } catch (error) { /* layout unavailable */ }
           return false;
         };
         const goTab = tab => {
+          mvCancelNative?.();
           pendingTab = tab;
+          routes.set(null);
           openPanel(PANEL);
           try { window.dispatchEvent(new CustomEvent('marshal:tab', { detail: tab })); } catch (error) { /* host without window */ }
-          setTimeout(() => {
+          clearTimeout(tabTimer);
+          tabTimer = setTimeout(() => {
             try { window.dispatchEvent(new CustomEvent('marshal:tab', { detail: tab })); } catch (error) { /* host without window */ }
           }, 60);
         };
-        try {
-          track(ctx.slots.inject('conversation.session.header.actions', () => ctx.slots.register({
+        const openRoom = (kind, item) => {
+          mvCancelNative?.();
+          clearTimeout(tabTimer);
+          pendingTab = null;
+          const route = { kind, item };
+          routes.set(route);
+          openPanel(PANEL);
+          try { window.dispatchEvent(new CustomEvent('marshal:room', { detail: route })); } catch {}
+        };
+        const mvDirectLookups = new Map();
+        const onOpenAgentDirect = (agent, canOpen) => {
+          const key = agent.agentKey;
+          if (mvDirectLookups.has(key)) return mvDirectLookups.get(key);
+          const { signal } = routeLifetime;
+          const resolve = async () => {
+            // Overview may point at a ticket run; only the direct endpoint proves ownership.
+            const result = await mvRead(mvAgentQuery('agent-direct-sessions', key), signal);
+            if (result?.mainSession !== null || !agent.teamId || !agent.agentId || !canOpen()) return result?.mainSession &&
+              { sessionId: mvSessionId(result.mainSession), agentKey: result.agentKey };
+            const created = await mvRunDirectSession(agent, signal);
+            return { sessionId: created?.run?.sessionId, agentKey: result.agentKey };
+          };
+          const request = resolve().finally(() => mvDirectLookups.delete(key));
+          mvDirectLookups.set(key, request);
+          return request;
+        };
+        let mvNativeDirect, mvStartVoice;
+        const MarshalDesktopPanel = props => {
+          // The default panel still works on hosts without the vNext sidebar slots.
+          const route = typeof React.useSyncExternalStore === 'function' ? useMvSnapshot(routes) : null;
+          if (!route) return h(SafeMarshalPanel, props);
+          const { kind, item } = route;
+          const key = kind + ':' + (item.agentKey ?? item.id);
+          return h('div', { className: 'mv-scope mv-stack mv-routed' },
+            h('header', { className: 'mv-line' }, h(MvButton, { icon: 'back', label: '返回调度官', onClick: () => routes.set(null) })),
+            h(MarshalErrorBoundary, { resetKey: kind === 'taskRooms' ? 'taskRooms-' + (item.taskId || 'archive') : key },
+              h('div', { className: 'mv-room-fill' },
+                kind === 'taskRooms' ? h(MarshalTicketRoomView, { key, task: { id: item.taskId, title: item.title, taskRoom: item }, openBoard: () => goTab('tasks') })
+                  : kind === 'direct' ? h(AgentDirectChatsView, { key, initialAgentId: item.agentId, openSession: props.openSession,
+                    mvOpenDirect: props.mvOpenDirect, onOpenAgents: () => goTab('agents') })
+                    : h(MarshalSidebarGroupRoom, { key, route, ownerSignal: routeLifetime.signal }))));
+        };
+        register({
             name: 'conversation.session.header.actions',
             id: 'marshal-quick-nav',
             order: 40,
-          }, () => h(MarshalNav, { active: 'chats', onTab: goTab, compact: true }))));
-        } catch (error) { /* older host without the conversation header action slot */ }
-        const ensureTaskboardHeader = () => {
-          if (typeof document === 'undefined') return;
-          const root = document.querySelector('[data-dsh-taskboard-view]');
-          if (root === null || root.querySelector('#marshal-taskboard-head') !== null) return;
-          const bar = document.createElement('div');
-          bar.id = 'marshal-taskboard-head';
-          bar.style.cssText = 'position:absolute;top:0;left:0;right:0;height:44px;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:0 16px;box-sizing:border-box;background:var(--dsw-alias-bg-base);border-bottom:1px solid var(--dsw-alias-border-l1);z-index:6;color:inherit;font-family:inherit';
-          const title = document.createElement('div');
-          title.textContent = '任务看板';
-          title.style.cssText = 'font-size:14px;font-weight:600;white-space:nowrap';
-          const nav = document.createElement('div');
-          nav.style.cssText = 'display:flex;align-items:center;gap:2px;padding:3px;border-radius:999px;border:1px solid color-mix(in srgb, currentColor 14%, transparent);background:color-mix(in srgb, currentColor 5%, transparent);overflow-x:auto;max-width:100%';
-          const add = (label, key) => {
-            const button = document.createElement('button');
-            button.type = 'button';
-            button.textContent = label;
-            button.setAttribute('aria-pressed', key === 'tasks' ? 'true' : 'false');
-            button.style.cssText = 'border:0;border-radius:999px;cursor:pointer;white-space:nowrap;font:11px/1 inherit;padding:6px 9px;color:inherit;background:' + (key === 'tasks' ? 'color-mix(in srgb, currentColor 16%, transparent)' : 'transparent') + ';font-weight:' + (key === 'tasks' ? '600' : '400');
-            button.onclick = () => {
-              goTab(key);
-            };
-            nav.appendChild(button);
-          };
-          add('任务看板', 'tasks');
-          add('会话', 'chats');
-          add('智能体', 'agents');
-          add('记忆', 'memory');
-          bar.append(title, nav);
-          root.prepend(bar);
-        };
-        ensureTaskboardHeader();
-        const headerTimer = setInterval(ensureTaskboardHeader, 1000);
-        disposers.push(() => clearInterval(headerTimer));
-        track(ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({ name: 'sidebar.panellist', id: PANEL, order: 25, label: () => '调度官' }, MarshalIcon)));
-        track(ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: PANEL,
+          }, () => h(MarshalNav, { active: 'agents', onTab: goTab, compact: true }));
+        register({ name: 'main', key: PANEL,
           children: { 'marshal.native.body': { kind: 'single', scope: 'session' } },
           inject: () => ({
-            marshalContext: ctx,
+            marshalContext: desktopContext ?? nativeContext ?? ctx,
             openSession: sessionId => openSessionRef.current?.(sessionId),
+            mvOpenDirect: agent => mvNativeDirect?.(agent),
+            closeMemorySidebar: () => {
+              const sidebarRight = service(desktopContext, 'sidebarRight') ?? service(ctx, 'sidebarRight');
+              if (typeof sidebarRight?.closeTab === 'function') return sidebarRight.closeTab();
+              return sidebarRight?.close?.();
+            },
+            mvStartVoice: agent => mvStartVoice?.(agent),
             openPanel,
             workspaceService: () => {
               if (workspacesRef.current) return workspacesRef.current;
               try { return ctx.get?.('workspaces'); } catch { return undefined; }
             },
           }),
-        }, SafeMarshalPanel)));
-        track(ctx.slots.inject('marshal.native.body', () => ctx.slots.register({ name: 'marshal.native.body' }, NativeBody)));
+        }, MarshalDesktopPanel);
+        register({ name: 'marshal.native.body' }, NativeBody);
+        try {
+          track(ctx.inject(['sessions', 'uiSession', 'uiConversation'], inner => {
+            nativeContext = inner;
+            return () => { nativeContext = undefined; };
+          }));
+        } catch {}
+        try {
+          track(ctx.inject(['layout', 'slots', 'sessions', 'uiSession', 'uiConversation'], inner => {
+            desktopContext = inner;
+            return () => { desktopContext = undefined; };
+          }));
+        } catch {}
         if (typeof ctx.effect === 'function') {
-          ctx.effect(() => () => {
-            for (const dispose of disposers.splice(0).reverse()) {
-              try { dispose(); } catch {}
-            }
+          ctx.effect(() => {
+            const lifetime = [];
+            track(ensureMarshalVnextStyles(), lifetime);
+            try {
+              // The legacy board and room renderers still lazily install these sheets.
+              const lazySheets = ['marshal-taskboard-styles', 'marshal-taskroom-styles']
+                .filter(id => !document.getElementById(id));
+              track(() => lazySheets.forEach(id => document.getElementById(id)?.remove()), lifetime);
+              if (!document.getElementById('marshal-consolidated-rows')) {
+                const style = document.createElement('style');
+                style.id = 'marshal-consolidated-rows';
+                style.textContent = 'button:has([data-dsh-panel-entry=\"agents\"]),[role=\"button\"]:has([data-dsh-panel-entry=\"agents\"]),li:has([data-dsh-panel-entry=\"agents\"]),button:has([data-dsh-panel-entry=\"task-board\"]),[role=\"button\"]:has([data-dsh-panel-entry=\"task-board\"]),li:has([data-dsh-panel-entry=\"task-board\"]){display:none!important}';
+                document.head.appendChild(style);
+                track(() => style.remove(), lifetime);
+              }
+            } catch {}
+            const sidebar = createMarshalSidebarData();
+            const target = mountSidebarSectionsPortal();
+            track(sidebar, lifetime);
+            track(target, lifetime);
+            const voiceLayer = createMvStore(null);
+            mvStartVoice = agent => voiceLayer.getSnapshot()?.start(agent);
+            const idleVoice = createMvStore(mvVoiceIdle);
+            const runtime = mvCreateAgentTasks();
+            track(runtime, lifetime);
+            const rightbar = () => service(ctx, 'sidebarRight') ?? service(desktopContext, 'sidebarRight');
+            const navCtx = { layout: { selectPanel: openPanel }, get sidebarRight() { return rightbar(); } };
+            let mvNavigationAttempt;
+            let mvDockMounted = false;
+            let mvTasksTabRegistered = false;
+            mvCancelNative = () => {
+              mvNavigationAttempt?.abort();
+              runtime.drawer.set(null);
+            };
+            const canOpenNative = () => Boolean(openSessionRef.current || typeof service(ctx, 'uiWorkspace')?.openSession === 'function');
+            const openNative = (agent, sessionId) => {
+              if (routeLifetime.signal.aborted) return;
+              mvCancelNative();
+              mvNavigationAttempt = new AbortController();
+              const { signal } = mvNavigationAttempt;
+              return mvOpenAgentDirectSession({
+                agent, sessionId, ctx: navCtx, onOpenAgentDirect: row => onOpenAgentDirect(row, canOpenNative),
+                openSessionRef, uiWorkspace: service(ctx, 'uiWorkspace'),
+                mvFocusedAgentStore: runtime.focus, signal,
+                openDrawer: (owner, id, signal) => {
+                  routes.set(null);
+                  const service = rightbar();
+                  if (!service && !mvTasksTabRegistered) return; // Slim host with no rightbar.
+                  if (mvDockMounted && typeof service?.active === 'function' && typeof service?.screen !== 'function') {
+                    runtime.drawer.set(id);
+                    return;
+                  }
+                  return mvOpenTasksTab(owner, { sessionId: id, signal });
+                },
+              });
+            };
+            mvNativeDirect = agent => openNative({
+              ...agent, agentKey: agent.agentKey ?? `${agent.teamId ?? agent.squadId}/${agent.agentId ?? agent.id}`,
+              teamId: agent.teamId ?? agent.squadId, agentId: agent.agentId ?? agent.id,
+            });
+            const openSidebarAgent = (agent, fromPrimary) => {
+              if (!canOpenNative() && !fromPrimary) { openRoom('direct', agent); return; }
+              return mvNativeDirect(agent);
+            };
+            const navigation = {
+              openAgent: agent => mvNativeDirect?.(agent),
+              openDrawer: options => mvOpenTasksTab(navCtx, options),
+              async openSubSession(agent, id, taskId) {
+                const message = await openNative(agent, id);
+                if (message) throw Error(message);
+                if (!runtime.signal.aborted && runtime.focus.getSnapshot()?.navigationSessionId === id) {
+                  runtime.setSelection(agent.agentKey, () => ({ focusedId: taskId, selected: [] }));
+                }
+              },
+              async openTicket(id, card, agent, chosenWorkspaceId) {
+                if (runtime.signal.aborted) return;
+                const ticket = runtime.tickets.getSnapshot().items.find(row => row.id === id);
+                let room = [card?.taskRoom, sidebar.getSnapshot().rooms.find(row => row.taskId === id && row.id),
+                  ticket?.taskRoom].find(row => row?.id);
+                if (!room) {
+                  card ??= ticket;
+                  let workspaceId = [card?.workflow?.workspaceId, card?.workspaceId, agent?.workspaceId, chosenWorkspaceId].find(mvValidWorkspaceId);
+                  if (!workspaceId) {
+                    const options = await mvReadTicketWorkspaces(runtime.signal);
+                    if (runtime.signal.aborted) return;
+                    if (options.length > 1) return options;
+                    if (!options.length) throw Error('没有可用的工单工作区。');
+                    workspaceId = options[0].id;
+                  }
+                  room = (await fetchJson('marshal/task-rooms/open', { taskId: id, workspaceId }, true, runtime.signal))?.room;
+                  if (!runtime.signal.aborted && !room?.id) throw Error('未确认工单群已绑定。');
+                }
+                if (!runtime.signal.aborted && room?.id) openRoom('taskRooms', room);
+              },
+            };
+            const agentSlots = { runtime, voiceLayer, idleVoice, navigation };
+            const AgentTasksRightbarTab = props => h(mvAgentTasksRightbarTab, { ...props, ...agentSlots });
+            const AgentComposerDockBar = props => h(mvAgentComposerDockBar, { ...props, ...agentSlots });
+            const installTasksTab = registry => {
+              const resources = [];
+              try {
+                const slots = service(ctx, 'slots');
+                if (!slots?.register || !registry?.register) return;
+                track(mvRegisterTasksTab(registry), resources);
+                register({ name: 'sidebar.right.pane.tab', key: MV_TASK_TAB_ID }, AgentTasksRightbarTab, resources, slots);
+                mvTasksTabRegistered = true;
+              } catch { clean(resources); }
+              return () => { mvTasksTabRegistered = false; clean(resources); };
+            };
+            try {
+              const registry = service(ctx, 'sidebarRightTabs');
+              if (registry) track(installTasksTab(registry), lifetime);
+              else track(ctx.inject?.(['sidebarRightTabs'], inner => installTasksTab(service(inner, 'sidebarRightTabs'))), lifetime);
+            } catch {}
+            try {
+              const slots = service(ctx, 'slots');
+              const options = { name: 'conversation.input.dock', id: MV_TASK_TAB_ID, order: 30 };
+              const mountDock = () => {
+                const handle = slots.register(options, AgentComposerDockBar);
+                mvDockMounted = true;
+                return handle;
+              };
+              if (typeof slots?.register === 'function') track(typeof slots.inject === 'function'
+                ? slots.inject(options.name, mountDock) : mountDock(), lifetime);
+            } catch {}
+            let closed = false;
+            track(() => {
+              closed = true;
+              mvDockMounted = false;
+              mvNativeDirect = undefined;
+              mvStartVoice = undefined;
+              mvCancelNative?.();
+              mvCancelNative = undefined;
+              voiceLayer.getSnapshot()?.dispose();
+              voiceLayer.set(null);
+              voiceLayer.clear();
+            }, lifetime);
+            const PanelItem = props => h(MarshalSidebarPanelItem, { ...props, sidebar, openPanel });
+            const MountedVoiceLayer = () => {
+              const voice = useMvSnapshot(voiceLayer);
+              const guidance = useMvSnapshot(runtime.modal);
+              React.useEffect(() => {
+                if (closed) return;
+                const canCapture = typeof navigator !== 'undefined' && typeof navigator.mediaDevices?.getUserMedia === 'function';
+                const provider = canCapture ? createLiveVoiceCallProvider() : createLocalVoiceSessionProvider();
+                voiceLayer.set(provider);
+                return () => {
+                  provider.dispose();
+                  if (voiceLayer.getSnapshot() === provider) voiceLayer.set(null);
+                };
+              }, []);
+              return h(React.Fragment, null, voice && h(MarshalVoiceCallOverlay, { voice,
+                guidanceRuntime: mvTasksTabRegistered || guidance ? runtime : undefined }),
+                guidance && h(mvSyncGuidanceModal, { runtime, data: guidance }),
+                h(MarshalSidebarPortal, { target, sidebar, openRoom, onOpenAgentDirect: openSidebarAgent }));
+            };
+            const SessionAction = props => {
+              const voice = useMvSnapshot(voiceLayer);
+              return h(MarshalSessionActionHoc, { ...props, sidebar, voice: voice ?? idleVoice, onOpenAgentDirect: openSidebarAgent,
+                voiceAvailable: Boolean(voice) });
+            };
+            register({ name: 'sidebar.panellist', id: PANEL, order: 25, label: () => '调度官' }, PanelItem, lifetime);
+            register({ name: 'sidebar.session.action', id: 'marshal-primary-agent' }, SessionAction, lifetime);
+            register({ name: 'shell.overlay', id: 'marshal-voice-call' }, MountedVoiceLayer, lifetime);
+            return () => {
+              clearTimeout(tabTimer);
+              pendingTab = null;
+              routeLifetime.abort();
+              clean(lifetime);
+              clean(disposers);
+              routes.set(null);
+              routes.clear();
+            };
           }, 'marshal: client lifecycle');
+          ctx.effect(() => () => {
+            disposeAllMarshalSse();
+          }, 'marshal: SSE lifecycle');
+        } else {
+          register({ name: 'sidebar.panellist', id: PANEL, order: 25, label: () => '调度官' }, MarshalIcon);
         }
       },
     };
@@ -6369,98 +8209,3 @@ window.__ModuleLoader__.load({
 });
 
 })();
-/* --- dsh-marshal superagent human-create observer --- */
-/* Human-create observer for the dsh-marshal superagent bridge.
- *
- * The task board has no "card created" event and does not record who created a
- * card. The one place that separates a human GUI create from an agent tool call
- * is the browser: only the GUI posts a create action over fetch. This observer
- * therefore waits for a successful POST to the board's action endpoint, reads
- * the create request's own task id, and tells the local host. It never changes
- * the request or the response, and every failure is swallowed: a broken bridge
- * must not break the board.
- *
- * Appended to the generated client bundle by the build; kept as a standalone
- * file so it can be tested in a virtual window and re-appended if the bundle is
- * regenerated.
- */
-(function installMarshalSuperagentHook(win) {
-  if (win === null || win === undefined) return;
-  if (win.__marshalSuperagentHook === true) return;
-  win.__marshalSuperagentHook = true;
-  win.__marshalSuperagentHookVersion = 1;
-  const original = win.fetch;
-  if (typeof original !== 'function') return;
-  const seen = new Set();
-  const endpoint = () => {
-    try {
-      const base = win.document && typeof win.document.baseURI === 'string'
-        ? win.document.baseURI
-        : (win.location && typeof win.location.href === 'string' ? win.location.href : undefined);
-      return new URL('api/marshal-superagent/human-create', base === undefined ? '/' : base).href;
-    }
-    catch {
-      return '/marshal-superagent/api/human-create';
-    }
-  };
-  const notify = (taskId, requestId) => {
-    if (typeof taskId !== 'string' || taskId === '' || seen.has(taskId)) return;
-    seen.add(taskId);
-    if (seen.size > 500) {
-      const first = seen.values().next().value;
-      if (first !== undefined) seen.delete(first);
-    }
-    try {
-      const init = {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          taskId,
-          source: 'board-ui',
-          ...(typeof requestId === 'string' && requestId !== '' ? { requestId } : {}),
-        }),
-      };
-      const result = original.call(win, endpoint(), init);
-      if (result !== null && typeof result.then === 'function') result.catch(() => {});
-    }
-    catch {
-      /* observation only */
-    }
-  };
-  const wrapped = function wrappedFetch(input, init) {
-    const promise = original.apply(this === undefined || this === null ? win : this, arguments);
-    try {
-      const url = typeof input === 'string'
-        ? input
-        : (input !== null && input !== undefined && typeof input.url === 'string' ? input.url : '');
-      const method = String((init && init.method) || (input && input.method) || 'GET').toUpperCase();
-      const body = init && typeof init.body === 'string' ? init.body : undefined;
-      if (method === 'POST' && body !== undefined && url.indexOf('api/task-board/action') !== -1) {
-        if (promise !== null && typeof promise.then === 'function') {
-          promise.then(response => {
-            try {
-              if (response === null || response === undefined || response.ok !== true) return;
-              const envelope = JSON.parse(body);
-              const action = envelope && envelope.action;
-              if (action === null || action === undefined || action.kind !== 'create' || typeof action.id !== 'string') return;
-              notify(action.id, envelope.requestId);
-            }
-            catch {
-              /* not a create envelope; ignore */
-            }
-          }).catch(() => {});
-        }
-      }
-    }
-    catch {
-      /* observation only */
-    }
-    return promise;
-  };
-  try {
-    win.fetch = wrapped;
-  }
-  catch {
-    /* a frozen window: leave the original in place */
-  }
-})(typeof window === 'undefined' ? undefined : window);
