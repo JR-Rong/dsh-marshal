@@ -248,6 +248,33 @@ const InputsSnapshotResultSchema = z.object({
   cards: z.array(z.unknown()),
 }).strict()
 
+const ArtifactReadSchema = z.object({
+  v: z.literal(2), type: z.literal('artifact.read'),
+  requestId: z.string().min(1),
+  target: TargetSchema,
+  path: z.string().min(1).max(4096),
+  offset: z.number().int().min(0).max(50 * 1024 * 1024).optional(),
+  maxBytes: z.number().int().min(1).max(524_288).optional(),
+  connectionId: z.string().min(1),
+  nodeEpoch: z.string().min(1),
+}).strict()
+
+const ArtifactResultSchema = z.object({
+  v: z.literal(2), type: z.literal('artifact.result'),
+  requestId: z.string().min(1),
+  ok: z.boolean(),
+  code: WireErrorCode.optional(),
+  name: z.string().max(260).optional(),
+  mime: z.string().max(120).optional(),
+  kind: z.enum(['text', 'image', 'video', 'audio', 'pdf', 'binary']).optional(),
+  size: z.number().int().nonnegative().optional(),
+  offset: z.number().int().nonnegative().optional(),
+  bytes: z.number().int().nonnegative().optional(),
+  eof: z.boolean().optional(),
+  encoding: z.enum(['utf8', 'base64']).optional(),
+  data: z.string().max(750_000).optional(),
+}).strict()
+
 const HeartbeatSchema = z.object({
   v: z.literal(2), type: z.literal('heartbeat'),
   nonce: z.string().min(1),
@@ -292,6 +319,7 @@ export const FrameSchema = z.discriminatedUnion('type', [
   SyncBeginSchema, SyncChunkSchema, SyncEndSchema, SyncAckSchema,
   CommandStatusSchema, CommandStatusResultSchema,
   InputsSnapshotSchema, InputsSnapshotResultSchema,
+  ArtifactReadSchema, ArtifactResultSchema,
   HeartbeatSchema, HeartbeatAckSchema,
 ])
 
@@ -313,6 +341,8 @@ export type CommandStatusFrame = z.infer<typeof CommandStatusSchema>
 export type CommandStatusResultFrame = z.infer<typeof CommandStatusResultSchema>
 export type InputsSnapshotFrame = z.infer<typeof InputsSnapshotSchema>
 export type InputsSnapshotResultFrame = z.infer<typeof InputsSnapshotResultSchema>
+export type ArtifactReadFrame = z.infer<typeof ArtifactReadSchema>
+export type ArtifactResultFrame = z.infer<typeof ArtifactResultSchema>
 export type HeartbeatFrame = z.infer<typeof HeartbeatSchema>
 export type HeartbeatAckFrame = z.infer<typeof HeartbeatAckSchema>
 
@@ -320,11 +350,11 @@ export type FrameDirection = 'node-to-hub' | 'hub-to-node'
 
 const NODE_TO_HUB: ReadonlySet<Frame['type']> = new Set([
   'hello', 'event', 'history.result', 'sync.begin', 'sync.chunk', 'sync.end',
-  'ack', 'command.status.result', 'inputs.snapshot.result', 'discussion.catalog', 'discussion.result', 'discussion.progress',
+  'ack', 'command.status.result', 'inputs.snapshot.result', 'artifact.result', 'discussion.catalog', 'discussion.result', 'discussion.progress',
 ])
 
 const HUB_TO_NODE: ReadonlySet<Frame['type']> = new Set([
-  'hello.ack', 'command', 'sync.ack', 'command.status', 'inputs.snapshot',
+  'hello.ack', 'command', 'sync.ack', 'command.status', 'inputs.snapshot', 'artifact.read',
 ])
 
 export function directionOf(frame: Frame): FrameDirection | 'both' {

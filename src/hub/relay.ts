@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import {
   encodeFrame, type AckFrame, type CommandFrame, type CommandOp,
   type CommandStatusFrame, type CommandStatusResultFrame, type EventFrame,
-  type InputsSnapshotFrame, type InputsSnapshotResultFrame, type HistoryResultFrame,
+  type InputsSnapshotFrame, type InputsSnapshotResultFrame, type ArtifactReadFrame, type ArtifactResultFrame, type HistoryResultFrame,
 } from '../wire/frames.ts'
 import { COMMAND_TTL_MS } from '../wire/limits.ts'
 import { commandPayloadDigest } from '../wire/commands.ts'
@@ -343,10 +343,37 @@ interface PendingInputs {
   readonly nodeEpoch: string
 }
 
+export type ArtifactOutcome =
+  | {
+    readonly ok: true
+    readonly name: string
+    readonly mime: string
+    readonly kind: 'text' | 'image' | 'video' | 'audio' | 'pdf' | 'binary'
+    readonly size: number
+    readonly offset: number
+    readonly bytes: number
+    readonly eof: boolean
+    readonly encoding: 'utf8' | 'base64'
+    readonly data: string
+  }
+  | {
+    readonly ok: false
+    readonly code: string
+  }
+
+interface PendingArtifact {
+  resolve: (outcome: ArtifactOutcome) => void
+  timer: NodeJS.Timeout
+  readonly deviceId: string
+  readonly connectionId: string
+  readonly nodeEpoch: string
+}
+
 export class HubRelay {
   private readonly pending = new Map<string, Pending>()
   private readonly statusPending = new Map<string, PendingStatus>()
   private readonly inputsPending = new Map<string, PendingInputs>()
+  private readonly artifactPending = new Map<string, PendingArtifact>()
   private readonly idempotency = new HubIdempotency<CommandOutcome>()
   /** 幂等键归属：断线时按设备清掉缓存里的结果正文。 */
   private readonly cacheDevices = new Map<string, string>()
@@ -707,6 +734,72 @@ export class HubRelay {
     })
   }
 
+  /** 只读远端文件/媒体分片拉取：绑定连接代次，绝不落盘缓存。 */
+  async requestArtifact(
+    target: CommandFrame['target'],
+    path: string,
+    offset?: number,
+    maxBytes?: number,
+  ): Promise<ArtifactOutcome> {
+    if (this.disposed) return { ok: false, code: 'disposed' }
+    const slot = this.options.registry.get(target.deviceId)
+    if (slot === undefined) return { ok: false, code: 'device-offline' }
+
+    const requestId = randomUUID()
+    const timeoutMs = this.options.timeoutMs ?? COMMAND_TTL_MS
+    const connectionId = slot.connectionId ?? UNBOUND_CONNECTION_ID
+    const nodeEpoch = slot.nodeEpoch ?? UNBOUND_NODE_EPOCH
+    const frame: ArtifactReadFrame = {
+      v: 2, type: 'artifact.read', requestId,
+      target, path,
+      ...(offset === undefined ? {} : { offset }),
+      ...(maxBytes === undefined ? {} : { maxBytes }),
+      connectionId, nodeEpoch,
+    }
+
+    return await new Promise<ArtifactOutcome>((resolve) => {
+      const timer = setTimeout(() => {
+        this.artifactPending.delete(requestId)
+        resolve({ ok: false, code: 'outcome-unknown' })
+      }, timeoutMs)
+      this.artifactPending.set(requestId, {
+        resolve, timer, deviceId: target.deviceId, connectionId, nodeEpoch,
+      })
+      try {
+        slot.sender.send(encodeFrame(frame))
+      } catch {
+        clearTimeout(timer)
+        this.artifactPending.delete(requestId)
+        resolve({ ok: false, code: 'outcome-unknown' })
+      }
+    })
+  }
+
+  settleArtifact(frame: ArtifactResultFrame, origin: FrameIdentity): void {
+    const entry = this.artifactPending.get(frame.requestId)
+    if (entry === undefined) return
+    if (!this.currentBinding(entry, origin)) return
+    clearTimeout(entry.timer)
+    this.artifactPending.delete(frame.requestId)
+    if (!frame.ok || frame.data === undefined || frame.name === undefined || frame.mime === undefined || frame.kind === undefined
+      || frame.size === undefined || frame.offset === undefined || frame.bytes === undefined || frame.eof === undefined || frame.encoding === undefined) {
+      entry.resolve({ ok: false, code: frame.code ?? 'unsupported' })
+      return
+    }
+    entry.resolve({
+      ok: true,
+      name: frame.name,
+      mime: frame.mime,
+      kind: frame.kind,
+      size: frame.size,
+      offset: frame.offset,
+      bytes: frame.bytes,
+      eof: frame.eof,
+      encoding: frame.encoding,
+      data: frame.data,
+    })
+  }
+
   private currentBinding(
     entry: { readonly deviceId: string; readonly connectionId: string; readonly nodeEpoch: string },
     origin: FrameIdentity,
@@ -739,6 +832,12 @@ export class HubRelay {
       this.inputsPending.delete(requestId)
       entry.resolve({ ok: false, code: 'device-offline' })
     }
+    for (const [requestId, entry] of [...this.artifactPending]) {
+      if (entry.deviceId !== deviceId) continue
+      clearTimeout(entry.timer)
+      this.artifactPending.delete(requestId)
+      entry.resolve({ ok: false, code: 'device-offline' })
+    }
   }
 
   /**
@@ -762,6 +861,12 @@ export class HubRelay {
       if (entry.deviceId !== deviceId) continue
       clearTimeout(entry.timer)
       this.inputsPending.delete(requestId)
+      entry.resolve({ ok: false, code: 'outcome-unknown' })
+    }
+    for (const [requestId, entry] of [...this.artifactPending]) {
+      if (entry.deviceId !== deviceId) continue
+      clearTimeout(entry.timer)
+      this.artifactPending.delete(requestId)
       entry.resolve({ ok: false, code: 'outcome-unknown' })
     }
   }
@@ -878,6 +983,8 @@ export class HubRelay {
     this.statusPending.clear()
     const waitingInputs = [...this.inputsPending.values()]
     this.inputsPending.clear()
+    const waitingArtifacts = [...this.artifactPending.values()]
+    this.artifactPending.clear()
     this.idempotency.clear()
     for (const entry of waiting) {
       clearTimeout(entry.timer)
@@ -888,6 +995,10 @@ export class HubRelay {
       entry.resolve({ status: 'outcome-unknown', code: 'disposed' })
     }
     for (const entry of waitingInputs) {
+      clearTimeout(entry.timer)
+      entry.resolve({ ok: false, code: 'disposed' })
+    }
+    for (const entry of waitingArtifacts) {
       clearTimeout(entry.timer)
       entry.resolve({ ok: false, code: 'disposed' })
     }

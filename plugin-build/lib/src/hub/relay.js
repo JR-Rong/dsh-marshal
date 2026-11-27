@@ -243,6 +243,7 @@ export class HubRelay {
     pending = new Map();
     statusPending = new Map();
     inputsPending = new Map();
+    artifactPending = new Map();
     idempotency = new HubIdempotency();
     /** 幂等键归属：断线时按设备清掉缓存里的结果正文。 */
     cacheDevices = new Map();
@@ -583,6 +584,67 @@ export class HubRelay {
             cards: frame.cards,
         });
     }
+    async requestArtifact(target, path, offset, maxBytes) {
+        if (this.disposed)
+            return { ok: false, code: 'disposed' };
+        const slot = this.options.registry.get(target.deviceId);
+        if (slot === undefined)
+            return { ok: false, code: 'device-offline' };
+        const requestId = randomUUID();
+        const timeoutMs = this.options.timeoutMs ?? COMMAND_TTL_MS;
+        const connectionId = slot.connectionId ?? UNBOUND_CONNECTION_ID;
+        const nodeEpoch = slot.nodeEpoch ?? UNBOUND_NODE_EPOCH;
+        const frame = {
+            v: 2, type: 'artifact.read', requestId,
+            target, path,
+            ...(offset === undefined ? {} : { offset }),
+            ...(maxBytes === undefined ? {} : { maxBytes }),
+            connectionId, nodeEpoch,
+        };
+        return await new Promise((resolve) => {
+            const timer = setTimeout(() => {
+                this.artifactPending.delete(requestId);
+                resolve({ ok: false, code: 'outcome-unknown' });
+            }, timeoutMs);
+            this.artifactPending.set(requestId, {
+                resolve, timer, deviceId: target.deviceId, connectionId, nodeEpoch,
+            });
+            try {
+                slot.sender.send(encodeFrame(frame));
+            }
+            catch {
+                clearTimeout(timer);
+                this.artifactPending.delete(requestId);
+                resolve({ ok: false, code: 'outcome-unknown' });
+            }
+        });
+    }
+    settleArtifact(frame, origin) {
+        const entry = this.artifactPending.get(frame.requestId);
+        if (entry === undefined)
+            return;
+        if (!this.currentBinding(entry, origin))
+            return;
+        clearTimeout(entry.timer);
+        this.artifactPending.delete(frame.requestId);
+        if (!frame.ok || frame.data === undefined || frame.name === undefined || frame.mime === undefined || frame.kind === undefined
+            || frame.size === undefined || frame.offset === undefined || frame.bytes === undefined || frame.eof === undefined || frame.encoding === undefined) {
+            entry.resolve({ ok: false, code: frame.code ?? 'unsupported' });
+            return;
+        }
+        entry.resolve({
+            ok: true,
+            name: frame.name,
+            mime: frame.mime,
+            kind: frame.kind,
+            size: frame.size,
+            offset: frame.offset,
+            bytes: frame.bytes,
+            eof: frame.eof,
+            encoding: frame.encoding,
+            data: frame.data,
+        });
+    }
     currentBinding(entry, origin) {
         const slot = this.options.registry.get(entry.deviceId);
         return origin.deviceId === entry.deviceId
@@ -614,6 +676,13 @@ export class HubRelay {
             this.inputsPending.delete(requestId);
             entry.resolve({ ok: false, code: 'device-offline' });
         }
+        for (const [requestId, entry] of [...this.artifactPending]) {
+            if (entry.deviceId !== deviceId)
+                continue;
+            clearTimeout(entry.timer);
+            this.artifactPending.delete(requestId);
+            entry.resolve({ ok: false, code: 'device-offline' });
+        }
     }
     /**
      * 新连接带来 nodeEpoch：同 epoch 的普通重连保留旧索引（stale）；
@@ -639,6 +708,13 @@ export class HubRelay {
                 continue;
             clearTimeout(entry.timer);
             this.inputsPending.delete(requestId);
+            entry.resolve({ ok: false, code: 'outcome-unknown' });
+        }
+        for (const [requestId, entry] of [...this.artifactPending]) {
+            if (entry.deviceId !== deviceId)
+                continue;
+            clearTimeout(entry.timer);
+            this.artifactPending.delete(requestId);
             entry.resolve({ ok: false, code: 'outcome-unknown' });
         }
     }
@@ -753,6 +829,8 @@ export class HubRelay {
         this.statusPending.clear();
         const waitingInputs = [...this.inputsPending.values()];
         this.inputsPending.clear();
+        const waitingArtifacts = [...this.artifactPending.values()];
+        this.artifactPending.clear();
         this.idempotency.clear();
         for (const entry of waiting) {
             clearTimeout(entry.timer);
@@ -763,6 +841,10 @@ export class HubRelay {
             entry.resolve({ status: 'outcome-unknown', code: 'disposed' });
         }
         for (const entry of waitingInputs) {
+            clearTimeout(entry.timer);
+            entry.resolve({ ok: false, code: 'disposed' });
+        }
+        for (const entry of waitingArtifacts) {
             clearTimeout(entry.timer);
             entry.resolve({ ok: false, code: 'disposed' });
         }

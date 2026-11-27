@@ -1514,6 +1514,59 @@ export function registerMarshalRoutes(options) {
                     completeness: result.completeness, ...(typeof result.nextCursor === 'string' ? { nextCursor: result.nextCursor } : {}) } }
             : publicOutcome(outcome));
     }));
+    // 远端文件/图片/视频分片只读拉取：严格按节点路径安全边界与脱敏策略执行。
+    register('/marshal/api/artifact', guard(async (req, res) => {
+        if (parseBearer(headerValue(req, 'authorization'))?.kind === 'node') {
+            deny(res, 401, 'unauthorized');
+            return;
+        }
+        if (req.method !== 'POST') {
+            methodNotAllowed(res, 'POST');
+            return;
+        }
+        if (phoneFrom(req) === undefined && authorize(req, res, { allowToken: true, refresh: true, write: true }) === undefined)
+            return;
+        const read = await readJsonBody(req, res, SMALL_BODY_LIMIT);
+        if (!read.ok)
+            return;
+        const body = asRecord(read.value);
+        const target = body?.target;
+        const filePath = body?.path;
+        const offset = body?.offset;
+        const maxBytes = body?.maxBytes;
+        if (body === undefined
+            || Object.keys(body).some(key => key !== 'target' && key !== 'path' && key !== 'offset' && key !== 'maxBytes')
+            || !isTarget(target)
+            || typeof filePath !== 'string' || filePath.trim() === '' || filePath.length > 4096
+            || (offset !== undefined && (typeof offset !== 'number' || !Number.isInteger(offset) || offset < 0 || offset > 50 * 1024 * 1024))
+            || (maxBytes !== undefined && (typeof maxBytes !== 'number' || !Number.isInteger(maxBytes) || maxBytes < 1 || maxBytes > 524_288))) {
+            json(res, 400, { ok: false, code: 'invalid-args' });
+            return;
+        }
+        const outcome = await relay.requestArtifact(target, filePath, offset, maxBytes);
+        if (!outcome.ok) {
+            const status = outcome.code === 'device-offline' || outcome.code === 'disposed' ? 503
+                : outcome.code === 'record-unavailable' ? 404
+                    : outcome.code === 'size-limit' ? 413
+                        : outcome.code === 'unsupported' ? 403
+                            : outcome.code === 'invalid-args' ? 400
+                                : 504;
+            json(res, status, { ok: false, code: outcome.code });
+            return;
+        }
+        json(res, 200, {
+            ok: true,
+            name: outcome.name,
+            mime: outcome.mime,
+            kind: outcome.kind,
+            size: outcome.size,
+            offset: outcome.offset,
+            bytes: outcome.bytes,
+            eof: outcome.eof,
+            encoding: outcome.encoding,
+            data: outcome.data,
+        });
+    }));
     register('/marshal/api/stream', guard(async (req, res) => {
         if (req.method !== 'GET') {
             methodNotAllowed(res, 'GET');

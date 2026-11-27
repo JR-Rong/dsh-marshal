@@ -1,7 +1,17 @@
+import { artifactKindLabel, isPreviewableLocalPath, parseArtifactTarget, type ArtifactKind } from './artifacts.ts'
+
 export type MarkdownLinkKind =
   | { kind: 'external'; href: string }
   | { kind: 'file'; label: string }
   | { kind: 'unsafe' }
+
+export interface MarkdownArtifactRef {
+  path: string
+  label: string
+  kind: ArtifactKind
+  startLine?: number
+  endLine?: number
+}
 
 export type InlineNode =
   | { type: 'text'; text: string }
@@ -11,7 +21,8 @@ export type InlineNode =
   | { type: 'em'; children: InlineNode[] }
   | { type: 'del'; children: InlineNode[] }
   | { type: 'link'; href: string; children: InlineNode[] }
-  | { type: 'fileRef'; label: string }
+  | { type: 'fileRef'; label: string; path?: string; kind?: ArtifactKind; startLine?: number; endLine?: number }
+  | { type: 'image'; alt: string; src: string; local: boolean; kind?: ArtifactKind }
 
 export type MarkdownBlock =
   | { type: 'heading'; level: 1 | 2 | 3 | 4 | 5 | 6; children: InlineNode[] }
@@ -121,7 +132,7 @@ export function parseInline(source: string, depth = 0): InlineNode[] {
       continue
     }
 
-    // Inline code (`...` or ``...``)
+    // Inline code (`...` or ``...``); previewable absolute media/file paths become clickable file chips
     if (ch === '`') {
       let ticks = 1
       while (source[i + ticks] === '`') ticks++
@@ -131,9 +142,47 @@ export function parseInline(source: string, depth = 0): InlineNode[] {
         flush()
         const raw = source.slice(i + ticks, close)
         const trimmed = raw.length >= 2 && raw.startsWith(' ') && raw.endsWith(' ') && raw.trim() !== '' ? raw.slice(1, -1) : raw
-        nodes.push({ type: 'code', text: trimmed })
+        if (isPreviewableLocalPath(trimmed)) {
+          const target = parseArtifactTarget(trimmed)
+          nodes.push({
+            type: 'fileRef',
+            label: trimmed,
+            path: target.path,
+            kind: target.kind,
+            ...(target.startLine !== undefined ? { startLine: target.startLine, endLine: target.endLine } : {}),
+          })
+        } else {
+          nodes.push({ type: 'code', text: trimmed })
+        }
         i = close + ticks
         continue
+      }
+    }
+
+    // Markdown image ![alt](src)
+    if (ch === '!' && source[i + 1] === '[' && depth < 6) {
+      const img = parseLink(source, i + 1)
+      if (img && img.href.length > 0) {
+        const classified = classifyMarkdownHref(img.href)
+        if (classified.kind === 'external') {
+          flush()
+          nodes.push({ type: 'image', alt: img.label || '图片', src: classified.href, local: false, kind: 'image' })
+          i = img.end
+          continue
+        }
+        if (classified.kind === 'file' || isPreviewableLocalPath(img.href)) {
+          flush()
+          const target = parseArtifactTarget(img.href)
+          nodes.push({
+            type: 'image',
+            alt: img.label || target.name,
+            src: target.path,
+            local: true,
+            kind: target.kind === 'binary' ? 'image' : target.kind,
+          })
+          i = img.end
+          continue
+        }
       }
     }
 
@@ -145,8 +194,15 @@ export function parseInline(source: string, depth = 0): InlineNode[] {
         const classified = classifyMarkdownHref(link.href)
         if (classified.kind === 'external') {
           nodes.push({ type: 'link', href: classified.href, children: parseInline(link.label, depth + 1) })
-        } else if (classified.kind === 'file') {
-          nodes.push({ type: 'fileRef', label: link.label || classified.label })
+        } else if (classified.kind === 'file' || isPreviewableLocalPath(link.href)) {
+          const target = parseArtifactTarget(link.href)
+          nodes.push({
+            type: 'fileRef',
+            label: link.label || target.name,
+            path: target.path,
+            kind: target.kind,
+            ...(target.startLine !== undefined ? { startLine: target.startLine, endLine: target.endLine } : {}),
+          })
         } else {
           nodes.push({ type: 'text', text: link.label })
         }
@@ -172,7 +228,6 @@ export function parseInline(source: string, depth = 0): InlineNode[] {
     }
 
     if (depth < 6) {
-      // Bold + Italic (***text***)
       if (source.startsWith('***', i) && source[i + 3] && !/\s/.test(source[i + 3]!)) {
         const close = findClosingDelimiter(source, i + 3, '***')
         if (close > i + 3) {
@@ -183,7 +238,6 @@ export function parseInline(source: string, depth = 0): InlineNode[] {
         }
       }
 
-      // Bold (**text** or __text__)
       if ((source.startsWith('**', i) || (source.startsWith('__', i) && !isWordChar(source[i - 1])))
         && source[i + 2] && !/\s/.test(source[i + 2]!)) {
         const marker = source.slice(i, i + 2)
@@ -196,7 +250,6 @@ export function parseInline(source: string, depth = 0): InlineNode[] {
         }
       }
 
-      // Strikethrough (~~text~~)
       if (source.startsWith('~~', i) && source[i + 2] && !/\s/.test(source[i + 2]!)) {
         const close = findClosingDelimiter(source, i + 2, '~~')
         if (close > i + 2) {
@@ -207,7 +260,6 @@ export function parseInline(source: string, depth = 0): InlineNode[] {
         }
       }
 
-      // Italic (*text* or _text_) — protect snake_case words
       if ((ch === '*' || (ch === '_' && !isWordChar(source[i - 1])))
         && source[i + 1] && source[i + 1] !== ch && !/\s/.test(source[i + 1]!)) {
         const close = findClosingDelimiter(source, i + 1, ch)
@@ -291,7 +343,6 @@ export function parseMarkdown(source: string): MarkdownBlock[] {
       continue
     }
 
-    // Fenced code block (``` or ~~~), also handles unclosed fences during live streaming
     const fenceMatch = line.match(/^\s*(`{3,}|~{3,})\s*([^\s`~]*)/)
     if (fenceMatch) {
       const markerChar = fenceMatch[1]![0]!
@@ -309,7 +360,6 @@ export function parseMarkdown(source: string): MarkdownBlock[] {
       continue
     }
 
-    // Heading (# .. ######)
     const headingMatch = line.match(/^\s*(#{1,6})\s+(.+?)(?:\s+#+\s*)?$/)
     if (headingMatch) {
       const level = headingMatch[1]!.length as 1 | 2 | 3 | 4 | 5 | 6
@@ -318,14 +368,12 @@ export function parseMarkdown(source: string): MarkdownBlock[] {
       continue
     }
 
-    // Horizontal rule
     if (isHorizontalRule(line)) {
       blocks.push({ type: 'hr' })
       i++
       continue
     }
 
-    // GFM Table
     if (line.includes('|') && i + 1 < lines.length) {
       const align = parseTableSeparator(lines[i + 1]!)
       if (align) {
@@ -344,7 +392,6 @@ export function parseMarkdown(source: string): MarkdownBlock[] {
       }
     }
 
-    // Blockquote (> ...)
     if (/^\s*>\s?/.test(line)) {
       const quoteLines: string[] = []
       while (i < lines.length && /^\s*>\s?/.test(lines[i]!)) {
@@ -355,7 +402,6 @@ export function parseMarkdown(source: string): MarkdownBlock[] {
       continue
     }
 
-    // Unordered or Ordered List
     const ulMatch = line.match(/^(\s*)[-*+]\s+(.*)$/)
     const olMatch = !ulMatch ? line.match(/^(\s*)(\d+)[.)]\s+(.*)$/) : null
     if (ulMatch || olMatch) {
@@ -389,7 +435,6 @@ export function parseMarkdown(source: string): MarkdownBlock[] {
       continue
     }
 
-    // Paragraph (coalesce consecutive plain lines)
     const paraLines: string[] = [line]
     i++
     while (i < lines.length && !isBlockStarter(lines, i)) {
@@ -405,6 +450,8 @@ export function parseMarkdown(source: string): MarkdownBlock[] {
 export interface MarkdownRenderOptions {
   onOpenLink?: (url: string) => void
   onCopyCode?: (code: string) => void
+  onOpenArtifact?: (ref: MarkdownArtifactRef) => void
+  onOpenImage?: (url: string, alt: string) => void
 }
 
 function renderInlineNodes(nodes: InlineNode[], options: MarkdownRenderOptions): Node[] {
@@ -425,10 +472,68 @@ function renderInlineNodes(nodes: InlineNode[], options: MarkdownRenderOptions):
         break
       }
       case 'fileRef': {
-        const code = document.createElement('code')
-        code.className = 'md-file-ref'
-        code.textContent = node.label
-        out.push(code)
+        if (node.path && options.onOpenArtifact) {
+          const btn = document.createElement('button')
+          btn.type = 'button'
+          btn.className = 'md-file-ref clickable'
+          const kind = node.kind ?? 'text'
+          const lineTag = node.startLine !== undefined
+            ? (node.endLine && node.endLine !== node.startLine ? `:${node.startLine}-${node.endLine}` : `:${node.startLine}`)
+            : ''
+          btn.textContent = `${node.label}${lineTag}`
+          btn.setAttribute('aria-label', `预览${artifactKindLabel(kind)} ${node.label}`)
+          const ref: MarkdownArtifactRef = {
+            path: node.path,
+            label: node.label,
+            kind,
+            ...(node.startLine !== undefined ? { startLine: node.startLine, endLine: node.endLine } : {}),
+          }
+          btn.addEventListener('click', () => options.onOpenArtifact?.(ref))
+          out.push(btn)
+        } else {
+          const code = document.createElement('code')
+          code.className = 'md-file-ref'
+          code.textContent = node.label
+          out.push(code)
+        }
+        break
+      }
+      case 'image': {
+        if (!node.local) {
+          const btn = document.createElement('button')
+          btn.type = 'button'
+          btn.className = 'md-img-btn'
+          btn.setAttribute('aria-label', `查看大图：${node.alt}`)
+          const img = document.createElement('img')
+          img.className = 'md-img'
+          img.src = node.src
+          img.alt = node.alt
+          img.loading = 'lazy'
+          btn.append(img)
+          btn.addEventListener('click', () => options.onOpenImage?.(node.src, node.alt))
+          out.push(btn)
+        } else {
+          const kind = node.kind ?? 'image'
+          const btn = document.createElement('button')
+          btn.type = 'button'
+          btn.className = 'md-media-card'
+          const badge = document.createElement('span')
+          badge.className = 'md-media-badge'
+          badge.textContent = artifactKindLabel(kind)
+          const label = document.createElement('span')
+          label.className = 'md-media-label'
+          label.textContent = node.alt
+          const action = document.createElement('span')
+          action.className = 'md-media-action'
+          action.textContent = '点开预览 ›'
+          btn.append(badge, label, action)
+          btn.addEventListener('click', () => options.onOpenArtifact?.({
+            path: node.src,
+            label: node.alt,
+            kind,
+          }))
+          out.push(btn)
+        }
         break
       }
       case 'strong': {

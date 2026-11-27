@@ -21,7 +21,11 @@ import {
   acceptEventSeq, extractPayloadText, fetchHistoryAdaptive, historyLoadsForward, initialHistoryLimit,
   TOOL_ARGS_PREVIEW_LIMIT, TOOL_OUTPUT_PREVIEW_LIMIT, truncateWithNotice,
 } from './lib/transcript.ts'
-import { renderMarkdown } from './lib/markdown.ts'
+import { renderMarkdown, type MarkdownArtifactRef } from './lib/markdown.ts'
+import {
+  artifactKindLabel, collectSessionArtifacts, extractToolArtifacts, formatBytes, parseArtifactTarget,
+  type DiffLine, type ToolArtifactItem,
+} from './lib/artifacts.ts'
 import { hasStoredBridge, loadBridgeDevice, openBridgeWorkbench, saveBridgeDevice } from './bridge/workbench.ts'
 import { classifyPairing, pairBridge, parsePairPayload, parseUnifiedPairing } from './lib/bridge.ts'
 import { openQrScanner } from './lib/scanner.ts'
@@ -71,6 +75,7 @@ interface Message {
   completed?: boolean
   toolTitle?: string
   toolArgs?: string
+  artifacts?: ToolArtifactItem[]
   failed?: boolean
   retryKey?: string
 }
@@ -902,11 +907,13 @@ export function historyToMessage(item: { kind: string; payload?: Record<string, 
       const args = payload.arguments !== undefined
         ? truncateWithNotice(extractPayloadText(payload.arguments), TOOL_ARGS_PREVIEW_LIMIT)
         : ''
+      const artifacts = extractToolArtifacts(title, payload.arguments)
       return {
         id, role: 'tool',
         text: args ? `开始：${title}\n参数：\n${args}` : '开始：' + title,
         toolTitle: title,
         toolArgs: args || undefined,
+        ...(artifacts.length > 0 ? { artifacts } : {}),
         open: false, at,
       }
     }
@@ -960,6 +967,9 @@ function historyMessages(items: Parameters<typeof historyToMessage>[0][]): Messa
     } else {
       if (previous) message.at = previous.at
       if (previous?.toolTitle && message.toolTitle === '工具结果') message.toolTitle = previous.toolTitle
+      if (previous?.artifacts?.length && !message.artifacts?.length) {
+        message.artifacts = previous.artifacts
+      }
       if (previous?.toolArgs && item.kind === 'tool.completed') {
         message.toolArgs = previous.toolArgs
         message.text = `参数：\n${previous.toolArgs}\n\n${message.text}`
@@ -1142,6 +1152,7 @@ async function onFrame(frame: StreamFrame): Promise<void> {
           } else if (!current.completed) {
             current.text = message.text
             if (message.toolArgs) current.toolArgs = message.toolArgs
+            if (message.artifacts?.length) current.artifacts = message.artifacts
           }
           if (message.toolTitle && message.toolTitle !== '工具结果') current.toolTitle = message.toolTitle
         } else state.messages = mergeTranscriptSnapshot([message], state.messages, { liveEvent: true })
@@ -2201,12 +2212,324 @@ async function copyReply(text: string, label = '已复制回复'): Promise<void>
 const markdownOptions = {
   onOpenLink: (url: string) => { void openExternal(url) },
   onCopyCode: (code: string) => { void copyReply(code, '已复制代码') },
+  onOpenArtifact: (ref: MarkdownArtifactRef) => {
+    const match = collectSessionArtifacts(state.messages).find((item) => item.path === ref.path)
+    openArtifactViewer(match ? { ...match, startLine: ref.startLine ?? match.startLine, endLine: ref.endLine ?? match.endLine } : {
+      path: ref.path,
+      name: parseArtifactTarget(ref.path).name || ref.label,
+      kind: ref.kind,
+      action: 'ref',
+      ...(ref.startLine !== undefined ? { startLine: ref.startLine, endLine: ref.endLine } : {}),
+    })
+  },
+  onOpenImage: (url: string, alt: string) => { openExternalImageViewer(url, alt) },
 }
 
 function markdownBodyNode(text: string): HTMLElement {
   const node = el('div', { class: 'msg-body md-body' })
   node.append(renderMarkdown(text, markdownOptions))
   return node
+}
+
+function renderDiffView(lines: readonly DiffLine[]): HTMLElement {
+  return el('div', { class: 'diff-view' }, ...lines.map((line) => el('div', { class: 'diff-line ' + line.type },
+    el('span', { class: 'sign', text: line.type === 'add' ? '+' : line.type === 'remove' ? '-' : ' ' }),
+    el('span', { text: line.text }),
+  )))
+}
+
+function renderCodeLines(text: string, startLine?: number, endLine?: number): { node: HTMLElement; firstHighlight: HTMLElement | null } {
+  const lines = text.replace(/\r\n?/g, '\n').split('\n')
+  let firstHighlight: HTMLElement | null = null
+  const rows = lines.map((line, idx) => {
+    const ln = idx + 1
+    const hl = startLine !== undefined && ln >= startLine && ln <= (endLine ?? startLine)
+    const row = el('div', { class: 'code-line' + (hl ? ' hl' : '') },
+      el('span', { class: 'ln', text: String(ln) }),
+      el('span', { text: line }),
+    )
+    if (hl && !firstHighlight) firstHighlight = row
+    return row
+  })
+  return { node: el('div', { class: 'code-lines' }, ...rows), firstHighlight }
+}
+
+function actionLabel(action: ToolArtifactItem['action']): string {
+  switch (action) {
+    case 'edit': return '修改'
+    case 'write': return '写入'
+    case 'present': return '交付'
+    case 'read': return '读取'
+    default: return '引用'
+  }
+}
+
+function toolArtifactCardNode(item: ToolArtifactItem): HTMLElement {
+  const stats = item.added !== undefined || item.removed !== undefined
+    ? el('span', { class: 'diff-stats' },
+      item.added ? el('span', { class: 'diff-stat-add', text: '+' + item.added }) : null,
+      item.removed ? el('span', { class: 'diff-stat-del', text: '-' + item.removed }) : null,
+    )
+    : null
+  const head = el('div', { class: 'tool-artifact-head' },
+    el('span', { class: 'chip on', text: item.kind === 'image' || item.kind === 'video' ? artifactKindLabel(item.kind) : actionLabel(item.action) }),
+    el('span', { class: 'name', text: item.name }),
+    stats,
+    button(item.kind === 'image' || item.kind === 'video' ? '预览' : '查看', () => openArtifactViewer(item), {
+      type: 'button', class: 'tool-artifact-open',
+    }),
+  )
+  const preview = item.diffLines && item.diffLines.length > 0
+    ? renderDiffView(item.diffLines.slice(0, 18))
+    : null
+  return el('div', { class: 'tool-artifact-card' }, head, preview)
+}
+
+function openExternalImageViewer(url: string, alt: string): void {
+  const dialog = el('dialog', { class: 'artifact-viewer', 'aria-label': alt || '图片预览' })
+  const close = () => { dialog.close(); dialog.remove() }
+  dialog.addEventListener('cancel', (event) => { event.preventDefault(); close() })
+  let zoomed = false
+  const img = el('img', { src: url, alt: alt || '图片' }) as HTMLImageElement
+  img.addEventListener('click', () => { zoomed = !zoomed; img.classList.toggle('zoomed', zoomed) })
+  dialog.append(
+    el('header', { class: 'artifact-viewer-head' },
+      el('div', { class: 'artifact-viewer-title' },
+        el('strong', { text: alt || '图片预览' }),
+        el('span', { text: '轻点图片可切换放大' }),
+      ),
+      button('关闭', close, { type: 'button', class: 'ghost' }),
+    ),
+    el('div', { class: 'artifact-viewer-body' }, el('div', { class: 'artifact-image-stage' }, img)),
+  )
+  document.body.append(dialog)
+  dialog.showModal()
+}
+
+function openArtifactViewer(item: ToolArtifactItem): void {
+  const api = state.api
+  const session = state.session
+  const dialog = el('dialog', { class: 'artifact-viewer', 'aria-label': item.name })
+  let aborted = false
+  let objectUrl: string | null = null
+  const close = () => {
+    aborted = true
+    if (objectUrl) { URL.revokeObjectURL(objectUrl); objectUrl = null }
+    dialog.close()
+    dialog.remove()
+  }
+  dialog.addEventListener('cancel', (event) => { event.preventDefault(); close() })
+
+  const hasLocalDiff = Boolean((item.diffLines && item.diffLines.length > 0) || item.content !== undefined)
+  let mode: 'diff' | 'full' | 'markdown' = hasLocalDiff && item.kind === 'text' ? 'diff' : 'full'
+  let remoteState: 'idle' | 'loading' | 'ready' | 'error' = 'idle'
+  let remoteError = ''
+  let loadedBytes = 0
+  let totalBytes = 0
+  let remoteData: {
+    name: string; mime: string; kind: string; size: number; text?: string; blob?: Blob; truncated?: boolean
+  } | null = null
+
+  const subtitle = el('span', { text: item.path })
+  const body = el('div', { class: 'artifact-viewer-body' })
+  const copyBtn = button('复制', () => {
+    const text = remoteData?.text ?? item.content ?? item.diffLines?.map((l) => (l.type === 'add' ? '+' : l.type === 'remove' ? '-' : ' ') + l.text).join('\n') ?? item.path
+    void copyReply(text, '已复制内容')
+  }, { type: 'button', class: 'icon-button' })
+
+  dialog.append(
+    el('header', { class: 'artifact-viewer-head' },
+      el('div', { class: 'artifact-viewer-title' },
+        el('strong', { text: item.name }),
+        subtitle,
+      ),
+      copyBtn,
+      button('关闭', close, { type: 'button', class: 'ghost' }),
+    ),
+    body,
+  )
+  document.body.append(dialog)
+  dialog.showModal()
+
+  const isMarkdownFile = /\.(?:md|mdx)$/i.test(item.name)
+
+  function draw(): void {
+    const nodes: Child[] = []
+    const tabs: Array<[typeof mode, string]> = []
+    if (hasLocalDiff) tabs.push(['diff', item.action === 'write' ? '本次写入' : '变更 Diff'])
+    if (isMarkdownFile && remoteData?.text) tabs.push(['markdown', '渲染视图'])
+    tabs.push(['full', item.kind === 'image' || item.kind === 'video' || item.kind === 'audio' ? artifactKindLabel(item.kind) + '预览' : '完整文件'])
+
+    if (tabs.length > 1) {
+      nodes.push(chatSegments('预览模式', tabs, mode, (next) => {
+        mode = next
+        if (next === 'full' && remoteState === 'idle') void fetchRemote()
+        draw()
+      }))
+    }
+
+    if (mode === 'diff' && hasLocalDiff) {
+      if (item.diffLines && item.diffLines.length > 0) {
+        nodes.push(el('p', { class: 'notice', text: `变更：+${item.added ?? 0} / -${item.removed ?? 0} 行` }))
+        nodes.push(renderDiffView(item.diffLines))
+      } else if (item.content !== undefined) {
+        nodes.push(el('p', { class: 'notice', text: `本次写入（${item.content.split('\n').length} 行）` }))
+        nodes.push(renderCodeLines(item.content, item.startLine, item.endLine).node)
+      }
+      body.replaceChildren(...nodes.filter((n): n is HTMLElement => n !== null))
+      return
+    }
+
+    if (remoteState === 'loading') {
+      const pct = totalBytes > 0 ? Math.min(100, Math.round((loadedBytes / totalBytes) * 100)) : 0
+      const progressText = totalBytes > 0
+        ? `正在从电脑拉取 ${item.name}（${formatBytes(loadedBytes)} / ${formatBytes(totalBytes)} · ${pct}%）…`
+        : `正在从电脑拉取 ${item.name}…`
+      nodes.push(el('div', { class: 'card' },
+        el('p', { class: 'empty', text: progressText }),
+        totalBytes > 0 ? el('div', { class: 'artifact-progress' }, el('span', { style: `width: ${pct}%` })) : null,
+      ))
+      body.replaceChildren(...nodes.filter((n): n is HTMLElement => n !== null))
+      return
+    }
+
+    if (remoteState === 'error') {
+      nodes.push(el('div', { class: 'card' },
+        el('p', { class: 'banner error', text: remoteError || '无法读取该文件。' }),
+        button('重试拉取', () => { void fetchRemote() }, { type: 'button', class: 'block' }),
+      ))
+      body.replaceChildren(...nodes.filter((n): n is HTMLElement => n !== null))
+      return
+    }
+
+    if (remoteData) {
+      subtitle.textContent = `${formatBytes(remoteData.size)} · ${item.path}`
+      if (mode === 'markdown' && remoteData.text !== undefined) {
+        nodes.push(el('div', { class: 'card' }, markdownBodyNode(remoteData.text)))
+      } else if (remoteData.text !== undefined) {
+        if (remoteData.truncated) {
+          nodes.push(el('p', { class: 'banner warn', text: `文件较大（${formatBytes(remoteData.size)}），已加载前 1.5 MB 供预览。` }))
+        }
+        const rendered = renderCodeLines(remoteData.text, item.startLine, item.endLine)
+        nodes.push(rendered.node)
+        body.replaceChildren(...nodes.filter((n): n is HTMLElement => n !== null))
+        rendered.firstHighlight?.scrollIntoView({ block: 'center' })
+        return
+      } else if (remoteData.blob) {
+        if (!objectUrl) objectUrl = URL.createObjectURL(remoteData.blob)
+        if (remoteData.kind === 'image') {
+          let zoomed = false
+          const img = el('img', { src: objectUrl, alt: remoteData.name }) as HTMLImageElement
+          img.addEventListener('click', () => { zoomed = !zoomed; img.classList.toggle('zoomed', zoomed) })
+          nodes.push(el('p', { class: 'notice', text: '轻点图片可切换 2× 放大并拖动查看细节' }))
+          nodes.push(el('div', { class: 'artifact-image-stage' }, img))
+        } else if (remoteData.kind === 'video') {
+          const video = document.createElement('video')
+          video.className = 'artifact-video'
+          video.src = objectUrl
+          video.controls = true
+          video.playsInline = true
+          video.preload = 'metadata'
+          nodes.push(video)
+        } else if (remoteData.kind === 'audio') {
+          const audio = document.createElement('audio')
+          audio.className = 'artifact-audio'
+          audio.src = objectUrl
+          audio.controls = true
+          nodes.push(audio)
+        } else if (remoteData.kind === 'pdf') {
+          const frame = document.createElement('iframe')
+          frame.src = objectUrl
+          frame.title = remoteData.name
+          frame.style.width = '100%'
+          frame.style.height = '72dvh'
+          frame.style.border = '0'
+          frame.style.borderRadius = '12px'
+          nodes.push(frame)
+        } else {
+          nodes.push(el('div', { class: 'card' },
+            el('p', { class: 'empty', text: `二进制文件（${remoteData.mime}，${formatBytes(remoteData.size)}），手机端不支持直接渲染。` }),
+          ))
+        }
+      }
+    }
+    body.replaceChildren(...nodes.filter((n): n is HTMLElement => n !== null))
+  }
+
+  async function fetchRemote(): Promise<void> {
+    if (!api || !session) {
+      remoteState = 'error'
+      remoteError = '当前未连接到会话主机。'
+      draw()
+      return
+    }
+    remoteState = 'loading'
+    remoteError = ''
+    loadedBytes = 0
+    totalBytes = 0
+    draw()
+    const res = await api.downloadArtifact(targetOf(session), item.path, {
+      onProgress: (loaded, total) => {
+        if (aborted) return
+        loadedBytes = loaded
+        totalBytes = total
+        draw()
+      },
+      isAborted: () => aborted,
+    })
+    if (aborted) return
+    if (!res.ok) {
+      remoteState = 'error'
+      remoteError = res.message
+      draw()
+      return
+    }
+    remoteData = res.data
+    remoteState = 'ready'
+    if (isMarkdownFile && res.data.text !== undefined && mode === 'full') mode = 'markdown'
+    draw()
+  }
+
+  draw()
+  if (mode === 'full') void fetchRemote()
+}
+
+function openSessionArtifactsSheet(): void {
+  const items = collectSessionArtifacts(state.messages)
+  const dialog = el('dialog', { class: 'ticket-sheet', 'aria-labelledby': 'session-artifacts-title' })
+  const close = () => { dialog.close(); dialog.remove() }
+  dialog.addEventListener('cancel', (event) => { event.preventDefault(); close() })
+  dialog.addEventListener('click', (event) => { if (event.target === dialog) close() })
+  const rows = items.map((item) => {
+    const meta = [
+      item.kind === 'image' || item.kind === 'video' ? artifactKindLabel(item.kind) : actionLabel(item.action),
+      item.added !== undefined ? `+${item.added} -${item.removed ?? 0}` : '',
+      item.description ?? '',
+      item.path,
+    ].filter(Boolean).join(' · ')
+    return el('button', {
+      type: 'button', class: 'session',
+      onClick: () => { close(); openArtifactViewer(item) },
+    },
+    el('span', { class: 'dot' + (item.action === 'edit' || item.action === 'write' ? ' online' : '') }),
+    el('span', { class: 'copy' },
+      el('strong', { text: item.name }),
+      el('span', { text: meta }),
+    ),
+    el('span', { class: 'chevron', 'aria-hidden': 'true' }),
+    )
+  })
+  dialog.append(el('div', {},
+    el('div', { class: 'ticket-sheet-header row-between' },
+      el('h2', { id: 'session-artifacts-title', text: `文件与媒体（${items.length}）` }),
+      button('关闭', close, { type: 'button', class: 'ghost' }),
+    ),
+    el('div', { class: 'ticket-sheet-body' },
+      ...(rows.length > 0 ? rows : [el('p', { class: 'empty', text: '当前已加载的对话记录中暂无修改文件或媒体。' })]),
+    ),
+  ))
+  document.body.append(dialog)
+  dialog.showModal()
 }
 
 function messageNode(message: Message): HTMLElement {
@@ -2241,7 +2564,10 @@ function messageNode(message: Message): HTMLElement {
       } else label.textContent = `${message.toolTitle ?? '工具调用'} ${expanded ? '▴' : '▾'}`
     }
     update()
-    return el('div', { class: cls, 'data-msg': key }, toggle, body)
+    const artifactCards = !isReason && message.artifacts && message.artifacts.length > 0
+      ? el('div', { class: 'tool-artifact-list' }, ...message.artifacts.map(toolArtifactCardNode))
+      : null
+    return el('div', { class: cls, 'data-msg': key }, toggle, artifactCards, body)
   }
   const role = message.role === 'assistant' ? agentLabel(state.session?.agent ?? '') : message.role === 'user' ? '我' : '系统'
   return el('div', { class: cls, 'data-msg': key },
@@ -2377,7 +2703,9 @@ function sessionView(): Child[] {
   if (!session) { state.view = 'sessions'; return sessionsView() }
   const generation = sessionGeneration
   const cards = pendingInputs.cards(session)
+  const sessionArtifactCount = collectSessionArtifacts(state.messages).length
   const header = topbar(sessionTitle(session), agentLabel(session.agent) + ' · ' + (state.running ? '运行中' : '空闲'), [
+    sessionArtifactCount > 0 ? button(`文件(${sessionArtifactCount})`, openSessionArtifactsSheet, { class: 'icon-button' }) : null,
     button('控制', openControls, { class: 'icon-button' }),
   ], backButton('sessions'))
   const controls = state.controls
